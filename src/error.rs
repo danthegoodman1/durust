@@ -41,6 +41,10 @@ impl DurableFailure {
             Error::ActivityTimedOut(message) => {
                 Self::new("durust.activity_timed_out", message.clone())
             }
+            Error::ChildWorkflowFailed(failure) => failure.clone(),
+            Error::ChildWorkflowCancelled(reason) => {
+                Self::new("durust.child_workflow_cancelled", reason.clone()).marked_non_retryable()
+            }
             Error::Nondeterminism(message) => {
                 Self::new("durust.nondeterminism", message.clone()).marked_non_retryable()
             }
@@ -123,6 +127,12 @@ pub enum Error {
     #[error("activity timed out: {0}")]
     ActivityTimedOut(String),
 
+    #[error("child workflow failed: {0}")]
+    ChildWorkflowFailed(DurableFailure),
+
+    #[error("child workflow cancelled: {0}")]
+    ChildWorkflowCancelled(String),
+
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),
 
@@ -163,7 +173,9 @@ impl Error {
 
     pub fn is_non_retryable(&self) -> bool {
         match self {
-            Self::Application(failure) | Self::ActivityFailed(failure) => failure.non_retryable,
+            Self::Application(failure)
+            | Self::ActivityFailed(failure)
+            | Self::ChildWorkflowFailed(failure) => failure.non_retryable,
             _ => false,
         }
     }

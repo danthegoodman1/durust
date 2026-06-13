@@ -1188,6 +1188,13 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: StartWorkflowRequest,
     ) -> durust::Result<StartWorkflowOutcome>;
 
+    async fn cancel_workflow(
+        &self,
+        req: CancelWorkflowRequest,
+    ) -> durust::Result<CancelWorkflowOutcome>;
+
+    async fn current_time(&self) -> durust::Result<TimestampMs>;
+
     async fn claim_workflow_task(
         &self,
         worker_id: WorkerId,
@@ -1204,6 +1211,12 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> durust::Result<CommitOutcome>;
+
+    async fn release_workflow_task(
+        &self,
+        claim: WorkflowTaskClaim,
+        release: WorkflowTaskRelease,
+    ) -> durust::Result<()>;
 
     async fn signal_workflow(
         &self,
@@ -1245,6 +1258,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: FailActivityRequest,
     ) -> durust::Result<FailActivityOutcome>;
+
+    async fn dispatch_child_workflow_starts(
+        &self,
+        req: DispatchChildWorkflowStartsRequest,
+    ) -> durust::Result<DispatchChildWorkflowStartsOutcome>;
 
     async fn query_projection(
         &self,
@@ -1288,9 +1306,10 @@ pub struct WorkflowTaskCommit {
 
     pub schedule_activities: Vec<ActivityTask>,
     pub schedule_activity_maps: Vec<ActivityMapTask>,
-    pub start_child_outbox: Vec<ChildStartOutboxMessage>,
+    pub start_child_workflows: Vec<ChildStartOutboxMessage>,
 
     pub consume_signals: Vec<SignalId>,
+    pub cancel_commands: Vec<CommandId>,
 
     pub query_projection: Option<QueryProjectionUpdate>,
 
@@ -1323,6 +1342,13 @@ range they are materializing. Result manifests are written as root-plus-page
 payloads. The runtime contract is that each item is independently claimable,
 lease-fenced, retryable, and completable by `ActivityMapItemId`, while workflow
 history remains compact at the map-operation level.
+
+`dispatch_child_workflow_starts` is the provider-neutral child outbox drain. It
+claims a bounded number of durable child-start messages, starts each child
+idempotently, and appends the corresponding `ChildWorkflowStarted` or
+`ChildWorkflowFailed` fact to the parent run. Providers must keep this generic:
+the runtime chooses child options and parent close policy; the provider only
+persists and dispatches durable visibility.
 
 ## 8.3 Atomicity requirement
 

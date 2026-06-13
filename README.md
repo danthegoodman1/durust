@@ -536,6 +536,7 @@ active wait indexes
 workflow and activity leases
 signal inboxes
 activity map state
+child workflow outbox and parent notifications
 query projections
 payload refs
 idempotency
@@ -563,6 +564,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`timer_wait.rs`](examples/timer_wait.rs)
 - [`select_approval.rs`](examples/select_approval.rs)
 - [`join_activities.rs`](examples/join_activities.rs)
+- [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)
 - [`activity_map.rs`](examples/activity_map.rs)

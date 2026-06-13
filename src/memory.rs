@@ -1,12 +1,13 @@
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapItem, ActivityMapTask, ActivityTask,
-    ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ClaimActivityOptions,
-    ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome,
-    CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, Error, EventId,
-    FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ReadSignalInboxRequest, Result, RunId,
-    SignalId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ChildStartOutboxMessage,
+    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask,
+    CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
+    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
+    EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
+    HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy,
+    ReadSignalInboxRequest, Result, RunId, SignalId, SignalInboxRecord, SignalWorkflowOutcome,
+    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
     TimeoutDueActivitiesRequest, TimestampMs, WaitId, WaitKind, WaitRecord, WorkflowId,
     WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
     encode_activity_map_result_manifest, event_payload_len, is_terminal,
@@ -47,6 +48,7 @@ struct MemoryState {
     runs: BTreeMap<RunId, RunRecord>,
     activities: BTreeMap<ActivityId, ActivityRecord>,
     activity_maps: BTreeMap<crate::CommandId, ActivityMapRecord>,
+    child_outbox: BTreeMap<String, ChildOutboxRecord>,
     waits: BTreeMap<WaitId, WaitRecord>,
     signals: BTreeMap<SignalId, SignalRecord>,
     query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
@@ -62,6 +64,20 @@ struct RunRecord {
     ready_at: Option<Instant>,
     workflow_claim: Option<u64>,
     terminal: bool,
+    parent: Option<ChildParentLink>,
+}
+
+#[derive(Clone)]
+struct ChildParentLink {
+    parent_run_id: RunId,
+    command_id: crate::CommandId,
+    parent_close_policy: ParentClosePolicy,
+}
+
+struct ChildOutboxRecord {
+    message: ChildStartOutboxMessage,
+    dispatched: bool,
+    child_run_id: Option<RunId>,
 }
 
 struct ActivityRecord {
@@ -134,6 +150,7 @@ impl DurableBackend for MemoryBackend {
                 ready_at: None,
                 workflow_claim: None,
                 terminal: false,
+                parent: None,
             },
         );
 
@@ -155,6 +172,7 @@ impl DurableBackend for MemoryBackend {
                 req.workflow_id.0
             )))));
         };
+        let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
         let event_id = {
             let Some(run) = state.runs.get_mut(&run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(run_id))));
@@ -173,7 +191,7 @@ impl DurableBackend for MemoryBackend {
             run.history.push(HistoryEvent {
                 event_id,
                 event_type: crate::HistoryEventType::WorkflowCancelled,
-                data: HistoryEventData::WorkflowCancelled { reason: req.reason },
+                data: terminal_event.clone(),
             });
             run.terminal = true;
             run.ready = None;
@@ -182,6 +200,7 @@ impl DurableBackend for MemoryBackend {
             event_id
         };
         cleanup_run_operational_state(&mut state, &run_id);
+        handle_terminal_run(&mut state, &run_id, &terminal_event);
 
         Box::pin(ready(Ok(CancelWorkflowOutcome::Cancelled {
             run_id,
@@ -315,7 +334,9 @@ impl DurableBackend for MemoryBackend {
         let consume_signals = batch.consume_signals;
         let delete_waits = batch.delete_waits;
         let cancel_commands = batch.cancel_commands;
+        let start_child_workflows = batch.start_child_workflows;
         let query_projection = batch.query_projection;
+        let mut terminal_event = None;
         let mut projection_update = None;
         let next_event_id = {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
@@ -344,6 +365,9 @@ impl DurableBackend for MemoryBackend {
             for new_event in batch.append_events {
                 next_event_id = next_event_id.next();
                 terminal |= is_terminal(&new_event.data);
+                if is_terminal(&new_event.data) {
+                    terminal_event = Some(new_event.data.clone());
+                }
                 run.history.push(HistoryEvent {
                     event_id: next_event_id,
                     event_type: new_event.data.event_type(),
@@ -400,6 +424,16 @@ impl DurableBackend for MemoryBackend {
                 return Box::pin(ready(Err(err)));
             }
         }
+        for message in start_child_workflows {
+            state.child_outbox.insert(
+                child_outbox_id(&message.command_id),
+                ChildOutboxRecord {
+                    message,
+                    dispatched: false,
+                    child_run_id: None,
+                },
+            );
+        }
         for wait in upsert_waits {
             state.waits.insert(wait.wait_id.clone(), wait);
         }
@@ -416,6 +450,9 @@ impl DurableBackend for MemoryBackend {
         }
         if next_event_id.1 {
             cleanup_run_operational_state(&mut state, &claim.run_id);
+            if let Some(event) = terminal_event {
+                handle_terminal_run(&mut state, &claim.run_id, &event);
+            }
         }
         let signal_wait_ready = state.waits.values().any(|wait| {
             wait.run_id == claim.run_id
@@ -786,6 +823,33 @@ impl DurableBackend for MemoryBackend {
         Box::pin(ready(Ok(FailActivityOutcome::Failed { event_id })))
     }
 
+    fn dispatch_child_workflow_starts(
+        &self,
+        req: DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>> {
+        let result = (|| {
+            let mut state = self.state.lock().expect("memory backend mutex poisoned");
+            let mut dispatched = 0usize;
+            let limit = req.limit.max(1);
+            while dispatched < limit {
+                let Some(outbox_id) = state.child_outbox.iter().find_map(|(outbox_id, record)| {
+                    (!record.dispatched
+                        && state
+                            .runs
+                            .get(&record.message.command_id.run_id)
+                            .is_some_and(|run| run.namespace == req.namespace))
+                    .then(|| outbox_id.clone())
+                }) else {
+                    break;
+                };
+                dispatch_child_start(&mut state, &outbox_id)?;
+                dispatched += 1;
+            }
+            Ok(DispatchChildWorkflowStartsOutcome { dispatched })
+        })();
+        Box::pin(ready(result))
+    }
+
     fn query_projection(
         &self,
         req: crate::QueryProjectionRequest,
@@ -867,6 +931,327 @@ fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {
     }
 }
 
+fn dispatch_child_start(state: &mut MemoryState, outbox_id: &str) -> Result<()> {
+    let message = {
+        let Some(record) = state.child_outbox.get(outbox_id) else {
+            return Ok(());
+        };
+        if record.dispatched {
+            return Ok(());
+        }
+        record.message.clone()
+    };
+
+    let parent_terminal = state
+        .runs
+        .get(&message.command_id.run_id)
+        .map(|run| run.terminal)
+        .unwrap_or(true);
+    if parent_terminal && message.parent_close_policy == ParentClosePolicy::Cancel {
+        if let Some(record) = state.child_outbox.get_mut(outbox_id) {
+            record.dispatched = true;
+        }
+        return Ok(());
+    }
+
+    let child_run_id = match state
+        .workflow_ids
+        .get(&(
+            state
+                .runs
+                .get(&message.command_id.run_id)
+                .ok_or_else(|| Error::RunNotFound(message.command_id.run_id.clone()))?
+                .namespace
+                .clone(),
+            message.workflow_id.clone(),
+        ))
+        .cloned()
+    {
+        Some(existing_run_id) => {
+            let same_child = state
+                .runs
+                .get(&existing_run_id)
+                .and_then(|run| run.parent.as_ref())
+                .is_some_and(|parent| parent.command_id == message.command_id);
+            if !same_child {
+                append_child_start_failed(
+                    state,
+                    &message.command_id,
+                    crate::DurableFailure::non_retryable(
+                        "durust.child_workflow_id_conflict",
+                        format!("workflow id `{}` is already started", message.workflow_id),
+                    ),
+                )?;
+                if let Some(record) = state.child_outbox.get_mut(outbox_id) {
+                    record.dispatched = true;
+                }
+                return Ok(());
+            }
+            existing_run_id
+        }
+        None => start_child_run(state, &message)?,
+    };
+
+    append_child_started(state, &message, child_run_id.clone())?;
+    if let Some(record) = state.child_outbox.get_mut(outbox_id) {
+        record.dispatched = true;
+        record.child_run_id = Some(child_run_id);
+    }
+    Ok(())
+}
+
+fn start_child_run(state: &mut MemoryState, message: &ChildStartOutboxMessage) -> Result<RunId> {
+    let parent_run = state
+        .runs
+        .get(&message.command_id.run_id)
+        .ok_or_else(|| Error::RunNotFound(message.command_id.run_id.clone()))?;
+    state.next_run_id += 1;
+    let run_id = RunId::new(format!("run-{}", state.next_run_id));
+    let start = HistoryEvent {
+        event_id: EventId(1),
+        event_type: crate::HistoryEventType::WorkflowStarted,
+        data: HistoryEventData::WorkflowStarted {
+            workflow_type: message.workflow_type.clone(),
+            input: message.input.clone(),
+        },
+    };
+    state.workflow_ids.insert(
+        (parent_run.namespace.clone(), message.workflow_id.clone()),
+        run_id.clone(),
+    );
+    state.runs.insert(
+        run_id.clone(),
+        RunRecord {
+            namespace: parent_run.namespace.clone(),
+            workflow_id: message.workflow_id.clone(),
+            workflow_type: message.workflow_type.clone(),
+            task_queue: message.task_queue.clone(),
+            history: vec![start],
+            ready: Some(WorkflowTaskReason::WorkflowStarted),
+            ready_at: None,
+            workflow_claim: None,
+            terminal: false,
+            parent: Some(ChildParentLink {
+                parent_run_id: message.command_id.run_id.clone(),
+                command_id: message.command_id.clone(),
+                parent_close_policy: message.parent_close_policy,
+            }),
+        },
+    );
+    Ok(run_id)
+}
+
+fn append_child_started(
+    state: &mut MemoryState,
+    message: &ChildStartOutboxMessage,
+    child_run_id: RunId,
+) -> Result<()> {
+    if child_event_exists(state, &message.command_id) {
+        return Ok(());
+    }
+    let Some(parent) = state.runs.get_mut(&message.command_id.run_id) else {
+        return Err(Error::RunNotFound(message.command_id.run_id.clone()));
+    };
+    if parent.terminal {
+        return Ok(());
+    }
+    let event_id = parent
+        .history
+        .last()
+        .map(|event| event.event_id.next())
+        .unwrap_or(EventId(1));
+    parent.history.push(HistoryEvent {
+        event_id,
+        event_type: crate::HistoryEventType::ChildWorkflowStarted,
+        data: HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
+            command_id: message.command_id.clone(),
+            workflow_id: message.workflow_id.clone(),
+            run_id: child_run_id,
+        }),
+    });
+    parent.ready = Some(WorkflowTaskReason::ChildWorkflowStarted);
+    parent.ready_at = None;
+    Ok(())
+}
+
+fn append_child_start_failed(
+    state: &mut MemoryState,
+    command_id: &crate::CommandId,
+    failure: crate::DurableFailure,
+) -> Result<()> {
+    if child_event_exists(state, command_id) {
+        return Ok(());
+    }
+    let Some(parent) = state.runs.get_mut(&command_id.run_id) else {
+        return Err(Error::RunNotFound(command_id.run_id.clone()));
+    };
+    if parent.terminal {
+        return Ok(());
+    }
+    let event_id = parent
+        .history
+        .last()
+        .map(|event| event.event_id.next())
+        .unwrap_or(EventId(1));
+    parent.history.push(HistoryEvent {
+        event_id,
+        event_type: crate::HistoryEventType::ChildWorkflowFailed,
+        data: HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+            command_id: command_id.clone(),
+            failure,
+        }),
+    });
+    parent.ready = Some(WorkflowTaskReason::ChildWorkflowFailed);
+    parent.ready_at = None;
+    Ok(())
+}
+
+fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> bool {
+    state.runs.get(&command_id.run_id).is_some_and(|run| {
+        run.history.iter().any(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                completed.command_id == *command_id
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                cancelled.command_id == *command_id
+            }
+            _ => false,
+        })
+    })
+}
+
+fn handle_terminal_run(state: &mut MemoryState, run_id: &RunId, terminal_event: &HistoryEventData) {
+    notify_parent_of_child_terminal(state, run_id, terminal_event);
+    cancel_children_for_parent(state, run_id);
+}
+
+fn notify_parent_of_child_terminal(
+    state: &mut MemoryState,
+    child_run_id: &RunId,
+    terminal_event: &HistoryEventData,
+) {
+    let Some(parent) = state
+        .runs
+        .get(child_run_id)
+        .and_then(|run| run.parent.clone())
+    else {
+        return;
+    };
+    if child_terminal_event_exists(state, &parent.command_id) {
+        return;
+    }
+    let Some(parent_run) = state.runs.get_mut(&parent.parent_run_id) else {
+        return;
+    };
+    if parent_run.terminal {
+        return;
+    }
+    let event_id = parent_run
+        .history
+        .last()
+        .map(|event| event.event_id.next())
+        .unwrap_or(EventId(1));
+    let (event_type, data, reason) = match terminal_event {
+        HistoryEventData::WorkflowCompleted { result } => (
+            crate::HistoryEventType::ChildWorkflowCompleted,
+            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
+                command_id: parent.command_id,
+                result: result.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCompleted,
+        ),
+        HistoryEventData::WorkflowFailed { failure } => (
+            crate::HistoryEventType::ChildWorkflowFailed,
+            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+                command_id: parent.command_id,
+                failure: failure.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowFailed,
+        ),
+        HistoryEventData::WorkflowCancelled { reason } => (
+            crate::HistoryEventType::ChildWorkflowCancelled,
+            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
+                command_id: parent.command_id,
+                reason: reason.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCancelled,
+        ),
+        _ => return,
+    };
+    parent_run.history.push(HistoryEvent {
+        event_id,
+        event_type,
+        data,
+    });
+    parent_run.ready = Some(reason);
+    parent_run.ready_at = None;
+}
+
+fn child_terminal_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> bool {
+    state.runs.get(&command_id.run_id).is_some_and(|run| {
+        run.history.iter().any(|event| match &event.data {
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                completed.command_id == *command_id
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                cancelled.command_id == *command_id
+            }
+            _ => false,
+        })
+    })
+}
+
+fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
+    for record in state.child_outbox.values_mut() {
+        if record.message.command_id.run_id == *parent_run_id
+            && record.message.parent_close_policy == ParentClosePolicy::Cancel
+            && record.child_run_id.is_none()
+        {
+            record.dispatched = true;
+        }
+    }
+
+    let children = state
+        .runs
+        .iter()
+        .filter_map(|(run_id, run)| {
+            run.parent
+                .as_ref()
+                .is_some_and(|parent| {
+                    parent.parent_run_id == *parent_run_id
+                        && parent.parent_close_policy == ParentClosePolicy::Cancel
+                        && !run.terminal
+                })
+                .then(|| run_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for child_run_id in children {
+        let terminal_event = HistoryEventData::WorkflowCancelled {
+            reason: format!("parent workflow `{parent_run_id}` closed"),
+        };
+        if let Some(child) = state.runs.get_mut(&child_run_id) {
+            let event_id = child
+                .history
+                .last()
+                .map(|event| event.event_id.next())
+                .unwrap_or(EventId(1));
+            child.history.push(HistoryEvent {
+                event_id,
+                event_type: crate::HistoryEventType::WorkflowCancelled,
+                data: terminal_event.clone(),
+            });
+            child.terminal = true;
+            child.ready = None;
+            child.ready_at = None;
+            child.workflow_claim = None;
+        }
+        cleanup_run_operational_state(state, &child_run_id);
+    }
+}
+
 fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate::CommandId) {
     for record in state.activities.values_mut() {
         let matches_activity = record.task.command_id == *command_id;
@@ -884,6 +1269,13 @@ fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate:
         map.completed = true;
         map.in_flight = 0;
     }
+    if let Some(record) = state.child_outbox.get_mut(&child_outbox_id(command_id)) {
+        record.dispatched = true;
+    }
+}
+
+fn child_outbox_id(command_id: &crate::CommandId) -> String {
+    format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
 }
 
 fn complete_map_item(

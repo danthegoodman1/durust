@@ -31,6 +31,7 @@ pub struct WorkerRunStats {
     pub activity_tasks: usize,
     pub timers_fired: usize,
     pub activities_timed_out: usize,
+    pub child_workflow_starts_dispatched: usize,
 }
 
 pub struct Client<B>
@@ -215,6 +216,7 @@ where
                 Ok(chunk) => {
                     let mut context = crate::runtime::RuntimeContext::new(
                         claimed.run_id.clone(),
+                        self.workflow_task_queue.clone(),
                         self.activity_task_queue.clone(),
                         now,
                         chunk.events,
@@ -263,6 +265,7 @@ where
                                     let mut future = registration.run(input);
                                     let mut context = crate::runtime::RuntimeContext::new(
                                         claimed.run_id.clone(),
+                                        self.workflow_task_queue.clone(),
                                         self.activity_task_queue.clone(),
                                         now,
                                         replay_events,
@@ -392,6 +395,17 @@ where
         Ok(outcome.timed_out)
     }
 
+    pub async fn run_child_workflow_starts_once(&mut self) -> Result<usize> {
+        let outcome = self
+            .backend
+            .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
+                namespace: self.namespace.clone(),
+                limit: 1024,
+            })
+            .await?;
+        Ok(outcome.dispatched)
+    }
+
     pub async fn run_until_idle(&mut self) -> Result<WorkerRunStats> {
         self.run_until_idle_with(WorkerRunOptions::default()).await
     }
@@ -418,6 +432,11 @@ where
             let activities_timed_out = self.run_activity_timeouts_once().await?;
             if activities_timed_out > 0 {
                 stats.activities_timed_out += activities_timed_out;
+                progressed = true;
+            }
+            let child_starts = self.run_child_workflow_starts_once().await?;
+            if child_starts > 0 {
+                stats.child_workflow_starts_dispatched += child_starts;
                 progressed = true;
             }
             if self.run_activity_once().await? {
@@ -549,6 +568,7 @@ where
                         upsert_waits: parts.upsert_waits,
                         schedule_activities: parts.schedule_activities,
                         schedule_activity_maps: parts.schedule_activity_maps,
+                        start_child_workflows: parts.start_child_workflows,
                         consume_signals: parts.consume_signals,
                         delete_waits: parts.delete_waits,
                         cancel_commands: parts.cancel_commands,

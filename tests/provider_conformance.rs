@@ -180,6 +180,11 @@ where
     non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
     activity_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone()).await;
     cancel_commands_clear_activity_tasks(backend.clone()).await;
+    child_start_dispatch_is_idempotent_and_wakes_parent(backend.clone()).await;
+    child_completion_routes_to_parent(backend.clone()).await;
+    child_start_conflict_records_failure(backend.clone()).await;
+    parent_close_policy_cancel_cancels_child(backend.clone()).await;
+    parent_close_policy_abandon_leaves_child_running(backend.clone()).await;
     activity_map_materializes_bounded_items_and_writes_result_manifest(backend.clone()).await;
     activity_map_failure_suppresses_remaining_items_and_wakes_workflow(backend.clone()).await;
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
@@ -325,6 +330,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -459,6 +465,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -504,6 +511,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -592,6 +600,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: vec![first_inbox.signal_id],
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -667,6 +676,7 @@ where
                 }],
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -771,6 +781,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -905,6 +916,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -1020,6 +1032,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -1212,6 +1225,7 @@ where
                 }],
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -1260,6 +1274,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: vec![activity_command],
@@ -1281,6 +1296,411 @@ where
         late_completion,
         durust::CompleteActivityOutcome::AlreadyCompleted
     );
+}
+
+async fn child_start_dispatch_is_idempotent_and_wakes_parent<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (parent_run_id, command_id) = schedule_child_start(
+        backend.clone(),
+        "wf/child-dispatch-parent",
+        "wf/child-dispatch-child",
+        durust::ParentClosePolicy::Cancel,
+    )
+    .await;
+
+    let dispatched = backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(dispatched.dispatched, 1);
+    let duplicate = backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(duplicate.dispatched, 0);
+
+    let parent_ready = backend
+        .claim_workflow_task(
+            WorkerId::new("child-start-parent-ready"),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent woken by child start");
+    assert_eq!(
+        parent_ready.reason,
+        durust::WorkflowTaskReason::ChildWorkflowStarted
+    );
+
+    let child_ready = backend
+        .claim_workflow_task(
+            WorkerId::new("child-start-child-ready"),
+            workflow_claim_opts("child-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("child workflow started");
+    assert_eq!(
+        child_ready.workflow_id,
+        durust::WorkflowId::new("wf/child-dispatch-child")
+    );
+
+    let history = stream_history(&backend, parent_run_id).await;
+    assert!(history.iter().any(|event| matches!(
+        &event.data,
+        HistoryEventData::ChildWorkflowStarted(started)
+            if started.command_id == command_id
+    )));
+}
+
+async fn child_completion_routes_to_parent<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (parent_run_id, command_id) = schedule_child_start(
+        backend.clone(),
+        "wf/child-completion-parent",
+        "wf/child-completion-child",
+        durust::ParentClosePolicy::Cancel,
+    )
+    .await;
+    backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let child = backend
+        .claim_workflow_task(
+            WorkerId::new("child-completion-worker"),
+            workflow_claim_opts("child-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("child workflow task");
+    let result = durust::encode_payload(&99_u64).unwrap();
+    backend
+        .commit_workflow_task(
+            child.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCompleted {
+                        result: result.clone(),
+                    },
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let parent_ready = backend
+        .claim_workflow_task(
+            WorkerId::new("child-completion-parent-ready"),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent woken by child completion");
+    assert_eq!(
+        parent_ready.reason,
+        durust::WorkflowTaskReason::ChildWorkflowCompleted
+    );
+    let history = stream_history(&backend, parent_run_id).await;
+    let completed = history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowCompleted(completed)
+                if completed.command_id == command_id =>
+            {
+                Some(completed)
+            }
+            _ => None,
+        })
+        .expect("child completion event");
+    assert_eq!(
+        durust::decode_payload::<u64>(&completed.result).unwrap(),
+        99
+    );
+}
+
+async fn child_start_conflict_records_failure<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/child-conflict-child", "conflict-child-workflows", 1)
+        .await
+        .unwrap();
+    let (parent_run_id, _command_id) = schedule_child_start(
+        backend.clone(),
+        "wf/child-conflict-parent",
+        "wf/child-conflict-child",
+        durust::ParentClosePolicy::Cancel,
+    )
+    .await;
+    backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+
+    let history = stream_history(&backend, parent_run_id).await;
+    let failed = history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowFailed(failed) => Some(failed),
+            _ => None,
+        })
+        .expect("child start conflict failure");
+    assert_eq!(
+        failed.failure.error_type,
+        "durust.child_workflow_id_conflict"
+    );
+    assert!(failed.failure.non_retryable);
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("child-conflict-parent-ready"),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap();
+    assert!(claimed.is_some());
+}
+
+async fn parent_close_policy_cancel_cancels_child<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (parent_run_id, _command_id) = schedule_child_start(
+        backend.clone(),
+        "wf/child-cancel-parent",
+        "wf/child-cancel-child",
+        durust::ParentClosePolicy::Cancel,
+    )
+    .await;
+    backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let parent = backend
+        .claim_workflow_task(
+            WorkerId::new("child-cancel-parent-ready"),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent ready after child start");
+    backend
+        .commit_workflow_task(
+            parent.claim,
+            terminal_parent_commit(parent.replay_target_event_id),
+        )
+        .await
+        .unwrap();
+
+    let child_claim = backend
+        .claim_workflow_task(
+            WorkerId::new("child-cancel-claim"),
+            workflow_claim_opts("child-workflows"),
+        )
+        .await
+        .unwrap();
+    assert!(child_claim.is_none());
+
+    let parent_history = stream_history(&backend, parent_run_id).await;
+    let child_run_id = parent_history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStarted(started) => Some(started.run_id.clone()),
+            _ => None,
+        })
+        .expect("child started");
+    let child_history = stream_history(&backend, child_run_id).await;
+    assert!(
+        child_history
+            .iter()
+            .any(|event| matches!(event.data, HistoryEventData::WorkflowCancelled { .. }))
+    );
+}
+
+async fn parent_close_policy_abandon_leaves_child_running<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    schedule_child_start(
+        backend.clone(),
+        "wf/child-abandon-parent",
+        "wf/child-abandon-child",
+        durust::ParentClosePolicy::Abandon,
+    )
+    .await;
+    backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let parent = backend
+        .claim_workflow_task(
+            WorkerId::new("child-abandon-parent-ready"),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent ready after child start");
+    backend
+        .commit_workflow_task(
+            parent.claim,
+            terminal_parent_commit(parent.replay_target_event_id),
+        )
+        .await
+        .unwrap();
+
+    let child_claim = backend
+        .claim_workflow_task(
+            WorkerId::new("child-abandon-claim"),
+            workflow_claim_opts("child-workflows"),
+        )
+        .await
+        .unwrap();
+    assert!(child_claim.is_some());
+}
+
+async fn schedule_child_start<B>(
+    backend: B,
+    parent_workflow_id: &str,
+    child_workflow_id: &str,
+    parent_close_policy: durust::ParentClosePolicy,
+) -> (durust::RunId, durust::CommandId)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let parent_run_id = client
+        .start_workflow::<workflow>(parent_workflow_id, "child-parent-workflows", 1)
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{parent_workflow_id}-scheduler")),
+            workflow_claim_opts("child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent workflow task");
+    let command_id = durust::command_id(&parent_run_id, 1);
+    let input = durust::encode_payload(&7_u64).unwrap();
+    let workflow_type = durust::WorkflowType::new("conformance.workflow", 1);
+    let workflow_id = durust::WorkflowId::new(child_workflow_id);
+    let task_queue = TaskQueue::new("child-workflows");
+    let requested = durust::ChildWorkflowStartRequested {
+        command_id: command_id.clone(),
+        workflow_type: workflow_type.clone(),
+        workflow_id: workflow_id.clone(),
+        task_queue: task_queue.clone(),
+        input: input.clone(),
+        parent_close_policy,
+        fingerprint: durust::child_workflow_fingerprint(
+            workflow_type,
+            workflow_id,
+            durust::payload_digest(&input),
+            task_queue,
+            parent_close_policy,
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
+                    &requested,
+                )],
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    (parent_run_id, command_id)
+}
+
+fn workflow_claim_opts(task_queue: &str) -> ClaimWorkflowTaskOptions {
+    ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(task_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+fn terminal_parent_commit(expected_tail_event_id: EventId) -> WorkflowTaskCommit {
+    WorkflowTaskCommit {
+        expected_tail_event_id,
+        append_events: vec![durust::NewHistoryEvent::new(
+            HistoryEventData::WorkflowCompleted {
+                result: durust::encode_payload(&()).unwrap(),
+            },
+        )],
+        upsert_waits: Vec::new(),
+        schedule_activities: Vec::new(),
+        schedule_activity_maps: Vec::new(),
+        start_child_workflows: Vec::new(),
+        consume_signals: Vec::new(),
+        delete_waits: Vec::new(),
+        cancel_commands: Vec::new(),
+        query_projection: None,
+    }
+}
+
+async fn stream_history<B>(backend: &B, run_id: durust::RunId) -> Vec<durust::HistoryEvent>
+where
+    B: DurableBackend,
+{
+    backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events
 }
 
 async fn activity_map_materializes_bounded_items_and_writes_result_manifest<B>(backend: B)
@@ -1358,6 +1778,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -1568,6 +1989,7 @@ where
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -1797,6 +2219,7 @@ where
                     &scheduled_activity,
                 )],
                 schedule_activity_maps: vec![map_task],
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),

@@ -12,6 +12,8 @@ error[E0277]: the trait bound `std::future::Ready<Result<(), durust::Error>>: Du
             ActivityFuture<A>
             ActivityMapResultFuture
             ActivityMapSpawnFuture<A>
+            ChildWorkflowResultFuture<W>
+            ChildWorkflowSpawnFuture<W>
             SignalFuture<T>
             TimerFuture
 note: required by a bound in `__durust_join_assert_branch`

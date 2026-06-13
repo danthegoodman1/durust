@@ -40,6 +40,20 @@ async fn join_four_activities(input: u64) -> durust::Result<u64> {
     Ok(first + second + third + fourth)
 }
 
+#[durust::workflow(name = "bench.child-double", version = 1)]
+async fn child_double(input: u64) -> durust::Result<u64> {
+    Ok(input * 2)
+}
+
+#[durust::workflow(name = "bench.child-start", version = 1)]
+async fn child_start(input: u64) -> durust::Result<()> {
+    let _child = durust::child!(child_double(input))
+        .workflow_id(format!("bench/child/{input}"))
+        .spawn()
+        .await?;
+    Ok(())
+}
+
 #[durust::workflow(name = "bench.select-signal-timer", version = 1)]
 async fn select_signal_timer(input: u64) -> durust::Result<String> {
     let outcome = durust::select! {
@@ -189,6 +203,29 @@ fn bounded_join_fanout(c: &mut Criterion) {
     });
 }
 
+fn child_start_dispatch(c: &mut Criterion) {
+    c.bench_function("child_start_dispatch_memory", |b| {
+        b.iter_batched(
+            setup_child_start_outbox,
+            |backend| {
+                block_on(async {
+                    let outcome = backend
+                        .dispatch_child_workflow_starts(
+                            durust::DispatchChildWorkflowStartsRequest {
+                                namespace: Namespace::default(),
+                                limit: 16,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome.dispatched, 1);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn projection_update(c: &mut Criterion) {
     c.bench_function("query_projection_update_memory", |b| {
         b.iter_batched(
@@ -204,6 +241,7 @@ fn projection_update(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: Vec::new(),
+                                start_child_workflows: Vec::new(),
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
                                 cancel_commands: Vec::new(),
@@ -332,6 +370,7 @@ fn signal_send_consume(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: Vec::new(),
+                                start_child_workflows: Vec::new(),
                                 consume_signals: vec![inbox.signal_id],
                                 delete_waits: Vec::new(),
                                 cancel_commands: Vec::new(),
@@ -365,6 +404,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: vec![map_task],
+                                start_child_workflows: Vec::new(),
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
                                 cancel_commands: Vec::new(),
@@ -476,6 +516,23 @@ fn setup_select_replay() -> MemoryBackend {
     })
 }
 
+fn setup_child_start_outbox() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<child_start>("bench/child-parent", "workflows", 42)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_start)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend
+    })
+}
+
 fn setup_join_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -513,6 +570,7 @@ fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
@@ -589,6 +647,7 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![activity_task],
                 schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
@@ -648,6 +707,7 @@ fn setup_due_timer() -> MemoryBackend {
                     }],
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
@@ -696,6 +756,7 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
                     }],
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
@@ -771,6 +832,7 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: vec![map_task],
+                    start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
@@ -855,6 +917,7 @@ criterion_group!(
     select_registration,
     select_replay,
     bounded_join_fanout,
+    child_start_dispatch,
     projection_update,
     projection_read,
     activity_claim_complete,

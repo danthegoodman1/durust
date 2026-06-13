@@ -17,6 +17,7 @@ pub struct CommandFingerprint {
 pub enum CommandKind {
     Activity,
     ActivityMap,
+    ChildWorkflow,
     Timer,
     Signal,
 }
@@ -125,6 +126,49 @@ pub struct ActivityMapFailed {
     pub failure: DurableFailure,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ParentClosePolicy {
+    #[default]
+    Cancel,
+    Abandon,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowStartRequested {
+    pub command_id: CommandId,
+    pub workflow_type: WorkflowType,
+    pub workflow_id: crate::WorkflowId,
+    pub task_queue: TaskQueue,
+    pub input: PayloadRef,
+    pub parent_close_policy: ParentClosePolicy,
+    pub fingerprint: CommandFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowStarted {
+    pub command_id: CommandId,
+    pub workflow_id: crate::WorkflowId,
+    pub run_id: RunId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowCompleted {
+    pub command_id: CommandId,
+    pub result: PayloadRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowFailed {
+    pub command_id: CommandId,
+    pub failure: DurableFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowCancelled {
+    pub command_id: CommandId,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectWinner {
     pub select_command_id: CommandId,
@@ -156,6 +200,11 @@ pub enum HistoryEventData {
     ActivityCompleted(ActivityCompleted),
     ActivityFailed(ActivityFailed),
     ActivityTimedOut(ActivityTimedOut),
+    ChildWorkflowStartRequested(ChildWorkflowStartRequested),
+    ChildWorkflowStarted(ChildWorkflowStarted),
+    ChildWorkflowCompleted(ChildWorkflowCompleted),
+    ChildWorkflowFailed(ChildWorkflowFailed),
+    ChildWorkflowCancelled(ChildWorkflowCancelled),
     TimerStarted(TimerStarted),
     TimerFired(TimerFired),
     SignalConsumed(SignalConsumed),
@@ -183,6 +232,11 @@ pub enum HistoryEventType {
     ActivityCompleted,
     ActivityFailed,
     ActivityTimedOut,
+    ChildWorkflowStartRequested,
+    ChildWorkflowStarted,
+    ChildWorkflowCompleted,
+    ChildWorkflowFailed,
+    ChildWorkflowCancelled,
     TimerStarted,
     TimerFired,
     SignalConsumed,
@@ -204,6 +258,11 @@ impl HistoryEventData {
             Self::ActivityCompleted(_) => HistoryEventType::ActivityCompleted,
             Self::ActivityFailed(_) => HistoryEventType::ActivityFailed,
             Self::ActivityTimedOut(_) => HistoryEventType::ActivityTimedOut,
+            Self::ChildWorkflowStartRequested(_) => HistoryEventType::ChildWorkflowStartRequested,
+            Self::ChildWorkflowStarted(_) => HistoryEventType::ChildWorkflowStarted,
+            Self::ChildWorkflowCompleted(_) => HistoryEventType::ChildWorkflowCompleted,
+            Self::ChildWorkflowFailed(_) => HistoryEventType::ChildWorkflowFailed,
+            Self::ChildWorkflowCancelled(_) => HistoryEventType::ChildWorkflowCancelled,
             Self::TimerStarted(_) => HistoryEventType::TimerStarted,
             Self::TimerFired(_) => HistoryEventType::TimerFired,
             Self::SignalConsumed(_) => HistoryEventType::SignalConsumed,
@@ -272,6 +331,29 @@ pub struct ActivityMapTask {
     pub max_in_flight: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildStartOutboxMessage {
+    pub command_id: CommandId,
+    pub workflow_type: WorkflowType,
+    pub workflow_id: crate::WorkflowId,
+    pub task_queue: TaskQueue,
+    pub input: PayloadRef,
+    pub parent_close_policy: ParentClosePolicy,
+}
+
+impl ChildStartOutboxMessage {
+    pub fn from_requested(requested: &ChildWorkflowStartRequested) -> Self {
+        Self {
+            command_id: requested.command_id.clone(),
+            workflow_type: requested.workflow_type.clone(),
+            workflow_id: requested.workflow_id.clone(),
+            task_queue: requested.task_queue.clone(),
+            input: requested.input.clone(),
+            parent_close_policy: requested.parent_close_policy,
+        }
+    }
+}
+
 pub fn activity_fingerprint(
     activity_name: ActivityName,
     input_digest: String,
@@ -298,6 +380,24 @@ pub fn activity_map_fingerprint(
         input_digest: Some(input_manifest_digest),
         options_digest: format!(
             "{options_digest}:result={result_manifest_name}:max={max_in_flight}"
+        ),
+    }
+}
+
+pub fn child_workflow_fingerprint(
+    workflow_type: WorkflowType,
+    workflow_id: crate::WorkflowId,
+    input_digest: String,
+    task_queue: TaskQueue,
+    parent_close_policy: ParentClosePolicy,
+) -> CommandFingerprint {
+    CommandFingerprint {
+        kind: CommandKind::ChildWorkflow,
+        name: format!("{}@{}", workflow_type.name, workflow_type.version),
+        input_digest: Some(input_digest),
+        options_digest: format!(
+            "workflow_id={}:task_queue={}:parent_close_policy={:?}",
+            workflow_id.0, task_queue.0, parent_close_policy
         ),
     }
 }

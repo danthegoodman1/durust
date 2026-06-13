@@ -1,10 +1,12 @@
 use crate::{
     Activity, ActivityMapCompleted, ActivityMapScheduled, ActivityMapTask, ActivityOptions,
-    ActivityScheduled, ActivityTask, CommandId, CommandSeq, Error, HistoryEvent, HistoryEventData,
-    NewHistoryEvent, PayloadRef, Result, RunId, SelectWinner, SignalConsumed, SignalId, SignalName,
-    TaskQueue, TimerFired, TimerStarted, TimestampMs, WaitId, WaitKind, WaitRecord,
-    activity_fingerprint, activity_map_fingerprint, command_id, encode_activity_map_input_manifest,
-    payload_digest, signal_fingerprint, timer_fingerprint,
+    ActivityScheduled, ActivityTask, ChildStartOutboxMessage, ChildWorkflowCompleted,
+    ChildWorkflowStarted, CommandId, CommandSeq, Error, HistoryEvent, HistoryEventData,
+    NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId, SelectWinner, SignalConsumed,
+    SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs, WaitId, WaitKind,
+    WaitRecord, Workflow, WorkflowId, activity_fingerprint, activity_map_fingerprint,
+    child_workflow_fingerprint, command_id, encode_activity_map_input_manifest, payload_digest,
+    signal_fingerprint, timer_fingerprint,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -48,6 +50,7 @@ fn with_context<T>(f: impl FnOnce(&mut RuntimeContext) -> T) -> T {
 #[derive(Debug)]
 pub(crate) struct RuntimeContext {
     run_id: RunId,
+    worker_workflow_task_queue: TaskQueue,
     worker_activity_task_queue: TaskQueue,
     default_activity_options: ActivityOptions,
     now: TimestampMs,
@@ -62,6 +65,10 @@ pub(crate) struct RuntimeContext {
     failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
     map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
     map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_starts: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)>,
+    child_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)>,
+    child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
     timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     signal_requests: Vec<LiveSignalRequest>,
@@ -69,6 +76,7 @@ pub(crate) struct RuntimeContext {
     upsert_waits: Vec<WaitRecord>,
     schedule_activities: Vec<ActivityTask>,
     schedule_activity_maps: Vec<ActivityMapTask>,
+    start_child_workflows: Vec<ChildStartOutboxMessage>,
     consume_signals: Vec<SignalId>,
     delete_waits: Vec<WaitId>,
     cancel_commands: Vec<CommandId>,
@@ -93,6 +101,7 @@ pub(crate) struct RuntimeCommitParts {
     pub upsert_waits: Vec<WaitRecord>,
     pub schedule_activities: Vec<ActivityTask>,
     pub schedule_activity_maps: Vec<ActivityMapTask>,
+    pub start_child_workflows: Vec<ChildStartOutboxMessage>,
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
     pub cancel_commands: Vec<CommandId>,
@@ -118,6 +127,7 @@ impl ActivityTerminalError {
 impl RuntimeContext {
     pub(crate) fn new(
         run_id: RunId,
+        worker_workflow_task_queue: TaskQueue,
         default_activity_task_queue: TaskQueue,
         now: TimestampMs,
         replay_events: Vec<HistoryEvent>,
@@ -130,10 +140,15 @@ impl RuntimeContext {
         let failures = collect_failures(&replay_events);
         let map_completions = collect_map_completions(&replay_events);
         let map_failures = collect_map_failures(&replay_events);
+        let child_starts = collect_child_starts(&replay_events);
+        let child_completions = collect_child_completions(&replay_events);
+        let child_failures = collect_child_failures(&replay_events);
+        let child_cancellations = collect_child_cancellations(&replay_events);
         let timers = collect_timers(&replay_events);
 
         Self {
             run_id,
+            worker_workflow_task_queue,
             worker_activity_task_queue: default_activity_task_queue,
             default_activity_options,
             now,
@@ -148,6 +163,10 @@ impl RuntimeContext {
             failures,
             map_completions,
             map_failures,
+            child_starts,
+            child_completions,
+            child_failures,
+            child_cancellations,
             timers,
             live_signals: BTreeMap::new(),
             signal_requests: Vec::new(),
@@ -155,6 +174,7 @@ impl RuntimeContext {
             upsert_waits: Vec::new(),
             schedule_activities: Vec::new(),
             schedule_activity_maps: Vec::new(),
+            start_child_workflows: Vec::new(),
             consume_signals: Vec::new(),
             delete_waits: Vec::new(),
             cancel_commands: Vec::new(),
@@ -168,6 +188,7 @@ impl RuntimeContext {
             upsert_waits: self.upsert_waits,
             schedule_activities: self.schedule_activities,
             schedule_activity_maps: self.schedule_activity_maps,
+            start_child_workflows: self.start_child_workflows,
             consume_signals: self.consume_signals,
             delete_waits: self.delete_waits,
             cancel_commands: self.cancel_commands,
@@ -203,6 +224,12 @@ impl RuntimeContext {
         self.map_completions
             .extend(collect_map_completions(&events));
         self.map_failures.extend(collect_map_failures(&events));
+        self.child_starts.extend(collect_child_starts(&events));
+        self.child_completions
+            .extend(collect_child_completions(&events));
+        self.child_failures.extend(collect_child_failures(&events));
+        self.child_cancellations
+            .extend(collect_child_cancellations(&events));
         self.timers.extend(collect_timers(&events));
         self.replay_events.extend(events);
         self.last_loaded_event_id = last_loaded_event_id;
@@ -380,6 +407,82 @@ impl RuntimeContext {
             })
     }
 
+    fn take_child_started(&mut self, command_id: &CommandId) -> Option<ChildWorkflowStarted> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            if let HistoryEventData::ChildWorkflowStarted(started) = event.data {
+                if started.command_id.seq == command_id.seq {
+                    self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
+                    self.child_starts.remove(&command_id.seq);
+                    return Some(started);
+                }
+            }
+        }
+        self.child_starts
+            .remove(&command_id.seq)
+            .map(|(event_id, started)| {
+                self.record_ready_event_id(event_id);
+                started
+            })
+    }
+
+    fn take_child_completion(&mut self, command_id: &CommandId) -> Option<ChildWorkflowCompleted> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            if let HistoryEventData::ChildWorkflowCompleted(completed) = event.data {
+                if completed.command_id.seq == command_id.seq {
+                    self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
+                    self.child_completions.remove(&command_id.seq);
+                    return Some(completed);
+                }
+            }
+        }
+        self.child_completions
+            .remove(&command_id.seq)
+            .map(|(event_id, completed)| {
+                self.record_ready_event_id(event_id);
+                completed
+            })
+    }
+
+    fn take_child_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            if let HistoryEventData::ChildWorkflowFailed(failed) = event.data {
+                if failed.command_id.seq == command_id.seq {
+                    self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
+                    self.child_failures.remove(&command_id.seq);
+                    return Some(failed.failure);
+                }
+            }
+        }
+        self.child_failures
+            .remove(&command_id.seq)
+            .map(|(event_id, failure)| {
+                self.record_ready_event_id(event_id);
+                failure
+            })
+    }
+
+    fn take_child_cancellation(&mut self, command_id: &CommandId) -> Option<String> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            if let HistoryEventData::ChildWorkflowCancelled(cancelled) = event.data {
+                if cancelled.command_id.seq == command_id.seq {
+                    self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
+                    self.child_cancellations.remove(&command_id.seq);
+                    return Some(cancelled.reason);
+                }
+            }
+        }
+        self.child_cancellations
+            .remove(&command_id.seq)
+            .map(|(event_id, reason)| {
+                self.record_ready_event_id(event_id);
+                reason
+            })
+    }
+
     fn take_live_signal(&mut self, command_id: &CommandId) -> Option<SignalInboxRecordForRuntime> {
         self.live_signals.remove(&command_id.seq)
     }
@@ -551,6 +654,10 @@ fn select_can_ignore_losing_ready_event(data: &HistoryEventData) -> bool {
             | HistoryEventData::ActivityTimedOut(_)
             | HistoryEventData::ActivityMapCompleted(_)
             | HistoryEventData::ActivityMapFailed(_)
+            | HistoryEventData::ChildWorkflowStarted(_)
+            | HistoryEventData::ChildWorkflowCompleted(_)
+            | HistoryEventData::ChildWorkflowFailed(_)
+            | HistoryEventData::ChildWorkflowCancelled(_)
             | HistoryEventData::TimerFired(_)
             | HistoryEventData::SignalConsumed(_)
     )
@@ -1024,6 +1131,316 @@ impl Future for ActivityMapResultFuture {
 
 impl DurableJoinBranch for ActivityMapResultFuture {}
 
+pub fn child_workflow<W>(input: W::Input) -> ChildWorkflowBuilder<W>
+where
+    W: Workflow,
+{
+    ChildWorkflowBuilder {
+        input: Some(input),
+        workflow_id: None,
+        task_queue: None,
+        parent_close_policy: ParentClosePolicy::Cancel,
+        _workflow: std::marker::PhantomData,
+    }
+}
+
+pub struct ChildWorkflowBuilder<W>
+where
+    W: Workflow,
+{
+    input: Option<W::Input>,
+    workflow_id: Option<WorkflowId>,
+    task_queue: Option<TaskQueue>,
+    parent_close_policy: ParentClosePolicy,
+    _workflow: std::marker::PhantomData<W>,
+}
+
+impl<W> ChildWorkflowBuilder<W>
+where
+    W: Workflow,
+{
+    pub fn workflow_id(mut self, workflow_id: impl Into<String>) -> Self {
+        self.workflow_id = Some(WorkflowId::new(workflow_id));
+        self
+    }
+
+    pub fn task_queue(mut self, task_queue: impl Into<String>) -> Self {
+        self.task_queue = Some(TaskQueue::new(task_queue));
+        self
+    }
+
+    pub fn parent_close_policy(mut self, parent_close_policy: ParentClosePolicy) -> Self {
+        self.parent_close_policy = parent_close_policy;
+        self
+    }
+
+    pub fn spawn(self) -> ChildWorkflowSpawnFuture<W> {
+        ChildWorkflowSpawnFuture {
+            input: self.input,
+            workflow_id: self.workflow_id,
+            task_queue: self.task_queue,
+            parent_close_policy: self.parent_close_policy,
+            state: ChildWorkflowSpawnState::Init,
+            _workflow: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct ChildWorkflowSpawnFuture<W>
+where
+    W: Workflow,
+{
+    input: Option<W::Input>,
+    workflow_id: Option<WorkflowId>,
+    task_queue: Option<TaskQueue>,
+    parent_close_policy: ParentClosePolicy,
+    state: ChildWorkflowSpawnState,
+    _workflow: std::marker::PhantomData<W>,
+}
+
+impl<W> Unpin for ChildWorkflowSpawnFuture<W> where W: Workflow {}
+
+#[derive(Debug)]
+enum ChildWorkflowSpawnState {
+    Init,
+    Waiting(CommandId, WorkflowId),
+    Done,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChildWorkflowHandle<W>
+where
+    W: Workflow,
+{
+    command_id: CommandId,
+    workflow_id: WorkflowId,
+    run_id: RunId,
+    _workflow: std::marker::PhantomData<W>,
+}
+
+impl<W> ChildWorkflowHandle<W>
+where
+    W: Workflow,
+{
+    pub fn workflow_id(&self) -> &WorkflowId {
+        &self.workflow_id
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn result(&self) -> ChildWorkflowResultFuture<W> {
+        ChildWorkflowResultFuture {
+            command_id: self.command_id.clone(),
+            done: false,
+            _workflow: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<W> Future for ChildWorkflowSpawnFuture<W>
+where
+    W: Workflow,
+{
+    type Output = Result<ChildWorkflowHandle<W>>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_context(|runtime| match &self.state {
+            ChildWorkflowSpawnState::Init => self.poll_init(runtime),
+            ChildWorkflowSpawnState::Waiting(command_id, workflow_id) => {
+                let command_id = command_id.clone();
+                let workflow_id = workflow_id.clone();
+                self.poll_waiting(runtime, &command_id, workflow_id)
+            }
+            ChildWorkflowSpawnState::Done => Poll::Ready(Err(Error::Nondeterminism(
+                "child workflow spawn future polled after completion".to_owned(),
+            ))),
+        })
+    }
+}
+
+impl<W> DurableSelectBranch for ChildWorkflowSpawnFuture<W>
+where
+    W: Workflow,
+{
+    fn __durust_cancel_branch(&self) {
+        if let ChildWorkflowSpawnState::Waiting(command_id, _) = &self.state {
+            with_context(|runtime| runtime.cancel_command(command_id.clone()));
+        }
+    }
+}
+
+impl<W> DurableJoinBranch for ChildWorkflowSpawnFuture<W> where W: Workflow {}
+
+impl<W> ChildWorkflowSpawnFuture<W>
+where
+    W: Workflow,
+{
+    fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowHandle<W>>> {
+        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+            runtime.request_more_history_if_available();
+            return Poll::Pending;
+        }
+
+        let command_id = runtime.next_command_id();
+        let Some(workflow_id) = self.workflow_id.clone() else {
+            return Poll::Ready(Err(Error::Backend(
+                "child workflow requires workflow_id".to_owned(),
+            )));
+        };
+        let task_queue = self
+            .task_queue
+            .clone()
+            .unwrap_or_else(|| runtime.worker_workflow_task_queue.clone());
+        let input = self
+            .input
+            .as_ref()
+            .expect("child workflow input exists before schedule");
+        let input_ref = crate::encode_payload(input)?;
+        let fingerprint = child_workflow_fingerprint(
+            W::workflow_type(),
+            workflow_id.clone(),
+            payload_digest(&input_ref),
+            task_queue.clone(),
+            self.parent_close_policy,
+        );
+
+        if let Some(event) = runtime.peek_replay_event().cloned() {
+            let HistoryEventData::ChildWorkflowStartRequested(requested) = event.data else {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected ChildWorkflowStartRequested for command {}, found {:?}",
+                    command_id.seq.0, event.event_type
+                ))));
+            };
+            if requested.command_id.seq != command_id.seq {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected command seq {}, found {}",
+                    command_id.seq.0, requested.command_id.seq.0
+                ))));
+            }
+            if requested.fingerprint != fingerprint {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "child workflow command fingerprint changed for command {}",
+                    command_id.seq.0
+                ))));
+            }
+            runtime.advance_replay();
+            if let Some(started) = runtime.take_child_started(&command_id) {
+                self.state = ChildWorkflowSpawnState::Done;
+                return Poll::Ready(Ok(ChildWorkflowHandle {
+                    command_id,
+                    workflow_id: started.workflow_id,
+                    run_id: started.run_id,
+                    _workflow: std::marker::PhantomData,
+                }));
+            }
+            if let Some(failure) = runtime.take_child_failure(&command_id) {
+                self.state = ChildWorkflowSpawnState::Done;
+                return Poll::Ready(Err(Error::ChildWorkflowFailed(failure)));
+            }
+            self.state = ChildWorkflowSpawnState::Waiting(command_id, workflow_id);
+            runtime.request_more_history_if_available();
+            return Poll::Pending;
+        }
+
+        let requested = crate::ChildWorkflowStartRequested {
+            command_id: command_id.clone(),
+            workflow_type: W::workflow_type(),
+            workflow_id: workflow_id.clone(),
+            task_queue,
+            input: input_ref,
+            parent_close_policy: self.parent_close_policy,
+            fingerprint,
+        };
+        runtime.append_events.push(NewHistoryEvent::new(
+            HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+        ));
+        runtime
+            .start_child_workflows
+            .push(ChildStartOutboxMessage::from_requested(&requested));
+        self.input = None;
+        self.state = ChildWorkflowSpawnState::Waiting(command_id, workflow_id);
+        Poll::Pending
+    }
+
+    fn poll_waiting(
+        &mut self,
+        runtime: &mut RuntimeContext,
+        command_id: &CommandId,
+        workflow_id: WorkflowId,
+    ) -> Poll<Result<ChildWorkflowHandle<W>>> {
+        if let Some(started) = runtime.take_child_started(command_id) {
+            self.state = ChildWorkflowSpawnState::Done;
+            return Poll::Ready(Ok(ChildWorkflowHandle {
+                command_id: command_id.clone(),
+                workflow_id: started.workflow_id,
+                run_id: started.run_id,
+                _workflow: std::marker::PhantomData,
+            }));
+        }
+        if let Some(failure) = runtime.take_child_failure(command_id) {
+            self.state = ChildWorkflowSpawnState::Done;
+            return Poll::Ready(Err(Error::ChildWorkflowFailed(failure)));
+        }
+
+        self.state = ChildWorkflowSpawnState::Waiting(command_id.clone(), workflow_id);
+        runtime.request_more_history_if_available();
+        Poll::Pending
+    }
+}
+
+pub struct ChildWorkflowResultFuture<W>
+where
+    W: Workflow,
+{
+    command_id: CommandId,
+    done: bool,
+    _workflow: std::marker::PhantomData<W>,
+}
+
+impl<W> Unpin for ChildWorkflowResultFuture<W> where W: Workflow {}
+
+impl<W> Future for ChildWorkflowResultFuture<W>
+where
+    W: Workflow,
+{
+    type Output = Result<W::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_context(|runtime| {
+            if self.done {
+                return Poll::Ready(Err(Error::Nondeterminism(
+                    "child workflow result future polled after completion".to_owned(),
+                )));
+            }
+            if let Some(completed) = runtime.take_child_completion(&self.command_id) {
+                self.done = true;
+                return Poll::Ready(crate::decode_payload::<W::Output>(&completed.result));
+            }
+            if let Some(failure) = runtime.take_child_failure(&self.command_id) {
+                self.done = true;
+                return Poll::Ready(Err(Error::ChildWorkflowFailed(failure)));
+            }
+            if let Some(reason) = runtime.take_child_cancellation(&self.command_id) {
+                self.done = true;
+                return Poll::Ready(Err(Error::ChildWorkflowCancelled(reason)));
+            }
+            runtime.request_more_history_if_available();
+            Poll::Pending
+        })
+    }
+}
+
+impl<W> DurableSelectBranch for ChildWorkflowResultFuture<W>
+where
+    W: Workflow,
+{
+    fn __durust_cancel_branch(&self) {}
+}
+
+impl<W> DurableJoinBranch for ChildWorkflowResultFuture<W> where W: Workflow {}
+
 pub fn sleep(duration: Duration) -> TimerFuture {
     TimerFuture {
         timer: TimerSpec::After(duration),
@@ -1397,6 +1814,65 @@ fn collect_map_failures(
         .collect()
 }
 
+fn collect_child_starts(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStarted(started) => {
+                Some((started.command_id.seq, (event.event_id, started.clone())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_child_completions(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowCompleted(completed) => Some((
+                completed.command_id.seq,
+                (event.event_id, completed.clone()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_child_failures(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowFailed(failed) => Some((
+                failed.command_id.seq,
+                (event.event_id, failed.failure.clone()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_child_cancellations(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, String)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => Some((
+                cancelled.command_id.seq,
+                (event.event_id, cancelled.reason.clone()),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
 fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, TimerFired)> {
     events
         .iter()
@@ -1434,6 +1910,19 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::ActivityCompleted(completed) => completed.result.encoded_len(),
         HistoryEventData::ActivityFailed(failed) => event_failure_len(&failed.failure),
         HistoryEventData::ActivityTimedOut(timed_out) => timed_out.message.len(),
+        HistoryEventData::ChildWorkflowStartRequested(requested) => {
+            requested.workflow_type.name.len()
+                + requested.workflow_id.0.len()
+                + requested.task_queue.0.len()
+                + requested.input.encoded_len()
+                + requested.fingerprint.options_digest.len()
+        }
+        HistoryEventData::ChildWorkflowStarted(started) => {
+            started.workflow_id.0.len() + started.run_id.0.len()
+        }
+        HistoryEventData::ChildWorkflowCompleted(completed) => completed.result.encoded_len(),
+        HistoryEventData::ChildWorkflowFailed(failed) => event_failure_len(&failed.failure),
+        HistoryEventData::ChildWorkflowCancelled(cancelled) => cancelled.reason.len(),
         HistoryEventData::TimerStarted(_) | HistoryEventData::TimerFired(_) => 16,
         HistoryEventData::SignalConsumed(signal) => signal.payload.encoded_len(),
         HistoryEventData::SelectWinner(winner) => winner.branches_digest.len() + 32,

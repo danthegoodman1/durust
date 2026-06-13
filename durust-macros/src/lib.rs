@@ -110,6 +110,15 @@ pub fn call_activity(input: TokenStream) -> TokenStream {
 }
 
 #[proc_macro]
+pub fn child(input: TokenStream) -> TokenStream {
+    let call = parse_macro_input!(input as ExprCall);
+    match expand_child(call) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[proc_macro]
 pub fn join(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as JoinInput);
     match expand_join(input) {
@@ -323,6 +332,20 @@ fn expand_call_activity(call: ExprCall) -> syn::Result<proc_macro2::TokenStream>
     let input = call.args.first().expect("checked arg count");
     Ok(quote! {
         ::durust::activity_call::<#activity>(#input)
+    })
+}
+
+fn expand_child(call: ExprCall) -> syn::Result<proc_macro2::TokenStream> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            call,
+            "durust::child! expects exactly one workflow input",
+        ));
+    }
+    let workflow = call.func;
+    let input = call.args.first().expect("checked arg count");
+    Ok(quote! {
+        ::durust::child_workflow::<#workflow>(#input)
     })
 }
 
@@ -823,10 +846,17 @@ impl<'ast> Visit<'ast> for AwaitLint {
         }
 
         let base = node.base.to_token_stream().to_string();
+        let result_method = matches!(
+            node.base.as_ref(),
+            Expr::MethodCall(method) if method.method == "result"
+        );
         let allowed = base.contains("durust :: activity_call")
             || base.contains("durust :: call_activity")
+            || base.contains("durust :: child")
+            || base.contains("durust :: child_workflow")
             || base.contains("durust :: activity_map")
             || base.contains("result_manifest")
+            || result_method
             || base.contains("durust :: sleep")
             || base.contains("durust :: sleep_until")
             || base.contains("durust :: signal")

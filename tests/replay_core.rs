@@ -64,6 +64,77 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
     Ok(doubled + 1)
 }
 
+#[durust::workflow(name = "tests.child-double", version = 1)]
+async fn child_double_workflow(input: u64) -> durust::Result<u64> {
+    Ok(input * 2)
+}
+
+#[durust::workflow(name = "tests.child-spawn-wait", version = 1)]
+async fn child_spawn_wait_workflow(input: u64) -> durust::Result<u64> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/child-spawn-wait/{input}"))
+        .spawn()
+        .await?;
+    child.result().await
+}
+
+#[durust::workflow(name = "tests.child-spawn-abandon", version = 1)]
+async fn child_spawn_abandon_workflow(input: u64) -> durust::Result<String> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/child-spawn-abandon/{input}"))
+        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .spawn()
+        .await?;
+    Ok(child.run_id().0.clone())
+}
+
+#[durust::workflow(name = "tests.child-spawn-cancel", version = 1)]
+async fn child_spawn_cancel_workflow(input: u64) -> durust::Result<String> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/child-spawn-cancel/{input}"))
+        .parent_close_policy(durust::ParentClosePolicy::Cancel)
+        .spawn()
+        .await?;
+    Ok(child.run_id().0.clone())
+}
+
+#[durust::workflow(name = "tests.select-child-result", version = 1)]
+async fn select_child_result_workflow(input: u64) -> durust::Result<String> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/select-child-result/{input}"))
+        .spawn()
+        .await?;
+    let outcome = durust::select! {
+        result = child.result() => {
+            format!("child:{}", result?)
+        }
+        timer = durust::sleep(Duration::from_secs(60)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-timer-before-child-result", version = 1)]
+async fn select_timer_before_child_result_workflow(input: u64) -> durust::Result<String> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/select-timer-before-child-result/{input}"))
+        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .spawn()
+        .await?;
+    let outcome = durust::select! {
+        result = child.result() => {
+            format!("child:{}", result?)
+        }
+        timer = durust::sleep(Duration::ZERO) => {
+            timer?;
+            format!("timer:{}", child.run_id().0)
+        }
+    };
+    Ok(outcome)
+}
+
 #[durust::workflow(name = "tests.join-two-activities", version = 1)]
 async fn join_two_activities(input: u64) -> durust::Result<u64> {
     let (left, right) = durust::join!(
@@ -372,6 +443,237 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
             panic!("workflow did not complete");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 41);
+    });
+}
+
+#[test]
+fn child_workflow_spawn_and_wait_completes_from_public_api() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_spawn_wait_workflow>("wf/child-wait-parent", "workflows", 11)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_spawn_wait_workflow)
+            .register_workflow(child_double_workflow)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert!(stats.child_workflow_starts_dispatched >= 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(history.iter().any(|event| {
+            matches!(event.data, HistoryEventData::ChildWorkflowStartRequested(_))
+        }));
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowStarted(_)))
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| { matches!(event.data, HistoryEventData::ChildWorkflowCompleted(_)) })
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("parent history").data
+        else {
+            panic!("parent workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 22);
+    });
+}
+
+#[test]
+fn child_workflow_abandon_lets_child_continue_after_parent_exit() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_spawn_abandon_workflow>(
+                "wf/child-abandon-parent",
+                "workflows",
+                12,
+            )
+            .await
+            .unwrap();
+        let mut parent_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_spawn_abandon_workflow)
+            .build();
+        parent_worker.run_until_idle().await.unwrap();
+
+        let parent_history = stream_all(&backend, &run_id).await;
+        let child_run_id = parent_history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ChildWorkflowStarted(started) => Some(started.run_id.clone()),
+                _ => None,
+            })
+            .expect("child started");
+        assert!(matches!(
+            parent_history.last().expect("parent terminal").data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+
+        let mut child_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_double_workflow)
+            .build();
+        assert!(child_worker.run_workflow_once().await.unwrap());
+        let child_history = stream_all(&backend, &child_run_id).await;
+        assert!(matches!(
+            child_history.last().expect("child terminal").data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+    });
+}
+
+#[test]
+fn child_workflow_cancel_policy_cancels_child_on_parent_exit() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_spawn_cancel_workflow>(
+                "wf/child-cancel-parent",
+                "workflows",
+                13,
+            )
+            .await
+            .unwrap();
+        let mut parent_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_spawn_cancel_workflow)
+            .build();
+        parent_worker.run_until_idle().await.unwrap();
+
+        let parent_history = stream_all(&backend, &run_id).await;
+        let child_run_id = parent_history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ChildWorkflowStarted(started) => Some(started.run_id.clone()),
+                _ => None,
+            })
+            .expect("child started");
+        let child_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("cancelled-child-worker"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("tests.child-double", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(child_claim.is_none());
+        let child_history = stream_all(&backend, &child_run_id).await;
+        assert!(
+            child_history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowCancelled { .. }))
+        );
+    });
+}
+
+#[test]
+fn child_workflow_result_can_win_select() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_child_result_workflow>(
+                "wf/select-child-result-parent",
+                "workflows",
+                14,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_child_result_workflow)
+            .register_workflow(child_double_workflow)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert!(stats.child_workflow_starts_dispatched >= 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowCompleted(_)))
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::TimerFired(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("parent terminal").data
+        else {
+            panic!("parent workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "child:28"
+        );
+    });
+}
+
+#[test]
+fn losing_child_workflow_result_select_branch_does_not_cancel_child() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_timer_before_child_result_workflow>(
+                "wf/select-child-result-loses-parent",
+                "workflows",
+                15,
+            )
+            .await
+            .unwrap();
+        let mut parent_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_timer_before_child_result_workflow)
+            .build();
+
+        let stats = parent_worker.run_until_idle().await.unwrap();
+        assert!(stats.child_workflow_starts_dispatched >= 1);
+
+        let parent_history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &parent_history.last().expect("parent terminal").data
+        else {
+            panic!("parent workflow did not complete");
+        };
+        let result = durust::decode_payload::<String>(result).unwrap();
+        let child_run_id = result
+            .strip_prefix("timer:")
+            .map(durust::RunId::new)
+            .expect("timer branch should win before child is claimed");
+        assert!(
+            !parent_history
+                .iter()
+                .any(|event| { matches!(event.data, HistoryEventData::ChildWorkflowCancelled(_)) })
+        );
+
+        let mut child_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_double_workflow)
+            .build();
+        assert!(child_worker.run_workflow_once().await.unwrap());
+        let child_history = stream_all(&backend, &child_run_id).await;
+        assert!(matches!(
+            child_history.last().expect("child terminal").data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
     });
 }
 
@@ -2151,6 +2453,52 @@ fn sqlite_activity_map_recovers_after_close_and_reopen() {
 }
 
 #[test]
+fn sqlite_child_outbox_recovers_after_close_and_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("durust-child.sqlite3");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_spawn_wait_workflow>(
+                "wf/sqlite-child-recovery",
+                "workflows",
+                14,
+            )
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .worker_id("sqlite-child-before-crash")
+            .workflow_task_queue("workflows")
+            .register_workflow(child_spawn_wait_workflow)
+            .register_workflow(child_double_workflow)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        drop(first_worker);
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&db_path).unwrap();
+        let mut recovered_worker = Worker::builder(reopened.clone())
+            .worker_id("sqlite-child-after-crash")
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(child_spawn_wait_workflow)
+            .register_workflow(child_double_workflow)
+            .build();
+        let stats = recovered_worker.run_until_idle().await.unwrap();
+        assert!(stats.child_workflow_starts_dispatched >= 1);
+
+        let history = stream_all(&reopened, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("parent terminal").data
+        else {
+            panic!("SQLite child workflow did not complete after reopen");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 28);
+    });
+}
+
+#[test]
 fn sqlite_worker_loop_runs_until_idle() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -2339,6 +2687,13 @@ impl DurableBackend for RecordingBackend {
         req: durust::FailActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
         self.inner.fail_activity(req)
+    }
+
+    fn dispatch_child_workflow_starts(
+        &self,
+        req: durust::DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
+        self.inner.dispatch_child_workflow_starts(req)
     }
 
     fn query_projection(

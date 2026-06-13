@@ -1,12 +1,14 @@
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapItem, ActivityMapTask,
     ActivityTask, ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest,
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask,
-    CommandId, CommandSeq, CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
-    DurableBackend, Error, EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome,
-    FireDueTimersRequest, HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType,
-    PayloadRef, ReadSignalInboxRequest, Result, RunId, SignalInboxRecord, SignalWorkflowOutcome,
-    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    ChildStartOutboxMessage, ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask,
+    ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome, CompleteActivityOutcome,
+    CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
+    DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
+    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
+    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadRef, ReadSignalInboxRequest,
+    Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
+    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
     TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowId, WorkflowTaskClaim,
     WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at,
     encode_activity_map_result_manifest, event_payload_len, is_terminal,
@@ -67,8 +69,9 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "insert into workflow_instances
                  (namespace, workflow_id, run_id, workflow_name, workflow_version, task_queue,
-                  current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, null, 0)",
+                  current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal,
+                  parent_run_id, parent_command_seq, parent_close_policy)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, null, 0, null, null, null)",
                 params![
                     req.namespace.0,
                     req.workflow_id.0,
@@ -122,12 +125,8 @@ impl DurableBackend for SqliteBackend {
             }
 
             let event_id = EventId(tail).next();
-            insert_history_event(
-                &tx,
-                &run_id,
-                event_id,
-                HistoryEventData::WorkflowCancelled { reason: req.reason },
-            )?;
+            let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
+            insert_history_event(&tx, &run_id, event_id, terminal_event.clone())?;
             cleanup_run_operational_state(&tx, &run_id)?;
             tx.execute(
                 "update workflow_instances
@@ -140,6 +139,7 @@ impl DurableBackend for SqliteBackend {
                 params![event_id.0, run_id.0],
             )
             .map_err(sqlite_error)?;
+            handle_terminal_run(&tx, &run_id, &terminal_event)?;
             tx.commit().map_err(sqlite_error)?;
             Ok(CancelWorkflowOutcome::Cancelled { run_id, event_id })
         })();
@@ -367,9 +367,13 @@ impl DurableBackend for SqliteBackend {
 
             let mut next_event_id = EventId(current_tail);
             let mut became_terminal = false;
+            let mut terminal_event = None;
             for event in batch.append_events {
                 next_event_id = next_event_id.next();
                 became_terminal |= is_terminal(&event.data);
+                if is_terminal(&event.data) {
+                    terminal_event = Some(event.data.clone());
+                }
                 insert_history_event(&tx, &claim.run_id, next_event_id, event.data)?;
             }
             for task in batch.schedule_activities {
@@ -396,6 +400,9 @@ impl DurableBackend for SqliteBackend {
             for map_task in batch.schedule_activity_maps {
                 insert_activity_map(&tx, namespace.as_str(), &map_task)?;
                 materialize_activity_map_items(&tx, &map_task.map_command_id)?;
+            }
+            for message in batch.start_child_workflows {
+                insert_child_outbox(&tx, namespace.as_str(), &message)?;
             }
             for wait in batch.upsert_waits {
                 tx.execute(
@@ -460,6 +467,9 @@ impl DurableBackend for SqliteBackend {
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
                 cleanup_run_operational_state(&tx, &claim.run_id)?;
+                if let Some(event) = terminal_event {
+                    handle_terminal_run(&tx, &claim.run_id, &event)?;
+                }
             }
             let ready_reason = if !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)? {
                 Some(reason_to_str(&WorkflowTaskReason::SignalReceived))
@@ -1094,6 +1104,43 @@ impl DurableBackend for SqliteBackend {
         Box::pin(ready(result))
     }
 
+    fn dispatch_child_workflow_starts(
+        &self,
+        req: DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>> {
+        let result = (|| {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            let limit = req.limit.max(1);
+            let outbox_ids = {
+                let mut stmt = tx
+                    .prepare(
+                        "select outbox_id
+                         from child_outbox
+                         where namespace = ?1 and dispatched = 0
+                         order by outbox_id asc
+                         limit ?2",
+                    )
+                    .map_err(sqlite_error)?;
+                let rows = stmt
+                    .query_map(params![req.namespace.0, limit as i64], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(sqlite_error)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sqlite_error)?
+            };
+            let mut dispatched = 0usize;
+            for outbox_id in outbox_ids {
+                dispatch_child_start(&tx, &outbox_id)?;
+                dispatched += 1;
+            }
+            tx.commit().map_err(sqlite_error)?;
+            Ok(DispatchChildWorkflowStartsOutcome { dispatched })
+        })();
+        Box::pin(ready(result))
+    }
+
     fn query_projection(
         &self,
         req: crate::QueryProjectionRequest,
@@ -1152,6 +1199,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ready_at_ms integer not null default 0,
             workflow_claim_token integer,
             terminal integer not null,
+            parent_run_id text,
+            parent_command_seq integer,
+            parent_close_policy text,
             unique(namespace, workflow_id)
         );
 
@@ -1193,6 +1243,21 @@ fn init_schema(conn: &Connection) -> Result<()> {
             result blob not null,
             primary key(map_command_id, item_ordinal)
         );
+
+        create table if not exists child_outbox (
+            outbox_id text primary key,
+            namespace text not null,
+            parent_run_id text not null,
+            command_seq integer not null,
+            child_workflow_id text not null,
+            parent_close_policy text not null default 'cancel',
+            message blob not null,
+            dispatched integer not null,
+            child_run_id text
+        );
+
+        create index if not exists idx_child_outbox_dispatch
+            on child_outbox(namespace, dispatched, outbox_id);
 
         create table if not exists active_waits (
             wait_id text primary key,
@@ -1238,6 +1303,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "workflow_instances",
         "ready_at_ms",
         "integer not null default 0",
+    )?;
+    ensure_column(conn, "workflow_instances", "parent_run_id", "text")?;
+    ensure_column(conn, "workflow_instances", "parent_command_seq", "integer")?;
+    ensure_column(conn, "workflow_instances", "parent_close_policy", "text")?;
+    ensure_column(
+        conn,
+        "child_outbox",
+        "parent_close_policy",
+        "text not null default 'cancel'",
     )?;
     ensure_column(conn, "activity_tasks", "timeout_at_ms", "integer")
 }
@@ -1339,6 +1413,176 @@ fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result
     Ok(())
 }
 
+fn handle_terminal_run(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    terminal_event: &HistoryEventData,
+) -> Result<()> {
+    notify_parent_of_child_terminal(tx, run_id, terminal_event)?;
+    cancel_children_for_parent(tx, run_id)?;
+    Ok(())
+}
+
+fn notify_parent_of_child_terminal(
+    tx: &Transaction<'_>,
+    child_run_id: &RunId,
+    terminal_event: &HistoryEventData,
+) -> Result<()> {
+    let Some((parent_run_id, parent_command_seq)) = tx
+        .query_row(
+            "select parent_run_id, parent_command_seq
+             from workflow_instances
+             where run_id = ?1",
+            params![child_run_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .and_then(|(run_id, seq)| Some((RunId::new(run_id?), CommandSeq(seq?))))
+    else {
+        return Ok(());
+    };
+    let command_id = CommandId {
+        run_id: parent_run_id.clone(),
+        seq: parent_command_seq,
+    };
+    if child_terminal_event_exists(tx, &command_id)? {
+        return Ok(());
+    }
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &parent_run_id)? else {
+        return Ok(());
+    };
+    if terminal {
+        return Ok(());
+    }
+    let event_id = EventId(tail).next();
+    let (data, reason) = match terminal_event {
+        HistoryEventData::WorkflowCompleted { result } => (
+            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
+                command_id,
+                result: result.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCompleted,
+        ),
+        HistoryEventData::WorkflowFailed { failure } => (
+            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+                command_id,
+                failure: failure.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowFailed,
+        ),
+        HistoryEventData::WorkflowCancelled { reason } => (
+            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
+                command_id,
+                reason: reason.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCancelled,
+        ),
+        _ => return Ok(()),
+    };
+    insert_history_event(tx, &parent_run_id, event_id, data)?;
+    set_workflow_ready(tx, &parent_run_id, event_id, reason)
+}
+
+fn child_terminal_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
+    let mut stmt = tx
+        .prepare(
+            "select data from history_events
+             where run_id = ?1
+               and event_type in (
+                 'child_workflow_completed',
+                 'child_workflow_failed',
+                 'child_workflow_cancelled'
+               )",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let event: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        let matches = match event {
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                completed.command_id == *command_id
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                cancelled.command_id == *command_id
+            }
+            _ => false,
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Result<()> {
+    tx.execute(
+        "update child_outbox
+         set dispatched = 1
+         where parent_run_id = ?1
+           and child_run_id is null
+           and parent_close_policy = ?2",
+        params![
+            parent_run_id.0,
+            parent_close_policy_to_str(ParentClosePolicy::Cancel)
+        ],
+    )
+    .map_err(sqlite_error)?;
+
+    let children = {
+        let mut stmt = tx
+            .prepare(
+                "select run_id, current_event_id
+                 from workflow_instances
+                 where parent_run_id = ?1
+                   and parent_close_policy = ?2
+                   and terminal = 0",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    parent_run_id.0,
+                    parent_close_policy_to_str(ParentClosePolicy::Cancel)
+                ],
+                |row| Ok((RunId::new(row.get::<_, String>(0)?), row.get::<_, u64>(1)?)),
+            )
+            .map_err(sqlite_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?
+    };
+    for (child_run_id, tail) in children {
+        let terminal_event = HistoryEventData::WorkflowCancelled {
+            reason: format!("parent workflow `{parent_run_id}` closed"),
+        };
+        let event_id = EventId(tail).next();
+        insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
+        cleanup_run_operational_state(tx, &child_run_id)?;
+        tx.execute(
+            "update workflow_instances
+             set current_event_id = ?1,
+                 workflow_claim_token = null,
+                 terminal = 1,
+                 ready_reason = null,
+                 ready_at_ms = 0
+             where run_id = ?2",
+            params![event_id.0, child_run_id.0],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
 fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId) -> Result<()> {
     let activity_id = ActivityId::new(command_id);
     let map_prefix = format!("{}:map:%", activity_id.0);
@@ -1356,7 +1600,25 @@ fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId
         params![map_command_key(command_id)],
     )
     .map_err(sqlite_error)?;
+    tx.execute(
+        "update child_outbox
+         set dispatched = 1
+         where outbox_id = ?1",
+        params![child_outbox_id(command_id)],
+    )
+    .map_err(sqlite_error)?;
     Ok(())
+}
+
+fn child_outbox_id(command_id: &CommandId) -> String {
+    format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
+}
+
+fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static str {
+    match policy {
+        ParentClosePolicy::Cancel => "cancel",
+        ParentClosePolicy::Abandon => "abandon",
+    }
 }
 
 fn insert_activity_map(
@@ -1383,6 +1645,291 @@ fn insert_activity_map(
     )
     .map_err(sqlite_error)?;
     Ok(())
+}
+
+fn insert_child_outbox(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    message: &ChildStartOutboxMessage,
+) -> Result<()> {
+    let blob =
+        rmp_serde::to_vec_named(message).map_err(|err| Error::PayloadEncode(err.to_string()))?;
+    tx.execute(
+        "insert into child_outbox
+         (outbox_id, namespace, parent_run_id, command_seq, child_workflow_id,
+          parent_close_policy, message,
+          dispatched, child_run_id)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, null)
+         on conflict(outbox_id) do nothing",
+        params![
+            child_outbox_id(&message.command_id),
+            namespace,
+            message.command_id.run_id.0,
+            message.command_id.seq.0,
+            message.workflow_id.0,
+            parent_close_policy_to_str(message.parent_close_policy),
+            blob
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn dispatch_child_start(tx: &Transaction<'_>, outbox_id: &str) -> Result<()> {
+    let Some((message_blob, dispatched)) = tx
+        .query_row(
+            "select message, dispatched from child_outbox where outbox_id = ?1",
+            params![outbox_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Ok(());
+    };
+    if dispatched {
+        return Ok(());
+    }
+    let message: ChildStartOutboxMessage = rmp_serde::from_slice(&message_blob)
+        .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let Some((namespace, parent_terminal)) = tx
+        .query_row(
+            "select namespace, terminal from workflow_instances where run_id = ?1",
+            params![message.command_id.run_id.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Err(Error::RunNotFound(message.command_id.run_id.clone()));
+    };
+    if parent_terminal && message.parent_close_policy == ParentClosePolicy::Cancel {
+        mark_child_outbox_dispatched(tx, outbox_id, None)?;
+        return Ok(());
+    }
+
+    let existing = tx
+        .query_row(
+            "select run_id, parent_run_id, parent_command_seq
+             from workflow_instances
+             where namespace = ?1 and workflow_id = ?2",
+            params![namespace.as_str(), message.workflow_id.0],
+            |row| {
+                Ok((
+                    RunId::new(row.get::<_, String>(0)?),
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+
+    let child_run_id = if let Some((run_id, parent_run_id, parent_seq)) = existing {
+        let same_child = parent_run_id.as_deref() == Some(message.command_id.run_id.0.as_str())
+            && parent_seq == Some(message.command_id.seq.0);
+        if !same_child {
+            append_child_start_failed(
+                tx,
+                &message.command_id,
+                crate::DurableFailure::non_retryable(
+                    "durust.child_workflow_id_conflict",
+                    format!("workflow id `{}` is already started", message.workflow_id),
+                ),
+            )?;
+            mark_child_outbox_dispatched(tx, outbox_id, None)?;
+            return Ok(());
+        }
+        run_id
+    } else {
+        start_child_run(tx, &namespace, &message)?
+    };
+
+    append_child_started(tx, &message, &child_run_id)?;
+    mark_child_outbox_dispatched(tx, outbox_id, Some(&child_run_id))?;
+    Ok(())
+}
+
+fn start_child_run(
+    tx: &Transaction<'_>,
+    namespace: &str,
+    message: &ChildStartOutboxMessage,
+) -> Result<RunId> {
+    let run_id = RunId::new(format!("run-{}", next_counter(tx, "run")?));
+    tx.execute(
+        "insert into workflow_instances
+         (namespace, workflow_id, run_id, workflow_name, workflow_version, task_queue,
+          current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal,
+          parent_run_id, parent_command_seq, parent_close_policy)
+         values (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, null, 0, ?8, ?9, ?10)",
+        params![
+            namespace,
+            message.workflow_id.0,
+            run_id.0,
+            message.workflow_type.name,
+            message.workflow_type.version,
+            message.task_queue.0,
+            reason_to_str(&WorkflowTaskReason::WorkflowStarted),
+            message.command_id.run_id.0,
+            message.command_id.seq.0,
+            parent_close_policy_to_str(message.parent_close_policy)
+        ],
+    )
+    .map_err(sqlite_error)?;
+    insert_history_event(
+        tx,
+        &run_id,
+        EventId(1),
+        HistoryEventData::WorkflowStarted {
+            workflow_type: message.workflow_type.clone(),
+            input: message.input.clone(),
+        },
+    )?;
+    Ok(run_id)
+}
+
+fn append_child_started(
+    tx: &Transaction<'_>,
+    message: &ChildStartOutboxMessage,
+    child_run_id: &RunId,
+) -> Result<()> {
+    if child_event_exists(tx, &message.command_id)? {
+        return Ok(());
+    }
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &message.command_id.run_id)? else {
+        return Err(Error::RunNotFound(message.command_id.run_id.clone()));
+    };
+    if terminal {
+        return Ok(());
+    }
+    let event_id = EventId(tail).next();
+    insert_history_event(
+        tx,
+        &message.command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
+            command_id: message.command_id.clone(),
+            workflow_id: message.workflow_id.clone(),
+            run_id: child_run_id.clone(),
+        }),
+    )?;
+    set_workflow_ready(
+        tx,
+        &message.command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowStarted,
+    )
+}
+
+fn append_child_start_failed(
+    tx: &Transaction<'_>,
+    command_id: &CommandId,
+    failure: crate::DurableFailure,
+) -> Result<()> {
+    if child_event_exists(tx, command_id)? {
+        return Ok(());
+    }
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &command_id.run_id)? else {
+        return Err(Error::RunNotFound(command_id.run_id.clone()));
+    };
+    if terminal {
+        return Ok(());
+    }
+    let event_id = EventId(tail).next();
+    insert_history_event(
+        tx,
+        &command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+            command_id: command_id.clone(),
+            failure,
+        }),
+    )?;
+    set_workflow_ready(
+        tx,
+        &command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowFailed,
+    )
+}
+
+fn mark_child_outbox_dispatched(
+    tx: &Transaction<'_>,
+    outbox_id: &str,
+    child_run_id: Option<&RunId>,
+) -> Result<()> {
+    tx.execute(
+        "update child_outbox
+         set dispatched = 1, child_run_id = ?1
+         where outbox_id = ?2",
+        params![child_run_id.map(|run_id| run_id.0.as_str()), outbox_id],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn parent_tail_and_terminal(tx: &Transaction<'_>, run_id: &RunId) -> Result<Option<(u64, bool)>> {
+    tx.query_row(
+        "select current_event_id, terminal from workflow_instances where run_id = ?1",
+        params![run_id.0],
+        |row| Ok((row.get::<_, u64>(0)?, row.get::<_, bool>(1)?)),
+    )
+    .optional()
+    .map_err(sqlite_error)
+}
+
+fn set_workflow_ready(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    event_id: EventId,
+    reason: WorkflowTaskReason,
+) -> Result<()> {
+    tx.execute(
+        "update workflow_instances
+         set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
+         where run_id = ?3",
+        params![event_id.0, reason_to_str(&reason), run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn child_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
+    let mut stmt = tx
+        .prepare(
+            "select data from history_events
+             where run_id = ?1
+               and event_type in (
+                 'child_workflow_started',
+                 'child_workflow_completed',
+                 'child_workflow_failed',
+                 'child_workflow_cancelled'
+               )",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let event: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        let matches = match event {
+            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                completed.command_id == *command_id
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                cancelled.command_id == *command_id
+            }
+            _ => false,
+        };
+        if matches {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &CommandId) -> Result<()> {
@@ -1883,6 +2430,10 @@ fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
         WorkflowTaskReason::ActivityTimedOut => "activity_timed_out",
         WorkflowTaskReason::ActivityMapCompleted => "activity_map_completed",
         WorkflowTaskReason::ActivityMapFailed => "activity_map_failed",
+        WorkflowTaskReason::ChildWorkflowStarted => "child_workflow_started",
+        WorkflowTaskReason::ChildWorkflowCompleted => "child_workflow_completed",
+        WorkflowTaskReason::ChildWorkflowFailed => "child_workflow_failed",
+        WorkflowTaskReason::ChildWorkflowCancelled => "child_workflow_cancelled",
         WorkflowTaskReason::TimerFired => "timer_fired",
         WorkflowTaskReason::SignalReceived => "signal_received",
         WorkflowTaskReason::CacheEvicted => "cache_evicted",
@@ -1897,6 +2448,10 @@ fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
         "activity_timed_out" => Ok(WorkflowTaskReason::ActivityTimedOut),
         "activity_map_completed" => Ok(WorkflowTaskReason::ActivityMapCompleted),
         "activity_map_failed" => Ok(WorkflowTaskReason::ActivityMapFailed),
+        "child_workflow_started" => Ok(WorkflowTaskReason::ChildWorkflowStarted),
+        "child_workflow_completed" => Ok(WorkflowTaskReason::ChildWorkflowCompleted),
+        "child_workflow_failed" => Ok(WorkflowTaskReason::ChildWorkflowFailed),
+        "child_workflow_cancelled" => Ok(WorkflowTaskReason::ChildWorkflowCancelled),
         "timer_fired" => Ok(WorkflowTaskReason::TimerFired),
         "signal_received" => Ok(WorkflowTaskReason::SignalReceived),
         "cache_evicted" => Ok(WorkflowTaskReason::CacheEvicted),
@@ -1920,6 +2475,11 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::ActivityCompleted => "activity_completed",
         HistoryEventType::ActivityFailed => "activity_failed",
         HistoryEventType::ActivityTimedOut => "activity_timed_out",
+        HistoryEventType::ChildWorkflowStartRequested => "child_workflow_start_requested",
+        HistoryEventType::ChildWorkflowStarted => "child_workflow_started",
+        HistoryEventType::ChildWorkflowCompleted => "child_workflow_completed",
+        HistoryEventType::ChildWorkflowFailed => "child_workflow_failed",
+        HistoryEventType::ChildWorkflowCancelled => "child_workflow_cancelled",
         HistoryEventType::TimerStarted => "timer_started",
         HistoryEventType::TimerFired => "timer_fired",
         HistoryEventType::SignalConsumed => "signal_consumed",
@@ -1941,6 +2501,11 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "activity_completed" => Ok(HistoryEventType::ActivityCompleted),
         "activity_failed" => Ok(HistoryEventType::ActivityFailed),
         "activity_timed_out" => Ok(HistoryEventType::ActivityTimedOut),
+        "child_workflow_start_requested" => Ok(HistoryEventType::ChildWorkflowStartRequested),
+        "child_workflow_started" => Ok(HistoryEventType::ChildWorkflowStarted),
+        "child_workflow_completed" => Ok(HistoryEventType::ChildWorkflowCompleted),
+        "child_workflow_failed" => Ok(HistoryEventType::ChildWorkflowFailed),
+        "child_workflow_cancelled" => Ok(HistoryEventType::ChildWorkflowCancelled),
         "timer_started" => Ok(HistoryEventType::TimerStarted),
         "timer_fired" => Ok(HistoryEventType::TimerFired),
         "signal_consumed" => Ok(HistoryEventType::SignalConsumed),

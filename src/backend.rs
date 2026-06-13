@@ -1,7 +1,7 @@
 use crate::{
-    ActivityId, ActivityMapTask, ActivityName, ActivityTask, DurableFailure, Error, EventId,
-    Namespace, NewHistoryEvent, PayloadRef, Result, RunId, SignalId, SignalName, TaskQueue,
-    TimestampMs, WaitId, WorkerId, WorkflowId, WorkflowType,
+    ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
+    DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef, Result, RunId,
+    SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId, WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -76,6 +76,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: FailActivityRequest,
     ) -> BoxFuture<'static, Result<FailActivityOutcome>>;
 
+    fn dispatch_child_workflow_starts(
+        &self,
+        req: DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>>;
+
     fn query_projection(
         &self,
         req: QueryProjectionRequest,
@@ -134,6 +139,10 @@ pub enum WorkflowTaskReason {
     ActivityTimedOut,
     ActivityMapCompleted,
     ActivityMapFailed,
+    ChildWorkflowStarted,
+    ChildWorkflowCompleted,
+    ChildWorkflowFailed,
+    ChildWorkflowCancelled,
     TimerFired,
     SignalReceived,
     CacheEvicted,
@@ -198,6 +207,7 @@ pub struct WorkflowTaskCommit {
     pub upsert_waits: Vec<WaitRecord>,
     pub schedule_activities: Vec<ActivityTask>,
     pub schedule_activity_maps: Vec<ActivityMapTask>,
+    pub start_child_workflows: Vec<ChildStartOutboxMessage>,
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
     pub cancel_commands: Vec<crate::CommandId>,
@@ -322,6 +332,17 @@ pub enum FailActivityOutcome {
     RetryScheduled { next_attempt: u32 },
     Failed { event_id: EventId },
     AlreadyCompleted,
+}
+
+#[derive(Clone, Debug)]
+pub struct DispatchChildWorkflowStartsRequest {
+    pub namespace: Namespace,
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DispatchChildWorkflowStartsOutcome {
+    pub dispatched: usize,
 }
 
 #[derive(Clone, Debug)]

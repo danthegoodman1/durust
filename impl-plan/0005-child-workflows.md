@@ -1,7 +1,7 @@
 ---
 id: 0005
 title: Child workflows
-status: not_started
+status: complete
 depends_on: [0002, 0003]
 labels: [child-workflows, outbox, cross-shard, examples]
 ---
@@ -29,6 +29,31 @@ outbox/inbox handoff.
 - Parent cancellation propagates by policy.
 - Cross-shard child start and completion survive dispatcher crash.
 - Child workflow examples compile and run.
+
+## Current State
+
+Implemented and covered:
+
+- `durust::child!(workflow(input))` with `workflow_id`, optional task queue,
+  `ParentClosePolicy`, `spawn().await`, typed `result().await`, and deterministic
+  replay fingerprints.
+- Provider-owned child-start outbox in memory and SQLite, with idempotent
+  dispatch and child workflow id conflict handling.
+- Child run parent links and parent wakeup events for child start, completion,
+  failure, and cancellation.
+- Parent close policy enforcement for `Cancel` and `Abandon`, including external
+  parent cancellation and parent workflow terminal commits.
+- SQLite restart recovery after a committed child-start outbox row and before
+  dispatch.
+- Public child workflow examples for spawn-and-wait and spawn-and-abandon.
+- Criterion coverage for memory child-start dispatch.
+
+Deferred to later scale-out hardening:
+
+- A physically partitioned provider implementation with explicit cross-shard
+  inbox rows and crash injection at every source/target ack step. The current
+  backend contract keeps this provider-owned and proves the generic idempotent
+  outbox semantics in shared conformance.
 
 ## Required Tests
 
