@@ -367,8 +367,13 @@ impl<'ast> Visit<'ast> for AwaitLint {
         }
 
         let base = node.base.to_token_stream().to_string();
-        let allowed =
-            base.contains("durust :: activity_call") || base.contains("durust :: call_activity");
+        let allowed = base.contains("durust :: activity_call")
+            || base.contains("durust :: call_activity")
+            || base.contains("durust :: activity_map")
+            || base.contains("result_manifest")
+            || base.contains("durust :: sleep")
+            || base.contains("durust :: sleep_until")
+            || base.contains("durust :: signal");
         if !allowed {
             self.err = Some(syn::Error::new_spanned(
                 node,

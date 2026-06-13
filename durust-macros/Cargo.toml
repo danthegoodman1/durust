@@ -2,6 +2,9 @@
 name = "durust-macros"
 version = "0.1.0"
 edition = "2024"
+description = "Procedural macros for the durust durable workflow runtime."
+license = "MIT"
+repository = "https://github.com/danthegoodman1/durust"
 
 [lib]
 proc-macro = true

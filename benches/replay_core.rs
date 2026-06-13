@@ -1,8 +1,10 @@
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use durust::{
-    ActivityName, ActivityScheduled, ActivityTask, ClaimWorkflowTaskOptions, ClaimedWorkflowTask,
-    Client, CommitOutcome, DurableBackend, EventId, HistoryEventData, MemoryBackend, Namespace,
-    NewHistoryEvent, TaskQueue, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
+    ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
+    ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
+    DurableBackend, EventId, FireDueTimersRequest, HistoryEventData, MemoryBackend, Namespace,
+    NewHistoryEvent, SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker,
+    WorkerId, WorkflowTaskCommit, WorkflowType,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -103,6 +105,174 @@ fn crash_replay(c: &mut Criterion) {
     });
 }
 
+fn activity_claim_complete(c: &mut Criterion) {
+    c.bench_function("activity_claim_complete_memory", |b| {
+        b.iter_batched(
+            setup_scheduled_activity,
+            |(backend, worker_id, opts)| {
+                block_on(async {
+                    let claimed = backend
+                        .claim_activity_task(worker_id, opts)
+                        .await
+                        .unwrap()
+                        .expect("activity task");
+                    let completed = backend
+                        .complete_activity(CompleteActivityRequest {
+                            claim: claimed.claim,
+                            result: durust::encode_payload(&20_u64).unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        completed,
+                        durust::CompleteActivityOutcome::Completed { .. }
+                    ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn timer_due_scan_wakeup(c: &mut Criterion) {
+    c.bench_function("timer_due_scan_wakeup_memory", |b| {
+        b.iter_batched(
+            setup_due_timer,
+            |backend| {
+                block_on(async {
+                    let fired = backend
+                        .fire_due_timers(FireDueTimersRequest {
+                            namespace: Namespace::default(),
+                            now: TimestampMs(10),
+                            limit: 1024,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(fired.fired, 1);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn signal_send_consume(c: &mut Criterion) {
+    c.bench_function("signal_send_consume_memory", |b| {
+        b.iter_batched(
+            setup_signal_wait,
+            |(backend, run_id)| {
+                block_on(async {
+                    let signal_id = durust::SignalId::new("bench/signal");
+                    let outcome = backend
+                        .signal_workflow(SignalWorkflowRequest {
+                            namespace: Namespace::default(),
+                            workflow_id: durust::WorkflowId::new("bench/signal"),
+                            signal_id: signal_id.clone(),
+                            signal_name: durust::SignalName::new("ready"),
+                            payload: durust::encode_payload(&"ready").unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+                    let claimed = backend
+                        .claim_workflow_task(
+                            WorkerId::new("bench-signal-consumer"),
+                            claim_workflow_options(),
+                        )
+                        .await
+                        .unwrap()
+                        .expect("signal-ready workflow task");
+                    let inbox = backend
+                        .read_signal_inbox(durust::ReadSignalInboxRequest {
+                            run_id,
+                            signal_name: durust::SignalName::new("ready"),
+                        })
+                        .await
+                        .unwrap()
+                        .expect("signal inbox record");
+                    let commit = backend
+                        .commit_workflow_task(
+                            claimed.claim,
+                            WorkflowTaskCommit {
+                                expected_tail_event_id: EventId(1),
+                                append_events: Vec::new(),
+                                upsert_waits: Vec::new(),
+                                schedule_activities: Vec::new(),
+                                schedule_activity_maps: Vec::new(),
+                                consume_signals: vec![inbox.signal_id],
+                                delete_waits: Vec::new(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(commit, CommitOutcome::Committed { .. }));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn activity_map_materialize(c: &mut Criterion) {
+    c.bench_function("activity_map_materialize_memory", |b| {
+        b.iter_batched(
+            setup_claimed_activity_map_workflow,
+            |(backend, claimed, map_task, scheduled)| {
+                block_on(async {
+                    let outcome = backend
+                        .commit_workflow_task(
+                            claimed.claim,
+                            WorkflowTaskCommit {
+                                expected_tail_event_id: EventId(1),
+                                append_events: vec![NewHistoryEvent::new(
+                                    HistoryEventData::ActivityMapScheduled(scheduled),
+                                )],
+                                upsert_waits: Vec::new(),
+                                schedule_activities: Vec::new(),
+                                schedule_activity_maps: vec![map_task],
+                                consume_signals: Vec::new(),
+                                delete_waits: Vec::new(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn activity_map_item_complete(c: &mut Criterion) {
+    c.bench_function("activity_map_item_complete_memory", |b| {
+        b.iter_batched(
+            setup_materialized_activity_map,
+            |(backend, worker_id, opts)| {
+                block_on(async {
+                    let claimed = backend
+                        .claim_activity_task(worker_id, opts)
+                        .await
+                        .unwrap()
+                        .expect("map item task");
+                    let completed = backend
+                        .complete_activity(CompleteActivityRequest {
+                            claim: claimed.claim,
+                            result: durust::encode_payload(&20_u64).unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        completed,
+                        durust::CompleteActivityOutcome::Completed { .. }
+                    ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn setup_started_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -167,9 +337,12 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
             command_id: durust::command_id(&claimed.run_id, 0),
             activity_name: ActivityName::new("bench.double"),
             task_queue: TaskQueue::new("activities"),
+            retry_policy: durust::RetryPolicy::none(),
+            start_to_close_timeout: None,
             fingerprint: durust::activity_fingerprint(
                 ActivityName::new("bench.double"),
                 durust::payload_digest(&input),
+                "sha256:bench-options".to_owned(),
             ),
             input,
         };
@@ -182,11 +355,204 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled,
                 ))],
+                upsert_waits: Vec::new(),
                 schedule_activities: vec![activity_task],
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
             },
         }
     })
+}
+
+fn setup_scheduled_activity() -> (MemoryBackend, WorkerId, ClaimActivityOptions) {
+    let state = setup_claimed_workflow_for_commit();
+    block_on(async {
+        state
+            .backend
+            .commit_workflow_task(state.claimed.claim, state.batch)
+            .await
+            .unwrap();
+        (
+            state.backend,
+            WorkerId::new("bench-activity-worker"),
+            claim_activity_options("activities"),
+        )
+    })
+}
+
+fn setup_due_timer() -> MemoryBackend {
+    block_on(async {
+        let (backend, worker_id, opts) = create_claimable_workflow().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let command_id = durust::command_id(&claimed.run_id, 1);
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                        durust::TimerStarted {
+                            command_id: command_id.clone(),
+                            fire_at: TimestampMs(10),
+                            fingerprint: durust::timer_fingerprint("sleep", TimestampMs(10)),
+                        },
+                    ))],
+                    upsert_waits: vec![WaitRecord {
+                        wait_id: durust::WaitId::new(format!(
+                            "{}:{}:timer",
+                            command_id.run_id, command_id.seq.0
+                        )),
+                        run_id: command_id.run_id.clone(),
+                        command_id,
+                        kind: WaitKind::Timer,
+                        key: "timer".to_owned(),
+                        ready_at: Some(TimestampMs(10)),
+                    }],
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("bench/signal", "workflows", 10)
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("bench-signal-worker"),
+                claim_workflow_options(),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let command_id = durust::command_id(&claimed.run_id, 1);
+        backend
+            .commit_workflow_task(
+                claimed.claim.clone(),
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: Vec::new(),
+                    upsert_waits: vec![WaitRecord {
+                        wait_id: durust::WaitId::new(format!(
+                            "{}:{}:signal",
+                            command_id.run_id, command_id.seq.0
+                        )),
+                        run_id: command_id.run_id.clone(),
+                        command_id,
+                        kind: WaitKind::Signal,
+                        key: "ready".to_owned(),
+                        ready_at: None,
+                    }],
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        (backend, run_id)
+    })
+}
+
+fn setup_claimed_activity_map_workflow() -> (
+    MemoryBackend,
+    ClaimedWorkflowTask,
+    ActivityMapTask,
+    durust::ActivityMapScheduled,
+) {
+    block_on(async {
+        let (backend, worker_id, opts) = create_claimable_workflow().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let command_id = durust::command_id(&claimed.run_id, 1);
+        let input_manifest = activity_map_input_manifest(128);
+        let activity_name = ActivityName::new("bench.double");
+        let task_queue = TaskQueue::new("activities");
+        let retry_policy = durust::RetryPolicy::none();
+        let scheduled = durust::ActivityMapScheduled {
+            command_id: command_id.clone(),
+            activity_name: activity_name.clone(),
+            task_queue: task_queue.clone(),
+            retry_policy: retry_policy.clone(),
+            start_to_close_timeout: None,
+            input_manifest: input_manifest.clone(),
+            result_manifest_name: "bench-results".to_owned(),
+            max_in_flight: 64,
+            fingerprint: durust::activity_map_fingerprint(
+                activity_name.clone(),
+                durust::payload_digest(&input_manifest),
+                "bench-results".to_owned(),
+                64,
+                "sha256:bench-options".to_owned(),
+            ),
+        };
+        let map_task = ActivityMapTask {
+            map_command_id: command_id,
+            activity_name,
+            task_queue,
+            retry_policy,
+            start_to_close_timeout: None,
+            input_manifest,
+            result_manifest_name: "bench-results".to_owned(),
+            max_in_flight: 64,
+        };
+        (backend, claimed, map_task, scheduled)
+    })
+}
+
+fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityOptions) {
+    let (backend, claimed, map_task, scheduled) = setup_claimed_activity_map_workflow();
+    block_on(async {
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![NewHistoryEvent::new(
+                        HistoryEventData::ActivityMapScheduled(scheduled),
+                    )],
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: vec![map_task],
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        (
+            backend,
+            WorkerId::new("bench-map-worker"),
+            claim_activity_options("activities"),
+        )
+    })
+}
+
+fn activity_map_input_manifest(items: u64) -> durust::PayloadRef {
+    let inputs = (0..items)
+        .map(|value| durust::encode_payload(&BenchInput { value }).unwrap())
+        .collect::<Vec<_>>();
+    durust::encode_activity_map_input_manifest(inputs, 32).unwrap()
 }
 
 fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
@@ -194,6 +560,15 @@ fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
         task_queue: TaskQueue::new("workflows"),
         registered_workflow_types: vec![WorkflowType::new("bench.double-plus-one", 1)],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+fn claim_activity_options(task_queue: &str) -> ClaimActivityOptions {
+    ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(task_queue),
+        registered_activity_names: vec![ActivityName::new("bench.double")],
         lease_duration: Duration::from_secs(30),
     }
 }
@@ -213,6 +588,11 @@ criterion_group!(
     workflow_task_claim,
     workflow_task_append_commit,
     cached_wake_poll,
-    crash_replay
+    crash_replay,
+    activity_claim_complete,
+    timer_due_scan_wakeup,
+    signal_send_consume,
+    activity_map_materialize,
+    activity_map_item_complete
 );
 criterion_main!(benches);

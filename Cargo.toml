@@ -2,6 +2,9 @@
 name = "durust"
 version = "0.1.0"
 edition = "2024"
+description = "A durable workflow runtime for Rust services."
+license = "MIT"
+repository = "https://github.com/danthegoodman1/durust"
 
 [dependencies]
 durust-macros = { version = "0.1.0", path = "durust-macros" }

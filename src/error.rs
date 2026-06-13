@@ -26,6 +26,12 @@ pub enum Error {
     #[error("workflow is terminal")]
     TerminalWorkflow,
 
+    #[error("activity failed: {0}")]
+    ActivityFailed(String),
+
+    #[error("activity timed out: {0}")]
+    ActivityTimedOut(String),
+
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),
 

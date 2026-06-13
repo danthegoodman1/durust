@@ -5,6 +5,10 @@ Durust is a durable workflow runtime for Rust services.
 Write async Rust workflows that survive crashes, restarts, timers, signals,
 long waits, child workflows, version rollouts, and large fanout.
 
+The workflow `name` is the durable identity stored in history and task indexes.
+Keep it stable across Rust function renames or module moves; use `version` for
+intentional workflow type changes.
+
 ```rust
 #[durust::workflow(name = "orders.checkout", version = 1, query_state = OrderView)]
 pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
@@ -172,6 +176,7 @@ let worker = durust::Worker::builder(backend.clone())
     .activity_task_queue("payments")
     .register_activity(price_quote)
     .register_activity(charge_card)
+    .max_local_activities_per_workflow_task(64)
     .max_cached_workflows(10_000)
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
@@ -197,9 +202,30 @@ export manifest metadata for the binary that links them. Use
 `durust::exported_manifest()` with `durust::write_manifest(...)` to materialize a
 current `durable.manifest.json` candidate for review.
 
-If an activity is registered locally on the workflow worker and local capacity is
-available, Durust prefers local execution. Otherwise remote workers polling
-the selected task queue can claim the task.
+If an activity is registered locally on the workflow worker and
+`max_local_activities_per_workflow_task` has available slots, Durust executes
+that activity in the workflow worker process before remote workers can claim
+remaining queued work. Set the local limit to `0` to leave all activity tasks for
+remote workers polling the selected task queue.
+
+Workflow code can set defaults for later activity calls:
+
+```rust
+durust::set_default_activity_options(
+    durust::ActivityOptions::new()
+        .task_queue("payments")
+        .retry(durust::RetryPolicy::exponential().max_attempts(5))
+        .timeout(std::time::Duration::from_secs(30)),
+);
+
+let quote = durust::call_activity!(price_quote(input.quote())).await?;
+let charge = durust::call_activity!(charge_card(input.charge(quote)))
+    .task_queue("high-priority-payments")
+    .await?;
+```
+
+Defaults are workflow-local and can be changed with normal deterministic control
+flow. Per-call options override the current defaults for that call.
 
 ## Core Patterns
 
@@ -232,6 +258,18 @@ let decision = durust::select! {
 
 A signal named `"cancel"` is just an application signal. It only cancels the
 workflow if your code maps it to a cancellation or terminal error.
+
+External cancellation is a client operation:
+
+```rust
+client
+    .cancel_workflow("order/123", "customer requested cancellation")
+    .await?;
+```
+
+Cancellation records a terminal workflow fact and the provider atomically clears
+derived waits, activity tasks, and activity-map item state for that run. Late
+activity completions are idempotent and do not append workflow failure history.
 
 ### Workflow Time
 
@@ -338,7 +376,7 @@ For large fanout, use manifest-backed maps. The workflow never holds all inputs
 or outputs in memory.
 
 ```rust
-#[durust::workflow(name = "jobs.word-count", version = 1, query_state = JobView)]
+#[durust::workflow(name = "jobs.word-count", version = 1)]
 pub async fn word_count(input: WordCountInput) -> durust::Result<WordCountOutput> {
     let partitions = durust::call_activity!(partition_input(input.source_ref))
         .task_queue("storage")
@@ -352,12 +390,6 @@ pub async fn word_count(input: WordCountInput) -> durust::Result<WordCountOutput
         .spawn()
         .await?;
 
-    durust::publish(&JobView {
-        status: JobStatus::Mapping,
-        map_run_id: Some(mapped.id().clone()),
-        ..JobView::default()
-    })?;
-
     let partials = mapped.result_manifest().await?;
 
     let output = durust::call_activity!(reduce_manifest(partials))
@@ -369,6 +401,15 @@ pub async fn word_count(input: WordCountInput) -> durust::Result<WordCountOutput
     })
 }
 ```
+
+On the happy path this workflow writes eight history events total:
+`WorkflowStarted`, partition activity scheduled/completed, map
+scheduled/completed, reduce activity scheduled/completed, and
+`WorkflowCompleted`. The map does not add one history event per manifest item;
+per-item leases, retries, and results stay in provider-owned map state.
+Input and result manifest refs point to small root manifests whose pages are
+separate payload refs, so providers do not need one large row for every map item
+or result.
 
 `do_work` is the activity Durust runs once per manifest item:
 
@@ -495,3 +536,11 @@ SQLite is included for local development, testing, and provider conformance.
 
 The [`examples/`](examples/) directory is the canonical reference for common
 patterns. Each example is small, runnable, and copyable into a new project.
+
+- [`hello_activity.rs`](examples/hello_activity.rs)
+- [`worker_registration.rs`](examples/worker_registration.rs)
+- [`signal_wait.rs`](examples/signal_wait.rs)
+- [`timer_wait.rs`](examples/timer_wait.rs)
+- [`local_remote_activity.rs`](examples/local_remote_activity.rs)
+- [`activity_map.rs`](examples/activity_map.rs)
+- [`map_reduce.rs`](examples/map_reduce.rs)

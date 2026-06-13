@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberInput {
     value: u64,
@@ -19,6 +21,27 @@ async fn double(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
 }
 
+#[durust::activity(name = "tests.map-double")]
+async fn map_double(input: NumberInput) -> durust::Result<u64> {
+    Ok(input.value * 2)
+}
+
+#[durust::activity(name = "tests.fail")]
+async fn fail_activity(_: ()) -> durust::Result<u64> {
+    Err(durust::Error::Backend("boom".to_owned()))
+}
+
+#[durust::activity(name = "tests.flaky")]
+async fn flaky_activity(_: ()) -> durust::Result<u64> {
+    let mut attempts = FLAKY_ATTEMPTS.lock().unwrap();
+    *attempts += 1;
+    if *attempts == 1 {
+        Err(durust::Error::Backend("transient".to_owned()))
+    } else {
+        Ok(7)
+    }
+}
+
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
 async fn double_plus_one(input: u64) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input }))
@@ -27,12 +50,95 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
     Ok(doubled + 1)
 }
 
+#[durust::workflow(name = "tests.failing-activity", version = 1)]
+async fn failing_activity_workflow(_: ()) -> durust::Result<u64> {
+    durust::call_activity!(fail_activity(())).await
+}
+
+#[durust::workflow(name = "tests.retry-activity", version = 1)]
+async fn retry_activity_workflow(_: ()) -> durust::Result<u64> {
+    durust::call_activity!(flaky_activity(()))
+        .retry(durust::RetryPolicy::exponential().max_attempts(2))
+        .await
+}
+
+#[durust::workflow(name = "tests.timeout-activity", version = 1)]
+async fn timeout_activity_workflow(input: u64) -> durust::Result<u64> {
+    durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .timeout(Duration::from_millis(10))
+        .await
+}
+
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
 async fn double_plus_one_changed(input: u64) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input + 1 }))
         .task_queue("activities")
         .await?;
     Ok(doubled + 1)
+}
+
+#[durust::workflow(name = "tests.default-activity-options", version = 1)]
+async fn default_activity_options_workflow(input: u64) -> durust::Result<u64> {
+    durust::set_default_activity_options(
+        durust::ActivityOptions::new()
+            .task_queue("preferred-activities")
+            .retry(durust::RetryPolicy::exponential().max_attempts(5)),
+    );
+    durust::call_activity!(double(NumberInput { value: input })).await
+}
+
+#[durust::workflow(name = "tests.override-activity-options", version = 1)]
+async fn override_activity_options_workflow(input: u64) -> durust::Result<u64> {
+    durust::set_default_activity_options(
+        durust::ActivityOptions::new()
+            .task_queue("default-activities")
+            .retry(durust::RetryPolicy::exponential().max_attempts(5)),
+    );
+    durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("override-activities")
+        .retry(durust::RetryPolicy::none())
+        .await
+}
+
+#[durust::workflow(name = "tests.cached-default-activity-options", version = 1)]
+async fn cached_default_activity_options_workflow(input: u64) -> durust::Result<u64> {
+    durust::set_default_activity_options(
+        durust::ActivityOptions::new()
+            .task_queue("sticky-activities")
+            .retry(durust::RetryPolicy::exponential().max_attempts(7)),
+    );
+    let first = durust::call_activity!(double(NumberInput { value: input })).await?;
+    durust::call_activity!(double(NumberInput { value: first })).await
+}
+
+#[durust::workflow(name = "tests.sleep-then-return", version = 1)]
+async fn sleep_then_return(input: u64) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(input)).await?;
+    Ok(input + 1)
+}
+
+#[durust::workflow(name = "tests.await-signal", version = 1)]
+async fn await_signal(_: ()) -> durust::Result<String> {
+    durust::signal::<String>("ready").await
+}
+
+#[durust::workflow(name = "tests.activity-map-sum", version = 1)]
+async fn activity_map_sum(input: Vec<u64>) -> durust::Result<u64> {
+    let input_manifest =
+        durust::activity_map_manifest(input.into_iter().map(|value| NumberInput { value }))?;
+    let mapped = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("doubled")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok(sum + durust::decode_payload::<u64>(payload)?)
+    })
 }
 
 #[test]
@@ -78,6 +184,460 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
 }
 
 #[test]
+fn cancelling_pending_workflow_cleans_activity_without_workflow_failure() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/cancel-pending", "workflows", 20)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let claimed_activity = backend
+            .claim_activity_task(
+                WorkerId::new("late-worker"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("activity task");
+
+        let cancelled = client
+            .cancel_workflow("wf/cancel-pending", "test cancellation")
+            .await
+            .unwrap();
+        assert_eq!(
+            cancelled,
+            durust::CancelWorkflowOutcome::Cancelled {
+                run_id: run_id.clone(),
+                event_id: EventId(3)
+            }
+        );
+        let late_completion = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed_activity.claim,
+                result: durust::encode_payload(&40_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            late_completion,
+            durust::CompleteActivityOutcome::AlreadyCompleted
+        );
+        assert!(!worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::WorkflowCancelled { .. }
+        ));
+        assert!(!history.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::ActivityCompleted(_)
+                | HistoryEventData::WorkflowCompleted { .. }
+                | HistoryEventData::WorkflowFailed { .. }
+        )));
+    });
+}
+
+#[test]
+fn workflow_default_activity_options_apply_to_scheduled_activity() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<default_activity_options_workflow>(
+                "wf/default-activity-options",
+                "workflows",
+                10,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("preferred-activities")
+            .register_workflow(default_activity_options_workflow)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let scheduled = scheduled_activity(&history, 1);
+        assert_eq!(scheduled.task_queue, TaskQueue::new("preferred-activities"));
+        assert_eq!(
+            scheduled.retry_policy,
+            durust::RetryPolicy::exponential().max_attempts(5)
+        );
+
+        let unclaimable_on_worker_fallback = backend
+            .claim_activity_task(
+                WorkerId::new("fallback-worker"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(unclaimable_on_worker_fallback.is_none());
+    });
+}
+
+#[test]
+fn per_call_activity_options_override_workflow_defaults() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<override_activity_options_workflow>(
+                "wf/override-activity-options",
+                "workflows",
+                10,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("fallback-activities")
+            .register_workflow(override_activity_options_workflow)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let scheduled = scheduled_activity(&history, 1);
+        assert_eq!(scheduled.task_queue, TaskQueue::new("override-activities"));
+        assert_eq!(scheduled.retry_policy, durust::RetryPolicy::none());
+    });
+}
+
+#[test]
+fn workflow_default_activity_options_survive_cached_wake_and_crash_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<cached_default_activity_options_workflow>(
+                "wf/cached-default-activity-options",
+                "workflows",
+                4,
+            )
+            .await
+            .unwrap();
+        let mut cached_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("sticky-activities")
+            .register_workflow(cached_default_activity_options_workflow)
+            .register_activity(double)
+            .build();
+
+        assert!(cached_worker.run_workflow_once().await.unwrap());
+        assert!(cached_worker.run_activity_once().await.unwrap());
+        assert!(cached_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let second = scheduled_activity(&history, 3);
+        assert_eq!(second.task_queue, TaskQueue::new("sticky-activities"));
+        assert_eq!(
+            second.retry_policy,
+            durust::RetryPolicy::exponential().max_attempts(7)
+        );
+
+        drop(cached_worker);
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("sticky-activities")
+            .history_chunk_events(1)
+            .register_workflow(cached_default_activity_options_workflow)
+            .register_activity(double)
+            .build();
+        assert!(replay_worker.run_activity_once().await.unwrap());
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 6);
+        let HistoryEventData::WorkflowCompleted { result } = &history[5].data else {
+            panic!("workflow did not complete after replay");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 16);
+    });
+}
+
+#[test]
+fn timer_fires_after_virtual_time_and_replays_after_worker_crash() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<sleep_then_return>("wf/timer-recovery", "workflows", 50)
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(sleep_then_return)
+            .build();
+
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert_eq!(first_worker.run_timers_once().await.unwrap(), 0);
+        backend.advance_time(Duration::from_millis(49));
+        assert_eq!(first_worker.run_timers_once().await.unwrap(), 0);
+        drop(first_worker);
+
+        backend.advance_time(Duration::from_millis(1));
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(sleep_then_return)
+            .build();
+        assert_eq!(recovered_worker.run_timers_once().await.unwrap(), 1);
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[2].data, HistoryEventData::TimerFired(_)));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("timer workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 51);
+    });
+}
+
+#[test]
+fn failed_activity_records_failure_and_workflow_failure_on_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<failing_activity_workflow>("wf/activity-failure", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(failing_activity_workflow)
+            .register_activity(fail_activity)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        drop(worker);
+
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(failing_activity_workflow)
+            .register_activity(fail_activity)
+            .build();
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
+            panic!("expected ActivityFailed");
+        };
+        assert!(failed.message.contains("boom"));
+        let HistoryEventData::WorkflowFailed { message } = &history[3].data else {
+            panic!("expected WorkflowFailed");
+        };
+        assert!(message.contains("activity failed"));
+    });
+}
+
+#[test]
+fn retryable_activity_failure_does_not_append_failure_history() {
+    block_on(async {
+        *FLAKY_ATTEMPTS.lock().unwrap() = 0;
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<retry_activity_workflow>("wf/activity-retry", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(retry_activity_workflow)
+            .register_activity(flaky_activity)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 2);
+        assert_eq!(stats.activity_tasks, 2);
+        assert_eq!(*FLAKY_ATTEMPTS.lock().unwrap(), 2);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(!history.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::ActivityFailed(_) | HistoryEventData::WorkflowFailed { .. }
+        )));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("retry workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 7);
+    });
+}
+
+#[test]
+fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<timeout_activity_workflow>("wf/activity-timeout", "workflows", 5)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(timeout_activity_workflow)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(9));
+        assert_eq!(worker.run_activity_timeouts_once().await.unwrap(), 0);
+        backend.advance_time(Duration::from_millis(1));
+        assert_eq!(worker.run_activity_timeouts_once().await.unwrap(), 1);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+            panic!("expected ActivityTimedOut");
+        };
+        assert!(timed_out.message.contains("timed out"));
+        let HistoryEventData::WorkflowFailed { message } = &history[3].data else {
+            panic!("expected WorkflowFailed");
+        };
+        assert!(message.contains("activity timed out"));
+    });
+}
+
+#[test]
+fn signal_before_wait_buffers_and_completes_without_extra_task() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<await_signal>("wf/signal-before", "workflows", ())
+            .await
+            .unwrap();
+        let outcome = client
+            .signal_workflow("wf/signal-before", "ready", "signal-before-1", "buffered")
+            .await
+            .unwrap();
+        assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+        let duplicate = client
+            .signal_workflow("wf/signal-before", "ready", "signal-before-1", "ignored")
+            .await
+            .unwrap();
+        assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(await_signal)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::SignalConsumed(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[2].data else {
+            panic!("signal workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "buffered"
+        );
+    });
+}
+
+#[test]
+fn signal_after_wait_wakes_and_consumes_atomically() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<await_signal>("wf/signal-after", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(await_signal)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let waiting_history = stream_all(&backend, &run_id).await;
+        assert_eq!(waiting_history.len(), 1);
+
+        let outcome = client
+            .signal_workflow("wf/signal-after", "ready", "signal-after-1", "delivered")
+            .await
+            .unwrap();
+        assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(!worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        let HistoryEventData::SignalConsumed(consumed) = &history[1].data else {
+            panic!("expected SignalConsumed");
+        };
+        assert_eq!(consumed.signal_id, durust::SignalId::new("signal-after-1"));
+        let HistoryEventData::WorkflowCompleted { result } = &history[2].data else {
+            panic!("signal workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "delivered"
+        );
+    });
+}
+
+#[test]
 fn worker_loop_runs_workflow_and_activity_until_idle() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -103,6 +663,194 @@ fn worker_loop_runs_workflow_and_activity_until_idle() {
             panic!("workflow did not complete");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 17);
+    });
+}
+
+#[test]
+fn configured_local_activity_preference_runs_before_remote_worker_can_claim() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/local-activity", "workflows", 5)
+            .await
+            .unwrap();
+        let mut workflow_worker = Worker::builder(backend.clone())
+            .worker_id("workflow-with-local-activity")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .max_local_activities_per_workflow_task(1)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        let mut remote_worker = Worker::builder(backend.clone())
+            .worker_id("remote-activity-worker")
+            .workflow_task_queue("unused")
+            .activity_task_queue("activities")
+            .register_activity(double)
+            .build();
+
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+        let history_after_local = stream_all(&backend, &run_id).await;
+        assert_eq!(history_after_local.len(), 3);
+        assert!(matches!(
+            history_after_local[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history_after_local[2].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(!remote_worker.run_activity_once().await.unwrap());
+
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("workflow did not complete after local activity");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 11);
+    });
+}
+
+#[test]
+fn zero_local_activity_capacity_falls_back_to_remote_worker() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/remote-fallback", "workflows", 6)
+            .await
+            .unwrap();
+        let mut workflow_worker = Worker::builder(backend.clone())
+            .worker_id("workflow-without-local-capacity")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .max_local_activities_per_workflow_task(0)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        let mut remote_worker = Worker::builder(backend.clone())
+            .worker_id("remote-fallback-worker")
+            .workflow_task_queue("unused")
+            .activity_task_queue("activities")
+            .register_activity(double)
+            .build();
+
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+        let history_after_schedule = stream_all(&backend, &run_id).await;
+        assert_eq!(history_after_schedule.len(), 2);
+        assert!(matches!(
+            history_after_schedule[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(remote_worker.run_activity_once().await.unwrap());
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("workflow did not complete after remote fallback");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 13);
+    });
+}
+
+#[test]
+fn activity_map_workflow_runs_with_compact_history() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_sum>("wf/activity-map-sum", "workflows", vec![1, 2, 3])
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 2);
+        assert_eq!(stats.activity_tasks, 3);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityMapScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityMapCompleted(_)
+        ));
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
+    });
+}
+
+#[test]
+fn configured_local_activity_preference_applies_to_activity_map_items() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_sum>("wf/local-activity-map", "workflows", vec![1, 2, 3])
+            .await
+            .unwrap();
+        let mut workflow_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .max_local_activities_per_workflow_task(2)
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+        let remote_item = backend
+            .claim_activity_task(
+                WorkerId::new("remote-map-worker"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("map-activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.map-double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("remaining map item after local slots");
+        let map_item = remote_item.task.map_item.as_ref().expect("map item");
+        assert_eq!(map_item.item_ordinal, 2);
+        assert_eq!(
+            durust::decode_payload::<NumberInput>(&remote_item.task.input)
+                .unwrap()
+                .value,
+            3
+        );
+
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: remote_item.claim,
+                result: durust::encode_payload(&6_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(workflow_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
     });
 }
 
@@ -414,6 +1162,63 @@ fn sqlite_backend_recovers_after_close_and_reopen() {
 }
 
 #[test]
+fn sqlite_activity_map_recovers_after_close_and_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("durust-map.sqlite3");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_sum>(
+                "wf/sqlite-map-recovery",
+                "workflows",
+                vec![2, 4, 6],
+            )
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .worker_id("sqlite-map-before-crash")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&db_path).unwrap();
+        let mut recovered_worker = Worker::builder(reopened.clone())
+            .worker_id("sqlite-map-after-crash")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .history_chunk_events(1)
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+        let stats = recovered_worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.activity_tasks, 2);
+        assert_eq!(stats.workflow_tasks, 1);
+
+        let history = stream_all(&reopened, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityMapScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityMapCompleted(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("SQLite map workflow did not complete after reopen replay");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 24);
+    });
+}
+
+#[test]
 fn sqlite_worker_loop_runs_until_idle() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -461,6 +1266,16 @@ where
         .events
 }
 
+fn scheduled_activity(
+    history: &[durust::HistoryEvent],
+    index: usize,
+) -> &durust::ActivityScheduled {
+    let HistoryEventData::ActivityScheduled(scheduled) = &history[index].data else {
+        panic!("expected ActivityScheduled at history index {index}");
+    };
+    scheduled
+}
+
 fn double_plus_one_claim_options() -> ClaimWorkflowTaskOptions {
     ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
@@ -501,6 +1316,17 @@ impl DurableBackend for RecordingBackend {
         self.inner.start_workflow(req)
     }
 
+    fn cancel_workflow(
+        &self,
+        req: durust::CancelWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::CancelWorkflowOutcome>> {
+        self.inner.cancel_workflow(req)
+    }
+
+    fn current_time(&self) -> BoxFuture<'static, durust::Result<durust::TimestampMs>> {
+        self.inner.current_time()
+    }
+
     fn claim_workflow_task(
         &self,
         worker_id: WorkerId,
@@ -533,6 +1359,34 @@ impl DurableBackend for RecordingBackend {
         self.inner.release_workflow_task(claim, release)
     }
 
+    fn signal_workflow(
+        &self,
+        req: durust::SignalWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>> {
+        self.inner.signal_workflow(req)
+    }
+
+    fn read_signal_inbox(
+        &self,
+        req: durust::ReadSignalInboxRequest,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::SignalInboxRecord>>> {
+        self.inner.read_signal_inbox(req)
+    }
+
+    fn fire_due_timers(
+        &self,
+        req: durust::FireDueTimersRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>> {
+        self.inner.fire_due_timers(req)
+    }
+
+    fn timeout_due_activities(
+        &self,
+        req: durust::TimeoutDueActivitiesRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>> {
+        self.inner.timeout_due_activities(req)
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -546,5 +1400,12 @@ impl DurableBackend for RecordingBackend {
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
         self.inner.complete_activity(req)
+    }
+
+    fn fail_activity(
+        &self,
+        req: durust::FailActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
+        self.inner.fail_activity(req)
     }
 }

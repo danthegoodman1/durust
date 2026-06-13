@@ -159,10 +159,43 @@ impl ActivityId {
     pub fn new(command_id: &CommandId) -> Self {
         Self(format!("{}:{}", command_id.run_id, command_id.seq.0))
     }
+
+    pub fn map_item(map_command_id: &CommandId, item_ordinal: u64) -> Self {
+        Self(format!(
+            "{}:{}:map:{}",
+            map_command_id.run_id, map_command_id.seq.0, item_ordinal
+        ))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct SignalId(pub String);
 
+impl SignalId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SignalName(pub String);
+
+impl SignalName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct WaitId(pub String);
+
+impl WaitId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct TimestampMs(pub i64);

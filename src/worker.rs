@@ -1,10 +1,12 @@
 use crate::{
     ClaimActivityOptions, ClaimWorkflowTaskOptions, CompleteActivityRequest, DurableBackend, Error,
-    EventId, HistoryEvent, HistoryEventData, Namespace, NewHistoryEvent, Registry, Result, RunId,
-    StartWorkflowRequest, TaskQueue, WorkerId, Workflow, WorkflowId, WorkflowTaskCommit,
+    EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace,
+    NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest,
+    TaskQueue, TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowId, WorkflowTaskCommit,
     WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error, poll_with_runtime_context,
 };
 use futures::Future;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::task::Poll;
@@ -27,6 +29,8 @@ impl Default for WorkerRunOptions {
 pub struct WorkerRunStats {
     pub workflow_tasks: usize,
     pub activity_tasks: usize,
+    pub timers_fired: usize,
+    pub activities_timed_out: usize,
 }
 
 pub struct Client<B>
@@ -74,6 +78,41 @@ where
             .await?;
         Ok(outcome.run_id().clone())
     }
+
+    pub async fn signal_workflow<T>(
+        &self,
+        workflow_id: impl Into<String>,
+        signal_name: impl Into<String>,
+        signal_id: impl Into<String>,
+        payload: T,
+    ) -> Result<crate::SignalWorkflowOutcome>
+    where
+        T: Serialize,
+    {
+        self.backend
+            .signal_workflow(crate::SignalWorkflowRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: WorkflowId::new(workflow_id),
+                signal_id: crate::SignalId::new(signal_id),
+                signal_name: crate::SignalName::new(signal_name),
+                payload: crate::encode_payload(&payload)?,
+            })
+            .await
+    }
+
+    pub async fn cancel_workflow(
+        &self,
+        workflow_id: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<crate::CancelWorkflowOutcome> {
+        self.backend
+            .cancel_workflow(crate::CancelWorkflowRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: WorkflowId::new(workflow_id),
+                reason: reason.into(),
+            })
+            .await
+    }
 }
 
 pub struct Worker<B>
@@ -90,12 +129,15 @@ where
     history_chunk_events: usize,
     history_chunk_bytes: usize,
     nondeterminism_retry_backoff: Duration,
+    max_local_activities_per_workflow_task: usize,
+    completed_local_activity_tasks: usize,
 }
 
 struct CachedWorkflow {
     future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
     last_event_id: EventId,
     next_command_seq: u64,
+    default_activity_options: crate::ActivityOptions,
 }
 
 impl<B> Worker<B>
@@ -113,6 +155,7 @@ where
             history_chunk_events: 128,
             history_chunk_bytes: 256 * 1024,
             nondeterminism_retry_backoff: Duration::from_secs(60),
+            max_local_activities_per_workflow_task: 0,
         }
     }
 
@@ -137,6 +180,7 @@ where
         let run_id = claimed.run_id.clone();
         let claim_for_release = claimed.claim.clone();
         let cached = self.cache.remove(&claimed.run_id);
+        let now = self.backend.current_time().await?;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
                 .stream_history_chunk(
@@ -150,7 +194,9 @@ where
                     let mut context = crate::runtime::RuntimeContext::new(
                         claimed.run_id.clone(),
                         self.activity_task_queue.clone(),
+                        now,
                         chunk.events,
+                        cached.default_activity_options,
                         cached.next_command_seq,
                         chunk.last_event_id,
                         claimed.replay_target_event_id,
@@ -196,7 +242,9 @@ where
                                     let mut context = crate::runtime::RuntimeContext::new(
                                         claimed.run_id.clone(),
                                         self.activity_task_queue.clone(),
+                                        now,
                                         replay_events,
+                                        crate::ActivityOptions::default(),
                                         0,
                                         last_loaded_event_id,
                                         claimed.replay_target_event_id,
@@ -249,6 +297,7 @@ where
         if let Some(entry) = entry {
             self.cache.insert(run_id, entry);
         }
+        self.run_local_activities_after_workflow_task().await?;
         Ok(true)
     }
 
@@ -274,14 +323,51 @@ where
             .registry
             .activity(&claimed.task.activity_name)
             .ok_or_else(|| Error::ActivityNotRegistered(claimed.task.activity_name.clone()))?;
-        let result = registration.run(claimed.task.input).await?;
-        self.backend
-            .complete_activity(CompleteActivityRequest {
-                claim: claimed.claim,
-                result,
+        match registration.run(claimed.task.input).await {
+            Ok(result) => {
+                self.backend
+                    .complete_activity(CompleteActivityRequest {
+                        claim: claimed.claim,
+                        result,
+                    })
+                    .await?;
+            }
+            Err(err) => {
+                self.backend
+                    .fail_activity(FailActivityRequest {
+                        claim: claimed.claim,
+                        message: err.to_string(),
+                    })
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub async fn run_timers_once(&mut self) -> Result<usize> {
+        let now = self.backend.current_time().await?;
+        let outcome = self
+            .backend
+            .fire_due_timers(FireDueTimersRequest {
+                namespace: self.namespace.clone(),
+                now,
+                limit: 1024,
             })
             .await?;
-        Ok(true)
+        Ok(outcome.fired)
+    }
+
+    pub async fn run_activity_timeouts_once(&mut self) -> Result<usize> {
+        let now = self.backend.current_time().await?;
+        let outcome = self
+            .backend
+            .timeout_due_activities(TimeoutDueActivitiesRequest {
+                namespace: self.namespace.clone(),
+                now,
+                limit: 1024,
+            })
+            .await?;
+        Ok(outcome.timed_out)
     }
 
     pub async fn run_until_idle(&mut self) -> Result<WorkerRunStats> {
@@ -295,6 +381,21 @@ where
 
             if self.run_workflow_once().await? {
                 stats.workflow_tasks += 1;
+                progressed = true;
+            }
+            let local_activity_tasks = self.take_completed_local_activity_tasks();
+            if local_activity_tasks > 0 {
+                stats.activity_tasks += local_activity_tasks;
+                progressed = true;
+            }
+            let timers_fired = self.run_timers_once().await?;
+            if timers_fired > 0 {
+                stats.timers_fired += timers_fired;
+                progressed = true;
+            }
+            let activities_timed_out = self.run_activity_timeouts_once().await?;
+            if activities_timed_out > 0 {
+                stats.activities_timed_out += activities_timed_out;
                 progressed = true;
             }
             if self.run_activity_once().await? {
@@ -346,6 +447,29 @@ where
     ) -> Result<Poll<Result<crate::PayloadRef>>> {
         loop {
             let poll = poll_cached(future, context);
+            let signal_requests = context.take_signal_requests();
+            if !signal_requests.is_empty() {
+                let mut fulfilled = false;
+                for request in signal_requests {
+                    let signal = self
+                        .backend
+                        .read_signal_inbox(ReadSignalInboxRequest {
+                            run_id: run_id.clone(),
+                            signal_name: request.signal_name,
+                        })
+                        .await?;
+                    let signal = signal.map(|signal| crate::runtime::SignalInboxRecordForRuntime {
+                        signal_id: signal.signal_id,
+                        signal_name: signal.signal_name,
+                        payload: signal.payload,
+                    });
+                    fulfilled |= signal.is_some();
+                    context.fulfill_signal_request(request.command_id, signal);
+                }
+                if fulfilled {
+                    continue;
+                }
+            }
             let Some(after_event_id) = context.needs_more_history_after() else {
                 return Ok(poll);
             };
@@ -369,7 +493,9 @@ where
         poll: Poll<Result<crate::PayloadRef>>,
     ) -> Result<Option<CachedWorkflow>> {
         let next_command_seq = context.next_command_seq();
-        let (mut append_events, schedule_activities) = context.into_commit_parts();
+        let parts = context.into_commit_parts();
+        let default_activity_options = parts.default_activity_options.clone();
+        let mut append_events = parts.append_events;
         let mut terminal = false;
 
         match poll {
@@ -398,8 +524,11 @@ where
                     WorkflowTaskCommit {
                         expected_tail_event_id: claimed.replay_target_event_id,
                         append_events,
-                        schedule_activities,
-                        delete_waits: Vec::new(),
+                        upsert_waits: parts.upsert_waits,
+                        schedule_activities: parts.schedule_activities,
+                        schedule_activity_maps: parts.schedule_activity_maps,
+                        consume_signals: parts.consume_signals,
+                        delete_waits: parts.delete_waits,
                     },
                 )
                 .await?,
@@ -413,7 +542,29 @@ where
             future,
             last_event_id,
             next_command_seq,
+            default_activity_options,
         }))
+    }
+
+    async fn run_local_activities_after_workflow_task(&mut self) -> Result<()> {
+        if self.max_local_activities_per_workflow_task == 0 {
+            return Ok(());
+        }
+        for _ in 0..self.max_local_activities_per_workflow_task {
+            if self.run_activity_once().await? {
+                self.completed_local_activity_tasks =
+                    self.completed_local_activity_tasks.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn take_completed_local_activity_tasks(&mut self) -> usize {
+        let completed = self.completed_local_activity_tasks;
+        self.completed_local_activity_tasks = 0;
+        completed
     }
 }
 
@@ -453,6 +604,7 @@ where
     history_chunk_events: usize,
     history_chunk_bytes: usize,
     nondeterminism_retry_backoff: Duration,
+    max_local_activities_per_workflow_task: usize,
 }
 
 impl<B> WorkerBuilder<B>
@@ -486,6 +638,11 @@ where
 
     pub fn nondeterminism_retry_backoff(mut self, backoff: Duration) -> Self {
         self.nondeterminism_retry_backoff = backoff;
+        self
+    }
+
+    pub fn max_local_activities_per_workflow_task(mut self, limit: usize) -> Self {
+        self.max_local_activities_per_workflow_task = limit;
         self
     }
 
@@ -537,6 +694,8 @@ where
             history_chunk_events: self.history_chunk_events,
             history_chunk_bytes: self.history_chunk_bytes,
             nondeterminism_retry_backoff: self.nondeterminism_retry_backoff,
+            max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
+            completed_local_activity_tasks: 0,
         }
     }
 }

@@ -1,7 +1,7 @@
 ---
 id: 0002
 title: Durable activity, timer, signal, and activity map
-status: not_started
+status: complete
 depends_on: [0001]
 labels: [activities, timers, signals, activity-map, task-queues, examples]
 ---
@@ -39,6 +39,31 @@ primitive.
 - Activity map enforces `max_in_flight` without loading all inputs.
 - Activity map example compiles and runs.
 - Map-reduce example compiles and runs.
+
+## Current State
+
+Implemented and covered:
+
+- Activity scheduling/completion/failure/timeout with durable retry attempts.
+- Workflow-local default activity options for task queue and retry policy.
+- Durable timers, signal inbox reads/consumption, and nondeterminism retry backoff.
+- Explicit local activity preference for activities and activity-map items with
+  remote fallback when local capacity is zero.
+- Generic delayed workflow-task release visibility in memory and SQLite providers.
+- Workflow cancellation that records a terminal history fact and clears
+  provider-owned timer waits, activity tasks, and activity-map item state.
+- Manifest-backed activity map scheduling, bounded item materialization, result
+  manifest writes, terminal failure, retry attempts, root-plus-page manifests,
+  and SQLite restart recovery.
+- Runnable signal wait, timer wait, local/remote activity, activity-map, and
+  map-reduce examples with assertions.
+- Criterion coverage for workflow scheduling/claim/commit/replay, activity
+  claim/complete, timer wakeup, signal send/consume, and activity-map
+  materialization/completion hot paths.
+
+Remaining before this phase is done:
+
+- None.
 
 ## Required Tests
 

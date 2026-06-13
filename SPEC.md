@@ -559,6 +559,7 @@ let worker = durust::Worker::builder(backend.clone())
     .activity_task_queue("payments")
     .register_activity(price_quote)
     .register_activity(charge_card)
+    .max_local_activities_per_workflow_task(64)
     .max_cached_workflows(10_000)
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
@@ -609,6 +610,21 @@ let payment = durust::call_activity!(charge_card(input))
     .await?;
 ```
 
+Workflow code may set workflow-local defaults for subsequent activity calls:
+
+```rust
+durust::set_default_activity_options(
+    durust::ActivityOptions::new()
+        .task_queue("payments")
+        .retry(durust::RetryPolicy::exponential().max_attempts(5))
+        .timeout(std::time::Duration::from_secs(30)),
+);
+```
+
+Defaults are part of deterministic workflow execution. They may be changed with
+normal workflow control flow, apply only to later activity calls in that
+workflow, and are superseded by explicit per-call options.
+
 Queue matching rules:
 
 ```text
@@ -621,7 +637,12 @@ multiple worker processes may poll the same task queue
 one process may poll workflow queues, activity queues, or both
 ```
 
-Local activity preference uses the same registration data. If a workflow worker also has the requested activity registered for the selected activity task queue and has local activity capacity, it should execute locally. Otherwise the scheduled activity task remains available to remote workers polling that queue.
+Local activity preference uses the same registration data. If a workflow worker
+also has the requested activity registered for the selected activity task queue
+and `max_local_activities_per_workflow_task` has available slots, it should
+execute locally after the workflow task commit. Otherwise the scheduled activity
+task remains available to remote workers polling that queue. Setting the local
+limit to `0` disables local activity preference and forces remote dispatch.
 
 Worker builder registration should fail before polling starts if two handlers register the same durable workflow identity or activity identity on the same worker. A worker that receives a task for an unregistered type should reject or release it without executing user code; provider conformance should ensure that such tasks can be claimed by a capable worker later.
 
@@ -950,6 +971,12 @@ For:
 let quote = durust::call_activity!(price_quote(input)).await?;
 ```
 
+The scheduled activity records the resolved task queue, retry policy, and
+per-attempt timeout after merging current workflow defaults with per-call
+overrides. The activity command fingerprint includes that resolved option set,
+so changing defaults or overrides before a recorded activity command is a
+nondeterministic replay change unless it is protected by a version marker.
+
 The durable future behaves like this:
 
 ```text
@@ -960,6 +987,8 @@ Replay mode:
       return recorded result.
   If ActivityFailed exists:
       return recorded failure.
+  If ActivityTimedOut exists:
+      return recorded timeout.
   If scheduled but incomplete:
       return Pending.
   If history cursor is at tail:
@@ -970,6 +999,8 @@ Live cached mode:
       return Pending.
   If completion event was delivered:
       return Ready(result).
+  If timeout event was delivered:
+      return Ready(timeout error).
   If first poll:
       buffer ActivityScheduled command and return Pending.
 ```
@@ -1004,23 +1035,34 @@ Semantics:
 one durable command schedules one manifest-backed map operation
 the map command increments command_seq once
 the map fingerprint includes activity name, input_manifest digest/ref, result_manifest config, max_in_flight, and options digest
-workflow history records ActivityMapScheduled and terminal ActivityMapCompleted/Failed/Cancelled facts
+workflow history records ActivityMapScheduled and terminal ActivityMapCompleted/Failed facts
 workflow history does not record one ActivityScheduled or ActivityCompleted fact per item
 the provider pages through the input manifest and materializes item tasks up to max_in_flight
 each item gets deterministic identity: map_command_id + manifest item ordinal
 per-item state lives in provider map/activity tables and indexes
 results are written to the result manifest, not collected into workflow memory
 replay reconstructs the same map handle from ActivityMapScheduled
+workflow cancellation is recorded as WorkflowCancelled and atomically clears provider-owned waits, activity tasks, and activity-map state for the run
 ```
 
 The canonical input is a paged manifest, not an iterator:
 
 ```text
-manifest_ref
-  page 0 -> input refs 0..9999
-  page 1 -> input refs 10000..19999
-  page 2 -> input refs 20000..29999
+input_manifest_ref -> ActivityMapInputManifest {
+  item_count
+  page_lengths
+  pages: [PayloadRef<ActivityMapInputPage>, ...]
+}
+
+page 0 -> input refs 0..9999
+page 1 -> input refs 10000..19999
+page 2 -> input refs 20000..29999
 ```
+
+Result manifests use the same root-plus-pages shape. `ActivityMapCompleted`
+stores the result root manifest ref, and result pages contain ordered result
+refs using the same page boundaries as the input manifest. This keeps both input
+and result manifests out of one oversized provider row.
 
 Small in-memory inputs should be converted to a manifest before scheduling:
 
@@ -1042,7 +1084,11 @@ The manifest helper is convenience sugar. The durable scheduling semantics remai
 
 When called from workflow code, manifest creation must itself be a durable API with provider-owned payload handling and idempotent commit behavior. For large or externally sourced inputs, prefer an activity such as `partition_input` that writes the manifest and returns its ref.
 
-Activity maps must preserve local activity preference. A workflow worker may execute map items locally when the activity is registered locally and capacity is available; otherwise materialized item tasks are claimed by remote activity workers on the selected task queue.
+Activity maps must preserve local activity preference. A workflow worker may
+execute materialized map items locally when the map activity is registered
+locally and `max_local_activities_per_workflow_task` has available slots;
+otherwise materialized item tasks are claimed by remote activity workers on the
+selected task queue.
 
 Provider implementations must enforce manifest page limits, `max_in_flight`, retry policy, cancellation, and result manifest writes without loading all inputs or results into workflow memory or a single durable row.
 
@@ -1059,7 +1105,11 @@ Otherwise:
     dispatch through the durable activity queue to a remote worker.
 ```
 
-Local preference is only an optimization. The activity still uses the same durable schedule event, idempotency key, retry policy, lease fencing, and completion append as a remote activity. If local execution cannot start promptly, the task remains eligible for remote workers according to the backend's normal claiming rules.
+Local preference is only an optimization. The activity still uses the same
+durable schedule event, idempotency key, retry policy, timeout, lease fencing,
+and completion append as a remote activity. If local execution capacity is zero
+or exhausted, the task remains eligible for remote workers according to the
+backend's normal claiming rules.
 
 ---
 
@@ -1147,6 +1197,16 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: ReadSignalInboxRequest,
     ) -> durust::Result<Option<SignalInboxRecord>>;
 
+    async fn fire_due_timers(
+        &self,
+        req: FireDueTimersRequest,
+    ) -> durust::Result<FireDueTimersOutcome>;
+
+    async fn timeout_due_activities(
+        &self,
+        req: TimeoutDueActivitiesRequest,
+    ) -> durust::Result<TimeoutDueActivitiesOutcome>;
+
     async fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -1225,8 +1285,8 @@ pub struct ActivityMapTask {
     pub map_command_id: CommandId,
     pub activity_name: ActivityName,
     pub task_queue: TaskQueue,
-    pub input_manifest_ref: PayloadRef,
-    pub result_manifest_ref: PayloadRef,
+    pub input_manifest: PayloadRef,
+    pub result_manifest_name: String,
     pub max_in_flight: usize,
     pub retry_policy_ref: Option<PayloadRef>,
     pub options_hash: Sha256,
@@ -1238,7 +1298,13 @@ pub struct ActivityMapItemId {
 }
 ```
 
-The provider persists a compact map descriptor and materializes item tasks from manifest pages subject to `max_in_flight`. The runtime contract is that each item is independently claimable, lease-fenced, retryable, and completable by `ActivityMapItemId`, while workflow history remains compact at the map-operation level.
+The provider persists a compact map descriptor and materializes item tasks from
+manifest pages subject to `max_in_flight`. The root input manifest contains page
+refs and page lengths; providers should load only the page needed for the item
+range they are materializing. Result manifests are written as root-plus-page
+payloads. The runtime contract is that each item is independently claimable,
+lease-fenced, retryable, and completable by `ActivityMapItemId`, while workflow
+history remains compact at the map-operation level.
 
 ## 8.3 Atomicity requirement
 
