@@ -13,7 +13,7 @@ use crate::{
     WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
     WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
     WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest, event_payload_len, is_terminal,
+    encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -65,6 +65,10 @@ impl SqliteBackend {
 }
 
 impl DurableBackend for SqliteBackend {
+    fn payload_storage_config(&self) -> PayloadStorageConfig {
+        self.payload_config.clone()
+    }
+
     fn start_workflow(
         &self,
         req: StartWorkflowRequest,
@@ -1861,10 +1865,18 @@ fn normalize_activity_map_input_manifest_for_storage(
                 .into_iter()
                 .map(|payload| normalize_payload_for_storage(conn, config, payload))
                 .collect::<Result<Vec<_>>>()?;
-            normalize_payload_for_storage(conn, config, crate::encode_payload(&page)?)
+            normalize_payload_for_storage(
+                conn,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
-    normalize_payload_for_storage(conn, config, crate::encode_payload(&manifest)?)
+    normalize_payload_for_storage(
+        conn,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
 }
 
 fn normalize_activity_map_result_manifest_for_storage(
@@ -1885,10 +1897,18 @@ fn normalize_activity_map_result_manifest_for_storage(
                 .into_iter()
                 .map(|payload| normalize_payload_for_storage(conn, config, payload))
                 .collect::<Result<Vec<_>>>()?;
-            normalize_payload_for_storage(conn, config, crate::encode_payload(&page)?)
+            normalize_payload_for_storage(
+                conn,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
-    normalize_payload_for_storage(conn, config, crate::encode_payload(&manifest)?)
+    normalize_payload_for_storage(
+        conn,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
 }
 
 fn hydrate_activity_map_input_manifest_from_storage(
@@ -3151,10 +3171,11 @@ fn complete_map_item(
         hydrate_activity_map_input_manifest_from_storage(tx, map_task.input_manifest.clone())?;
     let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
     let result_refs = activity_map_results(tx, key.as_str())?;
-    let result_manifest = encode_activity_map_result_manifest(
+    let result_manifest = encode_activity_map_result_manifest_with_codec(
         map_task.result_manifest_name,
         result_refs,
         &input_manifest.page_lengths,
+        config.codec,
     )?;
     let Some((tail, terminal)) = tx
         .query_row(

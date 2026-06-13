@@ -6,8 +6,7 @@ use crate::{
     SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs,
     VersionMarker, WaitId, WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind,
     WorkflowChangeVersionRecord, WorkflowId, activity_fingerprint, activity_map_fingerprint,
-    child_workflow_fingerprint, command_id, encode_activity_map_input_manifest, payload_digest,
-    signal_fingerprint, timer_fingerprint,
+    child_workflow_fingerprint, command_id, payload_digest, signal_fingerprint, timer_fingerprint,
 };
 use futures::future::BoxFuture;
 use std::cell::Cell;
@@ -100,6 +99,7 @@ pub(crate) struct RuntimeContext {
     run_id: RunId,
     worker_workflow_task_queue: TaskQueue,
     worker_activity_task_queue: TaskQueue,
+    payload_codec: crate::CodecId,
     default_activity_options: ActivityOptions,
     now: TimestampMs,
     replay_events: Vec<HistoryEvent>,
@@ -200,6 +200,7 @@ impl RuntimeContext {
         run_id: RunId,
         worker_workflow_task_queue: TaskQueue,
         default_activity_task_queue: TaskQueue,
+        payload_codec: crate::CodecId,
         now: TimestampMs,
         replay_events: Vec<HistoryEvent>,
         default_activity_options: ActivityOptions,
@@ -227,6 +228,7 @@ impl RuntimeContext {
             run_id,
             worker_workflow_task_queue,
             worker_activity_task_queue: default_activity_task_queue,
+            payload_codec,
             default_activity_options,
             now,
             replay_events,
@@ -278,6 +280,13 @@ impl RuntimeContext {
 
     pub(crate) fn next_command_seq(&self) -> u64 {
         self.next_command_seq
+    }
+
+    fn encode_payload<T>(&self, value: &T) -> Result<PayloadRef>
+    where
+        T: serde::Serialize + ?Sized,
+    {
+        crate::encode_payload_with_codec(value, self.payload_codec)
     }
 
     pub(crate) fn needs_more_history_after(&mut self) -> Option<crate::EventId> {
@@ -877,9 +886,8 @@ pub fn continue_as_new<T, I>(input: I) -> Result<T>
 where
     I: serde::Serialize,
 {
-    Err(Error::ContinueAsNew {
-        input: crate::encode_payload(&input)?,
-    })
+    let input = with_context(|runtime| runtime.encode_payload(&input))?;
+    Err(Error::ContinueAsNew { input })
 }
 
 pub fn publish<T>(view: &T) -> Result<()>
@@ -887,7 +895,7 @@ where
     T: serde::Serialize + ?Sized,
 {
     with_context(|runtime| {
-        runtime.query_projection = Some(crate::encode_payload(view)?);
+        runtime.query_projection = Some(runtime.encode_payload(view)?);
         Ok(())
     })
 }
@@ -1671,7 +1679,7 @@ where
     let activity_input = input
         .as_ref()
         .expect("activity input exists before schedule");
-    let input_ref = crate::encode_payload(activity_input)?;
+    let input_ref = runtime.encode_payload(activity_input)?;
     let fingerprint = activity_fingerprint(
         A::activity_name(),
         payload_digest(&input_ref),
@@ -1751,11 +1759,17 @@ pub fn activity_map_manifest_with_page_size<T>(
 where
     T: serde::Serialize,
 {
-    let items = items
-        .into_iter()
-        .map(|item| crate::encode_payload(&item))
-        .collect::<Result<Vec<_>>>()?;
-    encode_activity_map_input_manifest(items, page_size)
+    with_context(|runtime| {
+        let items = items
+            .into_iter()
+            .map(|item| runtime.encode_payload(&item))
+            .collect::<Result<Vec<_>>>()?;
+        crate::encode_activity_map_input_manifest_with_codec(
+            items,
+            page_size,
+            runtime.payload_codec,
+        )
+    })
 }
 
 pub struct ActivityMapBuilder<A>
@@ -2166,7 +2180,7 @@ where
             .input
             .as_ref()
             .expect("child workflow input exists before schedule");
-        let input_ref = crate::encode_payload(input)?;
+        let input_ref = runtime.encode_payload(input)?;
         let fingerprint = child_workflow_fingerprint(
             W::workflow_type(),
             workflow_id.clone(),

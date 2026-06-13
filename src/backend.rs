@@ -1,12 +1,17 @@
 use crate::{
     ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
-    DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef, Result, RunId,
-    SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId, WorkflowId, WorkflowType,
+    DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef, PayloadStorageConfig,
+    Result, RunId, SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId, WorkflowId,
+    WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
 
 pub trait DurableBackend: Clone + Send + Sync + 'static {
+    fn payload_storage_config(&self) -> PayloadStorageConfig {
+        PayloadStorageConfig::default()
+    }
+
     fn start_workflow(
         &self,
         req: StartWorkflowRequest,

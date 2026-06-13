@@ -190,6 +190,46 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
 }
 
 #[test]
+fn memory_provider_json_codec_round_trips_nested_activity_map_payloads() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new()
+                .codec(durust::CodecId::Json)
+                .inline_threshold_bytes(1),
+        );
+        payload_json_activity_map_round_trip(backend, "memory-json").await;
+    });
+}
+
+#[test]
+fn sqlite_provider_json_codec_round_trips_nested_activity_map_payloads_after_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload-json-map.sqlite3");
+        let config = durust::PayloadStorageConfig::new()
+            .codec(durust::CodecId::Json)
+            .inline_threshold_bytes(1);
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let run_id = payload_json_activity_map_round_trip(backend, "sqlite-json").await;
+
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        let history = stream_history(&reopened, run_id).await;
+        let HistoryEventData::ActivityMapCompleted(completed) = &history[2].data else {
+            panic!("expected persisted JSON activity map completion after reopen");
+        };
+        assert_eq!(completed.result_manifest.codec(), durust::CodecId::Json);
+        let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|payload| payload.codec())
+                .collect::<Vec<_>>(),
+            vec![durust::CodecId::Json, durust::CodecId::Json]
+        );
+    });
+}
+
+#[test]
 fn registry_rejects_duplicate_handler_identities() {
     let mut registry = Registry::default();
     registry.register_workflow::<workflow>().unwrap();
@@ -1021,6 +1061,199 @@ where
             large_payload("map-result-2")
         ]
     );
+}
+
+async fn payload_json_activity_map_round_trip<B>(backend: B, prefix: &str) -> durust::RunId
+where
+    B: DurableBackend,
+{
+    assert_eq!(
+        backend.payload_storage_config().codec,
+        durust::CodecId::Json
+    );
+    let workflow_id = format!("wf/{prefix}-payload-map");
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new("payload-json-map-workflows"),
+            input: json_payload(&0_u64),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let start_history = stream_history(&backend, run_id.clone()).await;
+    let HistoryEventData::WorkflowStarted { input, .. } = &start_history[0].data else {
+        panic!("expected JSON workflow start");
+    };
+    assert_eq!(input.codec(), durust::CodecId::Json);
+
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-json-map-scheduler")),
+            workflow_claim_opts("payload-json-map-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_manifest = durust::encode_activity_map_input_manifest_with_codec(
+        ["json-map-input-0", "json-map-input-1"]
+            .into_iter()
+            .map(|label| json_payload(&large_payload(label)))
+            .collect(),
+        1,
+        durust::CodecId::Json,
+    )
+    .unwrap();
+    assert_eq!(input_manifest.codec(), durust::CodecId::Json);
+
+    let activity_name = ActivityName::new("conformance.echo");
+    let task_queue = TaskQueue::new("payload-json-map-activities");
+    let retry_policy = durust::RetryPolicy::none();
+    let map_task = ActivityMapTask {
+        map_command_id: command_id.clone(),
+        activity_name: activity_name.clone(),
+        task_queue: task_queue.clone(),
+        retry_policy: retry_policy.clone(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input_manifest: input_manifest.clone(),
+        result_manifest_name: "payload-json-results".to_owned(),
+        max_in_flight: 2,
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
+                        command_id: command_id.clone(),
+                        activity_name,
+                        task_queue,
+                        retry_policy,
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                        input_manifest: input_manifest.clone(),
+                        result_manifest_name: "payload-json-results".to_owned(),
+                        max_in_flight: 2,
+                        fingerprint: durust::activity_map_fingerprint(
+                            ActivityName::new("conformance.echo"),
+                            durust::payload_digest(&input_manifest),
+                            "payload-json-results".to_owned(),
+                            2,
+                            "sha256:payload-json-map-options".to_owned(),
+                        ),
+                    }),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: vec![map_task],
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("payload-json-map-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new(format!("{prefix}-payload-json-map-0")),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first JSON map task");
+    let second = backend
+        .claim_activity_task(
+            WorkerId::new(format!("{prefix}-payload-json-map-1")),
+            activity_opts,
+        )
+        .await
+        .unwrap()
+        .expect("second JSON map task");
+    assert_eq!(first.task.input.codec(), durust::CodecId::Json);
+    assert_eq!(second.task.input.codec(), durust::CodecId::Json);
+    assert_eq!(
+        durust::decode_payload::<String>(&first.task.input).unwrap(),
+        large_payload("json-map-input-0")
+    );
+    assert_eq!(
+        durust::decode_payload::<String>(&second.task.input).unwrap(),
+        large_payload("json-map-input-1")
+    );
+
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: json_payload(&large_payload("json-map-result-0")),
+        })
+        .await
+        .unwrap();
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: json_payload(&large_payload("json-map-result-1")),
+        })
+        .await
+        .unwrap();
+
+    let history = stream_history(&backend, run_id.clone()).await;
+    let HistoryEventData::ActivityMapScheduled(scheduled) = &history[1].data else {
+        panic!("expected JSON activity map scheduled event");
+    };
+    assert_eq!(scheduled.input_manifest.codec(), durust::CodecId::Json);
+    let manifest: ActivityMapInputManifest =
+        durust::decode_payload(&scheduled.input_manifest).unwrap();
+    for page in &manifest.pages {
+        assert_eq!(page.codec(), durust::CodecId::Json);
+        let page: durust::ActivityMapInputPage = durust::decode_payload(page).unwrap();
+        assert_eq!(page.items[0].codec(), durust::CodecId::Json);
+    }
+
+    let HistoryEventData::ActivityMapCompleted(completed) = &history[2].data else {
+        panic!("expected JSON activity map completed event");
+    };
+    assert_eq!(completed.result_manifest.codec(), durust::CodecId::Json);
+    let result_manifest: ActivityMapResultManifest =
+        durust::decode_payload(&completed.result_manifest).unwrap();
+    for page in &result_manifest.pages {
+        assert_eq!(page.codec(), durust::CodecId::Json);
+        let page: durust::ActivityMapResultPage = durust::decode_payload(page).unwrap();
+        assert_eq!(page.results[0].codec(), durust::CodecId::Json);
+    }
+    let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .map(|payload| durust::decode_payload::<String>(payload).unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            large_payload("json-map-result-0"),
+            large_payload("json-map-result-1"),
+        ]
+    );
+
+    run_id
+}
+
+fn json_payload<T>(value: &T) -> durust::PayloadRef
+where
+    T: Serialize + ?Sized,
+{
+    durust::encode_payload_with_codec(value, durust::CodecId::Json).unwrap()
 }
 
 fn assert_string_map_item(task: &durust::ActivityTask, ordinal: u64, label: &str) {

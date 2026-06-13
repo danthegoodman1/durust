@@ -42,6 +42,7 @@ where
 {
     backend: B,
     namespace: Namespace,
+    payload_codec: crate::CodecId,
 }
 
 impl<B> Client<B>
@@ -49,9 +50,11 @@ where
     B: DurableBackend,
 {
     pub fn new(backend: B) -> Self {
+        let payload_codec = backend.payload_storage_config().codec;
         Self {
             backend,
             namespace: Namespace::default(),
+            payload_codec,
         }
     }
 
@@ -76,7 +79,7 @@ where
                 workflow_id: WorkflowId::new(workflow_id),
                 workflow_type: W::workflow_type(),
                 task_queue: TaskQueue::new(task_queue),
-                input: crate::encode_payload(&input)?,
+                input: crate::encode_payload_with_codec(&input, self.payload_codec)?,
             })
             .await?;
         Ok(outcome.run_id().clone())
@@ -98,7 +101,7 @@ where
                 workflow_id: WorkflowId::new(workflow_id),
                 signal_id: crate::SignalId::new(signal_id),
                 signal_name: crate::SignalName::new(signal_name),
-                payload: crate::encode_payload(&payload)?,
+                payload: crate::encode_payload_with_codec(&payload, self.payload_codec)?,
             })
             .await
     }
@@ -153,6 +156,7 @@ where
     cache: BTreeMap<RunId, CachedWorkflow>,
     history_chunk_events: usize,
     history_chunk_bytes: usize,
+    payload_codec: crate::CodecId,
     nondeterminism_retry_backoff: Duration,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
@@ -230,6 +234,7 @@ where
                         claimed.run_id.clone(),
                         self.workflow_task_queue.clone(),
                         self.activity_task_queue.clone(),
+                        self.payload_codec,
                         now,
                         chunk.events,
                         cached.default_activity_options,
@@ -275,11 +280,12 @@ where
                                     Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()))
                                 }
                                 Some(registration) => {
-                                    let mut future = registration.run(input);
+                                    let mut future = registration.run(input, self.payload_codec);
                                     let mut context = crate::runtime::RuntimeContext::new(
                                         claimed.run_id.clone(),
                                         self.workflow_task_queue.clone(),
                                         self.activity_task_queue.clone(),
+                                        self.payload_codec,
                                         now,
                                         replay_events,
                                         crate::ActivityOptions::default(),
@@ -376,7 +382,7 @@ where
                     .await
             })
         });
-        let mut future = registration.run(claimed.task.input);
+        let mut future = registration.run(claimed.task.input, self.payload_codec);
         let result = std::future::poll_fn(|cx| {
             poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
         })
@@ -770,6 +776,7 @@ where
     }
 
     pub fn build(self) -> Worker<B> {
+        let payload_codec = self.backend.payload_storage_config().codec;
         Worker {
             backend: self.backend,
             namespace: self.namespace,
@@ -780,6 +787,7 @@ where
             cache: BTreeMap::new(),
             history_chunk_events: self.history_chunk_events,
             history_chunk_bytes: self.history_chunk_bytes,
+            payload_codec,
             nondeterminism_retry_backoff: self.nondeterminism_retry_backoff,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,

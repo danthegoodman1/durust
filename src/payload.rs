@@ -91,6 +91,12 @@ pub struct PayloadBlob {
 }
 
 impl PayloadRef {
+    pub fn codec(&self) -> CodecId {
+        match self {
+            PayloadRef::Inline { codec, .. } | PayloadRef::Blob { codec, .. } => *codec,
+        }
+    }
+
     pub fn inline_messagepack<T>(value: &T) -> Result<Self>
     where
         T: Serialize + ?Sized,
@@ -230,7 +236,13 @@ pub fn decode_payload<T>(payload: &PayloadRef) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    payload.decode_messagepack()
+    match payload.codec() {
+        CodecId::MessagePack => payload.decode_messagepack(),
+        CodecId::Json => payload.decode_json(),
+        CodecId::Protobuf => Err(Error::PayloadDecode(
+            "protobuf payload codec is not enabled".to_owned(),
+        )),
+    }
 }
 
 pub fn type_fingerprint<T: ?Sized>() -> String {
@@ -300,16 +312,17 @@ where
         .into_iter()
         .map(|page| {
             let page = load_container(page)?;
+            let page_codec = page.codec();
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page
                 .items
                 .into_iter()
                 .map(&mut *map_leaf)
                 .collect::<Result<Vec<_>>>()?;
-            finish_container(crate::encode_payload(&page)?)
+            finish_container(crate::encode_payload_with_codec(&page, page_codec)?)
         })
         .collect::<Result<Vec<_>>>()?;
-    finish_container(crate::encode_payload(&manifest)?)
+    finish_container(crate::encode_payload_with_codec(&manifest, root.codec())?)
 }
 
 pub(crate) fn map_activity_map_result_manifest_ref<FLoad, FLeaf, FFinish>(
@@ -330,16 +343,17 @@ where
         .into_iter()
         .map(|page| {
             let page = load_container(page)?;
+            let page_codec = page.codec();
             let mut page: ActivityMapResultPage = crate::decode_payload(&page)?;
             page.results = page
                 .results
                 .into_iter()
                 .map(&mut *map_leaf)
                 .collect::<Result<Vec<_>>>()?;
-            finish_container(crate::encode_payload(&page)?)
+            finish_container(crate::encode_payload_with_codec(&page, page_codec)?)
         })
         .collect::<Result<Vec<_>>>()?;
-    finish_container(crate::encode_payload(&manifest)?)
+    finish_container(crate::encode_payload_with_codec(&manifest, root.codec())?)
 }
 
 pub(crate) fn map_child_start_payloads<F>(

@@ -568,8 +568,13 @@ Codec choices, inline thresholds, blob-store integrations, and provider test
 fixtures are provider implementation details. They are part of the durability
 contract, not the workflow API.
 
+The default durable codec is MessagePack. Providers may opt into JSON for
+debugging or export; typed client, workflow, activity, signal, child, map, and
+query APIs use the provider-configured codec for new payloads, while replay
+decodes each stored payload by its recorded codec.
+
 In tests or local providers, force small inline thresholds to exercise the blob
-path:
+path, or choose JSON explicitly:
 
 ```rust
 let backend = durust::MemoryBackend::with_payload_storage(
@@ -580,6 +585,10 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
     "durust.sqlite3",
     durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
 )?;
+
+let debug_backend = durust::MemoryBackend::with_payload_storage(
+    durust::PayloadStorageConfig::new().codec(durust::CodecId::Json),
+);
 ```
 
 The provider validates blob digests and hydrates payloads before returning them

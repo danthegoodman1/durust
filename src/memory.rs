@@ -13,7 +13,7 @@ use crate::{
     WaitId, WaitKind, WaitRecord, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
     WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
     WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
-    digest_bytes, encode_activity_map_result_manifest, event_payload_len, is_terminal,
+    digest_bytes, encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -139,6 +139,10 @@ struct QueryProjectionRecord {
 }
 
 impl DurableBackend for MemoryBackend {
+    fn payload_storage_config(&self) -> PayloadStorageConfig {
+        self.payload_config.clone()
+    }
+
     fn start_workflow(
         &self,
         req: StartWorkflowRequest,
@@ -1680,10 +1684,11 @@ fn complete_map_item(
                         .ok_or_else(|| Error::Backend(format!("missing result for item {ordinal}")))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let result_manifest = encode_activity_map_result_manifest(
+            let result_manifest = encode_activity_map_result_manifest_with_codec(
                 map.task.result_manifest_name.clone(),
                 results,
                 &map.input_manifest.page_lengths,
+                config.codec,
             )?;
             completed_map = Some((result_manifest, map.input_manifest.item_count));
         }
@@ -2172,10 +2177,18 @@ fn normalize_activity_map_input_manifest_for_storage(
                 .into_iter()
                 .map(|payload| normalize_payload_for_storage(state, config, payload))
                 .collect::<Result<Vec<_>>>()?;
-            normalize_payload_for_storage(state, config, crate::encode_payload(&page)?)
+            normalize_payload_for_storage(
+                state,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
-    normalize_payload_for_storage(state, config, crate::encode_payload(&manifest)?)
+    normalize_payload_for_storage(
+        state,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
 }
 
 fn normalize_activity_map_result_manifest_for_storage(
@@ -2196,10 +2209,18 @@ fn normalize_activity_map_result_manifest_for_storage(
                 .into_iter()
                 .map(|payload| normalize_payload_for_storage(state, config, payload))
                 .collect::<Result<Vec<_>>>()?;
-            normalize_payload_for_storage(state, config, crate::encode_payload(&page)?)
+            normalize_payload_for_storage(
+                state,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
-    normalize_payload_for_storage(state, config, crate::encode_payload(&manifest)?)
+    normalize_payload_for_storage(
+        state,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
 }
 
 fn hydrate_activity_map_input_manifest_from_storage(

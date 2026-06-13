@@ -61,6 +61,13 @@ Implemented and covered:
 - `PayloadStorageConfig` with a default MessagePack codec and 8 KiB inline
   threshold.
 - Explicit JSON payload encode/decode helpers for debug/export paths.
+- Provider-configured codec selection for typed workflow/activity APIs:
+  `Client`, `Worker`, workflow-side durable APIs, activity outputs, child
+  starts, query projections, and activity-map manifests encode new payloads with
+  the backend's configured codec.
+- Codec-aware generic payload decoding that dispatches from the recorded
+  `PayloadRef` codec, allowing replay to read histories containing MessagePack
+  and JSON payloads.
 - Provider-owned inline/blob threshold enforcement for `MemoryBackend` and
   `SqliteBackend`.
 - SQLite `payload_blobs` storage that persists compact `PayloadRef::Blob`
@@ -83,12 +90,15 @@ Implemented and covered:
 - Provider conformance coverage proving overwritten query-projection blobs are
   collected while the retained projection remains readable after SQLite
   close/reopen.
+- Replay-core regression coverage proving JSON-configured typed client,
+  workflow, activity, signal, and query APIs round-trip through normal worker
+  execution.
+- Provider conformance coverage proving JSON-configured nested activity-map
+  manifests and result manifests hydrate after provider offload, including
+  SQLite close/reopen.
 
 Remaining before this phase is done:
 
-- Provider-configured codec selection for typed workflow/activity APIs. The
-  current runtime still encodes typed values with MessagePack before providers
-  see them.
 - SQLite S3-compatible/Garage blob-store integration, transient upload failure
   behavior, and object-store GC coverage.
 - Lazy nested payload hydration during replay. Current public reads hydrate

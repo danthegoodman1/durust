@@ -470,21 +470,35 @@ pub fn encode_activity_map_input_manifest(
     items: Vec<PayloadRef>,
     page_size: usize,
 ) -> Result<PayloadRef> {
+    encode_activity_map_input_manifest_with_codec(items, page_size, crate::CodecId::MessagePack)
+}
+
+pub fn encode_activity_map_input_manifest_with_codec(
+    items: Vec<PayloadRef>,
+    page_size: usize,
+    codec: crate::CodecId,
+) -> Result<PayloadRef> {
     let page_size = page_size.max(1);
     let item_count = items.len();
     let mut page_lengths = Vec::new();
     let mut pages = Vec::new();
     for chunk in items.chunks(page_size) {
         page_lengths.push(chunk.len());
-        pages.push(crate::encode_payload(&ActivityMapInputPage {
-            items: chunk.to_vec(),
-        })?);
+        pages.push(crate::encode_payload_with_codec(
+            &ActivityMapInputPage {
+                items: chunk.to_vec(),
+            },
+            codec,
+        )?);
     }
-    crate::encode_payload(&ActivityMapInputManifest {
-        item_count,
-        page_lengths,
-        pages,
-    })
+    crate::encode_payload_with_codec(
+        &ActivityMapInputManifest {
+            item_count,
+            page_lengths,
+            pages,
+        },
+        codec,
+    )
 }
 
 pub fn activity_map_input_at(
@@ -527,6 +541,20 @@ pub fn encode_activity_map_result_manifest(
     results: Vec<PayloadRef>,
     page_lengths: &[usize],
 ) -> Result<PayloadRef> {
+    encode_activity_map_result_manifest_with_codec(
+        name,
+        results,
+        page_lengths,
+        crate::CodecId::MessagePack,
+    )
+}
+
+pub fn encode_activity_map_result_manifest_with_codec(
+    name: String,
+    results: Vec<PayloadRef>,
+    page_lengths: &[usize],
+    codec: crate::CodecId,
+) -> Result<PayloadRef> {
     let item_count = results.len();
     let expected: usize = page_lengths.iter().copied().sum();
     if expected != item_count {
@@ -539,18 +567,24 @@ pub fn encode_activity_map_result_manifest(
     let mut offset = 0usize;
     for page_len in page_lengths {
         let end = offset + page_len;
-        pages.push(crate::encode_payload(&ActivityMapResultPage {
-            results: results[offset..end].to_vec(),
-        })?);
+        pages.push(crate::encode_payload_with_codec(
+            &ActivityMapResultPage {
+                results: results[offset..end].to_vec(),
+            },
+            codec,
+        )?);
         offset = end;
     }
 
-    crate::encode_payload(&ActivityMapResultManifest {
-        name,
-        item_count,
-        page_lengths: page_lengths.to_vec(),
-        pages,
-    })
+    crate::encode_payload_with_codec(
+        &ActivityMapResultManifest {
+            name,
+            item_count,
+            page_lengths: page_lengths.to_vec(),
+            pages,
+        },
+        codec,
+    )
 }
 
 pub fn decode_activity_map_result_refs(manifest_ref: &PayloadRef) -> Result<Vec<PayloadRef>> {

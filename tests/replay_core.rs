@@ -546,6 +546,23 @@ fn query_status(view: &QueryView) -> String {
     view.status.clone()
 }
 
+#[durust::workflow(name = "tests.provider-json-codec", version = 1, query_state = QueryView)]
+async fn provider_json_codec_workflow(input: u64) -> durust::Result<u64> {
+    durust::publish(&QueryView {
+        status: "started".to_owned(),
+        value: input,
+    })?;
+    let doubled = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("json-activities")
+        .await?;
+    let signal = durust::signal::<String>("advance").await?;
+    durust::publish(&QueryView {
+        status: signal,
+        value: doubled,
+    })?;
+    Ok(doubled + 1)
+}
+
 #[durust::workflow(name = "tests.continue-as-new", version = 1)]
 async fn continue_as_new_workflow(input: ContinueInput) -> durust::Result<u64> {
     if input.remaining > 0 {
@@ -2485,6 +2502,126 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
             history.last().expect("terminal event").data,
             HistoryEventData::WorkflowCompleted { .. }
         ));
+    });
+}
+
+#[test]
+fn provider_configured_json_codec_round_trips_typed_runtime_apis() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().codec(durust::CodecId::Json),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<provider_json_codec_workflow>(
+                "wf/provider-json-codec",
+                "json-workflows",
+                21,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("json-workflows")
+            .activity_task_queue("json-activities")
+            .register_workflow(provider_json_codec_workflow)
+            .register_activity(double)
+            .build();
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected WorkflowStarted");
+        };
+        assert_eq!(input.codec(), durust::CodecId::Json);
+        assert_eq!(durust::decode_payload::<u64>(input).unwrap(), 21);
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let query = backend
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/provider-json-codec"),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = query else {
+            panic!("expected started query projection");
+        };
+        assert_eq!(payload.codec(), durust::CodecId::Json);
+        assert_eq!(
+            durust::decode_payload::<QueryView>(&payload).unwrap(),
+            QueryView {
+                status: "started".to_owned(),
+                value: 21,
+            }
+        );
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("expected ActivityScheduled");
+        };
+        assert_eq!(scheduled.input.codec(), durust::CodecId::Json);
+        assert_eq!(
+            durust::decode_payload::<NumberInput>(&scheduled.input).unwrap(),
+            NumberInput { value: 21 }
+        );
+
+        assert!(worker.run_activity_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityCompleted(completed) = &history[2].data else {
+            panic!("expected ActivityCompleted");
+        };
+        assert_eq!(completed.result.codec(), durust::CodecId::Json);
+        assert_eq!(
+            durust::decode_payload::<u64>(&completed.result).unwrap(),
+            42
+        );
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow(
+                "wf/provider-json-codec",
+                "advance",
+                "signal/provider-json-codec/advance",
+                "done",
+            )
+            .await
+            .unwrap();
+        let signal = backend
+            .read_signal_inbox(durust::ReadSignalInboxRequest {
+                run_id: run_id.clone(),
+                signal_name: durust::SignalName::new("advance"),
+            })
+            .await
+            .unwrap()
+            .expect("signal payload");
+        assert_eq!(signal.payload.codec(), durust::CodecId::Json);
+        assert_eq!(
+            durust::decode_payload::<String>(&signal.payload).unwrap(),
+            "done"
+        );
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::SignalConsumed(consumed) = &history[3].data else {
+            panic!("expected SignalConsumed");
+        };
+        assert_eq!(consumed.payload.codec(), durust::CodecId::Json);
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("expected WorkflowCompleted");
+        };
+        assert_eq!(result.codec(), durust::CodecId::Json);
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 43);
+
+        let view = client
+            .query_projection::<provider_json_codec_workflow>("wf/provider-json-codec")
+            .await
+            .unwrap()
+            .expect("updated projection");
+        assert_eq!(
+            view,
+            QueryView {
+                status: "done".to_owned(),
+                value: 42,
+            }
+        );
     });
 }
 

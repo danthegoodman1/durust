@@ -20,15 +20,16 @@ fn json_payload_round_trips_when_explicitly_encoded() {
         value: "json".to_owned(),
     };
     let payload = durust::encode_payload_with_codec(&sample, durust::CodecId::Json).unwrap();
+    assert_eq!(durust::decode_payload::<Sample>(&payload).unwrap(), sample);
     assert_eq!(payload.decode_json::<Sample>().unwrap(), sample);
 }
 
 #[test]
 fn codec_mismatch_fails_clearly() {
     let payload = durust::encode_payload_with_codec(&"json", durust::CodecId::Json).unwrap();
-    let err = durust::decode_payload::<String>(&payload).unwrap_err();
+    let err = payload.decode_messagepack::<String>().unwrap_err();
     assert!(
-        matches!(err, durust::Error::PayloadDecode(message) if message.contains("unsupported inline codec"))
+        matches!(err, durust::Error::PayloadDecode(message) if message.contains("unsupported inline codec for MessagePack decode"))
     );
 }
 

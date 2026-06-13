@@ -1,5 +1,5 @@
 use crate::{
-    ActivityName, DurableManifest, ManifestActivity, ManifestWorkflow, PayloadRef, Result,
+    ActivityName, CodecId, DurableManifest, ManifestActivity, ManifestWorkflow, PayloadRef, Result,
     WorkflowType,
 };
 use futures::future::BoxFuture;
@@ -77,7 +77,7 @@ pub struct WorkflowRegistration {
     pub input_schema_hash: String,
     pub output_schema_hash: String,
     pub query_state_schema_hash: Option<String>,
-    run: Arc<dyn Fn(PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
+    run: Arc<dyn Fn(PayloadRef, CodecId) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
 }
 
 impl WorkflowRegistration {
@@ -94,18 +94,18 @@ impl WorkflowRegistration {
             input_schema_hash: crate::type_fingerprint::<W::Input>(),
             output_schema_hash: crate::type_fingerprint::<W::Output>(),
             query_state_schema_hash: W::query_state_type_name().map(crate::type_name_fingerprint),
-            run: Arc::new(|input| {
+            run: Arc::new(|input, codec| {
                 Box::pin(async move {
                     let input = crate::decode_payload::<W::Input>(&input)?;
                     let output = W::default().run(input).await?;
-                    crate::encode_payload(&output)
+                    crate::encode_payload_with_codec(&output, codec)
                 })
             }),
         }
     }
 
-    pub fn run(&self, input: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
-        (self.run)(input)
+    pub fn run(&self, input: PayloadRef, codec: CodecId) -> BoxFuture<'static, Result<PayloadRef>> {
+        (self.run)(input, codec)
     }
 }
 
@@ -117,7 +117,7 @@ pub struct ActivityRegistration {
     pub output_type: &'static str,
     pub input_schema_hash: String,
     pub output_schema_hash: String,
-    run: Arc<dyn Fn(PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
+    run: Arc<dyn Fn(PayloadRef, CodecId) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
 }
 
 impl ActivityRegistration {
@@ -132,18 +132,18 @@ impl ActivityRegistration {
             output_type: A::output_type_name(),
             input_schema_hash: crate::type_fingerprint::<A::Input>(),
             output_schema_hash: crate::type_fingerprint::<A::Output>(),
-            run: Arc::new(|input| {
+            run: Arc::new(|input, codec| {
                 Box::pin(async move {
                     let input = crate::decode_payload::<A::Input>(&input)?;
                     let output = A::default().run(input).await?;
-                    crate::encode_payload(&output)
+                    crate::encode_payload_with_codec(&output, codec)
                 })
             }),
         }
     }
 
-    pub fn run(&self, input: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
-        (self.run)(input)
+    pub fn run(&self, input: PayloadRef, codec: CodecId) -> BoxFuture<'static, Result<PayloadRef>> {
+        (self.run)(input, codec)
     }
 }
 
