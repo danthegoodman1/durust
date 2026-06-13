@@ -31,3 +31,6 @@ Every item must leave behind:
 - Example coverage when the item adds public DX.
 - Criterion benchmarks for new hot paths.
 - Clear docs when public behavior changes.
+- A public API budget for every new first-class API, explaining why existing
+  primitives are insufficient and what scalability or determinism invariant the
+  API protects.

@@ -29,6 +29,34 @@ If `README.md`, `SPEC.md`, `impl-plan/`, and implementation behavior disagree, u
 - Add abstraction only when deterministic tests, conformance gaps, benchmark evidence, or real duplication proves the need.
 - Treat performance as a gate after correctness, not as permission to complicate unproven code.
 
+## Public API Discipline
+
+Durust should stay small because durable execution APIs are hard to remove once
+history depends on them. Optimize for simplicity, scalability, and performance
+through composable primitives before adding first-class surface area.
+
+Before adding a public API, write down the API budget in the relevant plan or
+spec change:
+
+- What existing primitive composition would look like.
+- Why that composition is insufficient for correctness, scalability, or
+  performance rather than merely less convenient.
+- The scaling invariant the new API protects, such as bounded history entries,
+  bounded provider rows, bounded memory, deterministic polling order, or bounded
+  recovery work.
+- The provider contract change, if any, and why it is generic rather than tied
+  to one runtime feature.
+- The conformance, replay, simulation, and benchmark coverage that proves the
+  API earns its place.
+
+Do not add first-class APIs for values or progress that can be represented by
+composing existing durable primitives without unbounded history, unbounded rows,
+hidden replay state, or avoidable hot-path cost. Favor small generic mechanisms
+over feature-specific helpers. Good first-class APIs are reserved for behavior
+that would otherwise scale poorly or become nondeterministic when hand-rolled,
+such as manifest-backed map reduce, dynamic `select_all`, and dynamic
+`join_all`.
+
 ## Test Coverage Requirements
 
 Every meaningful change needs comprehensive deterministic coverage for the behavior it touches.
