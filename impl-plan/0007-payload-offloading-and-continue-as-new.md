@@ -77,6 +77,12 @@ Implemented and covered:
 - Runnable `payload_offload` example that forces provider-owned blob storage.
 - Criterion benchmark coverage for MessagePack/JSON encode/decode and
   inline-vs-blob history streaming over 64 KiB payloads.
+- Generic dry-run-capable provider payload GC, with memory and SQLite
+  implementations that retain blobs reachable from history, activities, maps,
+  child outbox, signals, and query projections.
+- Provider conformance coverage proving overwritten query-projection blobs are
+  collected while the retained projection remains readable after SQLite
+  close/reopen.
 
 Remaining before this phase is done:
 
@@ -84,7 +90,7 @@ Remaining before this phase is done:
   current runtime still encodes typed values with MessagePack before providers
   see them.
 - SQLite S3-compatible/Garage blob-store integration, transient upload failure
-  behavior, and orphan blob GC.
+  behavior, and object-store GC coverage.
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
 - Blob-path coverage for side effects once side effects are implemented.

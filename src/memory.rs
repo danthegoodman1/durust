@@ -16,7 +16,7 @@ use crate::{
     digest_bytes, encode_activity_map_result_manifest, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1098,6 +1098,34 @@ impl DurableBackend for MemoryBackend {
         });
         Box::pin(ready(Ok(WorkflowChangeVersionsOutcome { records })))
     }
+
+    fn gc_payload_blobs(
+        &self,
+        req: crate::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, Result<crate::PayloadGarbageCollectionOutcome>> {
+        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let scanned_blobs = state.payload_blobs.len();
+        let mut reachable = BTreeSet::new();
+        if let Err(err) = collect_reachable_payload_blobs(&state, &mut reachable) {
+            return Box::pin(ready(Err(err)));
+        }
+        let retained_blobs = reachable.len();
+        let deleted_blobs = state
+            .payload_blobs
+            .keys()
+            .filter(|digest| !reachable.contains(*digest))
+            .count();
+        if !req.dry_run {
+            state
+                .payload_blobs
+                .retain(|digest, _| reachable.contains(digest));
+        }
+        Box::pin(ready(Ok(crate::PayloadGarbageCollectionOutcome {
+            scanned_blobs,
+            retained_blobs,
+            deleted_blobs,
+        })))
+    }
 }
 
 fn materialize_activity_map_items(
@@ -1848,6 +1876,166 @@ fn normalize_history_events_for_storage(
             })
         })
         .collect()
+}
+
+fn collect_reachable_payload_blobs(
+    state: &MemoryState,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    for run in state.runs.values() {
+        for event in &run.history {
+            collect_history_event_payload_blobs(state, &event.data, reachable)?;
+        }
+    }
+    for record in state.activities.values() {
+        collect_payload_blob_ref(state, &record.task.input, reachable)?;
+    }
+    for map in state.activity_maps.values() {
+        collect_activity_map_input_manifest_ref(state, &map.task.input_manifest, reachable)?;
+        collect_activity_map_input_manifest(state, &map.input_manifest, reachable)?;
+        for result in map.results.values() {
+            collect_payload_blob_ref(state, result, reachable)?;
+        }
+    }
+    for record in state.child_outbox.values() {
+        collect_payload_blob_ref(state, &record.message.input, reachable)?;
+    }
+    for signal in state.signals.values() {
+        collect_payload_blob_ref(state, &signal.payload, reachable)?;
+    }
+    for projection in state.query_projections.values() {
+        collect_payload_blob_ref(state, &projection.payload, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_history_event_payload_blobs(
+    state: &MemoryState,
+    data: &HistoryEventData,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    match data {
+        HistoryEventData::WorkflowStarted { input, .. }
+        | HistoryEventData::WorkflowContinuedAsNew { input } => {
+            collect_payload_blob_ref(state, input, reachable)
+        }
+        HistoryEventData::WorkflowCompleted { result } => {
+            collect_payload_blob_ref(state, result, reachable)
+        }
+        HistoryEventData::WorkflowFailed { failure } => {
+            collect_failure_payload_blobs(state, failure, reachable)
+        }
+        HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
+            Ok(())
+        }
+        HistoryEventData::ActivityScheduled(scheduled) => {
+            collect_payload_blob_ref(state, &scheduled.input, reachable)
+        }
+        HistoryEventData::ActivityMapScheduled(scheduled) => {
+            collect_activity_map_input_manifest_ref(state, &scheduled.input_manifest, reachable)
+        }
+        HistoryEventData::ActivityMapCompleted(completed) => {
+            collect_activity_map_result_manifest_ref(state, &completed.result_manifest, reachable)
+        }
+        HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_blobs(state, &failed.failure, reachable)
+        }
+        HistoryEventData::ActivityCompleted(completed) => {
+            collect_payload_blob_ref(state, &completed.result, reachable)
+        }
+        HistoryEventData::ActivityFailed(failed) => {
+            collect_failure_payload_blobs(state, &failed.failure, reachable)
+        }
+        HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
+        HistoryEventData::ChildWorkflowStartRequested(requested) => {
+            collect_payload_blob_ref(state, &requested.input, reachable)
+        }
+        HistoryEventData::ChildWorkflowCompleted(completed) => {
+            collect_payload_blob_ref(state, &completed.result, reachable)
+        }
+        HistoryEventData::ChildWorkflowFailed(failed) => {
+            collect_failure_payload_blobs(state, &failed.failure, reachable)
+        }
+        HistoryEventData::SignalConsumed(signal) => {
+            collect_payload_blob_ref(state, &signal.payload, reachable)
+        }
+    }
+}
+
+fn collect_failure_payload_blobs(
+    state: &MemoryState,
+    failure: &crate::DurableFailure,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    if let Some(details) = &failure.details {
+        collect_payload_blob_ref(state, details, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_payload_blob_ref(
+    state: &MemoryState,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    if let PayloadRef::Blob { digest, .. } = payload {
+        verify_payload_blob(state, payload)?;
+        reachable.insert(digest.clone());
+    }
+    Ok(())
+}
+
+fn collect_activity_map_input_manifest_ref(
+    state: &MemoryState,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(state, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    collect_activity_map_input_manifest(state, &manifest, reachable)
+}
+
+fn collect_activity_map_input_manifest(
+    state: &MemoryState,
+    manifest: &ActivityMapInputManifest,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    for page in &manifest.pages {
+        collect_payload_blob_ref(state, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
+        let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
+        for item in &page.items {
+            collect_payload_blob_ref(state, item, reachable)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_activity_map_result_manifest_ref(
+    state: &MemoryState,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(state, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
+    let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
+    for page in &manifest.pages {
+        collect_payload_blob_ref(state, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
+        let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
+        for result in &page.results {
+            collect_payload_blob_ref(state, result, reachable)?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_history_event_for_storage(

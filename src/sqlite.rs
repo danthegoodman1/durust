@@ -17,6 +17,7 @@ use crate::{
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1407,6 +1408,54 @@ impl DurableBackend for SqliteBackend {
         })();
         Box::pin(ready(result))
     }
+
+    fn gc_payload_blobs(
+        &self,
+        req: crate::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, Result<crate::PayloadGarbageCollectionOutcome>> {
+        let result = (|| {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            let scanned_blobs = tx
+                .query_row("select count(*) from payload_blobs", [], |row| {
+                    row.get::<_, usize>(0)
+                })
+                .map_err(sqlite_error)?;
+            let mut reachable = BTreeSet::new();
+            collect_reachable_payload_blobs(&tx, &mut reachable)?;
+            let retained_blobs = reachable.len();
+            let all_digests = {
+                let mut stmt = tx
+                    .prepare("select digest from payload_blobs order by digest asc")
+                    .map_err(sqlite_error)?;
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .map_err(sqlite_error)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(sqlite_error)?
+            };
+            let garbage = all_digests
+                .into_iter()
+                .filter(|digest| !reachable.contains(digest))
+                .collect::<Vec<_>>();
+            let deleted_blobs = garbage.len();
+            if !req.dry_run {
+                for digest in garbage {
+                    tx.execute(
+                        "delete from payload_blobs where digest = ?1",
+                        params![digest],
+                    )
+                    .map_err(sqlite_error)?;
+                }
+            }
+            tx.commit().map_err(sqlite_error)?;
+            Ok(crate::PayloadGarbageCollectionOutcome {
+                scanned_blobs,
+                retained_blobs,
+                deleted_blobs,
+            })
+        })();
+        Box::pin(ready(result))
+    }
 }
 
 fn normalize_history_events_for_storage(
@@ -1422,6 +1471,267 @@ fn normalize_history_events_for_storage(
             })
         })
         .collect()
+}
+
+fn collect_reachable_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_history_payload_blobs(conn, reachable)?;
+    collect_activity_payload_blobs(conn, reachable)?;
+    collect_activity_map_payload_blobs(conn, reachable)?;
+    collect_child_outbox_payload_blobs(conn, reachable)?;
+    collect_signal_payload_blobs(conn, reachable)?;
+    collect_query_projection_payload_blobs(conn, reachable)?;
+    Ok(())
+}
+
+fn collect_history_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select data from history_events order by run_id asc, event_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let data: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_history_event_payload_blobs(conn, &data, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_activity_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from activity_tasks order by activity_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ActivityTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_payload_blob_ref(conn, &task.input, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_activity_map_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from activity_maps order by map_command_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ActivityMapTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_activity_map_input_manifest_ref(conn, &task.input_manifest, reachable)?;
+    }
+    drop(stmt);
+
+    let mut stmt = conn
+        .prepare(
+            "select result from activity_map_results order by map_command_id asc, item_ordinal asc",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let result: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_payload_blob_ref(conn, &result, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_child_outbox_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select message from child_outbox order by outbox_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let message: ChildStartOutboxMessage =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_payload_blob_ref(conn, &message.input, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_signal_payload_blobs(conn: &Connection, reachable: &mut BTreeSet<String>) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select payload from signals order by signal_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let payload: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_payload_blob_ref(conn, &payload, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_query_projection_payload_blobs(
+    conn: &Connection,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select payload from query_projections order by namespace asc, workflow_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let payload: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_payload_blob_ref(conn, &payload, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_history_event_payload_blobs(
+    conn: &Connection,
+    data: &HistoryEventData,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    match data {
+        HistoryEventData::WorkflowStarted { input, .. }
+        | HistoryEventData::WorkflowContinuedAsNew { input } => {
+            collect_payload_blob_ref(conn, input, reachable)
+        }
+        HistoryEventData::WorkflowCompleted { result } => {
+            collect_payload_blob_ref(conn, result, reachable)
+        }
+        HistoryEventData::WorkflowFailed { failure } => {
+            collect_failure_payload_blobs(conn, failure, reachable)
+        }
+        HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
+            Ok(())
+        }
+        HistoryEventData::ActivityScheduled(scheduled) => {
+            collect_payload_blob_ref(conn, &scheduled.input, reachable)
+        }
+        HistoryEventData::ActivityMapScheduled(scheduled) => {
+            collect_activity_map_input_manifest_ref(conn, &scheduled.input_manifest, reachable)
+        }
+        HistoryEventData::ActivityMapCompleted(completed) => {
+            collect_activity_map_result_manifest_ref(conn, &completed.result_manifest, reachable)
+        }
+        HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+        }
+        HistoryEventData::ActivityCompleted(completed) => {
+            collect_payload_blob_ref(conn, &completed.result, reachable)
+        }
+        HistoryEventData::ActivityFailed(failed) => {
+            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+        }
+        HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
+        HistoryEventData::ChildWorkflowStartRequested(requested) => {
+            collect_payload_blob_ref(conn, &requested.input, reachable)
+        }
+        HistoryEventData::ChildWorkflowCompleted(completed) => {
+            collect_payload_blob_ref(conn, &completed.result, reachable)
+        }
+        HistoryEventData::ChildWorkflowFailed(failed) => {
+            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+        }
+        HistoryEventData::SignalConsumed(signal) => {
+            collect_payload_blob_ref(conn, &signal.payload, reachable)
+        }
+    }
+}
+
+fn collect_failure_payload_blobs(
+    conn: &Connection,
+    failure: &crate::DurableFailure,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    if let Some(details) = &failure.details {
+        collect_payload_blob_ref(conn, details, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_payload_blob_ref(
+    conn: &Connection,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    if let PayloadRef::Blob { digest, .. } = payload {
+        load_payload_blob(conn, payload)?;
+        reachable.insert(digest.clone());
+    }
+    Ok(())
+}
+
+fn collect_activity_map_input_manifest_ref(
+    conn: &Connection,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(conn, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(conn, payload.clone())?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    for page in &manifest.pages {
+        collect_payload_blob_ref(conn, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(conn, page.clone())?;
+        let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
+        for item in &page.items {
+            collect_payload_blob_ref(conn, item, reachable)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_activity_map_result_manifest_ref(
+    conn: &Connection,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(conn, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(conn, payload.clone())?;
+    let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
+    for page in &manifest.pages {
+        collect_payload_blob_ref(conn, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(conn, page.clone())?;
+        let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
+        for result in &page.results {
+            collect_payload_blob_ref(conn, result, reachable)?;
+        }
+    }
+    Ok(())
 }
 
 fn normalize_history_event_for_storage(

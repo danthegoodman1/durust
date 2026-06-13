@@ -95,6 +95,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>>;
+
+    fn gc_payload_blobs(
+        &self,
+        req: PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, Result<PayloadGarbageCollectionOutcome>>;
 }
 
 #[derive(Clone, Debug)]
@@ -403,6 +408,18 @@ pub struct WorkflowChangeVersionRecord {
     pub command_seq: crate::CommandSeq,
     pub first_event_id: EventId,
     pub last_seen_at: TimestampMs,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PayloadGarbageCollectionRequest {
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PayloadGarbageCollectionOutcome {
+    pub scanned_blobs: usize,
+    pub retained_blobs: usize,
+    pub deleted_blobs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

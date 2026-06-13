@@ -3894,4 +3894,11 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
         self.inner.workflow_change_versions(req)
     }
+
+    fn gc_payload_blobs(
+        &self,
+        req: durust::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
+        self.inner.gc_payload_blobs(req)
+    }
 }

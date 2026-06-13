@@ -584,6 +584,8 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
 
 The provider validates blob digests and hydrates payloads before returning them
 through workflow history, activity tasks, signals, and query projections.
+Providers also expose dry-run-capable payload GC that removes blobs no longer
+reachable from durable history or operational indexes.
 
 ## Recovery Model
 

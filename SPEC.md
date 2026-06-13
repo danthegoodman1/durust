@@ -2172,6 +2172,13 @@ The SQLite provider should support `PayloadStorageConfig` and an S3-compatible b
 
 Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored. Conformance should force both paths by setting a tiny inline threshold and then a larger threshold.
 
+Providers should expose generic payload garbage collection for provider-owned
+blob stores. GC treats workflow history, activity tasks, activity map manifests
+and results, child outbox entries, signal inbox rows, and query projections as
+roots. A dry-run mode must report retained and deleted blob counts without
+mutating storage. If a committed reachable `PayloadRef::Blob` is missing or
+fails digest/size validation, GC must fail rather than deleting unrelated blobs.
+
 ---
 
 # 19. Storage Shape

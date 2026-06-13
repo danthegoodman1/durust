@@ -125,6 +125,7 @@ fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
         .await;
         payload_offload_child_workflow_round_trip(backend.clone(), "memory").await;
         payload_offload_activity_map_round_trip(backend.clone(), "memory").await;
+        let _ = payload_gc_removes_unreachable_projection_blob(backend.clone(), "memory").await;
         assert!(backend.payload_blob_count() >= 4);
     });
 }
@@ -145,12 +146,28 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
         .await;
         payload_offload_child_workflow_round_trip(backend.clone(), "sqlite").await;
         payload_offload_activity_map_round_trip(backend.clone(), "sqlite").await;
+        let (gc_workflow_id, gc_projection) =
+            payload_gc_removes_unreachable_projection_blob(backend.clone(), "sqlite").await;
         let blob_count = backend.payload_blob_count().unwrap();
         assert!(blob_count >= 12);
         drop(backend);
 
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         assert_eq!(reopened.payload_blob_count().unwrap(), blob_count);
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(gc_workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected retained projection after reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            gc_projection
+        );
         let history = reopened
             .stream_history(durust::StreamHistoryRequest {
                 run_id,
@@ -529,6 +546,151 @@ where
 
 fn large_payload(label: &str) -> String {
     format!("{label}:{}", "x".repeat(64))
+}
+
+async fn payload_gc_removes_unreachable_projection_blob<B>(
+    backend: B,
+    prefix: &str,
+) -> (String, String)
+where
+    B: DurableBackend,
+{
+    let workflow_id = format!("wf/{prefix}-payload-gc");
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new("payload-gc-workflows"),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("payload-gc-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first_claim = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-gc-first")),
+            claim_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first projection workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let wait_id = durust::WaitId::new(format!("{}:{}:signal", command_id.run_id, command_id.seq.0));
+    let first_projection = large_payload(&format!("{prefix}-projection-old"));
+    backend
+        .commit_workflow_task(
+            first_claim.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id,
+                    run_id: run_id.clone(),
+                    command_id,
+                    kind: durust::WaitKind::Signal,
+                    key: "replace".to_owned(),
+                    ready_at: None,
+                }],
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(durust::encode_payload(&first_projection).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+    backend
+        .signal_workflow(durust::SignalWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&workflow_id),
+            signal_id: durust::SignalId::new(format!("{workflow_id}/replace")),
+            signal_name: durust::SignalName::new("replace"),
+            payload: durust::encode_payload(&large_payload(&format!("{prefix}-wake"))).unwrap(),
+        })
+        .await
+        .unwrap();
+    let inbox = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id: run_id.clone(),
+            signal_name: durust::SignalName::new("replace"),
+        })
+        .await
+        .unwrap()
+        .expect("replacement signal");
+    let second_claim = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-gc-second")),
+            claim_opts,
+        )
+        .await
+        .unwrap()
+        .expect("second projection workflow task");
+    let second_projection = large_payload(&format!("{prefix}-projection-new"));
+    backend
+        .commit_workflow_task(
+            second_claim.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: vec![inbox.signal_id],
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(durust::encode_payload(&second_projection).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let dry_run = backend
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .await
+        .unwrap();
+    assert!(dry_run.scanned_blobs > dry_run.retained_blobs);
+    assert!(dry_run.deleted_blobs > 0);
+
+    let collected = backend
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+        .await
+        .unwrap();
+    assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
+
+    let after = backend
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .await
+        .unwrap();
+    assert_eq!(after.deleted_blobs, 0);
+
+    let projection = backend
+        .query_projection(durust::QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&workflow_id),
+        })
+        .await
+        .unwrap();
+    let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        panic!("expected retained projection");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(&payload).unwrap(),
+        second_projection
+    );
+    (workflow_id, second_projection)
 }
 
 async fn payload_offload_child_workflow_round_trip<B>(backend: B, prefix: &str)
