@@ -28,6 +28,47 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
     Ok(doubled + 1)
 }
 
+#[durust::workflow(name = "bench.join-four-activities", version = 1)]
+async fn join_four_activities(input: u64) -> durust::Result<u64> {
+    let (first, second, third, fourth) = durust::join!(
+        durust::call_activity!(double(BenchInput { value: input })).task_queue("activities"),
+        durust::call_activity!(double(BenchInput { value: input + 1 })).task_queue("activities"),
+        durust::call_activity!(double(BenchInput { value: input + 2 })).task_queue("activities"),
+        durust::call_activity!(double(BenchInput { value: input + 3 })).task_queue("activities"),
+    )
+    .await?;
+    Ok(first + second + third + fourth)
+}
+
+#[durust::workflow(name = "bench.select-signal-timer", version = 1)]
+async fn select_signal_timer(input: u64) -> durust::Result<String> {
+    let outcome = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "bench.select-then-wait", version = 1)]
+async fn select_then_wait(input: u64) -> durust::Result<String> {
+    let first = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
 fn workflow_task_schedule(c: &mut Criterion) {
     c.bench_function("workflow_task_schedule_activity_memory", |b| {
         b.iter_batched(
@@ -98,6 +139,49 @@ fn crash_replay(c: &mut Criterion) {
                 block_on(async {
                     let mut recovered = worker(backend);
                     recovered.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn select_registration(c: &mut Criterion) {
+    c.bench_function("select_registration_memory", |b| {
+        b.iter_batched(
+            setup_select_registration_worker,
+            |(mut worker, _backend)| {
+                block_on(async {
+                    worker.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn select_replay(c: &mut Criterion) {
+    c.bench_function("select_replay_recorded_winner_memory", |b| {
+        b.iter_batched(
+            setup_select_replay,
+            |backend| {
+                block_on(async {
+                    let mut worker = select_replay_worker(backend);
+                    worker.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn bounded_join_fanout(c: &mut Criterion) {
+    c.bench_function("bounded_join_fanout_memory", |b| {
+        b.iter_batched(
+            setup_join_fanout_worker,
+            |(mut worker, _backend)| {
+                block_on(async {
+                    worker.run_workflow_once().await.unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -201,6 +285,7 @@ fn signal_send_consume(c: &mut Criterion) {
                                 schedule_activity_maps: Vec::new(),
                                 consume_signals: vec![inbox.signal_id],
                                 delete_waits: Vec::new(),
+                                cancel_commands: Vec::new(),
                             },
                         )
                         .await
@@ -232,6 +317,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                                 schedule_activity_maps: vec![map_task],
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
+                                cancel_commands: Vec::new(),
                             },
                         )
                         .await
@@ -300,6 +386,57 @@ fn setup_completed_activity() -> (Worker<MemoryBackend>, MemoryBackend) {
     })
 }
 
+fn setup_select_registration_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<select_signal_timer>("bench/select-registration", "workflows", 10)
+            .await
+            .unwrap();
+        (select_worker(backend.clone()), backend)
+    })
+}
+
+fn setup_select_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<select_then_wait>("bench/select-replay", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = select_replay_worker(backend.clone());
+        worker.run_workflow_once().await.unwrap();
+        backend.advance_time(Duration::from_millis(10));
+        worker.run_timers_once().await.unwrap();
+        worker.run_workflow_once().await.unwrap();
+        drop(worker);
+        client
+            .signal_workflow(
+                "bench/select-replay",
+                "after",
+                "bench/select-replay/after",
+                "done",
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn setup_join_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<join_four_activities>("bench/join-fanout", "workflows", 10)
+            .await
+            .unwrap();
+        (join_worker(backend.clone()), backend)
+    })
+}
+
 fn setup_claimable_workflow() -> (MemoryBackend, WorkerId, ClaimWorkflowTaskOptions) {
     block_on(create_claimable_workflow())
 }
@@ -360,6 +497,7 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
                 schedule_activity_maps: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         }
     })
@@ -417,6 +555,7 @@ fn setup_due_timer() -> MemoryBackend {
                     schedule_activity_maps: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
                 },
             )
             .await
@@ -463,6 +602,7 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
                     schedule_activity_maps: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
                 },
             )
             .await
@@ -536,6 +676,7 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
                     schedule_activity_maps: vec![map_task],
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
                 },
             )
             .await
@@ -582,6 +723,30 @@ fn worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .build()
 }
 
+fn select_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(select_signal_timer)
+        .build()
+}
+
+fn select_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .history_chunk_events(1)
+        .register_workflow(select_then_wait)
+        .build()
+}
+
+fn join_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(join_four_activities)
+        .register_activity(double)
+        .build()
+}
+
 criterion_group!(
     benches,
     workflow_task_schedule,
@@ -589,6 +754,9 @@ criterion_group!(
     workflow_task_append_commit,
     cached_wake_poll,
     crash_replay,
+    select_registration,
+    select_replay,
+    bounded_join_fanout,
     activity_claim_complete,
     timer_due_scan_wakeup,
     signal_send_consume,

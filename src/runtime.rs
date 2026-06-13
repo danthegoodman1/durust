@@ -1,10 +1,10 @@
 use crate::{
     Activity, ActivityMapCompleted, ActivityMapScheduled, ActivityMapTask, ActivityOptions,
     ActivityScheduled, ActivityTask, CommandId, CommandSeq, Error, HistoryEvent, HistoryEventData,
-    NewHistoryEvent, PayloadRef, Result, RunId, SignalConsumed, SignalId, SignalName, TaskQueue,
-    TimerFired, TimerStarted, TimestampMs, WaitId, WaitKind, WaitRecord, activity_fingerprint,
-    activity_map_fingerprint, command_id, encode_activity_map_input_manifest, payload_digest,
-    signal_fingerprint, timer_fingerprint,
+    NewHistoryEvent, PayloadRef, Result, RunId, SelectWinner, SignalConsumed, SignalId, SignalName,
+    TaskQueue, TimerFired, TimerStarted, TimestampMs, WaitId, WaitKind, WaitRecord,
+    activity_fingerprint, activity_map_fingerprint, command_id, encode_activity_map_input_manifest,
+    payload_digest, signal_fingerprint, timer_fingerprint,
 };
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -56,12 +56,13 @@ pub(crate) struct RuntimeContext {
     last_loaded_event_id: crate::EventId,
     replay_target_event_id: crate::EventId,
     needs_more_history: bool,
+    last_ready_event_id: Option<crate::EventId>,
     next_command_seq: u64,
-    completions: BTreeMap<CommandSeq, PayloadRef>,
-    failures: BTreeMap<CommandSeq, ActivityTerminalError>,
-    map_completions: BTreeMap<CommandSeq, ActivityMapCompleted>,
-    map_failures: BTreeMap<CommandSeq, String>,
-    timers: BTreeMap<CommandSeq, TimerFired>,
+    completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
+    failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
+    map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
+    map_failures: BTreeMap<CommandSeq, (crate::EventId, String)>,
+    timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
@@ -70,6 +71,7 @@ pub(crate) struct RuntimeContext {
     schedule_activity_maps: Vec<ActivityMapTask>,
     consume_signals: Vec<SignalId>,
     delete_waits: Vec<WaitId>,
+    cancel_commands: Vec<CommandId>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,7 @@ pub(crate) struct RuntimeCommitParts {
     pub schedule_activity_maps: Vec<ActivityMapTask>,
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
+    pub cancel_commands: Vec<CommandId>,
     pub default_activity_options: ActivityOptions,
 }
 
@@ -137,6 +140,7 @@ impl RuntimeContext {
             last_loaded_event_id,
             replay_target_event_id,
             needs_more_history: false,
+            last_ready_event_id: None,
             next_command_seq,
             completions,
             failures,
@@ -151,6 +155,7 @@ impl RuntimeContext {
             schedule_activity_maps: Vec::new(),
             consume_signals: Vec::new(),
             delete_waits: Vec::new(),
+            cancel_commands: Vec::new(),
         }
     }
 
@@ -162,6 +167,7 @@ impl RuntimeContext {
             schedule_activity_maps: self.schedule_activity_maps,
             consume_signals: self.consume_signals,
             delete_waits: self.delete_waits,
+            cancel_commands: self.cancel_commands,
             default_activity_options: self.default_activity_options,
         }
     }
@@ -217,6 +223,31 @@ impl RuntimeContext {
         command_id(&self.run_id, self.next_command_seq)
     }
 
+    fn record_ready_event_id(&mut self, event_id: crate::EventId) {
+        self.last_ready_event_id = Some(event_id);
+    }
+
+    fn record_next_appended_ready_event_id(&mut self) {
+        let offset = u64::try_from(self.append_events.len()).unwrap_or(u64::MAX);
+        self.last_ready_event_id = Some(crate::EventId(
+            self.replay_target_event_id.0.saturating_add(offset),
+        ));
+    }
+
+    fn take_last_ready_event_id(&mut self) -> Option<crate::EventId> {
+        self.last_ready_event_id.take()
+    }
+
+    fn cancel_command(&mut self, command_id: CommandId) {
+        if !self
+            .cancel_commands
+            .iter()
+            .any(|existing| existing == &command_id)
+        {
+            self.cancel_commands.push(command_id);
+        }
+    }
+
     fn peek_replay_event(&self) -> Option<&HistoryEvent> {
         self.replay_events.get(self.replay_cursor)
     }
@@ -244,12 +275,18 @@ impl RuntimeContext {
             if let HistoryEventData::ActivityCompleted(completed) = event.data {
                 if completed.command_id.seq == command_id.seq {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.completions.remove(&command_id.seq);
                     return Some(completed.result);
                 }
             }
         }
-        self.completions.remove(&command_id.seq)
+        self.completions
+            .remove(&command_id.seq)
+            .map(|(event_id, result)| {
+                self.record_ready_event_id(event_id);
+                result
+            })
     }
 
     fn take_failure(&mut self, command_id: &CommandId) -> Option<ActivityTerminalError> {
@@ -259,6 +296,7 @@ impl RuntimeContext {
                     if failed.command_id.seq == command_id.seq =>
                 {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.failures.remove(&command_id.seq);
                     return Some(ActivityTerminalError::Failed(failed.message));
                 }
@@ -266,13 +304,19 @@ impl RuntimeContext {
                     if timed_out.command_id.seq == command_id.seq =>
                 {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.failures.remove(&command_id.seq);
                     return Some(ActivityTerminalError::TimedOut(timed_out.message));
                 }
                 _ => {}
             }
         }
-        self.failures.remove(&command_id.seq)
+        self.failures
+            .remove(&command_id.seq)
+            .map(|(event_id, failure)| {
+                self.record_ready_event_id(event_id);
+                failure
+            })
     }
 
     fn take_timer(&mut self, command_id: &CommandId) -> Option<TimerFired> {
@@ -280,12 +324,18 @@ impl RuntimeContext {
             if let HistoryEventData::TimerFired(fired) = event.data {
                 if fired.command_id.seq == command_id.seq {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.timers.remove(&command_id.seq);
                     return Some(fired);
                 }
             }
         }
-        self.timers.remove(&command_id.seq)
+        self.timers
+            .remove(&command_id.seq)
+            .map(|(event_id, fired)| {
+                self.record_ready_event_id(event_id);
+                fired
+            })
     }
 
     fn take_map_completion(&mut self, command_id: &CommandId) -> Option<ActivityMapCompleted> {
@@ -293,12 +343,18 @@ impl RuntimeContext {
             if let HistoryEventData::ActivityMapCompleted(completed) = event.data {
                 if completed.command_id.seq == command_id.seq {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.map_completions.remove(&command_id.seq);
                     return Some(completed);
                 }
             }
         }
-        self.map_completions.remove(&command_id.seq)
+        self.map_completions
+            .remove(&command_id.seq)
+            .map(|(event_id, completed)| {
+                self.record_ready_event_id(event_id);
+                completed
+            })
     }
 
     fn take_map_failure(&mut self, command_id: &CommandId) -> Option<String> {
@@ -306,12 +362,18 @@ impl RuntimeContext {
             if let HistoryEventData::ActivityMapFailed(failed) = event.data {
                 if failed.command_id.seq == command_id.seq {
                     self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
                     self.map_failures.remove(&command_id.seq);
                     return Some(failed.message);
                 }
             }
         }
-        self.map_failures.remove(&command_id.seq)
+        self.map_failures
+            .remove(&command_id.seq)
+            .map(|(event_id, message)| {
+                self.record_ready_event_id(event_id);
+                message
+            })
     }
 
     fn take_live_signal(&mut self, command_id: &CommandId) -> Option<SignalInboxRecordForRuntime> {
@@ -357,6 +419,127 @@ pub fn set_default_activity_options(options: ActivityOptions) {
     with_context(|runtime| {
         runtime.default_activity_options = options;
     });
+}
+
+pub trait DurableSelectBranch: Future + Unpin {
+    #[doc(hidden)]
+    fn __durust_cancel_branch(&self);
+}
+
+pub trait DurableJoinBranch: Future + Unpin {}
+
+#[doc(hidden)]
+pub fn __durust_join_assert_branch<F>(_: &F)
+where
+    F: DurableJoinBranch,
+{
+}
+
+#[doc(hidden)]
+pub fn __durust_select_ensure_command_id(command_id: &mut Option<CommandId>) {
+    if command_id.is_none() {
+        *command_id = Some(with_context(|runtime| runtime.next_command_id()));
+    }
+}
+
+#[doc(hidden)]
+pub fn __durust_select_clear_ready_event_id() {
+    with_context(|runtime| {
+        runtime.take_last_ready_event_id();
+    });
+}
+
+#[doc(hidden)]
+pub fn __durust_select_take_ready_event_id() -> Option<crate::EventId> {
+    with_context(|runtime| runtime.take_last_ready_event_id())
+}
+
+#[doc(hidden)]
+pub fn __durust_select_record_winner(
+    select_command_id: &CommandId,
+    branch_ordinal: u32,
+    winning_event_id: crate::EventId,
+    branches_digest: &'static str,
+) -> Poll<Result<()>> {
+    record_select_winner(
+        select_command_id,
+        branch_ordinal,
+        winning_event_id,
+        branches_digest,
+    )
+}
+
+fn record_select_winner(
+    select_command_id: &CommandId,
+    branch_ordinal: u32,
+    winning_event_id: crate::EventId,
+    branches_digest: &'static str,
+) -> Poll<Result<()>> {
+    with_context(|runtime| {
+        while let Some(event) = runtime.peek_replay_event().cloned() {
+            match event.data {
+                HistoryEventData::SelectWinner(winner) => {
+                    if winner.select_command_id.seq != select_command_id.seq {
+                        return Poll::Ready(Err(Error::Nondeterminism(format!(
+                            "expected SelectWinner command {}, found {}",
+                            select_command_id.seq.0, winner.select_command_id.seq.0
+                        ))));
+                    }
+                    if winner.branches_digest != branches_digest {
+                        return Poll::Ready(Err(Error::Nondeterminism(format!(
+                            "select branch order changed for command {}",
+                            select_command_id.seq.0
+                        ))));
+                    }
+                    if winner.branch_ordinal != branch_ordinal {
+                        return Poll::Ready(Err(Error::Nondeterminism(format!(
+                            "select winner changed for command {}: recorded {}, observed {}",
+                            select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
+                        ))));
+                    }
+                    if winner.winning_event_id != winning_event_id {
+                        return Poll::Ready(Err(Error::Nondeterminism(format!(
+                            "select winning event changed for command {}: recorded {}, observed {}",
+                            select_command_id.seq.0, winner.winning_event_id, winning_event_id
+                        ))));
+                    }
+                    runtime.advance_replay();
+                    return Poll::Ready(Ok(()));
+                }
+                other if select_can_ignore_losing_ready_event(&other) => {
+                    runtime.advance_replay();
+                }
+                _ => break,
+            }
+        }
+        if runtime.request_more_history_if_available() {
+            return Poll::Pending;
+        }
+        runtime
+            .append_events
+            .push(NewHistoryEvent::new(HistoryEventData::SelectWinner(
+                SelectWinner {
+                    select_command_id: select_command_id.clone(),
+                    branch_ordinal,
+                    winning_event_id,
+                    branches_digest: branches_digest.to_owned(),
+                },
+            )));
+        Poll::Ready(Ok(()))
+    })
+}
+
+fn select_can_ignore_losing_ready_event(data: &HistoryEventData) -> bool {
+    matches!(
+        data,
+        HistoryEventData::ActivityCompleted(_)
+            | HistoryEventData::ActivityFailed(_)
+            | HistoryEventData::ActivityTimedOut(_)
+            | HistoryEventData::ActivityMapCompleted(_)
+            | HistoryEventData::ActivityMapFailed(_)
+            | HistoryEventData::TimerFired(_)
+            | HistoryEventData::SignalConsumed(_)
+    )
 }
 
 pub struct ActivityFuture<A>
@@ -415,6 +598,19 @@ where
         })
     }
 }
+
+impl<A> DurableSelectBranch for ActivityFuture<A>
+where
+    A: Activity,
+{
+    fn __durust_cancel_branch(&self) {
+        if let ActivityFutureState::Waiting(command_id) = &self.state {
+            with_context(|runtime| runtime.cancel_command(command_id.clone()));
+        }
+    }
+}
+
+impl<A> DurableJoinBranch for ActivityFuture<A> where A: Activity {}
 
 impl<A> ActivityFuture<A>
 where
@@ -476,6 +672,7 @@ where
                         if completed.command_id.seq == command_id.seq =>
                     {
                         runtime.advance_replay();
+                        runtime.record_ready_event_id(next.event_id);
                         self.state = ActivityFutureState::Done;
                         return Poll::Ready(crate::decode_payload::<A::Output>(&completed.result));
                     }
@@ -483,6 +680,7 @@ where
                         if failed.command_id.seq == command_id.seq =>
                     {
                         runtime.advance_replay();
+                        runtime.record_ready_event_id(next.event_id);
                         self.state = ActivityFutureState::Done;
                         return Poll::Ready(Err(Error::ActivityFailed(failed.message)));
                     }
@@ -490,6 +688,7 @@ where
                         if timed_out.command_id.seq == command_id.seq =>
                     {
                         runtime.advance_replay();
+                        runtime.record_ready_event_id(next.event_id);
                         self.state = ActivityFutureState::Done;
                         return Poll::Ready(Err(Error::ActivityTimedOut(timed_out.message)));
                     }
@@ -776,6 +975,8 @@ where
     }
 }
 
+impl<A> DurableJoinBranch for ActivityMapSpawnFuture<A> where A: Activity {}
+
 pub struct ActivityMapResultFuture {
     command_id: CommandId,
     done: bool,
@@ -806,6 +1007,8 @@ impl Future for ActivityMapResultFuture {
         })
     }
 }
+
+impl DurableJoinBranch for ActivityMapResultFuture {}
 
 pub fn sleep(duration: Duration) -> TimerFuture {
     TimerFuture {
@@ -858,6 +1061,16 @@ impl Future for TimerFuture {
     }
 }
 
+impl DurableSelectBranch for TimerFuture {
+    fn __durust_cancel_branch(&self) {
+        if let TimerFutureState::Waiting(command_id) = &self.state {
+            with_context(|runtime| runtime.delete_waits.push(timer_wait_id(command_id)));
+        }
+    }
+}
+
+impl DurableJoinBranch for TimerFuture {}
+
 impl TimerFuture {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<()>> {
         if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
@@ -893,6 +1106,7 @@ impl TimerFuture {
                 if let HistoryEventData::TimerFired(fired) = next.data {
                     if fired.command_id.seq == command_id.seq {
                         runtime.advance_replay();
+                        runtime.record_ready_event_id(next.event_id);
                         self.state = TimerFutureState::Done;
                         return Poll::Ready(Ok(()));
                     }
@@ -999,6 +1213,19 @@ where
     }
 }
 
+impl<T> DurableSelectBranch for SignalFuture<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    fn __durust_cancel_branch(&self) {
+        if let SignalFutureState::Waiting(command_id) = &self.state {
+            with_context(|runtime| runtime.delete_waits.push(signal_wait_id(command_id)));
+        }
+    }
+}
+
+impl<T> DurableJoinBranch for SignalFuture<T> where T: serde::de::DeserializeOwned {}
+
 impl<T> SignalFuture<T>
 where
     T: serde::de::DeserializeOwned,
@@ -1013,38 +1240,32 @@ where
         let fingerprint = signal_fingerprint(self.signal_name.clone());
 
         if let Some(event) = runtime.peek_replay_event().cloned() {
-            let HistoryEventData::SignalConsumed(consumed) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected SignalConsumed for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
-            };
-            if consumed.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, consumed.command_id.seq.0
-                ))));
+            if let HistoryEventData::SignalConsumed(consumed) = event.data {
+                if consumed.command_id.seq != command_id.seq {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "expected command seq {}, found {}",
+                        command_id.seq.0, consumed.command_id.seq.0
+                    ))));
+                }
+                if consumed.fingerprint != fingerprint {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "signal command fingerprint changed for command {}",
+                        command_id.seq.0
+                    ))));
+                }
+                runtime.advance_replay();
+                runtime.record_ready_event_id(event.event_id);
+                self.state = SignalFutureState::Done;
+                return Poll::Ready(crate::decode_payload::<T>(&consumed.payload));
             }
-            if consumed.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "signal command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-            self.state = SignalFutureState::Done;
-            return Poll::Ready(crate::decode_payload::<T>(&consumed.payload));
+
+            self.register_wait(runtime, &command_id);
+            runtime.request_more_history_if_available();
+            self.state = SignalFutureState::Waiting(command_id);
+            return Poll::Pending;
         }
 
-        runtime.upsert_waits.push(WaitRecord {
-            wait_id: signal_wait_id(&command_id),
-            run_id: runtime.run_id.clone(),
-            command_id: command_id.clone(),
-            kind: WaitKind::Signal,
-            key: self.signal_name.0.clone(),
-            ready_at: None,
-        });
-        runtime.request_signal(command_id.clone(), self.signal_name.clone());
+        self.register_wait(runtime, &command_id);
         self.state = SignalFutureState::Waiting(command_id);
         Poll::Pending
     }
@@ -1069,6 +1290,7 @@ where
                         fingerprint,
                     },
                 )));
+            runtime.record_next_appended_ready_event_id();
             self.state = SignalFutureState::Done;
             return Poll::Ready(crate::decode_payload::<T>(&signal.payload));
         }
@@ -1077,66 +1299,95 @@ where
         runtime.request_more_history_if_available();
         Poll::Pending
     }
+
+    fn register_wait(&self, runtime: &mut RuntimeContext, command_id: &CommandId) {
+        runtime.upsert_waits.push(WaitRecord {
+            wait_id: signal_wait_id(command_id),
+            run_id: runtime.run_id.clone(),
+            command_id: command_id.clone(),
+            kind: WaitKind::Signal,
+            key: self.signal_name.0.clone(),
+            ready_at: None,
+        });
+        runtime.request_signal(command_id.clone(), self.signal_name.clone());
+    }
 }
 
-fn collect_completions(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, PayloadRef> {
+fn collect_completions(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, PayloadRef)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityCompleted(completed) => {
-                Some((completed.command_id.seq, completed.result.clone()))
-            }
+            HistoryEventData::ActivityCompleted(completed) => Some((
+                completed.command_id.seq,
+                (event.event_id, completed.result.clone()),
+            )),
             _ => None,
         })
         .collect()
 }
 
-fn collect_failures(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, ActivityTerminalError> {
+fn collect_failures(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
             HistoryEventData::ActivityFailed(failed) => Some((
                 failed.command_id.seq,
-                ActivityTerminalError::Failed(failed.message.clone()),
+                (
+                    event.event_id,
+                    ActivityTerminalError::Failed(failed.message.clone()),
+                ),
             )),
             HistoryEventData::ActivityTimedOut(timed_out) => Some((
                 timed_out.command_id.seq,
-                ActivityTerminalError::TimedOut(timed_out.message.clone()),
+                (
+                    event.event_id,
+                    ActivityTerminalError::TimedOut(timed_out.message.clone()),
+                ),
             )),
             _ => None,
         })
         .collect()
 }
 
-fn collect_map_completions(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, ActivityMapCompleted> {
+fn collect_map_completions(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityMapCompleted(completed) => {
-                Some((completed.command_id.seq, completed.clone()))
-            }
+            HistoryEventData::ActivityMapCompleted(completed) => Some((
+                completed.command_id.seq,
+                (event.event_id, completed.clone()),
+            )),
             _ => None,
         })
         .collect()
 }
 
-fn collect_map_failures(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, String> {
+fn collect_map_failures(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, String)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityMapFailed(failed) => {
-                Some((failed.command_id.seq, failed.message.clone()))
-            }
+            HistoryEventData::ActivityMapFailed(failed) => Some((
+                failed.command_id.seq,
+                (event.event_id, failed.message.clone()),
+            )),
             _ => None,
         })
         .collect()
 }
 
-fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, TimerFired> {
+fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, TimerFired)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
-            HistoryEventData::TimerFired(fired) => Some((fired.command_id.seq, fired.clone())),
+            HistoryEventData::TimerFired(fired) => {
+                Some((fired.command_id.seq, (event.event_id, fired.clone())))
+            }
             _ => None,
         })
         .collect()
@@ -1169,6 +1420,7 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::ActivityTimedOut(timed_out) => timed_out.message.len(),
         HistoryEventData::TimerStarted(_) | HistoryEventData::TimerFired(_) => 16,
         HistoryEventData::SignalConsumed(signal) => signal.payload.encoded_len(),
+        HistoryEventData::SelectWinner(winner) => winner.branches_digest.len() + 32,
     }
 }
 

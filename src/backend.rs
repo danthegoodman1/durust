@@ -195,6 +195,7 @@ pub struct WorkflowTaskCommit {
     pub schedule_activity_maps: Vec<ActivityMapTask>,
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
+    pub cancel_commands: Vec<crate::CommandId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

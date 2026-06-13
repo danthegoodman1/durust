@@ -307,6 +307,7 @@ impl DurableBackend for MemoryBackend {
         let upsert_waits = batch.upsert_waits;
         let consume_signals = batch.consume_signals;
         let delete_waits = batch.delete_waits;
+        let cancel_commands = batch.cancel_commands;
         let next_event_id = {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
@@ -389,6 +390,9 @@ impl DurableBackend for MemoryBackend {
         }
         for wait_id in delete_waits {
             state.waits.remove(&wait_id);
+        }
+        for command_id in cancel_commands {
+            cancel_command_operational_state(&mut state, &command_id);
         }
         if next_event_id.1 {
             cleanup_run_operational_state(&mut state, &claim.run_id);
@@ -818,6 +822,25 @@ fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {
             map.completed = true;
             map.in_flight = 0;
         }
+    }
+}
+
+fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate::CommandId) {
+    for record in state.activities.values_mut() {
+        let matches_activity = record.task.command_id == *command_id;
+        let matches_map_item = record
+            .task
+            .map_item
+            .as_ref()
+            .is_some_and(|item| item.map_command_id == *command_id);
+        if matches_activity || matches_map_item {
+            record.completed = true;
+            record.claim = None;
+        }
+    }
+    if let Some(map) = state.activity_maps.get_mut(command_id) {
+        map.completed = true;
+        map.in_flight = 0;
     }
 }
 

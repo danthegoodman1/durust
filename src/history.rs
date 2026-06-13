@@ -126,6 +126,14 @@ pub struct ActivityMapFailed {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectWinner {
+    pub select_command_id: CommandId,
+    pub branch_ordinal: u32,
+    pub winning_event_id: EventId,
+    pub branches_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryEventData {
     WorkflowStarted {
         workflow_type: WorkflowType,
@@ -151,6 +159,7 @@ pub enum HistoryEventData {
     TimerStarted(TimerStarted),
     TimerFired(TimerFired),
     SignalConsumed(SignalConsumed),
+    SelectWinner(SelectWinner),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +186,7 @@ pub enum HistoryEventType {
     TimerStarted,
     TimerFired,
     SignalConsumed,
+    SelectWinner,
 }
 
 impl HistoryEventData {
@@ -197,6 +207,7 @@ impl HistoryEventData {
             Self::TimerStarted(_) => HistoryEventType::TimerStarted,
             Self::TimerFired(_) => HistoryEventType::TimerFired,
             Self::SignalConsumed(_) => HistoryEventType::SignalConsumed,
+            Self::SelectWinner(_) => HistoryEventType::SelectWinner,
         }
     }
 }

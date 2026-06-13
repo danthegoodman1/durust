@@ -50,6 +50,158 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
     Ok(doubled + 1)
 }
 
+#[durust::workflow(name = "tests.join-two-activities", version = 1)]
+async fn join_two_activities(input: u64) -> durust::Result<u64> {
+    let (left, right) = durust::join!(
+        durust::call_activity!(double(NumberInput { value: input })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput { value: input + 1 })).task_queue("activities"),
+    )
+    .await?;
+    Ok(left + right)
+}
+
+#[durust::workflow(name = "tests.join-four-activities", version = 1)]
+async fn join_four_activities(input: u64) -> durust::Result<u64> {
+    let (first, second, third, fourth) = durust::join!(
+        durust::call_activity!(double(NumberInput { value: input })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput { value: input + 1 })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput { value: input + 2 })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput { value: input + 3 })).task_queue("activities"),
+    )
+    .await?;
+    Ok(first + second + third + fourth)
+}
+
+#[durust::workflow(name = "tests.sequential-two-activities", version = 1)]
+async fn sequential_two_activities(input: u64) -> durust::Result<u64> {
+    let first = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .await?;
+    let second = durust::call_activity!(double(NumberInput { value: input + 1 }))
+        .task_queue("activities")
+        .await?;
+    Ok(first + second)
+}
+
+#[durust::workflow(name = "tests.join-signal-timer", version = 1)]
+async fn join_signal_timer(input: u64) -> durust::Result<String> {
+    let (signal, _) = durust::join!(
+        durust::signal::<String>("ready"),
+        durust::sleep(Duration::from_millis(input)),
+    )
+    .await?;
+    Ok(signal)
+}
+
+#[durust::workflow(name = "tests.select-signal-timer", version = 1)]
+async fn select_signal_timer(input: u64) -> durust::Result<String> {
+    let outcome = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-activity-timer", version = 1)]
+async fn select_activity_timer(input: u64) -> durust::Result<u64> {
+    let outcome = durust::select! {
+        activity = durust::call_activity!(double(NumberInput { value: input })).task_queue("activities") => {
+            activity?
+        }
+        timer = durust::sleep(Duration::from_millis(10)) => {
+            timer?;
+            0
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-timer-before-activity", version = 1)]
+async fn select_timer_before_activity(input: u64) -> durust::Result<String> {
+    let outcome = durust::select! {
+        activity = durust::call_activity!(double(NumberInput { value: input })).task_queue("activities") => {
+            format!("activity:{}", activity?)
+        }
+        timer = durust::sleep(Duration::from_millis(10)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-same-tick-timers", version = 1)]
+async fn select_same_tick_timers(input: u64) -> durust::Result<String> {
+    let outcome = durust::select! {
+        left = durust::sleep(Duration::from_millis(input)) => {
+            left?;
+            "left".to_owned()
+        }
+        right = durust::sleep(Duration::from_millis(input)) => {
+            right?;
+            "right".to_owned()
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-fourth-signal", version = 1)]
+async fn select_fourth_signal(_: ()) -> durust::Result<String> {
+    let outcome = durust::select! {
+        first = durust::sleep(Duration::from_secs(1)) => {
+            first?;
+            "first".to_owned()
+        }
+        second = durust::sleep(Duration::from_secs(2)) => {
+            second?;
+            "second".to_owned()
+        }
+        third = durust::sleep(Duration::from_secs(3)) => {
+            third?;
+            "third".to_owned()
+        }
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+    };
+    Ok(outcome)
+}
+
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait(input: u64) -> durust::Result<String> {
+    let first = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait_reordered(input: u64) -> durust::Result<String> {
+    let first = durust::select! {
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
 #[durust::workflow(name = "tests.failing-activity", version = 1)]
 async fn failing_activity_workflow(_: ()) -> durust::Result<u64> {
     durust::call_activity!(fail_activity(())).await
@@ -254,6 +406,586 @@ fn cancelling_pending_workflow_cleans_activity_without_workflow_failure() {
                 | HistoryEventData::WorkflowCompleted { .. }
                 | HistoryEventData::WorkflowFailed { .. }
         )));
+    });
+}
+
+#[test]
+fn join_registers_all_branches_before_waiting() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_two_activities>("wf/join-register", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(join_two_activities)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+
+        let activity_opts = ClaimActivityOptions {
+            namespace: Namespace::default(),
+            task_queue: TaskQueue::new("activities"),
+            registered_activity_names: vec![ActivityName::new("tests.double")],
+            lease_duration: Duration::from_secs(30),
+        };
+        let first = backend
+            .claim_activity_task(WorkerId::new("join-worker-1"), activity_opts.clone())
+            .await
+            .unwrap()
+            .expect("first joined activity");
+        let second = backend
+            .claim_activity_task(WorkerId::new("join-worker-2"), activity_opts)
+            .await
+            .unwrap()
+            .expect("second joined activity");
+        assert_ne!(first.task.command_id.seq, second.task.command_id.seq);
+    });
+}
+
+#[test]
+fn sequential_awaits_do_not_register_later_activity_before_waiting() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<sequential_two_activities>("wf/sequential-awaits", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(sequential_two_activities)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 2);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+    });
+}
+
+#[test]
+fn join_accepts_more_than_three_branches() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_four_activities>("wf/join-four", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(join_four_activities)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 5);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::ActivityScheduled(_)))
+                .count(),
+            4
+        );
+    });
+}
+
+#[test]
+fn join_waits_for_signal_and_timer_branches() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_signal_timer>("wf/join-signal-timer", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(join_signal_timer)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow("wf/join-signal-timer", "ready", "signal/join/1", "joined")
+            .await
+            .unwrap();
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 5);
+        assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[2].data, HistoryEventData::TimerFired(_)));
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::SignalConsumed(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("join signal/timer workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "joined");
+    });
+}
+
+#[test]
+fn join_replays_interleaved_branch_completions_after_crash() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_two_activities>("wf/join-replay", "workflows", 10)
+            .await
+            .unwrap();
+        let mut scheduling_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(join_two_activities)
+            .register_activity(double)
+            .build();
+
+        assert!(scheduling_worker.run_workflow_once().await.unwrap());
+        let activity_opts = ClaimActivityOptions {
+            namespace: Namespace::default(),
+            task_queue: TaskQueue::new("activities"),
+            registered_activity_names: vec![ActivityName::new("tests.double")],
+            lease_duration: Duration::from_secs(30),
+        };
+        let first = backend
+            .claim_activity_task(WorkerId::new("join-worker-1"), activity_opts.clone())
+            .await
+            .unwrap()
+            .expect("first joined activity");
+        let second = backend
+            .claim_activity_task(WorkerId::new("join-worker-2"), activity_opts)
+            .await
+            .unwrap()
+            .expect("second joined activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: second.claim,
+                result: durust::encode_payload(&22_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: first.claim,
+                result: durust::encode_payload(&20_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        drop(scheduling_worker);
+
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(join_two_activities)
+            .register_activity(double)
+            .build();
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 6);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(matches!(
+            history[4].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[5].data else {
+            panic!("join workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+    });
+}
+
+#[test]
+fn select_chooses_earliest_ready_event_before_lexical_order() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_timer_before_activity>(
+                "wf/select-event-order",
+                "workflows",
+                20,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(select_timer_before_activity)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let claimed_activity = backend
+            .claim_activity_task(
+                WorkerId::new("activity-after-timer"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("activity task");
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed_activity.claim,
+                result: durust::encode_payload(&40_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 7);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(history[2].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[3].data, HistoryEventData::TimerFired(_)));
+        assert!(matches!(
+            history[4].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        let HistoryEventData::SelectWinner(winner) = &history[5].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 1);
+        assert_eq!(winner.winning_event_id, EventId(4));
+        let HistoryEventData::WorkflowCompleted { result } = &history[6].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "timer");
+    });
+}
+
+#[test]
+fn select_same_tick_timer_race_is_deterministic() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_same_tick_timers>("wf/select-same-tick", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_same_tick_timers)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 2);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 7);
+        assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[2].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[3].data, HistoryEventData::TimerFired(_)));
+        assert!(matches!(history[4].data, HistoryEventData::TimerFired(_)));
+        let HistoryEventData::SelectWinner(winner) = &history[5].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 0);
+        assert_eq!(winner.winning_event_id, EventId(4));
+        let HistoryEventData::WorkflowCompleted { result } = &history[6].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "left");
+    });
+}
+
+#[test]
+fn select_signal_winner_cancels_losing_timer_wait() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_signal_timer>("wf/select-signal", "workflows", 50)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_signal_timer)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow("wf/select-signal", "ready", "signal/select/1", "go")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(50));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 0);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 5);
+        assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::SignalConsumed(_)
+        ));
+        let HistoryEventData::SelectWinner(winner) = &history[3].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 0);
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "signal:go"
+        );
+    });
+}
+
+#[test]
+fn select_timer_winner_cancels_in_flight_activity() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_activity_timer>("wf/select-activity-timer", "workflows", 20)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(select_activity_timer)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let claimed_activity = backend
+            .claim_activity_task(
+                WorkerId::new("late-activity-worker"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("activity task");
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let late_completion = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed_activity.claim,
+                result: durust::encode_payload(&40_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            late_completion,
+            durust::CompleteActivityOutcome::AlreadyCompleted
+        );
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 6);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        assert!(matches!(history[2].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[3].data, HistoryEventData::TimerFired(_)));
+        let HistoryEventData::SelectWinner(winner) = &history[4].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 1);
+        let HistoryEventData::WorkflowCompleted { result } = &history[5].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 0);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+        );
+    });
+}
+
+#[test]
+fn select_accepts_more_than_three_branches() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_fourth_signal>("wf/select-four", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_fourth_signal)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow("wf/select-four", "ready", "signal/select/four", "go")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 7);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::TimerStarted(_)))
+                .count(),
+            3
+        );
+        let HistoryEventData::SelectWinner(winner) = &history[5].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 3);
+        let HistoryEventData::WorkflowCompleted { result } = &history[6].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "signal:go"
+        );
+    });
+}
+
+#[test]
+fn select_replays_recorded_winner_after_worker_crash() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_then_wait>("wf/select-replay-winner", "workflows", 10)
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        client
+            .signal_workflow(
+                "wf/select-replay-winner",
+                "after",
+                "signal/select/replay-after",
+                "done",
+            )
+            .await
+            .unwrap();
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(select_then_wait)
+            .build();
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::SelectWinner(_)))
+                .count(),
+            1
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("completed event").data
+        else {
+            panic!("select replay workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "timer:done"
+        );
+    });
+}
+
+#[test]
+fn select_branch_reorder_is_detected_on_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<select_then_wait>("wf/select-reorder", "workflows", 10)
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        client
+            .signal_workflow("wf/select-reorder", "after", "signal/select/after", "done")
+            .await
+            .unwrap();
+        let mut changed_worker = Worker::builder(backend)
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait_reordered)
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .build();
+        let err = changed_worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Nondeterminism(_)));
     });
 }
 

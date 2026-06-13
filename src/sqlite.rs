@@ -432,6 +432,9 @@ impl DurableBackend for SqliteBackend {
                 )
                 .map_err(sqlite_error)?;
             }
+            for command_id in batch.cancel_commands {
+                cancel_command_operational_state(&tx, &command_id)?;
+            }
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
                 cleanup_run_operational_state(&tx, &claim.run_id)?;
@@ -1268,6 +1271,26 @@ fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result
     Ok(())
 }
 
+fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId) -> Result<()> {
+    let activity_id = ActivityId::new(command_id);
+    let map_prefix = format!("{}:map:%", activity_id.0);
+    tx.execute(
+        "update activity_tasks
+         set completed = 1, claim_token = null
+         where activity_id = ?1 or activity_id like ?2",
+        params![activity_id.0, map_prefix],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "update activity_maps
+         set completed = 1, in_flight = 0
+         where map_command_id = ?1",
+        params![map_command_key(command_id)],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 fn insert_activity_map(
     tx: &Transaction<'_>,
     namespace: &str,
@@ -1829,6 +1852,7 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::TimerStarted => "timer_started",
         HistoryEventType::TimerFired => "timer_fired",
         HistoryEventType::SignalConsumed => "signal_consumed",
+        HistoryEventType::SelectWinner => "select_winner",
     }
 }
 
@@ -1849,6 +1873,7 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "timer_started" => Ok(HistoryEventType::TimerStarted),
         "timer_fired" => Ok(HistoryEventType::TimerFired),
         "signal_consumed" => Ok(HistoryEventType::SignalConsumed),
+        "select_winner" => Ok(HistoryEventType::SelectWinner),
         other => Err(Error::Backend(format!("unknown event type `{other}`"))),
     }
 }

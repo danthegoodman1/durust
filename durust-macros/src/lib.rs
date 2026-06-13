@@ -4,8 +4,8 @@ use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    parse_macro_input, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn, Lit,
-    Meta, Pat, PathArguments, ReturnType, Token, Type,
+    parse_macro_input, Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn,
+    Lit, LitStr, Meta, Pat, PathArguments, ReturnType, Token, Type,
 };
 
 struct MacroArgs {
@@ -17,6 +17,48 @@ impl Parse for MacroArgs {
         Ok(Self {
             items: Punctuated::parse_terminated(input)?,
         })
+    }
+}
+
+struct JoinInput {
+    futures: Punctuated<Expr, Token![,]>,
+}
+
+impl Parse for JoinInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        Ok(Self {
+            futures: Punctuated::parse_terminated(input)?,
+        })
+    }
+}
+
+struct SelectInput {
+    branches: Vec<SelectBranch>,
+}
+
+struct SelectBranch {
+    pattern: Pat,
+    future: Expr,
+    body: Block,
+}
+
+impl Parse for SelectInput {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut branches = Vec::new();
+        while !input.is_empty() {
+            let pattern = Pat::parse_single(input)?;
+            input.parse::<Token![=]>()?;
+            let future = input.parse::<Expr>()?;
+            input.parse::<Token![=>]>()?;
+            let body = input.parse::<Block>()?;
+            let _ = input.parse::<Option<Token![,]>>()?;
+            branches.push(SelectBranch {
+                pattern,
+                future,
+                body,
+            });
+        }
+        Ok(Self { branches })
     }
 }
 
@@ -34,6 +76,24 @@ pub fn activity(args: TokenStream, item: TokenStream) -> TokenStream {
 pub fn call_activity(input: TokenStream) -> TokenStream {
     let call = parse_macro_input!(input as ExprCall);
     match expand_call_activity(call) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[proc_macro]
+pub fn join(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as JoinInput);
+    match expand_join(input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+#[proc_macro]
+pub fn select(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as SelectInput);
+    match expand_select(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
@@ -207,6 +267,292 @@ fn expand_call_activity(call: ExprCall) -> syn::Result<proc_macro2::TokenStream>
     })
 }
 
+fn expand_join(input: JoinInput) -> syn::Result<proc_macro2::TokenStream> {
+    let futures = input.futures.into_iter().collect::<Vec<_>>();
+    if futures.len() < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "durust::join! expects at least two durable futures",
+        ));
+    }
+
+    let future_vars = (0..futures.len())
+        .map(|index| format_ident!("__durust_join_future_{index}"))
+        .collect::<Vec<_>>();
+    let output_vars = (0..futures.len())
+        .map(|index| format_ident!("__durust_join_output_{index}"))
+        .collect::<Vec<_>>();
+    let output_messages = (0..futures.len())
+        .map(|index| {
+            LitStr::new(
+                &format!("join branch {index} completed without output"),
+                proc_macro2::Span::call_site(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let poll_branches =
+        future_vars
+            .iter()
+            .zip(output_vars.iter())
+            .map(|(future_var, output_var)| {
+                quote! {
+                    if #output_var.is_none() {
+                        match ::std::future::Future::poll(
+                            ::std::pin::Pin::new(&mut #future_var),
+                            __durust_cx,
+                        ) {
+                            ::std::task::Poll::Ready(::std::result::Result::Ok(__durust_join_value)) => {
+                                #output_var = ::std::option::Option::Some(__durust_join_value);
+                                __durust_join_made_progress = true;
+                            }
+                            ::std::task::Poll::Ready(::std::result::Result::Err(__durust_join_err)) => {
+                                if __durust_join_first_error.is_none() {
+                                    __durust_join_first_error = ::std::option::Option::Some(__durust_join_err);
+                                }
+                                __durust_join_made_progress = true;
+                            }
+                            ::std::task::Poll::Pending => {}
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+    let output_ready = output_vars.iter().map(|output_var| {
+        quote! {
+            #output_var.is_some()
+        }
+    });
+    let take_outputs =
+        output_vars
+            .iter()
+            .zip(output_messages.iter())
+            .map(|(output_var, output_message)| {
+                quote! {
+                    #output_var.take().expect(#output_message)
+                }
+            });
+
+    Ok(quote! {{
+        #(let mut #future_vars = #futures;)*
+        #(::durust::__durust_join_assert_branch(&#future_vars);)*
+        #(let mut #output_vars = ::std::option::Option::None;)*
+        ::std::future::poll_fn(move |__durust_cx| {
+            loop {
+                let mut __durust_join_made_progress = false;
+                let mut __durust_join_first_error = ::std::option::Option::None;
+                #(#poll_branches)*
+                if let ::std::option::Option::Some(__durust_join_err) = __durust_join_first_error {
+                    return ::std::task::Poll::Ready(::std::result::Result::Err(__durust_join_err));
+                }
+                if true #(&& #output_ready)* {
+                    return ::std::task::Poll::Ready(::std::result::Result::Ok((#(#take_outputs),*)));
+                }
+                if !__durust_join_made_progress {
+                    return ::std::task::Poll::Pending;
+                }
+            }
+        })
+    }})
+}
+
+fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
+    let branches = input.branches;
+    if branches.len() < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "durust::select! expects at least two durable futures",
+        ));
+    }
+
+    let branch_digest = branches
+        .iter()
+        .map(|branch| {
+            format!(
+                "{}={}",
+                branch.pattern.to_token_stream(),
+                branch.future.to_token_stream()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|");
+    let branch_digest = LitStr::new(&branch_digest, proc_macro2::Span::call_site());
+
+    let futures = branches
+        .iter()
+        .map(|branch| &branch.future)
+        .collect::<Vec<_>>();
+    let patterns = branches
+        .iter()
+        .map(|branch| &branch.pattern)
+        .collect::<Vec<_>>();
+    let bodies = branches.iter().map(|branch| &branch.body).collect::<Vec<_>>();
+    let future_vars = (0..branches.len())
+        .map(|index| format_ident!("__durust_select_future_{index}"))
+        .collect::<Vec<_>>();
+    let output_vars = (0..branches.len())
+        .map(|index| format_ident!("__durust_select_output_{index}"))
+        .collect::<Vec<_>>();
+    let branch_ordinals = (0..branches.len())
+        .map(|index| {
+            syn::LitInt::new(
+                &format!("{index}_u32"),
+                proc_macro2::Span::call_site(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let output_messages = (0..branches.len())
+        .map(|index| {
+            LitStr::new(
+                &format!("select branch {index} selected without output"),
+                proc_macro2::Span::call_site(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let poll_branches =
+        future_vars
+            .iter()
+            .zip(output_vars.iter())
+            .map(|(future_var, output_var)| {
+                quote! {
+                    if #output_var.is_none() {
+                        ::durust::__durust_select_clear_ready_event_id();
+                        match ::std::future::Future::poll(
+                            ::std::pin::Pin::new(&mut #future_var),
+                            __durust_cx,
+                        ) {
+                            ::std::task::Poll::Ready(::std::result::Result::Ok(__durust_select_value)) => {
+                                let __durust_select_event_id =
+                                    ::durust::__durust_select_take_ready_event_id()
+                                        .unwrap_or(::durust::EventId::ZERO);
+                                #output_var = ::std::option::Option::Some((
+                                    __durust_select_event_id,
+                                    ::std::result::Result::Ok(__durust_select_value),
+                                ));
+                            }
+                            ::std::task::Poll::Ready(::std::result::Result::Err(__durust_select_err)) => {
+                                if let ::std::option::Option::Some(__durust_select_event_id) =
+                                    ::durust::__durust_select_take_ready_event_id()
+                                {
+                                    #output_var = ::std::option::Option::Some((
+                                        __durust_select_event_id,
+                                        ::std::result::Result::Err(__durust_select_err),
+                                    ));
+                                } else {
+                                    return ::std::task::Poll::Ready(
+                                        ::std::result::Result::Err(__durust_select_err),
+                                    );
+                                }
+                            }
+                            ::std::task::Poll::Pending => {}
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+    let select_ready =
+        output_vars
+            .iter()
+            .zip(branch_ordinals.iter())
+            .map(|(output_var, branch_ordinal)| {
+                quote! {
+                    if let ::std::option::Option::Some((__durust_select_event_id, _)) =
+                        #output_var.as_ref()
+                    {
+                        match __durust_select_winner {
+                            ::std::option::Option::Some((
+                                __durust_select_winner_ordinal,
+                                __durust_select_winner_event_id,
+                            )) if (__durust_select_winner_event_id, __durust_select_winner_ordinal)
+                                <= (*__durust_select_event_id, #branch_ordinal) => {}
+                            _ => {
+                                __durust_select_winner =
+                                    ::std::option::Option::Some((#branch_ordinal, *__durust_select_event_id));
+                            }
+                        }
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+    let cancel_losers =
+        future_vars
+            .iter()
+            .zip(output_vars.iter())
+            .zip(branch_ordinals.iter())
+            .map(|((future_var, output_var), branch_ordinal)| {
+                quote! {
+                    if __durust_select_branch_ordinal != #branch_ordinal && #output_var.is_none() {
+                        ::durust::DurableSelectBranch::__durust_cancel_branch(&#future_var);
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+    let match_arms = branch_ordinals
+        .iter()
+        .zip(patterns.iter())
+        .zip(output_vars.iter())
+        .zip(output_messages.iter())
+        .zip(bodies.iter())
+        .map(
+            |((((branch_ordinal, pattern), output_var), output_message), body)| {
+                quote! {
+                    #branch_ordinal => {
+                        let (_, #pattern) = #output_var.take().expect(#output_message);
+                        #body
+                    }
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+
+    Ok(quote! {{
+        #(let mut #future_vars = #futures;)*
+        #(let mut #output_vars = ::std::option::Option::None;)*
+        let mut __durust_select_command_id = ::std::option::Option::None;
+        let __durust_select_branch_ordinal = ::std::future::poll_fn(|__durust_cx| {
+            ::durust::__durust_select_ensure_command_id(&mut __durust_select_command_id);
+            #(#poll_branches)*
+
+            let mut __durust_select_winner:
+                ::std::option::Option<(u32, ::durust::EventId)> = ::std::option::Option::None;
+            #(#select_ready)*
+            let ::std::option::Option::Some((
+                __durust_select_branch_ordinal,
+                __durust_select_winning_event_id,
+            )) = __durust_select_winner else {
+                return ::std::task::Poll::Pending;
+            };
+            let __durust_select_command_id = __durust_select_command_id
+                .as_ref()
+                .expect("select command id initialized");
+            match ::durust::__durust_select_record_winner(
+                __durust_select_command_id,
+                __durust_select_branch_ordinal,
+                __durust_select_winning_event_id,
+                #branch_digest,
+            ) {
+                ::std::task::Poll::Ready(::std::result::Result::Ok(())) => {
+                    #(#cancel_losers)*
+                    ::std::task::Poll::Ready(::std::result::Result::Ok(
+                        __durust_select_branch_ordinal,
+                    ))
+                }
+                ::std::task::Poll::Ready(::std::result::Result::Err(__durust_select_err)) => {
+                    ::std::task::Poll::Ready(::std::result::Result::Err(__durust_select_err))
+                }
+                ::std::task::Poll::Pending => ::std::task::Poll::Pending,
+            }
+        })
+        .await?;
+
+        match __durust_select_branch_ordinal {
+            #(#match_arms)*
+            _ => ::std::unreachable!("select returned a branch ordinal outside macro range"),
+        }
+    }})
+}
+
 fn extract_single_input(item_fn: &ItemFn) -> syn::Result<(Pat, Type)> {
     if item_fn.sig.inputs.len() != 1 {
         return Err(syn::Error::new_spanned(
@@ -373,7 +719,8 @@ impl<'ast> Visit<'ast> for AwaitLint {
             || base.contains("result_manifest")
             || base.contains("durust :: sleep")
             || base.contains("durust :: sleep_until")
-            || base.contains("durust :: signal");
+            || base.contains("durust :: signal")
+            || base.contains("durust :: join");
         if !allowed {
             self.err = Some(syn::Error::new_spanned(
                 node,

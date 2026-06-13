@@ -177,6 +177,7 @@ where
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
     activity_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone()).await;
+    cancel_commands_clear_activity_tasks(backend.clone()).await;
     activity_map_materializes_bounded_items_and_writes_result_manifest(backend.clone()).await;
     activity_map_failure_suppresses_remaining_items_and_wakes_workflow(backend.clone()).await;
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
@@ -324,6 +325,7 @@ where
                 schedule_activity_maps: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -477,6 +479,7 @@ where
                 schedule_activity_maps: Vec::new(),
                 consume_signals: vec![first_inbox.signal_id],
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -550,6 +553,7 @@ where
                 schedule_activity_maps: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -652,6 +656,7 @@ where
                 schedule_activity_maps: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -783,6 +788,7 @@ where
                 schedule_activity_maps: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -899,6 +905,147 @@ where
     assert!(timed_out.message.contains("timed out"));
 }
 
+async fn cancel_commands_clear_activity_tasks<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>("wf/cancel-command", "cancel-command-workflows", 5)
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("cancel-command-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let activity_command = durust::command_id(&run_id, 1);
+    let timer_command = durust::command_id(&run_id, 2);
+    let activity_input = durust::encode_payload(&Input { value: 5 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: activity_command.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        input: activity_input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&activity_input),
+            "sha256:cancel-command-options".to_owned(),
+        ),
+    };
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("cancel-command-scheduler"),
+            claim_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![
+                    durust::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                        scheduled.clone(),
+                    )),
+                    durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                        durust::TimerStarted {
+                            command_id: timer_command.clone(),
+                            fire_at: durust::TimestampMs(10),
+                            fingerprint: durust::timer_fingerprint(
+                                "sleep",
+                                durust::TimestampMs(10),
+                            ),
+                        },
+                    )),
+                ],
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: durust::WaitId::new(format!(
+                        "{}:{}:timer",
+                        timer_command.run_id, timer_command.seq.0
+                    )),
+                    run_id: timer_command.run_id.clone(),
+                    command_id: timer_command.clone(),
+                    kind: durust::WaitKind::Timer,
+                    key: "timer".to_owned(),
+                    ready_at: Some(durust::TimestampMs(10)),
+                }],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+
+    let claimed_activity = backend
+        .claim_activity_task(
+            WorkerId::new("cancel-command-activity"),
+            ClaimActivityOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("activities"),
+                registered_activity_names: vec![ActivityName::new("conformance.echo")],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+    let fired = backend
+        .fire_due_timers(durust::FireDueTimersRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(10),
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(fired.fired, 1);
+
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("cancel-command-selector"), claim_opts)
+        .await
+        .unwrap()
+        .expect("timer-ready workflow task");
+    assert_eq!(claimed.replay_target_event_id, EventId(4));
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(4),
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: vec![activity_command],
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+
+    let late_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: claimed_activity.claim,
+            result: durust::encode_payload(&5_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        late_completion,
+        durust::CompleteActivityOutcome::AlreadyCompleted
+    );
+}
+
 async fn activity_map_materializes_bounded_items_and_writes_result_manifest<B>(backend: B)
 where
     B: DurableBackend,
@@ -976,6 +1123,7 @@ where
                 schedule_activity_maps: vec![map_task],
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -1184,6 +1332,7 @@ where
                 schedule_activity_maps: vec![map_task],
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await
@@ -1408,6 +1557,7 @@ where
                 schedule_activity_maps: vec![map_task],
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
             },
         )
         .await

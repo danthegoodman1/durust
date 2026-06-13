@@ -529,6 +529,7 @@ where
                         schedule_activity_maps: parts.schedule_activity_maps,
                         consume_signals: parts.consume_signals,
                         delete_waits: parts.delete_waits,
+                        cancel_commands: parts.cancel_commands,
                     },
                 )
                 .await?,

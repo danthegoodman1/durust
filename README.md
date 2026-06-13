@@ -541,6 +541,8 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`worker_registration.rs`](examples/worker_registration.rs)
 - [`signal_wait.rs`](examples/signal_wait.rs)
 - [`timer_wait.rs`](examples/timer_wait.rs)
+- [`select_approval.rs`](examples/select_approval.rs)
+- [`join_activities.rs`](examples/join_activities.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)
 - [`activity_map.rs`](examples/activity_map.rs)
 - [`map_reduce.rs`](examples/map_reduce.rs)
