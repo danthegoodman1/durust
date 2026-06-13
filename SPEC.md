@@ -77,12 +77,12 @@ The replay history is authoritative. The in-memory workflow future is only a cac
 The user writes normal-looking async Rust:
 
 ```rust
-#[durable::workflow(name = "order", version = 1, query_state = OrderView)]
-pub async fn order(input: OrderInput) -> durable::Result<OrderOutput> {
+#[durust::workflow(name = "order", version = 1, query_state = OrderView)]
+pub async fn order(input: OrderInput) -> durust::Result<OrderOutput> {
     let mut view = OrderView::new(&input);
-    durable::publish(&view)?;
+    durust::publish(&view)?;
 
-    let quote = durable::activity!(price_quote(QuoteInput {
+    let quote = durust::activity!(price_quote(QuoteInput {
         sku: input.sku.clone(),
         qty: input.qty,
     }))
@@ -91,16 +91,16 @@ pub async fn order(input: OrderInput) -> durable::Result<OrderOutput> {
 
     view.status = OrderStatus::Quoted;
     view.quote = Some(quote.summary());
-    durable::publish(&view)?;
+    durust::publish(&view)?;
 
-    let approval = durable::select! {
-        approval = durable::signal::<Approval>("approved") => approval?,
-        _ = durable::sleep_until(input.deadline) => {
-            return Err(durable::Error::timeout("approval timed out"));
+    let approval = durust::select! {
+        approval = durust::signal::<Approval>("approved") => approval?,
+        _ = durust::sleep_until(input.deadline) => {
+            return Err(durust::Error::timeout("approval timed out"));
         }
     };
 
-    let payment = durable::activity!(charge_card(ChargeInput {
+    let payment = durust::activity!(charge_card(ChargeInput {
         order_id: input.order_id.clone(),
         amount: quote.total,
         approval_id: approval.id.clone(),
@@ -108,7 +108,7 @@ pub async fn order(input: OrderInput) -> durable::Result<OrderOutput> {
     .idempotency_key(("charge", &input.order_id))
     .await?;
 
-    let child = durable::child!(ship_order(ShipInput {
+    let child = durust::child!(ship_order(ShipInput {
         order_id: input.order_id.clone(),
         payment_id: payment.id.clone(),
     }))
@@ -159,13 +159,13 @@ Durable names are what get stored in history, tasks, indexes, and child-start re
 Recommended production style is an explicit durable name:
 
 ```rust
-#[durable::workflow(name = "orders.order", version = 1)]
-pub async fn order(input: OrderInput) -> durable::Result<OrderOutput> {
+#[durust::workflow(name = "orders.order", version = 1)]
+pub async fn order(input: OrderInput) -> durust::Result<OrderOutput> {
     // ...
 }
 
-#[durable::activity(name = "payments.charge-card")]
-pub async fn charge_card(input: ChargeInput) -> durable::Result<ChargeOutput> {
+#[durust::activity(name = "payments.charge-card")]
+pub async fn charge_card(input: ChargeInput) -> durust::Result<ChargeOutput> {
     // ...
 }
 ```
@@ -299,22 +299,22 @@ continue-as-new
 The intended DX is ordinary Rust control flow around durable futures:
 
 ```rust
-if durable::patched("new-payment-flow")? {
-    durable::activity!(charge_v2(input)).await?;
+if durust::patched("new-payment-flow")? {
+    durust::activity!(charge_v2(input)).await?;
 } else {
-    durable::activity!(charge_v1(input)).await?;
+    durust::activity!(charge_v1(input)).await?;
 }
 
-let outcome = durable::select! {
-    approval = durable::signal::<Approval>("approved") => {
+let outcome = durust::select! {
+    approval = durust::signal::<Approval>("approved") => {
         ApprovalOutcome::Approved(approval?)
     }
 
-    cancel = durable::signal::<Cancel>("cancel") => {
+    cancel = durust::signal::<Cancel>("cancel") => {
         ApprovalOutcome::Cancelled(cancel?)
     }
 
-    _ = durable::sleep_until(deadline) => {
+    _ = durust::sleep_until(deadline) => {
         ApprovalOutcome::TimedOut
     }
 };
@@ -322,10 +322,10 @@ let outcome = durable::select! {
 match outcome {
     ApprovalOutcome::Approved(approval) => approve(approval).await?,
     ApprovalOutcome::Cancelled(cancel) => return Err(cancel.into()),
-    ApprovalOutcome::TimedOut => return Err(durable::Error::timeout("approval")),
+    ApprovalOutcome::TimedOut => return Err(durust::Error::timeout("approval")),
 }
 
-let child = durable::child!(ship_order(input))
+let child = durust::child!(ship_order(input))
     .parent_close_policy(ParentClosePolicy::Cancel)
     .spawn()
     .await?;
@@ -423,7 +423,7 @@ Example:
 let mut x = 0;
 
 for i in 0..10 {
-    x += durable::activity!(compute(i)).await?;
+    x += durust::activity!(compute(i)).await?;
 }
 ```
 
@@ -448,7 +448,7 @@ For the loop:
 let mut x = 0;
 
 for i in 0..10 {
-    x += durable::activity!(compute(i)).await?;
+    x += durust::activity!(compute(i)).await?;
 }
 ```
 
@@ -519,7 +519,7 @@ pub trait HistoryStream {
         after: EventId,
         max_events: usize,
         max_bytes: usize,
-    ) -> durable::Result<HistoryChunk>;
+    ) -> durust::Result<HistoryChunk>;
 }
 ```
 
@@ -544,7 +544,7 @@ Workers are local processes that register code they can execute and poll durable
 Registration is local capability registration, not durable schema mutation:
 
 ```rust
-let worker = durable::Worker::builder(backend.clone())
+let worker = durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("orders-a")
     .workflow_task_queue("orders")
@@ -562,7 +562,7 @@ let worker = durable::Worker::builder(backend.clone())
 Workflow-only worker:
 
 ```rust
-durable::Worker::builder(backend.clone())
+durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("order-workflows-a")
     .workflow_task_queue("orders")
@@ -574,7 +574,7 @@ durable::Worker::builder(backend.clone())
 Activity-only worker on another machine:
 
 ```rust
-durable::Worker::builder(backend.clone())
+durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("payment-activities-a")
     .activity_task_queue("payments")
@@ -587,7 +587,7 @@ durable::Worker::builder(backend.clone())
 Client start chooses the workflow task queue:
 
 ```rust
-let handle = durable::Client::new(backend.clone())
+let handle = durust::Client::new(backend.clone())
     .start(order(input))
     .workflow_id("order/123")
     .task_queue("orders")
@@ -597,7 +597,7 @@ let handle = durable::Client::new(backend.clone())
 Activity calls choose an activity task queue, either from activity metadata or per-call override:
 
 ```rust
-let payment = durable::activity!(charge_card(input))
+let payment = durust::activity!(charge_card(input))
     .task_queue("payments")
     .await?;
 ```
@@ -889,7 +889,7 @@ Temporal’s docs call out adding, removing, or reordering command-producing awa
 For:
 
 ```rust
-let quote = durable::activity!(price_quote(input)).await?;
+let quote = durust::activity!(price_quote(input)).await?;
 ```
 
 The durable future behaves like this:
@@ -921,11 +921,11 @@ Live cached mode:
 Large fanout should not require one workflow command per activity or one in-memory `Vec` of inputs. Provide one manifest-based API for map-style fanout:
 
 ```rust
-let partitions = durable::activity!(partition_input(input.source_ref))
+let partitions = durust::activity!(partition_input(input.source_ref))
     .task_queue("storage")
     .await?;
 
-let mapped = durable::activity_map(map_chunk)
+let mapped = durust::activity_map(map_chunk)
     .task_queue("mappers")
     .input_manifest(partitions.manifest_ref)
     .max_in_flight(10_000)
@@ -933,7 +933,7 @@ let mapped = durable::activity_map(map_chunk)
     .spawn()
     .await?;
 
-let output = durable::activity!(reduce_manifest(mapped.result_manifest().await?))
+let output = durust::activity!(reduce_manifest(mapped.result_manifest().await?))
     .task_queue("reducers")
     .await?;
 ```
@@ -967,11 +967,11 @@ manifest_ref
 Small in-memory inputs should be converted to a manifest before scheduling:
 
 ```rust
-let manifest_ref = durable::manifest::from_iter(chunk_refs)
+let manifest_ref = durust::manifest::from_iter(chunk_refs)
     .spill_to_blob()
     .await?;
 
-let mapped = durable::activity_map(map_chunk)
+let mapped = durust::activity_map(map_chunk)
     .task_queue("mappers")
     .input_manifest(manifest_ref)
     .max_in_flight(100)
@@ -1060,60 +1060,60 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     async fn start_workflow(
         &self,
         req: StartWorkflowRequest,
-    ) -> durable::Result<StartWorkflowOutcome>;
+    ) -> durust::Result<StartWorkflowOutcome>;
 
     async fn claim_workflow_task(
         &self,
         worker_id: WorkerId,
         opts: ClaimWorkflowTaskOptions,
-    ) -> durable::Result<Option<ClaimedWorkflowTask>>;
+    ) -> durust::Result<Option<ClaimedWorkflowTask>>;
 
     async fn stream_history(
         &self,
         req: StreamHistoryRequest,
-    ) -> durable::Result<HistoryChunk>;
+    ) -> durust::Result<HistoryChunk>;
 
     async fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> durable::Result<CommitOutcome>;
+    ) -> durust::Result<CommitOutcome>;
 
     async fn signal_workflow(
         &self,
         req: SignalWorkflowRequest,
-    ) -> durable::Result<SignalWorkflowOutcome>;
+    ) -> durust::Result<SignalWorkflowOutcome>;
 
     async fn read_signal_inbox(
         &self,
         req: ReadSignalInboxRequest,
-    ) -> durable::Result<Option<SignalInboxRecord>>;
+    ) -> durust::Result<Option<SignalInboxRecord>>;
 
     async fn claim_activity_task(
         &self,
         worker_id: WorkerId,
         opts: ClaimActivityOptions,
-    ) -> durable::Result<Option<ClaimedActivityTask>>;
+    ) -> durust::Result<Option<ClaimedActivityTask>>;
 
     async fn heartbeat_activity(
         &self,
         req: ActivityHeartbeat,
-    ) -> durable::Result<HeartbeatOutcome>;
+    ) -> durust::Result<HeartbeatOutcome>;
 
     async fn complete_activity(
         &self,
         req: CompleteActivityRequest,
-    ) -> durable::Result<CompleteActivityOutcome>;
+    ) -> durust::Result<CompleteActivityOutcome>;
 
     async fn fail_activity(
         &self,
         req: FailActivityRequest,
-    ) -> durable::Result<FailActivityOutcome>;
+    ) -> durust::Result<FailActivityOutcome>;
 
     async fn query_projection(
         &self,
         req: QueryProjectionRequest,
-    ) -> durable::Result<QueryProjectionOutcome>;
+    ) -> durust::Result<QueryProjectionOutcome>;
 }
 ```
 
@@ -1225,6 +1225,89 @@ The runtime contract is append journal only. Backends may keep caches, materiali
 
 A SQLite implementation is required for tests and local development. It should exercise the same backend trait and append-journal semantics as production providers, but its schema must not define the public provider abstraction.
 
+## 8.5 Scale-out, shards, and outbox handoff
+
+Mega-scale providers should partition runtime state by logical shards.
+
+Shard key:
+
+```text
+namespace
++ workflow_id
++ run_id
+```
+
+Default shard assignment:
+
+```text
+shard_id = hash(namespace, workflow_id, run_id) % shard_count
+```
+
+The authoritative execution state for one workflow run should live on one logical shard:
+
+```text
+workflow instance row
+append history for the run
+active waits
+ready workflow task row
+signal inbox for the run
+activity map descriptors owned by the run
+child outbox rows owned by the run
+idempotency records scoped to the run
+query projection for the run
+```
+
+This keeps `commit_workflow_task` shard-local. The provider must not require a distributed transaction to commit a normal workflow task.
+
+Workers claim shard leases or queue leases depending on provider design:
+
+```rust
+pub struct ShardLease {
+    pub shard_id: ShardId,
+    pub owner_id: WorkerId,
+    pub lease_epoch: u64,
+    pub lease_until: Timestamp,
+}
+```
+
+Provider implementations may expose shard leasing internally rather than in the public runtime API, but conformance must prove stale lease owners cannot commit workflow tasks, activity completions, or map item completions.
+
+Cross-shard operations use transactional outbox/inbox handoff:
+
+```text
+1. Source shard commits local workflow state and an outbox message atomically.
+2. Dispatcher reads undispatched outbox messages.
+3. Dispatcher delivers to the target shard inbox idempotently.
+4. Target shard applies the message and writes any target-side state.
+5. Source shard records dispatch/ack state idempotently.
+```
+
+Use outbox/inbox handoff for:
+
+```text
+parent starting child on another shard
+child completion notifying parent on another shard
+parent cancellation propagating to child on another shard
+signal routing when the caller lands on a non-owner shard
+activity map item completion routed back to owner shard if item execution is partitioned elsewhere
+```
+
+Outbox message identity must be stable:
+
+```text
+source_shard_id
++ source_run_id
++ command_id
++ message_kind
++ target_run_id or target_key
+```
+
+Target inbox application must be idempotent. Dispatchers may crash, retry, duplicate messages, or deliver messages out of order. Correctness comes from stable message identity, target-side idempotency, and source/target shard-local commits.
+
+Cross-shard handoff affects visibility latency, not correctness. A committed source outbox row is enough to recover and eventually deliver the message.
+
+Physical partitions are provider implementation details. Logical shards are the runtime scaling unit; providers may map many logical shards onto a database partition, Kafka partition, RocksDB instance, or object-backed log segment.
+
 ---
 
 # 9. External Event Appends
@@ -1288,7 +1371,7 @@ Do not necessarily append to replay history yet.
 When workflow code executes:
 
 ```rust
-let approval = durable::signal::<Approval>("approved").await?;
+let approval = durust::signal::<Approval>("approved").await?;
 ```
 
 At tail, if a matching signal is available:
@@ -1316,8 +1399,8 @@ If multiple matching signals are already waiting, the runtime must not load them
 Core timers are UTC instants.
 
 ```rust
-durable::sleep(Duration::from_secs(30)).await;
-durable::sleep_until(deadline_utc).await;
+durust::sleep(Duration::from_secs(30)).await;
+durust::sleep_until(deadline_utc).await;
 ```
 
 Scheduling appends:
@@ -1339,7 +1422,7 @@ A pending timer is an active wait index row, not a future history row. Recovery 
 For wall-clock schedules, require explicit timezone ambiguity policies:
 
 ```rust
-durable::schedule::daily_at("America/Los_Angeles", LocalTime::from_hms(9, 0, 0))
+durust::schedule::daily_at("America/Los_Angeles", LocalTime::from_hms(9, 0, 0))
     .on_ambiguous_time(AmbiguousTimePolicy::Earlier)
     .on_nonexistent_time(NonexistentTimePolicy::NextValid);
 ```
@@ -1353,16 +1436,16 @@ Do not use `tokio::select!`.
 Provide:
 
 ```rust
-let outcome = durable::select! {
-    approval = durable::signal::<Approval>("approved") => {
+let outcome = durust::select! {
+    approval = durust::signal::<Approval>("approved") => {
         ApprovalOutcome::Approved(approval?)
     }
 
-    cancel = durable::signal::<Cancel>("cancel") => {
+    cancel = durust::signal::<Cancel>("cancel") => {
         ApprovalOutcome::Cancelled(cancel?)
     }
 
-    _ = durable::sleep_until(deadline) => {
+    _ = durust::sleep_until(deadline) => {
         ApprovalOutcome::TimedOut
     }
 };
@@ -1426,7 +1509,7 @@ Tie-break:
 Spawn and wait:
 
 ```rust
-let child = durable::child!(ship_order(input))
+let child = durust::child!(ship_order(input))
     .workflow_id(format!("ship/{}", order_id))
     .parent_close_policy(ParentClosePolicy::Cancel)
     .spawn()
@@ -1438,13 +1521,13 @@ let shipment = child.result().await?;
 Spawn and let the parent exit without cancelling the child:
 
 ```rust
-let child = durable::child!(send_receipt(input))
+let child = durust::child!(send_receipt(input))
     .workflow_id(format!("receipt/{}", order_id))
     .parent_close_policy(ParentClosePolicy::Abandon)
     .spawn()
     .await?;
 
-durable::publish(&OrderView {
+durust::publish(&OrderView {
     receipt_run_id: Some(child.run_id().clone()),
     ..view
 })?;
@@ -1499,13 +1582,13 @@ pub struct OrderView {
     pub quote: Option<QuoteSummary>,
 }
 
-durable::publish(&view)?;
+durust::publish(&view)?;
 ```
 
 Query handler:
 
 ```rust
-#[durable::query(workflow = order)]
+#[durust::query(workflow = order)]
 pub fn status(view: &OrderView) -> OrderStatus {
     view.status.clone()
 }
@@ -1519,7 +1602,7 @@ latest committed query projection
 
 No replay required.
 
-Queries are not durable workflow futures. They should not be called from workflow code, participate in `select!`, or change workflow state. Workflow code updates queryable state with `durable::publish(&view)`, and external callers read the latest committed projection through generated query APIs.
+Queries are not durable workflow futures. They should not be called from workflow code, participate in `select!`, or change workflow state. Workflow code updates queryable state with `durust::publish(&view)`, and external callers read the latest committed projection through generated query APIs.
 
 Optional later:
 
@@ -1545,7 +1628,7 @@ Implement the same concept.
 ```rust
 pub const DEFAULT_VERSION: i32 = -1;
 
-let v = durable::get_version("charge-flow", DEFAULT_VERSION, 2)?;
+let v = durust::get_version("charge-flow", DEFAULT_VERSION, 2)?;
 
 match v {
     DEFAULT_VERSION => {
@@ -1567,7 +1650,7 @@ match v {
 Boolean sugar:
 
 ```rust
-if durable::patched("new-charge-flow")? {
+if durust::patched("new-charge-flow")? {
     // new path
 } else {
     // old path
@@ -1577,13 +1660,13 @@ if durable::patched("new-charge-flow")? {
 Deprecation bridge:
 
 ```rust
-durable::deprecate_patch("new-charge-flow")?;
+durust::deprecate_patch("new-charge-flow")?;
 ```
 
 ## 15.2 `get_version` semantics
 
 ```rust
-durable::get_version(change_id, min_supported, max_supported)
+durust::get_version(change_id, min_supported, max_supported)
 ```
 
 During replay:
@@ -1609,13 +1692,13 @@ The marker is part of command history and participates in deterministic replay.
 ## 15.3 `patched` semantics
 
 ```rust
-durable::patched("id")
+durust::patched("id")
 ```
 
 Equivalent to:
 
 ```rust
-durable::get_version("id", DEFAULT_VERSION, 1)? != DEFAULT_VERSION
+durust::get_version("id", DEFAULT_VERSION, 1)? != DEFAULT_VERSION
 ```
 
 ## 15.4 Deployment flow
@@ -1623,16 +1706,16 @@ durable::get_version("id", DEFAULT_VERSION, 1)? != DEFAULT_VERSION
 ### Stage 1: original code
 
 ```rust
-let result = durable::activity!(activity_a(input)).await?;
+let result = durust::activity!(activity_a(input)).await?;
 ```
 
 ### Stage 2: patch in new code
 
 ```rust
-if durable::patched("replace-a-with-b")? {
-    let result = durable::activity!(activity_b(input)).await?;
+if durust::patched("replace-a-with-b")? {
+    let result = durust::activity!(activity_b(input)).await?;
 } else {
-    let result = durable::activity!(activity_a(input)).await?;
+    let result = durust::activity!(activity_a(input)).await?;
 }
 ```
 
@@ -1643,15 +1726,15 @@ No old worker binary needs to stay online.
 ### Stage 3: after no open workflows need the old branch
 
 ```rust
-durable::deprecate_patch("replace-a-with-b")?;
+durust::deprecate_patch("replace-a-with-b")?;
 
-let result = durable::activity!(activity_b(input)).await?;
+let result = durust::activity!(activity_b(input)).await?;
 ```
 
 ### Stage 4: after no histories with the patch marker remain relevant
 
 ```rust
-let result = durable::activity!(activity_b(input)).await?;
+let result = durust::activity!(activity_b(input)).await?;
 ```
 
 Temporal documents the same general patching lifecycle: introduce the patch branch, later deprecate it, and only remove the deprecation bridge after old executions are gone. ([Temporal Docs][2])
@@ -1714,19 +1797,19 @@ HashMap iteration for command-producing logic
 Use durable replacements:
 
 ```rust
-durable::sleep(...)
-durable::select! { ... }
-durable::spawn(...)
-durable::now()
-durable::side_effect!(...)
-durable::activity!(...)
+durust::sleep(...)
+durust::select! { ... }
+durust::spawn(...)
+durust::now()
+durust::side_effect!(...)
+durust::activity!(...)
 BTreeMap or sorted Vec
 ```
 
 The macro/lint layer should be fail-closed in strict mode:
 
 ```rust
-#[durable::workflow(strict)]
+#[durust::workflow(strict)]
 ```
 
 The `#[workflow]` macro should run a best-effort AST lint pass over the annotated workflow function. Strict mode should reject:
@@ -1744,13 +1827,13 @@ known network/database calls
 Diagnostics should point to the offending expression and suggest the durable replacement:
 
 ```text
-tokio::time::sleep      -> durable::sleep
-std::time::Instant::now -> durable::now
-std::time::SystemTime   -> durable::now
-tokio::select!          -> durable::select!
-tokio::spawn            -> durable::spawn or durable::join!
-rand/uuid generation    -> durable::side_effect!
-direct network/db calls -> durable::activity!
+tokio::time::sleep      -> durust::sleep
+std::time::Instant::now -> durust::now
+std::time::SystemTime   -> durust::now
+tokio::select!          -> durust::select!
+tokio::spawn            -> durust::spawn or durust::join!
+rand/uuid generation    -> durust::side_effect!
+direct network/db calls -> durust::activity!
 ```
 
 The lint is intentionally a guardrail, not the correctness mechanism. It may miss nondeterminism hidden behind helper functions, aliases, trait dispatch, dependencies, or data-structure iteration that is not syntactically obvious. Correctness still depends on replay and command fingerprint checks detecting divergent durable command sequences.
@@ -1762,15 +1845,15 @@ The lint is intentionally a guardrail, not the correctness mechanism. It may mis
 ## 17.1 Deterministic time
 
 ```rust
-let now = durable::now();
+let now = durust::now();
 ```
 
-`durable::now()` returns deterministic workflow time derived from recorded workflow-task/event timestamps, not system time.
+`durust::now()` returns deterministic workflow time derived from recorded workflow-task/event timestamps, not system time.
 
 ## 17.2 Side effect marker
 
 ```rust
-let id = durable::side_effect("make-id", || Uuid::new_v4())?;
+let id = durust::side_effect("make-id", || Uuid::new_v4())?;
 ```
 
 Behavior:
@@ -1842,6 +1925,7 @@ This is a logical storage shape, not a required table schema. Implementations ma
 ```text
 workflow_instances
   namespace
+  shard_id
   workflow_id
   run_id
   workflow_type
@@ -1856,6 +1940,7 @@ workflow_instances
 
 history_segments
   namespace
+  shard_id
   workflow_id
   run_id
   segment_id
@@ -1867,6 +1952,7 @@ history_segments
 
 active_waits
   namespace
+  shard_id
   workflow_id
   run_id
   wait_id
@@ -1878,6 +1964,7 @@ active_waits
 
 ready_workflows
   namespace
+  shard_id
   workflow_id
   run_id
   latest_event_id
@@ -1887,6 +1974,7 @@ ready_workflows
 
 signals
   namespace
+  shard_id
   workflow_id
   run_id
   signal_id
@@ -1930,6 +2018,8 @@ activity_maps
 
 child_outbox
   outbox_id
+  source_shard_id
+  target_shard_id
   parent_workflow_id
   parent_run_id
   command_id
@@ -1938,6 +2028,22 @@ child_outbox
   payload_ref
   idempotency_key
   dispatched_at
+
+cross_shard_inbox
+  target_shard_id
+  message_id
+  source_shard_id
+  source_run_id
+  target_run_id
+  message_kind
+  payload_ref
+  applied_at
+
+shard_leases
+  shard_id
+  owner_id
+  lease_epoch
+  lease_until
 
 workflow_change_versions
   namespace
@@ -1973,30 +2079,30 @@ idempotency
 Support:
 
 ```rust
-durable::select! { ... }
-durable::join!(...)
+durust::select! { ... }
+durust::join!(...)
 ```
 
-`durable::join!` should register multiple durable operations in deterministic order, then wait until all have completed. It is the V1 fanout-and-collect primitive for launching all branches before observing any one result.
+`durust::join!` should register multiple durable operations in deterministic order, then wait until all have completed. It is the V1 fanout-and-collect primitive for launching all branches before observing any one result.
 
 Example:
 
 ```rust
-let (a, b) = durable::join!(
-    durable::activity!(task_a()),
-    durable::activity!(task_b()),
+let (a, b) = durust::join!(
+    durust::activity!(task_a()),
+    durust::activity!(task_b()),
 ).await?;
 ```
 
-Plain Rust futures are lazy, so creating variables and then awaiting them one by one must not be treated as concurrent durable launch. If code awaits `task_a` before `task_b` has been registered, then the operations are sequential. For V1 concurrent launch, use `durable::join!` so the runtime registers every branch in deterministic lexical order before waiting for completions.
+Plain Rust futures are lazy, so creating variables and then awaiting them one by one must not be treated as concurrent durable launch. If code awaits `task_a` before `task_b` has been registered, then the operations are sequential. For V1 concurrent launch, use `durust::join!` so the runtime registers every branch in deterministic lexical order before waiting for completions.
 
 `join!` should work over the same durable future families as `select!`: activities, signals, timers, child starts, child results, and deterministic workflow-local spawned futures.
 
 An explicit spawned-handle API may be added when users need to launch work now and collect later:
 
 ```rust
-let a = durable::activity!(task_a()).spawn().await?;
-let b = durable::activity!(task_b()).spawn().await?;
+let a = durust::activity!(task_a()).spawn().await?;
+let b = durust::activity!(task_b()).spawn().await?;
 
 let a = a.result().await?;
 let b = b.result().await?;
@@ -2009,15 +2115,15 @@ If added, `spawn().await` must resolve only after the durable schedule/start com
 Support:
 
 ```rust
-let h1 = durable::spawn(async move {
-    durable::activity!(task_a()).await
+let h1 = durust::spawn(async move {
+    durust::activity!(task_a()).await
 });
 
-let h2 = durable::spawn(async move {
-    durable::signal::<Approval>("approved").await
+let h2 = durust::spawn(async move {
+    durust::signal::<Approval>("approved").await
 });
 
-let result = durable::select! {
+let result = durust::select! {
     r = h1 => r?,
     approval = h2 => approval?,
 };
@@ -2060,8 +2166,8 @@ run_id + fiber_id + command_seq
 Even though there is no hard history length limit, users need a way to cap recovery time.
 
 ```rust
-if durable::history().event_count() > 100_000 {
-    return durable::continue_as_new(SumInput {
+if durust::history().event_count() > 100_000 {
+    return durust::continue_as_new(SumInput {
         start_i: i + 1,
         initial_x: x,
         n: input.n,
@@ -2086,7 +2192,7 @@ This is not required for correctness. It is an operational latency tool.
 
 DST here means deterministic simulation testing.
 
-The deterministic simulation harness should be introduced in Milestone 1 and used for each feature as it lands. Later milestones should expand fault profiles and seed counts instead of adding simulation only at the end.
+The deterministic simulation harness is part of the core test model and is used for each feature as it lands. The implementation plan expands fault profiles and seed counts as runtime behavior grows.
 
 ## 22.1 Replay tests
 
@@ -2166,6 +2272,9 @@ after activity completion append before wake
 after signal append before wake
 after timer fire before wake
 after child outbox dispatch before mark dispatched
+after source outbox commit before cross-shard dispatch
+after target inbox write before apply
+after target apply before source ack
 after payload upload before history commit
 after history commit before worker ack
 ```
@@ -2208,6 +2317,9 @@ signal storm
 history streaming tiny chunks
 blob store transient errors
 commit conflicts
+shard lease loss
+cross-shard outbox duplicate delivery
+cross-shard outbox delayed delivery
 child fanout
 version patch rollout
 ```
@@ -2266,6 +2378,8 @@ worker registry rejects duplicate activity identity
 default durable names include package and module path
 claim workflow task lease fencing
 claim workflow task filters by task_queue and workflow_type
+workflow task commit is shard-local for one run
+stale shard lease owner cannot commit
 stream_history honors up_to_event_id, max_events, and max_bytes
 stream_history never returns uncommitted or future events
 commit_workflow_task detects stale expected_tail_event_id
@@ -2284,6 +2398,9 @@ SignalConsumed and signal consumption commit atomically
 timer due index wakes the workflow without history scanning
 query projection reads latest committed projection only
 child outbox dispatch is idempotent
+cross-shard outbox delivery is idempotent
+cross-shard inbox apply is idempotent
+cross-shard child start and completion survive dispatcher crash
 parent close policy is persisted and enforced
 inline and blob-backed payloads behave identically through public APIs
 derived indexes can be rebuilt from append history
@@ -2315,209 +2432,7 @@ Report warm-cache throughput separately from recovery throughput. The main perfo
 
 ---
 
-# 23. Implementation Milestones
-
-## Milestone 1: Replay core
-
-```text
-Workflow trait
-Activity trait
-#[workflow] registration macro
-#[activity] registration macro
-durable manifest generation, check, diff, and accept CLI
-task-local workflow context
-history event model
-streaming history cursor
-deterministic simulation harness
-virtual clock
-seeded task scheduler
-determinism lint pass in #[workflow]
-provider conformance harness
-worker builder and local registration registry
-example harness and CI runner
-memory backend
-SQLite test backend
-workflow worker loop
-```
-
-Acceptance:
-
-```text
-simple workflow starts, schedules activity, completes
-worker crash causes replay from streamed history
-no bulk history load
-cached workflow does not replay at each wait boundary
-compile-fail tests reject obvious nondeterministic workflow APIs
-diagnostics suggest durable replacements
-manifest check detects vanished workflow/activity identities
-manifest check detects schema changes that need versioning or compatibility review
-manifest check exits nonzero for CI conflicts
-manifest accept updates the checked-in baseline after intentional review
-same scenario is reproducible by seed
-virtual clock drives timer tests
-memory and SQLite backends pass initial provider conformance
-workflow worker claims only registered workflow types from configured queue
-hello activity and worker registration examples compile and run
-```
-
-## Milestone 2: Durable activity/timer/signal
-
-```text
-activity!(...)
-activity_map(...)
-sleep
-sleep_until
-signal
-active wait indexes
-activity task queue routing
-activity worker
-timer worker
-signal inbox
-local activity preference
-signal, timer, and local/remote activity examples
-activity map and map reduce examples
-```
-
-Acceptance:
-
-```text
-signal before wait buffers
-signal after wait wakes
-timer fires after virtual time
-activity completion wakes workflow
-locally registered activity runs locally before remote dispatch
-activity-only worker on another process can claim registered activity tasks
-activity map schedules manifest-backed fanout with one workflow command
-activity map replay does not duplicate item task creation
-activity map enforces max_in_flight without loading all inputs
-activity map example compiles and runs
-map reduce example compiles and runs
-```
-
-## Milestone 3: Select and join
-
-```text
-durable::select!
-durable::join!
-SelectWinner history event
-losing wait cancellation policy
-deterministic tie-break
-select and join examples
-```
-
-Acceptance:
-
-```text
-select replay is deterministic
-branch reorder is detected
-late losing completion is ignored safely
-select approval example and join activities example compile and run
-```
-
-## Milestone 4: Query projections
-
-```text
-query_state attribute
-publish
-#[query]
-query_projection backend reads
-query projection example
-```
-
-Acceptance:
-
-```text
-query reads latest committed projection without replay
-query projection example compiles and runs
-```
-
-## Milestone 5: Child workflows
-
-```text
-child!(...)
-spawn().await
-result().await
-child outbox
-parent wakeup
-parent close policy
-child wait, child abandon, and parent close examples
-```
-
-Acceptance:
-
-```text
-duplicate outbox dispatch creates one child
-child completion wakes parent
-parent cancellation propagates by policy
-child workflow examples compile and run
-```
-
-## Milestone 6: Versioning
-
-```text
-get_version
-patched
-deprecate_patch
-VersionMarker events
-workflow_change_versions index
-version CLI
-replay safety tests
-version branch example
-```
-
-Acceptance:
-
-```text
-new worker binary can run old and new branches
-old worker binary not required
-removing branch too early fails clearly
-version branch example compiles and runs
-```
-
-## Milestone 7: Payload offloading
-
-```text
-PayloadRef
-inline/blob threshold
-compression
-blob GC
-large activity/signal/child/query payloads
-payload offload example
-continue_as_new
-continue-as-new example
-```
-
-Acceptance:
-
-```text
-large payload not stored inline
-streaming replay does not hydrate large payload until observed
-orphan blob GC works
-payload offload example compiles and runs
-continue-as-new example compiles and runs
-```
-
-## Milestone 8: Deterministic simulation hardening
-
-```text
-fault injection
-trace logging
-invariant checker
-many-seed CI profile
-aggressive crash/reorder/delay profiles
-```
-
-Acceptance:
-
-```text
-thousands of seeds pass under aggressive fault profiles
-failing seed prints reproducible trace
-new concurrency and provider features add simulation scenarios before release
-```
-
----
-
-# 24. Final Shape
+# 23. Final Shape
 
 The durable runtime should be:
 
