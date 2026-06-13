@@ -50,6 +50,11 @@ Deferred to later phases:
 Implemented and covered:
 
 - Variadic `durust::select!` and `durust::join!` procedural macros.
+- `ActivityFuture::spawn().await?` handles for launching activities before
+  awaiting their result.
+- `durust::select_all(...)` for bounded dynamic races over activity handles,
+  child results, timers, signals, and other durable select branches mapped to a
+  common output type.
 - `SelectWinner` replay fact with branch digest, winner ordinal, and winning
   event id.
 - Deterministic winner selection by ready event id, then lexical branch order.
@@ -57,11 +62,15 @@ Implemented and covered:
   event id.
 - Losing timer, signal, and activity cancellation/ignore policy, including
   losing completions that race before `SelectWinner` is appended.
+- Pending spawned activity result losers are cancelled by command id; child
+  result losers remain ignore-only and rely on parent close policy for terminal
+  cleanup.
 - Durable branch trait gating so `join!` rejects plain Rust futures at compile
   time.
-- Runnable `select_approval` and `join_activities` examples with assertions.
-- Criterion benchmarks for select registration, select replay, and bounded join
-  fanout.
+- Runnable `select_approval`, `join_activities`, and
+  `activity_spawn_select_all` examples with assertions.
+- Criterion benchmarks for select registration, select replay, bounded join
+  fanout, and dynamic `select_all` races.
 
 Remaining before this phase is done:
 

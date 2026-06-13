@@ -49,7 +49,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
 
     let shipment = child.result().await?;
 
-Ok(CheckoutOutput {
+    Ok(CheckoutOutput {
         order_id: input.order_id,
         payment_id: payment.id,
         shipment_id: shipment.id,
@@ -66,19 +66,20 @@ Ok(CheckoutOutput {
   - [Append-Journal Durability](#append-journal-durability)
   - [No Event History Limit](#no-event-history-limit)
   - [First-Class Map Reduce](#first-class-map-reduce)
-  - [Payload Offloading Is Provider-Owned](#payload-offloading-is-provider-owned)
+  - [Payload Handling Is Provider-Owned](#payload-handling-is-provider-owned)
 - [Worker Registration](#worker-registration)
 - [Core Patterns](#core-patterns)
   - [Signals, Timers, And Select](#signals-timers-and-select)
   - [Workflow Time](#workflow-time)
   - [Bounded Fanout With Join](#bounded-fanout-with-join)
+  - [Dynamic Races With Select All](#dynamic-races-with-select-all)
   - [Child Workflow: Spawn And Wait](#child-workflow-spawn-and-wait)
   - [Child Workflow: Spawn And Abandon](#child-workflow-spawn-and-abandon)
   - [Query Projection](#query-projection)
   - [Version Branches](#version-branches)
   - [Map Reduce](#map-reduce)
   - [Continue As New](#continue-as-new)
-- [Payloads And Blob Storage](#payloads-and-blob-storage)
+- [Payloads](#payloads)
 - [Recovery Model](#recovery-model)
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
@@ -90,7 +91,7 @@ Ok(CheckoutOutput {
 - Local variables stay in memory while a workflow is hot on a worker.
 - Recovery reconstructs locals by streaming append-only history.
 - Providers optimize persistence with append-journal writes and derived indexes.
-- Large payloads are hidden behind provider-owned `PayloadRef` handling.
+- Payload storage is handled by providers, not workflow code.
 - SQLite works for tests and local development.
 
 Durust is built for services that need durable coordination, Rust control flow,
@@ -114,7 +115,7 @@ active indexes
   timers, signals, activity tasks, child completions, leases, ready queues
 
 payload provider
-  inline small payloads, offload large payloads to blob storage such as S3
+  stores compact payload refs for values too large for hot rows
 ```
 
 The happy path is fast because the workflow future remains hot in memory. When a
@@ -153,14 +154,13 @@ Large fanout uses paged manifests.
 Durust records compact map operation facts in workflow history. Per-item leases,
 retries, progress, and result writes live in provider-owned map/activity state.
 
-### Payload Offloading Is Provider-Owned
+### Payload Handling Is Provider-Owned
 
-Workflow code passes typed values. The provider chooses inline storage or blob
-storage such as S3.
+Workflow code passes typed values. Providers serialize those values and may keep
+large encoded payloads out of hot history and index rows.
 
-The durability provider owns serialization, compression, encryption, blob
-upload/download, and `PayloadRef` persistence. Application code sees the same
-API either way.
+Application code sees the same workflow, activity, signal, child, and query APIs
+regardless of where the encoded bytes live.
 
 ## Worker Registration
 
@@ -315,6 +315,37 @@ let (quote, inventory) = durust::join!(
 
 Plain Rust futures are lazy. Creating variables and awaiting them one by one is
 not a concurrent durable launch. Use `join!` for bounded fanout.
+
+### Dynamic Races With Select All
+
+Use activity spawn handles when the workflow learns a bounded set of activities
+at runtime and needs to launch them before awaiting any one result.
+
+```rust
+let mut branches = Vec::new();
+for (index, item) in items.into_iter().enumerate() {
+    let handle = durust::call_activity!(score_item(item))
+        .task_queue("scoring")
+        .spawn()
+        .await?;
+    branches.push(
+        handle
+            .result()
+            .map_ok(move |score| ScoredItem { index, score })
+            .boxed(),
+    );
+}
+
+let winner = durust::select_all(branches).await?;
+```
+
+`spawn().await` emits an `ActivityScheduled` command immediately; the backend
+makes it durable in the same atomic workflow-task commit. `select_all` picks the
+ready branch with the earliest history event id, using vector order as the
+tie-break. Pending activity losers are cancelled. Child-result losers are not
+cancelled unless parent close policy later cancels them.
+
+For very large collect-all fanout, prefer `activity_map`.
 
 ### Child Workflow: Spawn And Wait
 
@@ -472,24 +503,20 @@ if durust::history().event_count() > 100_000 {
 }
 ```
 
-## Payloads And Blob Storage
+## Payloads
 
-Durust APIs use typed inputs and outputs. Providers decide whether encoded bytes
-are inline or offloaded.
+Durust APIs use typed inputs and outputs. History and indexes record compact
+payload references so backends can keep hot persistence paths small without
+changing workflow code.
 
-```text
-default codec -> MessagePack via Serde
-debug/export codec -> JSON
-small payload -> inline PayloadRef
-large payload -> blob PayloadRef, often S3 or another object store
-```
+For application code, the rule is simple: pass serializable request and response
+types through workflows, activities, signals, children, and queries. For truly
+large domain data, pass application-level object references through those types
+and let activities read or write the external data.
 
-This keeps hot DB rows small and lets providers optimize write throughput.
-Providers offload payloads above roughly `4 KiB` to `16 KiB`, depending on the
-backing store.
-
-Provider config controls the inline threshold and blob store. The SQLite provider
-can use an S3-compatible store such as Garage for local tests.
+Codec choices, inline thresholds, blob-store integrations, and provider test
+fixtures are provider implementation details. They are part of the durability
+contract, not the workflow API.
 
 ## Recovery Model
 
@@ -564,6 +591,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`timer_wait.rs`](examples/timer_wait.rs)
 - [`select_approval.rs`](examples/select_approval.rs)
 - [`join_activities.rs`](examples/join_activities.rs)
+- [`activity_spawn_select_all.rs`](examples/activity_spawn_select_all.rs)
 - [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)

@@ -40,6 +40,22 @@ async fn join_four_activities(input: u64) -> durust::Result<u64> {
     Ok(first + second + third + fourth)
 }
 
+#[durust::workflow(name = "bench.select-all-activities", version = 1)]
+async fn select_all_activities(input: u64) -> durust::Result<u64> {
+    let mut branches = Vec::new();
+    for offset in 0..4_u64 {
+        let handle = durust::call_activity!(double(BenchInput {
+            value: input + offset,
+        }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+        branches.push(handle.result());
+    }
+    let winner = durust::select_all(branches).await?;
+    Ok(winner.value)
+}
+
 #[durust::workflow(name = "bench.child-double", version = 1)]
 async fn child_double(input: u64) -> durust::Result<u64> {
     Ok(input * 2)
@@ -193,6 +209,20 @@ fn bounded_join_fanout(c: &mut Criterion) {
     c.bench_function("bounded_join_fanout_memory", |b| {
         b.iter_batched(
             setup_join_fanout_worker,
+            |(mut worker, _backend)| {
+                block_on(async {
+                    worker.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn select_all_activity_race(c: &mut Criterion) {
+    c.bench_function("select_all_activity_race_memory", |b| {
+        b.iter_batched(
+            setup_select_all_activity_race,
             |(mut worker, _backend)| {
                 block_on(async {
                     worker.run_workflow_once().await.unwrap();
@@ -542,6 +572,35 @@ fn setup_join_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
             .await
             .unwrap();
         (join_worker(backend.clone()), backend)
+    })
+}
+
+fn setup_select_all_activity_race() -> (Worker<MemoryBackend>, MemoryBackend) {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<select_all_activities>("bench/select-all", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = select_all_worker(backend.clone());
+        worker.run_workflow_once().await.unwrap();
+        let claimed = backend
+            .claim_activity_task(
+                WorkerId::new("bench-select-all-activity"),
+                claim_activity_options("activities"),
+            )
+            .await
+            .unwrap()
+            .expect("select_all activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed.claim,
+                result: durust::encode_payload(&20_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        (worker, backend)
     })
 }
 
@@ -907,6 +966,13 @@ fn join_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .build()
 }
 
+fn select_all_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(select_all_activities)
+        .build()
+}
+
 criterion_group!(
     benches,
     workflow_task_schedule,
@@ -917,6 +983,7 @@ criterion_group!(
     select_registration,
     select_replay,
     bounded_join_fanout,
+    select_all_activity_race,
     child_start_dispatch,
     projection_update,
     projection_read,

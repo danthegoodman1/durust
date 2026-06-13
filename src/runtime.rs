@@ -545,6 +545,257 @@ pub trait DurableSelectBranch: Future + Unpin {
 
 pub trait DurableJoinBranch: Future + Unpin {}
 
+pub trait DurableBranchExt: DurableSelectBranch + Sized {
+    fn map_ok<T, U, M>(self, mapper: M) -> MapOkBranch<Self, M>
+    where
+        Self: Future<Output = Result<T>>,
+        M: FnOnce(T) -> U,
+    {
+        MapOkBranch {
+            branch: self,
+            mapper: Some(mapper),
+        }
+    }
+
+    fn boxed<T>(self) -> BoxSelectBranch<T>
+    where
+        Self: Future<Output = Result<T>> + Send + 'static,
+        T: 'static,
+    {
+        BoxSelectBranch {
+            branch: Box::new(self),
+        }
+    }
+}
+
+impl<B> DurableBranchExt for B where B: DurableSelectBranch + Sized {}
+
+pub struct MapOkBranch<B, M> {
+    branch: B,
+    mapper: Option<M>,
+}
+
+impl<B, M> Unpin for MapOkBranch<B, M>
+where
+    B: DurableSelectBranch,
+    M: Unpin,
+{
+}
+
+impl<B, M, T, U> Future for MapOkBranch<B, M>
+where
+    B: DurableSelectBranch + Future<Output = Result<T>>,
+    M: FnOnce(T) -> U + Unpin,
+{
+    type Output = Result<U>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.branch).poll(cx) {
+            Poll::Ready(Ok(value)) => {
+                let mapper = self
+                    .mapper
+                    .take()
+                    .expect("durust map_ok branch polled after completion");
+                Poll::Ready(Ok(mapper(value)))
+            }
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<B, M, T, U> DurableSelectBranch for MapOkBranch<B, M>
+where
+    B: DurableSelectBranch + Future<Output = Result<T>>,
+    M: FnOnce(T) -> U + Unpin,
+{
+    fn __durust_cancel_branch(&self) {
+        self.branch.__durust_cancel_branch();
+    }
+}
+
+impl<B, M, T, U> DurableJoinBranch for MapOkBranch<B, M>
+where
+    B: DurableSelectBranch + DurableJoinBranch + Future<Output = Result<T>>,
+    M: FnOnce(T) -> U + Unpin,
+{
+}
+
+pub struct BoxSelectBranch<T> {
+    branch: Box<dyn DurableSelectBranch<Output = Result<T>> + Send>,
+}
+
+impl<T> Unpin for BoxSelectBranch<T> {}
+
+impl<T> Future for BoxSelectBranch<T> {
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut *self.branch).poll(cx)
+    }
+}
+
+impl<T> DurableSelectBranch for BoxSelectBranch<T> {
+    fn __durust_cancel_branch(&self) {
+        self.branch.__durust_cancel_branch();
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectAllWinner<T> {
+    pub branch_index: usize,
+    pub value: T,
+}
+
+impl<T> SelectAllWinner<T> {
+    pub fn into_value(self) -> T {
+        self.value
+    }
+}
+
+pub fn select_all<I, B, T>(branches: I) -> SelectAllFuture<B, T>
+where
+    I: IntoIterator<Item = B>,
+    B: DurableSelectBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    let branches = branches.into_iter().map(Some).collect::<Vec<Option<B>>>();
+    let mut outputs = Vec::with_capacity(branches.len());
+    outputs.resize_with(branches.len(), || None);
+    SelectAllFuture {
+        branches_digest: format!("select_all:{}", branches.len()),
+        branches,
+        outputs,
+        command_id: None,
+        done: false,
+    }
+}
+
+pub struct SelectAllFuture<B, T>
+where
+    B: DurableSelectBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    branches: Vec<Option<B>>,
+    outputs: Vec<Option<(crate::EventId, Result<T>)>>,
+    command_id: Option<CommandId>,
+    branches_digest: String,
+    done: bool,
+}
+
+impl<B, T> Unpin for SelectAllFuture<B, T>
+where
+    B: DurableSelectBranch<Output = Result<T>>,
+    T: Unpin,
+{
+}
+
+impl<B, T> Future for SelectAllFuture<B, T>
+where
+    B: DurableSelectBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    type Output = Result<SelectAllWinner<T>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.done {
+            return Poll::Ready(Err(Error::Nondeterminism(
+                "select_all future polled after completion".to_owned(),
+            )));
+        }
+        if self.branches.is_empty() {
+            self.done = true;
+            return Poll::Ready(Err(Error::Backend(
+                "select_all requires at least one durable branch".to_owned(),
+            )));
+        }
+        if self.command_id.is_none() {
+            self.command_id = Some(with_context(|runtime| runtime.next_command_id()));
+        }
+
+        for index in 0..self.branches.len() {
+            if self.outputs[index].is_some() {
+                continue;
+            }
+            let Some(branch) = self.branches[index].as_mut() else {
+                continue;
+            };
+            with_context(|runtime| {
+                runtime.take_last_ready_event_id();
+            });
+            match Pin::new(branch).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    let event_id = with_context(|runtime| runtime.take_last_ready_event_id())
+                        .unwrap_or(crate::EventId::ZERO);
+                    self.outputs[index] = Some((event_id, Ok(value)));
+                }
+                Poll::Ready(Err(err)) => {
+                    if let Some(event_id) =
+                        with_context(|runtime| runtime.take_last_ready_event_id())
+                    {
+                        self.outputs[index] = Some((event_id, Err(err)));
+                    } else {
+                        self.done = true;
+                        return Poll::Ready(Err(err));
+                    }
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        let mut winner: Option<(usize, crate::EventId)> = None;
+        for (index, output) in self.outputs.iter().enumerate() {
+            if let Some((event_id, _)) = output {
+                match winner {
+                    Some((winner_index, winner_event_id))
+                        if (winner_event_id, winner_index) <= (*event_id, index) => {}
+                    _ => winner = Some((index, *event_id)),
+                }
+            }
+        }
+        let Some((winner_index, winning_event_id)) = winner else {
+            return Poll::Pending;
+        };
+        let command_id = self
+            .command_id
+            .as_ref()
+            .expect("select_all command id initialized")
+            .clone();
+        match record_select_winner(
+            &command_id,
+            winner_index as u32,
+            winning_event_id,
+            &self.branches_digest,
+        ) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(err)) => {
+                self.done = true;
+                Poll::Ready(Err(err))
+            }
+            Poll::Ready(Ok(())) => {
+                for index in 0..self.branches.len() {
+                    if index != winner_index && self.outputs[index].is_none() {
+                        if let Some(branch) = self.branches[index].as_ref() {
+                            branch.__durust_cancel_branch();
+                        }
+                    }
+                }
+                self.done = true;
+                let (_, value) = self.outputs[winner_index]
+                    .take()
+                    .expect("select_all winner completed without output");
+                match value {
+                    Ok(value) => Poll::Ready(Ok(SelectAllWinner {
+                        branch_index: winner_index,
+                        value,
+                    })),
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            }
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn __durust_join_assert_branch<F>(_: &F)
 where
@@ -576,7 +827,7 @@ pub fn __durust_select_record_winner(
     select_command_id: &CommandId,
     branch_ordinal: u32,
     winning_event_id: crate::EventId,
-    branches_digest: &'static str,
+    branches_digest: &str,
 ) -> Poll<Result<()>> {
     record_select_winner(
         select_command_id,
@@ -590,7 +841,7 @@ fn record_select_winner(
     select_command_id: &CommandId,
     branch_ordinal: u32,
     winning_event_id: crate::EventId,
-    branches_digest: &'static str,
+    branches_digest: &str,
 ) -> Poll<Result<()>> {
     with_context(|runtime| {
         while let Some(event) = runtime.peek_replay_event().cloned() {
@@ -691,6 +942,15 @@ where
         self.options = self.options.timeout(timeout);
         self
     }
+
+    pub fn spawn(self) -> ActivitySpawnFuture<A> {
+        ActivitySpawnFuture {
+            input: self.input,
+            options: self.options,
+            state: ActivitySpawnState::Init,
+            _activity: std::marker::PhantomData,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -738,110 +998,14 @@ where
     A: Activity,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<A::Output>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let command_id = runtime.next_command_id();
-        let options = runtime.effective_activity_options(self.options.clone());
-        let task_queue = options
-            .task_queue
-            .clone()
-            .expect("effective activity options include task queue fallback");
-        let retry_policy = options.effective_retry_policy();
-        let fingerprint_options = ActivityOptions {
-            task_queue: Some(task_queue.clone()),
-            retry_policy: Some(retry_policy.clone()),
-            start_to_close_timeout: options.start_to_close_timeout,
-        };
-        let input = self
-            .input
-            .as_ref()
-            .expect("activity input exists before schedule");
-        let input_ref = crate::encode_payload(input)?;
-        let fingerprint = activity_fingerprint(
-            A::activity_name(),
-            payload_digest(&input_ref),
-            fingerprint_options.digest()?,
-        );
-
-        if let Some(event) = runtime.peek_replay_event().cloned() {
-            let HistoryEventData::ActivityScheduled(scheduled) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected ActivityScheduled for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
+        let command_id =
+            match poll_activity_schedule::<A>(&mut self.input, self.options.clone(), runtime) {
+                Poll::Ready(Ok(command_id)) => command_id,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             };
-            if scheduled.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, scheduled.command_id.seq.0
-                ))));
-            }
-            if scheduled.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "activity command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-
-            if let Some(next) = runtime.peek_replay_event().cloned() {
-                match next.data {
-                    HistoryEventData::ActivityCompleted(completed)
-                        if completed.command_id.seq == command_id.seq =>
-                    {
-                        runtime.advance_replay();
-                        runtime.record_ready_event_id(next.event_id);
-                        self.state = ActivityFutureState::Done;
-                        return Poll::Ready(crate::decode_payload::<A::Output>(&completed.result));
-                    }
-                    HistoryEventData::ActivityFailed(failed)
-                        if failed.command_id.seq == command_id.seq =>
-                    {
-                        runtime.advance_replay();
-                        runtime.record_ready_event_id(next.event_id);
-                        self.state = ActivityFutureState::Done;
-                        return Poll::Ready(Err(Error::ActivityFailed(failed.failure)));
-                    }
-                    HistoryEventData::ActivityTimedOut(timed_out)
-                        if timed_out.command_id.seq == command_id.seq =>
-                    {
-                        runtime.advance_replay();
-                        runtime.record_ready_event_id(next.event_id);
-                        self.state = ActivityFutureState::Done;
-                        return Poll::Ready(Err(Error::ActivityTimedOut(timed_out.message)));
-                    }
-                    _ => {}
-                }
-            }
-
-            self.state = ActivityFutureState::Waiting(command_id);
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let scheduled = ActivityScheduled {
-            command_id: command_id.clone(),
-            activity_name: A::activity_name(),
-            task_queue,
-            retry_policy,
-            start_to_close_timeout: options.start_to_close_timeout,
-            input: input_ref,
-            fingerprint,
-        };
-        runtime
-            .append_events
-            .push(NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
-                scheduled.clone(),
-            )));
-        runtime
-            .schedule_activities
-            .push(ActivityTask::from_scheduled(&scheduled));
-        self.input = None;
-        self.state = ActivityFutureState::Waiting(command_id);
-        Poll::Pending
+        self.state = ActivityFutureState::Waiting(command_id.clone());
+        self.poll_waiting(runtime, &command_id)
     }
 
     fn poll_waiting(
@@ -861,6 +1025,206 @@ where
         runtime.request_more_history_if_available();
         Poll::Pending
     }
+}
+
+#[derive(Debug)]
+enum ActivitySpawnState {
+    Init,
+    Done,
+}
+
+pub struct ActivitySpawnFuture<A>
+where
+    A: Activity,
+{
+    input: Option<A::Input>,
+    options: ActivityOptions,
+    state: ActivitySpawnState,
+    _activity: std::marker::PhantomData<A>,
+}
+
+impl<A> Unpin for ActivitySpawnFuture<A> where A: Activity {}
+
+#[derive(Debug)]
+pub struct ActivityHandle<A>
+where
+    A: Activity,
+{
+    command_id: CommandId,
+    _activity: std::marker::PhantomData<A>,
+}
+
+impl<A> ActivityHandle<A>
+where
+    A: Activity,
+{
+    pub fn result(self) -> ActivityResultFuture<A> {
+        ActivityResultFuture {
+            command_id: self.command_id,
+            done: false,
+            _activity: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<A> Future for ActivitySpawnFuture<A>
+where
+    A: Activity,
+{
+    type Output = Result<ActivityHandle<A>>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_context(|runtime| match self.state {
+            ActivitySpawnState::Init => {
+                let options = self.options.clone();
+                match poll_activity_schedule::<A>(&mut self.input, options, runtime) {
+                    Poll::Ready(Ok(command_id)) => {
+                        self.state = ActivitySpawnState::Done;
+                        Poll::Ready(Ok(ActivityHandle {
+                            command_id,
+                            _activity: std::marker::PhantomData,
+                        }))
+                    }
+                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            ActivitySpawnState::Done => Poll::Ready(Err(Error::Nondeterminism(
+                "activity spawn future polled after completion".to_owned(),
+            ))),
+        })
+    }
+}
+
+impl<A> DurableJoinBranch for ActivitySpawnFuture<A> where A: Activity {}
+
+pub struct ActivityResultFuture<A>
+where
+    A: Activity,
+{
+    command_id: CommandId,
+    done: bool,
+    _activity: std::marker::PhantomData<A>,
+}
+
+impl<A> Unpin for ActivityResultFuture<A> where A: Activity {}
+
+impl<A> Future for ActivityResultFuture<A>
+where
+    A: Activity,
+{
+    type Output = Result<A::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_context(|runtime| {
+            if self.done {
+                return Poll::Ready(Err(Error::Nondeterminism(
+                    "activity result future polled after completion".to_owned(),
+                )));
+            }
+            if let Some(result) = runtime.take_completion(&self.command_id) {
+                self.done = true;
+                return Poll::Ready(crate::decode_payload::<A::Output>(&result));
+            }
+            if let Some(error) = runtime.take_failure(&self.command_id) {
+                self.done = true;
+                return Poll::Ready(Err(error.into_error()));
+            }
+            runtime.request_more_history_if_available();
+            Poll::Pending
+        })
+    }
+}
+
+impl<A> DurableSelectBranch for ActivityResultFuture<A>
+where
+    A: Activity,
+{
+    fn __durust_cancel_branch(&self) {
+        with_context(|runtime| runtime.cancel_command(self.command_id.clone()));
+    }
+}
+
+impl<A> DurableJoinBranch for ActivityResultFuture<A> where A: Activity {}
+
+fn poll_activity_schedule<A>(
+    input: &mut Option<A::Input>,
+    options: ActivityOptions,
+    runtime: &mut RuntimeContext,
+) -> Poll<Result<CommandId>>
+where
+    A: Activity,
+{
+    if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        runtime.request_more_history_if_available();
+        return Poll::Pending;
+    }
+
+    let command_id = runtime.next_command_id();
+    let options = runtime.effective_activity_options(options);
+    let task_queue = options
+        .task_queue
+        .clone()
+        .expect("effective activity options include task queue fallback");
+    let retry_policy = options.effective_retry_policy();
+    let fingerprint_options = ActivityOptions {
+        task_queue: Some(task_queue.clone()),
+        retry_policy: Some(retry_policy.clone()),
+        start_to_close_timeout: options.start_to_close_timeout,
+    };
+    let activity_input = input
+        .as_ref()
+        .expect("activity input exists before schedule");
+    let input_ref = crate::encode_payload(activity_input)?;
+    let fingerprint = activity_fingerprint(
+        A::activity_name(),
+        payload_digest(&input_ref),
+        fingerprint_options.digest()?,
+    );
+
+    if let Some(event) = runtime.peek_replay_event().cloned() {
+        let HistoryEventData::ActivityScheduled(scheduled) = event.data else {
+            return Poll::Ready(Err(Error::Nondeterminism(format!(
+                "expected ActivityScheduled for command {}, found {:?}",
+                command_id.seq.0, event.event_type
+            ))));
+        };
+        if scheduled.command_id.seq != command_id.seq {
+            return Poll::Ready(Err(Error::Nondeterminism(format!(
+                "expected command seq {}, found {}",
+                command_id.seq.0, scheduled.command_id.seq.0
+            ))));
+        }
+        if scheduled.fingerprint != fingerprint {
+            return Poll::Ready(Err(Error::Nondeterminism(format!(
+                "activity command fingerprint changed for command {}",
+                command_id.seq.0
+            ))));
+        }
+        runtime.advance_replay();
+        *input = None;
+        return Poll::Ready(Ok(command_id));
+    }
+
+    let scheduled = ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: A::activity_name(),
+        task_queue,
+        retry_policy,
+        start_to_close_timeout: options.start_to_close_timeout,
+        input: input_ref,
+        fingerprint,
+    };
+    runtime
+        .append_events
+        .push(NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+            scheduled.clone(),
+        )));
+    runtime
+        .schedule_activities
+        .push(ActivityTask::from_scheduled(&scheduled));
+    *input = None;
+    Poll::Ready(Ok(command_id))
 }
 
 pub fn activity_map<A>(_activity: A) -> ActivityMapBuilder<A>

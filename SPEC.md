@@ -2304,6 +2304,7 @@ Support:
 ```rust
 durust::select! { ... }
 durust::join!(...)
+durust::select_all(branches)
 ```
 
 `durust::join!` should register multiple durable operations in deterministic order, then wait until all have completed. It is the bounded fanout-and-collect primitive for launching all branches before observing any one result.
@@ -2321,7 +2322,7 @@ Plain Rust futures are lazy, so creating variables and then awaiting them one by
 
 `join!` should work over the same durable future families as `select!`: activities, signals, timers, child starts, child results, and deterministic workflow-local spawned futures.
 
-An explicit spawned-handle API may be added when users need to launch work now and collect later:
+Use explicit spawned activity handles when users need to launch work now and collect later:
 
 ```rust
 let a = durust::call_activity!(task_a()).spawn().await?;
@@ -2331,7 +2332,42 @@ let a = a.result().await?;
 let b = b.result().await?;
 ```
 
-If added, `spawn().await` must resolve only after the durable schedule/start command is committed or otherwise fenced by the backend. The handle can then be awaited sequentially because the durable work has already been launched.
+`spawn().await` emits the deterministic `ActivityScheduled` command immediately.
+The backend must make that schedule durable in the same atomic workflow-task
+commit before the activity can execute. The handle can then be awaited
+sequentially because the durable work has already been launched.
+
+Use `select_all` for bounded dynamic races and worker-pool style refill loops:
+
+```rust
+let mut branches = Vec::new();
+for item in items {
+    let handle = durust::call_activity!(score(item)).spawn().await?;
+    branches.push(handle.result().map_ok(RaceWinner::Score).boxed());
+}
+branches.push(durust::sleep(deadline).map_ok(|_| RaceWinner::Timeout).boxed());
+
+let winner = durust::select_all(branches).await?;
+```
+
+`select_all` accepts a deterministic ordered collection of durable select
+branches whose outputs have been mapped to one Rust type. It records the winner
+with the same `SelectWinner` replay fact as `select!`; the branch ordinal is the
+collection index. Winner choice is by earliest ready event id, then branch
+ordinal. Reordering the collection or changing which event wins is detected
+during replay through the recorded ordinal and event id. The branch-count digest
+detects obvious collection-size changes; command fingerprints remain the
+backstop for activity/timer/signal/child command changes.
+
+Loser policy matches `select!`: pending timers and signals remove waits,
+pending spawned activity results cancel their activity command, and child-result
+losers are ignored rather than implicitly cancelling the child. Already-ready
+losing terminal facts may be ignored during replay before the recorded
+`SelectWinner`.
+
+`select_all` is not the large collect-all primitive. For very large activity
+fanout, use manifest-backed `activity_map` so workflow history and workflow
+memory stay bounded.
 
 ## 20.2 V2 deterministic fibers
 
