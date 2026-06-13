@@ -15,6 +15,7 @@ pub type BoxActivityFuture<T> = std::pin::Pin<Box<dyn Future<Output = Result<T>>
 pub trait Workflow: Clone + Copy + Send + Sync + 'static {
     type Input: Serialize + DeserializeOwned + Send + 'static;
     type Output: Serialize + DeserializeOwned + Send + 'static;
+    type QueryState: Serialize + DeserializeOwned + Send + 'static;
 
     const NAME: &'static str;
     const VERSION: u32;
@@ -26,6 +27,15 @@ pub trait Workflow: Clone + Copy + Send + Sync + 'static {
 
     fn output_type_name() -> &'static str {
         std::any::type_name::<Self::Output>()
+    }
+
+    fn query_state_type_name() -> Option<&'static str> {
+        let type_name = std::any::type_name::<Self::QueryState>();
+        if type_name == "()" {
+            None
+        } else {
+            Some(type_name)
+        }
     }
 
     fn workflow_type() -> WorkflowType {
@@ -63,8 +73,10 @@ pub struct WorkflowRegistration {
     pub rust_path: &'static str,
     pub input_type: &'static str,
     pub output_type: &'static str,
+    pub query_state_type: Option<&'static str>,
     pub input_schema_hash: String,
     pub output_schema_hash: String,
+    pub query_state_schema_hash: Option<String>,
     run: Arc<dyn Fn(PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
 }
 
@@ -78,8 +90,10 @@ impl WorkflowRegistration {
             rust_path: W::RUST_PATH,
             input_type: W::input_type_name(),
             output_type: W::output_type_name(),
+            query_state_type: W::query_state_type_name(),
             input_schema_hash: crate::type_fingerprint::<W::Input>(),
             output_schema_hash: crate::type_fingerprint::<W::Output>(),
+            query_state_schema_hash: W::query_state_type_name().map(crate::type_name_fingerprint),
             run: Arc::new(|input| {
                 Box::pin(async move {
                     let input = crate::decode_payload::<W::Input>(&input)?;
@@ -197,8 +211,10 @@ impl Registry {
                     rust_path: registration.rust_path.to_owned(),
                     input_type: registration.input_type.to_owned(),
                     output_type: registration.output_type.to_owned(),
+                    query_state_type: registration.query_state_type.map(str::to_owned),
                     input_schema_hash: registration.input_schema_hash.clone(),
                     output_schema_hash: registration.output_schema_hash.clone(),
+                    query_state_schema_hash: registration.query_state_schema_hash.clone(),
                 })
                 .collect(),
             activities: self

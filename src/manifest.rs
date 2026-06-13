@@ -21,8 +21,12 @@ pub struct ManifestWorkflow {
     pub rust_path: String,
     pub input_type: String,
     pub output_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_state_type: Option<String>,
     pub input_schema_hash: String,
     pub output_schema_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_state_schema_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,8 +179,10 @@ pub fn diff_manifests(baseline: &DurableManifest, current: &DurableManifest) -> 
             Some(new) => {
                 if old.input_schema_hash != new.input_schema_hash
                     || old.output_schema_hash != new.output_schema_hash
+                    || old.query_state_schema_hash != new.query_state_schema_hash
                     || old.input_type != new.input_type
                     || old.output_type != new.output_type
+                    || old.query_state_type != new.query_state_type
                 {
                     diff.changed_workflow_schemas.push(key.clone());
                 }
@@ -341,8 +347,10 @@ mod tests {
             rust_path: "crate::workflow".to_owned(),
             input_type: "Input".to_owned(),
             output_type: "Output".to_owned(),
+            query_state_type: None,
             input_schema_hash: input_schema_hash.to_owned(),
             output_schema_hash: output_schema_hash.to_owned(),
+            query_state_schema_hash: None,
         }
     }
 

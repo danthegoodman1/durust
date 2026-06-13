@@ -173,6 +173,7 @@ where
     stream_history_honors_bounds(backend.clone()).await;
     released_workflow_task_is_claimable_again(backend.clone()).await;
     delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
+    query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
@@ -326,6 +327,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -413,6 +415,118 @@ where
     assert!(visible.is_some());
 }
 
+async fn query_projection_updates_atomically_and_reads_payload_refs<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/query-raw", "query-raw-workflows", 5)
+        .await
+        .unwrap();
+    let req = durust::QueryProjectionRequest {
+        namespace: Namespace::default(),
+        workflow_id: durust::WorkflowId::new("wf/query-raw"),
+    };
+    assert_eq!(
+        backend.query_projection(req.clone()).await.unwrap(),
+        durust::QueryProjectionOutcome::NotFound
+    );
+
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("query-raw-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("query-raw-worker"), claim_opts)
+        .await
+        .unwrap()
+        .expect("workflow task");
+    assert_eq!(
+        backend.query_projection(req.clone()).await.unwrap(),
+        durust::QueryProjectionOutcome::NotFound
+    );
+    let stale_payload = durust::encode_payload(&"stale").unwrap();
+    let conflict = backend
+        .commit_workflow_task(
+            claimed.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId::ZERO,
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(stale_payload),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict, CommitOutcome::Conflict);
+    assert_eq!(
+        backend.query_projection(req.clone()).await.unwrap(),
+        durust::QueryProjectionOutcome::NotFound
+    );
+
+    let reclaimed = backend
+        .claim_workflow_task(
+            WorkerId::new("query-raw-reclaimer"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("query-raw-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task after conflict");
+    let blob_payload = durust::PayloadRef::Blob {
+        codec: durust::CodecId::MessagePack,
+        schema_fingerprint: durust::SchemaFingerprint("sha256:blob".to_owned()),
+        compression: durust::CompressionId::None,
+        encryption: None,
+        digest: "sha256:projection".to_owned(),
+        size: 128,
+        uri: "memory://projection".to_owned(),
+    };
+    let committed = backend
+        .commit_workflow_task(
+            reclaimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(blob_payload.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        committed,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        }
+    );
+    assert_eq!(
+        backend.query_projection(req).await.unwrap(),
+        durust::QueryProjectionOutcome::Found {
+            run_id: claimed.run_id,
+            event_id: EventId(1),
+            payload: blob_payload,
+        }
+    );
+}
+
 async fn signal_inbox_is_idempotent_ordered_and_consumed_by_commit<B>(backend: B)
 where
     B: DurableBackend,
@@ -480,6 +594,7 @@ where
                 consume_signals: vec![first_inbox.signal_id],
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -554,6 +669,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -657,6 +773,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -789,6 +906,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -980,6 +1098,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -1027,6 +1146,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: vec![activity_command],
+                query_projection: None,
             },
         )
         .await
@@ -1124,6 +1244,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -1333,6 +1454,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await
@@ -1558,6 +1680,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         )
         .await

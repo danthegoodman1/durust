@@ -49,6 +49,7 @@ struct MemoryState {
     activity_maps: BTreeMap<crate::CommandId, ActivityMapRecord>,
     waits: BTreeMap<WaitId, WaitRecord>,
     signals: BTreeMap<SignalId, SignalRecord>,
+    query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
 }
 
 struct RunRecord {
@@ -85,6 +86,12 @@ struct SignalRecord {
     payload: crate::PayloadRef,
     received_sequence: u64,
     consumed: bool,
+}
+
+struct QueryProjectionRecord {
+    run_id: RunId,
+    event_id: EventId,
+    payload: crate::PayloadRef,
 }
 
 impl DurableBackend for MemoryBackend {
@@ -308,6 +315,8 @@ impl DurableBackend for MemoryBackend {
         let consume_signals = batch.consume_signals;
         let delete_waits = batch.delete_waits;
         let cancel_commands = batch.cancel_commands;
+        let query_projection = batch.query_projection;
+        let mut projection_update = None;
         let next_event_id = {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
@@ -347,6 +356,17 @@ impl DurableBackend for MemoryBackend {
                 run.terminal = true;
                 run.ready = None;
                 run.ready_at = None;
+            }
+            if let Some(payload) = query_projection {
+                projection_update = Some((
+                    run.namespace.clone(),
+                    run.workflow_id.clone(),
+                    QueryProjectionRecord {
+                        run_id: claim.run_id.clone(),
+                        event_id: next_event_id,
+                        payload,
+                    },
+                ));
             }
 
             (next_event_id, terminal)
@@ -413,6 +433,11 @@ impl DurableBackend for MemoryBackend {
                     run.ready_at = None;
                 }
             }
+        }
+        if let Some((namespace, workflow_id, projection)) = projection_update {
+            state
+                .query_projections
+                .insert((namespace, workflow_id), projection);
         }
 
         Box::pin(ready(Ok(CommitOutcome::Committed {
@@ -759,6 +784,23 @@ impl DurableBackend for MemoryBackend {
         run.ready_at = None;
 
         Box::pin(ready(Ok(FailActivityOutcome::Failed { event_id })))
+    }
+
+    fn query_projection(
+        &self,
+        req: crate::QueryProjectionRequest,
+    ) -> BoxFuture<'static, Result<crate::QueryProjectionOutcome>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        let outcome = state
+            .query_projections
+            .get(&(req.namespace, req.workflow_id))
+            .map(|projection| crate::QueryProjectionOutcome::Found {
+                run_id: projection.run_id.clone(),
+                event_id: projection.event_id,
+                payload: projection.payload.clone(),
+            })
+            .unwrap_or(crate::QueryProjectionOutcome::NotFound);
+        Box::pin(ready(Ok(outcome)))
     }
 }
 

@@ -16,6 +16,12 @@ struct NumberInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct QueryView {
+    status: String,
+    value: u64,
+}
+
 #[durust::activity(name = "tests.double")]
 async fn double(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
@@ -262,6 +268,25 @@ async fn cached_default_activity_options_workflow(input: u64) -> durust::Result<
     );
     let first = durust::call_activity!(double(NumberInput { value: input })).await?;
     durust::call_activity!(double(NumberInput { value: first })).await
+}
+
+#[durust::workflow(name = "tests.query-projection", version = 1, query_state = QueryView)]
+async fn query_projection_workflow(input: u64) -> durust::Result<u64> {
+    durust::publish(&QueryView {
+        status: "started".to_owned(),
+        value: input,
+    })?;
+    let signal = durust::signal::<String>("advance").await?;
+    durust::publish(&QueryView {
+        status: signal,
+        value: input + 1,
+    })?;
+    Ok(input + 1)
+}
+
+#[durust::query(workflow = query_projection_workflow)]
+fn query_status(view: &QueryView) -> String {
+    view.status.clone()
 }
 
 #[durust::workflow(name = "tests.sleep-then-return", version = 1)]
@@ -1113,6 +1138,101 @@ fn workflow_default_activity_options_survive_cached_wake_and_crash_replay() {
             panic!("workflow did not complete after replay");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 16);
+    });
+}
+
+#[test]
+fn query_projection_reads_latest_committed_publish_without_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<query_projection_workflow>("wf/query-projection", "workflows", 41)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .query_projection::<query_projection_workflow>("wf/query-projection")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(query_projection_workflow)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let view = client
+            .query_projection::<query_projection_workflow>("wf/query-projection")
+            .await
+            .unwrap()
+            .expect("committed projection");
+        assert_eq!(
+            view,
+            QueryView {
+                status: "started".to_owned(),
+                value: 41,
+            }
+        );
+        assert_eq!(query_status(&view), "started");
+
+        client
+            .signal_workflow(
+                "wf/query-projection",
+                "advance",
+                "signal/query/advance",
+                "done",
+            )
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("query-concurrent-reader"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("tests.query-projection", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("signal-ready workflow task");
+        let still_committed = client
+            .query_projection::<query_projection_workflow>("wf/query-projection")
+            .await
+            .unwrap()
+            .expect("committed projection");
+        assert_eq!(still_committed.status, "started");
+        backend
+            .release_workflow_task(
+                claimed.claim,
+                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+            )
+            .await
+            .unwrap();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let view = client
+            .query_projection::<query_projection_workflow>("wf/query-projection")
+            .await
+            .unwrap()
+            .expect("updated projection");
+        assert_eq!(
+            view,
+            QueryView {
+                status: "done".to_owned(),
+                value: 42,
+            }
+        );
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history.last().expect("terminal event").data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
     });
 }
 
@@ -2139,5 +2259,12 @@ impl DurableBackend for RecordingBackend {
         req: durust::FailActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
         self.inner.fail_activity(req)
+    }
+
+    fn query_projection(
+        &self,
+        req: durust::QueryProjectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
+        self.inner.query_projection(req)
     }
 }

@@ -189,6 +189,55 @@ fn bounded_join_fanout(c: &mut Criterion) {
     });
 }
 
+fn projection_update(c: &mut Criterion) {
+    c.bench_function("query_projection_update_memory", |b| {
+        b.iter_batched(
+            setup_claimed_projection_update,
+            |(backend, claimed, payload)| {
+                block_on(async {
+                    let outcome = backend
+                        .commit_workflow_task(
+                            claimed.claim,
+                            WorkflowTaskCommit {
+                                expected_tail_event_id: EventId(1),
+                                append_events: Vec::new(),
+                                upsert_waits: Vec::new(),
+                                schedule_activities: Vec::new(),
+                                schedule_activity_maps: Vec::new(),
+                                consume_signals: Vec::new(),
+                                delete_waits: Vec::new(),
+                                cancel_commands: Vec::new(),
+                                query_projection: Some(payload),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn projection_read(c: &mut Criterion) {
+    c.bench_function("query_projection_read_memory", |b| {
+        b.iter_batched(
+            setup_projection_read,
+            |(backend, req)| {
+                block_on(async {
+                    let outcome = backend.query_projection(req).await.unwrap();
+                    assert!(matches!(
+                        outcome,
+                        durust::QueryProjectionOutcome::Found { .. }
+                    ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn activity_claim_complete(c: &mut Criterion) {
     c.bench_function("activity_claim_complete_memory", |b| {
         b.iter_batched(
@@ -286,6 +335,7 @@ fn signal_send_consume(c: &mut Criterion) {
                                 consume_signals: vec![inbox.signal_id],
                                 delete_waits: Vec::new(),
                                 cancel_commands: Vec::new(),
+                                query_projection: None,
                             },
                         )
                         .await
@@ -318,6 +368,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
                                 cancel_commands: Vec::new(),
+                                query_projection: None,
                             },
                         )
                         .await
@@ -437,6 +488,49 @@ fn setup_join_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     })
 }
 
+fn setup_claimed_projection_update() -> (MemoryBackend, ClaimedWorkflowTask, durust::PayloadRef) {
+    block_on(async {
+        let (backend, worker_id, opts) = create_claimable_workflow().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let payload = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+        (backend, claimed, payload)
+    })
+}
+
+fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
+    let (backend, claimed, payload) = setup_claimed_projection_update();
+    block_on(async {
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: Vec::new(),
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: Some(payload),
+                },
+            )
+            .await
+            .unwrap();
+        (
+            backend,
+            durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("bench/claim"),
+            },
+        )
+    })
+}
+
 fn setup_claimable_workflow() -> (MemoryBackend, WorkerId, ClaimWorkflowTaskOptions) {
     block_on(create_claimable_workflow())
 }
@@ -498,6 +592,7 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
+                query_projection: None,
             },
         }
     })
@@ -556,6 +651,7 @@ fn setup_due_timer() -> MemoryBackend {
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
+                    query_projection: None,
                 },
             )
             .await
@@ -603,6 +699,7 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
+                    query_projection: None,
                 },
             )
             .await
@@ -677,6 +774,7 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
                     cancel_commands: Vec::new(),
+                    query_projection: None,
                 },
             )
             .await
@@ -757,6 +855,8 @@ criterion_group!(
     select_registration,
     select_replay,
     bounded_join_fanout,
+    projection_update,
+    projection_read,
     activity_claim_complete,
     timer_due_scan_wakeup,
     signal_send_consume,

@@ -162,8 +162,10 @@ fn workflow(
         rust_path: "crate::workflow".to_owned(),
         input_type: "Input".to_owned(),
         output_type: "Output".to_owned(),
+        query_state_type: None,
         input_schema_hash: input_schema_hash.to_owned(),
         output_schema_hash: output_schema_hash.to_owned(),
+        query_state_schema_hash: None,
     }
 }
 

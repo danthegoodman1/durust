@@ -324,9 +324,9 @@ impl DurableBackend for SqliteBackend {
         let result = (|| {
             let mut conn = self.connect()?;
             let tx = conn.transaction().map_err(sqlite_error)?;
-            let Some((current_tail, claim_token, terminal, namespace)) = tx
+            let Some((current_tail, claim_token, terminal, namespace, workflow_id)) = tx
                 .query_row(
-                    "select current_event_id, workflow_claim_token, terminal, namespace
+                    "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id
                      from workflow_instances where run_id = ?1",
                     params![claim.run_id.0],
                     |row| {
@@ -335,6 +335,7 @@ impl DurableBackend for SqliteBackend {
                             row.get::<_, Option<u64>>(1)?,
                             row.get::<_, bool>(2)?,
                             row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
                         ))
                     },
                 )
@@ -434,6 +435,27 @@ impl DurableBackend for SqliteBackend {
             }
             for command_id in batch.cancel_commands {
                 cancel_command_operational_state(&tx, &command_id)?;
+            }
+            if let Some(payload) = batch.query_projection {
+                let payload_blob = rmp_serde::to_vec_named(&payload)
+                    .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                tx.execute(
+                    "insert into query_projections
+                     (namespace, workflow_id, run_id, event_id, payload)
+                     values (?1, ?2, ?3, ?4, ?5)
+                     on conflict(namespace, workflow_id) do update set
+                        run_id = excluded.run_id,
+                        event_id = excluded.event_id,
+                        payload = excluded.payload",
+                    params![
+                        namespace.as_str(),
+                        workflow_id.as_str(),
+                        claim.run_id.0,
+                        next_event_id.0,
+                        payload_blob
+                    ],
+                )
+                .map_err(sqlite_error)?;
             }
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
@@ -1071,6 +1093,43 @@ impl DurableBackend for SqliteBackend {
         })();
         Box::pin(ready(result))
     }
+
+    fn query_projection(
+        &self,
+        req: crate::QueryProjectionRequest,
+    ) -> BoxFuture<'static, Result<crate::QueryProjectionOutcome>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            let row = conn
+                .query_row(
+                    "select run_id, event_id, payload
+                     from query_projections
+                     where namespace = ?1 and workflow_id = ?2",
+                    params![req.namespace.0, req.workflow_id.0],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            row.map(|(run_id, event_id, payload)| {
+                let payload: PayloadRef = rmp_serde::from_slice(&payload)
+                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+                Ok(crate::QueryProjectionOutcome::Found {
+                    run_id: RunId::new(run_id),
+                    event_id: EventId(event_id),
+                    payload,
+                })
+            })
+            .transpose()
+            .map(|outcome| outcome.unwrap_or(crate::QueryProjectionOutcome::NotFound))
+        })();
+        Box::pin(ready(result))
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -1142,6 +1201,15 @@ fn init_schema(conn: &Connection) -> Result<()> {
             kind text not null,
             wait_key text not null,
             ready_at_ms integer
+        );
+
+        create table if not exists query_projections (
+            namespace text not null,
+            workflow_id text not null,
+            run_id text not null,
+            event_id integer not null,
+            payload blob not null,
+            primary key(namespace, workflow_id)
         );
 
         create index if not exists idx_active_waits_timer_due

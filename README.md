@@ -354,6 +354,12 @@ durust::publish(&view)?;
 pub fn status(view: &OrderView) -> OrderStatus {
     view.status.clone()
 }
+
+let view = client
+    .query_projection::<checkout>("order/123")
+    .await?
+    .expect("projection published");
+let status = status(&view);
 ```
 
 ### Version Branches
@@ -543,6 +549,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`timer_wait.rs`](examples/timer_wait.rs)
 - [`select_approval.rs`](examples/select_approval.rs)
 - [`join_activities.rs`](examples/join_activities.rs)
+- [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)
 - [`activity_map.rs`](examples/activity_map.rs)
 - [`map_reduce.rs`](examples/map_reduce.rs)

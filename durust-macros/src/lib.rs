@@ -5,7 +5,7 @@ use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
     parse_macro_input, Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn,
-    Lit, LitStr, Meta, Pat, PathArguments, ReturnType, Token, Type,
+    Lit, LitStr, Meta, Pat, Path, PathArguments, ReturnType, Token, Type,
 };
 
 struct MacroArgs {
@@ -17,6 +17,34 @@ impl Parse for MacroArgs {
         Ok(Self {
             items: Punctuated::parse_terminated(input)?,
         })
+    }
+}
+
+struct QueryArgs {
+    workflow: Path,
+}
+
+impl Parse for QueryArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let key: syn::Ident = input.parse()?;
+        if key != "workflow" {
+            return Err(syn::Error::new_spanned(
+                key,
+                "#[durust::query] expects `workflow = workflow_name`",
+            ));
+        }
+        input.parse::<Token![=]>()?;
+        let workflow = input.parse::<Path>()?;
+        if !input.is_empty() {
+            input.parse::<Token![,]>()?;
+            if !input.is_empty() {
+                return Err(syn::Error::new(
+                    input.span(),
+                    "unsupported durust query attribute argument",
+                ));
+            }
+        }
+        Ok(Self { workflow })
     }
 }
 
@@ -99,6 +127,16 @@ pub fn select(input: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_attribute]
+pub fn query(args: TokenStream, item: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as QueryArgs);
+    let item_fn = parse_macro_input!(item as ItemFn);
+    match expand_query(args, item_fn) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 enum HandlerKind {
     Workflow,
     Activity,
@@ -127,6 +165,12 @@ fn expand_handler_inner(
     }
 
     let parsed = ParsedArgs::from(args)?;
+    if matches!(kind, HandlerKind::Activity) && parsed.query_state.is_some() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.ident,
+            "#[durust::activity] does not support `query_state`",
+        ));
+    }
     if matches!(kind, HandlerKind::Workflow) {
         lint_workflow_body(&item_fn)?;
     }
@@ -138,6 +182,10 @@ fn expand_handler_inner(
     let manifest_ident = format_ident!("__durust_manifest_{}", ident);
     let (input_binding, input) = extract_single_input(&item_fn)?;
     let output = extract_result_output(&item_fn)?;
+    let query_state = parsed
+        .query_state
+        .clone()
+        .unwrap_or_else(|| syn::parse_quote!(()));
     let rust_path =
         quote!(concat!(env!("CARGO_PKG_NAME"), "::", module_path!(), "::", stringify!(#ident)));
     let name = match parsed.name {
@@ -190,12 +238,16 @@ fn expand_handler_inner(
                     rust_path: <#ident as ::durust::Workflow>::RUST_PATH.to_owned(),
                     input_type: <#ident as ::durust::Workflow>::input_type_name().to_owned(),
                     output_type: <#ident as ::durust::Workflow>::output_type_name().to_owned(),
+                    query_state_type: <#ident as ::durust::Workflow>::query_state_type_name()
+                        .map(str::to_owned),
                     input_schema_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Workflow>::input_type_name(),
                     ),
                     output_schema_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Workflow>::output_type_name(),
                     ),
+                    query_state_schema_hash: <#ident as ::durust::Workflow>::query_state_type_name()
+                        .map(::durust::type_name_fingerprint),
                 }
             }
 
@@ -226,6 +278,12 @@ fn expand_handler_inner(
             }
         },
     };
+    let query_state_impl = match kind {
+        HandlerKind::Workflow => quote! {
+            type QueryState = #query_state;
+        },
+        HandlerKind::Activity => quote! {},
+    };
 
     Ok(quote! {
         #[allow(non_camel_case_types)]
@@ -235,6 +293,7 @@ fn expand_handler_inner(
         impl #trait_name for #ident {
             type Input = #input;
             type Output = #output;
+            #query_state_impl
 
             const NAME: &'static str = #name;
             #version_impl
@@ -264,6 +323,53 @@ fn expand_call_activity(call: ExprCall) -> syn::Result<proc_macro2::TokenStream>
     let input = call.args.first().expect("checked arg count");
     Ok(quote! {
         ::durust::activity_call::<#activity>(#input)
+    })
+}
+
+fn expand_query(args: QueryArgs, item_fn: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+    if item_fn.sig.asyncness.is_some() {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.asyncness,
+            "durust query handlers must be synchronous functions",
+        ));
+    }
+    if item_fn.sig.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.inputs,
+            "durust query handlers must take exactly one query-state reference",
+        ));
+    }
+    let FnArg::Typed(arg) = item_fn.sig.inputs.first().expect("checked input count") else {
+        return Err(syn::Error::new_spanned(
+            &item_fn.sig.inputs,
+            "durust query handlers cannot take self",
+        ));
+    };
+    let Type::Reference(reference) = arg.ty.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &arg.ty,
+            "durust query handlers must take `&<workflow query state>`",
+        ));
+    };
+    let query_state = &reference.elem;
+    let workflow = args.workflow;
+    let attrs = &item_fn.attrs;
+    let vis = &item_fn.vis;
+    let sig = &item_fn.sig;
+    let block = &item_fn.block;
+
+    Ok(quote! {
+        const _: fn() = || {
+            fn __durust_query_state_check()
+            where
+                #workflow: ::durust::Workflow<QueryState = #query_state>,
+            {
+            }
+            let _ = __durust_query_state_check;
+        };
+
+        #(#attrs)*
+        #vis #sig #block
     })
 }
 
@@ -620,6 +726,7 @@ fn extract_result_output(item_fn: &ItemFn) -> syn::Result<Type> {
 struct ParsedArgs {
     name: Option<String>,
     version: Option<u32>,
+    query_state: Option<Type>,
 }
 
 impl ParsedArgs {
@@ -633,6 +740,9 @@ impl ParsedArgs {
                 }
                 Meta::NameValue(name_value) if name_value.path.is_ident("version") => {
                     parsed.version = Some(lit_u32(&name_value.value, "version")?);
+                }
+                Meta::NameValue(name_value) if name_value.path.is_ident("query_state") => {
+                    parsed.query_state = Some(syn::parse2(name_value.value.to_token_stream())?);
                 }
                 other => {
                     return Err(syn::Error::new_spanned(

@@ -75,6 +75,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: FailActivityRequest,
     ) -> BoxFuture<'static, Result<FailActivityOutcome>>;
+
+    fn query_projection(
+        &self,
+        req: QueryProjectionRequest,
+    ) -> BoxFuture<'static, Result<QueryProjectionOutcome>>;
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +201,7 @@ pub struct WorkflowTaskCommit {
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
     pub cancel_commands: Vec<crate::CommandId>,
+    pub query_projection: Option<PayloadRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,6 +322,22 @@ pub enum FailActivityOutcome {
     RetryScheduled { next_attempt: u32 },
     Failed { event_id: EventId },
     AlreadyCompleted,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryProjectionRequest {
+    pub namespace: Namespace,
+    pub workflow_id: WorkflowId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryProjectionOutcome {
+    Found {
+        run_id: RunId,
+        event_id: EventId,
+        payload: PayloadRef,
+    },
+    NotFound,
 }
 
 pub fn conflict_to_error(outcome: CommitOutcome) -> Result<EventId> {

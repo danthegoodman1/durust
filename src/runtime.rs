@@ -72,6 +72,7 @@ pub(crate) struct RuntimeContext {
     consume_signals: Vec<SignalId>,
     delete_waits: Vec<WaitId>,
     cancel_commands: Vec<CommandId>,
+    query_projection: Option<PayloadRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +96,7 @@ pub(crate) struct RuntimeCommitParts {
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
     pub cancel_commands: Vec<CommandId>,
+    pub query_projection: Option<PayloadRef>,
     pub default_activity_options: ActivityOptions,
 }
 
@@ -156,6 +158,7 @@ impl RuntimeContext {
             consume_signals: Vec::new(),
             delete_waits: Vec::new(),
             cancel_commands: Vec::new(),
+            query_projection: None,
         }
     }
 
@@ -168,6 +171,7 @@ impl RuntimeContext {
             consume_signals: self.consume_signals,
             delete_waits: self.delete_waits,
             cancel_commands: self.cancel_commands,
+            query_projection: self.query_projection,
             default_activity_options: self.default_activity_options,
         }
     }
@@ -419,6 +423,16 @@ pub fn set_default_activity_options(options: ActivityOptions) {
     with_context(|runtime| {
         runtime.default_activity_options = options;
     });
+}
+
+pub fn publish<T>(view: &T) -> Result<()>
+where
+    T: serde::Serialize + ?Sized,
+{
+    with_context(|runtime| {
+        runtime.query_projection = Some(crate::encode_payload(view)?);
+        Ok(())
+    })
 }
 
 pub trait DurableSelectBranch: Future + Unpin {

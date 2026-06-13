@@ -113,6 +113,28 @@ where
             })
             .await
     }
+
+    pub async fn query_projection<W>(
+        &self,
+        workflow_id: impl Into<String>,
+    ) -> Result<Option<W::QueryState>>
+    where
+        W: Workflow,
+    {
+        match self
+            .backend
+            .query_projection(crate::QueryProjectionRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: WorkflowId::new(workflow_id),
+            })
+            .await?
+        {
+            crate::QueryProjectionOutcome::Found { payload, .. } => {
+                Ok(Some(crate::decode_payload::<W::QueryState>(&payload)?))
+            }
+            crate::QueryProjectionOutcome::NotFound => Ok(None),
+        }
+    }
 }
 
 pub struct Worker<B>
@@ -530,6 +552,7 @@ where
                         consume_signals: parts.consume_signals,
                         delete_waits: parts.delete_waits,
                         cancel_commands: parts.cancel_commands,
+                        query_projection: parts.query_projection,
                     },
                 )
                 .await?,

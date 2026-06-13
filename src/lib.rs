@@ -15,7 +15,7 @@ mod sqlite;
 mod worker;
 
 pub use backend::*;
-pub use durust_macros::{activity, call_activity, join, select, workflow};
+pub use durust_macros::{activity, call_activity, join, query, select, workflow};
 pub use error::{Error, Result};
 pub use history::*;
 pub use ids::*;
