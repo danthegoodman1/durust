@@ -227,6 +227,20 @@ let charge = durust::call_activity!(charge_card(input.charge(quote)))
 Defaults are workflow-local and can be changed with normal deterministic control
 flow. Per-call options override the current defaults for that call.
 
+Activities return serializable Durust errors. A retry policy is skipped when the
+activity returns a non-retryable application error:
+
+```rust
+return Err(durust::Error::non_retryable(
+    "orders.invalid-address",
+    "shipping address is not serviceable",
+));
+```
+
+The durable failure stores a stable error type, message, optional encoded
+details, and the non-retryable flag so replay can restore the same failure
+metadata.
+
 ## Core Patterns
 
 ### Signals, Timers, And Select

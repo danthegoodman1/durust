@@ -177,6 +177,7 @@ where
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
+    non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
     activity_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone()).await;
     cancel_commands_clear_activity_tasks(backend.clone()).await;
     activity_map_materializes_bounded_items_and_writes_result_manifest(backend.clone()).await;
@@ -794,7 +795,7 @@ where
     let retried = backend
         .fail_activity(FailActivityRequest {
             claim: first.claim,
-            message: "transient".to_owned(),
+            failure: durust::DurableFailure::new("test.transient", "transient"),
         })
         .await
         .unwrap();
@@ -817,7 +818,7 @@ where
     let failed = backend
         .fail_activity(FailActivityRequest {
             claim: second.claim,
-            message: "permanent".to_owned(),
+            failure: durust::DurableFailure::new("test.permanent", "permanent"),
         })
         .await
         .unwrap();
@@ -853,7 +854,123 @@ where
     let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
         panic!("expected final ActivityFailed event");
     };
-    assert_eq!(failed.message, "permanent");
+    assert_eq!(failed.failure.message, "permanent");
+    assert!(!failed.failure.non_retryable);
+}
+
+async fn non_retryable_activity_failure_skips_retry_and_wakes_workflow<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>("wf/activity-non-retryable", "non-retryable-workflows", 5)
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("non-retryable-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("non-retryable-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let retry_policy = durust::RetryPolicy::exponential().max_attempts(5);
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("non-retryable-activities"),
+        retry_policy,
+        start_to_close_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activity_maps: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("non-retryable-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("non-retryable-worker-1"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+    let failure = durust::DurableFailure::non_retryable("test.validation", "validation failed");
+    let failed = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: failure.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        failed,
+        durust::FailActivityOutcome::Failed {
+            event_id: EventId(3)
+        }
+    );
+    let no_retry = backend
+        .claim_activity_task(WorkerId::new("non-retryable-worker-2"), activity_opts)
+        .await
+        .unwrap();
+    assert!(no_retry.is_none());
+
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("non-retryable-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity failed workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityFailed);
+
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
+        panic!("expected final ActivityFailed event");
+    };
+    assert_eq!(failed.failure, failure);
 }
 
 async fn activity_timeout_retries_until_max_attempts_then_wakes_workflow<B>(backend: B)
@@ -1486,7 +1603,10 @@ where
     let retried = backend
         .fail_activity(FailActivityRequest {
             claim: first.claim,
-            message: "transient map item failure".to_owned(),
+            failure: durust::DurableFailure::new(
+                "test.map_transient",
+                "transient map item failure",
+            ),
         })
         .await
         .unwrap();
@@ -1510,7 +1630,7 @@ where
     let failed = backend
         .fail_activity(FailActivityRequest {
             claim: retry.claim,
-            message: "map item failed".to_owned(),
+            failure: durust::DurableFailure::new("test.map_failed", "map item failed"),
         })
         .await
         .unwrap();
@@ -1560,7 +1680,7 @@ where
     let HistoryEventData::ActivityMapFailed(failed) = &history[2].data else {
         panic!("expected compact ActivityMapFailed event");
     };
-    assert_eq!(failed.message, "map item failed");
+    assert_eq!(failed.failure.message, "map item failed");
 }
 
 async fn workflow_cancel_cleans_waits_activities_and_activity_maps<B>(backend: B)

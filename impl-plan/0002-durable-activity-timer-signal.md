@@ -44,7 +44,8 @@ primitive.
 
 Implemented and covered:
 
-- Activity scheduling/completion/failure/timeout with durable retry attempts.
+- Activity scheduling/completion/failure/timeout with durable retry attempts,
+  serializable failure envelopes, and non-retryable activity failures.
 - Workflow-local default activity options for task queue and retry policy.
 - Durable timers, signal inbox reads/consumption, and nondeterminism retry backoff.
 - Explicit local activity preference for activities and activity-map items with

@@ -743,7 +743,7 @@ impl DurableBackend for MemoryBackend {
         }
 
         let task = record.task.clone();
-        if should_retry_activity(&task) {
+        if should_retry_activity(&task) && !req.failure.non_retryable {
             record.task.attempt = record.task.attempt.saturating_add(1);
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
@@ -758,7 +758,7 @@ impl DurableBackend for MemoryBackend {
                 &mut state,
                 task,
                 map_item,
-                req.message,
+                req.failure,
             )));
         }
         let Some(run) = state.runs.get_mut(&task.run_id) else {
@@ -777,7 +777,7 @@ impl DurableBackend for MemoryBackend {
             event_type: crate::HistoryEventType::ActivityFailed,
             data: HistoryEventData::ActivityFailed(crate::ActivityFailed {
                 command_id: task.command_id,
-                message: req.message,
+                failure: req.failure,
             }),
         });
         run.ready = Some(WorkflowTaskReason::ActivityFailed);
@@ -980,7 +980,7 @@ fn fail_map_item(
     state: &mut MemoryState,
     task: ActivityTask,
     map_item: ActivityMapItem,
-    message: String,
+    failure: crate::DurableFailure,
 ) -> Result<FailActivityOutcome> {
     if let Some(map) = state.activity_maps.get_mut(&map_item.map_command_id) {
         if map.completed {
@@ -1005,7 +1005,7 @@ fn fail_map_item(
         event_type: crate::HistoryEventType::ActivityMapFailed,
         data: HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
             command_id: map_item.map_command_id,
-            message,
+            failure,
         }),
     });
     run.ready = Some(WorkflowTaskReason::ActivityMapFailed);
@@ -1047,7 +1047,10 @@ fn timeout_activity(
             state,
             timed_out_task.clone(),
             map_item,
-            timeout_message(activity_id, timed_out_task.attempt),
+            crate::DurableFailure::new(
+                "durust.activity_timed_out",
+                timeout_message(activity_id, timed_out_task.attempt),
+            ),
         )?;
         return Ok(true);
     }

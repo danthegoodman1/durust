@@ -37,6 +37,14 @@ async fn fail_activity(_: ()) -> durust::Result<u64> {
     Err(durust::Error::Backend("boom".to_owned()))
 }
 
+#[durust::activity(name = "tests.non-retryable")]
+async fn non_retryable_activity(_: ()) -> durust::Result<u64> {
+    Err(durust::Error::non_retryable(
+        "tests.validation",
+        "validation failed",
+    ))
+}
+
 #[durust::activity(name = "tests.flaky")]
 async fn flaky_activity(_: ()) -> durust::Result<u64> {
     let mut attempts = FLAKY_ATTEMPTS.lock().unwrap();
@@ -217,6 +225,13 @@ async fn failing_activity_workflow(_: ()) -> durust::Result<u64> {
 async fn retry_activity_workflow(_: ()) -> durust::Result<u64> {
     durust::call_activity!(flaky_activity(()))
         .retry(durust::RetryPolicy::exponential().max_attempts(2))
+        .await
+}
+
+#[durust::workflow(name = "tests.non-retryable-activity", version = 1)]
+async fn non_retryable_activity_workflow(_: ()) -> durust::Result<u64> {
+    durust::call_activity!(non_retryable_activity(()))
+        .retry(durust::RetryPolicy::exponential().max_attempts(5))
         .await
 }
 
@@ -1090,6 +1105,26 @@ fn per_call_activity_options_override_workflow_defaults() {
 }
 
 #[test]
+fn durust_errors_are_serializable_with_failure_details() {
+    let error = durust::Error::non_retryable("tests.validation", "validation failed")
+        .with_details(&NumberInput { value: 42 })
+        .unwrap();
+    let bytes = rmp_serde::to_vec_named(&error).unwrap();
+    let decoded: durust::Error = rmp_serde::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, error);
+
+    let durust::Error::Application(failure) = decoded else {
+        panic!("expected application failure");
+    };
+    assert!(failure.non_retryable);
+    let details = failure.details.expect("failure details");
+    assert_eq!(
+        durust::decode_payload::<NumberInput>(&details).unwrap(),
+        NumberInput { value: 42 }
+    );
+}
+
+#[test]
 fn workflow_default_activity_options_survive_cached_wake_and_crash_replay() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -1314,11 +1349,11 @@ fn failed_activity_records_failure_and_workflow_failure_on_replay() {
         let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
             panic!("expected ActivityFailed");
         };
-        assert!(failed.message.contains("boom"));
-        let HistoryEventData::WorkflowFailed { message } = &history[3].data else {
+        assert!(failed.failure.message.contains("boom"));
+        let HistoryEventData::WorkflowFailed { failure } = &history[3].data else {
             panic!("expected WorkflowFailed");
         };
-        assert!(message.contains("activity failed"));
+        assert!(failure.message.contains("boom"));
     });
 }
 
@@ -1366,6 +1401,51 @@ fn retryable_activity_failure_does_not_append_failure_history() {
 }
 
 #[test]
+fn non_retryable_activity_failure_skips_retries_and_restores_failure() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<non_retryable_activity_workflow>(
+                "wf/activity-non-retryable",
+                "workflows",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(non_retryable_activity_workflow)
+            .register_activity(non_retryable_activity)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 2);
+        assert_eq!(stats.activity_tasks, 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+        let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
+            panic!("expected ActivityFailed");
+        };
+        assert_eq!(failed.failure.error_type, "tests.validation");
+        assert_eq!(failed.failure.message, "validation failed");
+        assert!(failed.failure.non_retryable);
+        let HistoryEventData::WorkflowFailed { failure } = &history[3].data else {
+            panic!("expected WorkflowFailed");
+        };
+        assert_eq!(failure.error_type, "tests.validation");
+        assert_eq!(failure.message, "validation failed");
+        assert!(failure.non_retryable);
+    });
+}
+
+#[test]
 fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -1398,10 +1478,10 @@ fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
             panic!("expected ActivityTimedOut");
         };
         assert!(timed_out.message.contains("timed out"));
-        let HistoryEventData::WorkflowFailed { message } = &history[3].data else {
+        let HistoryEventData::WorkflowFailed { failure } = &history[3].data else {
             panic!("expected WorkflowFailed");
         };
-        assert!(message.contains("activity timed out"));
+        assert!(failure.message.contains("timed out"));
     });
 }
 

@@ -1,7 +1,7 @@
 use crate::{
-    ActivityId, ActivityMapTask, ActivityName, ActivityTask, Error, EventId, Namespace,
-    NewHistoryEvent, PayloadRef, Result, RunId, SignalId, SignalName, TaskQueue, TimestampMs,
-    WaitId, WorkerId, WorkflowId, WorkflowType,
+    ActivityId, ActivityMapTask, ActivityName, ActivityTask, DurableFailure, Error, EventId,
+    Namespace, NewHistoryEvent, PayloadRef, Result, RunId, SignalId, SignalName, TaskQueue,
+    TimestampMs, WaitId, WorkerId, WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -314,7 +314,7 @@ pub enum CompleteActivityOutcome {
 #[derive(Clone, Debug)]
 pub struct FailActivityRequest {
     pub claim: ActivityTaskClaim,
-    pub message: String,
+    pub failure: DurableFailure,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

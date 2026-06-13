@@ -358,7 +358,7 @@ where
                 self.backend
                     .fail_activity(FailActivityRequest {
                         claim: claimed.claim,
-                        message: err.to_string(),
+                        failure: err.durable_failure(),
                     })
                     .await?;
             }
@@ -532,7 +532,7 @@ where
                     return Err(err);
                 }
                 append_events.push(NewHistoryEvent::new(HistoryEventData::WorkflowFailed {
-                    message: err.to_string(),
+                    failure: err.durable_failure(),
                 }));
                 terminal = true;
             }

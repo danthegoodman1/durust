@@ -61,7 +61,7 @@ pub(crate) struct RuntimeContext {
     completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
     failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
     map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
-    map_failures: BTreeMap<CommandSeq, (crate::EventId, String)>,
+    map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
     timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     signal_requests: Vec<LiveSignalRequest>,
@@ -102,14 +102,14 @@ pub(crate) struct RuntimeCommitParts {
 
 #[derive(Clone, Debug)]
 enum ActivityTerminalError {
-    Failed(String),
+    Failed(crate::DurableFailure),
     TimedOut(String),
 }
 
 impl ActivityTerminalError {
     fn into_error(self) -> Error {
         match self {
-            Self::Failed(message) => Error::ActivityFailed(message),
+            Self::Failed(failure) => Error::ActivityFailed(failure),
             Self::TimedOut(message) => Error::ActivityTimedOut(message),
         }
     }
@@ -302,7 +302,7 @@ impl RuntimeContext {
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.failures.remove(&command_id.seq);
-                    return Some(ActivityTerminalError::Failed(failed.message));
+                    return Some(ActivityTerminalError::Failed(failed.failure));
                 }
                 HistoryEventData::ActivityTimedOut(timed_out)
                     if timed_out.command_id.seq == command_id.seq =>
@@ -361,22 +361,22 @@ impl RuntimeContext {
             })
     }
 
-    fn take_map_failure(&mut self, command_id: &CommandId) -> Option<String> {
+    fn take_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::ActivityMapFailed(failed) = event.data {
                 if failed.command_id.seq == command_id.seq {
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.map_failures.remove(&command_id.seq);
-                    return Some(failed.message);
+                    return Some(failed.failure);
                 }
             }
         }
         self.map_failures
             .remove(&command_id.seq)
-            .map(|(event_id, message)| {
+            .map(|(event_id, failure)| {
                 self.record_ready_event_id(event_id);
-                message
+                failure
             })
     }
 
@@ -696,7 +696,7 @@ where
                         runtime.advance_replay();
                         runtime.record_ready_event_id(next.event_id);
                         self.state = ActivityFutureState::Done;
-                        return Poll::Ready(Err(Error::ActivityFailed(failed.message)));
+                        return Poll::Ready(Err(Error::ActivityFailed(failed.failure)));
                     }
                     HistoryEventData::ActivityTimedOut(timed_out)
                         if timed_out.command_id.seq == command_id.seq =>
@@ -1012,9 +1012,9 @@ impl Future for ActivityMapResultFuture {
                 self.done = true;
                 return Poll::Ready(Ok(completed.result_manifest));
             }
-            if let Some(message) = runtime.take_map_failure(&self.command_id) {
+            if let Some(failure) = runtime.take_map_failure(&self.command_id) {
                 self.done = true;
-                return Poll::Ready(Err(Error::ActivityFailed(message)));
+                return Poll::Ready(Err(Error::ActivityFailed(failure)));
             }
             runtime.request_more_history_if_available();
             Poll::Pending
@@ -1352,7 +1352,7 @@ fn collect_failures(
                 failed.command_id.seq,
                 (
                     event.event_id,
-                    ActivityTerminalError::Failed(failed.message.clone()),
+                    ActivityTerminalError::Failed(failed.failure.clone()),
                 ),
             )),
             HistoryEventData::ActivityTimedOut(timed_out) => Some((
@@ -1382,13 +1382,15 @@ fn collect_map_completions(
         .collect()
 }
 
-fn collect_map_failures(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, String)> {
+fn collect_map_failures(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
     events
         .iter()
         .filter_map(|event| match &event.data {
             HistoryEventData::ActivityMapFailed(failed) => Some((
                 failed.command_id.seq,
-                (event.event_id, failed.message.clone()),
+                (event.event_id, failed.failure.clone()),
             )),
             _ => None,
         })
@@ -1420,7 +1422,7 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
     match data {
         HistoryEventData::WorkflowStarted { input, .. } => input.encoded_len(),
         HistoryEventData::WorkflowCompleted { result } => result.encoded_len(),
-        HistoryEventData::WorkflowFailed { message } => message.len(),
+        HistoryEventData::WorkflowFailed { failure } => event_failure_len(failure),
         HistoryEventData::WorkflowCancelled { reason } => reason.len(),
         HistoryEventData::WorkflowTaskStarted => 0,
         HistoryEventData::ActivityScheduled(scheduled) => scheduled.input.encoded_len(),
@@ -1428,14 +1430,25 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::ActivityMapCompleted(completed) => {
             completed.result_manifest.encoded_len()
         }
-        HistoryEventData::ActivityMapFailed(failed) => failed.message.len(),
+        HistoryEventData::ActivityMapFailed(failed) => event_failure_len(&failed.failure),
         HistoryEventData::ActivityCompleted(completed) => completed.result.encoded_len(),
-        HistoryEventData::ActivityFailed(failed) => failed.message.len(),
+        HistoryEventData::ActivityFailed(failed) => event_failure_len(&failed.failure),
         HistoryEventData::ActivityTimedOut(timed_out) => timed_out.message.len(),
         HistoryEventData::TimerStarted(_) | HistoryEventData::TimerFired(_) => 16,
         HistoryEventData::SignalConsumed(signal) => signal.payload.encoded_len(),
         HistoryEventData::SelectWinner(winner) => winner.branches_digest.len() + 32,
     }
+}
+
+fn event_failure_len(failure: &crate::DurableFailure) -> usize {
+    failure.error_type.len()
+        + failure.message.len()
+        + usize::from(failure.non_retryable)
+        + failure
+            .details
+            .as_ref()
+            .map(PayloadRef::encoded_len)
+            .unwrap_or_default()
 }
 
 fn timer_wait_id(command_id: &CommandId) -> WaitId {

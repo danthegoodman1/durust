@@ -1014,7 +1014,7 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            if should_retry_activity(&task) {
+            if should_retry_activity(&task) && !req.failure.non_retryable {
                 let mut retry_task = task.clone();
                 retry_task.attempt = retry_task.attempt.saturating_add(1);
                 let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -1042,7 +1042,7 @@ impl DurableBackend for SqliteBackend {
                     &tx,
                     task,
                     map_item,
-                    req.message,
+                    req.failure,
                     req.claim.activity_id.clone(),
                 )?;
                 tx.commit().map_err(sqlite_error)?;
@@ -1069,7 +1069,7 @@ impl DurableBackend for SqliteBackend {
                 event_id,
                 HistoryEventData::ActivityFailed(ActivityFailed {
                     command_id: task.command_id,
-                    message: req.message,
+                    failure: req.failure,
                 }),
             )?;
             tx.execute(
@@ -1617,7 +1617,7 @@ fn fail_map_item(
     tx: &Transaction<'_>,
     task: ActivityTask,
     map_item: ActivityMapItem,
-    message: String,
+    failure: crate::DurableFailure,
     activity_id: ActivityId,
 ) -> Result<FailActivityOutcome> {
     tx.execute(
@@ -1661,7 +1661,7 @@ fn fail_map_item(
         event_id,
         HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
             command_id: map_item.map_command_id,
-            message,
+            failure,
         }),
     )?;
     tx.execute(
@@ -1747,7 +1747,10 @@ fn timeout_activity(
             tx,
             task.clone(),
             map_item,
-            timeout_message(&activity_id, task.attempt),
+            crate::DurableFailure::new(
+                "durust.activity_timed_out",
+                timeout_message(&activity_id, task.attempt),
+            ),
             activity_id,
         )?;
         return Ok(true);

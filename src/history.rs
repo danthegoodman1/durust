@@ -1,6 +1,6 @@
 use crate::{
-    ActivityId, ActivityName, CommandId, CommandSeq, Error, EventId, PayloadRef, Result,
-    RetryPolicy, RunId, SignalId, SignalName, TaskQueue, TimestampMs, WorkflowType,
+    ActivityId, ActivityName, CommandId, CommandSeq, DurableFailure, Error, EventId, PayloadRef,
+    Result, RetryPolicy, RunId, SignalId, SignalName, TaskQueue, TimestampMs, WorkflowType,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -41,7 +41,7 @@ pub struct ActivityCompleted {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityFailed {
     pub command_id: CommandId,
-    pub message: String,
+    pub failure: DurableFailure,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +122,7 @@ pub struct ActivityMapCompleted {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityMapFailed {
     pub command_id: CommandId,
-    pub message: String,
+    pub failure: DurableFailure,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,7 +143,7 @@ pub enum HistoryEventData {
         result: PayloadRef,
     },
     WorkflowFailed {
-        message: String,
+        failure: DurableFailure,
     },
     WorkflowCancelled {
         reason: String,

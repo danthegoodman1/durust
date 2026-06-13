@@ -977,6 +977,24 @@ overrides. The activity command fingerprint includes that resolved option set,
 so changing defaults or overrides before a recorded activity command is a
 nondeterministic replay change unless it is protected by a version marker.
 
+Activity and workflow errors must be represented as a serializable Durust
+failure envelope before they are written to history:
+
+```text
+DurableFailure {
+  error_type
+  message
+  non_retryable
+  details_payload_ref?
+}
+```
+
+The worker converts returned `durust::Error` values into this envelope.
+Providers do not classify application errors; they only honor the generic
+`non_retryable` flag on a failed activity request. If `non_retryable` is true,
+the provider records the terminal activity failure immediately even when the
+stored retry policy has remaining attempts.
+
 The durable future behaves like this:
 
 ```text
@@ -986,7 +1004,7 @@ Replay mode:
   If ActivityCompleted exists:
       return recorded result.
   If ActivityFailed exists:
-      return recorded failure.
+      return recorded durable failure.
   If ActivityTimedOut exists:
       return recorded timeout.
   If scheduled but incomplete:
