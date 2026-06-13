@@ -617,7 +617,8 @@ durust::set_default_activity_options(
     durust::ActivityOptions::new()
         .task_queue("payments")
         .retry(durust::RetryPolicy::exponential().max_attempts(5))
-        .timeout(std::time::Duration::from_secs(30)),
+        .timeout(std::time::Duration::from_secs(30))
+        .heartbeat_timeout(std::time::Duration::from_secs(10)),
 );
 ```
 
@@ -971,11 +972,21 @@ For:
 let quote = durust::call_activity!(price_quote(input)).await?;
 ```
 
-The scheduled activity records the resolved task queue, retry policy, and
-per-attempt timeout after merging current workflow defaults with per-call
-overrides. The activity command fingerprint includes that resolved option set,
-so changing defaults or overrides before a recorded activity command is a
-nondeterministic replay change unless it is protected by a version marker.
+The scheduled activity records the resolved task queue, retry policy,
+per-attempt start-to-close timeout, and optional heartbeat timeout after merging
+current workflow defaults with per-call overrides. The activity command
+fingerprint includes that resolved option set, so changing defaults or
+overrides before a recorded activity command is a nondeterministic replay change
+unless it is protected by a version marker.
+
+Heartbeat enforcement is disabled by default. If a scheduled activity has a
+heartbeat timeout, the provider starts an operational heartbeat deadline when
+the activity task is claimed. Activity code may call
+`durust::heartbeat_activity().await?`; providers must accept only the currently
+claimed activity token, reject stale heartbeat claims, and refresh the deadline.
+Missed heartbeats are handled by the generic activity timeout scanner: retry
+attempts are rescheduled according to the stored retry policy, and only the
+terminal miss appends `ActivityTimedOut`.
 
 Activity and workflow errors must be represented as a serializable Durust
 failure envelope before they are written to history:
@@ -1246,8 +1257,8 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
 
     async fn heartbeat_activity(
         &self,
-        req: ActivityHeartbeat,
-    ) -> durust::Result<HeartbeatOutcome>;
+        req: ActivityHeartbeatRequest,
+    ) -> durust::Result<ActivityHeartbeatOutcome>;
 
     async fn complete_activity(
         &self,
@@ -1325,6 +1336,8 @@ pub struct ActivityMapTask {
     pub input_manifest: PayloadRef,
     pub result_manifest_name: String,
     pub max_in_flight: usize,
+    pub start_to_close_timeout: Option<Duration>,
+    pub heartbeat_timeout: Option<Duration>,
     pub retry_policy_ref: Option<PayloadRef>,
     pub options_hash: Sha256,
 }

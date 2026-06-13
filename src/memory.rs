@@ -85,6 +85,7 @@ struct ActivityRecord {
     claim: Option<u64>,
     completed: bool,
     timeout_at: Option<TimestampMs>,
+    heartbeat_deadline_at: Option<TimestampMs>,
 }
 
 struct ActivityMapRecord {
@@ -405,6 +406,7 @@ impl DurableBackend for MemoryBackend {
                     claim: None,
                     completed: false,
                     timeout_at,
+                    heartbeat_deadline_at: None,
                 },
             );
         }
@@ -628,9 +630,7 @@ impl DurableBackend for MemoryBackend {
             .iter()
             .filter(|(_, record)| {
                 !record.completed
-                    && record
-                        .timeout_at
-                        .is_some_and(|timeout_at| timeout_at <= req.now)
+                    && activity_due_at(record).is_some_and(|due_at| due_at <= req.now)
                     && state
                         .runs
                         .get(&record.task.run_id)
@@ -667,9 +667,7 @@ impl DurableBackend for MemoryBackend {
                     .runs
                     .get(&record.task.run_id)
                     .is_none_or(|run| run.terminal || run.namespace != opts.namespace)
-                || record
-                    .timeout_at
-                    .is_some_and(|timeout_at| timeout_at <= state.now)
+                || activity_due_at(record).is_some_and(|due_at| due_at <= state.now)
                 || !opts
                     .registered_activity_names
                     .iter()
@@ -695,11 +693,13 @@ impl DurableBackend for MemoryBackend {
 
         state.next_claim_token += 1;
         let token = state.next_claim_token;
+        let now = state.now;
         let record = state
             .activities
             .get_mut(&activity_id)
             .expect("activity id selected from activities map");
         record.claim = Some(token);
+        record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
         Box::pin(ready(Ok(Some(ClaimedActivityTask {
             task: record.task.clone(),
             claim: ActivityTaskClaim {
@@ -708,6 +708,29 @@ impl DurableBackend for MemoryBackend {
                 token,
             },
         }))))
+    }
+
+    fn heartbeat_activity(
+        &self,
+        req: crate::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>> {
+        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let now = state.now;
+        let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
+            return Box::pin(ready(Err(Error::Backend(format!(
+                "activity `{}` not found",
+                req.claim.activity_id.0
+            )))));
+        };
+        if record.completed {
+            return Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted)));
+        }
+        if record.claim != Some(req.claim.token) {
+            return Box::pin(ready(Err(Error::StaleLease)));
+        }
+
+        record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
+        Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::Recorded)))
     }
 
     fn complete_activity(
@@ -784,6 +807,7 @@ impl DurableBackend for MemoryBackend {
             record.task.attempt = record.task.attempt.saturating_add(1);
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
+            record.heartbeat_deadline_at = None;
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
                 next_attempt: record.task.attempt,
             })));
@@ -899,6 +923,7 @@ fn materialize_activity_map_items(
                     task_queue: map.task.task_queue.clone(),
                     retry_policy: map.task.retry_policy.clone(),
                     start_to_close_timeout: map.task.start_to_close_timeout,
+                    heartbeat_timeout: map.task.heartbeat_timeout,
                     attempt: 1,
                     input,
                     map_item: Some(ActivityMapItem {
@@ -909,6 +934,7 @@ fn materialize_activity_map_items(
                 claim: None,
                 completed: false,
                 timeout_at,
+                heartbeat_deadline_at: None,
             },
         );
     }
@@ -921,6 +947,7 @@ fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {
         if &record.task.run_id == run_id {
             record.completed = true;
             record.claim = None;
+            record.heartbeat_deadline_at = None;
         }
     }
     for map in state.activity_maps.values_mut() {
@@ -1263,6 +1290,7 @@ fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate:
         if matches_activity || matches_map_item {
             record.completed = true;
             record.claim = None;
+            record.heartbeat_deadline_at = None;
         }
     }
     if let Some(map) = state.activity_maps.get_mut(command_id) {
@@ -1414,26 +1442,30 @@ fn timeout_activity(
         let Some(record) = state.activities.get_mut(activity_id) else {
             return Ok(false);
         };
-        if record.completed
-            || !record
-                .timeout_at
-                .is_some_and(|timeout_at| timeout_at <= now)
-        {
+        if record.completed || !activity_due_at(record).is_some_and(|due_at| due_at <= now) {
             return Ok(false);
         }
+        let timed_out_by_heartbeat = record
+            .heartbeat_deadline_at
+            .is_some_and(|deadline| deadline <= now)
+            && !record
+                .timeout_at
+                .is_some_and(|timeout_at| timeout_at <= now);
 
         let task = record.task.clone();
         if should_retry_activity(&task) {
             record.task.attempt = record.task.attempt.saturating_add(1);
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
+            record.heartbeat_deadline_at = None;
             return Ok(true);
         }
 
         record.completed = true;
-        task
+        (task, timed_out_by_heartbeat)
     };
 
+    let (timed_out_task, timed_out_by_heartbeat) = timed_out_task;
     if let Some(map_item) = timed_out_task.map_item.clone() {
         fail_map_item(
             state,
@@ -1441,7 +1473,7 @@ fn timeout_activity(
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(activity_id, timed_out_task.attempt),
+                timeout_message(activity_id, timed_out_task.attempt, timed_out_by_heartbeat),
             ),
         )?;
         return Ok(true);
@@ -1463,7 +1495,7 @@ fn timeout_activity(
         event_type: crate::HistoryEventType::ActivityTimedOut,
         data: HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: timed_out_task.command_id,
-            message: timeout_message(activity_id, timed_out_task.attempt),
+            message: timeout_message(activity_id, timed_out_task.attempt, timed_out_by_heartbeat),
         }),
     });
     run.ready = Some(WorkflowTaskReason::ActivityTimedOut);
@@ -1484,12 +1516,31 @@ fn activity_timeout_at(now: TimestampMs, timeout: Option<Duration>) -> Option<Ti
     })
 }
 
-fn timeout_message(activity_id: &ActivityId, attempt: u32) -> String {
-    format!(
-        "activity `{}` timed out on attempt {}",
-        activity_id.0,
-        attempt.max(1)
-    )
+fn activity_due_at(record: &ActivityRecord) -> Option<TimestampMs> {
+    match (record.timeout_at, record.heartbeat_deadline_at) {
+        (Some(timeout_at), Some(heartbeat_deadline_at)) => {
+            Some(timeout_at.min(heartbeat_deadline_at))
+        }
+        (Some(timeout_at), None) => Some(timeout_at),
+        (None, Some(heartbeat_deadline_at)) => Some(heartbeat_deadline_at),
+        (None, None) => None,
+    }
+}
+
+fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
+    if heartbeat {
+        format!(
+            "activity `{}` missed heartbeat on attempt {}",
+            activity_id.0,
+            attempt.max(1)
+        )
+    } else {
+        format!(
+            "activity `{}` timed out on attempt {}",
+            activity_id.0,
+            attempt.max(1)
+        )
+    }
 }
 
 fn ready_at_for_delay(delay: Duration) -> Option<Instant> {

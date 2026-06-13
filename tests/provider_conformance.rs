@@ -51,6 +51,66 @@ fn sqlite_provider_passes_basic_conformance() {
 }
 
 #[test]
+fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heartbeat-reopen.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let (run_id, claim_opts, activity_opts) = schedule_heartbeat_activity(
+            backend.clone(),
+            "wf/sqlite-heartbeat-reopen",
+            "sqlite-heartbeat-reopen-workflows",
+            "sqlite-heartbeat-reopen-activities",
+            durust::RetryPolicy::exponential().max_attempts(1),
+        )
+        .await;
+
+        let activity = backend
+            .claim_activity_task(WorkerId::new("sqlite-heartbeat-worker"), activity_opts)
+            .await
+            .unwrap()
+            .expect("heartbeat activity");
+        assert_eq!(activity.task.attempt, 1);
+        let claimed_at = backend.current_time().await.unwrap();
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&path).unwrap();
+        let outcome = reopened
+            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                namespace: Namespace::default(),
+                now: durust::TimestampMs(claimed_at.0.saturating_add(500)),
+                limit: 16,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.timed_out, 1);
+
+        let ready = reopened
+            .claim_workflow_task(WorkerId::new("sqlite-heartbeat-ready"), claim_opts)
+            .await
+            .unwrap()
+            .expect("workflow task after heartbeat timeout");
+        assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(100),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+            panic!("expected ActivityTimedOut event after reopen");
+        };
+        assert!(timed_out.message.contains("missed heartbeat"));
+    });
+}
+
+#[test]
 fn registry_rejects_duplicate_handler_identities() {
     let mut registry = Registry::default();
     registry.register_workflow::<workflow>().unwrap();
@@ -179,6 +239,9 @@ where
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
     non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
     activity_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone()).await;
+    activity_heartbeat_extends_deadline_and_rejects_stale_claim(backend.clone()).await;
+    activity_heartbeat_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone())
+        .await;
     cancel_commands_clear_activity_tasks(backend.clone()).await;
     child_start_dispatch_is_idempotent_and_wakes_parent(backend.clone()).await;
     child_completion_routes_to_parent(backend.clone()).await;
@@ -763,6 +826,7 @@ where
         task_queue: TaskQueue::new("retry-activities"),
         retry_policy,
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input: input.clone(),
         fingerprint: durust::activity_fingerprint(
             ActivityName::new("conformance.echo"),
@@ -898,6 +962,7 @@ where
         task_queue: TaskQueue::new("non-retryable-activities"),
         retry_policy,
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input: input.clone(),
         fingerprint: durust::activity_fingerprint(
             ActivityName::new("conformance.echo"),
@@ -1014,6 +1079,7 @@ where
         task_queue: TaskQueue::new("timeout-activities"),
         retry_policy,
         start_to_close_timeout: Some(Duration::from_millis(10)),
+        heartbeat_timeout: None,
         input: input.clone(),
         fingerprint: durust::activity_fingerprint(
             ActivityName::new("conformance.echo"),
@@ -1153,6 +1219,264 @@ where
     assert!(timed_out.message.contains("timed out"));
 }
 
+async fn activity_heartbeat_extends_deadline_and_rejects_stale_claim<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_heartbeat_activity(
+        backend.clone(),
+        "wf/activity-heartbeat-extend",
+        "heartbeat-extend-workflows",
+        "heartbeat-extend-activities",
+        durust::RetryPolicy::exponential().max_attempts(1),
+    )
+    .await;
+
+    let activity = backend
+        .claim_activity_task(WorkerId::new("heartbeat-worker-1"), activity_opts)
+        .await
+        .unwrap()
+        .expect("heartbeat attempt");
+    assert_eq!(activity.task.attempt, 1);
+
+    let claimed_at = backend.current_time().await.unwrap();
+    let early = backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(claimed_at.0.saturating_add(100)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(early.timed_out, 0);
+
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: activity.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+
+    let mut stale_claim = activity.claim.clone();
+    stale_claim.token = stale_claim.token.saturating_add(1);
+    let stale = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest { claim: stale_claim })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, Error::StaleLease));
+
+    let heartbeat_at = backend.current_time().await.unwrap();
+    let still_early = backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(heartbeat_at.0.saturating_add(100)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(still_early.timed_out, 0);
+
+    let final_timeout = backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(heartbeat_at.0.saturating_add(500)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_timeout.timed_out, 1);
+
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("heartbeat-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("heartbeat timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected final ActivityTimedOut event");
+    };
+    assert!(timed_out.message.contains("missed heartbeat on attempt 1"));
+}
+
+async fn activity_heartbeat_timeout_retries_until_max_attempts_then_wakes_workflow<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_heartbeat_activity(
+        backend.clone(),
+        "wf/activity-heartbeat-retry",
+        "heartbeat-retry-workflows",
+        "heartbeat-retry-activities",
+        durust::RetryPolicy::exponential().max_attempts(2),
+    )
+    .await;
+
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("heartbeat-retry-worker-1"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first heartbeat attempt");
+    assert_eq!(first.task.attempt, 1);
+    let first_claimed_at = backend.current_time().await.unwrap();
+    let retry = backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(first_claimed_at.0.saturating_add(500)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(retry.timed_out, 1);
+    let not_ready = backend
+        .claim_workflow_task(
+            WorkerId::new("heartbeat-retry-not-ready"),
+            claim_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(not_ready.is_none());
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+
+    let second = backend
+        .claim_activity_task(WorkerId::new("heartbeat-retry-worker-2"), activity_opts)
+        .await
+        .unwrap()
+        .expect("second heartbeat attempt");
+    assert_eq!(second.task.attempt, 2);
+    let second_claimed_at = backend.current_time().await.unwrap();
+    let final_timeout = backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(second_claimed_at.0.saturating_add(500)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_timeout.timed_out, 1);
+
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("heartbeat-retry-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("heartbeat timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(history.len(), 3);
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected final ActivityTimedOut event");
+    };
+    assert!(timed_out.message.contains("missed heartbeat on attempt 2"));
+}
+
+async fn schedule_heartbeat_activity<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+    retry_policy: durust::RetryPolicy,
+) -> (
+    durust::RunId,
+    ClaimWorkflowTaskOptions,
+    ClaimActivityOptions,
+)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, 5)
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("heartbeat-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(activity_queue),
+        retry_policy,
+        start_to_close_timeout: Some(Duration::from_secs(10)),
+        heartbeat_timeout: Some(Duration::from_millis(200)),
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-heartbeat-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(activity_queue),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    (run_id, claim_opts, activity_opts)
+}
+
 async fn cancel_commands_clear_activity_tasks<B>(backend: B)
 where
     B: DurableBackend,
@@ -1177,6 +1501,7 @@ where
         task_queue: TaskQueue::new("activities"),
         retry_policy: durust::RetryPolicy::none(),
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input: activity_input.clone(),
         fingerprint: durust::activity_fingerprint(
             ActivityName::new("conformance.echo"),
@@ -1746,6 +2071,7 @@ where
         task_queue: task_queue.clone(),
         retry_policy: retry_policy.clone(),
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input_manifest: input_manifest.clone(),
         result_manifest_name: "mapped".to_owned(),
         max_in_flight: 2,
@@ -1769,6 +2095,7 @@ where
                         task_queue,
                         retry_policy,
                         start_to_close_timeout: None,
+                        heartbeat_timeout: None,
                         input_manifest: input_manifest.clone(),
                         result_manifest_name: "mapped".to_owned(),
                         max_in_flight: 2,
@@ -1958,6 +2285,7 @@ where
         task_queue: task_queue.clone(),
         retry_policy: retry_policy.clone(),
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input_manifest: input_manifest.clone(),
         result_manifest_name: "mapped".to_owned(),
         max_in_flight: 2,
@@ -1974,6 +2302,7 @@ where
                         task_queue,
                         retry_policy,
                         start_to_close_timeout: None,
+                        heartbeat_timeout: None,
                         input_manifest: input_manifest.clone(),
                         result_manifest_name: "mapped".to_owned(),
                         max_in_flight: 2,
@@ -2139,6 +2468,7 @@ where
         task_queue: TaskQueue::new("cancel-activities"),
         retry_policy: retry_policy.clone(),
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input: activity_input.clone(),
         fingerprint: durust::activity_fingerprint(
             ActivityName::new("conformance.echo"),
@@ -2160,6 +2490,7 @@ where
         task_queue: TaskQueue::new("cancel-activities"),
         retry_policy: retry_policy.clone(),
         start_to_close_timeout: None,
+        heartbeat_timeout: None,
         input_manifest: input_manifest.clone(),
         result_manifest_name: "cancelled".to_owned(),
         max_in_flight: 2,
@@ -2194,6 +2525,7 @@ where
                             task_queue: TaskQueue::new("cancel-activities"),
                             retry_policy,
                             start_to_close_timeout: None,
+                            heartbeat_timeout: None,
                             input_manifest: input_manifest.clone(),
                             result_manifest_name: "cancelled".to_owned(),
                             max_in_flight: 2,

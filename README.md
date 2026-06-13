@@ -228,6 +228,20 @@ let charge = durust::call_activity!(charge_card(input.charge(quote)))
 Defaults are workflow-local and can be changed with normal deterministic control
 flow. Per-call options override the current defaults for that call.
 
+Long-running activities can opt into heartbeat enforcement:
+
+```rust
+let result = durust::call_activity!(transcode(input))
+    .task_queue("media")
+    .heartbeat_timeout(std::time::Duration::from_secs(10))
+    .await?;
+```
+
+The heartbeat timeout is disabled by default. When enabled, the provider starts
+the heartbeat deadline when the activity task is claimed and refreshes it when
+the activity calls `durust::heartbeat_activity().await?`. A missed heartbeat
+uses the same retry policy as other activity timeouts.
+
 Activities return serializable Durust errors. A retry policy is skipped when the
 activity returns a non-retryable application error:
 

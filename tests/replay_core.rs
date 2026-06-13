@@ -56,6 +56,13 @@ async fn flaky_activity(_: ()) -> durust::Result<u64> {
     }
 }
 
+#[durust::activity(name = "tests.heartbeat")]
+async fn heartbeat_activity_test(input: NumberInput) -> durust::Result<u64> {
+    durust::heartbeat_activity().await?;
+    durust::heartbeat_activity().await?;
+    Ok(input.value * 2)
+}
+
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
 async fn double_plus_one(input: u64) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input }))
@@ -411,6 +418,14 @@ async fn timeout_activity_workflow(input: u64) -> durust::Result<u64> {
         .await
 }
 
+#[durust::workflow(name = "tests.heartbeat-activity", version = 1)]
+async fn heartbeat_activity_workflow(input: u64) -> durust::Result<u64> {
+    durust::call_activity!(heartbeat_activity_test(NumberInput { value: input }))
+        .task_queue("activities")
+        .heartbeat_timeout(Duration::from_secs(30))
+        .await
+}
+
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
 async fn double_plus_one_changed(input: u64) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input + 1 }))
@@ -528,10 +543,10 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
             history[0].data,
             HistoryEventData::WorkflowStarted { .. }
         ));
-        assert!(matches!(
-            history[1].data,
-            HistoryEventData::ActivityScheduled(_)
-        ));
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("workflow did not schedule activity");
+        };
+        assert_eq!(scheduled.heartbeat_timeout, None);
         assert!(matches!(
             history[2].data,
             HistoryEventData::ActivityCompleted(_)
@@ -540,6 +555,44 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
             panic!("workflow did not complete");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 41);
+    });
+}
+
+#[test]
+fn activity_can_heartbeat_through_worker_context() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<heartbeat_activity_workflow>("wf/heartbeat-activity", "workflows", 20)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("heartbeat-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(heartbeat_activity_workflow)
+            .register_activity(heartbeat_activity_test)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 2);
+        assert_eq!(stats.activity_tasks, 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("workflow did not schedule activity");
+        };
+        assert_eq!(scheduled.heartbeat_timeout, Some(Duration::from_secs(30)));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 40);
     });
 }
 
@@ -3163,6 +3216,13 @@ impl DurableBackend for RecordingBackend {
         opts: ClaimActivityOptions,
     ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>> {
         self.inner.claim_activity_task(worker_id, opts)
+    }
+
+    fn heartbeat_activity(
+        &self,
+        req: durust::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>> {
+        self.inner.heartbeat_activity(req)
     }
 
     fn complete_activity(

@@ -46,7 +46,11 @@ Implemented and covered:
 
 - Activity scheduling/completion/failure/timeout with durable retry attempts,
   serializable failure envelopes, and non-retryable activity failures.
-- Workflow-local default activity options for task queue and retry policy.
+- Workflow-local default activity options for task queue, retry policy, and
+  activity timeouts.
+- Opt-in activity heartbeats with claim-fenced heartbeat recording, generic
+  provider-owned delayed timeout visibility, retry-policy handling, and SQLite
+  restart recovery for heartbeat deadlines.
 - Durable timers, signal inbox reads/consumption, and nondeterminism retry backoff.
 - Explicit local activity preference for activities and activity-map items with
   remote fallback when local capacity is zero.
@@ -68,7 +72,8 @@ Remaining before this phase is done:
 
 ## Required Tests
 
-- Activity success, failure, retry, timeout, stale lease, and duplicate completion.
+- Activity success, failure, retry, timeout, heartbeat timeout, stale lease,
+  and duplicate completion.
 - Timer scheduling, firing, replay, cancellation, and timer firing during recovery.
 - Signal idempotency, signal-before-wait, signal-after-wait, atomic consume, and replay.
 - Local activity preference with remote fallback.

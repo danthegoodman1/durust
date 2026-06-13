@@ -66,6 +66,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         opts: ClaimActivityOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedActivityTask>>>;
 
+    fn heartbeat_activity(
+        &self,
+        req: ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, Result<ActivityHeartbeatOutcome>>;
+
     fn complete_activity(
         &self,
         req: CompleteActivityRequest,
@@ -239,6 +244,17 @@ pub struct ActivityTaskClaim {
 pub struct ClaimedActivityTask {
     pub task: ActivityTask,
     pub claim: ActivityTaskClaim,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActivityHeartbeatRequest {
+    pub claim: ActivityTaskClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivityHeartbeatOutcome {
+    Recorded,
+    AlreadyCompleted,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

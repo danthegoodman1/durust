@@ -1,9 +1,11 @@
 use crate::{
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, CompleteActivityRequest, DurableBackend, Error,
-    EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace,
-    NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest,
-    TaskQueue, TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowId, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error, poll_with_runtime_context,
+    ActivityHeartbeatRequest, ClaimActivityOptions, ClaimWorkflowTaskOptions,
+    CompleteActivityRequest, DurableBackend, Error, EventId, FailActivityRequest,
+    FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace, NewHistoryEvent,
+    ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest, TaskQueue,
+    TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowId, WorkflowTaskCommit,
+    WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error, poll_with_activity_context,
+    poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -348,7 +350,24 @@ where
             .registry
             .activity(&claimed.task.activity_name)
             .ok_or_else(|| Error::ActivityNotRegistered(claimed.task.activity_name.clone()))?;
-        match registration.run(claimed.task.input).await {
+        let heartbeat_backend = self.backend.clone();
+        let heartbeat_claim = claimed.claim.clone();
+        let activity_context = crate::runtime::ActivityRuntimeContext::new(move || {
+            let backend = heartbeat_backend.clone();
+            let claim = heartbeat_claim.clone();
+            Box::pin(async move {
+                backend
+                    .heartbeat_activity(ActivityHeartbeatRequest { claim })
+                    .await
+            })
+        });
+        let mut future = registration.run(claimed.task.input);
+        let result = std::future::poll_fn(|cx| {
+            poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
+        })
+        .await;
+
+        match result {
             Ok(result) => {
                 self.backend
                     .complete_activity(CompleteActivityRequest {

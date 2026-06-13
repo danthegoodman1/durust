@@ -383,8 +383,8 @@ impl DurableBackend for SqliteBackend {
                 tx.execute(
                     "insert into activity_tasks
                      (activity_id, namespace, run_id, activity_name, task_queue, task,
-                      claim_token, completed, timeout_at_ms)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7)",
+                      claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
                     params![
                         task.activity_id.0,
                         namespace.as_str(),
@@ -778,10 +778,17 @@ impl DurableBackend for SqliteBackend {
                      join workflow_instances i on i.run_id = a.run_id
                      where a.namespace = ?1
                        and a.completed = 0
-                       and a.timeout_at_ms is not null
-                       and a.timeout_at_ms <= ?2
+                       and (
+                         (a.timeout_at_ms is not null and a.timeout_at_ms <= ?2)
+                         or
+                         (a.heartbeat_deadline_at_ms is not null and a.heartbeat_deadline_at_ms <= ?2)
+                       )
                        and i.terminal = 0
-                     order by a.timeout_at_ms asc, a.activity_id asc
+                     order by min(
+                         coalesce(a.timeout_at_ms, 9223372036854775807),
+                         coalesce(a.heartbeat_deadline_at_ms, 9223372036854775807)
+                       ) asc,
+                       a.activity_id asc
                      limit ?3",
                 )
                 .map_err(sqlite_error)?;
@@ -820,6 +827,7 @@ impl DurableBackend for SqliteBackend {
         let result = (|| {
             let mut conn = self.connect()?;
             let tx = conn.transaction().map_err(sqlite_error)?;
+            let now = TimestampMs(unix_epoch_millis());
             let mut stmt = tx
                 .prepare(
                     "select a.activity_id, a.activity_name, a.task
@@ -835,16 +843,13 @@ impl DurableBackend for SqliteBackend {
                 )
                 .map_err(sqlite_error)?;
             let rows = stmt
-                .query_map(
-                    params![opts.namespace.0, opts.task_queue.0, unix_epoch_millis()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    },
-                )
+                .query_map(params![opts.namespace.0, opts.task_queue.0, now.0], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
                 .map_err(sqlite_error)?;
             let mut selected = None;
             for row in rows {
@@ -859,7 +864,10 @@ impl DurableBackend for SqliteBackend {
                     if let Some(map_item) = &task.map_item {
                         if activity_map_is_completed(&tx, &map_item.map_command_id)? {
                             tx.execute(
-                                "update activity_tasks set completed = 1 where activity_id = ?1",
+                                "update activity_tasks
+                                 set completed = 1,
+                                     heartbeat_deadline_at_ms = null
+                                 where activity_id = ?1",
                                 params![activity_id],
                             )
                             .map_err(sqlite_error)?;
@@ -878,8 +886,14 @@ impl DurableBackend for SqliteBackend {
             };
             let token = next_counter(&tx, "claim")?;
             tx.execute(
-                "update activity_tasks set claim_token = ?1 where activity_id = ?2",
-                params![token, activity_id.0],
+                "update activity_tasks
+                 set claim_token = ?1, heartbeat_deadline_at_ms = ?2
+                 where activity_id = ?3",
+                params![
+                    token,
+                    activity_timeout_at_ms_from(now, task.heartbeat_timeout),
+                    activity_id.0
+                ],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
@@ -891,6 +905,61 @@ impl DurableBackend for SqliteBackend {
                     token,
                 },
             }))
+        })();
+        Box::pin(ready(result))
+    }
+
+    fn heartbeat_activity(
+        &self,
+        req: crate::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>> {
+        let result = (|| {
+            let mut conn = self.connect()?;
+            let tx = conn.transaction().map_err(sqlite_error)?;
+            let Some((task_blob, claim_token, completed)) = tx
+                .query_row(
+                    "select task, claim_token, completed
+                     from activity_tasks
+                     where activity_id = ?1",
+                    params![req.claim.activity_id.0],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, Option<u64>>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(sqlite_error)?
+            else {
+                return Err(Error::Backend(format!(
+                    "activity `{}` not found",
+                    req.claim.activity_id.0
+                )));
+            };
+            if completed {
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted);
+            }
+            if claim_token != Some(req.claim.token) {
+                return Err(Error::StaleLease);
+            }
+
+            let task: ActivityTask = rmp_serde::from_slice(&task_blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            tx.execute(
+                "update activity_tasks
+                 set heartbeat_deadline_at_ms = ?1
+                 where activity_id = ?2",
+                params![
+                    activity_timeout_at_ms(task.heartbeat_timeout),
+                    req.claim.activity_id.0
+                ],
+            )
+            .map_err(sqlite_error)?;
+            tx.commit().map_err(sqlite_error)?;
+            Ok(crate::ActivityHeartbeatOutcome::Recorded)
         })();
         Box::pin(ready(result))
     }
@@ -978,7 +1047,10 @@ impl DurableBackend for SqliteBackend {
             )
             .map_err(sqlite_error)?;
             tx.execute(
-                "update activity_tasks set completed = 1 where activity_id = ?1",
+                "update activity_tasks
+                 set completed = 1,
+                     heartbeat_deadline_at_ms = null
+                 where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
             .map_err(sqlite_error)?;
@@ -1033,7 +1105,8 @@ impl DurableBackend for SqliteBackend {
                     "update activity_tasks
                      set task = ?1,
                          claim_token = null,
-                         timeout_at_ms = ?2
+                         timeout_at_ms = ?2,
+                         heartbeat_deadline_at_ms = null
                      where activity_id = ?3",
                     params![
                         retry_blob,
@@ -1094,7 +1167,10 @@ impl DurableBackend for SqliteBackend {
             )
             .map_err(sqlite_error)?;
             tx.execute(
-                "update activity_tasks set completed = 1 where activity_id = ?1",
+                "update activity_tasks
+                 set completed = 1,
+                     heartbeat_deadline_at_ms = null
+                 where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
             .map_err(sqlite_error)?;
@@ -1222,7 +1298,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             task blob not null,
             claim_token integer,
             completed integer not null,
-            timeout_at_ms integer
+            timeout_at_ms integer,
+            heartbeat_deadline_at_ms integer
         );
 
         create table if not exists activity_maps (
@@ -1295,6 +1372,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         create index if not exists idx_signals_inbox
             on signals(run_id, signal_name, consumed, received_sequence);
+
+        create index if not exists idx_activity_tasks_timeout_due
+            on activity_tasks(namespace, completed, timeout_at_ms, activity_id);
+
+        create index if not exists idx_activity_tasks_heartbeat_due
+            on activity_tasks(namespace, completed, heartbeat_deadline_at_ms, activity_id);
         ",
     )
     .map_err(sqlite_error)?;
@@ -1313,7 +1396,13 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "parent_close_policy",
         "text not null default 'cancel'",
     )?;
-    ensure_column(conn, "activity_tasks", "timeout_at_ms", "integer")
+    ensure_column(conn, "activity_tasks", "timeout_at_ms", "integer")?;
+    ensure_column(
+        conn,
+        "activity_tasks",
+        "heartbeat_deadline_at_ms",
+        "integer",
+    )
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -1352,12 +1441,20 @@ fn activity_timeout_at_ms_from(now: TimestampMs, timeout: Option<Duration>) -> O
     timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
 }
 
-fn timeout_message(activity_id: &ActivityId, attempt: u32) -> String {
-    format!(
-        "activity `{}` timed out on attempt {}",
-        activity_id.0,
-        attempt.max(1)
-    )
+fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
+    if heartbeat {
+        format!(
+            "activity `{}` missed heartbeat on attempt {}",
+            activity_id.0,
+            attempt.max(1)
+        )
+    } else {
+        format!(
+            "activity `{}` timed out on attempt {}",
+            activity_id.0,
+            attempt.max(1)
+        )
+    }
 }
 
 fn duration_millis_i64(duration: Duration) -> i64 {
@@ -1398,7 +1495,9 @@ fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result
     .map_err(sqlite_error)?;
     tx.execute(
         "update activity_tasks
-         set completed = 1, claim_token = null
+         set completed = 1,
+             claim_token = null,
+             heartbeat_deadline_at_ms = null
          where run_id = ?1",
         params![run_id.0],
     )
@@ -1588,7 +1687,9 @@ fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId
     let map_prefix = format!("{}:map:%", activity_id.0);
     tx.execute(
         "update activity_tasks
-         set completed = 1, claim_token = null
+         set completed = 1,
+             claim_token = null,
+             heartbeat_deadline_at_ms = null
          where activity_id = ?1 or activity_id like ?2",
         params![activity_id.0, map_prefix],
     )
@@ -1978,6 +2079,7 @@ fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &Command
             task_queue: task.task_queue.clone(),
             retry_policy: task.retry_policy.clone(),
             start_to_close_timeout: task.start_to_close_timeout,
+            heartbeat_timeout: task.heartbeat_timeout,
             attempt: 1,
             input,
             map_item: Some(ActivityMapItem {
@@ -1990,8 +2092,8 @@ fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &Command
         tx.execute(
             "insert into activity_tasks
              (activity_id, namespace, run_id, activity_name, task_queue, task,
-              claim_token, completed, timeout_at_ms)
-             values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7)",
+              claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
+             values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
             params![
                 activity_id.0,
                 namespace.as_str(),
@@ -2025,7 +2127,10 @@ fn complete_map_item(
     activity_id: ActivityId,
 ) -> Result<CompleteActivityOutcome> {
     tx.execute(
-        "update activity_tasks set completed = 1 where activity_id = ?1",
+        "update activity_tasks
+         set completed = 1,
+             heartbeat_deadline_at_ms = null
+         where activity_id = ?1",
         params![activity_id.0],
     )
     .map_err(sqlite_error)?;
@@ -2168,7 +2273,10 @@ fn fail_map_item(
     activity_id: ActivityId,
 ) -> Result<FailActivityOutcome> {
     tx.execute(
-        "update activity_tasks set completed = 1 where activity_id = ?1",
+        "update activity_tasks
+         set completed = 1,
+             heartbeat_deadline_at_ms = null
+         where activity_id = ?1",
         params![activity_id.0],
     )
     .map_err(sqlite_error)?;
@@ -2237,9 +2345,9 @@ fn timeout_activity(
     activity_id: ActivityId,
     now: TimestampMs,
 ) -> Result<bool> {
-    let Some((task_blob, completed, timeout_at_ms)) = tx
+    let Some((task_blob, completed, timeout_at_ms, heartbeat_deadline_at_ms)) = tx
         .query_row(
-            "select task, completed, timeout_at_ms
+            "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms
              from activity_tasks
              where activity_id = ?1",
             params![activity_id.0],
@@ -2248,6 +2356,7 @@ fn timeout_activity(
                     row.get::<_, Vec<u8>>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             },
         )
@@ -2256,9 +2365,12 @@ fn timeout_activity(
     else {
         return Ok(false);
     };
-    if completed || !timeout_at_ms.is_some_and(|timeout_at_ms| timeout_at_ms <= now.0) {
+    let start_timeout_due = timeout_at_ms.is_some_and(|timeout_at_ms| timeout_at_ms <= now.0);
+    let heartbeat_timeout_due = heartbeat_deadline_at_ms.is_some_and(|deadline| deadline <= now.0);
+    if completed || !(start_timeout_due || heartbeat_timeout_due) {
         return Ok(false);
     }
+    let timed_out_by_heartbeat = heartbeat_timeout_due && !start_timeout_due;
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
@@ -2271,7 +2383,8 @@ fn timeout_activity(
             "update activity_tasks
              set task = ?1,
                  claim_token = null,
-                 timeout_at_ms = ?2
+                 timeout_at_ms = ?2,
+                 heartbeat_deadline_at_ms = null
              where activity_id = ?3",
             params![
                 retry_blob,
@@ -2284,7 +2397,10 @@ fn timeout_activity(
     }
 
     tx.execute(
-        "update activity_tasks set completed = 1 where activity_id = ?1",
+        "update activity_tasks
+         set completed = 1,
+             heartbeat_deadline_at_ms = null
+         where activity_id = ?1",
         params![activity_id.0],
     )
     .map_err(sqlite_error)?;
@@ -2296,7 +2412,7 @@ fn timeout_activity(
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(&activity_id, task.attempt),
+                timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
             ),
             activity_id,
         )?;
@@ -2324,7 +2440,7 @@ fn timeout_activity(
         event_id,
         HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: task.command_id,
-            message: timeout_message(&activity_id, task.attempt),
+            message: timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
         }),
     )?;
     tx.execute(

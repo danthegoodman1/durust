@@ -8,6 +8,7 @@ use crate::{
     child_workflow_fingerprint, command_id, encode_activity_map_input_manifest, payload_digest,
     signal_fingerprint, timer_fingerprint,
 };
+use futures::future::BoxFuture;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -17,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 thread_local! {
     static CURRENT_CONTEXT: Cell<*mut RuntimeContext> = const { Cell::new(std::ptr::null_mut()) };
+    static CURRENT_ACTIVITY_CONTEXT: Cell<*const ActivityRuntimeContext> = const { Cell::new(std::ptr::null()) };
 }
 
 pub(crate) fn poll_with_runtime_context<F, T>(
@@ -44,6 +46,51 @@ fn with_context<T>(f: impl FnOnce(&mut RuntimeContext) -> T) -> T {
         // The worker installs the pointer only for the duration of one poll and
         // does not move the RuntimeContext during that scope.
         unsafe { f(&mut *ptr) }
+    })
+}
+
+pub(crate) struct ActivityRuntimeContext {
+    heartbeat:
+        Box<dyn Fn() -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>> + Send + Sync>,
+}
+
+impl ActivityRuntimeContext {
+    pub(crate) fn new(
+        heartbeat: impl Fn() -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            heartbeat: Box::new(heartbeat),
+        }
+    }
+}
+
+pub(crate) fn poll_with_activity_context<F, T>(
+    context: &ActivityRuntimeContext,
+    poll: F,
+) -> Poll<Result<T>>
+where
+    F: FnOnce() -> Poll<Result<T>>,
+{
+    CURRENT_ACTIVITY_CONTEXT.with(|slot| {
+        let previous = slot.replace(context as *const ActivityRuntimeContext);
+        let result = poll();
+        slot.set(previous);
+        result
+    })
+}
+
+fn with_activity_context<T>(f: impl FnOnce(&ActivityRuntimeContext) -> T) -> T {
+    CURRENT_ACTIVITY_CONTEXT.with(|slot| {
+        let ptr = slot.get();
+        assert!(
+            !ptr.is_null(),
+            "durust activity APIs must be polled inside an activity task"
+        );
+        // The worker installs this pointer only while polling one activity task.
+        unsafe { f(&*ptr) }
     })
 }
 
@@ -536,6 +583,51 @@ where
         runtime.query_projection = Some(crate::encode_payload(view)?);
         Ok(())
     })
+}
+
+pub fn heartbeat_activity() -> ActivityHeartbeatFuture {
+    ActivityHeartbeatFuture {
+        state: ActivityHeartbeatState::Init,
+    }
+}
+
+enum ActivityHeartbeatState {
+    Init,
+    Waiting(BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>>),
+    Done,
+}
+
+pub struct ActivityHeartbeatFuture {
+    state: ActivityHeartbeatState,
+}
+
+impl Unpin for ActivityHeartbeatFuture {}
+
+impl Future for ActivityHeartbeatFuture {
+    type Output = Result<crate::ActivityHeartbeatOutcome>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        loop {
+            match &mut self.state {
+                ActivityHeartbeatState::Init => {
+                    let heartbeat = with_activity_context(|context| (context.heartbeat)());
+                    self.state = ActivityHeartbeatState::Waiting(heartbeat);
+                }
+                ActivityHeartbeatState::Waiting(heartbeat) => {
+                    let poll = Pin::new(heartbeat).poll(cx);
+                    if poll.is_ready() {
+                        self.state = ActivityHeartbeatState::Done;
+                    }
+                    return poll;
+                }
+                ActivityHeartbeatState::Done => {
+                    return Poll::Ready(Err(Error::Backend(
+                        "activity heartbeat future polled after completion".to_owned(),
+                    )));
+                }
+            }
+        }
+    }
 }
 
 pub trait DurableSelectBranch: Future + Unpin {
@@ -1034,6 +1126,11 @@ where
         self
     }
 
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.options = self.options.heartbeat_timeout(timeout);
+        self
+    }
+
     pub fn spawn(self) -> ActivitySpawnFuture<A> {
         ActivitySpawnFuture {
             input: self.input,
@@ -1262,6 +1359,7 @@ where
         task_queue: Some(task_queue.clone()),
         retry_policy: Some(retry_policy.clone()),
         start_to_close_timeout: options.start_to_close_timeout,
+        heartbeat_timeout: options.heartbeat_timeout,
     };
     let activity_input = input
         .as_ref()
@@ -1303,6 +1401,7 @@ where
         task_queue,
         retry_policy,
         start_to_close_timeout: options.start_to_close_timeout,
+        heartbeat_timeout: options.heartbeat_timeout,
         input: input_ref,
         fingerprint,
     };
@@ -1379,6 +1478,11 @@ where
 
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.options = self.options.timeout(timeout);
+        self
+    }
+
+    pub fn heartbeat_timeout(mut self, timeout: Duration) -> Self {
+        self.options = self.options.heartbeat_timeout(timeout);
         self
     }
 
@@ -1488,6 +1592,7 @@ where
             task_queue: Some(task_queue.clone()),
             retry_policy: Some(retry_policy.clone()),
             start_to_close_timeout: options.start_to_close_timeout,
+            heartbeat_timeout: options.heartbeat_timeout,
         };
         let max_in_flight = self.max_in_flight.max(1);
         let fingerprint = activity_map_fingerprint(
@@ -1528,6 +1633,7 @@ where
             task_queue,
             retry_policy,
             start_to_close_timeout: options.start_to_close_timeout,
+            heartbeat_timeout: options.heartbeat_timeout,
             input_manifest: input_manifest.clone(),
             result_manifest_name: self.result_manifest_name.clone(),
             max_in_flight,
@@ -1542,6 +1648,7 @@ where
             task_queue: scheduled.task_queue,
             retry_policy: scheduled.retry_policy,
             start_to_close_timeout: scheduled.start_to_close_timeout,
+            heartbeat_timeout: scheduled.heartbeat_timeout,
             input_manifest,
             result_manifest_name: scheduled.result_manifest_name,
             max_in_flight,

@@ -46,6 +46,7 @@ pub struct ActivityOptions {
     pub task_queue: Option<TaskQueue>,
     pub retry_policy: Option<RetryPolicy>,
     pub start_to_close_timeout: Option<std::time::Duration>,
+    pub heartbeat_timeout: Option<std::time::Duration>,
 }
 
 impl ActivityOptions {
@@ -68,6 +69,11 @@ impl ActivityOptions {
         self
     }
 
+    pub fn heartbeat_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.heartbeat_timeout = Some(timeout);
+        self
+    }
+
     pub(crate) fn merge_overrides(mut self, overrides: Self) -> Self {
         if overrides.task_queue.is_some() {
             self.task_queue = overrides.task_queue;
@@ -77,6 +83,9 @@ impl ActivityOptions {
         }
         if overrides.start_to_close_timeout.is_some() {
             self.start_to_close_timeout = overrides.start_to_close_timeout;
+        }
+        if overrides.heartbeat_timeout.is_some() {
+            self.heartbeat_timeout = overrides.heartbeat_timeout;
         }
         self
     }

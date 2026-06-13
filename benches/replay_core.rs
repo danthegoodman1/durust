@@ -365,6 +365,24 @@ fn activity_claim_complete(c: &mut Criterion) {
     });
 }
 
+fn activity_heartbeat(c: &mut Criterion) {
+    c.bench_function("activity_heartbeat_memory", |b| {
+        b.iter_batched(
+            setup_claimed_heartbeat_activity,
+            |(backend, claim)| {
+                block_on(async {
+                    let outcome = backend
+                        .heartbeat_activity(durust::ActivityHeartbeatRequest { claim })
+                        .await
+                        .unwrap();
+                    assert_eq!(outcome, durust::ActivityHeartbeatOutcome::Recorded);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn timer_due_scan_wakeup(c: &mut Criterion) {
     c.bench_function("timer_due_scan_wakeup_memory", |b| {
         b.iter_batched(
@@ -729,6 +747,7 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
             task_queue: TaskQueue::new("activities"),
             retry_policy: durust::RetryPolicy::none(),
             start_to_close_timeout: None,
+            heartbeat_timeout: None,
             fingerprint: durust::activity_fingerprint(
                 ActivityName::new("bench.double"),
                 durust::payload_digest(&input),
@@ -771,6 +790,61 @@ fn setup_scheduled_activity() -> (MemoryBackend, WorkerId, ClaimActivityOptions)
             WorkerId::new("bench-activity-worker"),
             claim_activity_options("activities"),
         )
+    })
+}
+
+fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskClaim) {
+    block_on(async {
+        let (backend, worker_id, opts) = create_claimable_workflow().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+        let scheduled = ActivityScheduled {
+            command_id: durust::command_id(&claimed.run_id, 1),
+            activity_name: ActivityName::new("bench.double"),
+            task_queue: TaskQueue::new("activities"),
+            retry_policy: durust::RetryPolicy::none(),
+            start_to_close_timeout: None,
+            heartbeat_timeout: Some(Duration::from_secs(30)),
+            fingerprint: durust::activity_fingerprint(
+                ActivityName::new("bench.double"),
+                durust::payload_digest(&input),
+                "sha256:bench-heartbeat-options".to_owned(),
+            ),
+            input,
+        };
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                        scheduled.clone(),
+                    ))],
+                    upsert_waits: Vec::new(),
+                    schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
+                    schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: None,
+                },
+            )
+            .await
+            .unwrap();
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("bench-heartbeat-worker"),
+                claim_activity_options("activities"),
+            )
+            .await
+            .unwrap()
+            .expect("heartbeat activity");
+        (backend, activity.claim)
     })
 }
 
@@ -894,6 +968,7 @@ fn setup_claimed_activity_map_workflow() -> (
             task_queue: task_queue.clone(),
             retry_policy: retry_policy.clone(),
             start_to_close_timeout: None,
+            heartbeat_timeout: None,
             input_manifest: input_manifest.clone(),
             result_manifest_name: "bench-results".to_owned(),
             max_in_flight: 64,
@@ -911,6 +986,7 @@ fn setup_claimed_activity_map_workflow() -> (
             task_queue,
             retry_policy,
             start_to_close_timeout: None,
+            heartbeat_timeout: None,
             input_manifest,
             result_manifest_name: "bench-results".to_owned(),
             max_in_flight: 64,
@@ -1040,6 +1116,7 @@ criterion_group!(
     projection_update,
     projection_read,
     activity_claim_complete,
+    activity_heartbeat,
     timer_due_scan_wakeup,
     signal_send_consume,
     activity_map_materialize,
