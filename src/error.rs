@@ -45,6 +45,11 @@ impl DurableFailure {
             Error::ChildWorkflowCancelled(reason) => {
                 Self::new("durust.child_workflow_cancelled", reason.clone()).marked_non_retryable()
             }
+            Error::ContinueAsNew { .. } => Self::new(
+                "durust.continue_as_new",
+                "workflow requested continue-as-new",
+            )
+            .marked_non_retryable(),
             Error::Nondeterminism(message) => {
                 Self::new("durust.nondeterminism", message.clone()).marked_non_retryable()
             }
@@ -144,6 +149,9 @@ pub enum Error {
 
     #[error("child workflow cancelled: {0}")]
     ChildWorkflowCancelled(String),
+
+    #[error("workflow continued as new")]
+    ContinueAsNew { input: PayloadRef },
 
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),

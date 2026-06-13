@@ -2497,6 +2497,12 @@ if durust::history().event_count() > 100_000 {
 ```
 
 This is not required for correctness. It is an operational latency tool.
+The continued run keeps the same workflow type, task queue, and parent link when
+the continuing workflow is itself a child. A parent waiting on that child is
+not notified by the intermediate `WorkflowContinuedAsNew`; it is woken only
+when the latest continued run completes, fails, or is cancelled. Query
+projections are keyed by workflow id, so the last committed projection remains
+visible across the transition until the new run publishes a replacement.
 
 ---
 

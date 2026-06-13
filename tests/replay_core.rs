@@ -22,6 +22,12 @@ struct QueryView {
     value: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ContinueInput {
+    remaining: u32,
+    total: u64,
+}
+
 #[durust::activity(name = "tests.double")]
 async fn double(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
@@ -538,6 +544,56 @@ async fn query_projection_workflow(input: u64) -> durust::Result<u64> {
 #[durust::query(workflow = query_projection_workflow)]
 fn query_status(view: &QueryView) -> String {
     view.status.clone()
+}
+
+#[durust::workflow(name = "tests.continue-as-new", version = 1)]
+async fn continue_as_new_workflow(input: ContinueInput) -> durust::Result<u64> {
+    if input.remaining > 0 {
+        return durust::continue_as_new(ContinueInput {
+            remaining: input.remaining - 1,
+            total: input.total + 1,
+        });
+    }
+    Ok(input.total)
+}
+
+#[durust::workflow(name = "tests.continue-query", version = 1, query_state = QueryView)]
+async fn continue_query_workflow(input: ContinueInput) -> durust::Result<u64> {
+    if input.remaining > 0 {
+        durust::publish(&QueryView {
+            status: "continuing".to_owned(),
+            value: input.total,
+        })?;
+        return durust::continue_as_new(ContinueInput {
+            remaining: input.remaining - 1,
+            total: input.total + 1,
+        });
+    }
+    durust::publish(&QueryView {
+        status: "done".to_owned(),
+        value: input.total,
+    })?;
+    Ok(input.total)
+}
+
+#[durust::workflow(name = "tests.continued-child", version = 1)]
+async fn continued_child_workflow(input: ContinueInput) -> durust::Result<u64> {
+    if input.remaining > 0 {
+        return durust::continue_as_new(ContinueInput {
+            remaining: input.remaining - 1,
+            total: input.total + 1,
+        });
+    }
+    Ok(input.total)
+}
+
+#[durust::workflow(name = "tests.parent-waits-continued-child", version = 1)]
+async fn parent_waits_continued_child(input: ContinueInput) -> durust::Result<u64> {
+    let child = durust::child!(continued_child_workflow(input))
+        .workflow_id("wf/continued-child")
+        .spawn()
+        .await?;
+    child.result().await
 }
 
 #[durust::workflow(name = "tests.sleep-then-return", version = 1)]
@@ -2433,6 +2489,182 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
 }
 
 #[test]
+fn continue_as_new_starts_fresh_run_with_compacted_input() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let first_run_id = client
+            .start_workflow::<continue_as_new_workflow>(
+                "wf/continue-as-new",
+                "workflows",
+                ContinueInput {
+                    remaining: 2,
+                    total: 10,
+                },
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(continue_as_new_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let second_run_id = client
+            .start_workflow::<continue_as_new_workflow>(
+                "wf/continue-as-new",
+                "workflows",
+                ContinueInput {
+                    remaining: 99,
+                    total: 99,
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(first_run_id, second_run_id);
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let third_run_id = client
+            .start_workflow::<continue_as_new_workflow>(
+                "wf/continue-as-new",
+                "workflows",
+                ContinueInput {
+                    remaining: 99,
+                    total: 99,
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(second_run_id, third_run_id);
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(!worker.run_workflow_once().await.unwrap());
+
+        let first_history = stream_all(&backend, &first_run_id).await;
+        assert_eq!(first_history.len(), 2);
+        let HistoryEventData::WorkflowContinuedAsNew { input } = &first_history[1].data else {
+            panic!("expected first run to continue as new");
+        };
+        assert_eq!(
+            durust::decode_payload::<ContinueInput>(input).unwrap(),
+            ContinueInput {
+                remaining: 1,
+                total: 11
+            }
+        );
+
+        let final_history = stream_all(&backend, &third_run_id).await;
+        assert_eq!(final_history.len(), 2);
+        let HistoryEventData::WorkflowStarted { input, .. } = &final_history[0].data else {
+            panic!("expected compacted start input");
+        };
+        assert_eq!(
+            durust::decode_payload::<ContinueInput>(input).unwrap(),
+            ContinueInput {
+                remaining: 0,
+                total: 12
+            }
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &final_history[1].data else {
+            panic!("expected final run completion");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
+    });
+}
+
+#[test]
+fn query_projection_survives_until_continued_run_publishes_replacement() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<continue_query_workflow>(
+                "wf/continue-query",
+                "workflows",
+                ContinueInput {
+                    remaining: 1,
+                    total: 20,
+                },
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(continue_query_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let continuing = client
+            .query_projection::<continue_query_workflow>("wf/continue-query")
+            .await
+            .unwrap()
+            .expect("projection from continued run");
+        assert_eq!(
+            continuing,
+            QueryView {
+                status: "continuing".to_owned(),
+                value: 20,
+            }
+        );
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let done = client
+            .query_projection::<continue_query_workflow>("wf/continue-query")
+            .await
+            .unwrap()
+            .expect("replacement projection");
+        assert_eq!(
+            done,
+            QueryView {
+                status: "done".to_owned(),
+                value: 21,
+            }
+        );
+    });
+}
+
+#[test]
+fn parent_waits_for_child_that_continues_as_new() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let parent_run_id = client
+            .start_workflow::<parent_waits_continued_child>(
+                "wf/parent-continued-child",
+                "workflows",
+                ContinueInput {
+                    remaining: 1,
+                    total: 30,
+                },
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(parent_waits_continued_child)
+            .register_workflow(continued_child_workflow)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.child_workflow_starts_dispatched, 1);
+        assert!(stats.workflow_tasks >= 4);
+
+        let parent_history = stream_all(&backend, &parent_run_id).await;
+        assert!(
+            parent_history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowCompleted(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &parent_history.last().expect("parent terminal").data
+        else {
+            panic!("parent did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 31);
+    });
+}
+
+#[test]
 fn timer_fires_after_virtual_time_and_replays_after_worker_crash() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -3251,6 +3483,80 @@ fn sqlite_backend_recovers_after_close_and_reopen() {
             panic!("SQLite workflow did not complete after reopen replay");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 23);
+    });
+}
+
+#[test]
+fn sqlite_continue_as_new_recovers_after_close_and_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("durust-continue.sqlite3");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        let client = Client::new(backend.clone());
+        let first_run_id = client
+            .start_workflow::<continue_as_new_workflow>(
+                "wf/sqlite-continue",
+                "workflows",
+                ContinueInput {
+                    remaining: 1,
+                    total: 4,
+                },
+            )
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .worker_id("sqlite-continue-before-reopen")
+            .workflow_task_queue("workflows")
+            .register_workflow(continue_as_new_workflow)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        drop(first_worker);
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&db_path).unwrap();
+        let reopened_client = Client::new(reopened.clone());
+        let continued_run_id = reopened_client
+            .start_workflow::<continue_as_new_workflow>(
+                "wf/sqlite-continue",
+                "workflows",
+                ContinueInput {
+                    remaining: 99,
+                    total: 99,
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(first_run_id, continued_run_id);
+
+        let mut recovered_worker = Worker::builder(reopened.clone())
+            .worker_id("sqlite-continue-after-reopen")
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(continue_as_new_workflow)
+            .build();
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        let first_history = stream_all(&reopened, &first_run_id).await;
+        assert!(matches!(
+            first_history[1].data,
+            HistoryEventData::WorkflowContinuedAsNew { .. }
+        ));
+        let continued_history = stream_all(&reopened, &continued_run_id).await;
+        assert_eq!(continued_history.len(), 2);
+        let HistoryEventData::WorkflowStarted { input, .. } = &continued_history[0].data else {
+            panic!("expected continued run start");
+        };
+        assert_eq!(
+            durust::decode_payload::<ContinueInput>(input).unwrap(),
+            ContinueInput {
+                remaining: 0,
+                total: 5
+            }
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &continued_history[1].data else {
+            panic!("expected continued run completion");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 5);
     });
 }
 

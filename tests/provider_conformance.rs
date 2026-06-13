@@ -235,6 +235,7 @@ where
     delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
     workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
+    continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
@@ -704,6 +705,102 @@ where
         closed.records[0].status,
         durust::WorkflowChangeVersionStatus::Closed
     );
+}
+
+async fn continue_as_new_closes_current_run_and_starts_claimable_next_run<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let first_run_id = client
+        .start_workflow::<workflow>("wf/continue-conformance", "continue-workflows", 5)
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("continue-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("continue-worker"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("initial workflow task");
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowContinuedAsNew {
+                        input: durust::encode_payload(&7_u64).unwrap(),
+                    },
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        }
+    );
+
+    let old_history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: first_run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(old_history.len(), 2);
+    assert!(matches!(
+        old_history[1].data,
+        HistoryEventData::WorkflowContinuedAsNew { .. }
+    ));
+
+    let next = backend
+        .claim_workflow_task(WorkerId::new("continue-next-worker"), claim_opts)
+        .await
+        .unwrap()
+        .expect("continued workflow task");
+    assert_ne!(next.run_id, first_run_id);
+    assert_eq!(
+        next.workflow_id,
+        durust::WorkflowId::new("wf/continue-conformance")
+    );
+    assert_eq!(next.reason, durust::WorkflowTaskReason::WorkflowStarted);
+    assert_eq!(next.replay_target_event_id, EventId(1));
+    let new_history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: next.run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    assert_eq!(new_history.len(), 1);
+    let HistoryEventData::WorkflowStarted { input, .. } = &new_history[0].data else {
+        panic!("expected new run start");
+    };
+    assert_eq!(durust::decode_payload::<u64>(input).unwrap(), 7);
 }
 
 async fn signal_inbox_is_idempotent_ordered_and_consumed_by_commit<B>(backend: B)

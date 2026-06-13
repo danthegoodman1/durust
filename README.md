@@ -541,13 +541,17 @@ Use `continue_as_new` to cap recovery latency for workflows that naturally run
 for a long time.
 
 ```rust
-if durust::history().event_count() > 100_000 {
+if processed_batches >= 10_000 {
     return durust::continue_as_new(JobInput {
         cursor: next_cursor,
         accumulated_ref,
     });
 }
 ```
+
+The current run records `WorkflowContinuedAsNew`, and the provider starts a new
+run with the same workflow id and compacted input. The new run begins with a
+fresh history, so later recovery replays only the compacted state.
 
 ## Payloads
 
@@ -640,6 +644,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`activity_spawn_join_all.rs`](examples/activity_spawn_join_all.rs)
 - [`activity_spawn_select_all.rs`](examples/activity_spawn_select_all.rs)
 - [`version_branch.rs`](examples/version_branch.rs)
+- [`continue_as_new.rs`](examples/continue_as_new.rs)
 - [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)

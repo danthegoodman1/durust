@@ -581,16 +581,22 @@ where
                 terminal = true;
             }
             Poll::Ready(Err(err)) => {
-                if matches!(
+                if let Error::ContinueAsNew { input } = err {
+                    append_events.push(NewHistoryEvent::new(
+                        HistoryEventData::WorkflowContinuedAsNew { input },
+                    ));
+                    terminal = true;
+                } else if matches!(
                     err,
                     Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
                 ) {
                     return Err(err);
+                } else {
+                    append_events.push(NewHistoryEvent::new(HistoryEventData::WorkflowFailed {
+                        failure: err.durable_failure(),
+                    }));
+                    terminal = true;
                 }
-                append_events.push(NewHistoryEvent::new(HistoryEventData::WorkflowFailed {
-                    failure: err.durable_failure(),
-                }));
-                terminal = true;
             }
             Poll::Pending => {}
         }

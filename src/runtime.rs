@@ -873,6 +873,15 @@ pub fn deprecate_patch(patch_id: impl Into<String>) -> Result<()> {
     with_context(|runtime| runtime.deprecate_patch(patch_id.into()))
 }
 
+pub fn continue_as_new<T, I>(input: I) -> Result<T>
+where
+    I: serde::Serialize,
+{
+    Err(Error::ContinueAsNew {
+        input: crate::encode_payload(&input)?,
+    })
+}
+
 pub fn publish<T>(view: &T) -> Result<()>
 where
     T: serde::Serialize + ?Sized,
@@ -2751,6 +2760,7 @@ pub(crate) fn is_terminal(data: &HistoryEventData) -> bool {
         HistoryEventData::WorkflowCompleted { .. }
             | HistoryEventData::WorkflowFailed { .. }
             | HistoryEventData::WorkflowCancelled { .. }
+            | HistoryEventData::WorkflowContinuedAsNew { .. }
     )
 }
 
@@ -2760,6 +2770,7 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::WorkflowCompleted { result } => result.encoded_len(),
         HistoryEventData::WorkflowFailed { failure } => event_failure_len(failure),
         HistoryEventData::WorkflowCancelled { reason } => reason.len(),
+        HistoryEventData::WorkflowContinuedAsNew { input } => input.encoded_len(),
         HistoryEventData::WorkflowTaskStarted => 0,
         HistoryEventData::ActivityScheduled(scheduled) => scheduled.input.encoded_len(),
         HistoryEventData::ActivityMapScheduled(scheduled) => scheduled.input_manifest.encoded_len(),

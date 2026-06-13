@@ -41,6 +41,33 @@ distance.
 - Payload offload example compiles and runs.
 - Continue-as-new example compiles and runs.
 
+## Current State
+
+Implemented and covered:
+
+- `durust::continue_as_new(input)` workflow API.
+- `WorkflowContinuedAsNew` history event.
+- Worker handling that records continue-as-new without appending
+  `WorkflowFailed`.
+- Memory and SQLite provider support for closing the current run and making a
+  fresh run with the same workflow id claimable.
+- SQLite close/reopen recovery for a continued run.
+- Query projection behavior across continue-as-new: the previous committed
+  projection remains visible until the new run publishes a replacement.
+- Parent/child behavior for a child that continues as new before completing:
+  the parent is woken by the final continued child completion, not the
+  intermediate continuation.
+- Runnable `continue_as_new` example with assertions.
+
+Remaining before this phase is done:
+
+- Provider-owned payload storage configuration and JSON codec selection.
+- Inline/blob threshold enforcement.
+- SQLite blob offload integration, S3-compatible/Garage fixture, digest
+  validation, missing blob detection, transient upload failure behavior, and GC.
+- Public payload-offload example.
+- Payload codec/offload benchmarks.
+
 ## Required Tests
 
 - Inline and blob-backed payloads behave identically through public APIs.

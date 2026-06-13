@@ -469,6 +469,15 @@ impl DurableBackend for SqliteBackend {
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
                 cleanup_run_operational_state(&tx, &claim.run_id)?;
+                if let Some(event @ HistoryEventData::WorkflowContinuedAsNew { .. }) =
+                    terminal_event.clone()
+                {
+                    continue_run_as_new(&tx, &claim.run_id, event)?;
+                    tx.commit().map_err(sqlite_error)?;
+                    return Ok(CommitOutcome::Committed {
+                        new_tail_event_id: next_event_id,
+                    });
+                }
                 if let Some(event) = terminal_event {
                     handle_terminal_run(&tx, &claim.run_id, &event)?;
                 }
@@ -1640,6 +1649,57 @@ fn handle_terminal_run(
     Ok(())
 }
 
+fn continue_run_as_new(
+    tx: &Transaction<'_>,
+    old_run_id: &RunId,
+    event: HistoryEventData,
+) -> Result<()> {
+    let HistoryEventData::WorkflowContinuedAsNew { input } = event else {
+        return Ok(());
+    };
+    let Some((workflow_name, workflow_version)) = tx
+        .query_row(
+            "select workflow_name, workflow_version
+             from workflow_instances
+             where run_id = ?1",
+            params![old_run_id.0],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Err(Error::RunNotFound(old_run_id.clone()));
+    };
+    let workflow_type = WorkflowType::new(workflow_name, workflow_version);
+    let new_run_id = RunId::new(format!("run-{}", next_counter(tx, "run")?));
+    insert_history_event(
+        tx,
+        &new_run_id,
+        EventId(1),
+        HistoryEventData::WorkflowStarted {
+            workflow_type,
+            input,
+        },
+    )?;
+    tx.execute(
+        "update workflow_instances
+         set run_id = ?1,
+             current_event_id = 1,
+             ready_reason = ?2,
+             ready_at_ms = 0,
+             workflow_claim_token = null,
+             terminal = 0
+         where run_id = ?3",
+        params![
+            new_run_id.0,
+            reason_to_str(&WorkflowTaskReason::WorkflowStarted),
+            old_run_id.0
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 fn notify_parent_of_child_terminal(
     tx: &Transaction<'_>,
     child_run_id: &RunId,
@@ -2794,6 +2854,7 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::WorkflowCompleted => "workflow_completed",
         HistoryEventType::WorkflowFailed => "workflow_failed",
         HistoryEventType::WorkflowCancelled => "workflow_cancelled",
+        HistoryEventType::WorkflowContinuedAsNew => "workflow_continued_as_new",
         HistoryEventType::WorkflowTaskStarted => "workflow_task_started",
         HistoryEventType::ActivityScheduled => "activity_scheduled",
         HistoryEventType::ActivityMapScheduled => "activity_map_scheduled",
@@ -2822,6 +2883,7 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "workflow_completed" => Ok(HistoryEventType::WorkflowCompleted),
         "workflow_failed" => Ok(HistoryEventType::WorkflowFailed),
         "workflow_cancelled" => Ok(HistoryEventType::WorkflowCancelled),
+        "workflow_continued_as_new" => Ok(HistoryEventType::WorkflowContinuedAsNew),
         "workflow_task_started" => Ok(HistoryEventType::WorkflowTaskStarted),
         "activity_scheduled" => Ok(HistoryEventType::ActivityScheduled),
         "activity_map_scheduled" => Ok(HistoryEventType::ActivityMapScheduled),

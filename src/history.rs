@@ -208,6 +208,9 @@ pub enum HistoryEventData {
     WorkflowCancelled {
         reason: String,
     },
+    WorkflowContinuedAsNew {
+        input: PayloadRef,
+    },
     WorkflowTaskStarted,
     ActivityScheduled(ActivityScheduled),
     ActivityMapScheduled(ActivityMapScheduled),
@@ -242,6 +245,7 @@ pub enum HistoryEventType {
     WorkflowCompleted,
     WorkflowFailed,
     WorkflowCancelled,
+    WorkflowContinuedAsNew,
     WorkflowTaskStarted,
     ActivityScheduled,
     ActivityMapScheduled,
@@ -270,6 +274,7 @@ impl HistoryEventData {
             Self::WorkflowCompleted { .. } => HistoryEventType::WorkflowCompleted,
             Self::WorkflowFailed { .. } => HistoryEventType::WorkflowFailed,
             Self::WorkflowCancelled { .. } => HistoryEventType::WorkflowCancelled,
+            Self::WorkflowContinuedAsNew { .. } => HistoryEventType::WorkflowContinuedAsNew,
             Self::WorkflowTaskStarted => HistoryEventType::WorkflowTaskStarted,
             Self::ActivityScheduled(_) => HistoryEventType::ActivityScheduled,
             Self::ActivityMapScheduled(_) => HistoryEventType::ActivityMapScheduled,

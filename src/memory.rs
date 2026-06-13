@@ -464,7 +464,11 @@ impl DurableBackend for MemoryBackend {
         if next_event_id.1 {
             cleanup_run_operational_state(&mut state, &claim.run_id);
             if let Some(event) = terminal_event {
-                handle_terminal_run(&mut state, &claim.run_id, &event);
+                if matches!(event, HistoryEventData::WorkflowContinuedAsNew { .. }) {
+                    continue_run_as_new(&mut state, &claim.run_id, event);
+                } else {
+                    handle_terminal_run(&mut state, &claim.run_id, &event);
+                }
             }
         }
         let signal_wait_ready = state.waits.values().any(|wait| {
@@ -1269,6 +1273,48 @@ fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> boo
 fn handle_terminal_run(state: &mut MemoryState, run_id: &RunId, terminal_event: &HistoryEventData) {
     notify_parent_of_child_terminal(state, run_id, terminal_event);
     cancel_children_for_parent(state, run_id);
+}
+
+fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: HistoryEventData) {
+    let HistoryEventData::WorkflowContinuedAsNew { input } = event else {
+        return;
+    };
+    let Some(old_run) = state.runs.get(old_run_id) else {
+        return;
+    };
+    let namespace = old_run.namespace.clone();
+    let workflow_id = old_run.workflow_id.clone();
+    let workflow_type = old_run.workflow_type.clone();
+    let task_queue = old_run.task_queue.clone();
+    let parent = old_run.parent.clone();
+    state.next_run_id += 1;
+    let new_run_id = RunId::new(format!("run-{}", state.next_run_id));
+    let start = HistoryEvent {
+        event_id: EventId(1),
+        event_type: crate::HistoryEventType::WorkflowStarted,
+        data: HistoryEventData::WorkflowStarted {
+            workflow_type: workflow_type.clone(),
+            input,
+        },
+    };
+    state
+        .workflow_ids
+        .insert((namespace.clone(), workflow_id.clone()), new_run_id.clone());
+    state.runs.insert(
+        new_run_id,
+        RunRecord {
+            namespace,
+            workflow_id,
+            workflow_type,
+            task_queue,
+            history: vec![start],
+            ready: Some(WorkflowTaskReason::WorkflowStarted),
+            ready_at: None,
+            workflow_claim: None,
+            terminal: false,
+            parent,
+        },
+    );
 }
 
 fn notify_parent_of_child_terminal(
