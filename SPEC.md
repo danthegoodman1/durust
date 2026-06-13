@@ -2304,6 +2304,7 @@ Support:
 ```rust
 durust::select! { ... }
 durust::join!(...)
+durust::join_all(branches)
 durust::select_all(branches)
 ```
 
@@ -2321,6 +2322,25 @@ let (a, b) = durust::join!(
 Plain Rust futures are lazy, so creating variables and then awaiting them one by one must not be treated as concurrent durable launch. If code awaits `task_a` before `task_b` has been registered, then the operations are sequential. For bounded concurrent launch, use `durust::join!` so the runtime registers every branch in deterministic lexical order before waiting for completions.
 
 `join!` should work over the same durable future families as `select!`: activities, signals, timers, child starts, child results, and deterministic workflow-local spawned futures.
+
+Use `join_all` for bounded dynamic collect-all fanout when the branch count is
+known at runtime:
+
+```rust
+let mut branches = Vec::new();
+for item in items {
+    let handle = durust::call_activity!(work_item(item)).spawn().await?;
+    branches.push(handle.result());
+}
+
+let outputs = durust::join_all(branches).await?;
+```
+
+`join_all` polls and registers branches in deterministic collection order and
+returns outputs in that same order, regardless of completion order. It records no
+extra replay fact; each branch's own command fingerprint and terminal event are
+the replay contract. Plain Rust futures must not be accepted. Empty input
+returns an empty `Vec`.
 
 Use explicit spawned activity handles when users need to launch work now and collect later:
 

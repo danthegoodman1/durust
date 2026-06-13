@@ -861,6 +861,7 @@ impl<'ast> Visit<'ast> for AwaitLint {
             || base.contains("durust :: sleep_until")
             || base.contains("durust :: signal")
             || base.contains("durust :: select_all")
+            || base.contains("durust :: join_all")
             || base.contains("durust :: join");
         if !allowed {
             self.err = Some(syn::Error::new_spanned(

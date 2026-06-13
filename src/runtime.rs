@@ -641,6 +641,97 @@ impl<T> DurableSelectBranch for BoxSelectBranch<T> {
     }
 }
 
+impl<T> DurableJoinBranch for BoxSelectBranch<T> {}
+
+pub fn join_all<I, B, T>(branches: I) -> JoinAllFuture<B, T>
+where
+    I: IntoIterator<Item = B>,
+    B: DurableJoinBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    let branches = branches.into_iter().map(Some).collect::<Vec<Option<B>>>();
+    let mut outputs = Vec::with_capacity(branches.len());
+    outputs.resize_with(branches.len(), || None);
+    JoinAllFuture {
+        branches,
+        outputs,
+        done: false,
+    }
+}
+
+pub struct JoinAllFuture<B, T>
+where
+    B: DurableJoinBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    branches: Vec<Option<B>>,
+    outputs: Vec<Option<T>>,
+    done: bool,
+}
+
+impl<B, T> Unpin for JoinAllFuture<B, T>
+where
+    B: DurableJoinBranch<Output = Result<T>>,
+    T: Unpin,
+{
+}
+
+impl<B, T> Future for JoinAllFuture<B, T>
+where
+    B: DurableJoinBranch<Output = Result<T>>,
+    T: Unpin,
+{
+    type Output = Result<Vec<T>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.done {
+            return Poll::Ready(Err(Error::Nondeterminism(
+                "join_all future polled after completion".to_owned(),
+            )));
+        }
+        if self.branches.is_empty() {
+            self.done = true;
+            return Poll::Ready(Ok(Vec::new()));
+        }
+
+        let mut made_progress = false;
+        for index in 0..self.branches.len() {
+            if self.outputs[index].is_some() {
+                continue;
+            }
+            let Some(branch) = self.branches[index].as_mut() else {
+                continue;
+            };
+            match Pin::new(branch).poll(cx) {
+                Poll::Ready(Ok(value)) => {
+                    self.outputs[index] = Some(value);
+                    self.branches[index] = None;
+                    made_progress = true;
+                }
+                Poll::Ready(Err(err)) => {
+                    self.done = true;
+                    return Poll::Ready(Err(err));
+                }
+                Poll::Pending => {}
+            }
+        }
+
+        if self.outputs.iter().all(Option::is_some) {
+            self.done = true;
+            let outputs = self
+                .outputs
+                .iter_mut()
+                .map(|output| output.take().expect("join_all output missing"))
+                .collect();
+            return Poll::Ready(Ok(outputs));
+        }
+        if made_progress {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectAllWinner<T> {
     pub branch_index: usize,

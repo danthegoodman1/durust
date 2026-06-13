@@ -52,6 +52,8 @@ Implemented and covered:
 - Variadic `durust::select!` and `durust::join!` procedural macros.
 - `ActivityFuture::spawn().await?` handles for launching activities before
   awaiting their result.
+- `durust::join_all(...)` for bounded dynamic collect-all fanout over durable
+  join branches with vector-order result collection.
 - `durust::select_all(...)` for bounded dynamic races over activity handles,
   child results, timers, signals, and other durable select branches mapped to a
   common output type.
@@ -67,10 +69,10 @@ Implemented and covered:
   cleanup.
 - Durable branch trait gating so `join!` rejects plain Rust futures at compile
   time.
-- Runnable `select_approval`, `join_activities`, and
+- Runnable `select_approval`, `join_activities`, `activity_spawn_join_all`, and
   `activity_spawn_select_all` examples with assertions.
 - Criterion benchmarks for select registration, select replay, bounded join
-  fanout, and dynamic `select_all` races.
+  fanout, dynamic `join_all` fanout, and dynamic `select_all` races.
 
 Remaining before this phase is done:
 

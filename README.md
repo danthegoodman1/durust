@@ -72,6 +72,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
   - [Signals, Timers, And Select](#signals-timers-and-select)
   - [Workflow Time](#workflow-time)
   - [Bounded Fanout With Join](#bounded-fanout-with-join)
+  - [Dynamic Fanout With Join All](#dynamic-fanout-with-join-all)
   - [Dynamic Races With Select All](#dynamic-races-with-select-all)
   - [Child Workflow: Spawn And Wait](#child-workflow-spawn-and-wait)
   - [Child Workflow: Spawn And Abandon](#child-workflow-spawn-and-abandon)
@@ -315,6 +316,28 @@ let (quote, inventory) = durust::join!(
 
 Plain Rust futures are lazy. Creating variables and awaiting them one by one is
 not a concurrent durable launch. Use `join!` for bounded fanout.
+
+### Dynamic Fanout With Join All
+
+Use `join_all` when the workflow learns a bounded set of durable operations at
+runtime and needs every result.
+
+```rust
+let mut branches = Vec::new();
+for item in items {
+    let handle = durust::call_activity!(work_item(item))
+        .task_queue("workers")
+        .spawn()
+        .await?;
+    branches.push(handle.result());
+}
+
+let outputs = durust::join_all(branches).await?;
+```
+
+`join_all` registers and polls branches in vector order and returns results in
+that same order, even if completions arrive out of order. It is still a bounded
+workflow-level primitive; use `activity_map` for very large collect-all fanout.
 
 ### Dynamic Races With Select All
 
@@ -591,6 +614,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`timer_wait.rs`](examples/timer_wait.rs)
 - [`select_approval.rs`](examples/select_approval.rs)
 - [`join_activities.rs`](examples/join_activities.rs)
+- [`activity_spawn_join_all.rs`](examples/activity_spawn_join_all.rs)
 - [`activity_spawn_select_all.rs`](examples/activity_spawn_select_all.rs)
 - [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)

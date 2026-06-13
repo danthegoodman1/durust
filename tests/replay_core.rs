@@ -193,6 +193,45 @@ async fn select_all_mixed_branches_workflow(input: u64) -> durust::Result<String
     Ok(format!("{}:{}", winner.branch_index, winner.value))
 }
 
+#[durust::workflow(name = "tests.join-all-activity-handles", version = 1)]
+async fn join_all_activity_handles_workflow(input: u64) -> durust::Result<String> {
+    let mut branches = Vec::new();
+    for offset in 0..3_u64 {
+        let handle = durust::call_activity!(double(NumberInput {
+            value: input + offset,
+        }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+        branches.push(handle.result());
+    }
+    let results = durust::join_all(branches).await?;
+    Ok(results
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+#[durust::workflow(name = "tests.join-all-mixed-branches", version = 1)]
+async fn join_all_mixed_branches_workflow(input: u64) -> durust::Result<String> {
+    let activity = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    let branches: Vec<BoxSelectBranch<String>> = vec![
+        activity
+            .result()
+            .map_ok(|value| format!("activity:{value}"))
+            .boxed(),
+        durust::sleep(Duration::ZERO)
+            .map_ok(|_| "timer".to_owned())
+            .boxed(),
+    ];
+    let results = durust::join_all(branches).await?;
+    Ok(results.join("|"))
+}
+
 #[durust::workflow(name = "tests.join-two-activities", version = 1)]
 async fn join_two_activities(input: u64) -> durust::Result<u64> {
     let (left, right) = durust::join!(
@@ -966,6 +1005,165 @@ fn select_all_can_mix_activity_child_and_timer_branches() {
             .await
             .unwrap();
         assert!(remaining_activity.is_none());
+    });
+}
+
+#[test]
+fn join_all_collects_spawned_activity_results_in_input_order_after_crash() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_all_activity_handles_workflow>(
+                "wf/join-all-activity-handles",
+                "workflows",
+                10,
+            )
+            .await
+            .unwrap();
+        let mut scheduling_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(join_all_activity_handles_workflow)
+            .build();
+
+        assert!(scheduling_worker.run_workflow_once().await.unwrap());
+        let activity_opts = ClaimActivityOptions {
+            namespace: Namespace::default(),
+            task_queue: TaskQueue::new("activities"),
+            registered_activity_names: vec![ActivityName::new("tests.double")],
+            lease_duration: Duration::from_secs(30),
+        };
+        let first = backend
+            .claim_activity_task(WorkerId::new("join-all-worker-1"), activity_opts.clone())
+            .await
+            .unwrap()
+            .expect("first join_all activity");
+        let second = backend
+            .claim_activity_task(WorkerId::new("join-all-worker-2"), activity_opts.clone())
+            .await
+            .unwrap()
+            .expect("second join_all activity");
+        let third = backend
+            .claim_activity_task(WorkerId::new("join-all-worker-3"), activity_opts)
+            .await
+            .unwrap()
+            .expect("third join_all activity");
+
+        for (claim, result) in [
+            (third.claim, 24_u64),
+            (first.claim, 20_u64),
+            (second.claim, 22_u64),
+        ] {
+            backend
+                .complete_activity(CompleteActivityRequest {
+                    claim,
+                    result: durust::encode_payload(&result).unwrap(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(scheduling_worker);
+
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(join_all_activity_handles_workflow)
+            .build();
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::ActivityScheduled(_)))
+                .count(),
+            3
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+                .count(),
+            3
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::SelectWinner(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "20,22,24"
+        );
+    });
+}
+
+#[test]
+fn join_all_can_collect_boxed_mixed_durable_branches() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_all_mixed_branches_workflow>(
+                "wf/join-all-mixed-branches",
+                "workflows",
+                9,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(join_all_mixed_branches_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("join-all-mixed-activity"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("mixed join_all activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim,
+                result: durust::encode_payload(&18_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::TimerFired(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "activity:18|timer"
+        );
     });
 }
 
