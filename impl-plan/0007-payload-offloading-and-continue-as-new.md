@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Payload offloading and continue-as-new
-status: not_started
+status: in_progress
 depends_on: [0001, 0002]
 labels: [payloads, blob-storage, continue-as-new, examples]
 ---
@@ -58,13 +58,30 @@ Implemented and covered:
   the parent is woken by the final continued child completion, not the
   intermediate continuation.
 - Runnable `continue_as_new` example with assertions.
+- `PayloadStorageConfig` with a default MessagePack codec and 8 KiB inline
+  threshold.
+- Explicit JSON payload encode/decode helpers for debug/export paths.
+- Provider-owned inline/blob threshold enforcement for `MemoryBackend` and
+  `SqliteBackend`.
+- SQLite `payload_blobs` storage that persists compact `PayloadRef::Blob`
+  references across close/reopen.
+- Digest and size validation for provider-owned blob refs, plus missing blob
+  rejection.
+- Public API hydration coverage for large workflow input, activity input,
+  activity result, signal, and query projection payloads through memory and
+  SQLite providers.
 
 Remaining before this phase is done:
 
-- Provider-owned payload storage configuration and JSON codec selection.
-- Inline/blob threshold enforcement.
-- SQLite blob offload integration, S3-compatible/Garage fixture, digest
-  validation, missing blob detection, transient upload failure behavior, and GC.
+- Provider-configured codec selection for typed workflow/activity APIs. The
+  current runtime still encodes typed values with MessagePack before providers
+  see them.
+- SQLite S3-compatible/Garage blob-store integration, transient upload failure
+  behavior, and orphan blob GC.
+- Lazy nested payload hydration during replay. Current public reads hydrate
+  returned payload refs before handing them to runtime code.
+- Full blob-path coverage for child workflows, activity map manifests/results,
+  side effects, and recursive manifest page payload refs.
 - Public payload-offload example.
 - Payload codec/offload benchmarks.
 

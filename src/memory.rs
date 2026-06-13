@@ -5,28 +5,50 @@ use crate::{
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy,
-    ReadSignalInboxRequest, Result, RunId, SignalId, SignalInboxRecord, SignalWorkflowOutcome,
-    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitId, WaitKind, WaitRecord,
-    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
-    encode_activity_map_result_manifest, event_payload_len, is_terminal,
+    HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy, PayloadBlob,
+    PayloadRef, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalId,
+    SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
+    WaitId, WaitKind, WaitRecord, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
+    digest_bytes, encode_activity_map_result_manifest, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MemoryBackend {
     state: Arc<Mutex<MemoryState>>,
+    payload_config: PayloadStorageConfig,
+}
+
+impl Default for MemoryBackend {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryState::default())),
+            payload_config: PayloadStorageConfig::default(),
+        }
+    }
 }
 
 impl MemoryBackend {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_payload_storage(payload_config: PayloadStorageConfig) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MemoryState::default())),
+            payload_config,
+        }
+    }
+
+    pub fn payload_blob_count(&self) -> usize {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        state.payload_blobs.len()
     }
 
     pub fn advance_time(&self, duration: std::time::Duration) {
@@ -55,6 +77,7 @@ struct MemoryState {
     signals: BTreeMap<SignalId, SignalRecord>,
     query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
     workflow_change_versions: BTreeMap<(RunId, String), WorkflowChangeVersionRecord>,
+    payload_blobs: BTreeMap<String, PayloadBlob>,
 }
 
 struct RunRecord {
@@ -128,6 +151,11 @@ impl DurableBackend for MemoryBackend {
             return Box::pin(ready(Ok(StartWorkflowOutcome::AlreadyStarted { run_id })));
         }
 
+        let input = match normalize_payload_for_storage(&mut state, &self.payload_config, req.input)
+        {
+            Ok(input) => input,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
         state.next_run_id += 1;
         let run_id = RunId::new(format!("run-{}", state.next_run_id));
         let start = HistoryEvent {
@@ -135,7 +163,7 @@ impl DurableBackend for MemoryBackend {
             event_type: crate::HistoryEventType::WorkflowStarted,
             data: HistoryEventData::WorkflowStarted {
                 workflow_type: req.workflow_type.clone(),
-                input: req.input,
+                input,
             },
         };
         state.workflow_ids.insert(
@@ -295,7 +323,12 @@ impl DurableBackend for MemoryBackend {
                 break;
             }
             bytes += event_bytes;
-            events.push(event.clone());
+            let mut event = event.clone();
+            event.data = match hydrate_history_event_from_storage(&state, event.data) {
+                Ok(data) => data,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            events.push(event);
             if events.len() >= max_events {
                 break;
             }
@@ -323,28 +356,7 @@ impl DurableBackend for MemoryBackend {
         batch: WorkflowTaskCommit,
     ) -> BoxFuture<'static, Result<CommitOutcome>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
-        let scheduled = batch.schedule_activities;
-        let scheduled_maps = batch.schedule_activity_maps;
-        let mut decoded_maps = Vec::with_capacity(scheduled_maps.len());
-        for map_task in scheduled_maps {
-            let manifest: ActivityMapInputManifest =
-                match crate::decode_payload(&map_task.input_manifest) {
-                    Ok(manifest) => manifest,
-                    Err(err) => return Box::pin(ready(Err(err))),
-                };
-            decoded_maps.push((map_task, manifest));
-        }
-        let upsert_waits = batch.upsert_waits;
-        let consume_signals = batch.consume_signals;
-        let delete_waits = batch.delete_waits;
-        let cancel_commands = batch.cancel_commands;
-        let start_child_workflows = batch.start_child_workflows;
-        let query_projection = batch.query_projection;
-        let mut terminal_event = None;
-        let mut projection_update = None;
-        let mut change_version_updates = Vec::new();
-        let now = state.now;
-        let next_event_id = {
+        {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
             };
@@ -365,10 +377,78 @@ impl DurableBackend for MemoryBackend {
             if run.terminal && !batch.append_events.is_empty() {
                 return Box::pin(ready(Err(Error::TerminalWorkflow)));
             }
+        }
+
+        let config = self.payload_config.clone();
+        let append_events =
+            match normalize_history_events_for_storage(&mut state, &config, batch.append_events) {
+                Ok(events) => events,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+        let scheduled = match normalize_activity_tasks_for_storage(
+            &mut state,
+            &config,
+            batch.schedule_activities,
+        ) {
+            Ok(tasks) => tasks,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
+        let mut decoded_maps = Vec::with_capacity(batch.schedule_activity_maps.len());
+        for map_task in batch.schedule_activity_maps {
+            let map_task =
+                match normalize_activity_map_task_for_storage(&mut state, &config, map_task) {
+                    Ok(map_task) => map_task,
+                    Err(err) => return Box::pin(ready(Err(err))),
+                };
+            let manifest_payload =
+                match hydrate_payload_from_storage(&state, map_task.input_manifest.clone()) {
+                    Ok(payload) => payload,
+                    Err(err) => return Box::pin(ready(Err(err))),
+                };
+            let manifest: ActivityMapInputManifest = match crate::decode_payload(&manifest_payload)
+            {
+                Ok(manifest) => manifest,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            decoded_maps.push((map_task, manifest));
+        }
+        let upsert_waits = batch.upsert_waits;
+        let consume_signals = batch.consume_signals;
+        let delete_waits = batch.delete_waits;
+        let cancel_commands = batch.cancel_commands;
+        let start_child_workflows = match normalize_child_start_messages_for_storage(
+            &mut state,
+            &config,
+            batch.start_child_workflows,
+        ) {
+            Ok(messages) => messages,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
+        let query_projection = match batch
+            .query_projection
+            .map(|payload| normalize_payload_for_storage(&mut state, &config, payload))
+            .transpose()
+        {
+            Ok(payload) => payload,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
+        let mut terminal_event = None;
+        let mut projection_update = None;
+        let mut change_version_updates = Vec::new();
+        let now = state.now;
+        let next_event_id = {
+            let Some(run) = state.runs.get_mut(&claim.run_id) else {
+                return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
+            };
+            let current_tail = run
+                .history
+                .last()
+                .map(|event| event.event_id)
+                .unwrap_or(EventId::ZERO);
 
             let mut next_event_id = current_tail;
             let mut terminal = false;
-            for new_event in batch.append_events {
+            for new_event in append_events {
                 next_event_id = next_event_id.next();
                 let data = new_event.data;
                 terminal |= is_terminal(&data);
@@ -433,7 +513,9 @@ impl DurableBackend for MemoryBackend {
                     completed: false,
                 },
             );
-            if let Err(err) = materialize_activity_map_items(&mut state, &map_task.map_command_id) {
+            if let Err(err) =
+                materialize_activity_map_items(&mut state, &config, &map_task.map_command_id)
+            {
                 return Box::pin(ready(Err(err)));
             }
         }
@@ -547,6 +629,11 @@ impl DurableBackend for MemoryBackend {
         if state.runs.get(&run_id).is_some_and(|run| run.terminal) {
             return Box::pin(ready(Err(Error::TerminalWorkflow)));
         }
+        let payload =
+            match normalize_payload_for_storage(&mut state, &self.payload_config, req.payload) {
+                Ok(payload) => payload,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
         state.next_signal_sequence += 1;
         let received_sequence = state.next_signal_sequence;
         state.signals.insert(
@@ -554,7 +641,7 @@ impl DurableBackend for MemoryBackend {
             SignalRecord {
                 run_id: run_id.clone(),
                 signal_name: req.signal_name.clone(),
-                payload: req.payload,
+                payload,
                 received_sequence,
                 consumed: false,
             },
@@ -587,12 +674,19 @@ impl DurableBackend for MemoryBackend {
                     && !signal.consumed
             })
             .min_by_key(|(_, signal)| signal.received_sequence)
-            .map(|(signal_id, signal)| SignalInboxRecord {
-                signal_id: signal_id.clone(),
-                signal_name: signal.signal_name.clone(),
-                payload: signal.payload.clone(),
-            });
-        Box::pin(ready(Ok(signal)))
+            .map(|(signal_id, signal)| {
+                let payload = hydrate_payload_from_storage(&state, signal.payload.clone())?;
+                Ok(SignalInboxRecord {
+                    signal_id: signal_id.clone(),
+                    signal_name: signal.signal_name.clone(),
+                    payload,
+                })
+            })
+            .transpose();
+        match signal {
+            Ok(signal) => Box::pin(ready(Ok(signal))),
+            Err(err) => Box::pin(ready(Err(err))),
+        }
     }
 
     fn fire_due_timers(
@@ -714,14 +808,21 @@ impl DurableBackend for MemoryBackend {
         state.next_claim_token += 1;
         let token = state.next_claim_token;
         let now = state.now;
-        let record = state
-            .activities
-            .get_mut(&activity_id)
-            .expect("activity id selected from activities map");
-        record.claim = Some(token);
-        record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
+        let task = {
+            let record = state
+                .activities
+                .get_mut(&activity_id)
+                .expect("activity id selected from activities map");
+            record.claim = Some(token);
+            record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
+            record.task.clone()
+        };
+        let task = match hydrate_activity_task_from_storage(&state, task) {
+            Ok(task) => task,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
         Box::pin(ready(Ok(Some(ClaimedActivityTask {
-            task: record.task.clone(),
+            task,
             claim: ActivityTaskClaim {
                 activity_id,
                 worker_id,
@@ -758,24 +859,32 @@ impl DurableBackend for MemoryBackend {
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, Result<CompleteActivityOutcome>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
-        let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )))));
+        let task = {
+            let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
+                return Box::pin(ready(Err(Error::Backend(format!(
+                    "activity `{}` not found",
+                    req.claim.activity_id.0
+                )))));
+            };
+            if record.completed {
+                return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
+            }
+            if record.claim != Some(req.claim.token) {
+                return Box::pin(ready(Err(Error::StaleLease)));
+            }
+            record.task.clone()
         };
-        if record.completed {
-            return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
+        let config = self.payload_config.clone();
+        let result = match normalize_payload_for_storage(&mut state, &config, req.result) {
+            Ok(result) => result,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
+        if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
+            record.completed = true;
         }
-        if record.claim != Some(req.claim.token) {
-            return Box::pin(ready(Err(Error::StaleLease)));
-        }
-
-        record.completed = true;
-        let task = record.task.clone();
         if let Some(map_item) = task.map_item.clone() {
             return Box::pin(ready(complete_map_item(
-                &mut state, task, map_item, req.result,
+                &mut state, &config, task, map_item, result,
             )));
         }
         let Some(run) = state.runs.get_mut(&task.run_id) else {
@@ -794,7 +903,7 @@ impl DurableBackend for MemoryBackend {
             event_type: crate::HistoryEventType::ActivityCompleted,
             data: HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
                 command_id: task.command_id,
-                result: req.result,
+                result,
             }),
         });
         run.ready = Some(WorkflowTaskReason::ActivityCompleted);
@@ -809,21 +918,28 @@ impl DurableBackend for MemoryBackend {
     ) -> BoxFuture<'static, Result<FailActivityOutcome>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
-        let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )))));
+        let task = {
+            let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
+                return Box::pin(ready(Err(Error::Backend(format!(
+                    "activity `{}` not found",
+                    req.claim.activity_id.0
+                )))));
+            };
+            if record.completed {
+                return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
+            }
+            if record.claim != Some(req.claim.token) {
+                return Box::pin(ready(Err(Error::StaleLease)));
+            }
+            record.task.clone()
         };
-        if record.completed {
-            return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
-        }
-        if record.claim != Some(req.claim.token) {
-            return Box::pin(ready(Err(Error::StaleLease)));
-        }
-
-        let task = record.task.clone();
         if should_retry_activity(&task) && !req.failure.non_retryable {
+            let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
+                return Box::pin(ready(Err(Error::Backend(format!(
+                    "activity `{}` not found",
+                    req.claim.activity_id.0
+                )))));
+            };
             record.task.attempt = record.task.attempt.saturating_add(1);
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
@@ -833,14 +949,16 @@ impl DurableBackend for MemoryBackend {
             })));
         }
 
-        record.completed = true;
+        let config = self.payload_config.clone();
+        let failure = match normalize_failure_for_storage(&mut state, &config, req.failure) {
+            Ok(failure) => failure,
+            Err(err) => return Box::pin(ready(Err(err))),
+        };
+        if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
+            record.completed = true;
+        }
         if let Some(map_item) = task.map_item.clone() {
-            return Box::pin(ready(fail_map_item(
-                &mut state,
-                task,
-                map_item,
-                req.failure,
-            )));
+            return Box::pin(ready(fail_map_item(&mut state, task, map_item, failure)));
         }
         let Some(run) = state.runs.get_mut(&task.run_id) else {
             return Box::pin(ready(Err(Error::RunNotFound(task.run_id))));
@@ -858,7 +976,7 @@ impl DurableBackend for MemoryBackend {
             event_type: crate::HistoryEventType::ActivityFailed,
             data: HistoryEventData::ActivityFailed(crate::ActivityFailed {
                 command_id: task.command_id,
-                failure: req.failure,
+                failure,
             }),
         });
         run.ready = Some(WorkflowTaskReason::ActivityFailed);
@@ -899,15 +1017,22 @@ impl DurableBackend for MemoryBackend {
         req: crate::QueryProjectionRequest,
     ) -> BoxFuture<'static, Result<crate::QueryProjectionOutcome>> {
         let state = self.state.lock().expect("memory backend mutex poisoned");
-        let outcome = state
+        let outcome = match state
             .query_projections
             .get(&(req.namespace, req.workflow_id))
-            .map(|projection| crate::QueryProjectionOutcome::Found {
-                run_id: projection.run_id.clone(),
-                event_id: projection.event_id,
-                payload: projection.payload.clone(),
-            })
-            .unwrap_or(crate::QueryProjectionOutcome::NotFound);
+        {
+            Some(projection) => {
+                match hydrate_payload_from_storage(&state, projection.payload.clone()) {
+                    Ok(payload) => crate::QueryProjectionOutcome::Found {
+                        run_id: projection.run_id.clone(),
+                        event_id: projection.event_id,
+                        payload,
+                    },
+                    Err(err) => return Box::pin(ready(Err(err))),
+                }
+            }
+            None => crate::QueryProjectionOutcome::NotFound,
+        };
         Box::pin(ready(Ok(outcome)))
     }
 
@@ -974,28 +1099,32 @@ impl DurableBackend for MemoryBackend {
 
 fn materialize_activity_map_items(
     state: &mut MemoryState,
+    config: &PayloadStorageConfig,
     map_command_id: &crate::CommandId,
 ) -> Result<()> {
-    let Some(map) = state.activity_maps.get_mut(map_command_id) else {
-        return Ok(());
-    };
-    if map.completed {
-        return Ok(());
-    }
-
-    while map.in_flight < map.task.max_in_flight
-        && (map.next_ordinal as usize) < map.input_manifest.item_count
+    let now = state.now;
+    let mut tasks = Vec::new();
     {
-        let item_ordinal = map.next_ordinal;
-        let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
-        let activity_id = ActivityId::map_item(map_command_id, item_ordinal);
-        let timeout_at = activity_timeout_at(state.now, map.task.start_to_close_timeout);
-        map.next_ordinal += 1;
-        map.in_flight += 1;
-        state.activities.insert(
-            activity_id.clone(),
-            ActivityRecord {
-                task: ActivityTask {
+        let Some(map) = state.activity_maps.get_mut(map_command_id) else {
+            return Ok(());
+        };
+        if map.completed {
+            return Ok(());
+        }
+
+        while map.in_flight < map.task.max_in_flight
+            && (map.next_ordinal as usize) < map.input_manifest.item_count
+        {
+            let item_ordinal = map.next_ordinal;
+            let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
+            let activity_id = ActivityId::map_item(map_command_id, item_ordinal);
+            let timeout_at = activity_timeout_at(now, map.task.start_to_close_timeout);
+            map.next_ordinal += 1;
+            map.in_flight += 1;
+            tasks.push((
+                activity_id.clone(),
+                timeout_at,
+                ActivityTask {
                     activity_id,
                     run_id: map_command_id.run_id.clone(),
                     command_id: map_command_id.clone(),
@@ -1011,6 +1140,16 @@ fn materialize_activity_map_items(
                         item_ordinal,
                     }),
                 },
+            ));
+        }
+    }
+
+    for (activity_id, timeout_at, task) in tasks {
+        let task = normalize_activity_task_for_storage(state, config, task)?;
+        state.activities.insert(
+            activity_id,
+            ActivityRecord {
+                task,
                 claim: None,
                 completed: false,
                 timeout_at,
@@ -1471,6 +1610,7 @@ fn child_outbox_id(command_id: &crate::CommandId) -> String {
 
 fn complete_map_item(
     state: &mut MemoryState,
+    config: &PayloadStorageConfig,
     task: ActivityTask,
     map_item: ActivityMapItem,
     result: crate::PayloadRef,
@@ -1519,10 +1659,11 @@ fn complete_map_item(
     }
 
     if completed_map.is_none() {
-        materialize_activity_map_items(state, &map_item.map_command_id)?;
+        materialize_activity_map_items(state, config, &map_item.map_command_id)?;
     }
 
     let event_id = if let Some((result_manifest, item_count)) = completed_map {
+        let result_manifest = normalize_payload_for_storage(state, config, result_manifest)?;
         let Some(run) = state.runs.get_mut(&task.run_id) else {
             return Err(Error::RunNotFound(task.run_id));
         };
@@ -1688,6 +1829,212 @@ fn activity_due_at(record: &ActivityRecord) -> Option<TimestampMs> {
         (None, Some(heartbeat_deadline_at)) => Some(heartbeat_deadline_at),
         (None, None) => None,
     }
+}
+
+fn normalize_history_events_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    events: Vec<crate::NewHistoryEvent>,
+) -> Result<Vec<crate::NewHistoryEvent>> {
+    events
+        .into_iter()
+        .map(|event| {
+            Ok(crate::NewHistoryEvent {
+                data: normalize_history_event_for_storage(state, config, event.data)?,
+            })
+        })
+        .collect()
+}
+
+fn normalize_history_event_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    data: HistoryEventData,
+) -> Result<HistoryEventData> {
+    crate::payload::map_history_event_payloads(data, &mut |payload| {
+        normalize_payload_for_storage(state, config, payload)
+    })
+}
+
+fn hydrate_history_event_from_storage(
+    state: &MemoryState,
+    data: HistoryEventData,
+) -> Result<HistoryEventData> {
+    crate::payload::map_history_event_payloads(data, &mut |payload| {
+        hydrate_payload_from_storage(state, payload)
+    })
+}
+
+fn normalize_activity_tasks_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    tasks: Vec<ActivityTask>,
+) -> Result<Vec<ActivityTask>> {
+    tasks
+        .into_iter()
+        .map(|task| normalize_activity_task_for_storage(state, config, task))
+        .collect()
+}
+
+fn normalize_activity_task_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    task: ActivityTask,
+) -> Result<ActivityTask> {
+    crate::payload::map_activity_task_payloads(task, &mut |payload| {
+        normalize_payload_for_storage(state, config, payload)
+    })
+}
+
+fn hydrate_activity_task_from_storage(
+    state: &MemoryState,
+    task: ActivityTask,
+) -> Result<ActivityTask> {
+    crate::payload::map_activity_task_payloads(task, &mut |payload| {
+        hydrate_payload_from_storage(state, payload)
+    })
+}
+
+fn normalize_activity_map_task_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    task: ActivityMapTask,
+) -> Result<ActivityMapTask> {
+    crate::payload::map_activity_map_task_payloads(task, &mut |payload| {
+        normalize_payload_for_storage(state, config, payload)
+    })
+}
+
+fn normalize_child_start_messages_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    messages: Vec<ChildStartOutboxMessage>,
+) -> Result<Vec<ChildStartOutboxMessage>> {
+    messages
+        .into_iter()
+        .map(|message| {
+            crate::payload::map_child_start_payloads(message, &mut |payload| {
+                normalize_payload_for_storage(state, config, payload)
+            })
+        })
+        .collect()
+}
+
+fn normalize_failure_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    failure: crate::DurableFailure,
+) -> Result<crate::DurableFailure> {
+    crate::payload::map_failure_payloads(failure, &mut |payload| {
+        normalize_payload_for_storage(state, config, payload)
+    })
+}
+
+fn normalize_payload_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    match payload {
+        PayloadRef::Inline {
+            codec,
+            schema_fingerprint,
+            compression,
+            encryption,
+            bytes,
+        } if bytes.len() > config.inline_threshold_bytes => {
+            let digest = digest_bytes(&bytes);
+            let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            state
+                .payload_blobs
+                .entry(digest.clone())
+                .or_insert_with(|| PayloadBlob {
+                    codec,
+                    schema_fingerprint: schema_fingerprint.clone(),
+                    compression,
+                    encryption: encryption.clone(),
+                    bytes: bytes.clone(),
+                });
+            Ok(PayloadRef::Blob {
+                codec,
+                schema_fingerprint,
+                compression,
+                encryption,
+                digest: digest.clone(),
+                size,
+                uri: format!("memory://payload/{digest}"),
+            })
+        }
+        payload @ PayloadRef::Inline { .. } => Ok(payload),
+        payload @ PayloadRef::Blob { .. } => {
+            verify_payload_blob(state, &payload)?;
+            Ok(payload)
+        }
+    }
+}
+
+fn hydrate_payload_from_storage(state: &MemoryState, payload: PayloadRef) -> Result<PayloadRef> {
+    match payload {
+        payload @ PayloadRef::Inline { .. } => Ok(payload),
+        payload @ PayloadRef::Blob { .. } => {
+            let PayloadRef::Blob {
+                codec,
+                schema_fingerprint,
+                compression,
+                encryption,
+                ..
+            } = &payload
+            else {
+                unreachable!();
+            };
+            let blob = verify_payload_blob(state, &payload)?;
+            Ok(PayloadRef::Inline {
+                codec: *codec,
+                schema_fingerprint: schema_fingerprint.clone(),
+                compression: *compression,
+                encryption: encryption.clone(),
+                bytes: blob.bytes.clone(),
+            })
+        }
+    }
+}
+
+fn verify_payload_blob<'a>(
+    state: &'a MemoryState,
+    payload: &PayloadRef,
+) -> Result<&'a PayloadBlob> {
+    let PayloadRef::Blob {
+        codec: _,
+        schema_fingerprint: _,
+        compression: _,
+        encryption: _,
+        digest,
+        size,
+        uri: _,
+    } = payload
+    else {
+        return Err(Error::PayloadDecode(
+            "inline payload does not reference blob storage".to_owned(),
+        ));
+    };
+    let Some(blob) = state.payload_blobs.get(digest) else {
+        return Err(Error::PayloadDecode(format!(
+            "missing payload blob `{digest}`"
+        )));
+    };
+    let actual_digest = digest_bytes(&blob.bytes);
+    if &actual_digest != digest {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob digest mismatch: expected `{digest}`, got `{actual_digest}`"
+        )));
+    }
+    let actual_size = u64::try_from(blob.bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != *size {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob size mismatch: expected {size}, got {actual_size}"
+        )));
+    }
+    Ok(blob)
 }
 
 fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {

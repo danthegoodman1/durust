@@ -568,6 +568,23 @@ Codec choices, inline thresholds, blob-store integrations, and provider test
 fixtures are provider implementation details. They are part of the durability
 contract, not the workflow API.
 
+In tests or local providers, force small inline thresholds to exercise the blob
+path:
+
+```rust
+let backend = durust::MemoryBackend::with_payload_storage(
+    durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+);
+
+let backend = durust::SqliteBackend::open_with_payload_storage(
+    "durust.sqlite3",
+    durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+)?;
+```
+
+The provider validates blob digests and hydrates payloads before returning them
+through workflow history, activity tasks, signals, and query projections.
+
 ## Recovery Model
 
 Recovery is streaming and bounded:

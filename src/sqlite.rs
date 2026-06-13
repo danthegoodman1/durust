@@ -6,14 +6,14 @@ use crate::{
     CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
     DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
     FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
-    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadRef, ReadSignalInboxRequest,
-    Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowType, activity_map_input_at, encode_activity_map_result_manifest,
-    event_payload_len, is_terminal,
+    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob, PayloadRef,
+    PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalInboxRecord,
+    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
+    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
+    encode_activity_map_result_manifest, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -23,16 +23,39 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug)]
 pub struct SqliteBackend {
     path: PathBuf,
+    payload_config: PayloadStorageConfig,
 }
 
 impl SqliteBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let backend = Self {
             path: path.as_ref().to_path_buf(),
+            payload_config: PayloadStorageConfig::default(),
         };
         let conn = backend.connect()?;
         init_schema(&conn)?;
         Ok(backend)
+    }
+
+    pub fn open_with_payload_storage(
+        path: impl AsRef<Path>,
+        payload_config: PayloadStorageConfig,
+    ) -> Result<Self> {
+        let backend = Self {
+            path: path.as_ref().to_path_buf(),
+            payload_config,
+        };
+        let conn = backend.connect()?;
+        init_schema(&conn)?;
+        Ok(backend)
+    }
+
+    pub fn payload_blob_count(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        conn.query_row("select count(*) from payload_blobs", [], |row| {
+            row.get::<_, usize>(0)
+        })
+        .map_err(sqlite_error)
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -63,10 +86,11 @@ impl DurableBackend for SqliteBackend {
                 });
             }
 
+            let input = normalize_payload_for_storage(&tx, &self.payload_config, req.input)?;
             let run_id = RunId::new(format!("run-{}", next_counter(&tx, "run")?));
             let start = HistoryEventData::WorkflowStarted {
                 workflow_type: req.workflow_type.clone(),
-                input: req.input,
+                input,
             };
             tx.execute(
                 "insert into workflow_instances
@@ -282,6 +306,7 @@ impl DurableBackend for SqliteBackend {
                 {
                     break;
                 }
+                let data = hydrate_history_event_from_storage(&conn, data)?;
                 bytes += event_bytes;
                 events.push(HistoryEvent {
                     event_id: EventId(event_id),
@@ -367,10 +392,30 @@ impl DurableBackend for SqliteBackend {
                 return Err(Error::TerminalWorkflow);
             }
 
+            let config = self.payload_config.clone();
+            let append_events =
+                normalize_history_events_for_storage(&tx, &config, batch.append_events)?;
+            let schedule_activities =
+                normalize_activity_tasks_for_storage(&tx, &config, batch.schedule_activities)?;
+            let schedule_activity_maps = batch
+                .schedule_activity_maps
+                .into_iter()
+                .map(|task| normalize_activity_map_task_for_storage(&tx, &config, task))
+                .collect::<Result<Vec<_>>>()?;
+            let start_child_workflows = batch
+                .start_child_workflows
+                .into_iter()
+                .map(|message| normalize_child_start_message_for_storage(&tx, &config, message))
+                .collect::<Result<Vec<_>>>()?;
+            let query_projection = batch
+                .query_projection
+                .map(|payload| normalize_payload_for_storage(&tx, &config, payload))
+                .transpose()?;
+
             let mut next_event_id = EventId(current_tail);
             let mut became_terminal = false;
             let mut terminal_event = None;
-            for event in batch.append_events {
+            for event in append_events {
                 next_event_id = next_event_id.next();
                 became_terminal |= is_terminal(&event.data);
                 if is_terminal(&event.data) {
@@ -378,7 +423,7 @@ impl DurableBackend for SqliteBackend {
                 }
                 insert_history_event(&tx, &claim.run_id, next_event_id, event.data)?;
             }
-            for task in batch.schedule_activities {
+            for task in schedule_activities {
                 let timeout_at_ms = activity_timeout_at_ms(task.start_to_close_timeout);
                 let task_blob = rmp_serde::to_vec_named(&task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
@@ -399,11 +444,11 @@ impl DurableBackend for SqliteBackend {
                 )
                 .map_err(sqlite_error)?;
             }
-            for map_task in batch.schedule_activity_maps {
+            for map_task in schedule_activity_maps {
                 insert_activity_map(&tx, namespace.as_str(), &map_task)?;
-                materialize_activity_map_items(&tx, &map_task.map_command_id)?;
+                materialize_activity_map_items(&tx, &config, &map_task.map_command_id)?;
             }
-            for message in batch.start_child_workflows {
+            for message in start_child_workflows {
                 insert_child_outbox(&tx, namespace.as_str(), &message)?;
             }
             for wait in batch.upsert_waits {
@@ -445,7 +490,7 @@ impl DurableBackend for SqliteBackend {
             for command_id in batch.cancel_commands {
                 cancel_command_operational_state(&tx, &command_id)?;
             }
-            if let Some(payload) = batch.query_projection {
+            if let Some(payload) = query_projection {
                 let payload_blob = rmp_serde::to_vec_named(&payload)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
                 tx.execute(
@@ -593,7 +638,9 @@ impl DurableBackend for SqliteBackend {
             }
 
             let received_sequence = next_counter(&tx, "signal")?;
-            let payload = rmp_serde::to_vec_named(&req.payload)
+            let payload_ref =
+                normalize_payload_for_storage(&tx, &self.payload_config, req.payload)?;
+            let payload = rmp_serde::to_vec_named(&payload_ref)
                 .map_err(|err| Error::PayloadEncode(err.to_string()))?;
             tx.execute(
                 "insert into signals
@@ -654,6 +701,7 @@ impl DurableBackend for SqliteBackend {
                 .map(|(signal_id, signal_name, payload)| {
                     let payload: PayloadRef = rmp_serde::from_slice(&payload)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+                    let payload = hydrate_payload_from_storage(&conn, payload)?;
                     Ok(SignalInboxRecord {
                         signal_id: crate::SignalId::new(signal_id),
                         signal_name: crate::SignalName::new(signal_name),
@@ -872,6 +920,7 @@ impl DurableBackend for SqliteBackend {
                 {
                     let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+                    let task = hydrate_activity_task_from_storage(&tx, task)?;
                     if let Some(map_item) = &task.map_item {
                         if activity_map_is_completed(&tx, &map_item.map_command_id)? {
                             tx.execute(
@@ -1011,12 +1060,14 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let result = normalize_payload_for_storage(&tx, &self.payload_config, req.result)?;
             if let Some(map_item) = task.map_item.clone() {
                 let outcome = complete_map_item(
                     &tx,
+                    &self.payload_config,
                     task,
                     map_item,
-                    req.result,
+                    result,
                     req.claim.activity_id.clone(),
                 )?;
                 tx.commit().map_err(sqlite_error)?;
@@ -1043,7 +1094,7 @@ impl DurableBackend for SqliteBackend {
                 event_id,
                 HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
                     command_id: task.command_id,
-                    result: req.result,
+                    result,
                 }),
             )?;
             tx.execute(
@@ -1131,14 +1182,10 @@ impl DurableBackend for SqliteBackend {
                     next_attempt: retry_task.attempt,
                 });
             }
+            let failure = normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?;
             if let Some(map_item) = task.map_item.clone() {
-                let outcome = fail_map_item(
-                    &tx,
-                    task,
-                    map_item,
-                    req.failure,
-                    req.claim.activity_id.clone(),
-                )?;
+                let outcome =
+                    fail_map_item(&tx, task, map_item, failure, req.claim.activity_id.clone())?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(outcome);
             }
@@ -1163,7 +1210,7 @@ impl DurableBackend for SqliteBackend {
                 event_id,
                 HistoryEventData::ActivityFailed(ActivityFailed {
                     command_id: task.command_id,
-                    failure: req.failure,
+                    failure,
                 }),
             )?;
             tx.execute(
@@ -1253,6 +1300,7 @@ impl DurableBackend for SqliteBackend {
             row.map(|(run_id, event_id, payload)| {
                 let payload: PayloadRef = rmp_serde::from_slice(&payload)
                     .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+                let payload = hydrate_payload_from_storage(&conn, payload)?;
                 Ok(crate::QueryProjectionOutcome::Found {
                     run_id: RunId::new(run_id),
                     event_id: EventId(event_id),
@@ -1361,6 +1409,281 @@ impl DurableBackend for SqliteBackend {
     }
 }
 
+fn normalize_history_events_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    events: Vec<crate::NewHistoryEvent>,
+) -> Result<Vec<crate::NewHistoryEvent>> {
+    events
+        .into_iter()
+        .map(|event| {
+            Ok(crate::NewHistoryEvent {
+                data: normalize_history_event_for_storage(conn, config, event.data)?,
+            })
+        })
+        .collect()
+}
+
+fn normalize_history_event_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    data: HistoryEventData,
+) -> Result<HistoryEventData> {
+    crate::payload::map_history_event_payloads(data, &mut |payload| {
+        normalize_payload_for_storage(conn, config, payload)
+    })
+}
+
+fn hydrate_history_event_from_storage(
+    conn: &Connection,
+    data: HistoryEventData,
+) -> Result<HistoryEventData> {
+    crate::payload::map_history_event_payloads(data, &mut |payload| {
+        hydrate_payload_from_storage(conn, payload)
+    })
+}
+
+fn normalize_activity_tasks_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    tasks: Vec<ActivityTask>,
+) -> Result<Vec<ActivityTask>> {
+    tasks
+        .into_iter()
+        .map(|task| normalize_activity_task_for_storage(conn, config, task))
+        .collect()
+}
+
+fn normalize_activity_task_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    task: ActivityTask,
+) -> Result<ActivityTask> {
+    crate::payload::map_activity_task_payloads(task, &mut |payload| {
+        normalize_payload_for_storage(conn, config, payload)
+    })
+}
+
+fn hydrate_activity_task_from_storage(
+    conn: &Connection,
+    task: ActivityTask,
+) -> Result<ActivityTask> {
+    crate::payload::map_activity_task_payloads(task, &mut |payload| {
+        hydrate_payload_from_storage(conn, payload)
+    })
+}
+
+fn normalize_activity_map_task_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    task: ActivityMapTask,
+) -> Result<ActivityMapTask> {
+    crate::payload::map_activity_map_task_payloads(task, &mut |payload| {
+        normalize_payload_for_storage(conn, config, payload)
+    })
+}
+
+fn normalize_child_start_message_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    message: ChildStartOutboxMessage,
+) -> Result<ChildStartOutboxMessage> {
+    crate::payload::map_child_start_payloads(message, &mut |payload| {
+        normalize_payload_for_storage(conn, config, payload)
+    })
+}
+
+fn normalize_failure_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    failure: crate::DurableFailure,
+) -> Result<crate::DurableFailure> {
+    crate::payload::map_failure_payloads(failure, &mut |payload| {
+        normalize_payload_for_storage(conn, config, payload)
+    })
+}
+
+fn normalize_payload_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    match payload {
+        PayloadRef::Inline {
+            codec,
+            schema_fingerprint,
+            compression,
+            encryption,
+            bytes,
+        } if bytes.len() > config.inline_threshold_bytes => {
+            let digest = digest_bytes(&bytes);
+            let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let encryption_blob = encode_encryption_metadata(&encryption)?;
+            conn.execute(
+                "insert or ignore into payload_blobs
+                 (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
+                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    digest.as_str(),
+                    codec_to_str(codec),
+                    schema_fingerprint.0.as_str(),
+                    compression_to_str(compression),
+                    encryption_blob,
+                    size,
+                    bytes.as_slice()
+                ],
+            )
+            .map_err(sqlite_error)?;
+            Ok(PayloadRef::Blob {
+                codec,
+                schema_fingerprint,
+                compression,
+                encryption,
+                digest: digest.clone(),
+                size,
+                uri: format!("sqlite://payload/{digest}"),
+            })
+        }
+        payload @ PayloadRef::Inline { .. } => Ok(payload),
+        payload @ PayloadRef::Blob { .. } => {
+            load_payload_blob(conn, &payload)?;
+            Ok(payload)
+        }
+    }
+}
+
+fn hydrate_payload_from_storage(conn: &Connection, payload: PayloadRef) -> Result<PayloadRef> {
+    match payload {
+        payload @ PayloadRef::Inline { .. } => Ok(payload),
+        payload @ PayloadRef::Blob { .. } => {
+            let PayloadRef::Blob {
+                codec,
+                schema_fingerprint,
+                compression,
+                encryption,
+                ..
+            } = &payload
+            else {
+                unreachable!();
+            };
+            let blob = load_payload_blob(conn, &payload)?;
+            Ok(PayloadRef::Inline {
+                codec: *codec,
+                schema_fingerprint: schema_fingerprint.clone(),
+                compression: *compression,
+                encryption: encryption.clone(),
+                bytes: blob.bytes,
+            })
+        }
+    }
+}
+
+fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadBlob> {
+    let PayloadRef::Blob {
+        digest,
+        size,
+        uri: _,
+        ..
+    } = payload
+    else {
+        return Err(Error::PayloadDecode(
+            "inline payload does not reference blob storage".to_owned(),
+        ));
+    };
+    let row = conn
+        .query_row(
+            "select codec, schema_fingerprint, compression, encryption, size, bytes
+             from payload_blobs
+             where digest = ?1",
+            params![digest.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .ok_or_else(|| Error::PayloadDecode(format!("missing payload blob `{digest}`")))?;
+    let (codec, schema_fingerprint, compression, encryption_blob, stored_size, bytes) = row;
+    let actual_digest = digest_bytes(&bytes);
+    if &actual_digest != digest {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob digest mismatch: expected `{digest}`, got `{actual_digest}`"
+        )));
+    }
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != *size || stored_size != *size {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob size mismatch: expected {size}, got {actual_size}"
+        )));
+    }
+    Ok(PayloadBlob {
+        codec: codec_from_str(&codec)?,
+        schema_fingerprint: crate::SchemaFingerprint(schema_fingerprint),
+        compression: compression_from_str(&compression)?,
+        encryption: decode_encryption_metadata(encryption_blob)?,
+        bytes,
+    })
+}
+
+fn encode_encryption_metadata(
+    encryption: &Option<crate::EncryptionMetadata>,
+) -> Result<Option<Vec<u8>>> {
+    encryption
+        .as_ref()
+        .map(|metadata| {
+            rmp_serde::to_vec_named(metadata).map_err(|err| Error::PayloadEncode(err.to_string()))
+        })
+        .transpose()
+}
+
+fn decode_encryption_metadata(blob: Option<Vec<u8>>) -> Result<Option<crate::EncryptionMetadata>> {
+    blob.map(|blob| {
+        rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
+    })
+    .transpose()
+}
+
+fn codec_to_str(codec: crate::CodecId) -> &'static str {
+    match codec {
+        crate::CodecId::MessagePack => "messagepack",
+        crate::CodecId::Json => "json",
+        crate::CodecId::Protobuf => "protobuf",
+    }
+}
+
+fn codec_from_str(value: &str) -> Result<crate::CodecId> {
+    match value {
+        "messagepack" => Ok(crate::CodecId::MessagePack),
+        "json" => Ok(crate::CodecId::Json),
+        "protobuf" => Ok(crate::CodecId::Protobuf),
+        other => Err(Error::PayloadDecode(format!(
+            "unknown payload codec `{other}`"
+        ))),
+    }
+}
+
+fn compression_to_str(compression: crate::CompressionId) -> &'static str {
+    match compression {
+        crate::CompressionId::None => "none",
+    }
+}
+
+fn compression_from_str(value: &str) -> Result<crate::CompressionId> {
+    match value {
+        "none" => Ok(crate::CompressionId::None),
+        other => Err(Error::PayloadDecode(format!(
+            "unknown payload compression `{other}`"
+        ))),
+    }
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -1393,6 +1716,16 @@ fn init_schema(conn: &Connection) -> Result<()> {
             event_type text not null,
             data blob not null,
             primary key(run_id, event_id)
+        );
+
+        create table if not exists payload_blobs (
+            digest text primary key,
+            codec text not null,
+            schema_fingerprint text not null,
+            compression text not null,
+            encryption blob,
+            size integer not null,
+            bytes blob not null
         );
 
         create table if not exists activity_tasks (
@@ -1905,7 +2238,8 @@ fn insert_activity_map(
     namespace: &str,
     map_task: &ActivityMapTask,
 ) -> Result<()> {
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&map_task.input_manifest)?;
+    let manifest_payload = hydrate_payload_from_storage(tx, map_task.input_manifest.clone())?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     let task_blob =
         rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
@@ -2211,7 +2545,11 @@ fn child_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bo
     Ok(false)
 }
 
-fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &CommandId) -> Result<()> {
+fn materialize_activity_map_items(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_command_id: &CommandId,
+) -> Result<()> {
     let key = map_command_key(map_command_id);
     let Some((namespace, task_blob, item_count, next_ordinal, in_flight, completed)) = tx
         .query_row(
@@ -2244,7 +2582,8 @@ fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &Command
     let mut next_ordinal = next_ordinal;
     let mut in_flight = in_flight;
     let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&task.input_manifest)?;
+    let manifest_payload = hydrate_payload_from_storage(tx, task.input_manifest.clone())?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
 
     while in_flight < max_in_flight && next_ordinal < item_count {
         let input = activity_map_input_at(&manifest, next_ordinal)?;
@@ -2265,6 +2604,7 @@ fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &Command
                 item_ordinal: next_ordinal,
             }),
         };
+        let item_task = normalize_activity_task_for_storage(tx, config, item_task)?;
         let item_blob = rmp_serde::to_vec_named(&item_task)
             .map_err(|err| Error::PayloadEncode(err.to_string()))?;
         tx.execute(
@@ -2299,6 +2639,7 @@ fn materialize_activity_map_items(tx: &Transaction<'_>, map_command_id: &Command
 
 fn complete_map_item(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     task: ActivityTask,
     map_item: ActivityMapItem,
     result: PayloadRef,
@@ -2371,7 +2712,7 @@ fn complete_map_item(
         .map_err(sqlite_error)?;
 
     if success_count < item_count {
-        materialize_activity_map_items(tx, &map_item.map_command_id)?;
+        materialize_activity_map_items(tx, config, &map_item.map_command_id)?;
         let tail = tx
             .query_row(
                 "select current_event_id from workflow_instances where run_id = ?1",
@@ -2386,7 +2727,8 @@ fn complete_map_item(
 
     let map_task: ActivityMapTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let input_manifest: ActivityMapInputManifest = crate::decode_payload(&map_task.input_manifest)?;
+    let input_manifest_payload = hydrate_payload_from_storage(tx, map_task.input_manifest.clone())?;
+    let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
     let result_refs = activity_map_results(tx, key.as_str())?;
     let result_manifest = encode_activity_map_result_manifest(
         map_task.result_manifest_name,
@@ -2410,6 +2752,7 @@ fn complete_map_item(
     let event_id = EventId(tail).next();
     let item_count_usize = usize::try_from(item_count).unwrap_or(usize::MAX);
     let success_count_usize = usize::try_from(success_count).unwrap_or(usize::MAX);
+    let result_manifest = normalize_payload_for_storage(tx, config, result_manifest)?;
     insert_history_event(
         tx,
         &task.run_id,

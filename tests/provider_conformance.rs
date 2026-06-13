@@ -111,6 +111,64 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
 }
 
 #[test]
+fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/memory-payload-offload",
+            "memory-payload-workflows",
+            "memory-payload-activities",
+        )
+        .await;
+        assert!(backend.payload_blob_count() >= 4);
+    });
+}
+
+#[test]
+fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload-offload.sqlite3");
+        let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let run_id = payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/sqlite-payload-offload",
+            "sqlite-payload-workflows",
+            "sqlite-payload-activities",
+        )
+        .await;
+        let blob_count = backend.payload_blob_count().unwrap();
+        assert!(blob_count >= 4);
+        drop(backend);
+
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        assert_eq!(reopened.payload_blob_count().unwrap(), blob_count);
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(100),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+    });
+}
+
+#[test]
 fn registry_rejects_duplicate_handler_identities() {
     let mut registry = Registry::default();
     registry.register_workflow::<workflow>().unwrap();
@@ -234,6 +292,7 @@ where
     released_workflow_task_is_claimable_again(backend.clone()).await;
     delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
+    missing_provider_blob_ref_is_rejected(backend.clone()).await;
     workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
     continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
@@ -255,6 +314,217 @@ where
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
     stale_workflow_task_commit_conflicts(backend.clone()).await;
     activity_claim_filters_and_stale_completion_is_rejected(backend).await;
+}
+
+async fn payload_offload_public_api_round_trip<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+) -> durust::RunId
+where
+    B: DurableBackend,
+{
+    let workflow_input = large_payload("workflow-input");
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(workflow_queue),
+            input: durust::encode_payload(&workflow_input).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+
+    let start_history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &start_history[0].data else {
+        panic!("expected workflow start");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(input).unwrap(),
+        workflow_input
+    );
+    assert!(matches!(input, durust::PayloadRef::Inline { .. }));
+
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("payload-offload-workflow"), claim_opts)
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let activity_input = large_payload("activity-input");
+    let activity_payload = durust::encode_payload(&activity_input).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(activity_queue),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: activity_payload.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&activity_payload),
+            "sha256:payload-offload-options".to_owned(),
+        ),
+    };
+    let projection = large_payload("projection");
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(durust::encode_payload(&projection).unwrap()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        }
+    );
+
+    let query = backend
+        .query_projection(durust::QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+        })
+        .await
+        .unwrap();
+    let durust::QueryProjectionOutcome::Found { payload, .. } = query else {
+        panic!("expected query projection");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(&payload).unwrap(),
+        projection
+    );
+    assert!(matches!(payload, durust::PayloadRef::Inline { .. }));
+
+    let activity = backend
+        .claim_activity_task(
+            WorkerId::new("payload-offload-activity"),
+            ClaimActivityOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new(activity_queue),
+                registered_activity_names: vec![ActivityName::new("conformance.echo")],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+    assert_eq!(
+        durust::decode_payload::<String>(&activity.task.input).unwrap(),
+        activity_input
+    );
+    assert!(matches!(
+        activity.task.input,
+        durust::PayloadRef::Inline { .. }
+    ));
+
+    let activity_result = large_payload("activity-result");
+    let completed = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: activity.claim,
+            result: durust::encode_payload(&activity_result).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        completed,
+        durust::CompleteActivityOutcome::Completed {
+            event_id: EventId(3)
+        }
+    );
+
+    let signal_payload = large_payload("signal");
+    let accepted = backend
+        .signal_workflow(durust::SignalWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            signal_id: durust::SignalId::new(format!("{workflow_id}/signal/1")),
+            signal_name: durust::SignalName::new("payload"),
+            payload: durust::encode_payload(&signal_payload).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+    let signal = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id: run_id.clone(),
+            signal_name: durust::SignalName::new("payload"),
+        })
+        .await
+        .unwrap()
+        .expect("signal payload");
+    assert_eq!(
+        durust::decode_payload::<String>(&signal.payload).unwrap(),
+        signal_payload
+    );
+    assert!(matches!(signal.payload, durust::PayloadRef::Inline { .. }));
+
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+        panic!("expected activity scheduled event");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(&scheduled.input).unwrap(),
+        activity_input
+    );
+    let HistoryEventData::ActivityCompleted(completed) = &history[2].data else {
+        panic!("expected activity completed event");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(&completed.result).unwrap(),
+        activity_result
+    );
+
+    run_id
+}
+
+fn large_payload(label: &str) -> String {
+    format!("{label}:{}", "x".repeat(64))
 }
 
 async fn workflow_claim_filters_by_queue_and_registered_type<B>(backend: B)
@@ -558,15 +828,7 @@ where
         .await
         .unwrap()
         .expect("workflow task after conflict");
-    let blob_payload = durust::PayloadRef::Blob {
-        codec: durust::CodecId::MessagePack,
-        schema_fingerprint: durust::SchemaFingerprint("sha256:blob".to_owned()),
-        compression: durust::CompressionId::None,
-        encryption: None,
-        digest: "sha256:projection".to_owned(),
-        size: 128,
-        uri: "memory://projection".to_owned(),
-    };
+    let projection_payload = durust::encode_payload(&"visible").unwrap();
     let committed = backend
         .commit_workflow_task(
             reclaimed.claim,
@@ -580,7 +842,7 @@ where
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
                 cancel_commands: Vec::new(),
-                query_projection: Some(blob_payload.clone()),
+                query_projection: Some(projection_payload.clone()),
             },
         )
         .await
@@ -596,8 +858,62 @@ where
         durust::QueryProjectionOutcome::Found {
             run_id: claimed.run_id,
             event_id: EventId(1),
-            payload: blob_payload,
+            payload: projection_payload,
         }
+    );
+}
+
+async fn missing_provider_blob_ref_is_rejected<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", 5)
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("missing-blob-worker"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("missing-blob-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let missing = durust::PayloadRef::Blob {
+        codec: durust::CodecId::MessagePack,
+        schema_fingerprint: durust::SchemaFingerprint("sha256:test".to_owned()),
+        compression: durust::CompressionId::None,
+        encryption: None,
+        digest: "sha256:missing".to_owned(),
+        size: 9,
+        uri: "durust://missing".to_owned(),
+    };
+    let err = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(missing),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::PayloadDecode(message) if message.contains("missing payload blob"))
     );
 }
 
