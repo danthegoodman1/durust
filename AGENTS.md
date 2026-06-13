@@ -24,7 +24,7 @@ If `README.md`, `SPEC.md`, `impl-plan/`, and implementation behavior disagree, u
 - Use durable APIs for workflow time, sleeps, select, activities, side effects, child workflows, and version markers.
 - Keep providers behind the `DurableBackend` contract. Do not let SQLite-specific behavior shape runtime semantics.
 - Treat append history as authoritative. Derived indexes, caches, ready queues, leases, query projections, and map item state must be rebuildable or reconcilable from durable facts where the spec requires it.
-- Write docs, plans, and comments as the chosen end-state. Do not use "V1", "temporary", "for now", "later", or similar phrasing to excuse incomplete design. If scope is intentionally deferred, put that scope boundary in `impl-plan/`, not in the design artifact.
+- Write docs, plans, and comments as the chosen end-state. Scope boundaries belong in `impl-plan/`; design artifacts describe the intended behavior directly.
 - Prefer the smallest production-quality implementation that satisfies the current phase and its tests.
 - Add abstraction only when deterministic tests, conformance gaps, benchmark evidence, or real duplication proves the need.
 - Treat performance as a gate after correctness, not as permission to complicate unproven code.

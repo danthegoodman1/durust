@@ -1,7 +1,7 @@
 ---
 id: 0001
 title: Replay core
-status: not_started
+status: completed
 depends_on: []
 labels: [runtime, replay, testing, provider-conformance, examples]
 ---

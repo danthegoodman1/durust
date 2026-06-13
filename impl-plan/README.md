@@ -18,6 +18,7 @@ affected plan file.
 6. [`0006-versioning.md`](0006-versioning.md)
 7. [`0007-payload-offloading-and-continue-as-new.md`](0007-payload-offloading-and-continue-as-new.md)
 8. [`0008-deterministic-simulation-hardening.md`](0008-deterministic-simulation-hardening.md)
+9. [`0009-sqlite-shard-files.md`](0009-sqlite-shard-files.md)
 
 ## Shared Gate
 

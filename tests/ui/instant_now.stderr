@@ -1,0 +1,5 @@
+error: nondeterministic workflow API detected; use durust::now instead
+ --> tests/ui/instant_now.rs:2:10
+  |
+2 | async fn bad(_: ()) -> durust::Result<()> {
+  |          ^^^

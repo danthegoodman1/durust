@@ -1,0 +1,5 @@
+error: nondeterministic workflow API detected; use durust::spawn or durust::join! instead
+ --> tests/ui/tokio_spawn.rs:2:10
+  |
+2 | async fn bad(_: ()) -> durust::Result<()> {
+  |          ^^^

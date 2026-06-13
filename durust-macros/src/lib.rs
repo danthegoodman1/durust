@@ -2,9 +2,10 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote, ToTokens};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::visit::Visit;
 use syn::{
-    parse_macro_input, Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, Meta, Pat,
-    PathArguments, ReturnType, Token, Type,
+    parse_macro_input, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn, Lit,
+    Meta, Pat, PathArguments, ReturnType, Token, Type,
 };
 
 struct MacroArgs {
@@ -27,6 +28,15 @@ pub fn workflow(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn activity(args: TokenStream, item: TokenStream) -> TokenStream {
     expand_handler(args, item, HandlerKind::Activity)
+}
+
+#[proc_macro]
+pub fn call_activity(input: TokenStream) -> TokenStream {
+    let call = parse_macro_input!(input as ExprCall);
+    match expand_call_activity(call) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
 }
 
 enum HandlerKind {
@@ -65,10 +75,15 @@ fn expand_handler_inner(
     let attrs = &item_fn.attrs;
     let ident = &item_fn.sig.ident;
     let impl_ident = format_ident!("__durust_impl_{}", ident);
+    let manifest_ident = format_ident!("__durust_manifest_{}", ident);
     let (input_binding, input) = extract_single_input(&item_fn)?;
     let output = extract_result_output(&item_fn)?;
-    let name = parsed.name.unwrap_or_else(|| ident.to_string());
-    let rust_path = quote!(concat!(env!("CARGO_PKG_NAME"), "::", module_path!(), "::", stringify!(#ident)));
+    let rust_path =
+        quote!(concat!(env!("CARGO_PKG_NAME"), "::", module_path!(), "::", stringify!(#ident)));
+    let name = match parsed.name {
+        Some(name) => quote!(#name),
+        None => rust_path.clone(),
+    };
     let block = &item_fn.block;
 
     let version_impl = match kind {
@@ -104,6 +119,54 @@ fn expand_handler_inner(
         },
     };
 
+    let manifest_export = match kind {
+        HandlerKind::Workflow => quote! {
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            fn #manifest_ident() -> ::durust::ManifestWorkflow {
+                ::durust::ManifestWorkflow {
+                    name: <#ident as ::durust::Workflow>::NAME.to_owned(),
+                    version: <#ident as ::durust::Workflow>::VERSION,
+                    rust_path: <#ident as ::durust::Workflow>::RUST_PATH.to_owned(),
+                    input_type: <#ident as ::durust::Workflow>::input_type_name().to_owned(),
+                    output_type: <#ident as ::durust::Workflow>::output_type_name().to_owned(),
+                    input_schema_hash: ::durust::type_name_fingerprint(
+                        <#ident as ::durust::Workflow>::input_type_name(),
+                    ),
+                    output_schema_hash: ::durust::type_name_fingerprint(
+                        <#ident as ::durust::Workflow>::output_type_name(),
+                    ),
+                }
+            }
+
+            ::durust::inventory::submit! {
+                ::durust::DurableExport::Workflow(#manifest_ident)
+            }
+        },
+        HandlerKind::Activity => quote! {
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            fn #manifest_ident() -> ::durust::ManifestActivity {
+                ::durust::ManifestActivity {
+                    name: <#ident as ::durust::Activity>::NAME.to_owned(),
+                    rust_path: <#ident as ::durust::Activity>::RUST_PATH.to_owned(),
+                    input_type: <#ident as ::durust::Activity>::input_type_name().to_owned(),
+                    output_type: <#ident as ::durust::Activity>::output_type_name().to_owned(),
+                    input_schema_hash: ::durust::type_name_fingerprint(
+                        <#ident as ::durust::Activity>::input_type_name(),
+                    ),
+                    output_schema_hash: ::durust::type_name_fingerprint(
+                        <#ident as ::durust::Activity>::output_type_name(),
+                    ),
+                }
+            }
+
+            ::durust::inventory::submit! {
+                ::durust::DurableExport::Activity(#manifest_ident)
+            }
+        },
+    };
+
     Ok(quote! {
         #[allow(non_camel_case_types)]
         #[derive(Clone, Copy, Debug, Default)]
@@ -120,11 +183,27 @@ fn expand_handler_inner(
             #run_fn
         }
 
+        #manifest_export
+
         #(#attrs)*
         async fn #impl_ident(input: #input) -> ::durust::Result<#output> {
             let #input_binding = input;
             #block
         }
+    })
+}
+
+fn expand_call_activity(call: ExprCall) -> syn::Result<proc_macro2::TokenStream> {
+    if call.args.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            call,
+            "durust::call_activity! expects exactly one activity input",
+        ));
+    }
+    let activity = call.func;
+    let input = call.args.first().expect("checked arg count");
+    Ok(quote! {
+        ::durust::activity_call::<#activity>(#input)
     })
 }
 
@@ -267,5 +346,37 @@ fn lint_workflow_body(item_fn: &ItemFn) -> syn::Result<()> {
         }
     }
 
+    let mut await_lint = AwaitLint::default();
+    await_lint.visit_block(&item_fn.block);
+    if let Some(err) = await_lint.err {
+        return Err(err);
+    }
+
     Ok(())
+}
+
+#[derive(Default)]
+struct AwaitLint {
+    err: Option<syn::Error>,
+}
+
+impl<'ast> Visit<'ast> for AwaitLint {
+    fn visit_expr_await(&mut self, node: &'ast ExprAwait) {
+        if self.err.is_some() {
+            return;
+        }
+
+        let base = node.base.to_token_stream().to_string();
+        let allowed =
+            base.contains("durust :: activity_call") || base.contains("durust :: call_activity");
+        if !allowed {
+            self.err = Some(syn::Error::new_spanned(
+                node,
+                "unknown await in workflow code; use durable APIs such as durust::call_activity!",
+            ));
+            return;
+        }
+
+        syn::visit::visit_expr_await(self, node);
+    }
 }

@@ -82,7 +82,7 @@ pub async fn order(input: OrderInput) -> durust::Result<OrderOutput> {
     let mut view = OrderView::new(&input);
     durust::publish(&view)?;
 
-    let quote = durust::activity!(price_quote(QuoteInput {
+    let quote = durust::call_activity!(price_quote(QuoteInput {
         sku: input.sku.clone(),
         qty: input.qty,
     }))
@@ -100,7 +100,7 @@ pub async fn order(input: OrderInput) -> durust::Result<OrderOutput> {
         }
     };
 
-    let payment = durust::activity!(charge_card(ChargeInput {
+    let payment = durust::call_activity!(charge_card(ChargeInput {
         order_id: input.order_id.clone(),
         amount: quote.total,
         approval_id: approval.id.clone(),
@@ -242,6 +242,13 @@ The manifest records every workflow and activity exported by the crate:
 }
 ```
 
+The `#[workflow]` and `#[activity]` macros submit linked handler metadata into
+Durust's manifest inventory. A binary or test harness that links the handlers can
+call `durust::exported_manifest()` to materialize the current metadata, then
+write it with `durust::write_manifest(...)`. This keeps metadata generation tied
+to compiled handler code while leaving manifest review and CI failure policy to
+the explicit cargo helper.
+
 CLI:
 
 ```text
@@ -300,9 +307,9 @@ The intended DX is ordinary Rust control flow around durable futures:
 
 ```rust
 if durust::patched("new-payment-flow")? {
-    durust::activity!(charge_v2(input)).await?;
+    durust::call_activity!(charge_v2(input)).await?;
 } else {
-    durust::activity!(charge_v1(input)).await?;
+    durust::call_activity!(charge_v1(input)).await?;
 }
 
 let outcome = durust::select! {
@@ -423,7 +430,7 @@ Example:
 let mut x = 0;
 
 for i in 0..10 {
-    x += durust::activity!(compute(i)).await?;
+    x += durust::call_activity!(compute(i)).await?;
 }
 ```
 
@@ -448,7 +455,7 @@ For the loop:
 let mut x = 0;
 
 for i in 0..10 {
-    x += durust::activity!(compute(i)).await?;
+    x += durust::call_activity!(compute(i)).await?;
 }
 ```
 
@@ -597,7 +604,7 @@ let handle = durust::Client::new(backend.clone())
 Activity calls choose an activity task queue, either from activity metadata or per-call override:
 
 ```rust
-let payment = durust::activity!(charge_card(input))
+let payment = durust::call_activity!(charge_card(input))
     .task_queue("payments")
     .await?;
 ```
@@ -872,6 +879,12 @@ If emitted command fingerprint != recorded command fingerprint:
     raise NondeterminismError
 ```
 
+When a workflow task raises nondeterminism, the worker must abort that task
+without appending `WorkflowFailed`. The worker releases the run with a
+worker-configured retry backoff so bad workflow code does not hot-loop. Providers
+must only enforce generic delayed workflow-task visibility; they do not classify
+nondeterminism or choose retry durations.
+
 This catches unsafe changes such as:
 
 ```text
@@ -889,7 +902,7 @@ Temporal’s docs call out adding, removing, or reordering command-producing awa
 For:
 
 ```rust
-let quote = durust::activity!(price_quote(input)).await?;
+let quote = durust::call_activity!(price_quote(input)).await?;
 ```
 
 The durable future behaves like this:
@@ -921,7 +934,7 @@ Live cached mode:
 Large fanout should not require one workflow command per activity or one in-memory `Vec` of inputs. Provide one manifest-based API for map-style fanout:
 
 ```rust
-let partitions = durust::activity!(partition_input(input.source_ref))
+let partitions = durust::call_activity!(partition_input(input.source_ref))
     .task_queue("storage")
     .await?;
 
@@ -933,7 +946,7 @@ let mapped = durust::activity_map(map_chunk)
     .spawn()
     .await?;
 
-let output = durust::activity!(reduce_manifest(mapped.result_manifest().await?))
+let output = durust::call_activity!(reduce_manifest(mapped.result_manifest().await?))
     .task_queue("reducers")
     .await?;
 ```
@@ -1629,7 +1642,7 @@ match v {
     }
 
     1 => {
-        // v1 path
+        // version 1 path
     }
 
     2 => {
@@ -1699,16 +1712,16 @@ durust::get_version("id", DEFAULT_VERSION, 1)? != DEFAULT_VERSION
 ### Stage 1: original code
 
 ```rust
-let result = durust::activity!(activity_a(input)).await?;
+let result = durust::call_activity!(activity_a(input)).await?;
 ```
 
 ### Stage 2: patch in new code
 
 ```rust
 if durust::patched("replace-a-with-b")? {
-    let result = durust::activity!(activity_b(input)).await?;
+    let result = durust::call_activity!(activity_b(input)).await?;
 } else {
-    let result = durust::activity!(activity_a(input)).await?;
+    let result = durust::call_activity!(activity_a(input)).await?;
 }
 ```
 
@@ -1721,13 +1734,13 @@ No old worker binary needs to stay online.
 ```rust
 durust::deprecate_patch("replace-a-with-b")?;
 
-let result = durust::activity!(activity_b(input)).await?;
+let result = durust::call_activity!(activity_b(input)).await?;
 ```
 
 ### Stage 4: after no histories with the patch marker remain relevant
 
 ```rust
-let result = durust::activity!(activity_b(input)).await?;
+let result = durust::call_activity!(activity_b(input)).await?;
 ```
 
 Temporal documents the same general patching lifecycle: introduce the patch branch, later deprecate it, and only remove the deprecation bridge after old executions are gone. ([Temporal Docs][2])
@@ -1795,7 +1808,7 @@ durust::select! { ... }
 durust::spawn(...)
 durust::now()
 durust::side_effect!(...)
-durust::activity!(...)
+durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
 
@@ -1826,7 +1839,7 @@ std::time::SystemTime   -> durust::now
 tokio::select!          -> durust::select!
 tokio::spawn            -> durust::spawn or durust::join!
 rand/uuid generation    -> durust::side_effect!
-direct network/db calls -> durust::activity!
+direct network/db calls -> durust::call_activity!
 ```
 
 The lint is intentionally a guardrail, not the correctness mechanism. It may miss nondeterminism hidden behind helper functions, aliases, trait dispatch, dependencies, or data-structure iteration that is not syntactically obvious. Correctness still depends on replay and command fingerprint checks detecting divergent durable command sequences.
@@ -2144,8 +2157,8 @@ Example:
 
 ```rust
 let (a, b) = durust::join!(
-    durust::activity!(task_a()),
-    durust::activity!(task_b()),
+    durust::call_activity!(task_a()),
+    durust::call_activity!(task_b()),
 ).await?;
 ```
 
@@ -2156,8 +2169,8 @@ Plain Rust futures are lazy, so creating variables and then awaiting them one by
 An explicit spawned-handle API may be added when users need to launch work now and collect later:
 
 ```rust
-let a = durust::activity!(task_a()).spawn().await?;
-let b = durust::activity!(task_b()).spawn().await?;
+let a = durust::call_activity!(task_a()).spawn().await?;
+let b = durust::call_activity!(task_b()).spawn().await?;
 
 let a = a.result().await?;
 let b = b.result().await?;
@@ -2171,7 +2184,7 @@ Support:
 
 ```rust
 let h1 = durust::spawn(async move {
-    durust::activity!(task_a()).await
+    durust::call_activity!(task_a()).await
 });
 
 let h2 = durust::spawn(async move {

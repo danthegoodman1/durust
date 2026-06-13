@@ -13,7 +13,7 @@ primitive.
 
 ## Scope
 
-- `activity!(...)`.
+- `call_activity!(...)`.
 - `activity_map(...)`.
 - `sleep`.
 - `sleep_until`.

@@ -8,7 +8,7 @@ long waits, child workflows, version rollouts, and large fanout.
 ```rust
 #[durust::workflow(name = "orders.checkout", version = 1, query_state = OrderView)]
 pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
-    let quote = durust::activity!(price_quote(input.quote()))
+    let quote = durust::call_activity!(price_quote(input.quote()))
         .retry(RetryPolicy::exponential().max_attempts(5))
         .await?;
 
@@ -32,7 +32,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
         ApprovalDecision::TimedOut => return Err(durust::Error::timeout("approval")),
     };
 
-    let payment = durust::activity!(charge_card(input.charge(quote, approval)))
+    let payment = durust::call_activity!(charge_card(input.charge(quote, approval)))
         .task_queue("payments")
         .idempotency_key(("charge", &input.order_id))
         .await?;
@@ -192,6 +192,11 @@ durust::Worker::builder(backend.clone())
     .await?;
 ```
 
+Handlers annotated with `#[durust::workflow]` and `#[durust::activity]` also
+export manifest metadata for the binary that links them. Use
+`durust::exported_manifest()` with `durust::write_manifest(...)` to materialize a
+current `durable.manifest.json` candidate for review.
+
 If an activity is registered locally on the workflow worker and local capacity is
 available, Durust prefers local execution. Otherwise remote workers polling
 the selected task queue can claim the task.
@@ -250,8 +255,8 @@ launch and collect.
 
 ```rust
 let (quote, inventory) = durust::join!(
-    durust::activity!(price_quote(input.quote())).task_queue("pricing"),
-    durust::activity!(reserve_inventory(input.items)).task_queue("inventory"),
+    durust::call_activity!(price_quote(input.quote())).task_queue("pricing"),
+    durust::call_activity!(reserve_inventory(input.items)).task_queue("inventory"),
 )
 .await?;
 ```
@@ -319,9 +324,9 @@ Use version markers when changing command-producing workflow code.
 
 ```rust
 if durust::patched("new-payment-flow")? {
-    durust::activity!(charge_v2(input)).await?;
+    durust::call_activity!(charge_v2(input)).await?;
 } else {
-    durust::activity!(charge_v1(input)).await?;
+    durust::call_activity!(charge_v1(input)).await?;
 }
 ```
 
@@ -335,7 +340,7 @@ or outputs in memory.
 ```rust
 #[durust::workflow(name = "jobs.word-count", version = 1, query_state = JobView)]
 pub async fn word_count(input: WordCountInput) -> durust::Result<WordCountOutput> {
-    let partitions = durust::activity!(partition_input(input.source_ref))
+    let partitions = durust::call_activity!(partition_input(input.source_ref))
         .task_queue("storage")
         .await?;
 
@@ -355,7 +360,7 @@ pub async fn word_count(input: WordCountInput) -> durust::Result<WordCountOutput
 
     let partials = mapped.result_manifest().await?;
 
-    let output = durust::activity!(reduce_manifest(partials))
+    let output = durust::call_activity!(reduce_manifest(partials))
         .task_queue("reducers")
         .await?;
 
@@ -452,7 +457,7 @@ std::time::Instant::now -> durust::now
 tokio::select!          -> durust::select!
 tokio::spawn            -> durust::spawn or durust::join!
 random values           -> durust::side_effect!
-network/db calls        -> durust::activity!
+network/db calls        -> durust::call_activity!
 ```
 
 Replay and command fingerprints remain the correctness backstop.

@@ -1,0 +1,5 @@
+error: nondeterministic workflow API detected; use durust::sleep instead
+ --> tests/ui/tokio_sleep.rs:2:10
+  |
+2 | async fn bad(_: ()) -> durust::Result<()> {
+  |          ^^^

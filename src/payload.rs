@@ -48,8 +48,8 @@ impl PayloadRef {
     where
         T: Serialize + ?Sized,
     {
-        let bytes = rmp_serde::to_vec_named(value)
-            .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+        let bytes =
+            rmp_serde::to_vec_named(value).map_err(|err| Error::PayloadEncode(err.to_string()))?;
         Ok(Self::Inline {
             codec: CodecId::MessagePack,
             schema_fingerprint: SchemaFingerprint(type_fingerprint::<T>()),
@@ -103,8 +103,12 @@ where
 }
 
 pub fn type_fingerprint<T: ?Sized>() -> String {
+    type_name_fingerprint(std::any::type_name::<T>())
+}
+
+pub fn type_name_fingerprint(type_name: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(std::any::type_name::<T>().as_bytes());
+    hasher.update(type_name.as_bytes());
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
