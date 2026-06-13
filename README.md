@@ -412,6 +412,8 @@ Durust APIs use typed inputs and outputs. Providers decide whether encoded bytes
 are inline or offloaded.
 
 ```text
+default codec -> MessagePack via Serde
+debug/export codec -> JSON
 small payload -> inline PayloadRef
 large payload -> blob PayloadRef, often S3 or another object store
 ```
@@ -419,6 +421,9 @@ large payload -> blob PayloadRef, often S3 or another object store
 This keeps hot DB rows small and lets providers optimize write throughput.
 Providers offload payloads above roughly `4 KiB` to `16 KiB`, depending on the
 backing store.
+
+Provider config controls the inline threshold and blob store. The SQLite provider
+can use an S3-compatible store such as Garage for local tests.
 
 ## Recovery Model
 

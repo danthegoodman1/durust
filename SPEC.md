@@ -280,7 +280,7 @@ The manifest check is a deployment guardrail. Runtime correctness still depends 
 
 ## 2.3 Supported workflow feature surface
 
-V1 should support the durable coordination features directly inside normal workflow code:
+Durust supports the durable coordination features directly inside normal workflow code:
 
 ```text
 activities
@@ -1604,14 +1604,7 @@ No replay required.
 
 Queries are not durable workflow futures. They should not be called from workflow code, participate in `select!`, or change workflow state. Workflow code updates queryable state with `durust::publish(&view)`, and external callers read the latest committed projection through generated query APIs.
 
-Optional later:
-
-```text
-live query against cached workflow state
-replay-to-current query
-```
-
-But V1 should prefer projection queries.
+Projection queries are the query model. They read committed query state and avoid replaying workflow code for user-facing reads.
 
 ---
 
@@ -1882,11 +1875,17 @@ The public workflow, activity, signal, child, and query APIs are blind to inline
 pub enum PayloadRef {
     Inline {
         codec: CodecId,
+        schema_fingerprint: SchemaFingerprint,
+        compression: CompressionId,
+        encryption: Option<EncryptionMetadata>,
         bytes: Bytes,
     },
 
     Blob {
         codec: CodecId,
+        schema_fingerprint: SchemaFingerprint,
+        compression: CompressionId,
+        encryption: Option<EncryptionMetadata>,
         digest: Sha256Digest,
         size: u64,
         uri: String,
@@ -1897,11 +1896,37 @@ pub enum PayloadRef {
 Pipeline:
 
 ```text
-serde encode
+serde encode with configured codec
 optional compression
 optional encryption
 inline if small
 blob if large
+```
+
+Default durable payload codec:
+
+```text
+MessagePack via rmp-serde
+```
+
+Supported codec policy:
+
+```text
+MessagePack:
+  default durable payload codec.
+  Serde-native, compact, fast, and portable.
+
+JSON:
+  supported for debugging, export, CLI inspection, and explicit provider config.
+  not the default durable payload codec.
+
+Protobuf:
+  opt-in codec for users who want explicit generated schemas.
+  not the default because it changes the user type contract.
+
+FlatBuffers:
+  not a default codec.
+  only add if a benchmarked zero-copy use case needs it.
 ```
 
 Default inline threshold:
@@ -1910,11 +1935,41 @@ Default inline threshold:
 4 KiB to 16 KiB, backend configurable
 ```
 
+Provider config should expose this as an explicit knob:
+
+```rust
+pub struct PayloadStorageConfig {
+    pub codec: CodecId,
+    pub inline_threshold_bytes: usize,
+    pub blob_store: Option<BlobStoreConfig>,
+}
+
+pub enum CodecId {
+    MessagePack,
+    Json,
+    #[cfg(feature = "protobuf-codec")]
+    Protobuf,
+}
+
+pub enum BlobStoreConfig {
+    S3Compatible {
+        bucket: String,
+        endpoint: Option<String>,
+        region: String,
+        prefix: String,
+    },
+}
+```
+
+Providers must implement `MessagePack` and `Json`. `MessagePack` is the default for durable payloads. `Json` is required for debug/export flows and explicit provider configuration. `Protobuf` is reserved for an opt-in feature that uses explicit generated schemas.
+
 Durability implementation docs should recommend offloading larger workflow inputs, activity parameters, activity results, signals, child results, side effects, and query projections to object storage such as S3, then storing only a `PayloadRef` in the durable store. Large DB rows reduce write throughput, increase WAL/journal pressure, and make hot indexes and history scans more expensive.
 
 The inline threshold is a performance default, not a correctness boundary. Backends may choose a smaller limit for databases where row size strongly affects write amplification.
 
-Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored.
+The SQLite provider should support `PayloadStorageConfig` and an S3-compatible blob store. Tests should use local Garage as the S3-compatible service so SQLite-plus-blob behavior is covered without depending on AWS.
+
+Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored. Conformance should force both paths by setting a tiny inline threshold and then a larger threshold.
 
 ---
 
@@ -2074,7 +2129,7 @@ idempotency
 
 # 20. Concurrency
 
-## 20.1 V1
+## 20.1 Bounded coordination
 
 Support:
 
@@ -2083,7 +2138,7 @@ durust::select! { ... }
 durust::join!(...)
 ```
 
-`durust::join!` should register multiple durable operations in deterministic order, then wait until all have completed. It is the V1 fanout-and-collect primitive for launching all branches before observing any one result.
+`durust::join!` should register multiple durable operations in deterministic order, then wait until all have completed. It is the bounded fanout-and-collect primitive for launching all branches before observing any one result.
 
 Example:
 
@@ -2094,7 +2149,7 @@ let (a, b) = durust::join!(
 ).await?;
 ```
 
-Plain Rust futures are lazy, so creating variables and then awaiting them one by one must not be treated as concurrent durable launch. If code awaits `task_a` before `task_b` has been registered, then the operations are sequential. For V1 concurrent launch, use `durust::join!` so the runtime registers every branch in deterministic lexical order before waiting for completions.
+Plain Rust futures are lazy, so creating variables and then awaiting them one by one must not be treated as concurrent durable launch. If code awaits `task_a` before `task_b` has been registered, then the operations are sequential. For bounded concurrent launch, use `durust::join!` so the runtime registers every branch in deterministic lexical order before waiting for completions.
 
 `join!` should work over the same durable future families as `select!`: activities, signals, timers, child starts, child results, and deterministic workflow-local spawned futures.
 
@@ -2403,6 +2458,8 @@ cross-shard inbox apply is idempotent
 cross-shard child start and completion survive dispatcher crash
 parent close policy is persisted and enforced
 inline and blob-backed payloads behave identically through public APIs
+SQLite provider offloads payloads above configured threshold
+SQLite provider passes blob payload conformance against local Garage
 derived indexes can be rebuilt from append history
 provider restart loses no committed facts
 terminal workflow rejects new workflow-visible commands

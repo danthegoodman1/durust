@@ -1,14 +1,29 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Replay-first durable workflow runtime primitives.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod backend;
+mod error;
+mod history;
+mod ids;
+mod memory;
+mod payload;
+mod registry;
+mod runtime;
+mod worker;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+pub use backend::*;
+pub use durust_macros::{activity, workflow};
+pub use error::{Error, Result};
+pub use history::*;
+pub use ids::*;
+pub use memory::MemoryBackend;
+pub use payload::*;
+pub use registry::*;
+pub use runtime::*;
+pub use worker::*;
+
+#[macro_export]
+macro_rules! activity {
+    ($activity:ident($input:expr)) => {
+        $crate::activity_call::<$activity>($input)
+    };
 }
