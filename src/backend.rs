@@ -90,6 +90,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: QueryProjectionRequest,
     ) -> BoxFuture<'static, Result<QueryProjectionOutcome>>;
+
+    fn workflow_change_versions(
+        &self,
+        req: WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>>;
 }
 
 #[derive(Clone, Debug)]
@@ -375,6 +380,54 @@ pub enum QueryProjectionOutcome {
         payload: PayloadRef,
     },
     NotFound,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowChangeVersionsRequest {
+    pub namespace: Namespace,
+    pub workflow_id: Option<WorkflowId>,
+    pub run_id: Option<RunId>,
+    pub change_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowChangeVersionRecord {
+    pub namespace: Namespace,
+    pub workflow_id: WorkflowId,
+    pub workflow_type: WorkflowType,
+    pub run_id: RunId,
+    pub change_id: String,
+    pub version: i32,
+    pub marker_kind: WorkflowChangeMarkerKind,
+    pub status: WorkflowChangeVersionStatus,
+    pub command_seq: crate::CommandSeq,
+    pub first_event_id: EventId,
+    pub last_seen_at: TimestampMs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowChangeMarkerKind {
+    Version,
+    DeprecatedPatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowChangeVersionStatus {
+    Open,
+    Closed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkflowChangeVersionsOutcome {
+    pub records: Vec<WorkflowChangeVersionRecord>,
+}
+
+impl WorkflowChangeVersionsOutcome {
+    pub fn safe_to_remove(&self) -> bool {
+        self.records
+            .iter()
+            .all(|record| record.status == WorkflowChangeVersionStatus::Closed)
+    }
 }
 
 pub fn conflict_to_error(outcome: CommitOutcome) -> Result<EventId> {

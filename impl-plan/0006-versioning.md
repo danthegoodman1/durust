@@ -1,7 +1,7 @@
 ---
 id: 0006
 title: Versioning and patching
-status: not_started
+status: complete
 depends_on: [0001]
 labels: [versioning, replay, cli, examples]
 ---
@@ -28,6 +28,35 @@ markers.
 - Old worker binary is not required.
 - Removing branch too early fails clearly.
 - Version branch example compiles and runs.
+
+## Current State
+
+Implemented and covered:
+
+- `durust::get_version`, `durust::patched`, `durust::deprecate_patch`, and
+  `durust::DEFAULT_VERSION`.
+- `VersionMarker` and `DeprecatedPatchMarker` history events with deterministic
+  command sequence validation.
+- Worker preload of the generic `workflow_change_versions` index so synchronous
+  version APIs remain compatible with bounded streamed replay.
+- Workflow-task abort behavior for unsupported workflow versions, without
+  appending `WorkflowFailed`.
+- Generic `DurableBackend::workflow_change_versions` query with memory and
+  SQLite implementations, open/closed status derivation, and safe-to-remove
+  helper.
+- SQLite marker index schema, restart-safe marker visibility, and
+  `cargo durable versions <list|check|safe-to-remove> --sqlite ...`.
+- Replay-core coverage for default-version old histories, marker recording,
+  streamed replay stability, unsupported version ranges, patch deprecation
+  bridge markers, and early bridge removal nondeterminism.
+- Provider conformance coverage for marker index updates and safe-to-remove
+  status.
+- Runnable `version_branch` example with assertions.
+- Criterion benchmark `version_marker_lookup_replay_memory`.
+
+Remaining before this phase is done:
+
+- None.
 
 ## Required Tests
 

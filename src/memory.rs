@@ -8,8 +8,10 @@ use crate::{
     HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy,
     ReadSignalInboxRequest, Result, RunId, SignalId, SignalInboxRecord, SignalWorkflowOutcome,
     SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitId, WaitKind, WaitRecord, WorkflowId,
-    WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitId, WaitKind, WaitRecord,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
     encode_activity_map_result_manifest, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
@@ -52,6 +54,7 @@ struct MemoryState {
     waits: BTreeMap<WaitId, WaitRecord>,
     signals: BTreeMap<SignalId, SignalRecord>,
     query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
+    workflow_change_versions: BTreeMap<(RunId, String), WorkflowChangeVersionRecord>,
 }
 
 struct RunRecord {
@@ -339,6 +342,8 @@ impl DurableBackend for MemoryBackend {
         let query_projection = batch.query_projection;
         let mut terminal_event = None;
         let mut projection_update = None;
+        let mut change_version_updates = Vec::new();
+        let now = state.now;
         let next_event_id = {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
@@ -365,14 +370,20 @@ impl DurableBackend for MemoryBackend {
             let mut terminal = false;
             for new_event in batch.append_events {
                 next_event_id = next_event_id.next();
-                terminal |= is_terminal(&new_event.data);
-                if is_terminal(&new_event.data) {
-                    terminal_event = Some(new_event.data.clone());
+                let data = new_event.data;
+                terminal |= is_terminal(&data);
+                if is_terminal(&data) {
+                    terminal_event = Some(data.clone());
+                }
+                if let Some(record) =
+                    change_version_record_for_run(run, &claim.run_id, next_event_id, &data, now)
+                {
+                    change_version_updates.push(record);
                 }
                 run.history.push(HistoryEvent {
                     event_id: next_event_id,
-                    event_type: new_event.data.event_type(),
-                    data: new_event.data,
+                    event_type: data.event_type(),
+                    data,
                 });
             }
 
@@ -477,6 +488,11 @@ impl DurableBackend for MemoryBackend {
             state
                 .query_projections
                 .insert((namespace, workflow_id), projection);
+        }
+        for record in change_version_updates {
+            state
+                .workflow_change_versions
+                .insert((record.run_id.clone(), record.change_id.clone()), record);
         }
 
         Box::pin(ready(Ok(CommitOutcome::Committed {
@@ -890,6 +906,66 @@ impl DurableBackend for MemoryBackend {
             .unwrap_or(crate::QueryProjectionOutcome::NotFound);
         Box::pin(ready(Ok(outcome)))
     }
+
+    fn workflow_change_versions(
+        &self,
+        req: WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut records = Vec::new();
+        for record in state.workflow_change_versions.values() {
+            if record.namespace != req.namespace {
+                continue;
+            }
+            if req
+                .workflow_id
+                .as_ref()
+                .is_some_and(|workflow_id| workflow_id != &record.workflow_id)
+            {
+                continue;
+            }
+            if req
+                .run_id
+                .as_ref()
+                .is_some_and(|run_id| run_id != &record.run_id)
+            {
+                continue;
+            }
+            if req
+                .change_id
+                .as_ref()
+                .is_some_and(|change_id| change_id != &record.change_id)
+            {
+                continue;
+            }
+            let mut record = record.clone();
+            record.status = state
+                .runs
+                .get(&record.run_id)
+                .map(|run| {
+                    if run.terminal {
+                        WorkflowChangeVersionStatus::Closed
+                    } else {
+                        WorkflowChangeVersionStatus::Open
+                    }
+                })
+                .unwrap_or(WorkflowChangeVersionStatus::Closed);
+            records.push(record);
+        }
+        records.sort_by(|left, right| {
+            (
+                left.workflow_id.0.as_str(),
+                left.run_id.0.as_str(),
+                left.change_id.as_str(),
+            )
+                .cmp(&(
+                    right.workflow_id.0.as_str(),
+                    right.run_id.0.as_str(),
+                    right.change_id.as_str(),
+                ))
+        });
+        Box::pin(ready(Ok(WorkflowChangeVersionsOutcome { records })))
+    }
 }
 
 fn materialize_activity_map_items(
@@ -939,6 +1015,47 @@ fn materialize_activity_map_items(
         );
     }
     Ok(())
+}
+
+fn change_version_record_for_run(
+    run: &RunRecord,
+    run_id: &RunId,
+    event_id: EventId,
+    data: &HistoryEventData,
+    now: TimestampMs,
+) -> Option<WorkflowChangeVersionRecord> {
+    let (change_id, version, marker_kind, command_seq) = match data {
+        HistoryEventData::VersionMarker(marker) => (
+            marker.change_id.clone(),
+            marker.version,
+            WorkflowChangeMarkerKind::Version,
+            marker.command_id.seq,
+        ),
+        HistoryEventData::DeprecatedPatchMarker(marker) => (
+            marker.patch_id.clone(),
+            1,
+            WorkflowChangeMarkerKind::DeprecatedPatch,
+            marker.command_id.seq,
+        ),
+        _ => return None,
+    };
+    Some(WorkflowChangeVersionRecord {
+        namespace: run.namespace.clone(),
+        workflow_id: run.workflow_id.clone(),
+        workflow_type: run.workflow_type.clone(),
+        run_id: run_id.clone(),
+        change_id,
+        version,
+        marker_kind,
+        status: if run.terminal {
+            WorkflowChangeVersionStatus::Closed
+        } else {
+            WorkflowChangeVersionStatus::Open
+        },
+        command_seq,
+        first_event_id: event_id,
+        last_seen_at: now,
+    })
 }
 
 fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {

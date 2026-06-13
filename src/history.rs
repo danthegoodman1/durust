@@ -20,6 +20,7 @@ pub enum CommandKind {
     ChildWorkflow,
     Timer,
     Signal,
+    VersionMarker,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +181,19 @@ pub struct SelectWinner {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionMarker {
+    pub command_id: CommandId,
+    pub change_id: String,
+    pub version: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeprecatedPatchMarker {
+    pub command_id: CommandId,
+    pub patch_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryEventData {
     WorkflowStarted {
         workflow_type: WorkflowType,
@@ -211,6 +225,8 @@ pub enum HistoryEventData {
     TimerFired(TimerFired),
     SignalConsumed(SignalConsumed),
     SelectWinner(SelectWinner),
+    VersionMarker(VersionMarker),
+    DeprecatedPatchMarker(DeprecatedPatchMarker),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +259,8 @@ pub enum HistoryEventType {
     TimerFired,
     SignalConsumed,
     SelectWinner,
+    VersionMarker,
+    DeprecatedPatchMarker,
 }
 
 impl HistoryEventData {
@@ -269,6 +287,8 @@ impl HistoryEventData {
             Self::TimerFired(_) => HistoryEventType::TimerFired,
             Self::SignalConsumed(_) => HistoryEventType::SignalConsumed,
             Self::SelectWinner(_) => HistoryEventType::SelectWinner,
+            Self::VersionMarker(_) => HistoryEventType::VersionMarker,
+            Self::DeprecatedPatchMarker(_) => HistoryEventType::DeprecatedPatchMarker,
         }
     }
 }
@@ -422,6 +442,15 @@ pub fn signal_fingerprint(signal_name: SignalName) -> CommandFingerprint {
         name: signal_name.0,
         input_digest: None,
         options_digest: "sha256:default".to_owned(),
+    }
+}
+
+pub fn version_marker_fingerprint(change_id: &str, version: i32) -> CommandFingerprint {
+    CommandFingerprint {
+        kind: CommandKind::VersionMarker,
+        name: change_id.to_owned(),
+        input_digest: None,
+        options_digest: format!("version:{version}"),
     }
 }
 

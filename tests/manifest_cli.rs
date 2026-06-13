@@ -1,4 +1,10 @@
-use durust::{DurableManifest, ManifestActivity, ManifestWorkflow, write_manifest};
+use durust::{
+    ClaimWorkflowTaskOptions, DurableBackend, DurableManifest, EventId, HistoryEventData,
+    ManifestActivity, ManifestWorkflow, Namespace, NewHistoryEvent, SqliteBackend,
+    StartWorkflowOutcome, StartWorkflowRequest, TaskQueue, VersionMarker, WorkerId,
+    WorkflowChangeMarkerKind, WorkflowId, WorkflowTaskCommit, WorkflowType, write_manifest,
+};
+use futures::executor::block_on;
 use std::process::Command;
 
 #[test]
@@ -148,6 +154,122 @@ fn manifest_accept_updates_baseline_after_yes() {
 
     assert!(output.status.success());
     assert_eq!(durust::read_manifest(&baseline).unwrap(), current_manifest);
+}
+
+#[test]
+fn versions_safe_to_remove_queries_sqlite_marker_index() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("versions.sqlite3");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        let outcome = backend
+            .start_workflow(StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: WorkflowId::new("wf/version-cli"),
+                workflow_type: WorkflowType::new("cli.versioned", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&()).unwrap(),
+            })
+            .await
+            .unwrap();
+        let StartWorkflowOutcome::Started { run_id } = outcome else {
+            panic!("expected started workflow");
+        };
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("version-cli-worker"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("cli.versioned", 1)],
+                    lease_duration: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let command_id = durust::command_id(&run_id, 1);
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![NewHistoryEvent::new(HistoryEventData::VersionMarker(
+                        VersionMarker {
+                            command_id,
+                            change_id: "cli-change".to_owned(),
+                            version: 1,
+                        },
+                    ))],
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: None,
+                },
+            )
+            .await
+            .unwrap();
+        let records = backend
+            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                namespace: Namespace::default(),
+                workflow_id: None,
+                run_id: Some(run_id.clone()),
+                change_id: Some("cli-change".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            records.records[0].marker_kind,
+            WorkflowChangeMarkerKind::Version
+        );
+
+        let open = Command::new(env!("CARGO_BIN_EXE_cargo-durable"))
+            .args([
+                "durable",
+                "versions",
+                "safe-to-remove",
+                "--sqlite",
+                db_path.to_str().unwrap(),
+                "--change-id",
+                "cli-change",
+            ])
+            .output()
+            .unwrap();
+        assert!(!open.status.success());
+        assert!(String::from_utf8(open.stderr).unwrap().contains("not safe"));
+
+        backend
+            .cancel_workflow(durust::CancelWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: WorkflowId::new("wf/version-cli"),
+                reason: "done".to_owned(),
+            })
+            .await
+            .unwrap();
+
+        let closed = Command::new(env!("CARGO_BIN_EXE_cargo-durable"))
+            .args([
+                "durable",
+                "versions",
+                "safe-to-remove",
+                "--sqlite",
+                db_path.to_str().unwrap(),
+                "--change-id",
+                "cli-change",
+            ])
+            .output()
+            .unwrap();
+        assert!(closed.status.success());
+        assert!(
+            String::from_utf8(closed.stdout)
+                .unwrap()
+                .contains("safe to remove")
+        );
+    });
 }
 
 fn workflow(

@@ -9,9 +9,11 @@ use crate::{
     HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadRef, ReadSignalInboxRequest,
     Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
     StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowId, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at,
-    encode_activity_map_result_manifest, event_payload_len, is_terminal,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
+    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
+    WorkflowTaskReason, WorkflowType, activity_map_input_at, encode_activity_map_result_manifest,
+    event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -1253,6 +1255,101 @@ impl DurableBackend for SqliteBackend {
         })();
         Box::pin(ready(result))
     }
+
+    fn workflow_change_versions(
+        &self,
+        req: WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            let mut stmt = conn
+                .prepare(
+                    "select c.namespace,
+                            c.workflow_id,
+                            c.workflow_name,
+                            c.workflow_version,
+                            c.run_id,
+                            c.change_id,
+                            c.version,
+                            c.marker_kind,
+                            c.command_seq,
+                            c.first_event_id,
+                            c.last_seen_at_ms,
+                            i.terminal
+                     from workflow_change_versions c
+                     join workflow_instances i on i.run_id = c.run_id
+                     where c.namespace = ?1
+                       and (?2 is null or c.workflow_id = ?2)
+                       and (?3 is null or c.run_id = ?3)
+                       and (?4 is null or c.change_id = ?4)
+                     order by c.workflow_id asc, c.run_id asc, c.change_id asc",
+                )
+                .map_err(sqlite_error)?;
+            let workflow_id = req
+                .workflow_id
+                .as_ref()
+                .map(|workflow_id| workflow_id.0.as_str());
+            let run_id = req.run_id.as_ref().map(|run_id| run_id.0.as_str());
+            let change_id = req.change_id.as_deref();
+            let rows = stmt
+                .query_map(
+                    params![req.namespace.0, workflow_id, run_id, change_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i32>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, u64>(8)?,
+                            row.get::<_, u64>(9)?,
+                            row.get::<_, i64>(10)?,
+                            row.get::<_, bool>(11)?,
+                        ))
+                    },
+                )
+                .map_err(sqlite_error)?;
+            let mut records = Vec::new();
+            for row in rows {
+                let (
+                    namespace,
+                    workflow_id,
+                    workflow_name,
+                    workflow_version,
+                    run_id,
+                    change_id,
+                    version,
+                    marker_kind,
+                    command_seq,
+                    first_event_id,
+                    last_seen_at,
+                    terminal,
+                ) = row.map_err(sqlite_error)?;
+                records.push(WorkflowChangeVersionRecord {
+                    namespace: crate::Namespace::new(namespace),
+                    workflow_id: WorkflowId::new(workflow_id),
+                    workflow_type: WorkflowType::new(workflow_name, workflow_version),
+                    run_id: RunId::new(run_id),
+                    change_id,
+                    version,
+                    marker_kind: marker_kind_from_str(&marker_kind)?,
+                    command_seq: CommandSeq(command_seq),
+                    first_event_id: EventId(first_event_id),
+                    last_seen_at: TimestampMs(last_seen_at),
+                    status: if terminal {
+                        WorkflowChangeVersionStatus::Closed
+                    } else {
+                        WorkflowChangeVersionStatus::Open
+                    },
+                });
+            }
+            Ok(WorkflowChangeVersionsOutcome { records })
+        })();
+        Box::pin(ready(result))
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -1353,6 +1450,27 @@ fn init_schema(conn: &Connection) -> Result<()> {
             payload blob not null,
             primary key(namespace, workflow_id)
         );
+
+        create table if not exists workflow_change_versions (
+            namespace text not null,
+            workflow_id text not null,
+            workflow_name text not null,
+            workflow_version integer not null,
+            run_id text not null,
+            change_id text not null,
+            version integer not null,
+            marker_kind text not null,
+            command_seq integer not null,
+            first_event_id integer not null,
+            last_seen_at_ms integer not null,
+            primary key(run_id, change_id)
+        );
+
+        create index if not exists idx_workflow_change_versions_change
+            on workflow_change_versions(namespace, change_id, run_id);
+
+        create index if not exists idx_workflow_change_versions_workflow
+            on workflow_change_versions(namespace, workflow_id, change_id);
 
         create index if not exists idx_active_waits_timer_due
             on active_waits(kind, ready_at_ms, wait_id);
@@ -2523,12 +2641,88 @@ fn insert_history_event(
     data: HistoryEventData,
 ) -> Result<()> {
     let event_type = event_type_to_str(&data.event_type());
-    let data =
+    let blob =
         rmp_serde::to_vec_named(&data).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
         "insert into history_events(run_id, event_id, event_type, data)
          values (?1, ?2, ?3, ?4)",
-        params![run_id.0, event_id.0, event_type, data],
+        params![run_id.0, event_id.0, event_type, blob],
+    )
+    .map_err(sqlite_error)?;
+    index_workflow_change_marker(tx, run_id, event_id, &data)?;
+    Ok(())
+}
+
+fn index_workflow_change_marker(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    event_id: EventId,
+    data: &HistoryEventData,
+) -> Result<()> {
+    let (change_id, version, marker_kind, command_seq) = match data {
+        HistoryEventData::VersionMarker(marker) => (
+            marker.change_id.clone(),
+            marker.version,
+            WorkflowChangeMarkerKind::Version,
+            marker.command_id.seq,
+        ),
+        HistoryEventData::DeprecatedPatchMarker(marker) => (
+            marker.patch_id.clone(),
+            1,
+            WorkflowChangeMarkerKind::DeprecatedPatch,
+            marker.command_id.seq,
+        ),
+        _ => return Ok(()),
+    };
+    let Some((namespace, workflow_id, workflow_name, workflow_version, terminal)) = tx
+        .query_row(
+            "select namespace, workflow_id, workflow_name, workflow_version, terminal
+             from workflow_instances where run_id = ?1",
+            params![run_id.0],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, bool>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Err(Error::RunNotFound(run_id.clone()));
+    };
+    let _status = if terminal {
+        WorkflowChangeVersionStatus::Closed
+    } else {
+        WorkflowChangeVersionStatus::Open
+    };
+    tx.execute(
+        "insert into workflow_change_versions
+         (namespace, workflow_id, workflow_name, workflow_version, run_id, change_id,
+          version, marker_kind, command_seq, first_event_id, last_seen_at_ms)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         on conflict(run_id, change_id) do update set
+            version = excluded.version,
+            marker_kind = excluded.marker_kind,
+            command_seq = excluded.command_seq,
+            first_event_id = excluded.first_event_id,
+            last_seen_at_ms = excluded.last_seen_at_ms",
+        params![
+            namespace,
+            workflow_id,
+            workflow_name,
+            workflow_version,
+            run_id.0,
+            change_id,
+            version,
+            marker_kind_to_str(marker_kind),
+            command_seq.0,
+            event_id.0,
+            unix_epoch_millis(),
+        ],
     )
     .map_err(sqlite_error)?;
     Ok(())
@@ -2577,6 +2771,23 @@ fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
     }
 }
 
+fn marker_kind_to_str(kind: WorkflowChangeMarkerKind) -> &'static str {
+    match kind {
+        WorkflowChangeMarkerKind::Version => "version",
+        WorkflowChangeMarkerKind::DeprecatedPatch => "deprecated_patch",
+    }
+}
+
+fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKind> {
+    match value {
+        "version" => Ok(WorkflowChangeMarkerKind::Version),
+        "deprecated_patch" => Ok(WorkflowChangeMarkerKind::DeprecatedPatch),
+        other => Err(Error::Backend(format!(
+            "unknown workflow change marker kind `{other}`"
+        ))),
+    }
+}
+
 fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
     match event_type {
         HistoryEventType::WorkflowStarted => "workflow_started",
@@ -2600,6 +2811,8 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::TimerFired => "timer_fired",
         HistoryEventType::SignalConsumed => "signal_consumed",
         HistoryEventType::SelectWinner => "select_winner",
+        HistoryEventType::VersionMarker => "version_marker",
+        HistoryEventType::DeprecatedPatchMarker => "deprecated_patch_marker",
     }
 }
 
@@ -2626,6 +2839,8 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "timer_fired" => Ok(HistoryEventType::TimerFired),
         "signal_consumed" => Ok(HistoryEventType::SignalConsumed),
         "select_winner" => Ok(HistoryEventType::SelectWinner),
+        "version_marker" => Ok(HistoryEventType::VersionMarker),
+        "deprecated_patch_marker" => Ok(HistoryEventType::DeprecatedPatchMarker),
         other => Err(Error::Backend(format!("unknown event type `{other}`"))),
     }
 }

@@ -1,10 +1,11 @@
 use crate::{
     Activity, ActivityMapCompleted, ActivityMapScheduled, ActivityMapTask, ActivityOptions,
     ActivityScheduled, ActivityTask, ChildStartOutboxMessage, ChildWorkflowCompleted,
-    ChildWorkflowStarted, CommandId, CommandSeq, Error, HistoryEvent, HistoryEventData,
-    NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId, SelectWinner, SignalConsumed,
-    SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs, WaitId, WaitKind,
-    WaitRecord, Workflow, WorkflowId, activity_fingerprint, activity_map_fingerprint,
+    ChildWorkflowStarted, CommandId, CommandSeq, DeprecatedPatchMarker, Error, HistoryEvent,
+    HistoryEventData, NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId, SelectWinner,
+    SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs,
+    VersionMarker, WaitId, WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind,
+    WorkflowChangeVersionRecord, WorkflowId, activity_fingerprint, activity_map_fingerprint,
     child_workflow_fingerprint, command_id, encode_activity_map_input_manifest, payload_digest,
     signal_fingerprint, timer_fingerprint,
 };
@@ -118,6 +119,8 @@ pub(crate) struct RuntimeContext {
     child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
     timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
+    change_markers: BTreeMap<String, RuntimeChangeMarker>,
+    preconsumed_change_markers: BTreeMap<CommandSeq, RuntimeChangeMarker>,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
     upsert_waits: Vec<WaitRecord>,
@@ -128,6 +131,27 @@ pub(crate) struct RuntimeContext {
     delete_waits: Vec<WaitId>,
     cancel_commands: Vec<CommandId>,
     query_projection: Option<PayloadRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeChangeMarker {
+    pub command_id: CommandId,
+    pub change_id: String,
+    pub version: i32,
+    pub marker_kind: WorkflowChangeMarkerKind,
+    pub event_id: crate::EventId,
+}
+
+impl RuntimeChangeMarker {
+    fn from_record(record: WorkflowChangeVersionRecord) -> Self {
+        Self {
+            command_id: command_id(&record.run_id, record.command_seq.0),
+            change_id: record.change_id,
+            version: record.version,
+            marker_kind: record.marker_kind,
+            event_id: record.first_event_id,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -182,6 +206,7 @@ impl RuntimeContext {
         next_command_seq: u64,
         last_loaded_event_id: crate::EventId,
         replay_target_event_id: crate::EventId,
+        change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Self {
         let completions = collect_completions(&replay_events);
         let failures = collect_failures(&replay_events);
@@ -192,6 +217,11 @@ impl RuntimeContext {
         let child_failures = collect_child_failures(&replay_events);
         let child_cancellations = collect_child_cancellations(&replay_events);
         let timers = collect_timers(&replay_events);
+        let change_markers = change_versions
+            .into_iter()
+            .map(RuntimeChangeMarker::from_record)
+            .map(|marker| (marker.change_id.clone(), marker))
+            .collect();
 
         Self {
             run_id,
@@ -216,6 +246,8 @@ impl RuntimeContext {
             child_cancellations,
             timers,
             live_signals: BTreeMap::new(),
+            change_markers,
+            preconsumed_change_markers: BTreeMap::new(),
             signal_requests: Vec::new(),
             append_events: Vec::new(),
             upsert_waits: Vec::new(),
@@ -326,8 +358,47 @@ impl RuntimeContext {
         }
     }
 
-    fn peek_replay_event(&self) -> Option<&HistoryEvent> {
+    fn peek_replay_event(&mut self) -> Option<&HistoryEvent> {
+        self.skip_preconsumed_change_markers();
         self.replay_events.get(self.replay_cursor)
+    }
+
+    fn skip_preconsumed_change_markers(&mut self) {
+        while let Some(event) = self.replay_events.get(self.replay_cursor) {
+            let marker = match &event.data {
+                HistoryEventData::VersionMarker(marker) => Some((
+                    marker.command_id.seq,
+                    marker.command_id.clone(),
+                    marker.change_id.as_str(),
+                    marker.version,
+                    WorkflowChangeMarkerKind::Version,
+                )),
+                HistoryEventData::DeprecatedPatchMarker(marker) => Some((
+                    marker.command_id.seq,
+                    marker.command_id.clone(),
+                    marker.patch_id.as_str(),
+                    1,
+                    WorkflowChangeMarkerKind::DeprecatedPatch,
+                )),
+                _ => None,
+            };
+            let Some((seq, command_id, change_id, version, marker_kind)) = marker else {
+                break;
+            };
+            let Some(preconsumed) = self.preconsumed_change_markers.get(&seq) else {
+                break;
+            };
+            let matches = preconsumed.command_id == command_id
+                && preconsumed.change_id == change_id
+                && preconsumed.version == version
+                && preconsumed.marker_kind == marker_kind
+                && preconsumed.event_id == event.event_id;
+            if !matches {
+                break;
+            }
+            self.preconsumed_change_markers.remove(&seq);
+            self.replay_cursor += 1;
+        }
     }
 
     fn at_replay_tail(&self) -> bool {
@@ -553,6 +624,215 @@ impl RuntimeContext {
             .merge_overrides(overrides)
             .with_task_queue_fallback(self.worker_activity_task_queue.clone())
     }
+
+    fn get_version(
+        &mut self,
+        change_id: String,
+        min_supported: i32,
+        max_supported: i32,
+    ) -> Result<i32> {
+        validate_version_range(&change_id, min_supported, max_supported)?;
+
+        if let Some(event) = self.peek_replay_event().cloned() {
+            match event.data {
+                HistoryEventData::VersionMarker(marker) => {
+                    if marker.change_id != change_id {
+                        return Err(Error::Nondeterminism(format!(
+                            "expected VersionMarker `{change_id}`, found `{}`",
+                            marker.change_id
+                        )));
+                    }
+                    let command_id = self.next_command_id();
+                    validate_marker_command(&change_id, &command_id, &marker.command_id)?;
+                    self.advance_replay();
+                    return validate_recorded_version(
+                        change_id,
+                        marker.version,
+                        min_supported,
+                        max_supported,
+                    );
+                }
+                HistoryEventData::DeprecatedPatchMarker(marker) => {
+                    return Err(Error::Nondeterminism(format!(
+                        "expected VersionMarker `{change_id}`, found DeprecatedPatchMarker `{}`",
+                        marker.patch_id
+                    )));
+                }
+                _ => {
+                    if self.change_markers.contains_key(&change_id) {
+                        return Err(Error::Nondeterminism(format!(
+                            "version marker `{change_id}` moved relative to command history"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(marker) = self.change_markers.get(&change_id).cloned() {
+            if marker.marker_kind != WorkflowChangeMarkerKind::Version {
+                return Err(Error::Nondeterminism(format!(
+                    "expected VersionMarker `{change_id}`, found DeprecatedPatchMarker"
+                )));
+            }
+            self.preconsume_marker(&change_id, &marker)?;
+            return validate_recorded_version(
+                change_id,
+                marker.version,
+                min_supported,
+                max_supported,
+            );
+        }
+
+        if self.at_replay_tail() {
+            let command_id = self.next_command_id();
+            let marker = VersionMarker {
+                command_id,
+                change_id,
+                version: max_supported,
+            };
+            self.append_events
+                .push(NewHistoryEvent::new(HistoryEventData::VersionMarker(
+                    marker,
+                )));
+            return Ok(max_supported);
+        }
+
+        validate_recorded_version(change_id, DEFAULT_VERSION, min_supported, max_supported)
+    }
+
+    fn deprecate_patch(&mut self, patch_id: String) -> Result<()> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            match event.data {
+                HistoryEventData::VersionMarker(marker) => {
+                    if marker.change_id != patch_id {
+                        return Err(Error::Nondeterminism(format!(
+                            "expected patch marker `{patch_id}`, found VersionMarker `{}`",
+                            marker.change_id
+                        )));
+                    }
+                    let command_id = self.next_command_id();
+                    validate_marker_command(&patch_id, &command_id, &marker.command_id)?;
+                    if marker.version <= DEFAULT_VERSION {
+                        return Err(Error::UnsupportedWorkflowVersion {
+                            change_id: patch_id,
+                            version: marker.version,
+                            min_supported: 1,
+                            max_supported: i32::MAX,
+                        });
+                    }
+                    self.advance_replay();
+                    return Ok(());
+                }
+                HistoryEventData::DeprecatedPatchMarker(marker) => {
+                    if marker.patch_id != patch_id {
+                        return Err(Error::Nondeterminism(format!(
+                            "expected DeprecatedPatchMarker `{patch_id}`, found `{}`",
+                            marker.patch_id
+                        )));
+                    }
+                    let command_id = self.next_command_id();
+                    validate_marker_command(&patch_id, &command_id, &marker.command_id)?;
+                    self.advance_replay();
+                    return Ok(());
+                }
+                _ => {
+                    if self.change_markers.contains_key(&patch_id) {
+                        return Err(Error::Nondeterminism(format!(
+                            "patch marker `{patch_id}` moved relative to command history"
+                        )));
+                    }
+                }
+            }
+        }
+
+        if let Some(marker) = self.change_markers.get(&patch_id).cloned() {
+            match marker.marker_kind {
+                WorkflowChangeMarkerKind::Version => {
+                    if marker.version <= DEFAULT_VERSION {
+                        return Err(Error::UnsupportedWorkflowVersion {
+                            change_id: patch_id,
+                            version: marker.version,
+                            min_supported: 1,
+                            max_supported: i32::MAX,
+                        });
+                    }
+                }
+                WorkflowChangeMarkerKind::DeprecatedPatch => {}
+            }
+            self.preconsume_marker(&patch_id, &marker)?;
+            return Ok(());
+        }
+
+        if self.at_replay_tail() {
+            let command_id = self.next_command_id();
+            self.append_events.push(NewHistoryEvent::new(
+                HistoryEventData::DeprecatedPatchMarker(DeprecatedPatchMarker {
+                    command_id,
+                    patch_id,
+                }),
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn preconsume_marker(&mut self, change_id: &str, marker: &RuntimeChangeMarker) -> Result<()> {
+        if marker.event_id <= self.last_loaded_event_id {
+            return Err(Error::Nondeterminism(format!(
+                "change marker `{change_id}` was indexed before loaded history cursor"
+            )));
+        }
+        let command_id = self.next_command_id();
+        validate_marker_command(change_id, &command_id, &marker.command_id)?;
+        self.preconsumed_change_markers
+            .insert(command_id.seq, marker.clone());
+        Ok(())
+    }
+}
+
+fn validate_version_range(change_id: &str, min_supported: i32, max_supported: i32) -> Result<()> {
+    if min_supported > max_supported {
+        return Err(Error::Backend(format!(
+            "invalid version range for `{change_id}`: min {min_supported} exceeds max {max_supported}"
+        )));
+    }
+    if max_supported <= DEFAULT_VERSION {
+        return Err(Error::Backend(format!(
+            "invalid max version for `{change_id}`: {max_supported}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_recorded_version(
+    change_id: String,
+    version: i32,
+    min_supported: i32,
+    max_supported: i32,
+) -> Result<i32> {
+    if version < min_supported || version > max_supported {
+        return Err(Error::UnsupportedWorkflowVersion {
+            change_id,
+            version,
+            min_supported,
+            max_supported,
+        });
+    }
+    Ok(version)
+}
+
+fn validate_marker_command(
+    change_id: &str,
+    expected: &CommandId,
+    recorded: &CommandId,
+) -> Result<()> {
+    if recorded.seq != expected.seq {
+        return Err(Error::Nondeterminism(format!(
+            "version marker `{change_id}` command sequence changed: expected {}, found {}",
+            expected.seq.0, recorded.seq.0
+        )));
+    }
+    Ok(())
 }
 
 impl<A> Unpin for ActivityFuture<A> where A: Activity {}
@@ -573,6 +853,24 @@ pub fn set_default_activity_options(options: ActivityOptions) {
     with_context(|runtime| {
         runtime.default_activity_options = options;
     });
+}
+
+pub const DEFAULT_VERSION: i32 = -1;
+
+pub fn get_version(
+    change_id: impl Into<String>,
+    min_supported: i32,
+    max_supported: i32,
+) -> Result<i32> {
+    with_context(|runtime| runtime.get_version(change_id.into(), min_supported, max_supported))
+}
+
+pub fn patched(patch_id: impl Into<String>) -> Result<bool> {
+    Ok(get_version(patch_id, DEFAULT_VERSION, 1)? != DEFAULT_VERSION)
+}
+
+pub fn deprecate_patch(patch_id: impl Into<String>) -> Result<()> {
+    with_context(|runtime| runtime.deprecate_patch(patch_id.into()))
 }
 
 pub fn publish<T>(view: &T) -> Result<()>
@@ -2488,6 +2786,8 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::TimerStarted(_) | HistoryEventData::TimerFired(_) => 16,
         HistoryEventData::SignalConsumed(signal) => signal.payload.encoded_len(),
         HistoryEventData::SelectWinner(winner) => winner.branches_digest.len() + 32,
+        HistoryEventData::VersionMarker(marker) => marker.change_id.len() + 16,
+        HistoryEventData::DeprecatedPatchMarker(marker) => marker.patch_id.len() + 16,
     }
 }
 

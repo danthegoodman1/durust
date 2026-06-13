@@ -48,6 +48,18 @@ impl DurableFailure {
             Error::Nondeterminism(message) => {
                 Self::new("durust.nondeterminism", message.clone()).marked_non_retryable()
             }
+            Error::UnsupportedWorkflowVersion {
+                change_id,
+                version,
+                min_supported,
+                max_supported,
+            } => Self::new(
+                "durust.unsupported_workflow_version",
+                format!(
+                    "change `{change_id}` recorded version {version}, supported range {min_supported}..={max_supported}"
+                ),
+            )
+            .marked_non_retryable(),
             Error::PayloadEncode(message) => Self::new("durust.payload_encode", message.clone()),
             Error::PayloadDecode(message) => Self::new("durust.payload_decode", message.clone()),
             Error::Backend(message) => Self::new("durust.backend", message.clone()),
@@ -135,6 +147,16 @@ pub enum Error {
 
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),
+
+    #[error(
+        "unsupported workflow version for `{change_id}`: recorded {version}, supported {min_supported}..={max_supported}"
+    )]
+    UnsupportedWorkflowVersion {
+        change_id: String,
+        version: i32,
+        min_supported: i32,
+        max_supported: i32,
+    },
 
     #[error("payload encode failed: {0}")]
     PayloadEncode(String),

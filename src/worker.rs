@@ -3,9 +3,9 @@ use crate::{
     CompleteActivityRequest, DurableBackend, Error, EventId, FailActivityRequest,
     FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace, NewHistoryEvent,
     ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowId, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error, poll_with_activity_context,
-    poll_with_runtime_context,
+    TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowChangeVersionsRequest, WorkflowId,
+    WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error,
+    poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -206,6 +206,16 @@ where
         let claim_for_release = claimed.claim.clone();
         let cached = self.cache.remove(&claimed.run_id);
         let now = self.backend.current_time().await?;
+        let change_versions = self
+            .backend
+            .workflow_change_versions(WorkflowChangeVersionsRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: None,
+                run_id: Some(claimed.run_id.clone()),
+                change_id: None,
+            })
+            .await?
+            .records;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
                 .stream_history_chunk(
@@ -226,6 +236,7 @@ where
                         cached.next_command_seq,
                         chunk.last_event_id,
                         claimed.replay_target_event_id,
+                        change_versions.clone(),
                     );
                     let poll = self
                         .poll_until_history_blocked_or_ready(
@@ -275,6 +286,7 @@ where
                                         0,
                                         last_loaded_event_id,
                                         claimed.replay_target_event_id,
+                                        change_versions.clone(),
                                     );
                                     let poll = self
                                         .poll_until_history_blocked_or_ready(
@@ -305,7 +317,10 @@ where
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
-                let release = if matches!(&err, Error::Nondeterminism(_)) {
+                let release = if matches!(
+                    &err,
+                    Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
+                ) {
                     WorkflowTaskRelease::delayed(
                         WorkflowTaskReason::CacheEvicted,
                         self.nondeterminism_retry_backoff,
@@ -566,7 +581,10 @@ where
                 terminal = true;
             }
             Poll::Ready(Err(err)) => {
-                if matches!(err, Error::Nondeterminism(_)) {
+                if matches!(
+                    err,
+                    Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
+                ) {
                     return Err(err);
                 }
                 append_events.push(NewHistoryEvent::new(HistoryEventData::WorkflowFailed {

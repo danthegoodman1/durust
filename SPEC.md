@@ -1279,6 +1279,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: QueryProjectionRequest,
     ) -> durust::Result<QueryProjectionOutcome>;
+
+    async fn workflow_change_versions(
+        &self,
+        req: WorkflowChangeVersionsRequest,
+    ) -> durust::Result<WorkflowChangeVersionsOutcome>;
 }
 ```
 
@@ -1862,6 +1867,19 @@ If replay cursor is at tail:
 ```
 
 The marker is part of command history and participates in deterministic replay.
+Because `get_version` is a synchronous workflow API while recovery streams
+history in bounded chunks, workers preload the provider-maintained
+`workflow_change_versions` index for the claimed run. This index is bounded by
+the number of recorded change markers, not by history length. If a marker exists
+but its event has not been streamed yet, the runtime returns the indexed version
+and records that marker as pre-consumed; when the marker event later reaches the
+replay cursor, the runtime validates and skips it before matching subsequent
+commands. This preserves deterministic command order without loading full
+history.
+
+Unsupported workflow versions and marker-order mismatches abort the workflow
+task. They must not append `WorkflowFailed`; the worker releases the task with a
+retry backoff just like nondeterminism.
 
 ## 15.3 `patched` semantics
 
@@ -1934,6 +1952,8 @@ workflow_change_versions
   run_id
   change_id
   version
+  marker_kind
+  command_seq
   status
   first_event_id
   last_seen_at

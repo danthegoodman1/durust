@@ -457,6 +457,15 @@ if durust::patched("new-payment-flow")? {
 ```
 
 The marker lets one worker binary run both old and new open workflows.
+After no open workflow needs the old branch, keep a bridge while removing the
+branch body:
+
+```rust
+durust::deprecate_patch("new-payment-flow")?;
+durust::call_activity!(charge_v2(input)).await?;
+```
+
+Removing the bridge before marked histories are gone is detected during replay.
 
 ### Map Reduce
 
@@ -630,6 +639,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`join_activities.rs`](examples/join_activities.rs)
 - [`activity_spawn_join_all.rs`](examples/activity_spawn_join_all.rs)
 - [`activity_spawn_select_all.rs`](examples/activity_spawn_select_all.rs)
+- [`version_branch.rs`](examples/version_branch.rs)
 - [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)

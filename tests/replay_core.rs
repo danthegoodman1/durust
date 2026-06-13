@@ -63,12 +63,65 @@ async fn heartbeat_activity_test(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
 }
 
+#[durust::activity(name = "tests.version-a")]
+async fn version_activity_a(_: ()) -> durust::Result<String> {
+    Ok("a".to_owned())
+}
+
+#[durust::activity(name = "tests.version-b")]
+async fn version_activity_b(_: ()) -> durust::Result<String> {
+    Ok("b".to_owned())
+}
+
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
 async fn double_plus_one(input: u64) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .await?;
     Ok(doubled + 1)
+}
+
+#[durust::workflow(name = "tests.version-branch", version = 1)]
+async fn version_original(_: ()) -> durust::Result<String> {
+    durust::call_activity!(version_activity_a(()))
+        .task_queue("activities")
+        .await
+}
+
+#[durust::workflow(name = "tests.version-branch", version = 1)]
+async fn version_patched(_: ()) -> durust::Result<String> {
+    if durust::patched("replace-a-with-b")? {
+        durust::call_activity!(version_activity_b(()))
+            .task_queue("activities")
+            .await
+    } else {
+        durust::call_activity!(version_activity_a(()))
+            .task_queue("activities")
+            .await
+    }
+}
+
+#[durust::workflow(name = "tests.version-branch", version = 1)]
+async fn version_min_two(_: ()) -> durust::Result<String> {
+    let _ = durust::get_version("replace-a-with-b", 2, 2)?;
+    durust::call_activity!(version_activity_b(()))
+        .task_queue("activities")
+        .await
+}
+
+#[durust::workflow(name = "tests.version-branch", version = 1)]
+async fn version_deprecated(_: ()) -> durust::Result<String> {
+    durust::deprecate_patch("replace-a-with-b")?;
+    durust::call_activity!(version_activity_b(()))
+        .task_queue("activities")
+        .await
+}
+
+#[durust::workflow(name = "tests.version-branch", version = 1)]
+async fn version_removed(_: ()) -> durust::Result<String> {
+    durust::call_activity!(version_activity_b(()))
+        .task_queue("activities")
+        .await
 }
 
 #[durust::workflow(name = "tests.child-double", version = 1)]
@@ -1875,6 +1928,269 @@ fn select_branch_reorder_is_detected_on_replay() {
 }
 
 #[test]
+fn get_version_returns_default_for_old_history_without_marker() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_original>("wf/version-old", "workflows", ())
+            .await
+            .unwrap();
+        let mut old_worker = version_worker(backend.clone(), version_original);
+        assert!(old_worker.run_workflow_once().await.unwrap());
+        assert!(old_worker.run_activity_once().await.unwrap());
+        drop(old_worker);
+
+        let mut patched_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(version_patched)
+            .register_activity(version_activity_a)
+            .register_activity(version_activity_b)
+            .build();
+        assert!(patched_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::VersionMarker(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("expected workflow completion");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "a");
+    });
+}
+
+#[test]
+fn patched_records_marker_and_takes_new_branch_for_new_history() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_patched>("wf/version-new", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = version_worker(backend.clone(), version_patched);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::VersionMarker(marker) = &history[1].data else {
+            panic!("expected VersionMarker");
+        };
+        assert_eq!(marker.change_id, "replace-a-with-b");
+        assert_eq!(marker.version, 1);
+        assert_eq!(marker.command_id.seq, durust::CommandSeq(1));
+        let scheduled = scheduled_activity(&history, 2);
+        assert_eq!(
+            scheduled.activity_name,
+            ActivityName::new("tests.version-b")
+        );
+        assert_eq!(scheduled.command_id.seq, durust::CommandSeq(2));
+
+        let versions = backend
+            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                namespace: Namespace::default(),
+                workflow_id: None,
+                run_id: Some(run_id),
+                change_id: Some("replace-a-with-b".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions.records.len(), 1);
+        assert_eq!(
+            versions.records[0].marker_kind,
+            durust::WorkflowChangeMarkerKind::Version
+        );
+        assert!(!versions.safe_to_remove());
+    });
+}
+
+#[test]
+fn recorded_version_is_stable_across_streamed_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_patched>("wf/version-replay", "workflows", ())
+            .await
+            .unwrap();
+        let mut first_worker = version_worker(backend.clone(), version_patched);
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(version_patched)
+            .register_activity(version_activity_a)
+            .register_activity(version_activity_b)
+            .build();
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(event.data, HistoryEventData::VersionMarker(_)))
+                .count(),
+            1
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("expected workflow completion");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "b");
+    });
+}
+
+#[test]
+fn unsupported_min_version_aborts_task_without_workflow_failed() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_patched>("wf/version-unsupported", "workflows", ())
+            .await
+            .unwrap();
+        let mut first_worker = version_worker(backend.clone(), version_patched);
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+
+        let mut min_two_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .register_workflow(version_min_two)
+            .register_activity(version_activity_b)
+            .build();
+        let err = min_two_worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(
+            err,
+            durust::Error::UnsupportedWorkflowVersion { .. }
+        ));
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+    });
+}
+
+#[test]
+fn deprecate_patch_bridges_existing_patched_histories() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_patched>("wf/version-deprecated", "workflows", ())
+            .await
+            .unwrap();
+        let mut first_worker = version_worker(backend.clone(), version_patched);
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+
+        let mut deprecated_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(version_deprecated)
+            .register_activity(version_activity_b)
+            .build();
+        assert!(deprecated_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::DeprecatedPatchMarker(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("expected workflow completion");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "b");
+    });
+}
+
+#[test]
+fn deprecate_patch_records_bridge_marker_for_new_histories() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_deprecated>("wf/version-deprecated-new", "workflows", ())
+            .await
+            .unwrap();
+        let mut worker = version_worker(backend.clone(), version_deprecated);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::DeprecatedPatchMarker(marker) = &history[1].data else {
+            panic!("expected DeprecatedPatchMarker");
+        };
+        assert_eq!(marker.patch_id, "replace-a-with-b");
+        assert_eq!(marker.command_id.seq, durust::CommandSeq(1));
+        let scheduled = scheduled_activity(&history, 2);
+        assert_eq!(
+            scheduled.activity_name,
+            ActivityName::new("tests.version-b")
+        );
+
+        let versions = backend
+            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                namespace: Namespace::default(),
+                workflow_id: None,
+                run_id: Some(run_id),
+                change_id: Some("replace-a-with-b".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            versions.records[0].marker_kind,
+            durust::WorkflowChangeMarkerKind::DeprecatedPatch
+        );
+    });
+}
+
+#[test]
+fn removing_patch_bridge_too_early_is_nondeterministic() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<version_patched>("wf/version-removed-too-early", "workflows", ())
+            .await
+            .unwrap();
+        let mut first_worker = version_worker(backend.clone(), version_patched);
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+
+        let mut removed_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .register_workflow(version_removed)
+            .register_activity(version_activity_b)
+            .build();
+        let err = removed_worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Nondeterminism(_)));
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+    });
+}
+
+#[test]
 fn workflow_default_activity_options_apply_to_scheduled_activity() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -3089,6 +3405,19 @@ where
         .events
 }
 
+fn version_worker<W>(backend: MemoryBackend, workflow: W) -> Worker<MemoryBackend>
+where
+    W: durust::Workflow + Default,
+{
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(workflow)
+        .register_activity(version_activity_a)
+        .register_activity(version_activity_b)
+        .build()
+}
+
 fn scheduled_activity(
     history: &[durust::HistoryEvent],
     index: usize,
@@ -3251,5 +3580,12 @@ impl DurableBackend for RecordingBackend {
         req: durust::QueryProjectionRequest,
     ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
         self.inner.query_projection(req)
+    }
+
+    fn workflow_change_versions(
+        &self,
+        req: durust::WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
+        self.inner.workflow_change_versions(req)
     }
 }

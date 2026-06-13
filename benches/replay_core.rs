@@ -72,6 +72,19 @@ async fn join_all_activities(input: u64) -> durust::Result<u64> {
     Ok(results.into_iter().sum())
 }
 
+#[durust::workflow(name = "bench.version-branch", version = 1)]
+async fn version_branch(input: u64) -> durust::Result<u64> {
+    if durust::patched("bench-double-v2")? {
+        durust::call_activity!(double(BenchInput { value: input + 1 }))
+            .task_queue("activities")
+            .await
+    } else {
+        durust::call_activity!(double(BenchInput { value: input }))
+            .task_queue("activities")
+            .await
+    }
+}
+
 #[durust::workflow(name = "bench.child-double", version = 1)]
 async fn child_double(input: u64) -> durust::Result<u64> {
     Ok(input * 2)
@@ -329,6 +342,21 @@ fn projection_read(c: &mut Criterion) {
                         outcome,
                         durust::QueryProjectionOutcome::Found { .. }
                     ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn version_marker_replay(c: &mut Criterion) {
+    c.bench_function("version_marker_lookup_replay_memory", |b| {
+        b.iter_batched(
+            setup_version_marker_replay,
+            |backend| {
+                block_on(async {
+                    let mut worker = version_replay_worker(backend);
+                    worker.run_workflow_once().await.unwrap();
                 });
             },
             BatchSize::SmallInput,
@@ -607,6 +635,26 @@ fn setup_child_start_outbox() -> MemoryBackend {
             .register_workflow(child_start)
             .build();
         assert!(worker.run_workflow_once().await.unwrap());
+        backend
+    })
+}
+
+fn setup_version_marker_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<version_branch>("bench/version-branch", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(version_branch)
+            .register_activity(double)
+            .build();
+        worker.run_workflow_once().await.unwrap();
+        worker.run_activity_once().await.unwrap();
         backend
     })
 }
@@ -1100,6 +1148,16 @@ fn select_all_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .build()
 }
 
+fn version_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .history_chunk_events(1)
+        .register_workflow(version_branch)
+        .register_activity(double)
+        .build()
+}
+
 criterion_group!(
     benches,
     workflow_task_schedule,
@@ -1115,6 +1173,7 @@ criterion_group!(
     child_start_dispatch,
     projection_update,
     projection_read,
+    version_marker_replay,
     activity_claim_complete,
     activity_heartbeat,
     timer_due_scan_wakeup,

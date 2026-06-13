@@ -234,6 +234,7 @@ where
     released_workflow_task_is_claimable_again(backend.clone()).await;
     delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
+    workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
@@ -596,6 +597,112 @@ where
             event_id: EventId(1),
             payload: blob_payload,
         }
+    );
+}
+
+async fn workflow_change_version_index_tracks_markers_and_open_status<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>("wf/version-index", "version-index-workflows", 5)
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("version-index-worker"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("version-index-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::VersionMarker(durust::VersionMarker {
+                        command_id: command_id.clone(),
+                        change_id: "replace-a-with-b".to_owned(),
+                        version: 1,
+                    }),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        }
+    );
+
+    let open = backend
+        .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+            namespace: Namespace::default(),
+            workflow_id: None,
+            run_id: Some(run_id.clone()),
+            change_id: Some("replace-a-with-b".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert!(!open.safe_to_remove());
+    assert_eq!(open.records.len(), 1);
+    let record = &open.records[0];
+    assert_eq!(
+        record.workflow_id,
+        durust::WorkflowId::new("wf/version-index")
+    );
+    assert_eq!(
+        record.workflow_type,
+        WorkflowType::new("conformance.workflow", 1)
+    );
+    assert_eq!(record.run_id, run_id);
+    assert_eq!(record.change_id, "replace-a-with-b");
+    assert_eq!(record.version, 1);
+    assert_eq!(
+        record.marker_kind,
+        durust::WorkflowChangeMarkerKind::Version
+    );
+    assert_eq!(record.status, durust::WorkflowChangeVersionStatus::Open);
+    assert_eq!(record.command_seq, durust::CommandSeq(1));
+    assert_eq!(record.first_event_id, EventId(2));
+
+    client
+        .cancel_workflow("wf/version-index", "conformance close")
+        .await
+        .unwrap();
+    let closed = backend
+        .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+            namespace: Namespace::default(),
+            workflow_id: None,
+            run_id: Some(run_id),
+            change_id: Some("replace-a-with-b".to_owned()),
+        })
+        .await
+        .unwrap();
+    assert!(closed.safe_to_remove());
+    assert_eq!(closed.records.len(), 1);
+    assert_eq!(
+        closed.records[0].status,
+        durust::WorkflowChangeVersionStatus::Closed
     );
 }
 
