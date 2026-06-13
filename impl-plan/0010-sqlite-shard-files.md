@@ -1,8 +1,8 @@
 ---
-id: 0009
+id: 0010
 title: SQLite shard-file provider
 status: not_started
-depends_on: [0001, 0005, 0008]
+depends_on: [0001, 0005, 0008, 0009]
 labels: [sqlite, provider, shards, outbox, conformance, benchmarks]
 ---
 

@@ -699,6 +699,51 @@ activity/child:
 
 Those live reads do not mutate correctness state by themselves. The signal remains unconsumed until `commit_workflow_task` atomically appends `SignalConsumed` and consumes the signal id. If the worker crashes before commit, the signal remains available and the recovered workflow observes it again.
 
+## 4.6 Recovery flow control
+
+Streaming replay bounds per-workflow memory, but it does not by itself protect
+the durability provider from a fleet-wide recovery storm. Recovery must have
+explicit admission control and throughput limits separate from normal cached
+workflow progress.
+
+Worker/runtime policy owns semantic recovery throttling:
+
+```text
+max_concurrent_recoveries
+max_replay_events_per_second
+max_replay_bytes_per_second
+recovery_prefetch_chunks
+recovery_burst
+per_queue or per_namespace recovery limits
+separate cached-wake and cold-replay budgets
+```
+
+The worker must acquire recovery capacity before recreating a missing workflow
+future and streaming history. Cached workflow wakes should not be starved behind
+cold replay. When recovery budget is unavailable, the worker should release or
+defer the workflow task through generic delayed visibility, not hold leases while
+idle.
+
+Provider implementations own physical protection for the storage system:
+
+```text
+honor max_events and max_bytes on every history stream request
+enforce optional provider-wide read budgets by namespace, queue, or shard
+return generic backpressure or retry-after signals when saturated
+rate-limit provider startup replay and derived-index rebuilds
+keep provider throttling independent of workflow semantics
+```
+
+Providers must not know whether replay is caused by cache eviction, worker
+restart, nondeterminism retry, or deployment churn. They may expose generic
+mechanisms such as delayed task visibility, recovery permits, stream budgets, or
+retry-after responses. The worker chooses semantic policy and retry timing.
+
+Provider conformance should include delayed release, bounded history stream
+requests, and provider backpressure behavior. Simulation should include recovery
+storms, cache eviction storms, provider read-budget exhaustion, and fairness
+between hot cached workflows and cold recoveries.
+
 ---
 
 # 5. History Model
