@@ -1,5 +1,6 @@
 use crate::{
-    ActivityMapScheduled, ActivityMapTask, ActivityScheduled, ActivityTask,
+    ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
+    ActivityMapResultPage, ActivityMapScheduled, ActivityScheduled, ActivityTask,
     ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
     ChildWorkflowStartRequested, DurableFailure, Error, HistoryEventData, Result, SignalConsumed,
 };
@@ -281,15 +282,64 @@ where
     Ok(task)
 }
 
-pub(crate) fn map_activity_map_task_payloads<F>(
-    mut task: ActivityMapTask,
-    map_payload: &mut F,
-) -> Result<ActivityMapTask>
+pub(crate) fn map_activity_map_input_manifest_ref<FLoad, FLeaf, FFinish>(
+    payload: PayloadRef,
+    load_container: &mut FLoad,
+    map_leaf: &mut FLeaf,
+    finish_container: &mut FFinish,
+) -> Result<PayloadRef>
 where
-    F: FnMut(PayloadRef) -> Result<PayloadRef>,
+    FLoad: FnMut(PayloadRef) -> Result<PayloadRef>,
+    FLeaf: FnMut(PayloadRef) -> Result<PayloadRef>,
+    FFinish: FnMut(PayloadRef) -> Result<PayloadRef>,
 {
-    task.input_manifest = map_payload(task.input_manifest)?;
-    Ok(task)
+    let root = load_container(payload)?;
+    let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = load_container(page)?;
+            let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
+            page.items = page
+                .items
+                .into_iter()
+                .map(&mut *map_leaf)
+                .collect::<Result<Vec<_>>>()?;
+            finish_container(crate::encode_payload(&page)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    finish_container(crate::encode_payload(&manifest)?)
+}
+
+pub(crate) fn map_activity_map_result_manifest_ref<FLoad, FLeaf, FFinish>(
+    payload: PayloadRef,
+    load_container: &mut FLoad,
+    map_leaf: &mut FLeaf,
+    finish_container: &mut FFinish,
+) -> Result<PayloadRef>
+where
+    FLoad: FnMut(PayloadRef) -> Result<PayloadRef>,
+    FLeaf: FnMut(PayloadRef) -> Result<PayloadRef>,
+    FFinish: FnMut(PayloadRef) -> Result<PayloadRef>,
+{
+    let root = load_container(payload)?;
+    let mut manifest: ActivityMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = load_container(page)?;
+            let mut page: ActivityMapResultPage = crate::decode_payload(&page)?;
+            page.results = page
+                .results
+                .into_iter()
+                .map(&mut *map_leaf)
+                .collect::<Result<Vec<_>>>()?;
+            finish_container(crate::encode_payload(&page)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    finish_container(crate::encode_payload(&manifest)?)
 }
 
 pub(crate) fn map_child_start_payloads<F>(

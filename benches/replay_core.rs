@@ -3,16 +3,22 @@ use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, EventId, FireDueTimersRequest, HistoryEventData, MemoryBackend, Namespace,
-    NewHistoryEvent, SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker,
-    WorkerId, WorkflowTaskCommit, WorkflowType,
+    NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind,
+    WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
+use std::hint::black_box;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BenchInput {
     value: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LargePayload {
+    body: String,
 }
 
 #[durust::activity(name = "bench.double")]
@@ -556,6 +562,73 @@ fn activity_map_item_complete(c: &mut Criterion) {
     });
 }
 
+fn payload_codec(c: &mut Criterion) {
+    let payload = large_payload();
+    c.bench_function("payload_encode_messagepack_64kb", |b| {
+        b.iter(|| durust::encode_payload(black_box(&payload)).unwrap());
+    });
+    let messagepack = durust::encode_payload(&payload).unwrap();
+    c.bench_function("payload_decode_messagepack_64kb", |b| {
+        b.iter(|| durust::decode_payload::<LargePayload>(black_box(&messagepack)).unwrap());
+    });
+
+    c.bench_function("payload_encode_json_64kb", |b| {
+        b.iter(|| {
+            durust::encode_payload_with_codec(black_box(&payload), durust::CodecId::Json).unwrap()
+        });
+    });
+    let json = durust::encode_payload_with_codec(&payload, durust::CodecId::Json).unwrap();
+    c.bench_function("payload_decode_json_64kb", |b| {
+        b.iter(|| black_box(&json).decode_json::<LargePayload>().unwrap());
+    });
+}
+
+fn payload_provider_refs(c: &mut Criterion) {
+    c.bench_function("payload_inline_history_stream_memory_64kb", |b| {
+        b.iter_batched(
+            || setup_payload_history(usize::MAX),
+            |(backend, run_id)| {
+                block_on(async {
+                    let chunk = backend
+                        .stream_history(durust::StreamHistoryRequest {
+                            run_id,
+                            after_event_id: EventId::ZERO,
+                            up_to_event_id: EventId(1),
+                            max_events: 100,
+                            max_bytes: usize::MAX,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(chunk.events.len(), 1);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("payload_blob_history_stream_memory_64kb", |b| {
+        b.iter_batched(
+            || setup_payload_history(1),
+            |(backend, run_id)| {
+                block_on(async {
+                    let chunk = backend
+                        .stream_history(durust::StreamHistoryRequest {
+                            run_id,
+                            after_event_id: EventId::ZERO,
+                            up_to_event_id: EventId(1),
+                            max_events: 100,
+                            max_bytes: usize::MAX,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(chunk.events.len(), 1);
+                    assert!(backend.payload_blob_count() > 0);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn setup_started_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -1081,6 +1154,31 @@ fn activity_map_input_manifest(items: u64) -> durust::PayloadRef {
     durust::encode_activity_map_input_manifest(inputs, 32).unwrap()
 }
 
+fn large_payload() -> LargePayload {
+    LargePayload {
+        body: "x".repeat(64 * 1024),
+    }
+}
+
+fn setup_payload_history(inline_threshold_bytes: usize) -> (MemoryBackend, durust::RunId) {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            PayloadStorageConfig::new().inline_threshold_bytes(inline_threshold_bytes),
+        );
+        let outcome = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("bench/payload-history"),
+                workflow_type: WorkflowType::new("bench.double-plus-one", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&large_payload()).unwrap(),
+            })
+            .await
+            .unwrap();
+        (backend, outcome.run_id().clone())
+    })
+}
+
 fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
     ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
@@ -1176,6 +1274,8 @@ criterion_group!(
     version_marker_replay,
     activity_claim_complete,
     activity_heartbeat,
+    payload_codec,
+    payload_provider_refs,
     timer_due_scan_wakeup,
     signal_send_consume,
     activity_map_materialize,

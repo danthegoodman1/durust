@@ -1,5 +1,6 @@
 use crate::{
-    ActivityId, ActivityMapInputManifest, ActivityMapItem, ActivityMapTask, ActivityTask,
+    ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
+    ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
     ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ChildStartOutboxMessage,
     ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask,
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
@@ -400,11 +401,13 @@ impl DurableBackend for MemoryBackend {
                     Ok(map_task) => map_task,
                     Err(err) => return Box::pin(ready(Err(err))),
                 };
-            let manifest_payload =
-                match hydrate_payload_from_storage(&state, map_task.input_manifest.clone()) {
-                    Ok(payload) => payload,
-                    Err(err) => return Box::pin(ready(Err(err))),
-                };
+            let manifest_payload = match hydrate_activity_map_input_manifest_from_storage(
+                &state,
+                map_task.input_manifest.clone(),
+            ) {
+                Ok(payload) => payload,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
             let manifest: ActivityMapInputManifest = match crate::decode_payload(&manifest_payload)
             {
                 Ok(manifest) => manifest,
@@ -1663,7 +1666,8 @@ fn complete_map_item(
     }
 
     let event_id = if let Some((result_manifest, item_count)) = completed_map {
-        let result_manifest = normalize_payload_for_storage(state, config, result_manifest)?;
+        let result_manifest =
+            normalize_activity_map_result_manifest_for_storage(state, config, result_manifest)?;
         let Some(run) = state.runs.get_mut(&task.run_id) else {
             return Err(Error::RunNotFound(task.run_id));
         };
@@ -1851,18 +1855,50 @@ fn normalize_history_event_for_storage(
     config: &PayloadStorageConfig,
     data: HistoryEventData,
 ) -> Result<HistoryEventData> {
-    crate::payload::map_history_event_payloads(data, &mut |payload| {
-        normalize_payload_for_storage(state, config, payload)
-    })
+    match data {
+        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
+            scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
+                state,
+                config,
+                scheduled.input_manifest,
+            )?;
+            Ok(HistoryEventData::ActivityMapScheduled(scheduled))
+        }
+        HistoryEventData::ActivityMapCompleted(mut completed) => {
+            completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
+                state,
+                config,
+                completed.result_manifest,
+            )?;
+            Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        data => crate::payload::map_history_event_payloads(data, &mut |payload| {
+            normalize_payload_for_storage(state, config, payload)
+        }),
+    }
 }
 
 fn hydrate_history_event_from_storage(
     state: &MemoryState,
     data: HistoryEventData,
 ) -> Result<HistoryEventData> {
-    crate::payload::map_history_event_payloads(data, &mut |payload| {
-        hydrate_payload_from_storage(state, payload)
-    })
+    match data {
+        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
+            scheduled.input_manifest =
+                hydrate_activity_map_input_manifest_from_storage(state, scheduled.input_manifest)?;
+            Ok(HistoryEventData::ActivityMapScheduled(scheduled))
+        }
+        HistoryEventData::ActivityMapCompleted(mut completed) => {
+            completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
+                state,
+                completed.result_manifest,
+            )?;
+            Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        data => crate::payload::map_history_event_payloads(data, &mut |payload| {
+            hydrate_payload_from_storage(state, payload)
+        }),
+    }
 }
 
 fn normalize_activity_tasks_for_storage(
@@ -1898,11 +1934,11 @@ fn hydrate_activity_task_from_storage(
 fn normalize_activity_map_task_for_storage(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
-    task: ActivityMapTask,
+    mut task: ActivityMapTask,
 ) -> Result<ActivityMapTask> {
-    crate::payload::map_activity_map_task_payloads(task, &mut |payload| {
-        normalize_payload_for_storage(state, config, payload)
-    })
+    task.input_manifest =
+        normalize_activity_map_input_manifest_for_storage(state, config, task.input_manifest)?;
+    Ok(task)
 }
 
 fn normalize_child_start_messages_for_storage(
@@ -1928,6 +1964,84 @@ fn normalize_failure_for_storage(
     crate::payload::map_failure_payloads(failure, &mut |payload| {
         normalize_payload_for_storage(state, config, payload)
     })
+}
+
+fn normalize_activity_map_input_manifest_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(state, payload)?;
+    let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(state, page)?;
+            let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
+            page.items = page
+                .items
+                .into_iter()
+                .map(|payload| normalize_payload_for_storage(state, config, payload))
+                .collect::<Result<Vec<_>>>()?;
+            normalize_payload_for_storage(state, config, crate::encode_payload(&page)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_payload_for_storage(state, config, crate::encode_payload(&manifest)?)
+}
+
+fn normalize_activity_map_result_manifest_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(state, payload)?;
+    let mut manifest: ActivityMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(state, page)?;
+            let mut page: ActivityMapResultPage = crate::decode_payload(&page)?;
+            page.results = page
+                .results
+                .into_iter()
+                .map(|payload| normalize_payload_for_storage(state, config, payload))
+                .collect::<Result<Vec<_>>>()?;
+            normalize_payload_for_storage(state, config, crate::encode_payload(&page)?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_payload_for_storage(state, config, crate::encode_payload(&manifest)?)
+}
+
+fn hydrate_activity_map_input_manifest_from_storage(
+    state: &MemoryState,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let mut load_container = |payload| hydrate_payload_from_storage(state, payload);
+    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(state, payload);
+    let mut finish_container = Ok;
+    crate::payload::map_activity_map_input_manifest_ref(
+        payload,
+        &mut load_container,
+        &mut hydrate_leaf,
+        &mut finish_container,
+    )
+}
+
+fn hydrate_activity_map_result_manifest_from_storage(
+    state: &MemoryState,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let mut load_container = |payload| hydrate_payload_from_storage(state, payload);
+    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(state, payload);
+    let mut finish_container = Ok;
+    crate::payload::map_activity_map_result_manifest_ref(
+        payload,
+        &mut load_container,
+        &mut hydrate_leaf,
+        &mut finish_container,
+    )
 }
 
 fn normalize_payload_for_storage(

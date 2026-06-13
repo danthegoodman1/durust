@@ -70,6 +70,13 @@ Implemented and covered:
 - Public API hydration coverage for large workflow input, activity input,
   activity result, signal, and query projection payloads through memory and
   SQLite providers.
+- Blob-path public API coverage for child workflow start input and child
+  completion result payloads.
+- Recursive activity map manifest handling for root manifests, page refs, and
+  item/result refs, with forced-offload conformance for memory and SQLite.
+- Runnable `payload_offload` example that forces provider-owned blob storage.
+- Criterion benchmark coverage for MessagePack/JSON encode/decode and
+  inline-vs-blob history streaming over 64 KiB payloads.
 
 Remaining before this phase is done:
 
@@ -80,10 +87,10 @@ Remaining before this phase is done:
   behavior, and orphan blob GC.
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
-- Full blob-path coverage for child workflows, activity map manifests/results,
-  side effects, and recursive manifest page payload refs.
-- Public payload-offload example.
-- Payload codec/offload benchmarks.
+- Blob-path coverage for side effects once side effects are implemented.
+- Public payload-offload documentation for production object stores once S3
+  compatible storage lands.
+- Payload codec/offload benchmark baselines and regression thresholds.
 
 ## Required Tests
 

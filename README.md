@@ -662,6 +662,7 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`activity_spawn_select_all.rs`](examples/activity_spawn_select_all.rs)
 - [`version_branch.rs`](examples/version_branch.rs)
 - [`continue_as_new.rs`](examples/continue_as_new.rs)
+- [`payload_offload.rs`](examples/payload_offload.rs)
 - [`child_workflows.rs`](examples/child_workflows.rs)
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)

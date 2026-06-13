@@ -123,6 +123,8 @@ fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
             "memory-payload-activities",
         )
         .await;
+        payload_offload_child_workflow_round_trip(backend.clone(), "memory").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "memory").await;
         assert!(backend.payload_blob_count() >= 4);
     });
 }
@@ -141,8 +143,10 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
             "sqlite-payload-activities",
         )
         .await;
+        payload_offload_child_workflow_round_trip(backend.clone(), "sqlite").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "sqlite").await;
         let blob_count = backend.payload_blob_count().unwrap();
-        assert!(blob_count >= 4);
+        assert!(blob_count >= 12);
         drop(backend);
 
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
@@ -525,6 +529,346 @@ where
 
 fn large_payload(label: &str) -> String {
     format!("{label}:{}", "x".repeat(64))
+}
+
+async fn payload_offload_child_workflow_round_trip<B>(backend: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let parent_workflow_id = format!("wf/{prefix}-payload-child-parent");
+    let child_workflow_id = format!("wf/{prefix}-payload-child-child");
+    let parent_run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&parent_workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new("payload-child-parent-workflows"),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let parent = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-child-parent")),
+            workflow_claim_opts("payload-child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent workflow task");
+    let command_id = durust::command_id(&parent_run_id, 1);
+    let child_input = large_payload("child-input");
+    let input = durust::encode_payload(&child_input).unwrap();
+    let workflow_type = WorkflowType::new("conformance.workflow", 1);
+    let workflow_id = durust::WorkflowId::new(&child_workflow_id);
+    let task_queue = TaskQueue::new("payload-child-workflows");
+    let requested = durust::ChildWorkflowStartRequested {
+        command_id: command_id.clone(),
+        workflow_type: workflow_type.clone(),
+        workflow_id: workflow_id.clone(),
+        task_queue: task_queue.clone(),
+        input: input.clone(),
+        parent_close_policy: durust::ParentClosePolicy::Cancel,
+        fingerprint: durust::child_workflow_fingerprint(
+            workflow_type,
+            workflow_id,
+            durust::payload_digest(&input),
+            task_queue,
+            durust::ParentClosePolicy::Cancel,
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            parent.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
+                    &requested,
+                )],
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    backend
+        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            namespace: Namespace::default(),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+
+    let child = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-child")),
+            workflow_claim_opts("payload-child-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("child workflow task");
+    let child_history = stream_history(&backend, child.run_id.clone()).await;
+    let HistoryEventData::WorkflowStarted { input, .. } = &child_history[0].data else {
+        panic!("expected child start");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(input).unwrap(),
+        child_input
+    );
+
+    let child_result = large_payload("child-result");
+    backend
+        .commit_workflow_task(
+            child.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCompleted {
+                        result: durust::encode_payload(&child_result).unwrap(),
+                    },
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+    let parent_ready = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-child-parent-ready")),
+            workflow_claim_opts("payload-child-parent-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("parent completion wake");
+    assert_eq!(
+        parent_ready.reason,
+        durust::WorkflowTaskReason::ChildWorkflowCompleted
+    );
+    let parent_history = stream_history(&backend, parent_run_id).await;
+    let requested = parent_history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStartRequested(requested) => Some(requested),
+            _ => None,
+        })
+        .expect("child start request");
+    assert_eq!(
+        durust::decode_payload::<String>(&requested.input).unwrap(),
+        large_payload("child-input")
+    );
+    let completed = parent_history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowCompleted(completed) => Some(completed),
+            _ => None,
+        })
+        .expect("child completion");
+    assert_eq!(
+        durust::decode_payload::<String>(&completed.result).unwrap(),
+        child_result
+    );
+}
+
+async fn payload_offload_activity_map_round_trip<B>(backend: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let workflow_id = format!("wf/{prefix}-payload-map");
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(&workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new("payload-map-workflows"),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-payload-map-scheduler")),
+            workflow_claim_opts("payload-map-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_manifest = durust::encode_activity_map_input_manifest(
+        ["map-input-0", "map-input-1", "map-input-2"]
+            .into_iter()
+            .map(|label| durust::encode_payload(&large_payload(label)).unwrap())
+            .collect(),
+        1,
+    )
+    .unwrap();
+    let activity_name = ActivityName::new("conformance.echo");
+    let task_queue = TaskQueue::new("payload-map-activities");
+    let retry_policy = durust::RetryPolicy::none();
+    let map_task = ActivityMapTask {
+        map_command_id: command_id.clone(),
+        activity_name: activity_name.clone(),
+        task_queue: task_queue.clone(),
+        retry_policy: retry_policy.clone(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input_manifest: input_manifest.clone(),
+        result_manifest_name: "payload-results".to_owned(),
+        max_in_flight: 2,
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
+                        command_id: command_id.clone(),
+                        activity_name,
+                        task_queue,
+                        retry_policy,
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                        input_manifest: input_manifest.clone(),
+                        result_manifest_name: "payload-results".to_owned(),
+                        max_in_flight: 2,
+                        fingerprint: durust::activity_map_fingerprint(
+                            ActivityName::new("conformance.echo"),
+                            durust::payload_digest(&input_manifest),
+                            "payload-results".to_owned(),
+                            2,
+                            "sha256:payload-map-options".to_owned(),
+                        ),
+                    }),
+                )],
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: vec![map_task],
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("payload-map-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new(format!("{prefix}-payload-map-0")),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first map task");
+    let second = backend
+        .claim_activity_task(
+            WorkerId::new(format!("{prefix}-payload-map-1")),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("second map task");
+    assert_string_map_item(&first.task, 0, "map-input-0");
+    assert_string_map_item(&second.task, 1, "map-input-1");
+
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: durust::encode_payload(&large_payload("map-result-0")).unwrap(),
+        })
+        .await
+        .unwrap();
+    let third = backend
+        .claim_activity_task(
+            WorkerId::new(format!("{prefix}-payload-map-2")),
+            activity_opts,
+        )
+        .await
+        .unwrap()
+        .expect("third map task");
+    assert_string_map_item(&third.task, 2, "map-input-2");
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: third.claim,
+            result: durust::encode_payload(&large_payload("map-result-2")).unwrap(),
+        })
+        .await
+        .unwrap();
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: durust::encode_payload(&large_payload("map-result-1")).unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityMapScheduled(scheduled) = &history[1].data else {
+        panic!("expected activity map scheduled event");
+    };
+    let manifest: ActivityMapInputManifest =
+        durust::decode_payload(&scheduled.input_manifest).unwrap();
+    assert_eq!(manifest.item_count, 3);
+    for (ordinal, page) in manifest.pages.iter().enumerate() {
+        let page: durust::ActivityMapInputPage = durust::decode_payload(page).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            durust::decode_payload::<String>(&page.items[0]).unwrap(),
+            large_payload(&format!("map-input-{ordinal}"))
+        );
+    }
+
+    let HistoryEventData::ActivityMapCompleted(completed) = &history[2].data else {
+        panic!("expected activity map completed event");
+    };
+    let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+    let values = results
+        .iter()
+        .map(|payload| durust::decode_payload::<String>(payload).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            large_payload("map-result-0"),
+            large_payload("map-result-1"),
+            large_payload("map-result-2")
+        ]
+    );
+}
+
+fn assert_string_map_item(task: &durust::ActivityTask, ordinal: u64, label: &str) {
+    let map_item = task.map_item.as_ref().expect("map item metadata");
+    assert_eq!(map_item.item_ordinal, ordinal);
+    assert_eq!(
+        durust::decode_payload::<String>(&task.input).unwrap(),
+        large_payload(label)
+    );
+    assert!(matches!(task.input, durust::PayloadRef::Inline { .. }));
 }
 
 async fn workflow_claim_filters_by_queue_and_registered_type<B>(backend: B)
