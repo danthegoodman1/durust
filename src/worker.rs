@@ -866,6 +866,12 @@ where
             }
             Poll::Pending => {}
         }
+        let runtime_appended_tail = EventId(
+            claimed
+                .replay_target_event_id
+                .0
+                .saturating_add(u64::try_from(append_events.len()).unwrap_or(u64::MAX)),
+        );
 
         let commit = self
             .backend
@@ -893,6 +899,9 @@ where
         };
 
         if terminal {
+            return Ok(None);
+        }
+        if last_event_id > runtime_appended_tail {
             return Ok(None);
         }
 

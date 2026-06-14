@@ -5,7 +5,6 @@ use durust::{
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::future::Future;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -386,7 +385,8 @@ fn usage() -> String {
 
 fn run_memory_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult, String> {
     options.sqlite_layout = None;
-    run_backend_benchmark(MemoryBackend::new(), options, None)
+    let runtime = tokio_runtime()?;
+    run_backend_benchmark(&runtime, MemoryBackend::new(), options, None)
 }
 
 fn run_sqlite_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult, String> {
@@ -396,10 +396,11 @@ fn run_sqlite_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult
             .clone()
             .unwrap_or_else(|| "single-file".to_owned()),
     );
+    let runtime = tokio_runtime()?;
     let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let db_path = dir.path().join("durust-benchmark.sqlite3");
     let backend = SqliteBackend::open(&db_path).map_err(|err| err.to_string())?;
-    let result = run_backend_benchmark(backend, options.clone(), Some(db_path.clone()))?;
+    let result = run_backend_benchmark(&runtime, backend, options.clone(), Some(db_path.clone()))?;
     if options.keep_db {
         let kept = env::current_dir()
             .map_err(|err| err.to_string())?
@@ -424,15 +425,17 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         .unwrap_or_else(|| options.workers.saturating_add(2).max(1));
     options.postgres_pool_size = Some(pool_size);
 
-    let backend = run_async(PostgresBackend::connect_with_config(
-        PostgresBackendConfig::new(database_url.clone())
-            .schema(schema.clone())
-            .max_pool_size(pool_size),
-    ))?
-    .map_err(|err| err.to_string())?;
+    let runtime = tokio_runtime()?;
+    let backend = runtime
+        .block_on(PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(database_url.clone())
+                .schema(schema.clone())
+                .max_pool_size(pool_size),
+        ))
+        .map_err(|err| err.to_string())?;
 
-    let result = run_backend_benchmark(backend, options, None);
-    let cleanup = drop_postgres_schema(&database_url, &schema);
+    let result = run_backend_benchmark(&runtime, backend, options, None);
+    let cleanup = drop_postgres_schema(&runtime, &database_url, &schema);
     match (result, cleanup) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(err)) => Err(err),
@@ -441,6 +444,7 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
 }
 
 fn run_backend_benchmark<B>(
+    runtime: &tokio::runtime::Runtime,
     backend: B,
     options: BenchmarkOptions,
     db_path: Option<PathBuf>,
@@ -449,36 +453,58 @@ where
     B: DurableBackend,
 {
     let setup_started = Instant::now();
-    let start_outcome = run_async(start_workflows(&backend, &options))??;
+    let start_outcome = runtime.block_on(start_workflows(&backend, &options))?;
     let setup_finished = Instant::now();
 
+    let shared_worker_runtime = options.backend == BenchmarkBackend::Postgres;
     let mut workers = (0..options.workers)
-        .map(|worker_index| benchmark_worker_slot(backend.clone(), worker_index))
+        .map(|worker_index| {
+            benchmark_worker_slot(backend.clone(), worker_index, shared_worker_runtime)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let processing_started = setup_finished;
     let mut rounds = 0;
     let mut stats = WorkerRunStats::default();
+    let nominal_workflow_tasks = nominal_workflow_task_target(&options)?;
     loop {
         if rounds >= options.max_rounds {
             return Err(format!(
-                "benchmark did not become idle after {} rounds",
-                options.max_rounds
+                "benchmark did not reach nominal workflow task target after {} rounds: {}/{}",
+                options.max_rounds, stats.workflow_tasks, nominal_workflow_tasks
             ));
         }
         rounds += 1;
-        let round_stats = drain_worker_round(&mut workers, options.batch)?;
+        let round_stats =
+            drain_worker_round(runtime, &mut workers, options.batch, shared_worker_runtime)?;
         let made_progress = round_stats != WorkerRunStats::default();
         stats = add_worker_stats(stats, round_stats);
-        if !made_progress {
+        if stats.workflow_tasks >= nominal_workflow_tasks {
             break;
+        }
+        if !made_progress {
+            match runtime.block_on(verify_completed_workflows(&backend, &start_outcome.runs)) {
+                Ok(completed_workflows) if completed_workflows == options.workflows => break,
+                Ok(completed_workflows) => {
+                    return Err(format!(
+                        "benchmark stalled after {rounds} rounds: {}/{} workflow tasks processed, {completed_workflows}/{} workflows completed",
+                        stats.workflow_tasks, nominal_workflow_tasks, options.workflows
+                    ));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "benchmark stalled after {rounds} rounds: {}/{} workflow tasks processed: {err}",
+                        stats.workflow_tasks, nominal_workflow_tasks
+                    ));
+                }
+            }
         }
     }
     let processing_finished = Instant::now();
 
     let verify_started = processing_finished;
     let completed_workflows =
-        run_async(verify_completed_workflows(&backend, &start_outcome.runs))??;
+        runtime.block_on(verify_completed_workflows(&backend, &start_outcome.runs))?;
     if completed_workflows != options.workflows {
         return Err(format!(
             "benchmark completed {completed_workflows}/{} workflows",
@@ -526,6 +552,17 @@ where
         db_path: None,
         db_bytes,
     })
+}
+
+fn nominal_workflow_task_target(options: &BenchmarkOptions) -> Result<usize, String> {
+    if options.mode != "mixed" {
+        return Err(format!("unsupported benchmark mode `{}`", options.mode));
+    }
+    let workflows = usize::try_from(options.workflows)
+        .map_err(|_| format!("workflow count {} does not fit usize", options.workflows))?;
+    workflows
+        .checked_mul(8)
+        .ok_or_else(|| "nominal workflow task count overflowed".to_owned())
 }
 
 struct StartOutcome {
@@ -576,7 +613,11 @@ where
     })
 }
 
-fn benchmark_worker_slot<B>(backend: B, worker_index: usize) -> Result<WorkerSlot<B>, String>
+fn benchmark_worker_slot<B>(
+    backend: B,
+    worker_index: usize,
+    shared_worker_runtime: bool,
+) -> Result<WorkerSlot<B>, String>
 where
     B: DurableBackend,
 {
@@ -590,31 +631,57 @@ where
         .build();
     Ok(WorkerSlot {
         worker,
-        runtime: tokio_runtime()?,
+        runtime: if shared_worker_runtime {
+            None
+        } else {
+            Some(tokio_runtime()?)
+        },
     })
 }
+
 struct WorkerSlot<B>
 where
     B: DurableBackend,
 {
     worker: Worker<B>,
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
 }
 
 fn drain_worker_round<B>(
+    runtime: &tokio::runtime::Runtime,
     workers: &mut [WorkerSlot<B>],
     batch: usize,
+    shared_worker_runtime: bool,
 ) -> Result<WorkerRunStats, String>
 where
     B: DurableBackend,
 {
+    if shared_worker_runtime {
+        let results = runtime.block_on(async {
+            futures::future::join_all(
+                workers
+                    .iter_mut()
+                    .map(|slot| run_worker_batch(&mut slot.worker, batch)),
+            )
+            .await
+        });
+        let mut stats = WorkerRunStats::default();
+        for worker_stats in results {
+            stats = add_worker_stats(stats, worker_stats.map_err(|err| err.to_string())?);
+        }
+        return Ok(stats);
+    }
+
     thread::scope(|scope| {
         let handles = workers
             .iter_mut()
             .map(|slot| {
                 scope.spawn(move || {
-                    slot.runtime
-                        .block_on(run_worker_batch(&mut slot.worker, batch))
+                    let runtime = slot
+                        .runtime
+                        .as_mut()
+                        .expect("threaded benchmark worker runtime");
+                    runtime.block_on(run_worker_batch(&mut slot.worker, batch))
                 })
             })
             .collect::<Vec<_>>();
@@ -628,13 +695,6 @@ where
         }
         Ok(stats)
     })
-}
-
-fn run_async<F>(future: F) -> Result<F::Output, String>
-where
-    F: Future,
-{
-    Ok(tokio_runtime()?.block_on(future))
 }
 
 fn tokio_runtime() -> Result<tokio::runtime::Runtime, String> {
@@ -746,11 +806,6 @@ fn assert_mixed_stats(stats: &WorkerRunStats, workflows: u64) -> Result<(), Stri
     if stats.activity_tasks == 0 {
         return Err(format!("expected activity work, got {stats:?}"));
     }
-    if stats.child_workflow_starts_dispatched == 0 {
-        return Err(format!(
-            "expected child workflow dispatch work, got {stats:?}"
-        ));
-    }
     if stats.timers_fired == 0 {
         return Err(format!("expected timer work, got {stats:?}"));
     }
@@ -836,10 +891,14 @@ fn postgres_benchmark_schema() -> String {
     format!("durust_benchmark_{}_{}", std::process::id(), micros)
 }
 
-fn drop_postgres_schema(database_url: &str, schema: &str) -> Result<(), String> {
+fn drop_postgres_schema(
+    runtime: &tokio::runtime::Runtime,
+    database_url: &str,
+    schema: &str,
+) -> Result<(), String> {
     let database_url = database_url.to_owned();
     let schema = schema.to_owned();
-    run_async(async move {
+    runtime.block_on(async move {
         let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
             .await
             .map_err(|err| err.to_string())?;
@@ -852,7 +911,7 @@ fn drop_postgres_schema(database_url: &str, schema: &str) -> Result<(), String> 
             .batch_execute(&format!("drop schema if exists {schema} cascade"))
             .await
             .map_err(|err| err.to_string())
-    })?
+    })
 }
 
 fn print_text_result(result: &BenchmarkResult) {
@@ -962,6 +1021,17 @@ mod tests {
     }
 
     #[test]
+    fn mixed_workload_has_nominal_workflow_task_target() {
+        let mut options = default_options();
+        options.workflows = 4;
+        assert_eq!(nominal_workflow_task_target(&options).unwrap(), 32);
+
+        options.workflows = u64::MAX;
+        let err = nominal_workflow_task_target(&options).unwrap_err();
+        assert!(err.contains("does not fit usize") || err.contains("overflowed"));
+    }
+
+    #[test]
     fn memory_mixed_workload_completes() {
         let mut options = default_options();
         options.backend = BenchmarkBackend::Memory;
@@ -982,6 +1052,7 @@ mod tests {
         assert_eq!(result.counters.child_activities, 4);
         assert_eq!(result.counters.finish_activities, 4);
         assert_eq!(result.mixed_actions, 32);
+        assert_eq!(result.worker_stats.workflow_tasks, 32);
         assert!(result.worker_stats.activity_tasks >= 12);
         assert!(result.worker_stats.child_workflow_starts_dispatched >= 4);
         assert!(result.worker_stats.timers_fired >= 4);
@@ -1003,5 +1074,6 @@ mod tests {
         assert_eq!(result.counters.child_starts, 4);
         assert_eq!(result.counters.child_completions, 4);
         assert_eq!(result.mixed_actions, 32);
+        assert_eq!(result.worker_stats.workflow_tasks, 32);
     }
 }

@@ -205,6 +205,51 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     assert!(compare_source.contains("benchmark dimensions differ"));
 }
 
+#[test]
+fn phase_0012_mixed_postgres_baseline_is_dimensioned_and_semantic() {
+    let baseline: Value = serde_json::from_str(include_str!(
+        "../benches/baselines/durust-mixed-postgres.json"
+    ))
+    .expect("mixed Postgres benchmark baseline should be valid JSON");
+    assert_eq!(baseline["backend"], "postgres");
+    assert_eq!(baseline["mode"], "mixed");
+    assert_eq!(baseline["correct"], true);
+
+    let options = &baseline["options"];
+    assert_eq!(options["workflows"], 1000);
+    assert_eq!(options["workers"], 4);
+    assert_eq!(options["shards"], 1);
+    assert_eq!(options["activationConcurrency"], 1);
+    assert_eq!(options["activationPrefetchLimit"], 1);
+    assert_eq!(options["batch"], 32);
+    assert_eq!(options["postgresPoolSize"], 8);
+
+    assert_eq!(baseline["completedWorkflows"], 1000);
+    assert_eq!(baseline["mixedActions"], 8000);
+    positive_f64(&baseline, "processingWorkflowsPerSecond");
+    positive_f64(&baseline, "processingMixedActionsPerSecond");
+
+    let counters = &baseline["counters"];
+    for field in [
+        "workflowStarts",
+        "signals",
+        "childStarts",
+        "childCompletions",
+        "timerHandlers",
+        "bootActivities",
+        "childActivities",
+        "finishActivities",
+    ] {
+        assert_eq!(counters[field], 1000, "semantic counter `{field}` drifted");
+    }
+    assert!(
+        counters["workflowTasks"].as_u64().unwrap() <= 8000,
+        "Postgres may coalesce ready events during cold replay, but must not exceed the nominal task target"
+    );
+    assert_eq!(counters["activityTasks"], 3000);
+    assert_eq!(counters["timersFired"], 1000);
+}
+
 fn benchmark_exists(source: &str, name: &str) -> bool {
     if let Some((group, function)) = name.split_once('/') {
         source.contains(&format!("benchmark_group(\"{group}\")"))

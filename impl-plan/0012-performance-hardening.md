@@ -65,11 +65,20 @@ Implemented:
   batch 32. The captured release run completed 1,000 workflows, 8,000 semantic
   mixed actions, 8,000 workflow tasks, and reports about 44.5 processing
   workflows/sec and 356.3 processing mixed-actions/sec.
+- `benches/baselines/durust-mixed-postgres.json`, the first checked-in
+  env-gated Postgres baseline artifact. The accepted dimension is Postgres,
+  mixed mode, 1,000 workflows, 4 workers, shard/concurrency/prefetch dimensions
+  set to 1, batch 32, and pool size 8. The captured release run completed 1,000
+  workflows, 8,000 semantic mixed actions, 7,973 workflow tasks, and reports
+  about 41.7 processing workflows/sec and 333.3 processing mixed-actions/sec.
+  Workflow task count is provider/order dependent because cold replay may
+  consume multiple ready history events in one task; semantic mixed actions are
+  the stable cross-provider workload dimension.
+- `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
+  benchmark smoke runs and future checked-in Postgres workload baselines.
 
 Remaining:
 
-- Run and record env-gated Postgres workload numbers with
-  `DURUST_POSTGRES_URL`.
 - Add comparable benchmark support for additional modes: bare, activity,
   signal, timer, child, activity map, payload refs, recovery, and cached wake
   under recovery load.
@@ -99,6 +108,8 @@ cargo run --release --locked --bin durust-benchmark-workload -- \
 Current Durust mixed Postgres workload:
 
 ```bash
+docker compose -f tests/fixtures/postgres.compose.yml up -d --wait
+
 DURUST_POSTGRES_URL=postgresql://durable:durable@127.0.0.1:55432/durable \
   cargo run --release --locked --bin durust-benchmark-workload -- \
   --backend postgres \
@@ -110,7 +121,9 @@ DURUST_POSTGRES_URL=postgresql://durable:durable@127.0.0.1:55432/durable \
   --activation-prefetch-limit 1 \
   --batch 32 \
   --postgres-pool-size 8 \
-  --json
+  --json > target/durust-mixed-postgres.json
+
+docker compose -f tests/fixtures/postgres.compose.yml down -v
 ```
 
 Regression gate for captured JSON files:
@@ -119,6 +132,11 @@ Regression gate for captured JSON files:
 cargo run --release --locked --bin durust-benchmark-compare -- \
   --durust target/durust-mixed-sqlite.json \
   --baseline benches/baselines/durust-mixed-sqlite.json \
+  --min-ratio 0.95
+
+cargo run --release --locked --bin durust-benchmark-compare -- \
+  --durust target/durust-mixed-postgres.json \
+  --baseline benches/baselines/durust-mixed-postgres.json \
   --min-ratio 0.95
 ```
 
