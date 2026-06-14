@@ -1,9 +1,10 @@
 use durust::{
     ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ActivityName,
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, Client, CommitOutcome, CompleteActivityRequest,
-    DurableBackend, Error, EventId, FailActivityRequest, HistoryEventData, MemoryBackend,
-    Namespace, PayloadBackend, PostgresBackend, PostgresBackendConfig, Registry, SqliteBackend,
-    TaskQueue, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
+    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client,
+    CommitOutcome, CompleteActivityRequest, DurableBackend, Error, EventId, FailActivityRequest,
+    HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent, PayloadBackend, PostgresBackend,
+    PostgresBackendConfig, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
+    WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
 };
 use futures::executor::block_on;
 use futures::future::{BoxFuture, ready};
@@ -1007,6 +1008,7 @@ where
     activity_map_failure_suppresses_remaining_items_and_wakes_workflow(backend.clone()).await;
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
     stale_workflow_task_commit_conflicts(backend.clone()).await;
+    batch_workflow_task_claim_and_commit_results_are_ordered(backend.clone()).await;
     activity_claim_filters_and_stale_completion_is_rejected(backend).await;
 }
 
@@ -2255,6 +2257,78 @@ where
         .await
         .unwrap();
     assert_eq!(outcome, CommitOutcome::Conflict);
+}
+
+async fn batch_workflow_task_claim_and_commit_results_are_ordered<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/batch-commit-a", "batch-workflows", 11)
+        .await
+        .unwrap();
+    client
+        .start_workflow::<workflow>("wf/batch-commit-b", "batch-workflows", 12)
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("batch-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let mut claimed = backend
+        .claim_workflow_tasks(
+            WorkerId::new("batch-worker"),
+            ClaimWorkflowTasksOptions {
+                claim: claim_opts,
+                limit: 2,
+                shard_filter: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 2);
+    let first = claimed.remove(0);
+    let second = claimed.remove(0);
+    let completion = WorkflowTaskCommit {
+        expected_tail_event_id: first.replay_target_event_id,
+        append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+            result: durust::encode_payload(&first.run_id.0).unwrap(),
+        })],
+        ..WorkflowTaskCommit::default()
+    };
+    let stale = WorkflowTaskCommit {
+        expected_tail_event_id: EventId::ZERO,
+        ..WorkflowTaskCommit::default()
+    };
+    let results = backend
+        .commit_workflow_tasks(WorkflowTaskCommitBatch {
+            commits: vec![
+                WorkflowTaskCommitInput {
+                    claim: first.claim.clone(),
+                    commit: completion,
+                },
+                WorkflowTaskCommitInput {
+                    claim: second.claim.clone(),
+                    commit: stale,
+                },
+            ],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].claim.run_id, first.run_id);
+    assert_eq!(
+        results[0].result,
+        Ok(CommitOutcome::Committed {
+            new_tail_event_id: EventId(2),
+        })
+    );
+    assert_eq!(results[1].claim.run_id, second.run_id);
+    assert_eq!(results[1].result, Ok(CommitOutcome::Conflict));
 }
 
 async fn released_workflow_task_is_claimable_again<B>(backend: B)

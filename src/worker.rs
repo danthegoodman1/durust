@@ -1,11 +1,11 @@
 use crate::{
     ActivityHeartbeatRequest, ClaimActivityOptions, ClaimWorkflowTaskOptions,
-    CompleteActivityRequest, DurableBackend, Error, EventId, FailActivityRequest,
-    FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace, NewHistoryEvent,
-    ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowChangeVersionsRequest, WorkflowId,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease, poll_with_activity_context,
-    poll_with_runtime_context,
+    ClaimWorkflowTasksOptions, CompleteActivityRequest, DurableBackend, Error, EventId,
+    FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace,
+    NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, ShardId,
+    StartWorkflowRequest, TaskQueue, TimeoutDueActivitiesRequest, WorkerId, Workflow,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
+    WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -158,6 +158,7 @@ where
     history_chunk_bytes: usize,
     payload_codec: crate::CodecId,
     nondeterminism_retry_backoff: Duration,
+    workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
     active_recoveries: usize,
     max_local_activities_per_workflow_task: usize,
@@ -169,6 +170,27 @@ struct CachedWorkflow {
     last_event_id: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowTaskConcurrency {
+    max_concurrent_workflow_tasks: usize,
+    prefetch_limit: usize,
+    commit_batch_size: usize,
+    commit_max_delay: Duration,
+    shard_filter: Option<Vec<ShardId>>,
+}
+
+impl Default for WorkflowTaskConcurrency {
+    fn default() -> Self {
+        Self {
+            max_concurrent_workflow_tasks: 1,
+            prefetch_limit: 1,
+            commit_batch_size: 1,
+            commit_max_delay: Duration::ZERO,
+            shard_filter: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,6 +282,7 @@ where
             history_chunk_events: 128,
             history_chunk_bytes: 256 * 1024,
             nondeterminism_retry_backoff: Duration::from_secs(60),
+            workflow_task_concurrency: WorkflowTaskConcurrency::default(),
             recovery_flow_control: RecoveryFlowControl::default(),
             max_local_activities_per_workflow_task: 0,
         }
@@ -283,6 +306,52 @@ where
             return Ok(false);
         };
 
+        self.run_claimed_workflow_task(claimed).await?;
+        Ok(true)
+    }
+
+    pub async fn run_workflow_batch_once(&mut self) -> Result<usize> {
+        let limit = self
+            .workflow_task_concurrency
+            .prefetch_limit
+            .min(self.workflow_task_concurrency.max_concurrent_workflow_tasks)
+            .max(1);
+        if limit == 1 && self.workflow_task_concurrency.shard_filter.is_none() {
+            return self.run_workflow_once().await.map(usize::from);
+        }
+
+        let claimed = self
+            .backend
+            .claim_workflow_tasks(
+                self.worker_id.clone(),
+                ClaimWorkflowTasksOptions {
+                    claim: ClaimWorkflowTaskOptions {
+                        namespace: self.namespace.clone(),
+                        task_queue: self.workflow_task_queue.clone(),
+                        registered_workflow_types: self.registry.workflow_types(),
+                        lease_duration: Duration::from_secs(30),
+                    },
+                    limit,
+                    shard_filter: self.workflow_task_concurrency.shard_filter.clone(),
+                },
+            )
+            .await?;
+        if claimed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut processed = 0usize;
+        for task in claimed {
+            self.run_claimed_workflow_task(task).await?;
+            processed += 1;
+        }
+        Ok(processed)
+    }
+
+    async fn run_claimed_workflow_task(
+        &mut self,
+        claimed: crate::ClaimedWorkflowTask,
+    ) -> Result<()> {
         let run_id = claimed.run_id.clone();
         let claim_for_release = claimed.claim.clone();
         let cached = self.cache.remove(&claimed.run_id);
@@ -454,7 +523,7 @@ where
                             WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
                         )
                         .await;
-                    return Ok(true);
+                    return Ok(());
                 }
                 let release = if matches!(
                     &err,
@@ -476,14 +545,14 @@ where
         };
 
         let WorkflowTaskOutcome::Finished(entry) = entry else {
-            return Ok(true);
+            return Ok(());
         };
 
         if let Some(entry) = entry {
             self.cache.insert(run_id, entry);
         }
         self.run_local_activities_after_workflow_task().await?;
-        Ok(true)
+        Ok(())
     }
 
     pub async fn run_activity_once(&mut self) -> Result<bool> {
@@ -592,8 +661,9 @@ where
         for _ in 0..opts.max_iterations {
             let mut progressed = false;
 
-            if self.run_workflow_once().await? {
-                stats.workflow_tasks += 1;
+            let workflow_tasks = self.run_workflow_batch_once().await?;
+            if workflow_tasks > 0 {
+                stats.workflow_tasks += workflow_tasks;
                 progressed = true;
             }
             let local_activity_tasks = self.take_completed_local_activity_tasks();
@@ -971,6 +1041,7 @@ where
     history_chunk_events: usize,
     history_chunk_bytes: usize,
     nondeterminism_retry_backoff: Duration,
+    workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
     max_local_activities_per_workflow_task: usize,
 }
@@ -1011,6 +1082,32 @@ where
 
     pub fn nondeterminism_retry_backoff(mut self, backoff: Duration) -> Self {
         self.nondeterminism_retry_backoff = backoff;
+        self
+    }
+
+    pub fn max_concurrent_workflow_tasks(mut self, limit: usize) -> Self {
+        self.workflow_task_concurrency.max_concurrent_workflow_tasks = limit.max(1);
+        self
+    }
+
+    pub fn workflow_task_prefetch_limit(mut self, limit: usize) -> Self {
+        self.workflow_task_concurrency.prefetch_limit = limit.max(1);
+        self
+    }
+
+    pub fn workflow_task_commit_batch_size(mut self, limit: usize) -> Self {
+        self.workflow_task_concurrency.commit_batch_size = limit.max(1);
+        self
+    }
+
+    pub fn workflow_task_commit_max_delay(mut self, delay: Duration) -> Self {
+        self.workflow_task_concurrency.commit_max_delay = delay;
+        self
+    }
+
+    pub fn workflow_task_shard_filter(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
+        let shards = shards.into_iter().collect::<Vec<_>>();
+        self.workflow_task_concurrency.shard_filter = (!shards.is_empty()).then_some(shards);
         self
     }
 
@@ -1094,6 +1191,7 @@ where
             history_chunk_bytes: self.history_chunk_bytes,
             payload_codec,
             nondeterminism_retry_backoff: self.nondeterminism_retry_backoff,
+            workflow_task_concurrency: self.workflow_task_concurrency,
             recovery_flow_control: self.recovery_flow_control,
             active_recoveries: 0,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,

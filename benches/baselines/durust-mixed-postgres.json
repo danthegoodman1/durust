@@ -8,6 +8,7 @@
     "workflowOffset": 0,
     "workers": 4,
     "shards": 1,
+    "physicalPartitions": 1,
     "activationConcurrency": 1,
     "activationPrefetchLimit": 1,
     "activityDelayMs": 0,

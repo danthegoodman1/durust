@@ -89,8 +89,11 @@ Remaining:
   merely larger drain loops. This should stay generic at the runtime/backend
   contract boundary and preserve per-run fencing, event ordering, and crash
   safety.
-- Decide whether worker-level activation concurrency/prefetch should become
-  real runtime knobs before accepting benchmark dimensions with values above 1.
+- Implement `0013-postgres-shard-native.md` before accepting Postgres benchmark
+  dimensions with shard count, activation concurrency, prefetch, or batch size
+  above 1. The normalized Postgres layout remains the correctness baseline;
+  the shard-native layout inside `PostgresBackend` owns the scale-out benchmark
+  gate.
 - Wire CI/performance-job guidance.
 - Add checked-in baseline files or captured-output artifacts for the remaining
   accepted benchmark dimensions.

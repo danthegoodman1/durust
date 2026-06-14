@@ -1,6 +1,7 @@
 use durust::{
     Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, PostgresBackend,
-    PostgresBackendConfig, RunId, SqliteBackend, StreamHistoryRequest, Worker, WorkerRunStats,
+    PostgresBackendConfig, RunId, ShardId, SqliteBackend, StreamHistoryRequest, Worker,
+    WorkerRunStats,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -45,6 +46,7 @@ struct BenchmarkOptions {
     workflow_offset: u64,
     workers: usize,
     shards: u64,
+    physical_partitions: u64,
     activation_concurrency: u64,
     activation_prefetch_limit: u64,
     activity_delay_ms: u64,
@@ -218,6 +220,7 @@ fn default_options() -> BenchmarkOptions {
         workflow_offset: 0,
         workers: DEFAULT_WORKERS,
         shards: 1,
+        physical_partitions: 1,
         activation_concurrency: 1,
         activation_prefetch_limit: 1,
         activity_delay_ms: 0,
@@ -269,6 +272,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 options.shards =
                     parse_positive_u64(next_arg(&mut args, flag, inline_value)?, flag)?;
             }
+            "--physical-partitions" => {
+                options.physical_partitions =
+                    parse_positive_u64(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
             "--activation-concurrency" => {
                 options.activation_concurrency =
                     parse_positive_u64(next_arg(&mut args, flag, inline_value)?, flag)?;
@@ -306,17 +313,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
 }
 
 fn validate_supported_dimensions(options: &BenchmarkOptions) -> Result<(), String> {
-    if options.shards != 1 {
-        return Err("Durust benchmark workload currently supports --shards 1".to_owned());
+    if options.backend != BenchmarkBackend::Postgres && options.shards != 1 {
+        return Err("--shards above 1 currently requires --backend postgres".to_owned());
     }
-    if options.activation_concurrency != 1 {
+    if options.backend != BenchmarkBackend::Postgres && options.physical_partitions != 1 {
         return Err(
-            "Durust benchmark workload currently supports --activation-concurrency 1".to_owned(),
-        );
-    }
-    if options.activation_prefetch_limit != 1 {
-        return Err(
-            "Durust benchmark workload currently supports --activation-prefetch-limit 1".to_owned(),
+            "--physical-partitions above 1 currently requires --backend postgres".to_owned(),
         );
     }
     if options.backend != BenchmarkBackend::Sqlite && options.keep_db {
@@ -378,7 +380,9 @@ fn parse_positive_usize(value: String, flag: &str) -> Result<usize, String> {
 fn usage() -> String {
     format!(
         "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed] \
-         [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] \
+         [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] [--shards 1] \
+         [--physical-partitions 1] [--activation-concurrency 1] \
+         [--activation-prefetch-limit 1] \
          [--batch {DEFAULT_BATCH}] [--max-rounds {DEFAULT_MAX_ROUNDS}] [--json]"
     )
 }
@@ -424,13 +428,23 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         .postgres_pool_size
         .unwrap_or_else(|| options.workers.saturating_add(2).max(1));
     options.postgres_pool_size = Some(pool_size);
+    let logical_shards = u32::try_from(options.shards)
+        .map_err(|_| format!("--shards {} does not fit u32", options.shards))?;
+    let physical_partitions = u32::try_from(options.physical_partitions).map_err(|_| {
+        format!(
+            "--physical-partitions {} does not fit u32",
+            options.physical_partitions
+        )
+    })?;
 
     let runtime = tokio_runtime()?;
     let backend = runtime
         .block_on(PostgresBackend::connect_with_config(
             PostgresBackendConfig::new(database_url.clone())
                 .schema(schema.clone())
-                .max_pool_size(pool_size),
+                .max_pool_size(pool_size)
+                .logical_shards(logical_shards)
+                .physical_partitions(physical_partitions),
         ))
         .map_err(|err| err.to_string())?;
 
@@ -459,7 +473,12 @@ where
     let shared_worker_runtime = options.backend == BenchmarkBackend::Postgres;
     let mut workers = (0..options.workers)
         .map(|worker_index| {
-            benchmark_worker_slot(backend.clone(), worker_index, shared_worker_runtime)
+            benchmark_worker_slot(
+                backend.clone(),
+                worker_index,
+                shared_worker_runtime,
+                &options,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -617,18 +636,43 @@ fn benchmark_worker_slot<B>(
     backend: B,
     worker_index: usize,
     shared_worker_runtime: bool,
+    options: &BenchmarkOptions,
 ) -> Result<WorkerSlot<B>, String>
 where
     B: DurableBackend,
 {
-    let worker = Worker::builder(backend)
+    let mut builder = Worker::builder(backend)
         .worker_id(format!("durust-benchmark-worker-{worker_index}"))
         .workflow_task_queue(WORKFLOW_QUEUE)
         .activity_task_queue(ACTIVITY_QUEUE)
+        .max_concurrent_workflow_tasks(usize::try_from(options.activation_concurrency).map_err(
+            |_| {
+                format!(
+                    "--activation-concurrency {} does not fit usize",
+                    options.activation_concurrency
+                )
+            },
+        )?)
+        .workflow_task_prefetch_limit(usize::try_from(options.activation_prefetch_limit).map_err(
+            |_| {
+                format!(
+                    "--activation-prefetch-limit {} does not fit usize",
+                    options.activation_prefetch_limit
+                )
+            },
+        )?)
+        .workflow_task_commit_batch_size(options.batch)
         .register_workflow(benchmark_parent)
         .register_workflow(benchmark_child)
-        .register_activity(benchmark_activity)
-        .build();
+        .register_activity(benchmark_activity);
+    if options.backend == BenchmarkBackend::Postgres && options.shards > 1 {
+        builder = builder.workflow_task_shard_filter(worker_shards(
+            worker_index,
+            options.workers,
+            options.shards,
+        )?);
+    }
+    let worker = builder.build();
     Ok(WorkerSlot {
         worker,
         runtime: if shared_worker_runtime {
@@ -704,6 +748,22 @@ fn tokio_runtime() -> Result<tokio::runtime::Runtime, String> {
         .map_err(|err| err.to_string())
 }
 
+fn worker_shards(worker_index: usize, workers: usize, shards: u64) -> Result<Vec<ShardId>, String> {
+    let worker_index = u64::try_from(worker_index)
+        .map_err(|_| format!("worker index {worker_index} does not fit u64"))?;
+    let workers =
+        u64::try_from(workers).map_err(|_| format!("worker count {workers} does not fit u64"))?;
+    let mut assigned = Vec::new();
+    for shard in 0..shards {
+        if shard % workers == worker_index {
+            assigned.push(ShardId(
+                u32::try_from(shard).map_err(|_| format!("shard {shard} does not fit u32"))?,
+            ));
+        }
+    }
+    Ok(assigned)
+}
+
 async fn run_worker_batch<B>(worker: &mut Worker<B>, batch: usize) -> durust::Result<WorkerRunStats>
 where
     B: DurableBackend,
@@ -712,8 +772,9 @@ where
     for _ in 0..batch {
         let mut progressed = false;
 
-        if worker.run_workflow_once().await? {
-            stats.workflow_tasks += 1;
+        let workflow_tasks = worker.run_workflow_batch_once().await?;
+        if workflow_tasks > 0 {
+            stats.workflow_tasks += workflow_tasks;
             progressed = true;
         }
         let timers_fired = worker.run_timers_once().await?;
@@ -925,6 +986,10 @@ fn print_text_result(result: &BenchmarkResult) {
     println!("  workers: {}", result.options.workers);
     println!("  shards: {}", result.options.shards);
     println!(
+        "  physical partitions: {}",
+        result.options.physical_partitions
+    );
+    println!(
         "  activation concurrency: {}",
         result.options.activation_concurrency
     );
@@ -990,21 +1055,18 @@ mod tests {
         assert_eq!(options.mode, "mixed");
         assert_eq!(options.workflows, DEFAULT_WORKFLOWS);
         assert_eq!(options.shards, 1);
+        assert_eq!(options.physical_partitions, 1);
         assert_eq!(options.activation_concurrency, 1);
         assert_eq!(options.activation_prefetch_limit, 1);
     }
 
     #[test]
-    fn rejects_unsupported_dimensions() {
+    fn rejects_shards_for_non_postgres_backends() {
         let err = parse_args(["--shards".to_owned(), "2".to_owned()]).unwrap_err();
-        assert!(err.contains("--shards 1"));
+        assert!(err.contains("requires --backend postgres"));
 
-        let err = parse_args(["--activation-concurrency".to_owned(), "2".to_owned()]).unwrap_err();
-        assert!(err.contains("--activation-concurrency 1"));
-
-        let err =
-            parse_args(["--activation-prefetch-limit".to_owned(), "2".to_owned()]).unwrap_err();
-        assert!(err.contains("--activation-prefetch-limit 1"));
+        let err = parse_args(["--physical-partitions".to_owned(), "2".to_owned()]).unwrap_err();
+        assert!(err.contains("requires --backend postgres"));
     }
 
     #[test]
@@ -1014,10 +1076,22 @@ mod tests {
             "postgres".to_owned(),
             "--postgres-pool-size".to_owned(),
             "9".to_owned(),
+            "--shards".to_owned(),
+            "100".to_owned(),
+            "--physical-partitions".to_owned(),
+            "16".to_owned(),
+            "--activation-concurrency".to_owned(),
+            "4".to_owned(),
+            "--activation-prefetch-limit".to_owned(),
+            "8".to_owned(),
         ])
         .unwrap();
         assert_eq!(options.backend, BenchmarkBackend::Postgres);
         assert_eq!(options.postgres_pool_size, Some(9));
+        assert_eq!(options.shards, 100);
+        assert_eq!(options.physical_partitions, 16);
+        assert_eq!(options.activation_concurrency, 4);
+        assert_eq!(options.activation_prefetch_limit, 8);
     }
 
     #[test]

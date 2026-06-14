@@ -1,8 +1,8 @@
 use crate::{
     ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
     DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef, PayloadStorageConfig,
-    Result, RunId, SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId, WorkflowId,
-    WorkflowType,
+    Result, RunId, ShardId, SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId,
+    WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -30,6 +30,33 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>>;
 
+    fn claim_workflow_tasks(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, Result<Vec<ClaimedWorkflowTask>>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            if opts.shard_filter.is_some() {
+                return Err(Error::Backend(
+                    "workflow task shard filters require a shard-aware backend".to_owned(),
+                ));
+            }
+
+            let mut claimed = Vec::new();
+            for _ in 0..opts.limit {
+                let Some(task) = backend
+                    .claim_workflow_task(worker_id.clone(), opts.claim.clone())
+                    .await?
+                else {
+                    break;
+                };
+                claimed.push(task);
+            }
+            Ok(claimed)
+        })
+    }
+
     fn stream_history(&self, req: StreamHistoryRequest)
     -> BoxFuture<'static, Result<HistoryChunk>>;
 
@@ -56,6 +83,24 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> BoxFuture<'static, Result<CommitOutcome>>;
+
+    fn commit_workflow_tasks(
+        &self,
+        batch: WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, Result<Vec<WorkflowTaskCommitBatchResult>>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(batch.commits.len());
+            for input in batch.commits {
+                let claim = input.claim;
+                let result = backend
+                    .commit_workflow_task(claim.clone(), input.commit)
+                    .await;
+                results.push(WorkflowTaskCommitBatchResult { claim, result });
+            }
+            Ok(results)
+        })
+    }
 
     fn release_workflow_task(
         &self,
@@ -171,6 +216,13 @@ pub struct ClaimWorkflowTaskOptions {
     pub lease_duration: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClaimWorkflowTasksOptions {
+    pub claim: ClaimWorkflowTaskOptions,
+    pub limit: usize,
+    pub shard_filter: Option<Vec<ShardId>>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowTaskReason {
     WorkflowStarted,
@@ -252,6 +304,23 @@ pub struct WorkflowTaskCommit {
     pub delete_waits: Vec<WaitId>,
     pub cancel_commands: Vec<crate::CommandId>,
     pub query_projection: Option<PayloadRef>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkflowTaskCommitBatch {
+    pub commits: Vec<WorkflowTaskCommitInput>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowTaskCommitInput {
+    pub claim: WorkflowTaskClaim,
+    pub commit: WorkflowTaskCommit,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkflowTaskCommitBatchResult {
+    pub claim: WorkflowTaskClaim,
+    pub result: Result<CommitOutcome>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

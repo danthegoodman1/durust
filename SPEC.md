@@ -1226,6 +1226,12 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         opts: ClaimWorkflowTaskOptions,
     ) -> durust::Result<Option<ClaimedWorkflowTask>>;
 
+    async fn claim_workflow_tasks(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimWorkflowTasksOptions,
+    ) -> durust::Result<Vec<ClaimedWorkflowTask>>;
+
     async fn stream_history(
         &self,
         req: StreamHistoryRequest,
@@ -1248,6 +1254,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> durust::Result<CommitOutcome>;
+
+    async fn commit_workflow_tasks(
+        &self,
+        batch: WorkflowTaskCommitBatch,
+    ) -> durust::Result<Vec<WorkflowTaskCommitBatchResult>>;
 
     async fn release_workflow_task(
         &self,
@@ -1325,6 +1336,12 @@ pub struct ClaimWorkflowTaskOptions {
     pub lease_duration: Duration,
 }
 
+pub struct ClaimWorkflowTasksOptions {
+    pub claim: ClaimWorkflowTaskOptions,
+    pub limit: usize,
+    pub shard_filter: Option<Vec<ShardId>>,
+}
+
 pub struct ClaimActivityOptions {
     pub namespace: Namespace,
     pub task_queue: TaskQueue,
@@ -1334,6 +1351,35 @@ pub struct ClaimActivityOptions {
 ```
 
 The provider should match both queue and registered type/name. If no matching task exists, it returns `Ok(None)`. A task for an unregistered type must remain claimable by another worker that advertises the matching capability.
+
+Batch claim and batch commit methods are a provider-neutral optimization
+surface. Memory, SQLite, and the normalized Postgres layout may implement them
+by looping over the one-at-a-time methods. Shard-native or log-backed provider
+layouts should use them to reduce durable round trips while preserving the same
+lease fencing, event ordering, and conflict semantics as individual calls.
+
+Batch commit returns one result per input commit in input order:
+
+```rust
+pub struct WorkflowTaskCommitBatch {
+    pub commits: Vec<WorkflowTaskCommitInput>,
+}
+
+pub struct WorkflowTaskCommitInput {
+    pub claim: WorkflowTaskClaim,
+    pub commit: WorkflowTaskCommit,
+}
+
+pub struct WorkflowTaskCommitBatchResult {
+    pub claim: WorkflowTaskClaim,
+    pub result: durust::Result<CommitOutcome>,
+}
+```
+
+Per-item `CommitOutcome::Conflict` means the workflow task was fenced correctly
+but the expected tail was stale. Per-item `Error::StaleLease` means the claim or
+owning shard lease was stale. Providers may fail the outer batch result only
+when the batch could not be evaluated at all.
 
 ## 8.2 Workflow task commit
 
@@ -1451,14 +1497,17 @@ Shard key:
 ```text
 namespace
 + workflow_id
-+ run_id
 ```
 
-Default shard assignment:
+Default v1 Postgres shard assignment:
 
 ```text
-shard_id = hash(namespace, workflow_id, run_id) % shard_count
+shard_id = hash(namespace, workflow_id) % logical_shards
 ```
+
+Run IDs must record or be resolvable to the owning shard, but the default v1
+route is workflow-identity based rather than run-ID based. This keeps signals,
+queries, continue-as-new, and default child workflow IDs shard-stable.
 
 The authoritative execution state for one workflow run should live on one logical shard:
 
@@ -1475,6 +1524,23 @@ query projection for the run
 ```
 
 This keeps `commit_workflow_task` shard-local. The provider must not require a distributed transaction to commit a normal workflow task.
+
+Worker/runtime scale-out knobs bound provider pressure and write-combining
+latency:
+
+```rust
+pub struct WorkerConcurrencyOptions {
+    pub max_concurrent_workflow_tasks: usize,
+    pub workflow_task_prefetch_limit: usize,
+    pub workflow_task_commit_batch_size: usize,
+    pub workflow_task_commit_max_delay: Duration,
+    pub shard_filter: Option<Vec<ShardId>>,
+}
+```
+
+These options affect provider polling, buffering, and commit grouping only.
+They must not introduce wall-clock reads, native async scheduling choices, or
+other nondeterminism inside workflow replay or workflow code.
 
 Workers claim shard leases or queue leases depending on provider design:
 

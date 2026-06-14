@@ -21,6 +21,7 @@ affected plan file.
 9. [`0009-recovery-flow-control.md`](0009-recovery-flow-control.md)
 10. [`0011-postgres-provider.md`](0011-postgres-provider.md)
 11. [`0012-performance-hardening.md`](0012-performance-hardening.md)
+12. [`0013-postgres-shard-native.md`](0013-postgres-shard-native.md)
 
 ## Shared Gate
 

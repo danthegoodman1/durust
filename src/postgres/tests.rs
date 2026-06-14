@@ -24,6 +24,20 @@ where
         .block_on(future)
 }
 
+fn workflow_id_for_shard(
+    backend: &PostgresBackend,
+    namespace: &Namespace,
+    shard_id: ShardId,
+) -> crate::WorkflowId {
+    for attempt in 0..10_000_u32 {
+        let workflow_id = crate::WorkflowId::new(format!("wf/shard-{}/{}", shard_id.0, attempt));
+        if backend.shard_for_workflow(namespace, &workflow_id) == shard_id {
+            return workflow_id;
+        }
+    }
+    panic!("could not find workflow id for shard {shard_id}");
+}
+
 async fn start_inline_child_for_tests(
     backend: &PostgresBackend,
     prefix: &str,
@@ -154,6 +168,237 @@ fn postgres_schema_migration_runs_when_configured() {
         .unwrap();
         assert_eq!(backend.schema(), schema);
         assert_eq!(backend.schema_version().await.unwrap(), 1);
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_shard_key_is_stable_and_bounded() {
+    let namespace = Namespace::new("default");
+    let workflow_id = WorkflowId::new("jobs/word-count");
+    let first = shard_for_workflow(&namespace, &workflow_id, 100);
+    let second = shard_for_workflow(&namespace, &workflow_id, 100);
+    assert_eq!(first, second);
+    assert!(first.0 < 100);
+}
+
+#[test]
+fn postgres_shard_key_uses_namespace() {
+    let workflow_id = WorkflowId::new("same-id");
+    let a = shard_for_workflow(&Namespace::new("a"), &workflow_id, 4096);
+    let b = shard_for_workflow(&Namespace::new("b"), &workflow_id, 4096);
+    assert_ne!(a, b);
+}
+
+#[test]
+fn postgres_partition_suffix_width_tracks_partition_count() {
+    assert_eq!(partition_suffix(0, 1), "p0");
+    assert_eq!(partition_suffix(3, 16), "p03");
+    assert_eq!(partition_suffix(12, 128), "p012");
+}
+
+#[test]
+fn postgres_shard_metadata_is_validated_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres shard metadata test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("shard_metadata");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone())
+                .schema(schema.clone())
+                .max_pool_size(8)
+                .logical_shards(16)
+                .physical_partitions(4),
+        )
+        .await
+        .unwrap();
+        assert_eq!(backend.logical_shards(), 16);
+        assert_eq!(backend.physical_partitions(), 4);
+
+        let client = backend.client().await.unwrap();
+        let row = client
+            .query_one(
+                &format!("select count(*) from {}.shard_leases", quote_ident(&schema)),
+                &[],
+            )
+            .await
+            .unwrap();
+        let shard_rows: i64 = row.get(0);
+        assert_eq!(shard_rows, 16);
+
+        let err = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .max_pool_size(8)
+                .logical_shards(32)
+                .physical_partitions(4),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("metadata mismatch for `logical_shards`"),
+            "unexpected error: {err}"
+        );
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_claim_honors_shard_filter_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres shard-filter claim test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("shard_filter");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .logical_shards(8)
+                .physical_partitions(2),
+        )
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let target_shard = ShardId(3);
+        let other_shard = ShardId(4);
+        let target_workflow_id = workflow_id_for_shard(&backend, &namespace, target_shard);
+        let other_workflow_id = workflow_id_for_shard(&backend, &namespace, other_shard);
+        let workflow_type = WorkflowType::new("postgres.sharded", 1);
+        let queue = crate::TaskQueue::new("postgres-sharded-workflows");
+
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: namespace.clone(),
+                workflow_id: target_workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&"target").unwrap(),
+            })
+            .await
+            .unwrap();
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: namespace.clone(),
+                workflow_id: other_workflow_id,
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&"other").unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let claimed = backend
+            .claim_workflow_tasks(
+                WorkerId::new("postgres-shard-filter-worker"),
+                crate::ClaimWorkflowTasksOptions {
+                    claim: crate::ClaimWorkflowTaskOptions {
+                        namespace,
+                        task_queue: queue,
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                    limit: 8,
+                    shard_filter: Some(vec![target_shard]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].workflow_id, target_workflow_id);
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_stale_shard_owner_cannot_commit_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres stale shard owner test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("stale_shard_owner");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .logical_shards(8)
+                .physical_partitions(2),
+        )
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let target_shard = ShardId(3);
+        let workflow_id = workflow_id_for_shard(&backend, &namespace, target_shard);
+        let workflow_type = WorkflowType::new("postgres.shard-fence", 1);
+        let queue = crate::TaskQueue::new("postgres-shard-fence-workflows");
+
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: namespace.clone(),
+                workflow_id,
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&"input").unwrap(),
+            })
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_tasks(
+                WorkerId::new("old-owner"),
+                crate::ClaimWorkflowTasksOptions {
+                    claim: crate::ClaimWorkflowTaskOptions {
+                        namespace,
+                        task_queue: queue,
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                    limit: 1,
+                    shard_filter: Some(vec![target_shard]),
+                },
+            )
+            .await
+            .unwrap()
+            .pop()
+            .expect("claimed shard-filtered workflow");
+
+        let client = backend.client().await.unwrap();
+        client
+            .execute(
+                &format!(
+                    "update {}.shard_leases
+                     set owner_id = 'new-owner',
+                         lease_epoch = lease_epoch + 1,
+                         lease_until_ms = $1
+                     where shard_id = $2",
+                    quote_ident(&schema)
+                ),
+                &[
+                    &unix_epoch_millis().saturating_add(60_000),
+                    &(i32::try_from(target_shard.0).unwrap_or(i32::MAX)),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let err = backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events: vec![crate::NewHistoryEvent::new(
+                        HistoryEventData::WorkflowCompleted {
+                            result: crate::encode_payload(&"done").unwrap(),
+                        },
+                    )],
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::StaleLease));
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
