@@ -117,6 +117,13 @@ Implemented and covered:
 - Provider conformance coverage for `PayloadBackend` over memory and SQLite,
   including SQLite close/reopen with an external blob store and upload-failure
   coverage proving a missing external payload ref is not committed.
+- Generic provider payload-root scanning plus `PayloadBackend` external object
+  GC. Concrete providers expose roots without S3/Garage policy, and wrapper GC
+  validates recursively reachable activity-map manifests before deleting
+  wrapper-owned unreachable blobs.
+- Provider conformance coverage proving `PayloadBackend` hydrates activity-map
+  payloads over memory and SQLite, survives SQLite close/reopen, and collects
+  overwritten query-projection blobs from the wrapper object store.
 
 Remaining before this phase is done:
 
@@ -124,10 +131,6 @@ Remaining before this phase is done:
   `PayloadBackend<SqliteBackend, S3BlobStore>`. The wrapper architecture keeps
   S3/Garage out of concrete durability providers; the next storage proof is a
   real Garage fixture, not a SQLite-specific S3 branch.
-- External object-store GC in `PayloadBackend`. Concrete providers retain
-  unknown external blob refs opaquely; wrapper GC still needs provider-visible
-  root scanning plus recursive external manifest traversal before it can delete
-  unreachable S3/Garage blobs safely.
 - Compression policy for object-store payloads. A local 64 KiB Criterion probe
   measured Zstd compression around 62 us and compressed decode around 44 us,
   versus MessagePack encode around 1.08 us and decode around 2.02 us, so
@@ -152,6 +155,7 @@ Remaining before this phase is done:
 - SQLite provider threshold forces inline payload below threshold and blob ref above threshold.
 - SQLite local-directory blob store round-trips public payload refs across close/reopen.
 - SQLite local-directory blob GC deletes unreachable object-store blobs.
+- PayloadBackend over memory and SQLite recursively hydrates activity-map inputs/results and deletes unreachable wrapper-owned blobs.
 - PayloadBackend plus Garage round-trips activity, signal, query, child, side-effect, and workflow payload refs.
 - Blob upload before history commit crash.
 - History commit before blob GC crash.
@@ -175,7 +179,7 @@ Remaining before this phase is done:
   bytes before delegating compact refs to the inner provider and hydrates refs
   after reads.
 - `PayloadBlobStore` is the minimal composable primitive the wrapper needs:
-  put, get, list, and delete by digest. It does not expose workflow concepts or
-  provider-specific state.
+  put, get, list, delete, and URI ownership checks by digest/URI. It does not
+  expose workflow concepts or provider-specific state.
 - `S3BlobStore` is async and package-backed (`rust-s3` with Tokio/Rustls). We do
   not maintain custom S3 signing, request construction, or blocking S3 calls.

@@ -143,13 +143,17 @@ fn payload_backend_offloads_large_payloads_and_hydrates_memory_provider_apis() {
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
         );
         payload_offload_public_api_round_trip(
-            backend,
+            backend.clone(),
             "wf/payload-backend-memory-offload",
             "payload-backend-memory-workflows",
             "payload-backend-memory-activities",
         )
         .await;
-        assert!(blob_store.payload_blob_count() >= 5);
+        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-memory").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-memory").await;
+        let _ =
+            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-memory").await;
+        assert!(blob_store.payload_blob_count() >= 8);
     });
 }
 
@@ -225,13 +229,16 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
             config.clone(),
         );
         let run_id = payload_offload_public_api_round_trip(
-            backend,
+            backend.clone(),
             "wf/payload-backend-sqlite-offload",
             "payload-backend-sqlite-workflows",
             "payload-backend-sqlite-activities",
         )
         .await;
-        assert!(blob_store.payload_blob_count() >= 5);
+        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-sqlite").await;
+        let (gc_workflow_id, gc_projection) =
+            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-sqlite").await;
+        assert!(blob_store.payload_blob_count() >= 8);
 
         let reopened = PayloadBackend::with_payload_storage(
             SqliteBackend::open(&path).unwrap(),
@@ -255,6 +262,20 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
         assert_eq!(
             durust::decode_payload::<String>(input).unwrap(),
             large_payload("workflow-input")
+        );
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(gc_workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected retained wrapper projection after reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            gc_projection
         );
     });
 }
@@ -323,6 +344,10 @@ impl durust::PayloadBlobStore for FailingBlobStore {
 
     fn delete_payload_blob(&self, _digest: String) -> BoxFuture<'static, durust::Result<()>> {
         Box::pin(ready(Ok(())))
+    }
+
+    fn owns_payload_blob_uri(&self, _uri: &str) -> bool {
+        false
     }
 }
 
@@ -971,8 +996,20 @@ where
         .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
         .await
         .unwrap();
-    assert!(dry_run.scanned_blobs > dry_run.retained_blobs);
-    assert!(dry_run.deleted_blobs > 0);
+    assert!(
+        dry_run.scanned_blobs > dry_run.retained_blobs,
+        "expected garbage: scanned={}, retained={}, deleted={}",
+        dry_run.scanned_blobs,
+        dry_run.retained_blobs,
+        dry_run.deleted_blobs
+    );
+    assert!(
+        dry_run.deleted_blobs > 0,
+        "expected deletions: scanned={}, retained={}, deleted={}",
+        dry_run.scanned_blobs,
+        dry_run.retained_blobs,
+        dry_run.deleted_blobs
+    );
 
     let collected = backend
         .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })

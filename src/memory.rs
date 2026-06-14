@@ -7,13 +7,14 @@ use crate::{
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
     HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy, PayloadBlob,
-    PayloadRef, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalId,
-    SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
-    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
-    WaitId, WaitKind, WaitRecord, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
-    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
-    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at,
-    digest_bytes, encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
+    PayloadRef, PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest,
+    Result, RunId, SignalId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
+    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitId, WaitKind, WaitRecord,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at, digest_bytes,
+    encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1103,6 +1104,13 @@ impl DurableBackend for MemoryBackend {
         Box::pin(ready(Ok(WorkflowChangeVersionsOutcome { records })))
     }
 
+    fn payload_roots(&self) -> BoxFuture<'static, Result<PayloadRootsOutcome>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        Box::pin(ready(
+            collect_payload_roots(&state).map(|roots| PayloadRootsOutcome { roots }),
+        ))
+    }
+
     fn gc_payload_blobs(
         &self,
         req: crate::PayloadGarbageCollectionRequest,
@@ -1113,7 +1121,11 @@ impl DurableBackend for MemoryBackend {
         if let Err(err) = collect_reachable_payload_blobs(&state, &mut reachable) {
             return Box::pin(ready(Err(err)));
         }
-        let retained_blobs = reachable.len();
+        let retained_blobs = state
+            .payload_blobs
+            .keys()
+            .filter(|digest| reachable.contains(*digest))
+            .count();
         let deleted_blobs = state
             .payload_blobs
             .keys()
@@ -1914,6 +1926,126 @@ fn collect_reachable_payload_blobs(
     Ok(())
 }
 
+fn collect_payload_roots(state: &MemoryState) -> Result<Vec<PayloadRootRef>> {
+    let mut roots = Vec::new();
+    for run in state.runs.values() {
+        for event in &run.history {
+            collect_history_event_payload_roots(state, &event.data, &mut roots)?;
+        }
+    }
+    for record in state.activities.values() {
+        roots.push(PayloadRootRef::Payload(record.task.input.clone()));
+    }
+    for map in state.activity_maps.values() {
+        roots.push(PayloadRootRef::ActivityMapInputManifest(
+            activity_map_input_root_for_roots(state, &map.task.input_manifest)?,
+        ));
+        for result in map.results.values() {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+    }
+    for record in state.child_outbox.values() {
+        roots.push(PayloadRootRef::Payload(record.message.input.clone()));
+    }
+    for signal in state.signals.values() {
+        roots.push(PayloadRootRef::Payload(signal.payload.clone()));
+    }
+    for projection in state.query_projections.values() {
+        roots.push(PayloadRootRef::Payload(projection.payload.clone()));
+    }
+    Ok(roots)
+}
+
+fn collect_history_event_payload_roots(
+    state: &MemoryState,
+    data: &HistoryEventData,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    match data {
+        HistoryEventData::WorkflowStarted { input, .. }
+        | HistoryEventData::WorkflowContinuedAsNew { input } => {
+            roots.push(PayloadRootRef::Payload(input.clone()));
+        }
+        HistoryEventData::WorkflowCompleted { result } => {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        HistoryEventData::WorkflowFailed { failure } => {
+            collect_failure_payload_roots(failure, roots);
+        }
+        HistoryEventData::ActivityScheduled(scheduled) => {
+            roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
+        }
+        HistoryEventData::ActivityMapScheduled(scheduled) => {
+            roots.push(PayloadRootRef::ActivityMapInputManifest(
+                activity_map_input_root_for_roots(state, &scheduled.input_manifest)?,
+            ));
+        }
+        HistoryEventData::ActivityMapCompleted(completed) => {
+            roots.push(PayloadRootRef::ActivityMapResultManifest(
+                activity_map_result_root_for_roots(state, &completed.result_manifest)?,
+            ));
+        }
+        HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::ActivityCompleted(completed) => {
+            roots.push(PayloadRootRef::Payload(completed.result.clone()));
+        }
+        HistoryEventData::ActivityFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::ChildWorkflowStartRequested(requested) => {
+            roots.push(PayloadRootRef::Payload(requested.input.clone()));
+        }
+        HistoryEventData::ChildWorkflowCompleted(completed) => {
+            roots.push(PayloadRootRef::Payload(completed.result.clone()));
+        }
+        HistoryEventData::ChildWorkflowFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::SignalConsumed(signal) => {
+            roots.push(PayloadRootRef::Payload(signal.payload.clone()));
+        }
+        HistoryEventData::WorkflowCancelled { .. }
+        | HistoryEventData::WorkflowTaskStarted
+        | HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_) => {}
+    }
+    Ok(())
+}
+
+fn collect_failure_payload_roots(failure: &crate::DurableFailure, roots: &mut Vec<PayloadRootRef>) {
+    if let Some(details) = &failure.details {
+        roots.push(PayloadRootRef::Payload(details.clone()));
+    }
+}
+
+fn activity_map_input_root_for_roots(
+    state: &MemoryState,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_activity_map_input_manifest_from_storage(state, payload.clone())
+}
+
+fn activity_map_result_root_for_roots(
+    state: &MemoryState,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_activity_map_result_manifest_from_storage(state, payload.clone())
+}
+
 fn collect_history_event_payload_blobs(
     state: &MemoryState,
     data: &HistoryEventData,
@@ -2066,19 +2198,23 @@ fn normalize_history_event_for_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
-                state,
-                config,
-                scheduled.input_manifest,
-            )?;
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
+                    state,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
-                state,
-                config,
-                completed.result_manifest,
-            )?;
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
+                    state,
+                    config,
+                    completed.result_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
@@ -2093,15 +2229,21 @@ fn hydrate_history_event_from_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                hydrate_activity_map_input_manifest_from_storage(state, scheduled.input_manifest)?;
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
+                    state,
+                    scheduled.input_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
-                state,
-                completed.result_manifest,
-            )?;
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
+                    state,
+                    completed.result_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {

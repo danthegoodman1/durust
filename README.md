@@ -621,7 +621,9 @@ outside hot SQLite rows. For S3-compatible object stores such as Garage, use
 `PayloadBackend` so the async object-store implementation works across
 durability providers instead of being duplicated inside each provider. Providers
 also expose dry-run-capable payload GC that removes blobs no longer reachable
-from durable history or operational indexes.
+from durable history or operational indexes; `PayloadBackend` applies the same
+contract to its external object store by asking the inner provider for generic
+payload roots and deleting only wrapper-owned unreachable objects.
 
 ## Recovery Model
 

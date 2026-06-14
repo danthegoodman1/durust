@@ -101,6 +101,8 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>>;
 
+    fn payload_roots(&self) -> BoxFuture<'static, Result<PayloadRootsOutcome>>;
+
     fn gc_payload_blobs(
         &self,
         req: PayloadGarbageCollectionRequest,
@@ -418,6 +420,28 @@ pub struct WorkflowChangeVersionRecord {
 #[derive(Clone, Debug, Default)]
 pub struct PayloadGarbageCollectionRequest {
     pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PayloadRootsOutcome {
+    pub roots: Vec<PayloadRootRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PayloadRootRef {
+    Payload(PayloadRef),
+    ActivityMapInputManifest(PayloadRef),
+    ActivityMapResultManifest(PayloadRef),
+}
+
+impl PayloadRootRef {
+    pub fn payload(&self) -> &PayloadRef {
+        match self {
+            Self::Payload(payload)
+            | Self::ActivityMapInputManifest(payload)
+            | Self::ActivityMapResultManifest(payload) => payload,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

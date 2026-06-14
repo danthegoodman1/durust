@@ -8,12 +8,13 @@ use crate::{
     DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, FailActivityOutcome,
     FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
     HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
-    PayloadGarbageCollectionRequest, PayloadRef, PayloadStorageConfig, QueryProjectionOutcome,
-    QueryProjectionRequest, ReadSignalInboxRequest, Result, SignalConsumed, SignalInboxRecord,
-    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
-    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, WorkerId,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskRelease, digest_bytes,
+    PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
+    PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
+    Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
+    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
+    WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
+    digest_bytes,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,6 +32,8 @@ pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
     fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
 
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool;
 }
 
 #[derive(Clone, Debug)]
@@ -293,11 +296,41 @@ where
         self.inner.workflow_change_versions(req)
     }
 
+    fn payload_roots(&self) -> BoxFuture<'static, Result<PayloadRootsOutcome>> {
+        self.inner.payload_roots()
+    }
+
     fn gc_payload_blobs(
         &self,
         req: PayloadGarbageCollectionRequest,
     ) -> BoxFuture<'static, Result<PayloadGarbageCollectionOutcome>> {
-        self.inner.gc_payload_blobs(req)
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let roots = inner.payload_roots().await?;
+            let external_blobs = blob_store.list_payload_blob_digests().await?;
+            let mut reachable = BTreeSet::new();
+            collect_reachable_external_blobs(&blob_store, roots.roots, &mut reachable).await?;
+            reachable.retain(|digest| external_blobs.contains(digest));
+            let garbage = external_blobs
+                .iter()
+                .filter(|digest| !reachable.contains(*digest))
+                .cloned()
+                .collect::<Vec<_>>();
+            let inner_outcome = inner.gc_payload_blobs(req.clone()).await?;
+            if !req.dry_run {
+                for digest in &garbage {
+                    blob_store.delete_payload_blob(digest.clone()).await?;
+                }
+            }
+            Ok(PayloadGarbageCollectionOutcome {
+                scanned_blobs: inner_outcome
+                    .scanned_blobs
+                    .saturating_add(external_blobs.len()),
+                retained_blobs: inner_outcome.retained_blobs.saturating_add(reachable.len()),
+                deleted_blobs: inner_outcome.deleted_blobs.saturating_add(garbage.len()),
+            })
+        })
     }
 }
 
@@ -556,8 +589,12 @@ async fn normalize_activity_map_task<S>(
 where
     S: PayloadBlobStore,
 {
-    task.input_manifest =
-        normalize_activity_map_input_manifest(blob_store, config, task.input_manifest).await?;
+    task.input_manifest = normalize_activity_map_input_manifest_for_operations(
+        blob_store,
+        config,
+        task.input_manifest,
+    )
+    .await?;
     Ok(task)
 }
 
@@ -725,6 +762,33 @@ where
     .await
 }
 
+async fn normalize_activity_map_input_manifest_for_operations<S>(
+    blob_store: &S,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef>
+where
+    S: PayloadBlobStore,
+{
+    let root = hydrate_payload_ref(blob_store, payload).await?;
+    let root_codec = root.codec();
+    let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
+    let mut pages = Vec::with_capacity(manifest.pages.len());
+    for page in manifest.pages {
+        let page = hydrate_payload_ref(blob_store, page).await?;
+        let page_codec = page.codec();
+        let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
+        let mut items = Vec::with_capacity(page.items.len());
+        for item in page.items {
+            items.push(normalize_payload_ref(blob_store, config, item).await?);
+        }
+        page.items = items;
+        pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
+    }
+    manifest.pages = pages;
+    crate::encode_payload_with_codec(&manifest, root_codec)
+}
+
 async fn hydrate_activity_map_input_manifest<S>(
     blob_store: &S,
     payload: PayloadRef,
@@ -814,6 +878,136 @@ where
     }
     manifest.pages = pages;
     crate::encode_payload_with_codec(&manifest, root_codec)
+}
+
+async fn collect_reachable_external_blobs<S>(
+    blob_store: &S,
+    roots: Vec<PayloadRootRef>,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()>
+where
+    S: PayloadBlobStore,
+{
+    for root in roots {
+        match root {
+            PayloadRootRef::Payload(payload) => {
+                collect_reachable_external_payload(blob_store, &payload, reachable).await?;
+            }
+            PayloadRootRef::ActivityMapInputManifest(payload) => {
+                collect_reachable_external_input_manifest(blob_store, payload, reachable).await?;
+            }
+            PayloadRootRef::ActivityMapResultManifest(payload) => {
+                collect_reachable_external_result_manifest(blob_store, payload, reachable).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn collect_reachable_external_payload<S>(
+    blob_store: &S,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()>
+where
+    S: PayloadBlobStore,
+{
+    let PayloadRef::Blob { digest, uri, .. } = payload else {
+        return Ok(());
+    };
+    if !blob_store.owns_payload_blob_uri(uri) {
+        return Ok(());
+    }
+    load_payload_blob(blob_store, payload).await?;
+    reachable.insert(digest.clone());
+    Ok(())
+}
+
+async fn load_external_container<S>(
+    blob_store: &S,
+    payload: PayloadRef,
+    reachable: &mut BTreeSet<String>,
+    context: &str,
+) -> Result<PayloadRef>
+where
+    S: PayloadBlobStore,
+{
+    let (digest, uri) = match &payload {
+        PayloadRef::Inline { .. } => return Ok(payload),
+        PayloadRef::Blob { digest, uri, .. } => (digest.clone(), uri.clone()),
+    };
+    if !blob_store.owns_payload_blob_uri(&uri) {
+        return Err(Error::PayloadDecode(format!(
+            "{context} references a non-wrapper payload blob `{uri}`"
+        )));
+    }
+    let hydrated = hydrate_payload_ref(blob_store, payload).await?;
+    reachable.insert(digest);
+    Ok(hydrated)
+}
+
+async fn collect_reachable_external_input_manifest<S>(
+    blob_store: &S,
+    payload: PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()>
+where
+    S: PayloadBlobStore,
+{
+    let root = load_external_container(
+        blob_store,
+        payload,
+        reachable,
+        "activity map input manifest root",
+    )
+    .await?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
+    for page in manifest.pages {
+        let page = load_external_container(
+            blob_store,
+            page,
+            reachable,
+            "activity map input manifest page",
+        )
+        .await?;
+        let page: ActivityMapInputPage = crate::decode_payload(&page)?;
+        for item in page.items {
+            collect_reachable_external_payload(blob_store, &item, reachable).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_reachable_external_result_manifest<S>(
+    blob_store: &S,
+    payload: PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()>
+where
+    S: PayloadBlobStore,
+{
+    let root = load_external_container(
+        blob_store,
+        payload,
+        reachable,
+        "activity map result manifest root",
+    )
+    .await?;
+    let manifest: ActivityMapResultManifest = crate::decode_payload(&root)?;
+    for page in manifest.pages {
+        let page = load_external_container(
+            blob_store,
+            page,
+            reachable,
+            "activity map result manifest page",
+        )
+        .await?;
+        let page: ActivityMapResultPage = crate::decode_payload(&page)?;
+        for result in page.results {
+            collect_reachable_external_payload(blob_store, &result, reachable).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn normalize_payload_ref<S>(
@@ -1004,6 +1198,10 @@ impl PayloadBlobStore for MemoryBlobStore {
             Ok(())
         })
     }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        uri.starts_with("memory-blob://payload/")
+    }
 }
 
 fn memory_blob_uri(digest: &str) -> String {
@@ -1121,6 +1319,14 @@ impl PayloadBlobStore for S3BlobStore {
             require_s3_success("delete payload blob", response.status_code())?;
             Ok(())
         })
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        let bucket_prefix = format!("s3://{}/", self.bucket_name);
+        let Some(key) = uri.strip_prefix(&bucket_prefix) else {
+            return false;
+        };
+        digest_from_s3_key(&self.prefix, key).is_some()
     }
 }
 

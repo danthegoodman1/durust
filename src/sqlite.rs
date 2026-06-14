@@ -7,14 +7,15 @@ use crate::{
     CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
     DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
     FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
-    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob, PayloadRef,
-    PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalInboxRecord,
-    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
-    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
-    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
+    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob, PayloadRef, PayloadRootRef,
+    PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId,
+    SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
+    WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, WorkflowType,
+    activity_map_input_at, digest_bytes, encode_activity_map_result_manifest_with_codec,
+    event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -1454,6 +1455,15 @@ impl DurableBackend for SqliteBackend {
         Box::pin(ready(result))
     }
 
+    fn payload_roots(&self) -> BoxFuture<'static, Result<PayloadRootsOutcome>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            collect_payload_roots(&conn, &self.payload_config)
+                .map(|roots| PayloadRootsOutcome { roots })
+        })();
+        Box::pin(ready(result))
+    }
+
     fn gc_payload_blobs(
         &self,
         req: crate::PayloadGarbageCollectionRequest,
@@ -1477,7 +1487,10 @@ impl DurableBackend for SqliteBackend {
             let mut all_digests = sqlite_digests.into_iter().collect::<BTreeSet<_>>();
             all_digests.extend(external_blob_digests(&self.payload_config)?);
             let scanned_blobs = all_digests.len();
-            let retained_blobs = reachable.len();
+            let retained_blobs = all_digests
+                .iter()
+                .filter(|digest| reachable.contains(*digest))
+                .count();
             let garbage = all_digests
                 .into_iter()
                 .filter(|digest| !reachable.contains(digest))
@@ -1531,6 +1544,244 @@ fn collect_reachable_payload_blobs(
     collect_signal_payload_blobs(conn, config, reachable)?;
     collect_query_projection_payload_blobs(conn, config, reachable)?;
     Ok(())
+}
+
+fn collect_payload_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+) -> Result<Vec<PayloadRootRef>> {
+    let mut roots = Vec::new();
+    collect_history_payload_roots(conn, config, &mut roots)?;
+    collect_activity_payload_roots(conn, &mut roots)?;
+    collect_activity_map_payload_roots(conn, config, &mut roots)?;
+    collect_child_outbox_payload_roots(conn, &mut roots)?;
+    collect_signal_payload_roots(conn, &mut roots)?;
+    collect_query_projection_payload_roots(conn, &mut roots)?;
+    Ok(roots)
+}
+
+fn collect_history_payload_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select data from history_events order by run_id asc, event_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let data: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_history_event_payload_roots(conn, config, &data, roots)?;
+    }
+    Ok(())
+}
+
+fn collect_activity_payload_roots(
+    conn: &Connection,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from activity_tasks order by activity_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ActivityTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::Payload(task.input));
+    }
+    Ok(())
+}
+
+fn collect_activity_map_payload_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from activity_maps order by map_command_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ActivityMapTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::ActivityMapInputManifest(
+            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+        ));
+    }
+    drop(stmt);
+
+    let mut stmt = conn
+        .prepare(
+            "select result from activity_map_results order by map_command_id asc, item_ordinal asc",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let result: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::Payload(result));
+    }
+    Ok(())
+}
+
+fn collect_child_outbox_payload_roots(
+    conn: &Connection,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select message from child_outbox order by outbox_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let message: ChildStartOutboxMessage =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::Payload(message.input));
+    }
+    Ok(())
+}
+
+fn collect_signal_payload_roots(conn: &Connection, roots: &mut Vec<PayloadRootRef>) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select payload from signals order by signal_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let payload: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::Payload(payload));
+    }
+    Ok(())
+}
+
+fn collect_query_projection_payload_roots(
+    conn: &Connection,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select payload from query_projections order by namespace asc, workflow_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let payload: PayloadRef =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::Payload(payload));
+    }
+    Ok(())
+}
+
+fn collect_history_event_payload_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    data: &HistoryEventData,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    match data {
+        HistoryEventData::WorkflowStarted { input, .. }
+        | HistoryEventData::WorkflowContinuedAsNew { input } => {
+            roots.push(PayloadRootRef::Payload(input.clone()));
+        }
+        HistoryEventData::WorkflowCompleted { result } => {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        HistoryEventData::WorkflowFailed { failure } => {
+            collect_failure_payload_roots(failure, roots);
+        }
+        HistoryEventData::ActivityScheduled(scheduled) => {
+            roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
+        }
+        HistoryEventData::ActivityMapScheduled(scheduled) => {
+            roots.push(PayloadRootRef::ActivityMapInputManifest(
+                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
+            ));
+        }
+        HistoryEventData::ActivityMapCompleted(completed) => {
+            roots.push(PayloadRootRef::ActivityMapResultManifest(
+                activity_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
+            ));
+        }
+        HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::ActivityCompleted(completed) => {
+            roots.push(PayloadRootRef::Payload(completed.result.clone()));
+        }
+        HistoryEventData::ActivityFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::ChildWorkflowStartRequested(requested) => {
+            roots.push(PayloadRootRef::Payload(requested.input.clone()));
+        }
+        HistoryEventData::ChildWorkflowCompleted(completed) => {
+            roots.push(PayloadRootRef::Payload(completed.result.clone()));
+        }
+        HistoryEventData::ChildWorkflowFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::SignalConsumed(signal) => {
+            roots.push(PayloadRootRef::Payload(signal.payload.clone()));
+        }
+        HistoryEventData::WorkflowCancelled { .. }
+        | HistoryEventData::WorkflowTaskStarted
+        | HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_) => {}
+    }
+    Ok(())
+}
+
+fn collect_failure_payload_roots(failure: &crate::DurableFailure, roots: &mut Vec<PayloadRootRef>) {
+    if let Some(details) = &failure.details {
+        roots.push(PayloadRootRef::Payload(details.clone()));
+    }
+}
+
+fn activity_map_input_root_for_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_activity_map_input_manifest_from_storage(conn, config, payload.clone())
+}
+
+fn activity_map_result_root_for_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
 }
 
 fn collect_history_payload_blobs(
@@ -1828,19 +2079,23 @@ fn normalize_history_event_for_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
-                conn,
-                config,
-                scheduled.input_manifest,
-            )?;
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
+                    conn,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
-                conn,
-                config,
-                completed.result_manifest,
-            )?;
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
+                    conn,
+                    config,
+                    completed.result_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
@@ -1856,19 +2111,23 @@ fn hydrate_history_event_from_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
-                conn,
-                config,
-                scheduled.input_manifest,
-            )?;
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
+                    conn,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
-                conn,
-                config,
-                completed.result_manifest,
-            )?;
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
+                    conn,
+                    config,
+                    completed.result_manifest,
+                )?;
+            }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {

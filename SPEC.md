@@ -2179,6 +2179,7 @@ pub trait PayloadBlobStore {
     fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>>;
     fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool;
 }
 
 pub struct PayloadBackend<B, S> {
@@ -2222,8 +2223,20 @@ Providers should expose generic payload garbage collection for provider-owned
 blob stores. GC treats workflow history, activity tasks, activity map manifests
 and results, child outbox entries, signal inbox rows, and query projections as
 roots. A dry-run mode must report retained and deleted blob counts without
-mutating storage. If a committed reachable `PayloadRef::Blob` is missing or
-fails digest/size validation, GC must fail rather than deleting unrelated blobs.
+mutating storage. Counts are for blobs owned by the GC target: concrete providers
+count provider-owned blobs, while wrapper GC counts wrapper-owned object-store
+blobs. If a committed reachable `PayloadRef::Blob` is missing or fails
+digest/size validation, GC must fail rather than deleting unrelated blobs.
+
+For provider-agnostic object stores, concrete providers also expose durable
+payload roots without object-store policy. Roots are typed so an outer
+`PayloadBackend` can recursively traverse activity-map input and result
+manifests, validate wrapper-owned blob refs through `PayloadBlobStore`, and
+delete only unreachable wrapper-owned objects. Concrete providers may persist
+unknown external blob refs opaquely and must not know whether they point at S3,
+Garage, or another object store. Operational activity-map task state still
+requires provider-decodable manifest containers so providers can materialize
+bounded map items without object-store-specific logic.
 
 ---
 

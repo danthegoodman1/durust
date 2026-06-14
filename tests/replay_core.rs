@@ -4428,6 +4428,10 @@ impl DurableBackend for RecordingBackend {
         self.inner.workflow_change_versions(req)
     }
 
+    fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>> {
+        self.inner.payload_roots()
+    }
+
     fn gc_payload_blobs(
         &self,
         req: durust::PayloadGarbageCollectionRequest,
