@@ -184,9 +184,8 @@ Implemented and covered:
 
 Remaining follow-up outside this phase:
 
-- Partitioned SQLite shard-file throughput baselines remain part of the
-  dedicated performance-hardening phase; the current SQLite numbers are
-  single-database-file baselines.
+- Dedicated performance-hardening owns broader throughput baselines; the
+  current SQLite numbers are single-database-file baselines.
 
 ## Required Tests
 
@@ -219,8 +218,8 @@ Remaining follow-up outside this phase:
 ## Public API Budget
 
 - `PayloadBackend<B, S>` is a first-class provider wrapper because production
-  object stores must work across SQLite, partitioned SQLite, Postgres, and future
-  providers without duplicating S3/Garage behavior in each concrete provider.
+  object stores must work across SQLite, Postgres, and future providers without
+  duplicating S3/Garage behavior in each concrete provider.
   It also keeps network I/O outside provider transactions: the wrapper uploads
   bytes before delegating compact refs to the inner provider and hydrates refs
   after reads.

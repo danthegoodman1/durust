@@ -80,8 +80,6 @@ Remaining follow-up outside this phase:
 
 - Phase 0009 adds production recovery flow-control policy and provider
   backpressure behavior.
-- Phase 0010 adds the partitioned SQLite shard-file provider and real
-  horizontal scaling tests on one machine.
 - Phase 0012 turns advisory benchmark metadata into stronger performance
   hardening and regression gates.
 

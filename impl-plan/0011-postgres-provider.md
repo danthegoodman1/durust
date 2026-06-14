@@ -8,9 +8,9 @@ labels: [postgres, provider, leases, conformance, recovery, benchmarks]
 
 # Postgres Provider
 
-Add a production Postgres durability provider after the single-file and
-shard-file SQLite providers have proven the runtime/provider contract, recovery
-flow control, and cross-shard handoff model.
+Add a production Postgres durability provider after memory and single-file
+SQLite have proven the runtime/provider contract and recovery flow-control
+model.
 
 This phase is about correctness, durability, operability, and conformance. It
 must include benchmarks for visibility and regression tracking, but hard
