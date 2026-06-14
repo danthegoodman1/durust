@@ -1758,8 +1758,12 @@ fn collect_payload_blob_ref(
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    if let PayloadRef::Blob { digest, .. } = payload {
-        load_payload_blob(conn, config, payload)?;
+    if let PayloadRef::Blob { digest, uri, .. } = payload {
+        if is_sqlite_payload_uri(uri) {
+            load_payload_blob(conn, config, payload)?;
+        } else if !is_opaque_external_payload_uri(uri) {
+            load_payload_blob(conn, config, payload)?;
+        }
         reachable.insert(digest.clone());
     }
     Ok(())
@@ -1772,10 +1776,16 @@ fn collect_activity_map_input_manifest_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     collect_payload_blob_ref(conn, config, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
     let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     for page in &manifest.pages {
         collect_payload_blob_ref(conn, config, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
         let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
         let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
         for item in &page.items {
@@ -1792,10 +1802,16 @@ fn collect_activity_map_result_manifest_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     collect_payload_blob_ref(conn, config, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
     let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
     let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
     for page in &manifest.pages {
         collect_payload_blob_ref(conn, config, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
         let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
         let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
         for result in &page.results {
@@ -2066,7 +2082,10 @@ fn normalize_payload_for_storage(
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            load_payload_blob(conn, config, &payload)?;
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
+            {
+                load_payload_blob(conn, config, &payload)?;
+            }
             Ok(payload)
         }
     }
@@ -2080,6 +2099,10 @@ fn hydrate_payload_from_storage(
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
+            {
+                return Ok(payload);
+            }
             let PayloadRef::Blob {
                 codec,
                 schema_fingerprint,
@@ -2355,6 +2378,18 @@ fn local_blob_path(root: &Path, prefix: &str, digest: &str) -> PathBuf {
 
 fn local_blob_uri(digest: &str) -> String {
     format!("local://payload/{digest}")
+}
+
+fn is_sqlite_payload_uri(uri: &str) -> bool {
+    uri.starts_with("sqlite://payload/") || uri.starts_with("local://payload/")
+}
+
+fn is_external_payload_ref(payload: &PayloadRef) -> bool {
+    matches!(payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
+}
+
+fn is_opaque_external_payload_uri(uri: &str) -> bool {
+    uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
 }
 
 fn encode_encryption_metadata(

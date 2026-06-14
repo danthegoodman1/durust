@@ -2171,16 +2171,28 @@ pub enum BlobStoreConfig {
 }
 ```
 
-Production object-store backend target:
+Production object-store target:
 
 ```rust
-pub enum BlobStoreConfig {
-    S3Compatible {
-        bucket: String,
-        endpoint: Option<String>,
-        region: String,
-        prefix: String,
-    },
+pub trait PayloadBlobStore {
+    fn put_payload_blob(&self, digest: String, bytes: Vec<u8>) -> BoxFuture<'static, Result<String>>;
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>>;
+    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
+}
+
+pub struct PayloadBackend<B, S> {
+    inner: B,
+    blob_store: S,
+}
+
+pub struct S3BlobStoreConfig {
+    pub bucket: String,
+    pub endpoint: String,
+    pub region: String,
+    pub prefix: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
 }
 ```
 
@@ -2190,10 +2202,19 @@ Durability implementation docs should recommend offloading larger workflow input
 
 The inline threshold is a performance default, not a correctness boundary. Backends may choose a smaller limit for databases where row size strongly affects write amplification.
 
-The SQLite provider should support `PayloadStorageConfig`, a local-directory
-object store for deterministic tests and local deployments, and an S3-compatible
-blob store. Tests should use local Garage as the S3-compatible service so
-SQLite-plus-blob behavior is covered without depending on AWS.
+Concrete durability providers may implement provider-owned blob storage, such as
+SQLite row blobs or a local-directory object store for deterministic tests and
+local deployments. Production object stores should be provider-agnostic: wrap the
+durability provider in `PayloadBackend<B, S>`, where `S` is an async
+`PayloadBlobStore` such as `S3BlobStore`. The wrapper uploads external payloads
+before delegating durable writes to the inner provider and hydrates external
+`PayloadRef::Blob` values after reads. Concrete providers persist unknown blob
+refs opaquely; they must not know S3, Garage, signing, endpoints, or retry
+policy.
+
+Tests should use local Garage as the S3-compatible service so
+`PayloadBackend<SqliteBackend, S3BlobStore>` behavior is covered without
+depending on AWS.
 
 Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored. Conformance should force both paths by setting a tiny inline threshold and then a larger threshold.
 
@@ -2754,7 +2775,7 @@ cross-shard child start and completion survive dispatcher crash
 parent close policy is persisted and enforced
 inline and blob-backed payloads behave identically through public APIs
 SQLite provider offloads payloads above configured threshold
-SQLite provider passes blob payload conformance against local Garage
+PayloadBackend over SQLite passes blob payload conformance against local Garage
 derived indexes can be rebuilt from append history
 provider restart loses no committed facts
 terminal workflow rejects new workflow-visible commands

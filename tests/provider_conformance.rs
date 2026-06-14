@@ -2,11 +2,13 @@ use durust::{
     ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ActivityName,
     ClaimActivityOptions, ClaimWorkflowTaskOptions, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, Error, EventId, FailActivityRequest, HistoryEventData, MemoryBackend,
-    Namespace, Registry, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowTaskCommit,
-    WorkflowType,
+    Namespace, PayloadBackend, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
+    WorkflowTaskCommit, WorkflowType,
 };
 use futures::executor::block_on;
+use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::fs;
 use std::time::Duration;
 
@@ -132,6 +134,26 @@ fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
 }
 
 #[test]
+fn payload_backend_offloads_large_payloads_and_hydrates_memory_provider_apis() {
+    block_on(async {
+        let blob_store = durust::MemoryBlobStore::new();
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        payload_offload_public_api_round_trip(
+            backend,
+            "wf/payload-backend-memory-offload",
+            "payload-backend-memory-workflows",
+            "payload-backend-memory-activities",
+        )
+        .await;
+        assert!(blob_store.payload_blob_count() >= 5);
+    });
+}
+
+#[test]
 fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -188,6 +210,120 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
             large_payload("workflow-input")
         );
     });
+}
+
+#[test]
+fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload-wrapper.sqlite3");
+        let blob_store = durust::MemoryBlobStore::new();
+        let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
+        let backend = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            config.clone(),
+        );
+        let run_id = payload_offload_public_api_round_trip(
+            backend,
+            "wf/payload-backend-sqlite-offload",
+            "payload-backend-sqlite-workflows",
+            "payload-backend-sqlite-activities",
+        )
+        .await;
+        assert!(blob_store.payload_blob_count() >= 5);
+
+        let reopened = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store,
+            config,
+        );
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(100),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start after wrapper reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+    });
+}
+
+#[test]
+fn payload_backend_upload_failure_does_not_commit_missing_payload_ref() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let backend = PayloadBackend::with_payload_storage(
+            inner.clone(),
+            FailingBlobStore,
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let err = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/payload-backend-upload-failure"),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&large_payload("workflow-input")).unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(message) if message.contains("intentional blob upload failure"))
+        );
+        let claim = inner
+            .claim_workflow_task(
+                WorkerId::new("payload-backend-upload-failure-worker"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(claim.is_none());
+    });
+}
+
+#[derive(Clone, Debug)]
+struct FailingBlobStore;
+
+impl durust::PayloadBlobStore for FailingBlobStore {
+    fn put_payload_blob(
+        &self,
+        _digest: String,
+        _bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        Box::pin(ready(Err(Error::Backend(
+            "intentional blob upload failure".to_owned(),
+        ))))
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        Box::pin(ready(Err(Error::PayloadDecode(format!(
+            "missing payload blob `{digest}`"
+        )))))
+    }
+
+    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
+        Box::pin(ready(Ok(BTreeSet::new())))
+    }
+
+    fn delete_payload_blob(&self, _digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        Box::pin(ready(Ok(())))
+    }
 }
 
 #[test]

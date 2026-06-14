@@ -596,6 +596,19 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
         }),
 )?;
 
+let backend = durust::PayloadBackend::with_payload_storage(
+    durust::SqliteBackend::open("durust.sqlite3")?,
+    durust::S3BlobStore::garage(durust::S3BlobStoreConfig {
+        bucket: "durust-payloads".to_owned(),
+        endpoint: "http://127.0.0.1:3900".to_owned(),
+        region: "garage".to_owned(),
+        prefix: "payloads".to_owned(),
+        access_key_id: "garage-access-key".to_owned(),
+        secret_access_key: "garage-secret-key".to_owned(),
+    })?,
+    durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+);
+
 let debug_backend = durust::MemoryBackend::with_payload_storage(
     durust::PayloadStorageConfig::new().codec(durust::CodecId::Json),
 );
@@ -604,8 +617,11 @@ let debug_backend = durust::MemoryBackend::with_payload_storage(
 The provider validates blob digests and hydrates payloads before returning them
 through workflow history, activity tasks, signals, and query projections. The
 SQLite local-directory store is content-addressed and keeps large encoded bytes
-outside hot SQLite rows. Providers also expose dry-run-capable payload GC that
-removes blobs no longer reachable from durable history or operational indexes.
+outside hot SQLite rows. For S3-compatible object stores such as Garage, use
+`PayloadBackend` so the async object-store implementation works across
+durability providers instead of being duplicated inside each provider. Providers
+also expose dry-run-capable payload GC that removes blobs no longer reachable
+from durable history or operational indexes.
 
 ## Recovery Model
 

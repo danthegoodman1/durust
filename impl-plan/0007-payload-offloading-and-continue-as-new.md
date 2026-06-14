@@ -19,7 +19,8 @@ distance.
 - Codec, schema fingerprint, compression, encryption, digest, and size metadata.
 - Inline/blob threshold.
 - Provider config knob for inline/offload threshold.
-- SQLite provider integration with S3-compatible blob offload.
+- Provider-agnostic S3-compatible blob offload through a durability-provider
+  wrapper.
 - Local Garage-backed S3 test fixture.
 - Compression.
 - Blob GC.
@@ -107,13 +108,26 @@ Implemented and covered:
 - Provider conformance coverage proving JSON-configured nested activity-map
   manifests and result manifests hydrate after provider offload, including
   SQLite close/reopen.
+- `PayloadBackend<B, S>` provider wrapper that offloads external payload blobs
+  before delegating durable writes to an inner provider and hydrates them after
+  reads, keeping object-store behavior provider-agnostic.
+- `PayloadBlobStore`, `MemoryBlobStore`, and async `S3BlobStore` types. The S3
+  implementation uses the `rust-s3` package with the Tokio/Rustls client rather
+  than hand-rolled signing or blocking S3 I/O.
+- Provider conformance coverage for `PayloadBackend` over memory and SQLite,
+  including SQLite close/reopen with an external blob store and upload-failure
+  coverage proving a missing external payload ref is not committed.
 
 Remaining before this phase is done:
 
-- SQLite S3-compatible/Garage blob-store integration and Garage-backed
-  conformance coverage. The local-directory object store now proves the generic
-  external blob-store contract, upload failure behavior, and object-store GC;
-  S3/Garage still needs the network client and fixture.
+- Local Garage-backed conformance coverage for
+  `PayloadBackend<SqliteBackend, S3BlobStore>`. The wrapper architecture keeps
+  S3/Garage out of concrete durability providers; the next storage proof is a
+  real Garage fixture, not a SQLite-specific S3 branch.
+- External object-store GC in `PayloadBackend`. Concrete providers retain
+  unknown external blob refs opaquely; wrapper GC still needs provider-visible
+  root scanning plus recursive external manifest traversal before it can delete
+  unreachable S3/Garage blobs safely.
 - Compression policy for object-store payloads. A local 64 KiB Criterion probe
   measured Zstd compression around 62 us and compressed decode around 44 us,
   versus MessagePack encode around 1.08 us and decode around 2.02 us, so
@@ -138,7 +152,7 @@ Remaining before this phase is done:
 - SQLite provider threshold forces inline payload below threshold and blob ref above threshold.
 - SQLite local-directory blob store round-trips public payload refs across close/reopen.
 - SQLite local-directory blob GC deletes unreachable object-store blobs.
-- SQLite plus Garage round-trips activity, signal, query, child, side-effect, and workflow payload refs.
+- PayloadBackend plus Garage round-trips activity, signal, query, child, side-effect, and workflow payload refs.
 - Blob upload before history commit crash.
 - History commit before blob GC crash.
 - Garage unavailable during upload returns a retryable provider error without committing a missing payload ref.
@@ -151,3 +165,17 @@ Remaining before this phase is done:
 ## Performance Gate
 
 - Criterion benchmark for MessagePack encode/decode, JSON encode/decode, inline payload refs, blob payload refs, and replay over large blob refs.
+
+## Public API Budget
+
+- `PayloadBackend<B, S>` is a first-class provider wrapper because production
+  object stores must work across SQLite, partitioned SQLite, Postgres, and future
+  providers without duplicating S3/Garage behavior in each concrete provider.
+  It also keeps network I/O outside provider transactions: the wrapper uploads
+  bytes before delegating compact refs to the inner provider and hydrates refs
+  after reads.
+- `PayloadBlobStore` is the minimal composable primitive the wrapper needs:
+  put, get, list, and delete by digest. It does not expose workflow concepts or
+  provider-specific state.
+- `S3BlobStore` is async and package-backed (`rust-s3` with Tokio/Rustls). We do
+  not maintain custom S3 signing, request construction, or blocking S3 calls.

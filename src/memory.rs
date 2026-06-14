@@ -1990,8 +1990,12 @@ fn collect_payload_blob_ref(
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    if let PayloadRef::Blob { digest, .. } = payload {
-        verify_payload_blob(state, payload)?;
+    if let PayloadRef::Blob { digest, uri, .. } = payload {
+        if is_memory_payload_uri(uri) {
+            verify_payload_blob(state, payload)?;
+        } else if !is_opaque_external_payload_uri(uri) {
+            verify_payload_blob(state, payload)?;
+        }
         reachable.insert(digest.clone());
     }
     Ok(())
@@ -2003,6 +2007,9 @@ fn collect_activity_map_input_manifest_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     collect_payload_blob_ref(state, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
     let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     collect_activity_map_input_manifest(state, &manifest, reachable)
@@ -2015,6 +2022,9 @@ fn collect_activity_map_input_manifest(
 ) -> Result<()> {
     for page in &manifest.pages {
         collect_payload_blob_ref(state, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
         let page_payload = hydrate_payload_from_storage(state, page.clone())?;
         let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
         for item in &page.items {
@@ -2030,10 +2040,16 @@ fn collect_activity_map_result_manifest_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     collect_payload_blob_ref(state, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
     let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
     let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
     for page in &manifest.pages {
         collect_payload_blob_ref(state, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
         let page_payload = hydrate_payload_from_storage(state, page.clone())?;
         let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
         for result in &page.results {
@@ -2290,7 +2306,10 @@ fn normalize_payload_for_storage(
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            verify_payload_blob(state, &payload)?;
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
+            {
+                verify_payload_blob(state, &payload)?;
+            }
             Ok(payload)
         }
     }
@@ -2300,6 +2319,10 @@ fn hydrate_payload_from_storage(state: &MemoryState, payload: PayloadRef) -> Res
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
+            {
+                return Ok(payload);
+            }
             let PayloadRef::Blob {
                 codec,
                 schema_fingerprint,
@@ -2320,6 +2343,18 @@ fn hydrate_payload_from_storage(state: &MemoryState, payload: PayloadRef) -> Res
             })
         }
     }
+}
+
+fn is_memory_payload_uri(uri: &str) -> bool {
+    uri.starts_with("memory://payload/")
+}
+
+fn is_external_payload_ref(payload: &PayloadRef) -> bool {
+    matches!(payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
+}
+
+fn is_opaque_external_payload_uri(uri: &str) -> bool {
+    uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
 }
 
 fn verify_payload_blob<'a>(
