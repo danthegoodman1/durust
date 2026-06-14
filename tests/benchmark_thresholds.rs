@@ -94,6 +94,64 @@ fn phase_0009_recovery_flow_control_benchmark_profiles_have_stable_names() {
     }
 }
 
+#[test]
+fn phase_0011_postgres_provider_benchmark_profiles_have_stable_names() {
+    let bench_source = include_str!("../benches/replay_core.rs");
+    let required = [
+        (
+            "workflow task claim",
+            "postgres_provider_hot_paths/workflow_task_claim_postgres",
+        ),
+        (
+            "workflow task append commit",
+            "postgres_provider_hot_paths/workflow_task_append_commit_postgres",
+        ),
+        (
+            "bounded history streaming",
+            "postgres_provider_hot_paths/history_stream_postgres",
+        ),
+        (
+            "activity claim complete",
+            "postgres_provider_hot_paths/activity_claim_complete_postgres",
+        ),
+        (
+            "activity heartbeat",
+            "postgres_provider_hot_paths/activity_heartbeat_postgres",
+        ),
+        (
+            "signal send consume",
+            "postgres_provider_hot_paths/signal_send_consume_postgres",
+        ),
+        (
+            "timer wakeup",
+            "postgres_provider_hot_paths/timer_due_scan_wakeup_postgres",
+        ),
+        (
+            "query projection update",
+            "postgres_provider_hot_paths/query_projection_update_postgres",
+        ),
+        (
+            "query projection read",
+            "postgres_provider_hot_paths/query_projection_read_postgres",
+        ),
+        (
+            "child workflow start",
+            "postgres_provider_hot_paths/child_workflow_start_parent_wakeup_postgres",
+        ),
+        (
+            "activity map scheduling and completion",
+            "postgres_provider_hot_paths/activity_map_schedule_complete_postgres",
+        ),
+    ];
+
+    for (profile, benchmark) in required {
+        assert!(
+            benchmark_exists(bench_source, benchmark),
+            "phase 0011 benchmark profile `{profile}` is missing benchmark `{benchmark}`"
+        );
+    }
+}
+
 fn benchmark_exists(source: &str, name: &str) -> bool {
     if let Some((group, function)) = name.split_once('/') {
         source.contains(&format!("benchmark_group(\"{group}\")"))

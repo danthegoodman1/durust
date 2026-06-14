@@ -1387,11 +1387,16 @@ payloads. The runtime contract is that each item is independently claimable,
 lease-fenced, retryable, and completable by `ActivityMapItemId`, while workflow
 history remains compact at the map-operation level.
 
-`dispatch_child_workflow_starts` is the provider-neutral child outbox drain. It
-claims a bounded number of durable child-start messages, starts each child
-idempotently, and appends the corresponding `ChildWorkflowStarted` or
-`ChildWorkflowFailed` fact to the parent run. Providers must keep this generic:
-the runtime chooses child options and parent close policy; the provider only
+`dispatch_child_workflow_starts` is the provider-neutral child-start handoff
+drain for providers that cannot apply the child-side state in the same local
+transaction as the parent workflow-task commit. It claims a bounded number of
+durable child-start messages, starts each child idempotently, and appends the
+corresponding `ChildWorkflowStarted` or `ChildWorkflowFailed` fact to the parent
+run. Providers that keep both parent and child state inside one transactional
+store boundary, such as one Postgres database connection, may apply the child
+start and parent wake event inline during `commit_workflow_task`; for those
+providers this drain is a no-op. Providers must keep either path generic: the
+runtime chooses child options and parent close policy; the provider only
 persists and dispatches durable visibility.
 
 ## 8.3 Atomicity requirement
@@ -1405,7 +1410,7 @@ The backend must atomically:
 4. update active waits
 5. create activity tasks
 6. create activity map descriptors
-7. enqueue child outbox messages
+7. enqueue child handoff messages or apply inline child starts
 8. consume signals
 9. update query projection
 10. mark workflow ready/not ready
@@ -1484,7 +1489,8 @@ pub struct ShardLease {
 
 Provider implementations may expose shard leasing internally rather than in the public runtime API, but conformance must prove stale lease owners cannot commit workflow tasks, activity completions, or map item completions.
 
-Cross-shard operations use transactional outbox/inbox handoff:
+Cross-shard operations that cannot be applied inside one local provider
+transaction use transactional outbox/inbox handoff:
 
 ```text
 1. Source shard commits local workflow state and an outbox message atomically.
@@ -1494,7 +1500,8 @@ Cross-shard operations use transactional outbox/inbox handoff:
 5. Source shard records dispatch/ack state idempotently.
 ```
 
-Use outbox/inbox handoff for:
+Use outbox/inbox handoff when these operations cross a non-atomic provider
+boundary:
 
 ```text
 parent starting child on another shard
@@ -1503,6 +1510,13 @@ parent cancellation propagating to child on another shard
 signal routing when the caller lands on a non-owner shard
 activity map item completion routed back to owner shard if item execution is partitioned elsewhere
 ```
+
+If a provider maps multiple logical shards into one transactional database
+boundary, it may update both logical shards directly in the same transaction
+instead of using an outbox. This is valid only when the commit is a normal local
+database transaction, not a distributed transaction across independent stores.
+The provider must still preserve stable command identity, idempotency, fencing,
+and deterministic history order.
 
 Outbox message identity must be stable:
 

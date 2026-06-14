@@ -4,20 +4,22 @@ use durust::{
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
     MemoryBackend, Namespace, NewHistoryEvent, PayloadBlobStore, PayloadStorageConfig,
-    SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId,
-    WorkflowTaskCommit, WorkflowType,
+    PostgresBackend, PostgresBackendConfig, SignalWorkflowRequest, TaskQueue, TimestampMs,
+    WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::hint::black_box;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SQLITE_SINGLE_FILE_WORKFLOWS: usize = 1_000;
 const SQLITE_SINGLE_FILE_WORKERS: usize = 4;
 const SQLITE_DRAIN_MAX_ITERATIONS: usize = 50_000;
+static POSTGRES_BENCH_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BenchInput {
@@ -596,6 +598,390 @@ fn sqlite_single_file_mixed_throughput(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
+}
+
+fn postgres_provider_hot_paths(c: &mut Criterion) {
+    let Some(database_url) = postgres_benchmark_url() else {
+        return;
+    };
+    let mut group = c.benchmark_group("postgres_provider_hot_paths");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(5));
+
+    group.bench_function("workflow_task_claim_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "claim",
+                iters,
+                |fixture, iteration| {
+                    start_postgres_workflow(fixture, "claim", iteration);
+                },
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for _ in values {
+                            let claimed = fixture
+                                .backend
+                                .claim_workflow_task(
+                                    WorkerId::new("bench-postgres-claim-worker"),
+                                    claim_workflow_options(),
+                                )
+                                .await
+                                .unwrap();
+                            assert!(claimed.is_some());
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("workflow_task_append_commit_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "commit",
+                iters,
+                setup_postgres_claimed_workflow_for_commit,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for (claimed, batch) in values {
+                            let outcome = fixture
+                                .backend
+                                .commit_workflow_task(claimed.claim, batch)
+                                .await
+                                .unwrap();
+                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("history_stream_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "history",
+                iters,
+                setup_postgres_history_stream,
+                |fixture, run_ids| {
+                    fixture.runtime.block_on(async {
+                        for run_id in run_ids {
+                            let chunk = fixture
+                                .backend
+                                .stream_history_for_replay(durust::StreamHistoryRequest {
+                                    run_id,
+                                    after_event_id: EventId::ZERO,
+                                    up_to_event_id: EventId(129),
+                                    max_events: 32,
+                                    max_bytes: usize::MAX,
+                                })
+                                .await
+                                .unwrap();
+                            assert_eq!(chunk.events.len(), 32);
+                            assert!(chunk.has_more);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("activity_claim_complete_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "activity",
+                iters,
+                setup_postgres_scheduled_activity,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for _ in values {
+                            let claimed = fixture
+                                .backend
+                                .claim_activity_task(
+                                    WorkerId::new("bench-postgres-activity-worker"),
+                                    claim_activity_options("activities"),
+                                )
+                                .await
+                                .unwrap()
+                                .expect("activity task");
+                            let completed = fixture
+                                .backend
+                                .complete_activity(CompleteActivityRequest {
+                                    claim: claimed.claim,
+                                    result: durust::encode_payload(&20_u64).unwrap(),
+                                })
+                                .await
+                                .unwrap();
+                            assert!(matches!(
+                                completed,
+                                durust::CompleteActivityOutcome::Completed { .. }
+                            ));
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("activity_heartbeat_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "heartbeat",
+                iters,
+                setup_postgres_claimed_heartbeat_activity,
+                |fixture, claims| {
+                    fixture.runtime.block_on(async {
+                        for claim in claims {
+                            let outcome = fixture
+                                .backend
+                                .heartbeat_activity(durust::ActivityHeartbeatRequest { claim })
+                                .await
+                                .unwrap();
+                            assert_eq!(outcome, durust::ActivityHeartbeatOutcome::Recorded);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("timer_due_scan_wakeup_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "timer",
+                iters,
+                setup_postgres_due_timer,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for _ in values {
+                            let fired = fixture
+                                .backend
+                                .fire_due_timers(FireDueTimersRequest {
+                                    namespace: Namespace::default(),
+                                    now: TimestampMs(10),
+                                    limit: 1,
+                                })
+                                .await
+                                .unwrap();
+                            assert_eq!(fired.fired, 1);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("signal_send_consume_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "signal",
+                iters,
+                setup_postgres_signal_wait,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for (run_id, workflow_id, signal_id) in values {
+                            let outcome = fixture
+                                .backend
+                                .signal_workflow(SignalWorkflowRequest {
+                                    namespace: Namespace::default(),
+                                    workflow_id,
+                                    signal_id: signal_id.clone(),
+                                    signal_name: durust::SignalName::new("ready"),
+                                    payload: durust::encode_payload(&"ready").unwrap(),
+                                })
+                                .await
+                                .unwrap();
+                            assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+                            let inbox = fixture
+                                .backend
+                                .read_signal_inbox(durust::ReadSignalInboxRequest {
+                                    run_id,
+                                    signal_name: durust::SignalName::new("ready"),
+                                })
+                                .await
+                                .unwrap()
+                                .expect("signal inbox record");
+                            assert_eq!(inbox.signal_id, signal_id);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("query_projection_update_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "projection_update",
+                iters,
+                setup_postgres_claimed_projection_update,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for (claimed, payload) in values {
+                            let outcome = fixture
+                                .backend
+                                .commit_workflow_task(
+                                    claimed.claim,
+                                    WorkflowTaskCommit {
+                                        expected_tail_event_id: EventId(1),
+                                        append_events: Vec::new(),
+                                        upsert_waits: Vec::new(),
+                                        schedule_activities: Vec::new(),
+                                        schedule_activity_maps: Vec::new(),
+                                        start_child_workflows: Vec::new(),
+                                        consume_signals: Vec::new(),
+                                        delete_waits: Vec::new(),
+                                        cancel_commands: Vec::new(),
+                                        query_projection: Some(payload),
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("query_projection_read_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "projection_read",
+                iters,
+                setup_postgres_projection_read,
+                |fixture, requests| {
+                    fixture.runtime.block_on(async {
+                        for req in requests {
+                            let outcome = fixture.backend.query_projection(req).await.unwrap();
+                            assert!(matches!(
+                                outcome,
+                                durust::QueryProjectionOutcome::Found { .. }
+                            ));
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("child_workflow_start_parent_wakeup_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "child",
+                iters,
+                setup_postgres_child_start,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for (claimed, batch) in values {
+                            let outcome = fixture
+                                .backend
+                                .commit_workflow_task(claimed.claim, batch)
+                                .await
+                                .unwrap();
+                            assert_eq!(
+                                outcome,
+                                CommitOutcome::Committed {
+                                    new_tail_event_id: EventId(3)
+                                }
+                            );
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("activity_map_schedule_complete_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "activity_map",
+                iters,
+                setup_postgres_claimed_activity_map_workflow,
+                |fixture, values| {
+                    fixture.runtime.block_on(async {
+                        for (iteration, (claimed, map_task, scheduled)) in
+                            values.into_iter().enumerate()
+                        {
+                            let outcome = fixture
+                                .backend
+                                .commit_workflow_task(
+                                    claimed.claim,
+                                    WorkflowTaskCommit {
+                                        expected_tail_event_id: EventId(1),
+                                        append_events: vec![NewHistoryEvent::new(
+                                            HistoryEventData::ActivityMapScheduled(scheduled),
+                                        )],
+                                        upsert_waits: Vec::new(),
+                                        schedule_activities: Vec::new(),
+                                        schedule_activity_maps: vec![map_task],
+                                        start_child_workflows: Vec::new(),
+                                        consume_signals: Vec::new(),
+                                        delete_waits: Vec::new(),
+                                        cancel_commands: Vec::new(),
+                                        query_projection: None,
+                                    },
+                                )
+                                .await
+                                .unwrap();
+                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            for value in 0..8_u64 {
+                                let claimed = fixture
+                                    .backend
+                                    .claim_activity_task(
+                                        WorkerId::new(format!(
+                                            "bench-postgres-map-worker-{iteration}-{value}"
+                                        )),
+                                        claim_activity_options("activities"),
+                                    )
+                                    .await
+                                    .unwrap()
+                                    .expect("map item task");
+                                let completed = fixture
+                                    .backend
+                                    .complete_activity(CompleteActivityRequest {
+                                        claim: claimed.claim,
+                                        result: durust::encode_payload(&(value * 2)).unwrap(),
+                                    })
+                                    .await
+                                    .unwrap();
+                                assert!(matches!(
+                                    completed,
+                                    durust::CompleteActivityOutcome::Completed { .. }
+                                ));
+                            }
+                        }
+                    });
+                },
+            )
+        });
+    });
+
     group.finish();
 }
 
@@ -1869,6 +2255,490 @@ fn sqlite_mixed_worker(backend: SqliteBackend, worker_index: usize) -> Worker<Sq
         .build()
 }
 
+struct PostgresBenchFixture {
+    runtime: tokio::runtime::Runtime,
+    database_url: String,
+    schema: String,
+    backend: PostgresBackend,
+}
+
+fn postgres_benchmark_url() -> Option<String> {
+    env::var("DURUST_POSTGRES_URL").ok()
+}
+
+fn postgres_bench_schema(prefix: &str) -> String {
+    let counter = POSTGRES_BENCH_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("durust_bench_{prefix}_{}_{}", std::process::id(), counter)
+}
+
+fn postgres_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
+fn measure_postgres_bench<T, Setup, Measure>(
+    database_url: String,
+    prefix: &str,
+    iters: u64,
+    mut setup: Setup,
+    measure: Measure,
+) -> Duration
+where
+    Setup: FnMut(&PostgresBenchFixture, u64) -> T,
+    Measure: FnOnce(&PostgresBenchFixture, Vec<T>),
+{
+    let fixture = setup_postgres_backend(database_url, prefix);
+    let values = (0..iters)
+        .map(|iteration| setup(&fixture, iteration))
+        .collect::<Vec<_>>();
+    let start = Instant::now();
+    measure(&fixture, values);
+    let elapsed = start.elapsed();
+    finish_postgres_bench(fixture);
+    elapsed
+}
+
+fn setup_postgres_backend(database_url: String, prefix: &str) -> PostgresBenchFixture {
+    let runtime = postgres_runtime();
+    let schema = postgres_bench_schema(prefix);
+    let backend = runtime
+        .block_on(PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(database_url.clone())
+                .schema(schema.clone())
+                .max_pool_size(8),
+        ))
+        .unwrap();
+    PostgresBenchFixture {
+        runtime,
+        database_url,
+        schema,
+        backend,
+    }
+}
+
+fn finish_postgres_bench(fixture: PostgresBenchFixture) {
+    let PostgresBenchFixture {
+        runtime,
+        database_url,
+        schema,
+        backend,
+    } = fixture;
+    drop(backend);
+    runtime.block_on(drop_postgres_schema(&database_url, &schema));
+}
+
+async fn drop_postgres_schema(database_url: &str, schema: &str) {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "drop schema if exists {} cascade",
+            quote_postgres_identifier(schema)
+        ))
+        .await
+        .unwrap();
+    connection.abort();
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn postgres_workflow_id(prefix: &str, schema: &str, iteration: u64) -> durust::WorkflowId {
+    durust::WorkflowId::new(format!("bench/postgres/{prefix}/{schema}/{iteration}"))
+}
+
+fn start_postgres_workflow(
+    fixture: &PostgresBenchFixture,
+    prefix: &str,
+    iteration: u64,
+) -> (durust::WorkflowId, durust::RunId) {
+    let workflow_id = postgres_workflow_id(prefix, &fixture.schema, iteration);
+    let outcome = fixture
+        .runtime
+        .block_on(
+            fixture
+                .backend
+                .start_workflow(durust::StartWorkflowRequest {
+                    namespace: Namespace::default(),
+                    workflow_id: workflow_id.clone(),
+                    workflow_type: WorkflowType::new("bench.double-plus-one", 1),
+                    task_queue: TaskQueue::new("workflows"),
+                    input: durust::encode_payload(&10_u64).unwrap(),
+                }),
+        )
+        .unwrap();
+    (workflow_id, outcome.run_id().clone())
+}
+
+fn claim_postgres_workflow_task(
+    fixture: &PostgresBenchFixture,
+    worker_id: impl Into<String>,
+) -> ClaimedWorkflowTask {
+    fixture
+        .runtime
+        .block_on(
+            fixture
+                .backend
+                .claim_workflow_task(WorkerId::new(worker_id), claim_workflow_options()),
+        )
+        .unwrap()
+        .expect("workflow task")
+}
+
+fn setup_postgres_claimed_workflow_for_commit(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> (ClaimedWorkflowTask, WorkflowTaskCommit) {
+    start_postgres_workflow(fixture, "commit", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-commit-worker");
+    let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+    let scheduled = ActivityScheduled {
+        command_id: durust::command_id(&claimed.run_id, 1),
+        activity_name: ActivityName::new("bench.double"),
+        task_queue: TaskQueue::new("activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("bench.double"),
+            durust::payload_digest(&input),
+            "sha256:bench-options".to_owned(),
+        ),
+        input,
+    };
+    let activity_task = ActivityTask::from_scheduled(&scheduled);
+    (
+        claimed,
+        WorkflowTaskCommit {
+            expected_tail_event_id: EventId(1),
+            append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                scheduled,
+            ))],
+            upsert_waits: Vec::new(),
+            schedule_activities: vec![activity_task],
+            schedule_activity_maps: Vec::new(),
+            start_child_workflows: Vec::new(),
+            consume_signals: Vec::new(),
+            delete_waits: Vec::new(),
+            cancel_commands: Vec::new(),
+            query_projection: None,
+        },
+    )
+}
+
+fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: u64) {
+    let (claimed, batch) = setup_postgres_claimed_workflow_for_commit(fixture, iteration);
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(claimed.claim, batch))
+        .unwrap();
+}
+
+fn setup_postgres_claimed_heartbeat_activity(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> durust::ActivityTaskClaim {
+    start_postgres_workflow(fixture, "heartbeat", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-heartbeat-workflow-worker");
+    let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+    let scheduled = ActivityScheduled {
+        command_id: durust::command_id(&claimed.run_id, 1),
+        activity_name: ActivityName::new("bench.double"),
+        task_queue: TaskQueue::new("activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: Some(Duration::from_secs(30)),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("bench.double"),
+            durust::payload_digest(&input),
+            "sha256:bench-heartbeat-options".to_owned(),
+        ),
+        input,
+    };
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled.clone(),
+                ))],
+                upsert_waits: Vec::new(),
+                schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+    let activity = fixture
+        .runtime
+        .block_on(fixture.backend.claim_activity_task(
+            WorkerId::new(format!("bench-postgres-heartbeat-worker-{iteration}")),
+            claim_activity_options("activities"),
+        ))
+        .unwrap()
+        .expect("heartbeat activity");
+    activity.claim
+}
+
+fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
+    start_postgres_workflow(fixture, "timer", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-timer-worker");
+    let command_id = durust::command_id(&claimed.run_id, 1);
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                    durust::TimerStarted {
+                        command_id: command_id.clone(),
+                        fire_at: TimestampMs(10),
+                        fingerprint: durust::timer_fingerprint("sleep", TimestampMs(10)),
+                    },
+                ))],
+                upsert_waits: vec![WaitRecord {
+                    wait_id: durust::WaitId::new(format!(
+                        "{}:{}:timer",
+                        command_id.run_id, command_id.seq.0
+                    )),
+                    run_id: command_id.run_id.clone(),
+                    command_id,
+                    kind: WaitKind::Timer,
+                    key: "timer".to_owned(),
+                    ready_at: Some(TimestampMs(10)),
+                }],
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+}
+
+fn setup_postgres_signal_wait(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> (durust::RunId, durust::WorkflowId, durust::SignalId) {
+    let (workflow_id, _) = start_postgres_workflow(fixture, "signal", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-signal-worker");
+    let command_id = durust::command_id(&claimed.run_id, 1);
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: vec![WaitRecord {
+                    wait_id: durust::WaitId::new(format!(
+                        "{}:{}:signal",
+                        command_id.run_id, command_id.seq.0
+                    )),
+                    run_id: command_id.run_id.clone(),
+                    command_id,
+                    kind: WaitKind::Signal,
+                    key: "ready".to_owned(),
+                    ready_at: None,
+                }],
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+    (
+        claimed.run_id,
+        workflow_id,
+        durust::SignalId::new(format!("bench/signal/{}/{}", fixture.schema, iteration)),
+    )
+}
+
+fn setup_postgres_claimed_projection_update(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> (ClaimedWorkflowTask, durust::PayloadRef) {
+    start_postgres_workflow(fixture, "projection_update", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-projection-update-worker");
+    (
+        claimed,
+        durust::encode_payload(&BenchInput { value: 10 }).unwrap(),
+    )
+}
+
+fn setup_postgres_projection_read(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> durust::QueryProjectionRequest {
+    let (workflow_id, _) = start_postgres_workflow(fixture, "projection_read", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-projection-read-worker");
+    let payload = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: Vec::new(),
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: Some(payload),
+            },
+        ))
+        .unwrap();
+    durust::QueryProjectionRequest {
+        namespace: Namespace::default(),
+        workflow_id,
+    }
+}
+
+fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64) -> durust::RunId {
+    start_postgres_workflow(fixture, "history", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-history-worker");
+    let events = (0..128)
+        .map(|_| NewHistoryEvent::new(HistoryEventData::WorkflowTaskStarted))
+        .collect::<Vec<_>>();
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: events,
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+    claimed.run_id
+}
+
+fn setup_postgres_child_start(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> (ClaimedWorkflowTask, WorkflowTaskCommit) {
+    start_postgres_workflow(fixture, "child_parent", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-child-worker");
+    let command_id = durust::command_id(&claimed.run_id, 1);
+    let input = durust::encode_payload(&10_u64).unwrap();
+    let workflow_type = WorkflowType::new("bench.child-double", 1);
+    let workflow_id = postgres_workflow_id("child_target", &fixture.schema, iteration);
+    let task_queue = TaskQueue::new("workflows");
+    let requested = durust::ChildWorkflowStartRequested {
+        command_id: command_id.clone(),
+        workflow_type: workflow_type.clone(),
+        workflow_id: workflow_id.clone(),
+        task_queue: task_queue.clone(),
+        input: input.clone(),
+        parent_close_policy: durust::ParentClosePolicy::Cancel,
+        fingerprint: durust::child_workflow_fingerprint(
+            workflow_type,
+            workflow_id,
+            durust::payload_digest(&input),
+            task_queue,
+            durust::ParentClosePolicy::Cancel,
+        ),
+    };
+    (
+        claimed,
+        WorkflowTaskCommit {
+            expected_tail_event_id: EventId(1),
+            append_events: vec![NewHistoryEvent::new(
+                HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+            )],
+            upsert_waits: Vec::new(),
+            schedule_activities: Vec::new(),
+            schedule_activity_maps: Vec::new(),
+            start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
+                &requested,
+            )],
+            consume_signals: Vec::new(),
+            delete_waits: Vec::new(),
+            cancel_commands: Vec::new(),
+            query_projection: None,
+        },
+    )
+}
+
+fn setup_postgres_claimed_activity_map_workflow(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> (
+    ClaimedWorkflowTask,
+    ActivityMapTask,
+    durust::ActivityMapScheduled,
+) {
+    start_postgres_workflow(fixture, "activity_map", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-map-workflow-worker");
+    let command_id = durust::command_id(&claimed.run_id, 1);
+    let input_manifest = activity_map_input_manifest(8);
+    let activity_name = ActivityName::new("bench.double");
+    let task_queue = TaskQueue::new("activities");
+    let retry_policy = durust::RetryPolicy::none();
+    let scheduled = durust::ActivityMapScheduled {
+        command_id: command_id.clone(),
+        activity_name: activity_name.clone(),
+        task_queue: task_queue.clone(),
+        retry_policy: retry_policy.clone(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input_manifest: input_manifest.clone(),
+        result_manifest_name: "bench-results".to_owned(),
+        max_in_flight: 8,
+        fingerprint: durust::activity_map_fingerprint(
+            activity_name.clone(),
+            durust::payload_digest(&input_manifest),
+            "bench-results".to_owned(),
+            8,
+            "sha256:bench-options".to_owned(),
+        ),
+    };
+    let map_task = ActivityMapTask {
+        map_command_id: command_id,
+        activity_name,
+        task_queue,
+        retry_policy,
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input_manifest,
+        result_manifest_name: "bench-results".to_owned(),
+        max_in_flight: 8,
+    };
+    (claimed, map_task, scheduled)
+}
+
 fn add_worker_stats(mut left: WorkerRunStats, right: WorkerRunStats) -> WorkerRunStats {
     left.workflow_tasks += right.workflow_tasks;
     left.activity_tasks += right.activity_tasks;
@@ -1966,6 +2836,7 @@ criterion_group!(
     version_marker_replay,
     activity_claim_complete,
     sqlite_single_file_mixed_throughput,
+    postgres_provider_hot_paths,
     activity_heartbeat,
     payload_codec,
     payload_compression,
