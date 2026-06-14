@@ -38,6 +38,41 @@ fn workflow_id_for_shard(
     panic!("could not find workflow id for shard {shard_id}");
 }
 
+async fn shard_leases_for_tests(
+    backend: &PostgresBackend,
+    schema: &str,
+    shards: &[ShardId],
+) -> Vec<(ShardId, Option<String>, i64, Option<i64>)> {
+    let shard_ids = shards
+        .iter()
+        .map(|shard| i32::try_from(shard.0).unwrap_or(i32::MAX))
+        .collect::<Vec<_>>();
+    let client = backend.client().await.unwrap();
+    client
+        .query(
+            &format!(
+                "select shard_id, owner_id, lease_epoch, lease_until_ms
+                 from {}.shard_leases
+                 where shard_id = any($1::integer[])
+                 order by shard_id asc",
+                quote_ident(schema)
+            ),
+            &[&shard_ids],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                ShardId(u32::try_from(row.get::<_, i32>(0)).unwrap_or(u32::MAX)),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+            )
+        })
+        .collect()
+}
+
 async fn start_inline_child_for_tests(
     backend: &PostgresBackend,
     prefix: &str,
@@ -198,6 +233,111 @@ fn postgres_partition_suffix_width_tracks_partition_count() {
 }
 
 #[test]
+fn postgres_batch_shard_lease_refresh_preserves_epoch_for_same_owner() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres batch lease refresh test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_lease_refresh");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .logical_shards(8)
+                .physical_partitions(2),
+        )
+        .await
+        .unwrap();
+        let shards = vec![ShardId(1), ShardId(3), ShardId(5)];
+        let owner = WorkerId::new("lease-owner");
+        let competitor = WorkerId::new("lease-competitor");
+        let now_ms = unix_epoch_millis();
+
+        let mut client = backend.client().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let owned = backend
+            .refresh_shard_leases_tx(&tx, &owner, &shards, Duration::from_secs(30), now_ms)
+            .await
+            .unwrap();
+        assert_eq!(owned, shards);
+        tx.commit().await.unwrap();
+
+        let rows = shard_leases_for_tests(&backend, &schema, &shards).await;
+        assert_eq!(rows.len(), shards.len());
+        for (shard, owner_id, lease_epoch, lease_until_ms) in &rows {
+            assert!(shards.contains(shard));
+            assert_eq!(owner_id.as_deref(), Some("lease-owner"));
+            assert_eq!(*lease_epoch, 1);
+            assert!(lease_until_ms.is_some_and(|lease_until_ms| lease_until_ms > now_ms));
+        }
+
+        let mut client = backend.client().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let owned = backend
+            .refresh_shard_leases_tx(
+                &tx,
+                &owner,
+                &shards,
+                Duration::from_secs(30),
+                now_ms.saturating_add(1_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owned, shards);
+        tx.commit().await.unwrap();
+
+        let rows = shard_leases_for_tests(&backend, &schema, &shards).await;
+        for (_, owner_id, lease_epoch, _) in &rows {
+            assert_eq!(owner_id.as_deref(), Some("lease-owner"));
+            assert_eq!(*lease_epoch, 1);
+        }
+
+        let mut client = backend.client().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let owned = backend
+            .refresh_shard_leases_tx(
+                &tx,
+                &competitor,
+                &shards,
+                Duration::from_secs(30),
+                now_ms.saturating_add(2_000),
+            )
+            .await
+            .unwrap();
+        assert!(owned.is_empty());
+        tx.commit().await.unwrap();
+
+        let rows = shard_leases_for_tests(&backend, &schema, &shards).await;
+        for (_, owner_id, lease_epoch, _) in &rows {
+            assert_eq!(owner_id.as_deref(), Some("lease-owner"));
+            assert_eq!(*lease_epoch, 1);
+        }
+
+        let mut client = backend.client().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        let owned = backend
+            .refresh_shard_leases_tx(
+                &tx,
+                &competitor,
+                &shards,
+                Duration::from_secs(30),
+                now_ms.saturating_add(31_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owned, shards);
+        tx.commit().await.unwrap();
+
+        let rows = shard_leases_for_tests(&backend, &schema, &shards).await;
+        for (_, owner_id, lease_epoch, _) in &rows {
+            assert_eq!(owner_id.as_deref(), Some("lease-competitor"));
+            assert_eq!(*lease_epoch, 2);
+        }
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
 fn postgres_shard_metadata_is_validated_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {
@@ -228,6 +368,18 @@ fn postgres_shard_metadata_is_validated_when_configured() {
         let shard_rows: i64 = row.get(0);
         assert_eq!(shard_rows, 16);
 
+        let same_schema_different_pool = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone())
+                .schema(schema.clone())
+                .max_pool_size(2)
+                .logical_shards(16)
+                .physical_partitions(4),
+        )
+        .await
+        .unwrap();
+        assert_eq!(same_schema_different_pool.logical_shards(), 16);
+        assert_eq!(same_schema_different_pool.physical_partitions(), 4);
+
         let err = PostgresBackend::connect_with_config(
             PostgresBackendConfig::new(url)
                 .schema(schema.clone())
@@ -242,6 +394,106 @@ fn postgres_shard_metadata_is_validated_when_configured() {
                 .contains("metadata mismatch for `logical_shards`"),
             "unexpected error: {err}"
         );
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_hot_path_ids_use_sequences_without_meta_counters() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres sequence counter test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("hot_path_sequences");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        let namespace = Namespace::default();
+        let workflow_type = WorkflowType::new("postgres.claim-token", 1);
+        let queue = crate::TaskQueue::new("postgres-claim-token-workflows");
+
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: namespace.clone(),
+                workflow_id: crate::WorkflowId::new("wf/hot-path-sequences"),
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&"input").unwrap(),
+            })
+            .await
+            .unwrap();
+        backend
+            .signal_workflow(crate::SignalWorkflowRequest {
+                namespace: namespace.clone(),
+                workflow_id: crate::WorkflowId::new("wf/hot-path-sequences"),
+                signal_id: crate::SignalId::new("signal/hot-path-sequences"),
+                signal_name: crate::SignalName::new("finish"),
+                payload: crate::encode_payload(&"payload").unwrap(),
+            })
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("claim-token-worker"),
+                crate::ClaimWorkflowTaskOptions {
+                    namespace,
+                    task_queue: queue,
+                    registered_workflow_types: vec![workflow_type],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("workflow task should be claimed");
+        assert!(claimed.claim.token > 0);
+
+        let client = backend.client().await.unwrap();
+        let hot_meta_keys: i64 = client
+            .query_one(
+                &format!(
+                    "select count(*) from {}.meta where key in ('run', 'signal', 'claim')",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(hot_meta_keys, 0);
+        let run_sequence_value: i64 = client
+            .query_one(
+                &format!("select last_value from {}.run_id_seq", quote_ident(&schema)),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(run_sequence_value > 0);
+        let signal_sequence_value: i64 = client
+            .query_one(
+                &format!("select last_value from {}.signal_seq", quote_ident(&schema)),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(signal_sequence_value > 0);
+        let claim_sequence_value: i64 = client
+            .query_opt(
+                &format!(
+                    "select last_value from {}.claim_token_seq",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0);
+        assert!(claim_sequence_value > 0);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -309,6 +561,52 @@ fn postgres_batch_claim_honors_shard_filter_when_configured() {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].workflow_id, target_workflow_id);
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_empty_shard_filtered_claim_does_not_acquire_leases() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres empty shard-filter claim test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("empty_shard_filter");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .logical_shards(8)
+                .physical_partitions(2),
+        )
+        .await
+        .unwrap();
+        let shards = vec![ShardId(1), ShardId(3), ShardId(5)];
+        let claimed = backend
+            .claim_workflow_tasks(
+                WorkerId::new("idle-filtered-worker"),
+                crate::ClaimWorkflowTasksOptions {
+                    claim: crate::ClaimWorkflowTaskOptions {
+                        namespace: Namespace::default(),
+                        task_queue: crate::TaskQueue::new("postgres-empty-shard-filter"),
+                        registered_workflow_types: vec![WorkflowType::new("postgres.empty", 1)],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                    limit: 8,
+                    shard_filter: Some(shards.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(claimed.is_empty());
+
+        let rows = shard_leases_for_tests(&backend, &schema, &shards).await;
+        assert_eq!(rows.len(), shards.len());
+        for (_, owner_id, lease_epoch, lease_until_ms) in rows {
+            assert_eq!(owner_id, None);
+            assert_eq!(lease_epoch, 0);
+            assert_eq!(lease_until_ms, None);
+        }
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -2920,6 +3218,182 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
             CommitOutcome::Committed {
                 new_tail_event_id: EventId(2)
             }
+        );
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres batch activity claim test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_activity_claim");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema)
+                .max_pool_size(4),
+        )
+        .await
+        .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-batch-activity-claim");
+        let workflow_type = WorkflowType::new("postgres.batch.activity", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-activity-workflows");
+        let activity_queue = crate::TaskQueue::new("postgres-batch-activity-tasks");
+        let activity_name = crate::ActivityName::new("postgres.batch.activity");
+        let started = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id,
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"batch-activity-claim").unwrap(),
+            })
+            .await
+            .unwrap();
+        let run_id = started.run_id().clone();
+        let workflow_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-activity-scheduler"),
+                workflow_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let schedules = (0..3_u64)
+            .map(|index| crate::ActivityScheduled {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: CommandSeq(index + 1),
+                },
+                activity_name: activity_name.clone(),
+                task_queue: activity_queue.clone(),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: Some(Duration::from_secs(30)),
+                heartbeat_timeout: Some(Duration::from_secs(30)),
+                input: crate::encode_payload(&index).unwrap(),
+                fingerprint: crate::CommandFingerprint {
+                    kind: crate::CommandKind::Activity,
+                    name: activity_name.0.clone(),
+                    input_digest: None,
+                    options_digest: format!("batch-{index}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let outcome = backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events: schedules
+                        .iter()
+                        .cloned()
+                        .map(|scheduled| {
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                scheduled,
+                            ))
+                        })
+                        .collect(),
+                    schedule_activities: schedules
+                        .iter()
+                        .map(ActivityTask::from_scheduled)
+                        .collect(),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(4)
+            }
+        );
+
+        let activity_opts = ClaimActivityOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: activity_queue,
+            registered_activity_names: vec![activity_name],
+            lease_duration: Duration::from_secs(30),
+        };
+        assert!(
+            backend
+                .claim_activity_tasks(
+                    WorkerId::new("postgres-batch-activity-zero"),
+                    ClaimActivityTasksOptions {
+                        claim: activity_opts.clone(),
+                        limit: 0,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let first_batch = backend
+            .claim_activity_tasks(
+                WorkerId::new("postgres-batch-activity-worker-a"),
+                ClaimActivityTasksOptions {
+                    claim: activity_opts.clone(),
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_batch.len(), 2);
+        let first_tokens = first_batch
+            .iter()
+            .map(|claimed| claimed.claim.token)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(first_tokens.len(), 2);
+        assert_eq!(
+            first_batch
+                .iter()
+                .map(|claimed| claimed.task.activity_id.clone())
+                .collect::<Vec<_>>(),
+            schedules
+                .iter()
+                .take(2)
+                .map(|scheduled| ActivityId::new(&scheduled.command_id))
+                .collect::<Vec<_>>()
+        );
+
+        let second_batch = backend
+            .claim_activity_tasks(
+                WorkerId::new("postgres-batch-activity-worker-b"),
+                ClaimActivityTasksOptions {
+                    claim: activity_opts.clone(),
+                    limit: 4,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(
+            second_batch[0].task.activity_id,
+            ActivityId::new(&schedules[2].command_id)
+        );
+        assert!(
+            backend
+                .claim_activity_tasks(
+                    WorkerId::new("postgres-batch-activity-empty"),
+                    ClaimActivityTasksOptions {
+                        claim: activity_opts,
+                        limit: 4,
+                    },
+                )
+                .await
+                .unwrap()
+                .is_empty()
         );
 
         backend.drop_schema_for_tests().await.unwrap();

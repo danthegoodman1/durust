@@ -5,11 +5,16 @@ use durust::{
 };
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_WORKFLOWS: u64 = 250;
@@ -18,6 +23,7 @@ const DEFAULT_BATCH: usize = 32;
 const DEFAULT_MAX_ROUNDS: usize = 10_000;
 const WORKFLOW_QUEUE: &str = "workflows";
 const ACTIVITY_QUEUE: &str = "activities";
+static POSTGRES_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchmarkBackend {
@@ -102,6 +108,19 @@ struct LatencyReport {
 #[serde(rename_all = "camelCase")]
 struct BackendMetricsReport {
     workflow_task_commit_latency: LatencyReport,
+    operations: BTreeMap<String, BackendOperationReport>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendOperationReport {
+    calls: u64,
+    errors: u64,
+    items: u64,
+    total_ms: f64,
+    items_per_call: f64,
+    items_per_second: f64,
+    latency: LatencyReport,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -109,12 +128,75 @@ struct BackendMetricsReport {
 struct PostgresStatsReport {
     wal_bytes: u64,
     wal_bytes_per_second: f64,
+    wal_records: u64,
+    wal_records_per_second: f64,
+    wal_fpi: u64,
+    wal_buffers_full: u64,
+    wal_write: u64,
+    wal_sync: u64,
+    wal_write_time_ms: f64,
+    wal_sync_time_ms: f64,
+    xact_commit: u64,
+    xact_rollback: u64,
+    transactions_per_second: f64,
+    rows_returned: u64,
+    rows_fetched: u64,
+    rows_inserted: u64,
+    rows_updated: u64,
+    rows_deleted: u64,
+    blocks_read: u64,
+    blocks_hit: u64,
+    block_cache_hit_ratio: f64,
+    temp_files: u64,
+    temp_bytes: u64,
+    deadlocks: u64,
+    block_read_time_ms: f64,
+    block_write_time_ms: f64,
+    active_time_ms: f64,
+    session_time_ms: f64,
     active_connections_after: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_samples: Option<PostgresActivitySamplesReport>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostgresActivitySamplesReport {
+    samples: u64,
+    max_connections: u64,
+    max_active: u64,
+    max_idle: u64,
+    max_waiting: u64,
+    wait_event_type_counts: BTreeMap<String, u64>,
+    wait_event_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PostgresStatsSnapshot {
     wal_bytes: u64,
+    wal_records: u64,
+    wal_fpi: u64,
+    wal_buffers_full: u64,
+    wal_write: u64,
+    wal_sync: u64,
+    wal_write_time_ms: f64,
+    wal_sync_time_ms: f64,
+    xact_commit: u64,
+    xact_rollback: u64,
+    rows_returned: u64,
+    rows_fetched: u64,
+    rows_inserted: u64,
+    rows_updated: u64,
+    rows_deleted: u64,
+    blocks_read: u64,
+    blocks_hit: u64,
+    temp_files: u64,
+    temp_bytes: u64,
+    deadlocks: u64,
+    block_read_time_ms: f64,
+    block_write_time_ms: f64,
+    active_time_ms: f64,
+    session_time_ms: f64,
     active_connections: u64,
 }
 
@@ -153,6 +235,15 @@ struct BenchmarkResult {
 #[derive(Clone, Default)]
 struct BackendMetrics {
     workflow_task_commit_latencies: Arc<Mutex<Vec<Duration>>>,
+    operations: Arc<Mutex<BTreeMap<&'static str, OperationSamples>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct OperationSamples {
+    durations: Vec<Duration>,
+    total_duration: Duration,
+    items: u64,
+    errors: u64,
 }
 
 impl BackendMetrics {
@@ -163,14 +254,46 @@ impl BackendMetrics {
             .push(duration);
     }
 
+    fn record_operation(&self, name: &'static str, duration: Duration, items: u64, success: bool) {
+        let mut operations = self
+            .operations
+            .lock()
+            .expect("benchmark metrics mutex poisoned");
+        let samples = operations.entry(name).or_default();
+        samples.durations.push(duration);
+        samples.total_duration += duration;
+        samples.items = samples.items.saturating_add(items);
+        if !success {
+            samples.errors = samples.errors.saturating_add(1);
+        }
+    }
+
     fn report(&self) -> BackendMetricsReport {
-        let samples = self
+        let commit_samples = self
             .workflow_task_commit_latencies
             .lock()
             .expect("benchmark metrics mutex poisoned")
             .clone();
+        let operations = self
+            .operations
+            .lock()
+            .expect("benchmark metrics mutex poisoned")
+            .iter()
+            .map(|(name, samples)| {
+                (
+                    (*name).to_owned(),
+                    operation_report(
+                        samples.durations.clone(),
+                        samples.total_duration,
+                        samples.items,
+                        samples.errors,
+                    ),
+                )
+            })
+            .collect();
         BackendMetricsReport {
-            workflow_task_commit_latency: latency_report(samples),
+            workflow_task_commit_latency: latency_report(commit_samples),
+            operations,
         }
     }
 }
@@ -205,18 +328,54 @@ where
         &self,
         req: durust::StartWorkflowRequest,
     ) -> BoxFuture<'static, durust::Result<durust::StartWorkflowOutcome>> {
-        self.inner.start_workflow(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.start_workflow(req).await;
+            metrics.record_operation(
+                "start_workflow",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn cancel_workflow(
         &self,
         req: durust::CancelWorkflowRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CancelWorkflowOutcome>> {
-        self.inner.cancel_workflow(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.cancel_workflow(req).await;
+            metrics.record_operation(
+                "cancel_workflow",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn current_time(&self) -> BoxFuture<'static, durust::Result<durust::TimestampMs>> {
-        self.inner.current_time()
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.current_time().await;
+            metrics.record_operation(
+                "current_time",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn claim_workflow_task(
@@ -224,7 +383,24 @@ where
         worker_id: durust::WorkerId,
         opts: durust::ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
-        self.inner.claim_workflow_task(worker_id, opts)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.claim_workflow_task(worker_id, opts).await;
+            let items = result
+                .as_ref()
+                .ok()
+                .and_then(|task| task.as_ref())
+                .map_or(0, |_| 1);
+            metrics.record_operation(
+                "claim_workflow_task",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn claim_workflow_tasks(
@@ -232,35 +408,93 @@ where
         worker_id: durust::WorkerId,
         opts: durust::ClaimWorkflowTasksOptions,
     ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedWorkflowTask>>> {
-        self.inner.claim_workflow_tasks(worker_id, opts)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.claim_workflow_tasks(worker_id, opts).await;
+            let items = result.as_ref().map_or(0, |tasks| tasks.len() as u64);
+            metrics.record_operation(
+                "claim_workflow_tasks",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn stream_history(
         &self,
         req: durust::StreamHistoryRequest,
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
-        self.inner.stream_history(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.stream_history(req).await;
+            let items = result.as_ref().map_or(0, |chunk| chunk.events.len() as u64);
+            metrics.record_operation("stream_history", started.elapsed(), items, result.is_ok());
+            result
+        })
     }
 
     fn stream_history_for_replay(
         &self,
         req: durust::StreamHistoryRequest,
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
-        self.inner.stream_history_for_replay(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.stream_history_for_replay(req).await;
+            let items = result.as_ref().map_or(0, |chunk| chunk.events.len() as u64);
+            metrics.record_operation(
+                "stream_history_for_replay",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn hydrate_payload(
         &self,
         payload: durust::PayloadRef,
     ) -> BoxFuture<'static, durust::Result<durust::PayloadRef>> {
-        self.inner.hydrate_payload(payload)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.hydrate_payload(payload).await;
+            metrics.record_operation(
+                "hydrate_payload",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn hydrate_activity_map_result_manifest(
         &self,
         payload: durust::PayloadRef,
     ) -> BoxFuture<'static, durust::Result<durust::PayloadRef>> {
-        self.inner.hydrate_activity_map_result_manifest(payload)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.hydrate_activity_map_result_manifest(payload).await;
+            metrics.record_operation(
+                "hydrate_activity_map_result_manifest",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn commit_workflow_task(
@@ -273,7 +507,14 @@ where
         Box::pin(async move {
             let started = Instant::now();
             let result = inner.commit_workflow_task(claim, batch).await;
-            metrics.record_workflow_task_commit(started.elapsed());
+            let duration = started.elapsed();
+            metrics.record_workflow_task_commit(duration);
+            metrics.record_operation(
+                "commit_workflow_task",
+                duration,
+                success_item(&result),
+                result.is_ok(),
+            );
             result
         })
     }
@@ -284,10 +525,16 @@ where
     ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
+        let input_items = batch.commits.len() as u64;
         Box::pin(async move {
             let started = Instant::now();
             let result = inner.commit_workflow_tasks(batch).await;
-            metrics.record_workflow_task_commit(started.elapsed());
+            let duration = started.elapsed();
+            metrics.record_workflow_task_commit(duration);
+            let items = result
+                .as_ref()
+                .map_or(input_items, |results| results.len() as u64);
+            metrics.record_operation("commit_workflow_tasks", duration, items, result.is_ok());
             result
         })
     }
@@ -297,35 +544,99 @@ where
         claim: durust::WorkflowTaskClaim,
         release: durust::WorkflowTaskRelease,
     ) -> BoxFuture<'static, durust::Result<()>> {
-        self.inner.release_workflow_task(claim, release)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.release_workflow_task(claim, release).await;
+            metrics.record_operation(
+                "release_workflow_task",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn signal_workflow(
         &self,
         req: durust::SignalWorkflowRequest,
     ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>> {
-        self.inner.signal_workflow(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.signal_workflow(req).await;
+            metrics.record_operation(
+                "signal_workflow",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn read_signal_inbox(
         &self,
         req: durust::ReadSignalInboxRequest,
     ) -> BoxFuture<'static, durust::Result<Option<durust::SignalInboxRecord>>> {
-        self.inner.read_signal_inbox(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.read_signal_inbox(req).await;
+            let items = result
+                .as_ref()
+                .ok()
+                .and_then(|record| record.as_ref())
+                .map_or(0, |_| 1);
+            metrics.record_operation(
+                "read_signal_inbox",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn fire_due_timers(
         &self,
         req: durust::FireDueTimersRequest,
     ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>> {
-        self.inner.fire_due_timers(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.fire_due_timers(req).await;
+            let items = result.as_ref().map_or(0, |outcome| outcome.fired as u64);
+            metrics.record_operation("fire_due_timers", started.elapsed(), items, result.is_ok());
+            result
+        })
     }
 
     fn timeout_due_activities(
         &self,
         req: durust::TimeoutDueActivitiesRequest,
     ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>> {
-        self.inner.timeout_due_activities(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.timeout_due_activities(req).await;
+            let items = result
+                .as_ref()
+                .map_or(0, |outcome| outcome.timed_out as u64);
+            metrics.record_operation(
+                "timeout_due_activities",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn claim_activity_task(
@@ -333,60 +644,197 @@ where
         worker_id: durust::WorkerId,
         opts: durust::ClaimActivityOptions,
     ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>> {
-        self.inner.claim_activity_task(worker_id, opts)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.claim_activity_task(worker_id, opts).await;
+            let items = result
+                .as_ref()
+                .ok()
+                .and_then(|task| task.as_ref())
+                .map_or(0, |_| 1);
+            metrics.record_operation(
+                "claim_activity_task",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
+    }
+
+    fn claim_activity_tasks(
+        &self,
+        worker_id: durust::WorkerId,
+        opts: durust::ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedActivityTask>>> {
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.claim_activity_tasks(worker_id, opts).await;
+            let items = result.as_ref().map_or(0, |tasks| tasks.len() as u64);
+            metrics.record_operation(
+                "claim_activity_tasks",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn heartbeat_activity(
         &self,
         req: durust::ActivityHeartbeatRequest,
     ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>> {
-        self.inner.heartbeat_activity(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.heartbeat_activity(req).await;
+            metrics.record_operation(
+                "heartbeat_activity",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn complete_activity(
         &self,
         req: durust::CompleteActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
-        self.inner.complete_activity(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.complete_activity(req).await;
+            metrics.record_operation(
+                "complete_activity",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn fail_activity(
         &self,
         req: durust::FailActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
-        self.inner.fail_activity(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.fail_activity(req).await;
+            metrics.record_operation(
+                "fail_activity",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn dispatch_child_workflow_starts(
         &self,
         req: durust::DispatchChildWorkflowStartsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
-        self.inner.dispatch_child_workflow_starts(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.dispatch_child_workflow_starts(req).await;
+            let items = result
+                .as_ref()
+                .map_or(0, |outcome| outcome.dispatched as u64);
+            metrics.record_operation(
+                "dispatch_child_workflow_starts",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn query_projection(
         &self,
         req: durust::QueryProjectionRequest,
     ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
-        self.inner.query_projection(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.query_projection(req).await;
+            metrics.record_operation(
+                "query_projection",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn workflow_change_versions(
         &self,
         req: durust::WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
-        self.inner.workflow_change_versions(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.workflow_change_versions(req).await;
+            metrics.record_operation(
+                "workflow_change_versions",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>> {
-        self.inner.payload_roots()
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.payload_roots().await;
+            metrics.record_operation(
+                "payload_roots",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 
     fn gc_payload_blobs(
         &self,
         req: durust::PayloadGarbageCollectionRequest,
     ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
-        self.inner.gc_payload_blobs(req)
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.gc_payload_blobs(req).await;
+            metrics.record_operation(
+                "gc_payload_blobs",
+                started.elapsed(),
+                success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
     }
 }
 
@@ -724,24 +1172,79 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         .map_err(|err| err.to_string())?;
 
     let postgres_stats_before = postgres_stats_snapshot(&runtime, &database_url).ok();
+    let activity_sampler =
+        PostgresActivitySampler::start(database_url.clone(), Duration::from_millis(100));
     let mut result = run_backend_benchmark(&runtime, backend, options, None);
+    let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
     let postgres_stats_after = postgres_stats_snapshot(&runtime, &database_url).ok();
     if let (Ok(result), Some(before), Some(after)) =
         (&mut result, postgres_stats_before, postgres_stats_after)
     {
-        let wal_bytes = after.wal_bytes.saturating_sub(before.wal_bytes);
         let processing_seconds = (result.processing_ms / 1_000.0).max(f64::EPSILON);
-        result.postgres_stats = Some(PostgresStatsReport {
-            wal_bytes,
-            wal_bytes_per_second: wal_bytes as f64 / processing_seconds,
-            active_connections_after: after.active_connections,
-        });
+        result.postgres_stats = Some(postgres_stats_report(
+            before,
+            after,
+            processing_seconds,
+            activity_samples,
+        ));
     }
     let cleanup = drop_postgres_schema(&runtime, &database_url, &schema);
     match (result, cleanup) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(err)) => Err(err),
         (Err(err), _) => Err(err),
+    }
+}
+
+fn postgres_stats_report(
+    before: PostgresStatsSnapshot,
+    after: PostgresStatsSnapshot,
+    processing_seconds: f64,
+    activity_samples: Option<PostgresActivitySamplesReport>,
+) -> PostgresStatsReport {
+    let wal_bytes = after.wal_bytes.saturating_sub(before.wal_bytes);
+    let xact_commit = after.xact_commit.saturating_sub(before.xact_commit);
+    let xact_rollback = after.xact_rollback.saturating_sub(before.xact_rollback);
+    let blocks_read = after.blocks_read.saturating_sub(before.blocks_read);
+    let blocks_hit = after.blocks_hit.saturating_sub(before.blocks_hit);
+    let wal_records = after.wal_records.saturating_sub(before.wal_records);
+    PostgresStatsReport {
+        wal_bytes,
+        wal_bytes_per_second: wal_bytes as f64 / processing_seconds,
+        wal_records,
+        wal_records_per_second: wal_records as f64 / processing_seconds,
+        wal_fpi: after.wal_fpi.saturating_sub(before.wal_fpi),
+        wal_buffers_full: after
+            .wal_buffers_full
+            .saturating_sub(before.wal_buffers_full),
+        wal_write: after.wal_write.saturating_sub(before.wal_write),
+        wal_sync: after.wal_sync.saturating_sub(before.wal_sync),
+        wal_write_time_ms: (after.wal_write_time_ms - before.wal_write_time_ms).max(0.0),
+        wal_sync_time_ms: (after.wal_sync_time_ms - before.wal_sync_time_ms).max(0.0),
+        xact_commit,
+        xact_rollback,
+        transactions_per_second: (xact_commit + xact_rollback) as f64 / processing_seconds,
+        rows_returned: after.rows_returned.saturating_sub(before.rows_returned),
+        rows_fetched: after.rows_fetched.saturating_sub(before.rows_fetched),
+        rows_inserted: after.rows_inserted.saturating_sub(before.rows_inserted),
+        rows_updated: after.rows_updated.saturating_sub(before.rows_updated),
+        rows_deleted: after.rows_deleted.saturating_sub(before.rows_deleted),
+        blocks_read,
+        blocks_hit,
+        block_cache_hit_ratio: if blocks_read + blocks_hit == 0 {
+            0.0
+        } else {
+            blocks_hit as f64 / (blocks_read + blocks_hit) as f64
+        },
+        temp_files: after.temp_files.saturating_sub(before.temp_files),
+        temp_bytes: after.temp_bytes.saturating_sub(before.temp_bytes),
+        deadlocks: after.deadlocks.saturating_sub(before.deadlocks),
+        block_read_time_ms: (after.block_read_time_ms - before.block_read_time_ms).max(0.0),
+        block_write_time_ms: (after.block_write_time_ms - before.block_write_time_ms).max(0.0),
+        active_time_ms: (after.active_time_ms - before.active_time_ms).max(0.0),
+        session_time_ms: (after.session_time_ms - before.session_time_ms).max(0.0),
+        active_connections_after: after.active_connections,
+        activity_samples,
     }
 }
 
@@ -954,6 +1457,7 @@ where
             },
         )?)
         .workflow_task_commit_batch_size(options.batch)
+        .max_concurrent_activities(options.batch)
         .register_workflow(benchmark_parent)
         .register_workflow(benchmark_child)
         .register_activity(benchmark_activity);
@@ -1084,8 +1588,9 @@ where
             stats.child_workflow_starts_dispatched += child_starts;
             progressed = true;
         }
-        if worker.run_activity_once().await? {
-            stats.activity_tasks += 1;
+        let activity_tasks = worker.run_activity_batch_once().await?;
+        if activity_tasks > 0 {
+            stats.activity_tasks += activity_tasks;
             progressed = true;
         }
 
@@ -1220,6 +1725,37 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn success_item<T>(result: &durust::Result<T>) -> u64 {
+    u64::from(result.is_ok())
+}
+
+fn operation_report(
+    samples: Vec<Duration>,
+    total_duration: Duration,
+    items: u64,
+    errors: u64,
+) -> BackendOperationReport {
+    let latency = latency_report(samples);
+    let total_seconds = total_duration.as_secs_f64();
+    BackendOperationReport {
+        calls: latency.samples,
+        errors,
+        items,
+        total_ms: duration_ms(total_duration),
+        items_per_call: if latency.samples == 0 {
+            0.0
+        } else {
+            items as f64 / latency.samples as f64
+        },
+        items_per_second: if total_seconds <= f64::EPSILON {
+            0.0
+        } else {
+            items as f64 / total_seconds
+        },
+        latency,
+    }
+}
+
 fn latency_report(mut samples: Vec<Duration>) -> LatencyReport {
     if samples.is_empty() {
         return LatencyReport::default();
@@ -1266,7 +1802,13 @@ fn postgres_benchmark_schema() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros();
-    format!("durust_benchmark_{}_{}", std::process::id(), micros)
+    let counter = POSTGRES_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "durust_benchmark_{}_{}_{}",
+        std::process::id(),
+        micros,
+        counter
+    )
 }
 
 fn drop_postgres_schema(
@@ -1292,6 +1834,96 @@ fn drop_postgres_schema(
     })
 }
 
+struct PostgresActivitySampler {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<Result<PostgresActivitySamplesReport, String>>,
+}
+
+impl PostgresActivitySampler {
+    fn start(database_url: String, interval: Duration) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("durust-postgres-activity-sampler".to_owned())
+            .spawn(move || postgres_activity_sampler_loop(database_url, interval, thread_stop))
+            .ok()?;
+        Some(Self { stop, handle })
+    }
+
+    fn stop(self) -> Result<PostgresActivitySamplesReport, String> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle
+            .join()
+            .map_err(|_| "postgres activity sampler panicked".to_owned())?
+    }
+}
+
+fn postgres_activity_sampler_loop(
+    database_url: String,
+    interval: Duration,
+    stop: Arc<AtomicBool>,
+) -> Result<PostgresActivitySamplesReport, String> {
+    let runtime = tokio_runtime()?;
+    runtime.block_on(async move {
+        let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|err| err.to_string())?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                eprintln!("postgres activity sampler connection error: {err}");
+            }
+        });
+
+        let mut report = PostgresActivitySamplesReport::default();
+        while !stop.load(Ordering::Relaxed) {
+            let rows = client
+                .query(
+                    "select state,
+                            coalesce(wait_event_type, ''),
+                            coalesce(wait_event, '')
+                     from pg_stat_activity
+                     where datname = current_database()
+                       and pid <> pg_backend_pid()",
+                    &[],
+                )
+                .await
+                .map_err(|err| err.to_string())?;
+
+            let mut active = 0_u64;
+            let mut idle = 0_u64;
+            let mut waiting = 0_u64;
+            for row in &rows {
+                let state: Option<String> = row.get(0);
+                let wait_event_type: String = row.get(1);
+                let wait_event: String = row.get(2);
+                match state.as_deref() {
+                    Some("active") => active += 1,
+                    Some("idle") => idle += 1,
+                    _ => {}
+                }
+                if !wait_event_type.is_empty() {
+                    waiting += 1;
+                    *report
+                        .wait_event_type_counts
+                        .entry(wait_event_type)
+                        .or_default() += 1;
+                }
+                if !wait_event.is_empty() {
+                    *report.wait_event_counts.entry(wait_event).or_default() += 1;
+                }
+            }
+            report.samples += 1;
+            report.max_connections = report.max_connections.max(rows.len() as u64);
+            report.max_active = report.max_active.max(active);
+            report.max_idle = report.max_idle.max(idle);
+            report.max_waiting = report.max_waiting.max(waiting);
+
+            tokio::time::sleep(interval).await;
+        }
+        Ok(report)
+    })
+}
+
 fn postgres_stats_snapshot(
     runtime: &tokio::runtime::Runtime,
     database_url: &str,
@@ -1307,10 +1939,45 @@ fn postgres_stats_snapshot(
             }
         });
         let wal_bytes = client
-            .query_one("select wal_bytes::bigint from pg_stat_wal", &[])
+            .query_one(
+                "select wal_records::bigint,
+                        wal_fpi::bigint,
+                        wal_bytes::bigint,
+                        wal_buffers_full::bigint,
+                        wal_write::bigint,
+                        wal_sync::bigint,
+                        coalesce(wal_write_time, 0)::double precision,
+                        coalesce(wal_sync_time, 0)::double precision
+                 from pg_stat_wal",
+                &[],
+            )
             .await
-            .map_err(|err| err.to_string())?
-            .get::<_, i64>(0);
+            .map_err(|err| err.to_string())?;
+        let database = client
+            .query_one(
+                "select xact_commit::bigint,
+                        xact_rollback::bigint,
+                        blks_read::bigint,
+                        blks_hit::bigint,
+                        tup_returned::bigint,
+                        tup_fetched::bigint,
+                        tup_inserted::bigint,
+                        tup_updated::bigint,
+                        tup_deleted::bigint,
+                        conflicts::bigint,
+                        temp_files::bigint,
+                        temp_bytes::bigint,
+                        deadlocks::bigint,
+                        coalesce(blk_read_time, 0)::double precision,
+                        coalesce(blk_write_time, 0)::double precision,
+                        coalesce(session_time, 0)::double precision,
+                        coalesce(active_time, 0)::double precision
+                 from pg_stat_database
+                 where datname = current_database()",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
         let active_connections = client
             .query_one(
                 "select count(*) from pg_stat_activity where datname = current_database()",
@@ -1320,10 +1987,37 @@ fn postgres_stats_snapshot(
             .map_err(|err| err.to_string())?
             .get::<_, i64>(0);
         Ok(PostgresStatsSnapshot {
-            wal_bytes: u64::try_from(wal_bytes).unwrap_or(0),
+            wal_records: row_u64(&wal_bytes, 0),
+            wal_fpi: row_u64(&wal_bytes, 1),
+            wal_bytes: row_u64(&wal_bytes, 2),
+            wal_buffers_full: row_u64(&wal_bytes, 3),
+            wal_write: row_u64(&wal_bytes, 4),
+            wal_sync: row_u64(&wal_bytes, 5),
+            wal_write_time_ms: wal_bytes.get(6),
+            wal_sync_time_ms: wal_bytes.get(7),
+            xact_commit: row_u64(&database, 0),
+            xact_rollback: row_u64(&database, 1),
+            blocks_read: row_u64(&database, 2),
+            blocks_hit: row_u64(&database, 3),
+            rows_returned: row_u64(&database, 4),
+            rows_fetched: row_u64(&database, 5),
+            rows_inserted: row_u64(&database, 6),
+            rows_updated: row_u64(&database, 7),
+            rows_deleted: row_u64(&database, 8),
+            temp_files: row_u64(&database, 10),
+            temp_bytes: row_u64(&database, 11),
+            deadlocks: row_u64(&database, 12),
+            block_read_time_ms: database.get(13),
+            block_write_time_ms: database.get(14),
+            session_time_ms: database.get(15),
+            active_time_ms: database.get(16),
             active_connections: u64::try_from(active_connections).unwrap_or(0),
         })
     })
+}
+
+fn row_u64(row: &tokio_postgres::Row, idx: usize) -> u64 {
+    u64::try_from(row.get::<_, i64>(idx)).unwrap_or(0)
 }
 
 fn print_text_result(result: &BenchmarkResult) {
@@ -1378,11 +2072,50 @@ fn print_text_result(result: &BenchmarkResult) {
         result.backend_metrics.workflow_task_commit_latency.p99_ms,
         result.backend_metrics.workflow_task_commit_latency.max_ms
     );
+    if !result.backend_metrics.operations.is_empty() {
+        let mut operations = result.backend_metrics.operations.iter().collect::<Vec<_>>();
+        operations.sort_by(|(_, left), (_, right)| {
+            right
+                .total_ms
+                .partial_cmp(&left.total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!();
+        println!("Backend operation latency:");
+        for (name, operation) in operations.into_iter().take(8) {
+            println!(
+                "  {name}: calls {}, items {}, total {:.2}ms, p50 {:.3}ms, p95 {:.3}ms, p99 {:.3}ms",
+                operation.calls,
+                operation.items,
+                operation.total_ms,
+                operation.latency.p50_ms,
+                operation.latency.p95_ms,
+                operation.latency.p99_ms
+            );
+        }
+    }
     if let Some(postgres) = &result.postgres_stats {
         println!();
         println!("Postgres stats:");
         println!("  WAL bytes: {}", postgres.wal_bytes);
         println!("  WAL bytes/sec: {:.2}", postgres.wal_bytes_per_second);
+        println!("  WAL records/sec: {:.2}", postgres.wal_records_per_second);
+        println!(
+            "  transactions/sec: {:.2}",
+            postgres.transactions_per_second
+        );
+        println!(
+            "  block cache hit ratio: {:.4}",
+            postgres.block_cache_hit_ratio
+        );
+        println!("  temp bytes: {}", postgres.temp_bytes);
+        println!("  deadlocks: {}", postgres.deadlocks);
+        if let Some(samples) = &postgres.activity_samples {
+            println!(
+                "  activity samples: {}, max connections {}, max active {}, max waiting {}",
+                samples.samples, samples.max_connections, samples.max_active, samples.max_waiting
+            );
+        }
         println!(
             "  active connections after: {}",
             postgres.active_connections_after
@@ -1501,6 +2234,17 @@ mod tests {
         assert!(result.worker_stats.activity_tasks >= 12);
         assert!(result.worker_stats.child_workflow_starts_dispatched >= 4);
         assert!(result.worker_stats.timers_fired >= 4);
+        assert!(
+            result
+                .backend_metrics
+                .operations
+                .contains_key("commit_workflow_task")
+                || result
+                    .backend_metrics
+                    .operations
+                    .contains_key("commit_workflow_tasks"),
+            "benchmark results should include per-backend-method instrumentation"
+        );
     }
 
     #[test]

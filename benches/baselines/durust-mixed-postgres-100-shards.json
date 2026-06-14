@@ -18,20 +18,20 @@
     "postgresPoolSize": 24,
     "json": true
   },
-  "elapsedMs": 22607.574375,
-  "setupMs": 3449.1979170000004,
-  "processingMs": 18356.801125,
-  "verifyMs": 801.575333,
-  "rounds": 12,
-  "activations": 7953,
+  "elapsedMs": 14890.182375,
+  "setupMs": 2969.719583,
+  "processingMs": 11201.876417,
+  "verifyMs": 718.586375,
+  "rounds": 9,
+  "activations": 7865,
   "completedWorkflows": 1000,
   "mixedActions": 8000,
-  "activationsPerSecond": 351.78475444029147,
-  "mixedActionsPerSecond": 353.8637036995262,
-  "workflowsPerSecond": 44.23296296244077,
-  "processingActivationsPerSecond": 433.24541927781,
-  "processingMixedActionsPerSecond": 435.8057782248812,
-  "processingWorkflowsPerSecond": 54.47572227811015,
+  "activationsPerSecond": 528.200380755914,
+  "mixedActionsPerSecond": 537.2667572851001,
+  "workflowsPerSecond": 67.15834466063751,
+  "processingActivationsPerSecond": 702.1145125350654,
+  "processingMixedActionsPerSecond": 714.166064879914,
+  "processingWorkflowsPerSecond": 89.27075810998925,
   "counters": {
     "workflowStarts": 1000,
     "signals": 1000,
@@ -41,14 +41,14 @@
     "bootActivities": 1000,
     "childActivities": 1000,
     "finishActivities": 1000,
-    "workflowTasks": 7953,
+    "workflowTasks": 7865,
     "activityTasks": 3000,
     "timersFired": 1000,
     "activitiesTimedOut": 0,
     "childWorkflowStartsDispatched": 0
   },
   "workerStats": {
-    "workflowTasks": 7953,
+    "workflowTasks": 7865,
     "activityTasks": 3000,
     "timersFired": 1000,
     "activitiesTimedOut": 0,
@@ -56,17 +56,289 @@
   },
   "backendMetrics": {
     "workflowTaskCommitLatency": {
-      "samples": 2426,
-      "p50Ms": 18.629917,
-      "p95Ms": 57.356042,
-      "p99Ms": 122.395375,
-      "maxMs": 309.673333
+      "samples": 1043,
+      "p50Ms": 46.859958999999996,
+      "p95Ms": 65.81587499999999,
+      "p99Ms": 88.112125,
+      "maxMs": 123.96162500000001
+    },
+    "operations": {
+      "claim_activity_tasks": {
+        "calls": 1111,
+        "errors": 0,
+        "items": 3000,
+        "totalMs": 2646.6537670000002,
+        "itemsPerCall": 2.7002700270027002,
+        "itemsPerSecond": 1133.5067840779643,
+        "latency": {
+          "samples": 1111,
+          "p50Ms": 2.723042,
+          "p95Ms": 3.678208,
+          "p99Ms": 4.0882499999999995,
+          "maxMs": 11.2165
+        }
+      },
+      "claim_workflow_tasks": {
+        "calls": 1111,
+        "errors": 0,
+        "items": 7911,
+        "totalMs": 11892.725754000001,
+        "itemsPerCall": 7.120612061206121,
+        "itemsPerSecond": 665.1965380887735,
+        "latency": {
+          "samples": 1111,
+          "p50Ms": 11.632625,
+          "p95Ms": 13.284666000000001,
+          "p99Ms": 23.898833,
+          "maxMs": 51.63325
+        }
+      },
+      "commit_workflow_tasks": {
+        "calls": 1043,
+        "errors": 0,
+        "items": 7911,
+        "totalMs": 48266.04371,
+        "itemsPerCall": 7.584851390220518,
+        "itemsPerSecond": 163.9040491392287,
+        "latency": {
+          "samples": 1043,
+          "p50Ms": 46.859958999999996,
+          "p95Ms": 65.81587499999999,
+          "p99Ms": 88.112125,
+          "maxMs": 123.96162500000001
+        }
+      },
+      "complete_activity": {
+        "calls": 3000,
+        "errors": 0,
+        "items": 3000,
+        "totalMs": 12108.53847,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 247.75905097322618,
+        "latency": {
+          "samples": 3000,
+          "p50Ms": 4.027625,
+          "p95Ms": 4.835624999999999,
+          "p99Ms": 5.84275,
+          "maxMs": 16.852167
+        }
+      },
+      "current_time": {
+        "calls": 10133,
+        "errors": 0,
+        "items": 10133,
+        "totalMs": 2.4816439999999997,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 4083180.3433530354,
+        "latency": {
+          "samples": 10133,
+          "p50Ms": 0.000209,
+          "p95Ms": 0.000458,
+          "p99Ms": 0.000542,
+          "maxMs": 0.006875
+        }
+      },
+      "dispatch_child_workflow_starts": {
+        "calls": 1111,
+        "errors": 0,
+        "items": 0,
+        "totalMs": 0.28132599999999996,
+        "itemsPerCall": 0.0,
+        "itemsPerSecond": 0.0,
+        "latency": {
+          "samples": 1111,
+          "p50Ms": 0.000209,
+          "p95Ms": 0.000417,
+          "p99Ms": 0.000542,
+          "maxMs": 0.009333000000000001
+        }
+      },
+      "fire_due_timers": {
+        "calls": 1111,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 3780.362669,
+        "itemsPerCall": 0.9000900090009001,
+        "itemsPerSecond": 264.5248849271186,
+        "latency": {
+          "samples": 1111,
+          "p50Ms": 1.3140420000000002,
+          "p95Ms": 9.262167,
+          "p99Ms": 13.356665999999999,
+          "maxMs": 19.171208
+        }
+      },
+      "hydrate_payload": {
+        "calls": 3046,
+        "errors": 0,
+        "items": 3046,
+        "totalMs": 1.787387,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 1704163.6758016031,
+        "latency": {
+          "samples": 3046,
+          "p50Ms": 0.000583,
+          "p95Ms": 0.000917,
+          "p99Ms": 0.0012079999999999999,
+          "maxMs": 0.011084
+        }
+      },
+      "read_signal_inbox": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 591.7916909999999,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 1689.7837790020612,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 0.588125,
+          "p95Ms": 0.733375,
+          "p99Ms": 0.793166,
+          "maxMs": 2.542167
+        }
+      },
+      "signal_workflow": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 1616.637493,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 618.567863438758,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 1.5037500000000001,
+          "p95Ms": 2.045,
+          "p99Ms": 2.723292,
+          "maxMs": 5.891249999999999
+        }
+      },
+      "start_workflow": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 1350.339247,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 740.5546437472391,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 1.254167,
+          "p95Ms": 1.6600409999999999,
+          "p99Ms": 2.2732910000000004,
+          "maxMs": 10.898833
+        }
+      },
+      "stream_history": {
+        "calls": 2000,
+        "errors": 0,
+        "items": 24000,
+        "totalMs": 1427.746516,
+        "itemsPerCall": 12.0,
+        "itemsPerSecond": 16809.706576794055,
+        "latency": {
+          "samples": 2000,
+          "p50Ms": 0.7,
+          "p95Ms": 0.8279169999999999,
+          "p99Ms": 0.918209,
+          "maxMs": 1.365125
+        }
+      },
+      "stream_history_for_replay": {
+        "calls": 7911,
+        "errors": 0,
+        "items": 12230,
+        "totalMs": 9211.455565,
+        "itemsPerCall": 1.5459486790544812,
+        "itemsPerSecond": 1327.6946204321184,
+        "latency": {
+          "samples": 7911,
+          "p50Ms": 1.1615,
+          "p95Ms": 1.367583,
+          "p99Ms": 1.5777079999999999,
+          "maxMs": 6.604291
+        }
+      },
+      "timeout_due_activities": {
+        "calls": 1111,
+        "errors": 0,
+        "items": 0,
+        "totalMs": 1260.044303,
+        "itemsPerCall": 0.0,
+        "itemsPerSecond": 0.0,
+        "latency": {
+          "samples": 1111,
+          "p50Ms": 1.1460000000000001,
+          "p95Ms": 1.36375,
+          "p99Ms": 1.6117499999999998,
+          "maxMs": 4.759959
+        }
+      },
+      "workflow_change_versions": {
+        "calls": 7911,
+        "errors": 0,
+        "items": 7911,
+        "totalMs": 5091.51419,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 1553.7617503919791,
+        "latency": {
+          "samples": 7911,
+          "p50Ms": 0.6337079999999999,
+          "p95Ms": 0.779917,
+          "p99Ms": 0.896375,
+          "maxMs": 8.441707999999998
+        }
+      }
     }
   },
   "postgresStats": {
-    "walBytes": 33488969,
-    "walBytesPerSecond": 1824335.7746242401,
-    "activeConnectionsAfter": 1
+    "walBytes": 30104120,
+    "walBytesPerSecond": 2687417.6146340896,
+    "walRecords": 259776,
+    "walRecordsPerSecond": 23190.40045878057,
+    "walFpi": 146,
+    "walBuffersFull": 0,
+    "walWrite": 8299,
+    "walSync": 8165,
+    "walWriteTimeMs": 0.0,
+    "walSyncTimeMs": 0.0,
+    "xactCommit": 68517,
+    "xactRollback": 0,
+    "transactionsPerSecond": 6116.5645334221335,
+    "rowsReturned": 8785783,
+    "rowsFetched": 228161,
+    "rowsInserted": 32877,
+    "rowsUpdated": 42213,
+    "rowsDeleted": 2000,
+    "blocksRead": 51,
+    "blocksHit": 1850652,
+    "blockCacheHitRatio": 0.9999724429041289,
+    "tempFiles": 0,
+    "tempBytes": 0,
+    "deadlocks": 0,
+    "blockReadTimeMs": 0.0,
+    "blockWriteTimeMs": 0.0,
+    "activeTimeMs": 11362.061999999918,
+    "sessionTimeMs": 137690.97199999914,
+    "activeConnectionsAfter": 1,
+    "activitySamples": {
+      "samples": 146,
+      "maxConnections": 10,
+      "maxActive": 6,
+      "maxIdle": 10,
+      "maxWaiting": 10,
+      "waitEventTypeCounts": {
+        "Client": 1008,
+        "IO": 34,
+        "LWLock": 12,
+        "Lock": 9
+      },
+      "waitEventCounts": {
+        "ClientRead": 1008,
+        "WALSync": 34,
+        "WALWrite": 12,
+        "transactionid": 9
+      }
+    }
   },
   "dbPath": null,
   "dbBytes": null

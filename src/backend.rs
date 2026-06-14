@@ -134,6 +134,27 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         opts: ClaimActivityOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedActivityTask>>>;
 
+    fn claim_activity_tasks(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, Result<Vec<ClaimedActivityTask>>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut claimed = Vec::new();
+            for _ in 0..opts.limit {
+                let Some(task) = backend
+                    .claim_activity_task(worker_id.clone(), opts.claim.clone())
+                    .await?
+                else {
+                    break;
+                };
+                claimed.push(task);
+            }
+            Ok(claimed)
+        })
+    }
+
     fn heartbeat_activity(
         &self,
         req: ActivityHeartbeatRequest,
@@ -335,6 +356,12 @@ pub struct ClaimActivityOptions {
     pub task_queue: TaskQueue,
     pub registered_activity_names: Vec<ActivityName>,
     pub lease_duration: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaimActivityTasksOptions {
+    pub claim: ClaimActivityOptions,
+    pub limit: usize,
 }
 
 #[derive(Clone, Debug)]

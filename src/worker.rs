@@ -1,8 +1,8 @@
 use crate::{
-    ActivityHeartbeatRequest, ClaimActivityOptions, ClaimWorkflowTaskOptions,
-    ClaimWorkflowTasksOptions, CompleteActivityRequest, DurableBackend, Error, EventId,
-    FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace,
-    NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, ShardId,
+    ActivityHeartbeatRequest, ClaimActivityOptions, ClaimActivityTasksOptions,
+    ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, CompleteActivityRequest, DurableBackend,
+    Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
+    Namespace, NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, ShardId,
     StartWorkflowRequest, TaskQueue, TimeoutDueActivitiesRequest, WorkerId, Workflow,
     WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
     WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
@@ -161,6 +161,7 @@ where
     workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
     active_recoveries: usize,
+    activity_task_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
 }
@@ -300,6 +301,7 @@ where
             nondeterminism_retry_backoff: Duration::from_secs(60),
             workflow_task_concurrency: WorkflowTaskConcurrency::default(),
             recovery_flow_control: RecoveryFlowControl::default(),
+            activity_task_batch_size: 1,
             max_local_activities_per_workflow_task: 0,
         }
     }
@@ -818,7 +820,7 @@ where
     }
 
     pub async fn run_activity_once(&mut self) -> Result<bool> {
-        let claim = self
+        let claimed = self
             .backend
             .claim_activity_task(
                 self.worker_id.clone(),
@@ -831,10 +833,48 @@ where
             )
             .await?;
 
-        let Some(claimed) = claim else {
+        let Some(claimed) = claimed else {
             return Ok(false);
         };
 
+        self.run_claimed_activity(claimed).await?;
+        Ok(true)
+    }
+
+    pub async fn run_activity_batch_once(&mut self) -> Result<usize> {
+        let limit = self.activity_task_batch_size.max(1);
+        if limit == 1 {
+            return self.run_activity_once().await.map(usize::from);
+        }
+
+        let claimed = self
+            .backend
+            .claim_activity_tasks(
+                self.worker_id.clone(),
+                ClaimActivityTasksOptions {
+                    claim: ClaimActivityOptions {
+                        namespace: self.namespace.clone(),
+                        task_queue: self.activity_task_queue.clone(),
+                        registered_activity_names: self.registry.activity_names(),
+                        lease_duration: Duration::from_secs(30),
+                    },
+                    limit,
+                },
+            )
+            .await?;
+        if claimed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut completed = 0usize;
+        for task in claimed {
+            self.run_claimed_activity(task).await?;
+            completed += 1;
+        }
+        Ok(completed)
+    }
+
+    async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
         let registration = self
             .registry
             .activity(&claimed.task.activity_name)
@@ -874,7 +914,7 @@ where
                     .await?;
             }
         }
-        Ok(true)
+        Ok(())
     }
 
     pub async fn run_timers_once(&mut self) -> Result<usize> {
@@ -948,8 +988,9 @@ where
                 stats.child_workflow_starts_dispatched += child_starts;
                 progressed = true;
             }
-            if self.run_activity_once().await? {
-                stats.activity_tasks += 1;
+            let activity_tasks = self.run_activity_batch_once().await?;
+            if activity_tasks > 0 {
+                stats.activity_tasks += activity_tasks;
                 progressed = true;
             }
 
@@ -1335,6 +1376,7 @@ where
     nondeterminism_retry_backoff: Duration,
     workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
+    activity_task_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
 }
 
@@ -1400,6 +1442,16 @@ where
     pub fn workflow_task_shard_filter(mut self, shards: impl IntoIterator<Item = ShardId>) -> Self {
         let shards = shards.into_iter().collect::<Vec<_>>();
         self.workflow_task_concurrency.shard_filter = (!shards.is_empty()).then_some(shards);
+        self
+    }
+
+    pub fn activity_task_batch_size(mut self, limit: usize) -> Self {
+        self.activity_task_batch_size = limit.max(1);
+        self
+    }
+
+    pub fn max_concurrent_activities(mut self, limit: usize) -> Self {
+        self.activity_task_batch_size = limit.max(1);
         self
     }
 
@@ -1486,6 +1538,7 @@ where
             workflow_task_concurrency: self.workflow_task_concurrency,
             recovery_flow_control: self.recovery_flow_control,
             active_recoveries: 0,
+            activity_task_batch_size: self.activity_task_batch_size,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,
         }

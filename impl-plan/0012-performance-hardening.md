@@ -56,9 +56,10 @@ Implemented:
   signal, zero-duration timer, finish activity, exact output verification, and
   semantic action counters. The runner emits `backend`, `mode`, `correct`,
   provider-specific options, nested benchmark dimensions, processing-only
-  throughput, semantic action counters, and Durust worker stats, and rejects
-  unsupported shard, activation-concurrency, and prefetch dimensions instead of
-  reporting misleading numbers.
+  throughput, semantic action counters, Durust worker stats, per-backend-method
+  latency/count/item metrics, and Postgres transaction/WAL/block/activity-wait
+  counters. It rejects unsupported shard, activation-concurrency, and prefetch
+  dimensions instead of reporting misleading numbers.
 - `benches/baselines/durust-mixed-sqlite.json`, the first checked-in baseline
   artifact. The accepted dimension is single-file SQLite, mixed mode, 1,000
   workflows, 4 workers, shard/concurrency/prefetch dimensions set to 1, and
@@ -82,9 +83,13 @@ Implemented:
   Postgres, mixed mode, 1,000 workflows, 10 workers, 100 logical shards, 16
   physical partitions, activation concurrency 8, prefetch 32, batch 32, and pool
   size 24. The captured release run completed 1,000 workflows, 8,000 semantic
-  mixed actions, 7,953 workflow tasks, and reports about 54.5 processing
-  workflows/sec and 435.8 processing mixed-actions/sec with p50/p95/p99
-  workflow-task commit latency 18.63/57.36/122.40ms.
+  mixed actions, 7,865 workflow tasks, and reports about 89.3 processing
+  workflows/sec and 714.2 processing mixed-actions/sec with p50/p95/p99
+  workflow-task commit latency 46.86/65.82/88.11ms. This run includes
+  sequence-backed run IDs, signal receive sequences, and claim tokens,
+  selected-shard-only lease refresh, and batched activity claims, removing hot
+  `meta` counter locks, idle shard lease churn, and thousands of individual
+  activity claim round trips from the sharded workload.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 
