@@ -1,17 +1,63 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
+    MemoryBackend, Namespace, PostgresBackend, PostgresBackendConfig, SqliteBackend, TaskQueue,
+    Worker, WorkerId, WorkflowType,
 };
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
+
+fn postgres_url_from_env() -> Option<String> {
+    env::var("DURUST_POSTGRES_URL").ok()
+}
+
+fn postgres_test_schema(prefix: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("durust_{prefix}_{}_{}", std::process::id(), millis)
+}
+
+async fn drop_postgres_schema(database_url: &str, schema: &str) {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(&format!(
+            "drop schema if exists {} cascade",
+            quote_postgres_identifier(schema)
+        ))
+        .await
+        .unwrap();
+    connection.abort();
+}
+
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn block_on_tokio<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberInput {
@@ -156,6 +202,18 @@ async fn child_spawn_wait_workflow(input: u64) -> durust::Result<u64> {
         .spawn()
         .await?;
     child.result().await
+}
+
+#[durust::workflow(name = "tests.postgres-inline-child-signal-timer", version = 1)]
+async fn postgres_inline_child_signal_timer(input: u64) -> durust::Result<String> {
+    let child = durust::child!(child_double_workflow(input))
+        .workflow_id(format!("wf/postgres-inline-child-signal-timer/{input}"))
+        .spawn()
+        .await?;
+    let child_value = child.result().await?;
+    let signal_value = durust::signal::<String>("ready").await?;
+    durust::sleep(Duration::ZERO).await?;
+    Ok(format!("{child_value}:{signal_value}"))
 }
 
 #[durust::workflow(name = "tests.child-spawn-abandon", version = 1)]
@@ -1012,6 +1070,77 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
             panic!("parent workflow did not complete");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 22);
+    });
+}
+
+#[test]
+fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres inline child cache regression; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("inline_child_cache");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<postgres_inline_child_signal_timer>(
+                "wf/postgres-inline-child-cache",
+                "workflows",
+                11,
+            )
+            .await
+            .unwrap();
+        client
+            .signal_workflow(
+                "wf/postgres-inline-child-cache",
+                "ready",
+                "signal/postgres-inline-child-cache/ready",
+                "go",
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("postgres-inline-child-cache-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(postgres_inline_child_signal_timer)
+            .register_workflow(child_double_workflow)
+            .build();
+        let stats = worker.run_until_idle().await.unwrap();
+        assert!(
+            stats.workflow_tasks >= 4,
+            "worker should make progress through parent, child, signal, and timer wakes"
+        );
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowCompleted(_)))
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::SignalConsumed(_)))
+        );
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::TimerFired(_)))
+        );
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("parent history").data
+        else {
+            panic!("parent workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "22:go");
+
+        drop_postgres_schema(&url, &schema).await;
     });
 }
 
