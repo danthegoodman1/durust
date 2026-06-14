@@ -1,10 +1,10 @@
 use crate::{
     Activity, ActivityMapCompleted, ActivityMapScheduled, ActivityMapTask, ActivityOptions,
     ActivityScheduled, ActivityTask, ChildStartOutboxMessage, ChildWorkflowCompleted,
-    ChildWorkflowStarted, CommandId, CommandSeq, DeprecatedPatchMarker, Error, HistoryEvent,
-    HistoryEventData, NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId, SelectWinner,
-    SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs,
-    VersionMarker, WaitId, WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind,
+    ChildWorkflowStarted, CommandFingerprint, CommandId, CommandSeq, DeprecatedPatchMarker, Error,
+    HistoryEvent, HistoryEventData, NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId,
+    SelectWinner, SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired, TimerStarted,
+    TimestampMs, VersionMarker, WaitId, WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind,
     WorkflowChangeVersionRecord, WorkflowId, activity_fingerprint, activity_map_fingerprint,
     child_workflow_fingerprint, command_id, payload_digest, signal_fingerprint, timer_fingerprint,
 };
@@ -119,6 +119,7 @@ pub(crate) struct RuntimeContext {
     child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
     child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
     timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
+    consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     change_markers: BTreeMap<String, RuntimeChangeMarker>,
     preconsumed_change_markers: BTreeMap<CommandSeq, RuntimeChangeMarker>,
@@ -219,6 +220,7 @@ impl RuntimeContext {
         let child_failures = collect_child_failures(&replay_events);
         let child_cancellations = collect_child_cancellations(&replay_events);
         let timers = collect_timers(&replay_events);
+        let consumed_signals = collect_consumed_signals(&replay_events);
         let change_markers = change_versions
             .into_iter()
             .map(RuntimeChangeMarker::from_record)
@@ -249,6 +251,7 @@ impl RuntimeContext {
             child_failures,
             child_cancellations,
             timers,
+            consumed_signals,
             live_signals: BTreeMap::new(),
             change_markers,
             preconsumed_change_markers: BTreeMap::new(),
@@ -321,6 +324,8 @@ impl RuntimeContext {
         self.child_cancellations
             .extend(collect_child_cancellations(&events));
         self.timers.extend(collect_timers(&events));
+        self.consumed_signals
+            .extend(collect_consumed_signals(&events));
         self.replay_events.extend(events);
         self.last_loaded_event_id = last_loaded_event_id;
     }
@@ -639,6 +644,25 @@ impl RuntimeContext {
 
     fn take_live_signal(&mut self, command_id: &CommandId) -> Option<SignalInboxRecordForRuntime> {
         self.live_signals.remove(&command_id.seq)
+    }
+
+    fn take_consumed_signal(&mut self, command_id: &CommandId) -> Option<SignalConsumed> {
+        if let Some(event) = self.peek_replay_event().cloned() {
+            if let HistoryEventData::SignalConsumed(consumed) = event.data {
+                if consumed.command_id.seq == command_id.seq {
+                    self.advance_replay();
+                    self.record_ready_event_id(event.event_id);
+                    self.consumed_signals.remove(&command_id.seq);
+                    return Some(consumed);
+                }
+            }
+        }
+        self.consumed_signals
+            .remove(&command_id.seq)
+            .map(|(event_id, consumed)| {
+                self.record_indexed_ready_event_id(event_id);
+                consumed
+            })
     }
 
     fn request_signal(&mut self, command_id: CommandId, signal_name: SignalName) {
@@ -2580,6 +2604,15 @@ where
         let command_id = runtime.next_command_id();
         let fingerprint = signal_fingerprint(self.signal_name.clone());
 
+        if let Some(consumed) = runtime.take_consumed_signal(&command_id) {
+            self.state = SignalFutureState::Done;
+            return Poll::Ready(decode_consumed_signal(
+                command_id.seq,
+                &fingerprint,
+                consumed,
+            ));
+        }
+
         if let Some(event) = runtime.peek_replay_event().cloned() {
             if let HistoryEventData::SignalConsumed(consumed) = event.data {
                 if consumed.command_id.seq != command_id.seq {
@@ -2616,8 +2649,24 @@ where
         runtime: &mut RuntimeContext,
         command_id: &CommandId,
     ) -> Poll<Result<T>> {
+        let fingerprint = signal_fingerprint(self.signal_name.clone());
+        if let Some(consumed) = runtime.take_consumed_signal(command_id) {
+            self.state = SignalFutureState::Done;
+            return Poll::Ready(decode_consumed_signal(
+                command_id.seq,
+                &fingerprint,
+                consumed,
+            ));
+        }
+        if let Some(event) = runtime.peek_replay_event().cloned() {
+            if let HistoryEventData::SignalConsumed(consumed) = event.data {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected command seq {}, found {}",
+                    command_id.seq.0, consumed.command_id.seq.0
+                ))));
+            }
+        }
         if let Some(signal) = runtime.take_live_signal(command_id) {
-            let fingerprint = signal_fingerprint(signal.signal_name.clone());
             runtime.consume_signals.push(signal.signal_id.clone());
             runtime.delete_waits.push(signal_wait_id(command_id));
             runtime
@@ -2652,6 +2701,23 @@ where
         });
         runtime.request_signal(command_id.clone(), self.signal_name.clone());
     }
+}
+
+fn decode_consumed_signal<T>(
+    command_seq: CommandSeq,
+    fingerprint: &CommandFingerprint,
+    consumed: SignalConsumed,
+) -> Result<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if consumed.fingerprint != *fingerprint {
+        return Err(Error::Nondeterminism(format!(
+            "signal command fingerprint changed for command {}",
+            command_seq.0
+        )));
+    }
+    crate::decode_payload::<T>(&consumed.payload)
 }
 
 fn collect_completions(
@@ -2795,6 +2861,20 @@ fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::Event
         .collect()
 }
 
+fn collect_consumed_signals(
+    events: &[HistoryEvent],
+) -> BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::SignalConsumed(consumed) => {
+                Some((consumed.command_id.seq, (event.event_id, consumed.clone())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 pub(crate) fn is_terminal(data: &HistoryEventData) -> bool {
     matches!(
         data,
@@ -2876,4 +2956,215 @@ fn system_time_to_timestamp(value: SystemTime) -> TimestampMs {
 
 fn duration_millis_i64(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ActivityCompleted, ActivityFailed, ActivityMapCompleted, ActivityMapFailed,
+        ActivityTimedOut, ChildWorkflowCancelled, ChildWorkflowCompleted, ChildWorkflowFailed,
+        ChildWorkflowStarted, CodecId, DurableFailure, EventId, HistoryEventType, TimerStarted,
+    };
+
+    #[test]
+    fn indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor() {
+        assert_indexed_ready_event_skips(
+            "activity_completed",
+            |command_id| {
+                HistoryEventData::ActivityCompleted(ActivityCompleted {
+                    command_id,
+                    result: payload(&22_u64),
+                })
+            },
+            |runtime, command_id| runtime.take_completion(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "activity_failed",
+            |command_id| {
+                HistoryEventData::ActivityFailed(ActivityFailed {
+                    command_id,
+                    failure: failure("boom"),
+                })
+            },
+            |runtime, command_id| runtime.take_failure(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "activity_timed_out",
+            |command_id| {
+                HistoryEventData::ActivityTimedOut(ActivityTimedOut {
+                    command_id,
+                    message: "timeout".to_owned(),
+                })
+            },
+            |runtime, command_id| runtime.take_failure(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "activity_map_completed",
+            |command_id| {
+                HistoryEventData::ActivityMapCompleted(ActivityMapCompleted {
+                    command_id,
+                    result_manifest: payload(&"map-result"),
+                    item_count: 2,
+                    success_count: 2,
+                    failure_count: 0,
+                })
+            },
+            |runtime, command_id| runtime.take_map_completion(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "activity_map_failed",
+            |command_id| {
+                HistoryEventData::ActivityMapFailed(ActivityMapFailed {
+                    command_id,
+                    failure: failure("map failed"),
+                })
+            },
+            |runtime, command_id| runtime.take_map_failure(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "child_workflow_started",
+            |command_id| {
+                HistoryEventData::ChildWorkflowStarted(ChildWorkflowStarted {
+                    command_id,
+                    workflow_id: WorkflowId::new("wf/child"),
+                    run_id: RunId::new("run/child"),
+                })
+            },
+            |runtime, command_id| runtime.take_child_started(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "child_workflow_completed",
+            |command_id| {
+                HistoryEventData::ChildWorkflowCompleted(ChildWorkflowCompleted {
+                    command_id,
+                    result: payload(&44_u64),
+                })
+            },
+            |runtime, command_id| runtime.take_child_completion(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "child_workflow_failed",
+            |command_id| {
+                HistoryEventData::ChildWorkflowFailed(ChildWorkflowFailed {
+                    command_id,
+                    failure: failure("child failed"),
+                })
+            },
+            |runtime, command_id| runtime.take_child_failure(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "child_workflow_cancelled",
+            |command_id| {
+                HistoryEventData::ChildWorkflowCancelled(ChildWorkflowCancelled {
+                    command_id,
+                    reason: "cancelled".to_owned(),
+                })
+            },
+            |runtime, command_id| runtime.take_child_cancellation(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "timer_fired",
+            |command_id| {
+                HistoryEventData::TimerFired(TimerFired {
+                    command_id,
+                    fired_at: TimestampMs(10),
+                })
+            },
+            |runtime, command_id| runtime.take_timer(command_id).is_some(),
+        );
+        assert_indexed_ready_event_skips(
+            "signal_consumed",
+            |command_id| {
+                HistoryEventData::SignalConsumed(SignalConsumed {
+                    command_id,
+                    signal_id: SignalId::new("signal/1"),
+                    signal_name: SignalName::new("ready"),
+                    payload: payload(&"ready"),
+                    fingerprint: signal_fingerprint(SignalName::new("ready")),
+                })
+            },
+            |runtime, command_id| runtime.take_consumed_signal(command_id).is_some(),
+        );
+    }
+
+    fn assert_indexed_ready_event_skips(
+        case_name: &str,
+        indexed_event: impl FnOnce(CommandId) -> HistoryEventData,
+        consume_indexed: impl FnOnce(&mut RuntimeContext, &CommandId) -> bool,
+    ) {
+        let run_id = RunId::new(format!("run/{case_name}"));
+        let first_command_id = command_id(&run_id, 1);
+        let indexed_command_id = command_id(&run_id, 2);
+        let after_skipped_command_id = command_id(&run_id, 3);
+        let first_event = HistoryEventData::ActivityCompleted(ActivityCompleted {
+            command_id: first_command_id.clone(),
+            result: payload(&11_u64),
+        });
+        let after_skipped = HistoryEventData::TimerStarted(TimerStarted {
+            command_id: after_skipped_command_id,
+            fire_at: TimestampMs(10),
+            fingerprint: timer_fingerprint("sleep", TimestampMs(10)),
+        });
+        let mut runtime = runtime_with_history(
+            run_id,
+            vec![
+                event(1, first_event),
+                event(2, indexed_event(indexed_command_id.clone())),
+                event(3, after_skipped),
+            ],
+        );
+
+        assert!(
+            consume_indexed(&mut runtime, &indexed_command_id),
+            "{case_name} indexed event should be consumable before the cursor reaches it"
+        );
+        assert!(
+            runtime.take_completion(&first_command_id).is_some(),
+            "{case_name} should still consume the in-cursor event"
+        );
+
+        let next = runtime
+            .peek_replay_event()
+            .unwrap_or_else(|| panic!("{case_name} should skip the consumed indexed event"));
+        assert!(
+            matches!(next.data, HistoryEventData::TimerStarted(_)),
+            "{case_name} should skip consumed ready event and continue at the next unconsumed event, found {:?}",
+            next.event_type
+        );
+        assert_eq!(next.event_id, EventId(3));
+    }
+
+    fn runtime_with_history(run_id: RunId, events: Vec<HistoryEvent>) -> RuntimeContext {
+        RuntimeContext::new(
+            run_id,
+            TaskQueue::new("workflows"),
+            TaskQueue::new("activities"),
+            CodecId::MessagePack,
+            TimestampMs(0),
+            events,
+            ActivityOptions::default(),
+            0,
+            EventId(3),
+            EventId(3),
+            Vec::new(),
+        )
+    }
+
+    fn event(event_id: u64, data: HistoryEventData) -> HistoryEvent {
+        let event_type: HistoryEventType = data.event_type();
+        HistoryEvent {
+            event_id: EventId(event_id),
+            event_type,
+            data,
+        }
+    }
+
+    fn payload<T: serde::Serialize + ?Sized>(value: &T) -> PayloadRef {
+        crate::encode_payload(value).expect("test payload should encode")
+    }
+
+    fn failure(message: &str) -> DurableFailure {
+        DurableFailure::new("tests.failure", message)
+    }
 }

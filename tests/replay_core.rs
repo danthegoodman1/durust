@@ -386,6 +386,17 @@ async fn join_signal_timer(input: u64) -> durust::Result<String> {
     Ok(signal)
 }
 
+#[durust::workflow(name = "tests.join-signal-timer-then-timer", version = 1)]
+async fn join_signal_timer_then_timer(input: u64) -> durust::Result<String> {
+    let (signal, _) = durust::join!(
+        durust::signal::<String>("ready"),
+        durust::sleep(Duration::from_millis(input)),
+    )
+    .await?;
+    durust::sleep(Duration::ZERO).await?;
+    Ok(signal)
+}
+
 #[durust::workflow(name = "tests.select-signal-timer", version = 1)]
 async fn select_signal_timer(input: u64) -> durust::Result<String> {
     let outcome = durust::select! {
@@ -1823,6 +1834,68 @@ fn join_waits_for_signal_and_timer_branches() {
         ));
         let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
             panic!("join signal/timer workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "joined");
+    });
+}
+
+#[test]
+fn join_replays_signal_consumed_after_timer_fired_before_later_timer_command() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<join_signal_timer_then_timer>(
+                "wf/join-signal-timer-replay-order",
+                "workflows",
+                10,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(join_signal_timer_then_timer)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow(
+                "wf/join-signal-timer-replay-order",
+                "ready",
+                "signal/join/replay-order",
+                "joined",
+            )
+            .await
+            .unwrap();
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 5);
+        assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
+        assert!(matches!(history[2].data, HistoryEventData::TimerFired(_)));
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::SignalConsumed(_)
+        ));
+        assert!(matches!(history[4].data, HistoryEventData::TimerStarted(_)));
+
+        drop(worker);
+        let mut replay_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(join_signal_timer_then_timer)
+            .build();
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(replay_worker.run_timers_once().await.unwrap(), 1);
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete after replay");
         };
         assert_eq!(durust::decode_payload::<String>(result).unwrap(), "joined");
     });

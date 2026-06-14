@@ -906,6 +906,16 @@ It lets recovery know an activity was already scheduled but not yet completed.
 It prevents duplicate scheduling.
 ```
 
+Replay matches completion and ready facts by `command_id`, not only by the
+current stream cursor. Valid histories can contain ready facts in an order that
+differs from workflow polling order, for example `TimerFired` before
+`SignalConsumed` or child workflow events before an earlier activity result.
+When replay consumes a ready fact before the cursor reaches that event, the
+runtime records the consumed `event_id` and skips that exact event when the
+cursor advances. This rule applies to activity completion/failure/timeout,
+activity-map completion/failure, child workflow start/completion/failure/cancel,
+timer fire, and signal consumption facts.
+
 ---
 
 # 6. Durable Command Matching
