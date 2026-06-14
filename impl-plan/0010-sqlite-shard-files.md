@@ -14,8 +14,9 @@ scale-out behavior, exercise shard-local provider invariants, and simulate
 cross-shard outbox/inbox handoff without relying on cross-file transactions.
 
 The single-file SQLite provider remains the default correctness and local
-development backend. The shard-file provider is a separate conformance,
-simulation, and performance target.
+development backend. The shard-file provider is a separate conformance and
+simulation target. This phase records diagnostic shard-scaling benchmarks, but
+hard comparative performance tuning belongs to `0012-performance-hardening.md`.
 
 ## Scope
 
@@ -30,8 +31,8 @@ simulation, and performance target.
 - Cross-shard child start, child completion, cancellation, signal routing, and activity map completion through outbox/inbox handoff.
 - Dispatcher recovery across source outbox, target inbox, target apply, and source ack boundaries.
 - Provider conformance registration as `sqlite-shard-files`.
-- Criterion benchmarks comparing single-file SQLite, shard-file SQLite, and
-  the `../durable-phases` partitioned SQLite durability-provider baseline.
+- Diagnostic Criterion benchmarks comparing single-file SQLite and shard-file
+  SQLite at multiple shard counts.
 
 ## Acceptance
 
@@ -43,11 +44,10 @@ simulation, and performance target.
 - Duplicate, delayed, reordered, and retried dispatch does not duplicate child starts, signal delivery, activity map completion, or parent wakeups.
 - Closing and reopening the provider reconstructs every shard from durable append history and provider-owned derived state.
 - Memory, single-file SQLite, and shard-file SQLite all pass the shared provider conformance suite.
-- Benchmarks report comparable dimensions to `../durable-phases`: workflow count, worker count, shard count, activation concurrency, prefetch limit, commit batch size, and throughput.
-- Shard-file SQLite at least meets the relevant `../durable-phases`
-  partitioned SQLite durability-provider throughput baselines for comparable
-  dimensions, or the phase documents the measured gap and the next bottleneck
-  before accepting the implementation.
+- Diagnostic benchmarks report workflow count, worker count, shard count,
+  activation concurrency, prefetch limit, commit batch size, throughput, and
+  whether throughput scales with shard count. The hard parity target against
+  `../durable-phases` is deferred to `0012-performance-hardening.md`.
 
 ## Required Tests
 
@@ -84,6 +84,6 @@ simulation, and performance target.
 - Criterion benchmark for cross-shard signal routing.
 - Criterion benchmark for provider startup replay across many shard files.
 - Compare single-file SQLite and shard-file SQLite at 1, 4, and 16 shards.
-- Compare shard-file SQLite against `../durable-phases` partitioned SQLite
-  durability-provider benchmark numbers for equivalent workload dimensions.
-- Record whether throughput scales with shard count and explain any bottleneck.
+- Record whether throughput scales with shard count and explain any observed
+  bottleneck without making throughput parity an acceptance blocker for this
+  correctness-focused phase.

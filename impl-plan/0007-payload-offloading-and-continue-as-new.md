@@ -116,7 +116,7 @@ Remaining before this phase is done:
   compatible storage lands.
 - Payload codec/offload benchmark baselines and regression thresholds.
 - Partitioned SQLite shard-file throughput baselines remain part of the
-  dedicated SQLite shard-file provider phase; the current SQLite numbers are
+  dedicated performance-hardening phase; the current SQLite numbers are
   single-database-file baselines.
 
 ## Required Tests

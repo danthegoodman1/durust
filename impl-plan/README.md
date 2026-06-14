@@ -20,6 +20,8 @@ affected plan file.
 8. [`0008-deterministic-simulation-hardening.md`](0008-deterministic-simulation-hardening.md)
 9. [`0009-recovery-flow-control.md`](0009-recovery-flow-control.md)
 10. [`0010-sqlite-shard-files.md`](0010-sqlite-shard-files.md)
+11. [`0011-postgres-provider.md`](0011-postgres-provider.md)
+12. [`0012-performance-hardening.md`](0012-performance-hardening.md)
 
 ## Shared Gate
 
