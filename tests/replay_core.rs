@@ -298,6 +298,51 @@ async fn join_all_mixed_branches_workflow(input: u64) -> durust::Result<String> 
     Ok(results.join("|"))
 }
 
+#[durust::workflow(name = "tests.child-first-select-then-timer", version = 1)]
+async fn child_first_select_then_timer_workflow(input: u64) -> durust::Result<String> {
+    let activity = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    let child = durust::child!(child_double_workflow(input + 10))
+        .workflow_id(format!("wf/child-first-select/{input}"))
+        .spawn()
+        .await?;
+    let branches: Vec<BoxSelectBranch<String>> = vec![
+        child
+            .result()
+            .map_ok(|value| format!("child:{value}"))
+            .boxed(),
+        activity
+            .result()
+            .map_ok(|value| format!("activity:{value}"))
+            .boxed(),
+    ];
+    let winner = durust::select_all(branches).await?;
+    durust::sleep(Duration::ZERO).await?;
+    Ok(format!("{}:{}", winner.branch_index, winner.value))
+}
+
+#[durust::workflow(name = "tests.timer-first-select-then-timer", version = 1)]
+async fn timer_first_select_then_timer_workflow(input: u64) -> durust::Result<String> {
+    let activity = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    let branches: Vec<BoxSelectBranch<String>> = vec![
+        durust::sleep(Duration::ZERO)
+            .map_ok(|_| "timer".to_owned())
+            .boxed(),
+        activity
+            .result()
+            .map_ok(|value| format!("activity:{value}"))
+            .boxed(),
+    ];
+    let winner = durust::select_all(branches).await?;
+    durust::sleep(Duration::ZERO).await?;
+    Ok(format!("{}:{}", winner.branch_index, winner.value))
+}
+
 #[durust::workflow(name = "tests.join-two-activities", version = 1)]
 async fn join_two_activities(input: u64) -> durust::Result<u64> {
     let (left, right) = durust::join!(
@@ -1184,6 +1229,226 @@ fn select_all_can_mix_activity_child_and_timer_branches() {
             .await
             .unwrap();
         assert!(remaining_activity.is_none());
+    });
+}
+
+#[test]
+fn replay_skips_child_start_consumed_out_of_order_before_later_timer_command() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_all_mixed_branches_workflow>(
+                "wf/out-of-order-child-start",
+                "workflows",
+                8,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(select_all_mixed_branches_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("out-of-order-child-start-activity"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim,
+                result: durust::encode_payload(&16_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(worker.run_child_workflow_starts_once().await.unwrap(), 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(matches!(
+            history[4].data,
+            HistoryEventData::ChildWorkflowStarted(_)
+        ));
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "0:activity:16"
+        );
+    });
+}
+
+#[test]
+fn replay_skips_child_completion_consumed_out_of_order_before_later_timer_command() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_first_select_then_timer_workflow>(
+                "wf/out-of-order-child-completion",
+                "workflows",
+                9,
+            )
+            .await
+            .unwrap();
+        let mut parent_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(child_first_select_then_timer_workflow)
+            .build();
+        let mut child_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(child_double_workflow)
+            .build();
+
+        assert!(parent_worker.run_workflow_once().await.unwrap());
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("out-of-order-child-completion-activity"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim,
+                result: durust::encode_payload(&18_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            parent_worker
+                .run_child_workflow_starts_once()
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(child_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(matches!(
+            history[4].data,
+            HistoryEventData::ChildWorkflowStarted(_)
+        ));
+        assert!(matches!(
+            history[5].data,
+            HistoryEventData::ChildWorkflowCompleted(_)
+        ));
+
+        assert!(parent_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(parent_worker.run_timers_once().await.unwrap(), 1);
+        assert!(parent_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "1:activity:18"
+        );
+    });
+}
+
+#[test]
+fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<timer_first_select_then_timer_workflow>(
+                "wf/out-of-order-timer-fired",
+                "workflows",
+                7,
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(timer_first_select_then_timer_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("out-of-order-timer-activity"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim,
+                result: durust::encode_payload(&14_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history[3].data,
+            HistoryEventData::ActivityCompleted(_)
+        ));
+        assert!(matches!(history[4].data, HistoryEventData::TimerFired(_)));
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("workflow terminal").data
+        else {
+            panic!("workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "1:activity:14"
+        );
     });
 }
 
@@ -3831,6 +4096,38 @@ fn sqlite_worker_loop_runs_until_idle() {
     });
 }
 
+#[test]
+fn worker_drops_cache_and_retries_after_workflow_task_commit_conflict() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner);
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/commit-conflict", "workflows", 11)
+            .await
+            .unwrap();
+        backend.conflict_next_commit();
+
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert_eq!(stream_all(&backend, &run_id).await.len(), 1);
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 2);
+        assert_eq!(stats.activity_tasks, 1);
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("workflow did not complete after retry");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 23);
+    });
+}
+
 async fn stream_all<B>(backend: &B, run_id: &durust::RunId) -> Vec<durust::HistoryEvent>
 where
     B: DurableBackend,
@@ -3884,6 +4181,7 @@ fn double_plus_one_claim_options() -> ClaimWorkflowTaskOptions {
 struct RecordingBackend {
     inner: MemoryBackend,
     stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
+    conflict_next_commit: Arc<Mutex<bool>>,
 }
 
 impl RecordingBackend {
@@ -3891,6 +4189,7 @@ impl RecordingBackend {
         Self {
             inner,
             stream_requests: Arc::new(Mutex::new(Vec::new())),
+            conflict_next_commit: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -3900,6 +4199,10 @@ impl RecordingBackend {
 
     fn stream_requests(&self) -> Vec<durust::StreamHistoryRequest> {
         self.stream_requests.lock().unwrap().clone()
+    }
+
+    fn conflict_next_commit(&self) {
+        *self.conflict_next_commit.lock().unwrap() = true;
     }
 }
 
@@ -3943,6 +4246,26 @@ impl DurableBackend for RecordingBackend {
         claim: durust::WorkflowTaskClaim,
         batch: durust::WorkflowTaskCommit,
     ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+        let should_conflict = {
+            let mut conflict_next_commit = self.conflict_next_commit.lock().unwrap();
+            let should_conflict = *conflict_next_commit;
+            *conflict_next_commit = false;
+            should_conflict
+        };
+        if should_conflict {
+            let inner = self.inner.clone();
+            return Box::pin(async move {
+                inner
+                    .release_workflow_task(
+                        claim,
+                        durust::WorkflowTaskRelease::immediate(
+                            durust::WorkflowTaskReason::CacheEvicted,
+                        ),
+                    )
+                    .await?;
+                Ok(durust::CommitOutcome::Conflict)
+            });
+        }
         self.inner.commit_workflow_task(claim, batch)
     }
 

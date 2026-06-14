@@ -10,7 +10,7 @@ use crate::{
 };
 use futures::future::BoxFuture;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -106,6 +106,7 @@ pub(crate) struct RuntimeContext {
     replay_cursor: usize,
     last_loaded_event_id: crate::EventId,
     replay_target_event_id: crate::EventId,
+    consumed_replay_event_ids: BTreeSet<crate::EventId>,
     needs_more_history: bool,
     last_ready_event_id: Option<crate::EventId>,
     next_command_seq: u64,
@@ -235,6 +236,7 @@ impl RuntimeContext {
             replay_cursor: 0,
             last_loaded_event_id,
             replay_target_event_id,
+            consumed_replay_event_ids: BTreeSet::new(),
             needs_more_history: false,
             last_ready_event_id: None,
             next_command_seq,
@@ -368,8 +370,28 @@ impl RuntimeContext {
     }
 
     fn peek_replay_event(&mut self) -> Option<&HistoryEvent> {
-        self.skip_preconsumed_change_markers();
+        self.skip_consumed_replay_events();
         self.replay_events.get(self.replay_cursor)
+    }
+
+    fn skip_consumed_replay_events(&mut self) {
+        loop {
+            let start = self.replay_cursor;
+            self.skip_consumed_indexed_events();
+            self.skip_preconsumed_change_markers();
+            if self.replay_cursor == start {
+                break;
+            }
+        }
+    }
+
+    fn skip_consumed_indexed_events(&mut self) {
+        while let Some(event) = self.replay_events.get(self.replay_cursor) {
+            if !self.consumed_replay_event_ids.remove(&event.event_id) {
+                break;
+            }
+            self.replay_cursor += 1;
+        }
     }
 
     fn skip_preconsumed_change_markers(&mut self) {
@@ -428,6 +450,11 @@ impl RuntimeContext {
         self.replay_cursor += 1;
     }
 
+    fn record_indexed_ready_event_id(&mut self, event_id: crate::EventId) {
+        self.consumed_replay_event_ids.insert(event_id);
+        self.record_ready_event_id(event_id);
+    }
+
     fn take_completion(&mut self, command_id: &CommandId) -> Option<PayloadRef> {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::ActivityCompleted(completed) = event.data {
@@ -442,7 +469,7 @@ impl RuntimeContext {
         self.completions
             .remove(&command_id.seq)
             .map(|(event_id, result)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 result
             })
     }
@@ -472,7 +499,7 @@ impl RuntimeContext {
         self.failures
             .remove(&command_id.seq)
             .map(|(event_id, failure)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 failure
             })
     }
@@ -491,7 +518,7 @@ impl RuntimeContext {
         self.timers
             .remove(&command_id.seq)
             .map(|(event_id, fired)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 fired
             })
     }
@@ -510,7 +537,7 @@ impl RuntimeContext {
         self.map_completions
             .remove(&command_id.seq)
             .map(|(event_id, completed)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 completed
             })
     }
@@ -529,7 +556,7 @@ impl RuntimeContext {
         self.map_failures
             .remove(&command_id.seq)
             .map(|(event_id, failure)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 failure
             })
     }
@@ -548,7 +575,7 @@ impl RuntimeContext {
         self.child_starts
             .remove(&command_id.seq)
             .map(|(event_id, started)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 started
             })
     }
@@ -567,7 +594,7 @@ impl RuntimeContext {
         self.child_completions
             .remove(&command_id.seq)
             .map(|(event_id, completed)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 completed
             })
     }
@@ -586,7 +613,7 @@ impl RuntimeContext {
         self.child_failures
             .remove(&command_id.seq)
             .map(|(event_id, failure)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 failure
             })
     }
@@ -605,7 +632,7 @@ impl RuntimeContext {
         self.child_cancellations
             .remove(&command_id.seq)
             .map(|(event_id, reason)| {
-                self.record_ready_event_id(event_id);
+                self.record_indexed_ready_event_id(event_id);
                 reason
             })
     }

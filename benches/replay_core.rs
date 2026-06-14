@@ -1,15 +1,22 @@
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
-    DurableBackend, EventId, FireDueTimersRequest, HistoryEventData, MemoryBackend, Namespace,
-    NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind,
-    WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
+    DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
+    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
+    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
+    WorkflowType,
 };
+use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::hint::black_box;
+use std::thread;
 use std::time::Duration;
+
+const SQLITE_SINGLE_FILE_WORKFLOWS: usize = 1_000;
+const SQLITE_SINGLE_FILE_WORKERS: usize = 4;
+const SQLITE_DRAIN_MAX_ITERATIONS: usize = 50_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct BenchInput {
@@ -119,6 +126,35 @@ async fn select_signal_timer(input: u64) -> durust::Result<String> {
     Ok(outcome)
 }
 
+#[durust::workflow(name = "bench.select-all-mixed", version = 1)]
+async fn select_all_mixed(input: u64) -> durust::Result<String> {
+    let activity = durust::call_activity!(double(BenchInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    let child = durust::child!(child_double(input + 10_000))
+        .workflow_id(format!("bench/mixed-child/{input}"))
+        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .spawn()
+        .await?;
+
+    let branches: Vec<BoxSelectBranch<String>> = vec![
+        activity
+            .result()
+            .map_ok(|value| format!("activity:{value}"))
+            .boxed(),
+        child
+            .result()
+            .map_ok(|value| format!("child:{value}"))
+            .boxed(),
+        durust::sleep(Duration::ZERO)
+            .map_ok(|_| "timer".to_owned())
+            .boxed(),
+    ];
+    let winner = durust::select_all(branches).await?;
+    Ok(format!("{}:{}", winner.branch_index, winner.value))
+}
+
 #[durust::workflow(name = "bench.select-then-wait", version = 1)]
 async fn select_then_wait(input: u64) -> durust::Result<String> {
     let first = durust::select! {
@@ -146,6 +182,20 @@ fn workflow_task_schedule(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    c.bench_function("workflow_one_activity_e2e_sqlite", |b| {
+        b.iter_batched(
+            setup_started_sqlite_worker,
+            |(_dir, mut worker)| {
+                block_on(async {
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(stats.workflow_tasks, 2);
+                    assert_eq!(stats.activity_tasks, 1);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
 }
 
 fn workflow_task_claim(c: &mut Criterion) {
@@ -161,12 +211,42 @@ fn workflow_task_claim(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    c.bench_function("workflow_task_claim_sqlite", |b| {
+        b.iter_batched(
+            setup_claimable_workflow_sqlite,
+            |(_dir, backend, worker_id, opts)| {
+                block_on(async {
+                    let claimed = backend.claim_workflow_task(worker_id, opts).await.unwrap();
+                    assert!(claimed.is_some());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
 }
 
 fn workflow_task_append_commit(c: &mut Criterion) {
     c.bench_function("workflow_task_append_commit_memory", |b| {
         b.iter_batched(
             setup_claimed_workflow_for_commit,
+            |state| {
+                block_on(async {
+                    let outcome = state
+                        .backend
+                        .commit_workflow_task(state.claimed.claim, state.batch)
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("workflow_task_append_commit_sqlite", |b| {
+        b.iter_batched(
+            setup_claimed_workflow_for_commit_sqlite,
             |state| {
                 block_on(async {
                     let outcome = state
@@ -397,6 +477,63 @@ fn activity_claim_complete(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+
+    c.bench_function("activity_claim_complete_sqlite", |b| {
+        b.iter_batched(
+            setup_scheduled_activity_sqlite,
+            |(_dir, backend, worker_id, opts)| {
+                block_on(async {
+                    let claimed = backend
+                        .claim_activity_task(worker_id, opts)
+                        .await
+                        .unwrap()
+                        .expect("activity task");
+                    let completed = backend
+                        .complete_activity(CompleteActivityRequest {
+                            claim: claimed.claim,
+                            result: durust::encode_payload(&20_u64).unwrap(),
+                        })
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        completed,
+                        durust::CompleteActivityOutcome::Completed { .. }
+                    ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn sqlite_single_file_mixed_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sqlite_single_file_throughput");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(10));
+    group.throughput(Throughput::Elements(SQLITE_SINGLE_FILE_WORKFLOWS as u64));
+    group.bench_function("drain_1000_mixed_workflows_4_workers", |b| {
+        b.iter_batched(
+            setup_sqlite_single_file_mixed_workflows,
+            |(_dir, backend)| {
+                let stats =
+                    drain_sqlite_workers_concurrently(backend.clone(), SQLITE_SINGLE_FILE_WORKERS);
+                assert_mixed_sqlite_stats(stats);
+                block_on(async {
+                    let mut idle_check = sqlite_mixed_worker(backend, SQLITE_SINGLE_FILE_WORKERS);
+                    let idle_stats = idle_check
+                        .run_until_idle_with(WorkerRunOptions {
+                            max_iterations: SQLITE_DRAIN_MAX_ITERATIONS,
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(idle_stats, WorkerRunStats::default());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
 }
 
 fn activity_heartbeat(c: &mut Criterion) {
@@ -641,6 +778,18 @@ fn setup_started_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     })
 }
 
+fn setup_started_sqlite_worker() -> (tempfile::TempDir, Worker<SqliteBackend>) {
+    block_on(async {
+        let (dir, backend) = sqlite_backend();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .await
+            .unwrap();
+        (dir, sqlite_worker(backend))
+    })
+}
+
 fn setup_completed_activity() -> (Worker<MemoryBackend>, MemoryBackend) {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -847,8 +996,44 @@ async fn create_claimable_workflow() -> (MemoryBackend, WorkerId, ClaimWorkflowT
     )
 }
 
+fn setup_claimable_workflow_sqlite() -> (
+    tempfile::TempDir,
+    SqliteBackend,
+    WorkerId,
+    ClaimWorkflowTaskOptions,
+) {
+    block_on(create_claimable_workflow_sqlite())
+}
+
+async fn create_claimable_workflow_sqlite() -> (
+    tempfile::TempDir,
+    SqliteBackend,
+    WorkerId,
+    ClaimWorkflowTaskOptions,
+) {
+    let (dir, backend) = sqlite_backend();
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<double_plus_one>("bench/claim", "workflows", 10)
+        .await
+        .unwrap();
+    (
+        dir,
+        backend,
+        WorkerId::new("bench-claim-worker"),
+        claim_workflow_options(),
+    )
+}
+
 struct AppendCommitBenchState {
     backend: MemoryBackend,
+    claimed: ClaimedWorkflowTask,
+    batch: WorkflowTaskCommit,
+}
+
+struct SqliteAppendCommitBenchState {
+    _dir: tempfile::TempDir,
+    backend: SqliteBackend,
     claimed: ClaimedWorkflowTask,
     batch: WorkflowTaskCommit,
 }
@@ -898,6 +1083,52 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
     })
 }
 
+fn setup_claimed_workflow_for_commit_sqlite() -> SqliteAppendCommitBenchState {
+    block_on(async {
+        let (dir, backend, worker_id, opts) = create_claimable_workflow_sqlite().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("claimable workflow task");
+        let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
+        let scheduled = ActivityScheduled {
+            command_id: durust::command_id(&claimed.run_id, 0),
+            activity_name: ActivityName::new("bench.double"),
+            task_queue: TaskQueue::new("activities"),
+            retry_policy: durust::RetryPolicy::none(),
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            fingerprint: durust::activity_fingerprint(
+                ActivityName::new("bench.double"),
+                durust::payload_digest(&input),
+                "sha256:bench-options".to_owned(),
+            ),
+            input,
+        };
+        let activity_task = ActivityTask::from_scheduled(&scheduled);
+        SqliteAppendCommitBenchState {
+            _dir: dir,
+            backend,
+            claimed,
+            batch: WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled,
+                ))],
+                upsert_waits: Vec::new(),
+                schedule_activities: vec![activity_task],
+                schedule_activity_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        }
+    })
+}
+
 fn setup_scheduled_activity() -> (MemoryBackend, WorkerId, ClaimActivityOptions) {
     let state = setup_claimed_workflow_for_commit();
     block_on(async {
@@ -907,6 +1138,28 @@ fn setup_scheduled_activity() -> (MemoryBackend, WorkerId, ClaimActivityOptions)
             .await
             .unwrap();
         (
+            state.backend,
+            WorkerId::new("bench-activity-worker"),
+            claim_activity_options("activities"),
+        )
+    })
+}
+
+fn setup_scheduled_activity_sqlite() -> (
+    tempfile::TempDir,
+    SqliteBackend,
+    WorkerId,
+    ClaimActivityOptions,
+) {
+    let state = setup_claimed_workflow_for_commit_sqlite();
+    block_on(async {
+        state
+            .backend
+            .commit_workflow_task(state.claimed.claim, state.batch)
+            .await
+            .unwrap();
+        (
+            state._dir,
             state.backend,
             WorkerId::new("bench-activity-worker"),
             claim_activity_options("activities"),
@@ -1206,6 +1459,158 @@ fn worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .build()
 }
 
+fn sqlite_backend() -> (tempfile::TempDir, SqliteBackend) {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = SqliteBackend::open(dir.path().join("bench.sqlite3")).unwrap();
+    (dir, backend)
+}
+
+fn sqlite_worker(backend: SqliteBackend) -> Worker<SqliteBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build()
+}
+
+fn setup_sqlite_single_file_mixed_workflows() -> (tempfile::TempDir, SqliteBackend) {
+    block_on(async {
+        let (dir, backend) = sqlite_backend();
+        start_sqlite_mixed_workflows(&backend, SQLITE_SINGLE_FILE_WORKFLOWS).await;
+        (dir, backend)
+    })
+}
+
+async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize) {
+    let client = Client::new(backend.clone());
+    for index in 0..workflows {
+        let input = index as u64;
+        match index % 5 {
+            0 => {
+                client
+                    .start_workflow::<double_plus_one>(
+                        format!("bench/sqlite-mixed/double/{index}"),
+                        "workflows",
+                        input,
+                    )
+                    .await
+                    .unwrap();
+            }
+            1 => {
+                client
+                    .start_workflow::<join_all_activities>(
+                        format!("bench/sqlite-mixed/join-all/{index}"),
+                        "workflows",
+                        input,
+                    )
+                    .await
+                    .unwrap();
+            }
+            2 => {
+                client
+                    .start_workflow::<select_all_activities>(
+                        format!("bench/sqlite-mixed/select-all/{index}"),
+                        "workflows",
+                        input,
+                    )
+                    .await
+                    .unwrap();
+            }
+            3 => {
+                client
+                    .start_workflow::<child_start>(
+                        format!("bench/sqlite-mixed/child-start/{index}"),
+                        "workflows",
+                        input,
+                    )
+                    .await
+                    .unwrap();
+            }
+            _ => {
+                client
+                    .start_workflow::<select_all_mixed>(
+                        format!("bench/sqlite-mixed/mixed/{index}"),
+                        "workflows",
+                        input,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+    }
+}
+
+fn drain_sqlite_workers_concurrently(
+    backend: SqliteBackend,
+    worker_count: usize,
+) -> WorkerRunStats {
+    let handles = (0..worker_count)
+        .map(|worker_index| {
+            let backend = backend.clone();
+            thread::spawn(move || {
+                let mut worker = sqlite_mixed_worker(backend, worker_index);
+                block_on(async {
+                    worker
+                        .run_until_idle_with(WorkerRunOptions {
+                            max_iterations: SQLITE_DRAIN_MAX_ITERATIONS,
+                        })
+                        .await
+                        .unwrap()
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    handles
+        .into_iter()
+        .map(|handle| handle.join().expect("SQLite benchmark worker panicked"))
+        .fold(WorkerRunStats::default(), add_worker_stats)
+}
+
+fn sqlite_mixed_worker(backend: SqliteBackend, worker_index: usize) -> Worker<SqliteBackend> {
+    Worker::builder(backend)
+        .worker_id(format!("sqlite-single-file-worker-{worker_index}"))
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(double_plus_one)
+        .register_workflow(join_all_activities)
+        .register_workflow(select_all_activities)
+        .register_workflow(child_start)
+        .register_workflow(child_double)
+        .register_workflow(select_all_mixed)
+        .register_activity(double)
+        .build()
+}
+
+fn add_worker_stats(mut left: WorkerRunStats, right: WorkerRunStats) -> WorkerRunStats {
+    left.workflow_tasks += right.workflow_tasks;
+    left.activity_tasks += right.activity_tasks;
+    left.timers_fired += right.timers_fired;
+    left.activities_timed_out += right.activities_timed_out;
+    left.child_workflow_starts_dispatched += right.child_workflow_starts_dispatched;
+    left
+}
+
+fn assert_mixed_sqlite_stats(stats: WorkerRunStats) {
+    assert!(
+        stats.workflow_tasks >= SQLITE_SINGLE_FILE_WORKFLOWS,
+        "expected at least one workflow task per started workflow, got {stats:?}"
+    );
+    assert!(
+        stats.activity_tasks >= SQLITE_SINGLE_FILE_WORKFLOWS,
+        "expected activity work from double and join_all workflows, got {stats:?}"
+    );
+    assert!(
+        stats.child_workflow_starts_dispatched >= SQLITE_SINGLE_FILE_WORKFLOWS / 5,
+        "expected child dispatch work from child workflows, got {stats:?}"
+    );
+    assert!(
+        stats.timers_fired > 0,
+        "expected timer work from mixed select workflows, got {stats:?}"
+    );
+}
+
 fn select_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
     Worker::builder(backend)
         .workflow_task_queue("workflows")
@@ -1273,6 +1678,7 @@ criterion_group!(
     projection_read,
     version_marker_replay,
     activity_claim_complete,
+    sqlite_single_file_mixed_throughput,
     activity_heartbeat,
     payload_codec,
     payload_provider_refs,

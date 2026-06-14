@@ -4,8 +4,8 @@ use crate::{
     FireDueTimersRequest, HistoryEvent, HistoryEventData, Namespace, NewHistoryEvent,
     ReadSignalInboxRequest, Registry, Result, RunId, StartWorkflowRequest, TaskQueue,
     TimeoutDueActivitiesRequest, WorkerId, Workflow, WorkflowChangeVersionsRequest, WorkflowId,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease, conflict_to_error,
-    poll_with_activity_context, poll_with_runtime_context,
+    WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease, poll_with_activity_context,
+    poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -607,25 +607,30 @@ where
             Poll::Pending => {}
         }
 
-        let last_event_id = conflict_to_error(
-            self.backend
-                .commit_workflow_task(
-                    claimed.claim,
-                    WorkflowTaskCommit {
-                        expected_tail_event_id: claimed.replay_target_event_id,
-                        append_events,
-                        upsert_waits: parts.upsert_waits,
-                        schedule_activities: parts.schedule_activities,
-                        schedule_activity_maps: parts.schedule_activity_maps,
-                        start_child_workflows: parts.start_child_workflows,
-                        consume_signals: parts.consume_signals,
-                        delete_waits: parts.delete_waits,
-                        cancel_commands: parts.cancel_commands,
-                        query_projection: parts.query_projection,
-                    },
-                )
-                .await?,
-        )?;
+        let commit = self
+            .backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events,
+                    upsert_waits: parts.upsert_waits,
+                    schedule_activities: parts.schedule_activities,
+                    schedule_activity_maps: parts.schedule_activity_maps,
+                    start_child_workflows: parts.start_child_workflows,
+                    consume_signals: parts.consume_signals,
+                    delete_waits: parts.delete_waits,
+                    cancel_commands: parts.cancel_commands,
+                    query_projection: parts.query_projection,
+                },
+            )
+            .await?;
+        let crate::CommitOutcome::Committed {
+            new_tail_event_id: last_event_id,
+        } = commit
+        else {
+            return Ok(None);
+        };
 
         if terminal {
             return Ok(None);

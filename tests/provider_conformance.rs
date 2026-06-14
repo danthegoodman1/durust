@@ -354,6 +354,7 @@ where
     delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
     missing_provider_blob_ref_is_rejected(backend.clone()).await;
+    provider_blob_ref_metadata_mismatch_is_rejected(backend.clone()).await;
     workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
     continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
@@ -1656,6 +1657,115 @@ where
     );
 }
 
+async fn provider_blob_ref_metadata_mismatch_is_rejected<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let large_value = "x".repeat(16 * 1024);
+    let source_payload = durust::encode_payload(&large_value).unwrap();
+    let durust::PayloadRef::Inline {
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
+        bytes,
+    } = source_payload.clone()
+    else {
+        panic!("freshly encoded payload should be inline before provider storage");
+    };
+    let digest = durust::digest_bytes(&bytes);
+    let size = u64::try_from(bytes.len()).unwrap();
+    backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new("wf/blob-metadata-source"),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new("blob-metadata-source-workflows"),
+            input: source_payload,
+        })
+        .await
+        .unwrap();
+
+    let cases = [
+        (
+            "schema",
+            durust::PayloadRef::Blob {
+                codec,
+                schema_fingerprint: durust::SchemaFingerprint("sha256:mismatched".to_owned()),
+                compression,
+                encryption: encryption.clone(),
+                digest: digest.clone(),
+                size,
+                uri: format!("durust://payload/{digest}"),
+            },
+        ),
+        (
+            "codec",
+            durust::PayloadRef::Blob {
+                codec: durust::CodecId::Json,
+                schema_fingerprint: schema_fingerprint.clone(),
+                compression,
+                encryption: encryption.clone(),
+                digest: digest.clone(),
+                size,
+                uri: format!("durust://payload/{digest}"),
+            },
+        ),
+    ];
+
+    for (case, mismatched) in cases {
+        let workflow_id = format!("wf/blob-metadata-mismatch/{case}");
+        let run_id = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(&workflow_id),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("blob-metadata-mismatch-workflows"),
+                input: durust::encode_payload(&0_u64).unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("blob-metadata-mismatch-{case}")),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("blob-metadata-mismatch-workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        assert_eq!(claimed.run_id, run_id);
+        let err = backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: Vec::new(),
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: Some(mismatched),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::PayloadDecode(message) if message.contains("payload blob metadata mismatch")),
+            "unexpected error for {case} mismatch: {err:?}"
+        );
+    }
+}
+
 async fn workflow_change_version_index_tracks_markers_and_open_status<B>(backend: B)
 where
     B: DurableBackend,
@@ -2337,7 +2447,7 @@ where
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("timeout-activities"),
         retry_policy,
-        start_to_close_timeout: Some(Duration::from_millis(10)),
+        start_to_close_timeout: Some(Duration::from_secs(1)),
         heartbeat_timeout: None,
         input: input.clone(),
         fingerprint: durust::activity_fingerprint(
@@ -2377,7 +2487,7 @@ where
     let early = backend
         .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
-            now: durust::TimestampMs(after_schedule.0.saturating_add(5)),
+            now: durust::TimestampMs(after_schedule.0.saturating_add(100)),
             limit: 16,
         })
         .await
@@ -2393,7 +2503,7 @@ where
     let retry = backend
         .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
-            now: durust::TimestampMs(after_schedule.0.saturating_add(20)),
+            now: durust::TimestampMs(after_schedule.0.saturating_add(1_200)),
             limit: 16,
         })
         .await
@@ -2422,7 +2532,7 @@ where
     let final_timeout = backend
         .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
-            now: durust::TimestampMs(after_schedule.0.saturating_add(40)),
+            now: durust::TimestampMs(after_schedule.0.saturating_add(2_400)),
             limit: 16,
         })
         .await
@@ -2431,7 +2541,7 @@ where
     let duplicate_timeout = backend
         .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
-            now: durust::TimestampMs(after_schedule.0.saturating_add(50)),
+            now: durust::TimestampMs(after_schedule.0.saturating_add(2_500)),
             limit: 16,
         })
         .await

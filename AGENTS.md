@@ -67,6 +67,11 @@ Required coverage by default:
 - Table-driven tests for normal behavior and boundary conditions.
 - Deterministic replay tests for command-producing workflow behavior.
 - Fault tests for stale, duplicate, delayed, reordered, and concurrently committed events when relevant.
+- Replay tests must force valid but unfavorable event orderings, not only
+  friendly `run_until_idle` schedules. Cover cached and cold replay where
+  activity completions, timer fires, signals, child starts/completions/failures,
+  cancellations, and activity-map completions arrive before or after unrelated
+  command events in the same loaded history chunk.
 - Provider conformance tests for every `DurableBackend` behavior change.
 - Deterministic simulation tests for modules that own scheduling, leases, retries, timers, recovery, activity maps, or state transitions.
 - Regression tests for every bug fix, added before or alongside the fix.

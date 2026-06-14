@@ -84,6 +84,9 @@ Implemented and covered:
 - Runnable `payload_offload` example that forces provider-owned blob storage.
 - Criterion benchmark coverage for MessagePack/JSON encode/decode and
   inline-vs-blob history streaming over 64 KiB payloads.
+- Criterion single-file SQLite baseline coverage for workflow task claim,
+  workflow task append/commit, activity claim/complete, one-activity workflow
+  execution, and a 1k mixed-workflow drain with four workers.
 - Generic dry-run-capable provider payload GC, with memory and SQLite
   implementations that retain blobs reachable from history, activities, maps,
   child outbox, signals, and query projections.
@@ -101,12 +104,20 @@ Remaining before this phase is done:
 
 - SQLite S3-compatible/Garage blob-store integration, transient upload failure
   behavior, and object-store GC coverage.
+- Compression policy for object-store payloads. A local 64 KiB Criterion probe
+  measured Zstd compression around 62 us and compressed decode around 44 us,
+  versus MessagePack encode around 1.08 us and decode around 2.02 us, so
+  compression should remain unimplemented until S3/Garage storage and network
+  benchmarks prove the tradeoff.
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
 - Blob-path coverage for side effects once side effects are implemented.
 - Public payload-offload documentation for production object stores once S3
   compatible storage lands.
 - Payload codec/offload benchmark baselines and regression thresholds.
+- Partitioned SQLite shard-file throughput baselines remain part of the
+  dedicated SQLite shard-file provider phase; the current SQLite numbers are
+  single-database-file baselines.
 
 ## Required Tests
 

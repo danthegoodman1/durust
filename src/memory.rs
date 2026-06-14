@@ -2327,10 +2327,10 @@ fn verify_payload_blob<'a>(
     payload: &PayloadRef,
 ) -> Result<&'a PayloadBlob> {
     let PayloadRef::Blob {
-        codec: _,
-        schema_fingerprint: _,
-        compression: _,
-        encryption: _,
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
         digest,
         size,
         uri: _,
@@ -2345,6 +2345,15 @@ fn verify_payload_blob<'a>(
             "missing payload blob `{digest}`"
         )));
     };
+    if blob.codec != *codec
+        || blob.schema_fingerprint != *schema_fingerprint
+        || blob.compression != *compression
+        || blob.encryption != *encryption
+    {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob metadata mismatch for `{digest}`"
+        )));
+    }
     let actual_digest = digest_bytes(&blob.bytes);
     if &actual_digest != digest {
         return Err(Error::PayloadDecode(format!(

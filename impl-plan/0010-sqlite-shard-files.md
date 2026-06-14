@@ -30,7 +30,8 @@ simulation, and performance target.
 - Cross-shard child start, child completion, cancellation, signal routing, and activity map completion through outbox/inbox handoff.
 - Dispatcher recovery across source outbox, target inbox, target apply, and source ack boundaries.
 - Provider conformance registration as `sqlite-shard-files`.
-- Criterion benchmarks comparing single-file SQLite and shard-file SQLite.
+- Criterion benchmarks comparing single-file SQLite, shard-file SQLite, and
+  the `../durable-phases` partitioned SQLite durability-provider baseline.
 
 ## Acceptance
 
@@ -43,6 +44,10 @@ simulation, and performance target.
 - Closing and reopening the provider reconstructs every shard from durable append history and provider-owned derived state.
 - Memory, single-file SQLite, and shard-file SQLite all pass the shared provider conformance suite.
 - Benchmarks report comparable dimensions to `../durable-phases`: workflow count, worker count, shard count, activation concurrency, prefetch limit, commit batch size, and throughput.
+- Shard-file SQLite at least meets the relevant `../durable-phases`
+  partitioned SQLite durability-provider throughput baselines for comparable
+  dimensions, or the phase documents the measured gap and the next bottleneck
+  before accepting the implementation.
 
 ## Required Tests
 
@@ -79,4 +84,6 @@ simulation, and performance target.
 - Criterion benchmark for cross-shard signal routing.
 - Criterion benchmark for provider startup replay across many shard files.
 - Compare single-file SQLite and shard-file SQLite at 1, 4, and 16 shards.
+- Compare shard-file SQLite against `../durable-phases` partitioned SQLite
+  durability-provider benchmark numbers for equivalent workload dimensions.
 - Record whether throughput scales with shard count and explain any bottleneck.
