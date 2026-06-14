@@ -625,6 +625,20 @@ from durable history or operational indexes; `PayloadBackend` applies the same
 contract to its external object store by asking the inner provider for generic
 payload roots and deleting only wrapper-owned unreachable objects.
 
+To run the local Garage-backed S3 conformance test:
+
+```bash
+docker compose -f tests/fixtures/garage.compose.yml up -d
+DURUST_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
+DURUST_GARAGE_BUCKET=durust-payloads \
+DURUST_GARAGE_REGION=garage \
+DURUST_GARAGE_PREFIX=local/payloads \
+DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
+DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+cargo test --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+docker compose -f tests/fixtures/garage.compose.yml down -v
+```
+
 ## Recovery Model
 
 Recovery is streaming and bounded:

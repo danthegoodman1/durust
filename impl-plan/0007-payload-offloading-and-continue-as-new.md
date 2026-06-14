@@ -124,13 +124,14 @@ Implemented and covered:
 - Provider conformance coverage proving `PayloadBackend` hydrates activity-map
   payloads over memory and SQLite, survives SQLite close/reopen, and collects
   overwritten query-projection blobs from the wrapper object store.
+- Local Garage fixture and CI/local conformance path for
+  `PayloadBackend<SqliteBackend, S3BlobStore>`, using Garage's single-node
+  default-bucket mode rather than MinIO.
+- S3 upload-failure coverage proving an unavailable object store does not
+  commit a missing external payload ref.
 
 Remaining before this phase is done:
 
-- Local Garage-backed conformance coverage for
-  `PayloadBackend<SqliteBackend, S3BlobStore>`. The wrapper architecture keeps
-  S3/Garage out of concrete durability providers; the next storage proof is a
-  real Garage fixture, not a SQLite-specific S3 branch.
 - Compression policy for object-store payloads. A local 64 KiB Criterion probe
   measured Zstd compression around 62 us and compressed decode around 44 us,
   versus MessagePack encode around 1.08 us and decode around 2.02 us, so
@@ -139,8 +140,8 @@ Remaining before this phase is done:
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
 - Blob-path coverage for side effects once side effects are implemented.
-- Public payload-offload documentation for production S3-compatible object
-  stores once S3/Garage storage lands.
+- Broader production payload-offload documentation after compression and lazy
+  hydration policy settle.
 - Checked-in payload codec/offload benchmark regression thresholds.
 - Partitioned SQLite shard-file throughput baselines remain part of the
   dedicated performance-hardening phase; the current SQLite numbers are
@@ -156,10 +157,10 @@ Remaining before this phase is done:
 - SQLite local-directory blob store round-trips public payload refs across close/reopen.
 - SQLite local-directory blob GC deletes unreachable object-store blobs.
 - PayloadBackend over memory and SQLite recursively hydrates activity-map inputs/results and deletes unreachable wrapper-owned blobs.
-- PayloadBackend plus Garage round-trips activity, signal, query, child, side-effect, and workflow payload refs.
+- PayloadBackend plus Garage round-trips activity, signal, query, child, map, and workflow payload refs.
 - Blob upload before history commit crash.
 - History commit before blob GC crash.
-- Garage unavailable during upload returns a retryable provider error without committing a missing payload ref.
+- Garage unavailable during upload returns a provider error without committing a missing payload ref.
 - Missing blob detection.
 - Payload digest validation.
 - Continue-as-new starts a new run with the same workflow id.

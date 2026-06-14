@@ -9,8 +9,10 @@ use futures::executor::block_on;
 use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::env;
 use std::fs;
-use std::time::Duration;
+use std::future::Future;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Input {
@@ -278,6 +280,173 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
             gc_projection
         );
     });
+}
+
+#[test]
+fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
+    block_on_tokio(async {
+        let Some(garage) = garage_config_from_env() else {
+            eprintln!("skipping Garage S3 conformance; set DURUST_GARAGE_* env vars");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload-wrapper-garage.sqlite3");
+        let blob_store = durust::S3BlobStore::garage(garage).unwrap();
+        wait_for_blob_store(&blob_store).await;
+        let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
+        let backend = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            config.clone(),
+        );
+        let run_id = payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/payload-backend-garage-offload",
+            "payload-backend-garage-workflows",
+            "payload-backend-garage-activities",
+        )
+        .await;
+        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-garage").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-garage").await;
+        let (gc_workflow_id, gc_projection) =
+            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-garage").await;
+        let external_blobs = durust::PayloadBlobStore::list_payload_blob_digests(&blob_store)
+            .await
+            .unwrap();
+        assert!(external_blobs.len() >= 8);
+
+        let reopened = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store,
+            config,
+        );
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(100),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start after Garage wrapper reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(gc_workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected retained Garage projection after reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            gc_projection
+        );
+    });
+}
+
+#[test]
+fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
+    block_on_tokio(async {
+        let inner = MemoryBackend::new();
+        let blob_store = durust::S3BlobStore::garage(durust::S3BlobStoreConfig {
+            bucket: "durust-payloads".to_owned(),
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            region: "garage".to_owned(),
+            prefix: "payloads".to_owned(),
+            access_key_id: "GK0123456789abcdef0123456789abcdef".to_owned(),
+            secret_access_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+        })
+        .unwrap();
+        let backend = PayloadBackend::with_payload_storage(
+            inner.clone(),
+            blob_store,
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let err = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/payload-backend-s3-upload-failure"),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&large_payload("workflow-input")).unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(message) if message.contains("S3 payload store error"))
+        );
+        let claim = inner
+            .claim_workflow_task(
+                WorkerId::new("payload-backend-s3-upload-failure-worker"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(claim.is_none());
+    });
+}
+
+fn block_on_tokio<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
+    let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
+    let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
+    let access_key_id = env::var("DURUST_GARAGE_ACCESS_KEY_ID").ok()?;
+    let secret_access_key = env::var("DURUST_GARAGE_SECRET_ACCESS_KEY").ok()?;
+    let region = env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned());
+    let prefix = env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "payloads".to_owned());
+    Some(durust::S3BlobStoreConfig {
+        bucket,
+        endpoint,
+        region,
+        prefix,
+        access_key_id,
+        secret_access_key,
+    })
+}
+
+async fn wait_for_blob_store<S>(blob_store: &S)
+where
+    S: durust::PayloadBlobStore,
+{
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match blob_store.list_payload_blob_digests().await {
+            Ok(_) => return,
+            Err(err) => {
+                last_error = Some(err);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    panic!("Garage S3 blob store did not become ready: {last_error:?}");
 }
 
 #[test]

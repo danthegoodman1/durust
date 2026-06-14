@@ -22,6 +22,23 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
+      - name: Start Garage
+        run: docker compose -f tests/fixtures/garage.compose.yml up -d
+
+      - name: Run Garage S3 conformance
+        env:
+          DURUST_GARAGE_ENDPOINT: http://127.0.0.1:3900
+          DURUST_GARAGE_BUCKET: durust-payloads
+          DURUST_GARAGE_REGION: garage
+          DURUST_GARAGE_PREFIX: ci/${{ github.run_id }}/${{ github.run_attempt }}
+          DURUST_GARAGE_ACCESS_KEY_ID: GK0123456789abcdef0123456789abcdef
+          DURUST_GARAGE_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        run: cargo test --locked --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+
+      - name: Stop Garage
+        if: always()
+        run: docker compose -f tests/fixtures/garage.compose.yml down -v
+
       - name: Run examples
         run: |
           cargo run --locked --example hello_activity
