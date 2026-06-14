@@ -163,10 +163,9 @@ Implemented and covered:
 - These DB tests require `DURUST_POSTGRES_URL`; when it is absent they skip the
   live database portion. The current slice has also been run against the
   `../durable-phases` Docker Postgres fixture.
-- The provider implementation is split into focused modules:
-  `src/postgres/mod.rs` for the public type and core backend operations,
-  `helpers.rs` for SQL/transaction helpers, `payloads.rs` for payload/blob
-  storage and hydration, and `tests.rs` for the env-gated Postgres test suite.
+- The production provider implementation lives in one auditable
+  `src/postgres.rs` module. The env-gated Postgres test suite lives separately
+  in `src/postgres/tests.rs` so test volume does not obscure the provider code.
 - All current `DurableBackend` methods have Postgres implementations.
 
 Remaining:
