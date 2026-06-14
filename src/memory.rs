@@ -2065,6 +2065,9 @@ fn collect_history_event_payload_roots(
         HistoryEventData::SignalConsumed(signal) => {
             roots.push(PayloadRootRef::Payload(signal.payload.clone()));
         }
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(marker)?;
+        }
         HistoryEventData::WorkflowCancelled { .. }
         | HistoryEventData::WorkflowTaskStarted
         | HistoryEventData::ActivityTimedOut(_)
@@ -2150,6 +2153,9 @@ fn collect_history_event_payload_blobs(
         | HistoryEventData::SelectWinner(_)
         | HistoryEventData::VersionMarker(_)
         | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(marker)
+        }
         HistoryEventData::ChildWorkflowStartRequested(requested) => {
             collect_payload_blob_ref(state, &requested.input, reachable)
         }

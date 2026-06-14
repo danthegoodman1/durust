@@ -486,6 +486,10 @@ where
         HistoryEventData::SignalConsumed(signal) => {
             HistoryEventData::SignalConsumed(normalize_signal(blob_store, config, signal).await?)
         }
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(&marker)?;
+            HistoryEventData::SideEffectMarker(marker)
+        }
         data => data,
     })
 }
@@ -566,6 +570,10 @@ where
         }
         HistoryEventData::SignalConsumed(signal) => {
             HistoryEventData::SignalConsumed(hydrate_signal(blob_store, signal).await?)
+        }
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(&marker)?;
+            HistoryEventData::SideEffectMarker(marker)
         }
         data => data,
     })

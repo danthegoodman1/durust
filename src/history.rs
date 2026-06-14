@@ -194,6 +194,13 @@ pub struct DeprecatedPatchMarker {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideEffectMarker {
+    pub command_id: CommandId,
+    pub key: String,
+    pub value: PayloadRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HistoryEventData {
     WorkflowStarted {
         workflow_type: WorkflowType,
@@ -230,6 +237,7 @@ pub enum HistoryEventData {
     SelectWinner(SelectWinner),
     VersionMarker(VersionMarker),
     DeprecatedPatchMarker(DeprecatedPatchMarker),
+    SideEffectMarker(SideEffectMarker),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -265,6 +273,7 @@ pub enum HistoryEventType {
     SelectWinner,
     VersionMarker,
     DeprecatedPatchMarker,
+    SideEffectMarker,
 }
 
 impl HistoryEventData {
@@ -294,6 +303,7 @@ impl HistoryEventData {
             Self::SelectWinner(_) => HistoryEventType::SelectWinner,
             Self::VersionMarker(_) => HistoryEventType::VersionMarker,
             Self::DeprecatedPatchMarker(_) => HistoryEventType::DeprecatedPatchMarker,
+            Self::SideEffectMarker(_) => HistoryEventType::SideEffectMarker,
         }
     }
 }

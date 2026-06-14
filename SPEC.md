@@ -2017,7 +2017,7 @@ durust::sleep(...)
 durust::select! { ... }
 durust::spawn(...)
 durust::now()
-durust::side_effect!(...)
+durust::side_effect(...).await
 durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
@@ -2048,7 +2048,7 @@ std::time::Instant::now -> durust::now
 std::time::SystemTime   -> durust::now
 tokio::select!          -> durust::select!
 tokio::spawn            -> durust::spawn or durust::join!
-rand/uuid generation    -> durust::side_effect!
+rand/uuid generation    -> durust::side_effect(...).await
 direct network/db calls -> durust::call_activity!
 ```
 
@@ -2069,7 +2069,7 @@ let now = durust::now();
 ## 17.2 Side effect marker
 
 ```rust
-let id = durust::side_effect("make-id", || Uuid::new_v4())?;
+let id = durust::side_effect("make-id", || Uuid::new_v4()).await?;
 ```
 
 Behavior:
@@ -2084,7 +2084,13 @@ At tail:
     return value
 ```
 
-The closure may run again if the workflow task crashes before commit, so it must not perform external side effects. External side effects belong in activities.
+`SideEffectMarker` payloads are small inline facts. They are capped at 8 KiB and
+are never offloaded to blob storage, so replay can return the recorded value
+without async blob hydration. Larger values should be produced by activities or
+ordinary payload-ref APIs.
+
+The closure may run again if the workflow task crashes before commit, so it must
+not perform external side effects. External side effects belong in activities.
 
 ---
 
@@ -2092,7 +2098,7 @@ The closure may run again if the workflow task crashes before commit, so it must
 
 Every event payload is a `PayloadRef`.
 
-The public workflow, activity, signal, child, and query APIs are blind to inline versus blob storage. User code passes and receives typed payloads. The durability provider implementation owns serialization, compression, encryption, inline/blob selection, blob upload/download, and `PayloadRef` persistence.
+The public workflow, activity, signal, child, and query APIs are blind to inline versus blob storage. User code passes and receives typed payloads. The durability provider implementation owns serialization, compression metadata, encryption metadata, inline/blob selection, blob upload/download, and `PayloadRef` persistence.
 
 ```rust
 pub enum PayloadRef {
@@ -2120,8 +2126,8 @@ Pipeline:
 
 ```text
 serde encode with configured codec
-optional compression
-optional encryption
+compression = none
+optional encryption metadata
 inline if small
 blob if large
 ```
@@ -2211,7 +2217,17 @@ pub struct S3BlobStoreConfig {
 
 Providers must implement `MessagePack` and `Json`. `MessagePack` is the default for durable payloads. `Json` is required for debug/export flows and explicit provider configuration. `Protobuf` is reserved for an opt-in feature that uses explicit generated schemas.
 
-Durability implementation docs should recommend offloading larger workflow inputs, activity parameters, activity results, signals, child results, side effects, and query projections to object storage such as S3, then storing only a `PayloadRef` in the durable store. Large DB rows reduce write throughput, increase WAL/journal pressure, and make hot indexes and history scans more expensive.
+Payload refs reserve compression metadata, but the current runtime writes
+`CompressionId::None` and does not expose a compression policy. Compression is a
+provider option to add only with explicit corpus, network, storage, and CPU
+evidence; it is not part of the 0007 payload-offload contract.
+
+Durability implementation docs should recommend offloading larger workflow
+inputs, activity parameters, activity results, signals, child results, and query
+projections to object storage such as S3, then storing only a `PayloadRef` in
+the durable store. Side-effect markers are excluded because they are capped
+inline facts. Large DB rows reduce write throughput, increase WAL/journal
+pressure, and make hot indexes and history scans more expensive.
 
 The inline threshold is a performance default, not a correctness boundary. Backends may choose a smaller limit for databases where row size strongly affects write amplification.
 

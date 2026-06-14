@@ -1838,6 +1838,9 @@ fn collect_history_event_payload_roots(
         HistoryEventData::SignalConsumed(signal) => {
             roots.push(PayloadRootRef::Payload(signal.payload.clone()));
         }
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(marker)?;
+        }
         HistoryEventData::WorkflowCancelled { .. }
         | HistoryEventData::WorkflowTaskStarted
         | HistoryEventData::ActivityTimedOut(_)
@@ -2072,6 +2075,9 @@ fn collect_history_event_payload_blobs(
         | HistoryEventData::SelectWinner(_)
         | HistoryEventData::VersionMarker(_)
         | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
+        HistoryEventData::SideEffectMarker(marker) => {
+            crate::payload::validate_side_effect_marker(marker)
+        }
         HistoryEventData::ChildWorkflowStartRequested(requested) => {
             collect_payload_blob_ref(conn, config, &requested.input, reachable)
         }
@@ -4408,6 +4414,7 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::SelectWinner => "select_winner",
         HistoryEventType::VersionMarker => "version_marker",
         HistoryEventType::DeprecatedPatchMarker => "deprecated_patch_marker",
+        HistoryEventType::SideEffectMarker => "side_effect_marker",
     }
 }
 
@@ -4437,6 +4444,7 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "select_winner" => Ok(HistoryEventType::SelectWinner),
         "version_marker" => Ok(HistoryEventType::VersionMarker),
         "deprecated_patch_marker" => Ok(HistoryEventType::DeprecatedPatchMarker),
+        "side_effect_marker" => Ok(HistoryEventType::SideEffectMarker),
         other => Err(Error::Backend(format!("unknown event type `{other}`"))),
     }
 }

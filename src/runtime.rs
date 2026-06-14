@@ -3,10 +3,11 @@ use crate::{
     ActivityScheduled, ActivityTask, ChildStartOutboxMessage, ChildWorkflowCompleted,
     ChildWorkflowStarted, CommandFingerprint, CommandId, CommandSeq, DeprecatedPatchMarker, Error,
     HistoryEvent, HistoryEventData, NewHistoryEvent, ParentClosePolicy, PayloadRef, Result, RunId,
-    SelectWinner, SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired, TimerStarted,
-    TimestampMs, VersionMarker, WaitId, WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowId, activity_fingerprint, activity_map_fingerprint,
-    child_workflow_fingerprint, command_id, payload_digest, signal_fingerprint, timer_fingerprint,
+    SelectWinner, SideEffectMarker, SignalConsumed, SignalId, SignalName, TaskQueue, TimerFired,
+    TimerStarted, TimestampMs, VersionMarker, WaitId, WaitKind, WaitRecord, Workflow,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowId, activity_fingerprint,
+    activity_map_fingerprint, child_workflow_fingerprint, command_id, payload_digest,
+    signal_fingerprint, timer_fingerprint,
 };
 use futures::future::BoxFuture;
 use std::cell::Cell;
@@ -1054,6 +1055,115 @@ where
 {
     let input = with_context(|runtime| runtime.encode_payload(&input))?;
     Err(Error::ContinueAsNew { input })
+}
+
+pub fn side_effect<T, F>(key: impl Into<String>, effect: F) -> SideEffectFuture<T, F>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> T,
+{
+    SideEffectFuture {
+        key: key.into(),
+        effect: Some(effect),
+        done: false,
+        _value: std::marker::PhantomData,
+    }
+}
+
+pub struct SideEffectFuture<T, F>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> T,
+{
+    key: String,
+    effect: Option<F>,
+    done: bool,
+    _value: std::marker::PhantomData<T>,
+}
+
+impl<T, F> Unpin for SideEffectFuture<T, F>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> T,
+{
+}
+
+impl<T, F> Future for SideEffectFuture<T, F>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+    F: FnOnce() -> T,
+{
+    type Output = Result<T>;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        with_context(|runtime| {
+            if self.done {
+                return Poll::Ready(Err(Error::Nondeterminism(
+                    "side effect future polled after completion".to_owned(),
+                )));
+            }
+            if self.key.is_empty() {
+                return Poll::Ready(Err(Error::PayloadEncode(
+                    "side effect key must not be empty".to_owned(),
+                )));
+            }
+
+            if let Some(event) = runtime.peek_replay_event().cloned() {
+                let HistoryEventData::SideEffectMarker(marker) = event.data else {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "expected SideEffectMarker `{}`, found {:?}",
+                        self.key, event.event_type
+                    ))));
+                };
+                let command_id = runtime.next_command_id();
+                if marker.command_id.seq != command_id.seq {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "side effect `{}` command sequence changed: expected {}, found {}",
+                        self.key, command_id.seq.0, marker.command_id.seq.0
+                    ))));
+                }
+                if marker.key != self.key {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "expected side effect `{}`, found `{}`",
+                        self.key, marker.key
+                    ))));
+                }
+                if let Err(err) = crate::validate_side_effect_marker(&marker) {
+                    return Poll::Ready(Err(err));
+                }
+                runtime.advance_replay();
+                self.done = true;
+                Poll::Ready(crate::decode_payload(&marker.value))
+            } else if runtime.at_replay_tail() {
+                let command_id = runtime.next_command_id();
+                let Some(effect) = self.effect.take() else {
+                    return Poll::Ready(Err(Error::Nondeterminism(
+                        "side effect closure missing".to_owned(),
+                    )));
+                };
+                let value = effect();
+                let payload = match runtime.encode_payload(&value) {
+                    Ok(payload) => payload,
+                    Err(err) => return Poll::Ready(Err(err)),
+                };
+                if let Err(err) = crate::validate_inline_side_effect_payload(&payload) {
+                    return Poll::Ready(Err(err));
+                }
+                runtime.append_events.push(NewHistoryEvent::new(
+                    HistoryEventData::SideEffectMarker(SideEffectMarker {
+                        command_id,
+                        key: self.key.clone(),
+                        value: payload,
+                    }),
+                ));
+                self.done = true;
+                Poll::Ready(Ok(value))
+            } else {
+                runtime.request_more_history_if_available();
+                Poll::Pending
+            }
+        })
+    }
 }
 
 pub fn publish<T>(view: &T) -> Result<()>
@@ -3026,6 +3136,7 @@ pub(crate) fn event_payload_len(data: &HistoryEventData) -> usize {
         HistoryEventData::SelectWinner(winner) => winner.branches_digest.len() + 32,
         HistoryEventData::VersionMarker(marker) => marker.change_id.len() + 16,
         HistoryEventData::DeprecatedPatchMarker(marker) => marker.patch_id.len() + 16,
+        HistoryEventData::SideEffectMarker(marker) => marker.key.len() + marker.value.encoded_len(),
     }
 }
 

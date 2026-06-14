@@ -813,7 +813,10 @@ fn lint_workflow_body(item_fn: &ItemFn) -> syn::Result<()> {
         ("tokio :: spawn", "use durust::spawn or durust::join! instead"),
         ("std :: time :: Instant :: now", "use durust::now instead"),
         ("std :: time :: SystemTime :: now", "use durust::now instead"),
-        ("rand :: random", "use durust::side_effect instead"),
+        (
+            "rand :: random",
+            "use durust::side_effect(...).await instead",
+        ),
     ];
 
     for (needle, suggestion) in forbidden {
@@ -860,6 +863,7 @@ impl<'ast> Visit<'ast> for AwaitLint {
             || base.contains("durust :: sleep")
             || base.contains("durust :: sleep_until")
             || base.contains("durust :: signal")
+            || base.contains("side_effect")
             || base.contains("durust :: select_all")
             || base.contains("durust :: join_all")
             || base.contains("durust :: join");

@@ -152,6 +152,22 @@ fn memory_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydrat
 }
 
 #[test]
+fn memory_provider_keeps_side_effect_marker_inline_when_threshold_would_offload() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        assert_side_effect_marker_stays_inline_for_replay_stream(
+            backend.clone(),
+            "wf/memory-side-effect-inline",
+            "memory-side-effect-workflows",
+        )
+        .await;
+        assert_eq!(backend.payload_blob_count(), 0);
+    });
+}
+
+#[test]
 fn payload_backend_offloads_large_payloads_and_hydrates_memory_provider_apis() {
     block_on(async {
         let blob_store = durust::MemoryBlobStore::new();
@@ -251,6 +267,31 @@ fn sqlite_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydrat
 
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         assert_replay_stream_payload_hydrates_explicitly(reopened, run_id).await;
+    });
+}
+
+#[test]
+fn sqlite_provider_keeps_side_effect_marker_inline_after_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("side-effect-inline.sqlite3");
+        let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        assert_side_effect_marker_stays_inline_for_replay_stream(
+            backend.clone(),
+            "wf/sqlite-side-effect-inline",
+            "sqlite-side-effect-workflows",
+        )
+        .await;
+        assert_eq!(backend.payload_blob_count().unwrap(), 0);
+        drop(backend);
+
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        assert_side_effect_marker_stays_inline_in_existing_history(
+            reopened,
+            "wf/sqlite-side-effect-inline",
+        )
+        .await;
     });
 }
 
@@ -930,6 +971,107 @@ where
     assert_eq!(
         durust::decode_payload::<String>(&hydrated).unwrap(),
         large_payload("workflow-input")
+    );
+}
+
+async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+) where
+    B: DurableBackend,
+{
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.side-effect-marker", 1),
+            task_queue: TaskQueue::new(workflow_queue),
+            input: durust::encode_payload(&()).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.side-effect-marker", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("side-effect-marker-commit"), claim_opts)
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let value = durust::encode_payload(&"side-effect-value-that-exceeds-threshold").unwrap();
+    assert!(value.encoded_len() > 1);
+
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::SideEffectMarker(durust::SideEffectMarker {
+                        command_id,
+                        key: "make-id".to_owned(),
+                        value,
+                    }),
+                )],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        durust::CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        }
+    );
+
+    assert_side_effect_marker_stays_inline_in_existing_history(backend, workflow_id).await;
+}
+
+async fn assert_side_effect_marker_stays_inline_in_existing_history<B>(
+    backend: B,
+    workflow_id: &str,
+) where
+    B: DurableBackend,
+{
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.side-effect-marker", 1),
+            task_queue: TaskQueue::new("unused"),
+            input: durust::encode_payload(&()).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let replay_history = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(2),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::SideEffectMarker(marker) = &replay_history[1].data else {
+        panic!("expected side effect marker in replay history");
+    };
+    assert_eq!(marker.key, "make-id");
+    assert!(matches!(marker.value, durust::PayloadRef::Inline { .. }));
+    assert_eq!(
+        durust::decode_payload::<String>(&marker.value).unwrap(),
+        "side-effect-value-that-exceeds-threshold"
     );
 }
 

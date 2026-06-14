@@ -2,7 +2,8 @@ use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
     ActivityMapResultPage, ActivityMapScheduled, ActivityScheduled, ActivityTask,
     ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
-    ChildWorkflowStartRequested, DurableFailure, Error, HistoryEventData, Result, SignalConsumed,
+    ChildWorkflowStartRequested, DurableFailure, Error, HistoryEventData, Result, SideEffectMarker,
+    SignalConsumed,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,7 @@ pub enum PayloadRef {
 }
 
 pub const DEFAULT_INLINE_THRESHOLD_BYTES: usize = 8 * 1024;
+pub const MAX_SIDE_EFFECT_PAYLOAD_BYTES: usize = DEFAULT_INLINE_THRESHOLD_BYTES;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PayloadStorageConfig {
@@ -257,6 +259,29 @@ where
             "protobuf payload codec is not enabled".to_owned(),
         )),
     }
+}
+
+pub fn validate_inline_side_effect_payload(payload: &PayloadRef) -> Result<()> {
+    match payload {
+        PayloadRef::Inline { bytes, .. } if bytes.len() <= MAX_SIDE_EFFECT_PAYLOAD_BYTES => Ok(()),
+        PayloadRef::Inline { bytes, .. } => Err(Error::PayloadEncode(format!(
+            "side effect payload is {} bytes, exceeding the {} byte inline limit",
+            bytes.len(),
+            MAX_SIDE_EFFECT_PAYLOAD_BYTES
+        ))),
+        PayloadRef::Blob { .. } => Err(Error::PayloadDecode(
+            "side effect payloads must be stored inline".to_owned(),
+        )),
+    }
+}
+
+pub(crate) fn validate_side_effect_marker(marker: &SideEffectMarker) -> Result<()> {
+    if marker.key.is_empty() {
+        return Err(Error::PayloadEncode(
+            "side effect key must not be empty".to_owned(),
+        ));
+    }
+    validate_inline_side_effect_payload(&marker.value)
 }
 
 pub fn type_fingerprint<T: ?Sized>() -> String {
@@ -469,6 +494,10 @@ where
         HistoryEventData::VersionMarker(marker) => HistoryEventData::VersionMarker(marker),
         HistoryEventData::DeprecatedPatchMarker(marker) => {
             HistoryEventData::DeprecatedPatchMarker(marker)
+        }
+        HistoryEventData::SideEffectMarker(marker) => {
+            validate_side_effect_marker(&marker)?;
+            HistoryEventData::SideEffectMarker(marker)
         }
     })
 }

@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
+static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct NumberInput {
@@ -236,6 +237,27 @@ async fn sleep_before_large_activity_result(_: ()) -> durust::Result<usize> {
     durust::sleep(Duration::from_secs(1)).await?;
     let payload = handle.result().await?;
     Ok(payload.bytes.len())
+}
+
+#[durust::workflow(name = "tests.side-effect-then-sleep", version = 1)]
+async fn side_effect_then_sleep_workflow(_: ()) -> durust::Result<String> {
+    let value = durust::side_effect("make-id", || {
+        let mut counter = SIDE_EFFECT_COUNTER.lock().unwrap();
+        *counter += 1;
+        format!("side-effect-{}", *counter)
+    })
+    .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    Ok(value)
+}
+
+#[durust::workflow(name = "tests.oversized-side-effect", version = 1)]
+async fn oversized_side_effect_workflow(_: ()) -> durust::Result<()> {
+    let _: String = durust::side_effect("too-large", || {
+        "x".repeat(durust::MAX_SIDE_EFFECT_PAYLOAD_BYTES + 1)
+    })
+    .await?;
+    Ok(())
 }
 
 #[durust::workflow(name = "tests.select-all-activity-handles", version = 1)]
@@ -817,6 +839,100 @@ fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
             panic!("workflow did not complete after timer and activity result");
         };
         assert_eq!(durust::decode_payload::<usize>(result).unwrap(), 64 * 1024);
+    });
+}
+
+#[test]
+fn side_effect_replays_recorded_marker_without_rerunning_closure() {
+    block_on(async {
+        *SIDE_EFFECT_COUNTER.lock().unwrap() = 0;
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<side_effect_then_sleep_workflow>(
+                "wf/side-effect-replay",
+                "workflows",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .worker_id("side-effect-first")
+            .workflow_task_queue("workflows")
+            .register_workflow(side_effect_then_sleep_workflow)
+            .build();
+
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert_eq!(*SIDE_EFFECT_COUNTER.lock().unwrap(), 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::SideEffectMarker(marker) = &history[1].data else {
+            panic!("workflow did not record a side effect marker");
+        };
+        assert!(matches!(marker.value, durust::PayloadRef::Inline { .. }));
+        assert_eq!(backend.payload_blob_count(), 0);
+
+        backend.advance_time(Duration::from_secs(1));
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .worker_id("side-effect-recovered")
+            .workflow_task_queue("workflows")
+            .register_workflow(side_effect_then_sleep_workflow)
+            .build();
+        assert_eq!(recovered_worker.run_timers_once().await.unwrap(), 1);
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+        assert_eq!(*SIDE_EFFECT_COUNTER.lock().unwrap(), 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[4].data else {
+            panic!("side effect workflow did not complete after replay");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "side-effect-1"
+        );
+    });
+}
+
+#[test]
+fn oversized_side_effect_fails_without_recording_marker() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<oversized_side_effect_workflow>(
+                "wf/oversized-side-effect",
+                "workflows",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("oversized-side-effect-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(oversized_side_effect_workflow)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::SideEffectMarker(_)))
+        );
+        let HistoryEventData::WorkflowFailed { failure } = &history[1].data else {
+            panic!("oversized side effect should fail the workflow task");
+        };
+        assert_eq!(failure.error_type, "durust.payload_encode");
+        assert!(failure.message.contains("side effect payload"));
     });
 }
 

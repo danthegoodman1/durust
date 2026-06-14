@@ -1,0 +1,72 @@
+{
+  "schema": 1,
+  "unit": "nanoseconds_per_iteration",
+  "status": "advisory_until_phase_0012",
+  "notes": [
+    "These thresholds track the 0007 payload codec/offload/replay benchmark scale.",
+    "They are intentionally loose enough for local machine variance and are not CI timing gates yet.",
+    "Compression benchmarks are exploratory evidence only; runtime compression policy is out of phase."
+  ],
+  "benchmarks": [
+    {
+      "name": "payload_encode_messagepack_64kb",
+      "local_baseline_ns": 1096,
+      "warn_above_ns": 5000,
+      "fail_above_ns": 10000
+    },
+    {
+      "name": "payload_decode_messagepack_64kb",
+      "local_baseline_ns": 2036,
+      "warn_above_ns": 10000,
+      "fail_above_ns": 20000
+    },
+    {
+      "name": "payload_encode_json_64kb",
+      "local_baseline_ns": 21629,
+      "warn_above_ns": 50000,
+      "fail_above_ns": 100000
+    },
+    {
+      "name": "payload_decode_json_64kb",
+      "local_baseline_ns": 6937,
+      "warn_above_ns": 20000,
+      "fail_above_ns": 50000
+    },
+    {
+      "name": "payload_inline_history_stream_memory_64kb",
+      "local_baseline_ns": 9582,
+      "warn_above_ns": 25000,
+      "fail_above_ns": 50000
+    },
+    {
+      "name": "payload_blob_history_stream_memory_64kb",
+      "local_baseline_ns": 35917,
+      "warn_above_ns": 75000,
+      "fail_above_ns": 150000
+    },
+    {
+      "name": "workflow_replay_large_payload_inline_memory_64kb",
+      "local_baseline_ns": 62828,
+      "warn_above_ns": 150000,
+      "fail_above_ns": 300000
+    },
+    {
+      "name": "workflow_replay_large_payload_blob_memory_64kb",
+      "local_baseline_ns": 82331,
+      "warn_above_ns": 150000,
+      "fail_above_ns": 300000
+    },
+    {
+      "name": "payload_garage_object_store_64kb/get_existing_blob",
+      "local_baseline_ns": 1180000,
+      "warn_above_ns": 5000000,
+      "fail_above_ns": 15000000
+    },
+    {
+      "name": "payload_garage_object_store_64kb/put_unique_blob",
+      "local_baseline_ns": 3480000,
+      "warn_above_ns": 12000000,
+      "fail_above_ns": 30000000
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 ---
 id: 0007
 title: Payload offloading and continue-as-new
-status: in_progress
+status: complete
 depends_on: [0001, 0002]
 labels: [payloads, blob-storage, continue-as-new, examples]
 ---
@@ -16,15 +16,16 @@ distance.
 - `PayloadRef`.
 - MessagePack default payload codec via `rmp-serde`.
 - JSON payload codec for debug/export and explicit provider config.
-- Codec, schema fingerprint, compression, encryption, digest, and size metadata.
+- Codec, schema fingerprint, compression metadata, encryption metadata, digest,
+  and size metadata.
 - Inline/blob threshold.
 - Provider config knob for inline/offload threshold.
 - Provider-agnostic S3-compatible blob offload through a durability-provider
   wrapper.
 - Local Garage-backed S3 test fixture.
-- Compression.
 - Blob GC.
-- Large activity, signal, child, query, side-effect, and workflow payloads.
+- Large activity, signal, child, query, and workflow payloads.
+- Small inline side-effect marker payloads.
 - Payload offload example.
 - `continue_as_new`.
 - Continue-as-new example.
@@ -41,6 +42,8 @@ distance.
 - Orphan blob GC works.
 - Payload offload example compiles and runs.
 - Continue-as-new example compiles and runs.
+- Side-effect markers remain inline, bounded, and replayable without blob
+  hydration.
 
 ## Current State
 
@@ -135,6 +138,10 @@ Implemented and covered:
   64 KiB get and 3.48 ms for a unique 64 KiB put; Zstd level 3 was about
   5.47 us compress / 13.17 us decompress for repetitive payloads and
   55.33 us compress / 58.64 us decompress for mixed payloads.
+- Compression policy deliberately removed from this phase. Payload refs keep
+  compression metadata and current writes use `CompressionId::None`; no runtime
+  compression dependency, default, or provider option is added without a later
+  evidence-backed design.
 - Raw replay history streaming via `stream_history_for_replay`, with explicit
   provider hydration APIs for observed payloads and paged activity-map result
   manifests. Public `stream_history` remains hydrated for inspection APIs, while
@@ -149,17 +156,34 @@ Implemented and covered:
 - Replay-core regression coverage for the ordering bug where `TimerStarted`,
   another ready event, then `TimerFired` must still let the timer complete via
   indexed ready events.
+- `durust::side_effect(key, closure).await` workflow API, backed by
+  `SideEffectMarker` history events.
+- Side-effect markers are deliberately not part of payload offload: marker
+  payloads must be inline, are capped at 8 KiB, and provider/wrapper storage
+  paths reject blob-backed markers. This keeps lazy replay hydration simple and
+  makes larger values use activities or ordinary payload-ref APIs.
+- Replay-core regression coverage proving a side-effect closure is not re-run
+  after a worker crash once the marker has committed, plus oversized marker
+  coverage proving no marker is recorded.
+- Provider coverage proving memory and SQLite replay streams keep side-effect
+  markers inline even when normal payload thresholds would force offload,
+  including SQLite close/reopen.
+- Production payload-offload docs in README/SPEC covering provider-owned
+  offload, provider-agnostic async object stores, digest validation, lazy replay
+  hydration, GC roots, and the explicit choice to keep runtime compression
+  policy out of this phase.
+- Checked-in advisory payload benchmark thresholds in
+  `benches/payload_thresholds.json`, with test coverage proving tracked
+  benchmark names still exist and threshold ordering is sane. These numbers are
+  metadata until phase 0012 adds strict timing gates.
+- Local `cargo bench --bench replay_core payload_ -- --sample-size 10`
+  measurements recorded the current scale: MessagePack encode/decode around
+  1.10 us / 2.04 us, JSON encode/decode around 21.63 us / 6.94 us, memory
+  inline/blob history streaming around 9.58 us / 35.92 us, and large-payload
+  cold replay around 62.83 us inline / 82.33 us blob.
 
-Remaining before this phase is done:
+Remaining follow-up outside this phase:
 
-- Compression policy for object-store payloads. Compression remains
-  unimplemented in runtime code until payload corpus, network, storage, and CPU
-  budget data justify a specific default or explicit provider option.
-- Blob-path and lazy-hydration coverage for side effects once side effects are
-  implemented.
-- Broader production payload-offload documentation after compression and lazy
-  hydration policy settle.
-- Checked-in payload codec/offload benchmark regression thresholds.
 - Partitioned SQLite shard-file throughput baselines remain part of the
   dedicated performance-hardening phase; the current SQLite numbers are
   single-database-file baselines.
@@ -186,9 +210,11 @@ Remaining before this phase is done:
 
 ## Performance Gate
 
-- Criterion benchmark for MessagePack encode/decode, JSON encode/decode, Zstd
-  compression/decompression, inline payload refs, blob payload refs, replay over
-  large blob refs, and env-gated Garage put/get over 64 KiB object-store blobs.
+- Criterion benchmark for MessagePack encode/decode, JSON encode/decode, inline
+  payload refs, blob payload refs, replay over large blob refs, and env-gated
+  Garage put/get over 64 KiB object-store blobs. Exploratory Zstd
+  compression/decompression benchmarks may remain as evidence, but compression
+  is not a runtime phase gate.
 
 ## Public API Budget
 

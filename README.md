@@ -573,6 +573,11 @@ debugging or export; typed client, workflow, activity, signal, child, map, and
 query APIs use the provider-configured codec for new payloads, while replay
 decodes each stored payload by its recorded codec.
 
+Payload refs include compression metadata for forward compatibility, but Durust
+does not choose a runtime compression policy today. New payloads are written
+with `CompressionId::None`; keep compression decisions outside the runtime until
+benchmark and deployment evidence justifies a specific provider option.
+
 In tests or local providers, force small inline thresholds to exercise the blob
 path, or choose JSON explicitly:
 
@@ -615,10 +620,19 @@ let debug_backend = durust::MemoryBackend::with_payload_storage(
 ```
 
 The provider validates blob digests and hydrates payloads before returning them
-through workflow history, activity tasks, signals, and query projections. The
-SQLite local-directory store is content-addressed and keeps large encoded bytes
-outside hot SQLite rows. For S3-compatible object stores such as Garage, use
-`PayloadBackend` so the async object-store implementation works across
+through public workflow history, activity tasks, signals, and query projections.
+Worker replay uses a separate raw history stream so large blob refs stay compact
+until workflow code actually observes the payload. The worker then hydrates that
+payload at an explicit async boundary before polling the workflow again; replay
+polling itself does not hide database or object-store I/O.
+
+Side-effect markers are the deliberate exception: `durust::side_effect(...).await`
+records a small inline value, capped at 8 KiB, and is never offloaded. Use
+activities or ordinary payload refs for larger values.
+
+The SQLite local-directory store is content-addressed and keeps large encoded
+bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
+use `PayloadBackend` so the async object-store implementation works across
 durability providers instead of being duplicated inside each provider. Providers
 also expose dry-run-capable payload GC that removes blobs no longer reachable
 from durable history or operational indexes; `PayloadBackend` applies the same
@@ -665,7 +679,7 @@ tokio::time::sleep      -> durust::sleep
 std::time::Instant::now -> durust::now
 tokio::select!          -> durust::select!
 tokio::spawn            -> durust::spawn or durust::join!
-random values           -> durust::side_effect!
+random values           -> durust::side_effect(...).await
 network/db calls        -> durust::call_activity!
 ```
 
