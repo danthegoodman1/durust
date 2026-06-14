@@ -1,13 +1,14 @@
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
     ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
-    ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ChildStartOutboxMessage,
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask,
-    CommandId, CommandSeq, CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
-    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
-    EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob,
-    PayloadRef, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalInboxRecord,
+    ActivityTaskClaim, BlobStoreConfig, CancelWorkflowOutcome, CancelWorkflowRequest,
+    ChildStartOutboxMessage, ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask,
+    ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome, CompleteActivityOutcome,
+    CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
+    DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
+    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
+    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob, PayloadRef,
+    PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId, SignalInboxRecord,
     SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
     TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
     WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
@@ -18,6 +19,8 @@ use crate::{
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -57,10 +60,13 @@ impl SqliteBackend {
 
     pub fn payload_blob_count(&self) -> Result<usize> {
         let conn = self.connect()?;
-        conn.query_row("select count(*) from payload_blobs", [], |row| {
-            row.get::<_, usize>(0)
-        })
-        .map_err(sqlite_error)
+        let sqlite_blobs = conn
+            .query_row("select count(*) from payload_blobs", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .map_err(sqlite_error)?;
+        let external_blobs = external_blob_digests(&self.payload_config)?.len();
+        Ok(sqlite_blobs + external_blobs)
     }
 
     fn connect(&self) -> Result<Connection> {
@@ -325,7 +331,7 @@ impl DurableBackend for SqliteBackend {
                 {
                     break;
                 }
-                let data = hydrate_history_event_from_storage(&conn, data)?;
+                let data = hydrate_history_event_from_storage(&conn, &self.payload_config, data)?;
                 bytes += event_bytes;
                 events.push(HistoryEvent {
                     event_id: EventId(event_id),
@@ -466,7 +472,7 @@ impl DurableBackend for SqliteBackend {
                 .map_err(sqlite_error)?;
             }
             for map_task in schedule_activity_maps {
-                insert_activity_map(&tx, namespace.as_str(), &map_task)?;
+                insert_activity_map(&tx, &config, namespace.as_str(), &map_task)?;
                 materialize_activity_map_items(&tx, &config, &map_task.map_command_id)?;
             }
             for message in start_child_workflows {
@@ -726,7 +732,8 @@ impl DurableBackend for SqliteBackend {
                 .map(|(signal_id, signal_name, payload)| {
                     let payload: PayloadRef = rmp_serde::from_slice(&payload)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                    let payload = hydrate_payload_from_storage(&conn, payload)?;
+                    let payload =
+                        hydrate_payload_from_storage(&conn, &self.payload_config, payload)?;
                     Ok(SignalInboxRecord {
                         signal_id: crate::SignalId::new(signal_id),
                         signal_name: crate::SignalName::new(signal_name),
@@ -951,7 +958,7 @@ impl DurableBackend for SqliteBackend {
                 {
                     let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                    let task = hydrate_activity_task_from_storage(&tx, task)?;
+                    let task = hydrate_activity_task_from_storage(&tx, &self.payload_config, task)?;
                     if let Some(map_item) = &task.map_item {
                         if activity_map_is_completed(&tx, &map_item.map_command_id)? {
                             tx.execute(
@@ -1339,7 +1346,7 @@ impl DurableBackend for SqliteBackend {
             row.map(|(run_id, event_id, payload)| {
                 let payload: PayloadRef = rmp_serde::from_slice(&payload)
                     .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                let payload = hydrate_payload_from_storage(&conn, payload)?;
+                let payload = hydrate_payload_from_storage(&conn, &self.payload_config, payload)?;
                 Ok(crate::QueryProjectionOutcome::Found {
                     run_id: RunId::new(run_id),
                     event_id: EventId(event_id),
@@ -1456,15 +1463,9 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let scanned_blobs = tx
-                .query_row("select count(*) from payload_blobs", [], |row| {
-                    row.get::<_, usize>(0)
-                })
-                .map_err(sqlite_error)?;
             let mut reachable = BTreeSet::new();
-            collect_reachable_payload_blobs(&tx, &mut reachable)?;
-            let retained_blobs = reachable.len();
-            let all_digests = {
+            collect_reachable_payload_blobs(&tx, &self.payload_config, &mut reachable)?;
+            let sqlite_digests = {
                 let mut stmt = tx
                     .prepare("select digest from payload_blobs order by digest asc")
                     .map_err(sqlite_error)?;
@@ -1473,6 +1474,10 @@ impl DurableBackend for SqliteBackend {
                     .collect::<std::result::Result<Vec<_>, _>>()
                     .map_err(sqlite_error)?
             };
+            let mut all_digests = sqlite_digests.into_iter().collect::<BTreeSet<_>>();
+            all_digests.extend(external_blob_digests(&self.payload_config)?);
+            let scanned_blobs = all_digests.len();
+            let retained_blobs = reachable.len();
             let garbage = all_digests
                 .into_iter()
                 .filter(|digest| !reachable.contains(digest))
@@ -1482,9 +1487,10 @@ impl DurableBackend for SqliteBackend {
                 for digest in garbage {
                     tx.execute(
                         "delete from payload_blobs where digest = ?1",
-                        params![digest],
+                        params![digest.as_str()],
                     )
                     .map_err(sqlite_error)?;
+                    delete_external_blob(&self.payload_config, &digest)?;
                 }
             }
             tx.commit().map_err(sqlite_error)?;
@@ -1515,19 +1521,21 @@ fn normalize_history_events_for_storage(
 
 fn collect_reachable_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    collect_history_payload_blobs(conn, reachable)?;
-    collect_activity_payload_blobs(conn, reachable)?;
-    collect_activity_map_payload_blobs(conn, reachable)?;
-    collect_child_outbox_payload_blobs(conn, reachable)?;
-    collect_signal_payload_blobs(conn, reachable)?;
-    collect_query_projection_payload_blobs(conn, reachable)?;
+    collect_history_payload_blobs(conn, config, reachable)?;
+    collect_activity_payload_blobs(conn, config, reachable)?;
+    collect_activity_map_payload_blobs(conn, config, reachable)?;
+    collect_child_outbox_payload_blobs(conn, config, reachable)?;
+    collect_signal_payload_blobs(conn, config, reachable)?;
+    collect_query_projection_payload_blobs(conn, config, reachable)?;
     Ok(())
 }
 
 fn collect_history_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut stmt = conn
@@ -1540,13 +1548,14 @@ fn collect_history_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let data: HistoryEventData =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_history_event_payload_blobs(conn, &data, reachable)?;
+        collect_history_event_payload_blobs(conn, config, &data, reachable)?;
     }
     Ok(())
 }
 
 fn collect_activity_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut stmt = conn
@@ -1559,13 +1568,14 @@ fn collect_activity_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ActivityTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_payload_blob_ref(conn, &task.input, reachable)?;
+        collect_payload_blob_ref(conn, config, &task.input, reachable)?;
     }
     Ok(())
 }
 
 fn collect_activity_map_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut stmt = conn
@@ -1578,7 +1588,7 @@ fn collect_activity_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ActivityMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_activity_map_input_manifest_ref(conn, &task.input_manifest, reachable)?;
+        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
     }
     drop(stmt);
 
@@ -1594,13 +1604,14 @@ fn collect_activity_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let result: PayloadRef =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_payload_blob_ref(conn, &result, reachable)?;
+        collect_payload_blob_ref(conn, config, &result, reachable)?;
     }
     Ok(())
 }
 
 fn collect_child_outbox_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut stmt = conn
@@ -1613,12 +1624,16 @@ fn collect_child_outbox_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let message: ChildStartOutboxMessage =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_payload_blob_ref(conn, &message.input, reachable)?;
+        collect_payload_blob_ref(conn, config, &message.input, reachable)?;
     }
     Ok(())
 }
 
-fn collect_signal_payload_blobs(conn: &Connection, reachable: &mut BTreeSet<String>) -> Result<()> {
+fn collect_signal_payload_blobs(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
     let mut stmt = conn
         .prepare("select payload from signals order by signal_id asc")
         .map_err(sqlite_error)?;
@@ -1629,13 +1644,14 @@ fn collect_signal_payload_blobs(conn: &Connection, reachable: &mut BTreeSet<Stri
         let blob = row.map_err(sqlite_error)?;
         let payload: PayloadRef =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_payload_blob_ref(conn, &payload, reachable)?;
+        collect_payload_blob_ref(conn, config, &payload, reachable)?;
     }
     Ok(())
 }
 
 fn collect_query_projection_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     let mut stmt = conn
@@ -1648,47 +1664,58 @@ fn collect_query_projection_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let payload: PayloadRef =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_payload_blob_ref(conn, &payload, reachable)?;
+        collect_payload_blob_ref(conn, config, &payload, reachable)?;
     }
     Ok(())
 }
 
 fn collect_history_event_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     data: &HistoryEventData,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     match data {
         HistoryEventData::WorkflowStarted { input, .. }
         | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            collect_payload_blob_ref(conn, input, reachable)
+            collect_payload_blob_ref(conn, config, input, reachable)
         }
         HistoryEventData::WorkflowCompleted { result } => {
-            collect_payload_blob_ref(conn, result, reachable)
+            collect_payload_blob_ref(conn, config, result, reachable)
         }
         HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_blobs(conn, failure, reachable)
+            collect_failure_payload_blobs(conn, config, failure, reachable)
         }
         HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
             Ok(())
         }
         HistoryEventData::ActivityScheduled(scheduled) => {
-            collect_payload_blob_ref(conn, &scheduled.input, reachable)
+            collect_payload_blob_ref(conn, config, &scheduled.input, reachable)
         }
         HistoryEventData::ActivityMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(conn, &scheduled.input_manifest, reachable)
+            collect_activity_map_input_manifest_ref(
+                conn,
+                config,
+                &scheduled.input_manifest,
+                reachable,
+            )
         }
         HistoryEventData::ActivityMapCompleted(completed) => {
-            collect_activity_map_result_manifest_ref(conn, &completed.result_manifest, reachable)
+            collect_activity_map_result_manifest_ref(
+                conn,
+                config,
+                &completed.result_manifest,
+                reachable,
+            )
         }
         HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
         }
         HistoryEventData::ActivityCompleted(completed) => {
-            collect_payload_blob_ref(conn, &completed.result, reachable)
+            collect_payload_blob_ref(conn, config, &completed.result, reachable)
         }
         HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
         }
         HistoryEventData::ActivityTimedOut(_)
         | HistoryEventData::ChildWorkflowStarted(_)
@@ -1699,38 +1726,40 @@ fn collect_history_event_payload_blobs(
         | HistoryEventData::VersionMarker(_)
         | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
         HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            collect_payload_blob_ref(conn, &requested.input, reachable)
+            collect_payload_blob_ref(conn, config, &requested.input, reachable)
         }
         HistoryEventData::ChildWorkflowCompleted(completed) => {
-            collect_payload_blob_ref(conn, &completed.result, reachable)
+            collect_payload_blob_ref(conn, config, &completed.result, reachable)
         }
         HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_blobs(conn, &failed.failure, reachable)
+            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
         }
         HistoryEventData::SignalConsumed(signal) => {
-            collect_payload_blob_ref(conn, &signal.payload, reachable)
+            collect_payload_blob_ref(conn, config, &signal.payload, reachable)
         }
     }
 }
 
 fn collect_failure_payload_blobs(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     failure: &crate::DurableFailure,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let Some(details) = &failure.details {
-        collect_payload_blob_ref(conn, details, reachable)?;
+        collect_payload_blob_ref(conn, config, details, reachable)?;
     }
     Ok(())
 }
 
 fn collect_payload_blob_ref(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let PayloadRef::Blob { digest, .. } = payload {
-        load_payload_blob(conn, payload)?;
+        load_payload_blob(conn, config, payload)?;
         reachable.insert(digest.clone());
     }
     Ok(())
@@ -1738,18 +1767,19 @@ fn collect_payload_blob_ref(
 
 fn collect_activity_map_input_manifest_ref(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    collect_payload_blob_ref(conn, payload, reachable)?;
-    let manifest_payload = hydrate_payload_from_storage(conn, payload.clone())?;
+    collect_payload_blob_ref(conn, config, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     for page in &manifest.pages {
-        collect_payload_blob_ref(conn, page, reachable)?;
-        let page_payload = hydrate_payload_from_storage(conn, page.clone())?;
+        collect_payload_blob_ref(conn, config, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
         let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
         for item in &page.items {
-            collect_payload_blob_ref(conn, item, reachable)?;
+            collect_payload_blob_ref(conn, config, item, reachable)?;
         }
     }
     Ok(())
@@ -1757,18 +1787,19 @@ fn collect_activity_map_input_manifest_ref(
 
 fn collect_activity_map_result_manifest_ref(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    collect_payload_blob_ref(conn, payload, reachable)?;
-    let manifest_payload = hydrate_payload_from_storage(conn, payload.clone())?;
+    collect_payload_blob_ref(conn, config, payload, reachable)?;
+    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
     let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
     for page in &manifest.pages {
-        collect_payload_blob_ref(conn, page, reachable)?;
-        let page_payload = hydrate_payload_from_storage(conn, page.clone())?;
+        collect_payload_blob_ref(conn, config, page, reachable)?;
+        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
         let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
         for result in &page.results {
-            collect_payload_blob_ref(conn, result, reachable)?;
+            collect_payload_blob_ref(conn, config, result, reachable)?;
         }
     }
     Ok(())
@@ -1804,21 +1835,28 @@ fn normalize_history_event_for_storage(
 
 fn hydrate_history_event_from_storage(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     data: HistoryEventData,
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                hydrate_activity_map_input_manifest_from_storage(conn, scheduled.input_manifest)?;
+            scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
+                conn,
+                config,
+                scheduled.input_manifest,
+            )?;
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest =
-                hydrate_activity_map_result_manifest_from_storage(conn, completed.result_manifest)?;
+            completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
+                conn,
+                config,
+                completed.result_manifest,
+            )?;
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
-            hydrate_payload_from_storage(conn, payload)
+            hydrate_payload_from_storage(conn, config, payload)
         }),
     }
 }
@@ -1846,10 +1884,11 @@ fn normalize_activity_task_for_storage(
 
 fn hydrate_activity_task_from_storage(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     task: ActivityTask,
 ) -> Result<ActivityTask> {
     crate::payload::map_activity_task_payloads(task, &mut |payload| {
-        hydrate_payload_from_storage(conn, payload)
+        hydrate_payload_from_storage(conn, config, payload)
     })
 }
 
@@ -1888,13 +1927,13 @@ fn normalize_activity_map_input_manifest_for_storage(
     config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let root = hydrate_payload_from_storage(conn, payload)?;
+    let root = hydrate_payload_from_storage(conn, config, payload)?;
     let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
     manifest.pages = manifest
         .pages
         .into_iter()
         .map(|page| {
-            let page = hydrate_payload_from_storage(conn, page)?;
+            let page = hydrate_payload_from_storage(conn, config, page)?;
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page
                 .items
@@ -1920,13 +1959,13 @@ fn normalize_activity_map_result_manifest_for_storage(
     config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let root = hydrate_payload_from_storage(conn, payload)?;
+    let root = hydrate_payload_from_storage(conn, config, payload)?;
     let mut manifest: ActivityMapResultManifest = crate::decode_payload(&root)?;
     manifest.pages = manifest
         .pages
         .into_iter()
         .map(|page| {
-            let page = hydrate_payload_from_storage(conn, page)?;
+            let page = hydrate_payload_from_storage(conn, config, page)?;
             let mut page: ActivityMapResultPage = crate::decode_payload(&page)?;
             page.results = page
                 .results
@@ -1949,10 +1988,11 @@ fn normalize_activity_map_result_manifest_for_storage(
 
 fn hydrate_activity_map_input_manifest_from_storage(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let mut load_container = |payload| hydrate_payload_from_storage(conn, payload);
-    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, payload);
+    let mut load_container = |payload| hydrate_payload_from_storage(conn, config, payload);
+    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, config, payload);
     let mut finish_container = Ok;
     crate::payload::map_activity_map_input_manifest_ref(
         payload,
@@ -1964,10 +2004,11 @@ fn hydrate_activity_map_input_manifest_from_storage(
 
 fn hydrate_activity_map_result_manifest_from_storage(
     conn: &Connection,
+    config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let mut load_container = |payload| hydrate_payload_from_storage(conn, payload);
-    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, payload);
+    let mut load_container = |payload| hydrate_payload_from_storage(conn, config, payload);
+    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, config, payload);
     let mut finish_container = Ok;
     crate::payload::map_activity_map_result_manifest_ref(
         payload,
@@ -1992,22 +2033,27 @@ fn normalize_payload_for_storage(
         } if bytes.len() > config.inline_threshold_bytes => {
             let digest = digest_bytes(&bytes);
             let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            let encryption_blob = encode_encryption_metadata(&encryption)?;
-            conn.execute(
-                "insert or ignore into payload_blobs
-                 (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                 values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    digest.as_str(),
-                    codec_to_str(codec),
-                    schema_fingerprint.0.as_str(),
-                    compression_to_str(compression),
-                    encryption_blob,
-                    size,
-                    bytes.as_slice()
-                ],
-            )
-            .map_err(sqlite_error)?;
+            let uri = if let Some(uri) = store_external_payload_blob(config, &digest, &bytes)? {
+                uri
+            } else {
+                let encryption_blob = encode_encryption_metadata(&encryption)?;
+                conn.execute(
+                    "insert or ignore into payload_blobs
+                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        digest.as_str(),
+                        codec_to_str(codec),
+                        schema_fingerprint.0.as_str(),
+                        compression_to_str(compression),
+                        encryption_blob,
+                        size,
+                        bytes.as_slice()
+                    ],
+                )
+                .map_err(sqlite_error)?;
+                format!("sqlite://payload/{digest}")
+            };
             Ok(PayloadRef::Blob {
                 codec,
                 schema_fingerprint,
@@ -2015,18 +2061,22 @@ fn normalize_payload_for_storage(
                 encryption,
                 digest: digest.clone(),
                 size,
-                uri: format!("sqlite://payload/{digest}"),
+                uri,
             })
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            load_payload_blob(conn, &payload)?;
+            load_payload_blob(conn, config, &payload)?;
             Ok(payload)
         }
     }
 }
 
-fn hydrate_payload_from_storage(conn: &Connection, payload: PayloadRef) -> Result<PayloadRef> {
+fn hydrate_payload_from_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
@@ -2040,7 +2090,7 @@ fn hydrate_payload_from_storage(conn: &Connection, payload: PayloadRef) -> Resul
             else {
                 unreachable!();
             };
-            let blob = load_payload_blob(conn, &payload)?;
+            let blob = load_payload_blob(conn, config, &payload)?;
             Ok(PayloadRef::Inline {
                 codec: *codec,
                 schema_fingerprint: schema_fingerprint.clone(),
@@ -2052,7 +2102,11 @@ fn hydrate_payload_from_storage(conn: &Connection, payload: PayloadRef) -> Resul
     }
 }
 
-fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadBlob> {
+fn load_payload_blob(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<PayloadBlob> {
     let PayloadRef::Blob {
         codec: ref_codec,
         schema_fingerprint: ref_schema_fingerprint,
@@ -2060,13 +2114,23 @@ fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadB
         encryption: ref_encryption,
         digest,
         size,
-        uri: _,
+        uri,
     } = payload
     else {
         return Err(Error::PayloadDecode(
             "inline payload does not reference blob storage".to_owned(),
         ));
     };
+    if uri.starts_with("local://payload/") {
+        let bytes = load_external_payload_blob(config, digest, size)?;
+        return Ok(PayloadBlob {
+            codec: *ref_codec,
+            schema_fingerprint: ref_schema_fingerprint.clone(),
+            compression: *ref_compression,
+            encryption: ref_encryption.clone(),
+            bytes,
+        });
+    }
     let row = conn
         .query_row(
             "select codec, schema_fingerprint, compression, encryption, size, bytes
@@ -2080,7 +2144,7 @@ fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadB
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
                     row.get::<_, u64>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
                 ))
             },
         )
@@ -2089,6 +2153,11 @@ fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadB
         .ok_or_else(|| Error::PayloadDecode(format!("missing payload blob `{digest}`")))?;
     let (row_codec, row_schema_fingerprint, row_compression, encryption_blob, stored_size, bytes) =
         row;
+    let Some(bytes) = bytes else {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob `{digest}` is stored outside SQLite but no configured external blob store matched `{uri}`"
+        )));
+    };
     let actual_digest = digest_bytes(&bytes);
     if &actual_digest != digest {
         return Err(Error::PayloadDecode(format!(
@@ -2118,6 +2187,174 @@ fn load_payload_blob(conn: &Connection, payload: &PayloadRef) -> Result<PayloadB
         )));
     }
     Ok(blob)
+}
+
+fn store_external_payload_blob(
+    config: &PayloadStorageConfig,
+    digest: &str,
+    bytes: &[u8],
+) -> Result<Option<String>> {
+    let Some(blob_store) = &config.blob_store else {
+        return Ok(None);
+    };
+    match blob_store {
+        BlobStoreConfig::LocalDirectory { root, prefix } => {
+            let dir = local_blob_dir(root, prefix);
+            fs::create_dir_all(&dir).map_err(|err| {
+                Error::Backend(format!(
+                    "failed to create local payload blob directory `{}`: {err}",
+                    dir.display()
+                ))
+            })?;
+            let path = dir.join(digest);
+            if path.exists() {
+                let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                load_external_payload_blob(config, digest, &expected_size)?;
+                return Ok(Some(local_blob_uri(digest)));
+            }
+            let tmp_path = dir.join(format!("{digest}.tmp-{}", std::process::id()));
+            fs::write(&tmp_path, bytes).map_err(|err| {
+                Error::Backend(format!(
+                    "failed to write local payload blob `{}`: {err}",
+                    tmp_path.display()
+                ))
+            })?;
+            match fs::rename(&tmp_path, &path) {
+                Ok(()) => {}
+                Err(_) if path.exists() => {
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                Err(err) => {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(Error::Backend(format!(
+                        "failed to commit local payload blob `{}`: {err}",
+                        path.display()
+                    )));
+                }
+            }
+            Ok(Some(local_blob_uri(digest)))
+        }
+    }
+}
+
+fn load_external_payload_blob(
+    config: &PayloadStorageConfig,
+    digest: &str,
+    expected_size: &u64,
+) -> Result<Vec<u8>> {
+    let Some(blob_store) = &config.blob_store else {
+        return Err(Error::PayloadDecode(format!(
+            "missing payload blob `{digest}`"
+        )));
+    };
+    match blob_store {
+        BlobStoreConfig::LocalDirectory { root, prefix } => {
+            let path = local_blob_path(root, prefix, digest);
+            let bytes = fs::read(&path).map_err(|err| match err.kind() {
+                ErrorKind::NotFound => {
+                    Error::PayloadDecode(format!("missing payload blob `{digest}`"))
+                }
+                _ => Error::PayloadDecode(format!(
+                    "failed to read local payload blob `{}`: {err}",
+                    path.display()
+                )),
+            })?;
+            let actual_digest = digest_bytes(&bytes);
+            if actual_digest != digest {
+                return Err(Error::PayloadDecode(format!(
+                    "payload blob digest mismatch: expected `{digest}`, got `{actual_digest}`"
+                )));
+            }
+            let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            if actual_size != *expected_size {
+                return Err(Error::PayloadDecode(format!(
+                    "payload blob size mismatch: expected {expected_size}, got {actual_size}"
+                )));
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn external_blob_digests(config: &PayloadStorageConfig) -> Result<BTreeSet<String>> {
+    let Some(blob_store) = &config.blob_store else {
+        return Ok(BTreeSet::new());
+    };
+    match blob_store {
+        BlobStoreConfig::LocalDirectory { root, prefix } => {
+            let dir = local_blob_dir(root, prefix);
+            let mut digests = BTreeSet::new();
+            match fs::read_dir(&dir) {
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry.map_err(|err| {
+                            Error::Backend(format!(
+                                "failed to list local payload blob directory `{}`: {err}",
+                                dir.display()
+                            ))
+                        })?;
+                        if !entry
+                            .file_type()
+                            .map_err(|err| {
+                                Error::Backend(format!(
+                                    "failed to inspect local payload blob `{}`: {err}",
+                                    entry.path().display()
+                                ))
+                            })?
+                            .is_file()
+                        {
+                            continue;
+                        }
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        if !name.contains(".tmp-") {
+                            digests.insert(name);
+                        }
+                    }
+                    Ok(digests)
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(digests),
+                Err(err) => Err(Error::Backend(format!(
+                    "failed to list local payload blob directory `{}`: {err}",
+                    dir.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn delete_external_blob(config: &PayloadStorageConfig, digest: &str) -> Result<()> {
+    let Some(blob_store) = &config.blob_store else {
+        return Ok(());
+    };
+    match blob_store {
+        BlobStoreConfig::LocalDirectory { root, prefix } => {
+            let path = local_blob_path(root, prefix, digest);
+            match fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(Error::Backend(format!(
+                    "failed to delete local payload blob `{}`: {err}",
+                    path.display()
+                ))),
+            }
+        }
+    }
+}
+
+fn local_blob_dir(root: &Path, prefix: &str) -> PathBuf {
+    if prefix.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(prefix)
+    }
+}
+
+fn local_blob_path(root: &Path, prefix: &str, digest: &str) -> PathBuf {
+    local_blob_dir(root, prefix).join(digest)
+}
+
+fn local_blob_uri(digest: &str) -> String {
+    format!("local://payload/{digest}")
 }
 
 fn encode_encryption_metadata(
@@ -2213,7 +2450,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             compression text not null,
             encryption blob,
             size integer not null,
-            bytes blob not null
+            bytes blob
         );
 
         create table if not exists activity_tasks (
@@ -2723,11 +2960,15 @@ fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static str {
 
 fn insert_activity_map(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     namespace: &str,
     map_task: &ActivityMapTask,
 ) -> Result<()> {
-    let manifest_payload =
-        hydrate_activity_map_input_manifest_from_storage(tx, map_task.input_manifest.clone())?;
+    let manifest_payload = hydrate_activity_map_input_manifest_from_storage(
+        tx,
+        config,
+        map_task.input_manifest.clone(),
+    )?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     let task_blob =
         rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
@@ -3072,7 +3313,7 @@ fn materialize_activity_map_items(
     let mut in_flight = in_flight;
     let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
     let manifest_payload =
-        hydrate_activity_map_input_manifest_from_storage(tx, task.input_manifest.clone())?;
+        hydrate_activity_map_input_manifest_from_storage(tx, config, task.input_manifest.clone())?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
 
     while in_flight < max_in_flight && next_ordinal < item_count {
@@ -3217,8 +3458,11 @@ fn complete_map_item(
 
     let map_task: ActivityMapTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let input_manifest_payload =
-        hydrate_activity_map_input_manifest_from_storage(tx, map_task.input_manifest.clone())?;
+    let input_manifest_payload = hydrate_activity_map_input_manifest_from_storage(
+        tx,
+        config,
+        map_task.input_manifest.clone(),
+    )?;
     let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
     let result_refs = activity_map_results(tx, key.as_str())?;
     let result_manifest = encode_activity_map_result_manifest_with_codec(

@@ -2162,6 +2162,18 @@ pub enum CodecId {
     Protobuf,
 }
 
+#[non_exhaustive]
+pub enum BlobStoreConfig {
+    LocalDirectory {
+        root: PathBuf,
+        prefix: String,
+    },
+}
+```
+
+Production object-store backend target:
+
+```rust
 pub enum BlobStoreConfig {
     S3Compatible {
         bucket: String,
@@ -2178,7 +2190,10 @@ Durability implementation docs should recommend offloading larger workflow input
 
 The inline threshold is a performance default, not a correctness boundary. Backends may choose a smaller limit for databases where row size strongly affects write amplification.
 
-The SQLite provider should support `PayloadStorageConfig` and an S3-compatible blob store. Tests should use local Garage as the S3-compatible service so SQLite-plus-blob behavior is covered without depending on AWS.
+The SQLite provider should support `PayloadStorageConfig`, a local-directory
+object store for deterministic tests and local deployments, and an S3-compatible
+blob store. Tests should use local Garage as the S3-compatible service so
+SQLite-plus-blob behavior is covered without depending on AWS.
 
 Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored. Conformance should force both paths by setting a tiny inline threshold and then a larger threshold.
 

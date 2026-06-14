@@ -94,6 +94,10 @@ Implemented and covered:
 - Generic dry-run-capable provider payload GC, with memory and SQLite
   implementations that retain blobs reachable from history, activities, maps,
   child outbox, signals, and query projections.
+- `BlobStoreConfig::LocalDirectory` and SQLite external object payload storage,
+  with content-addressed local object writes, digest/size validation on hydrate,
+  close/reopen coverage, object GC coverage, and upload-failure coverage proving
+  a missing payload ref is not committed.
 - Provider conformance coverage proving overwritten query-projection blobs are
   collected while the retained projection remains readable after SQLite
   close/reopen.
@@ -106,8 +110,10 @@ Implemented and covered:
 
 Remaining before this phase is done:
 
-- SQLite S3-compatible/Garage blob-store integration, transient upload failure
-  behavior, and object-store GC coverage.
+- SQLite S3-compatible/Garage blob-store integration and Garage-backed
+  conformance coverage. The local-directory object store now proves the generic
+  external blob-store contract, upload failure behavior, and object-store GC;
+  S3/Garage still needs the network client and fixture.
 - Compression policy for object-store payloads. A local 64 KiB Criterion probe
   measured Zstd compression around 62 us and compressed decode around 44 us,
   versus MessagePack encode around 1.08 us and decode around 2.02 us, so
@@ -116,8 +122,8 @@ Remaining before this phase is done:
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
 - Blob-path coverage for side effects once side effects are implemented.
-- Public payload-offload documentation for production object stores once S3
-  compatible storage lands.
+- Public payload-offload documentation for production S3-compatible object
+  stores once S3/Garage storage lands.
 - Checked-in payload codec/offload benchmark regression thresholds.
 - Partitioned SQLite shard-file throughput baselines remain part of the
   dedicated performance-hardening phase; the current SQLite numbers are
@@ -130,6 +136,8 @@ Remaining before this phase is done:
 - JSON round-trips all public payload families when configured.
 - Codec mismatch or schema fingerprint mismatch fails clearly.
 - SQLite provider threshold forces inline payload below threshold and blob ref above threshold.
+- SQLite local-directory blob store round-trips public payload refs across close/reopen.
+- SQLite local-directory blob GC deletes unreachable object-store blobs.
 - SQLite plus Garage round-trips activity, signal, query, child, side-effect, and workflow payload refs.
 - Blob upload before history commit crash.
 - History commit before blob GC crash.

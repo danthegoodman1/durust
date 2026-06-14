@@ -586,15 +586,26 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
     durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
 )?;
 
+let backend = durust::SqliteBackend::open_with_payload_storage(
+    "durust.sqlite3",
+    durust::PayloadStorageConfig::new()
+        .inline_threshold_bytes(1024)
+        .blob_store(durust::BlobStoreConfig::LocalDirectory {
+            root: "durust-payloads".into(),
+            prefix: "payloads".to_owned(),
+        }),
+)?;
+
 let debug_backend = durust::MemoryBackend::with_payload_storage(
     durust::PayloadStorageConfig::new().codec(durust::CodecId::Json),
 );
 ```
 
 The provider validates blob digests and hydrates payloads before returning them
-through workflow history, activity tasks, signals, and query projections.
-Providers also expose dry-run-capable payload GC that removes blobs no longer
-reachable from durable history or operational indexes.
+through workflow history, activity tasks, signals, and query projections. The
+SQLite local-directory store is content-addressed and keeps large encoded bytes
+outside hot SQLite rows. Providers also expose dry-run-capable payload GC that
+removes blobs no longer reachable from durable history or operational indexes.
 
 ## Recovery Model
 

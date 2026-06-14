@@ -7,6 +7,7 @@ use durust::{
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::time::Duration;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,6 +187,125 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
             durust::decode_payload::<String>(input).unwrap(),
             large_payload("workflow-input")
         );
+    });
+}
+
+#[test]
+fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_objects() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let object_dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload-local-objects.sqlite3");
+        let config = durust::PayloadStorageConfig::new()
+            .inline_threshold_bytes(1)
+            .blob_store(durust::BlobStoreConfig::LocalDirectory {
+                root: object_dir.path().to_path_buf(),
+                prefix: "payloads".to_owned(),
+            });
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let run_id = payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/sqlite-local-payload-offload",
+            "sqlite-local-payload-workflows",
+            "sqlite-local-payload-activities",
+        )
+        .await;
+        let (gc_workflow_id, gc_projection) =
+            payload_gc_removes_unreachable_projection_blob(backend.clone(), "sqlite-local").await;
+        let object_count = local_blob_file_count(object_dir.path(), "payloads");
+        assert!(object_count >= 4);
+        assert_eq!(backend.payload_blob_count().unwrap(), object_count);
+
+        fs::write(object_dir.path().join("payloads").join("orphan"), b"orphan").unwrap();
+        let dry_run = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+            .await
+            .unwrap();
+        assert!(dry_run.deleted_blobs >= 1);
+        let collected = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+            .await
+            .unwrap();
+        assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
+        assert!(!object_dir.path().join("payloads").join("orphan").exists());
+        drop(backend);
+
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(gc_workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected retained projection after local object-store reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            gc_projection
+        );
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(100),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start from local object store");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+    });
+}
+
+#[test]
+fn sqlite_local_blob_store_upload_failure_does_not_commit_missing_payload_ref() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let root_file = dir.path().join("not-a-directory");
+        fs::write(&root_file, b"not a directory").unwrap();
+        let path = dir.path().join("payload-upload-failure.sqlite3");
+        let config = durust::PayloadStorageConfig::new()
+            .inline_threshold_bytes(1)
+            .blob_store(durust::BlobStoreConfig::LocalDirectory {
+                root: root_file,
+                prefix: "payloads".to_owned(),
+            });
+        let backend = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        let err = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/sqlite-local-upload-failure"),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&large_payload("workflow-input")).unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Backend(message) if message.contains("failed to create local payload blob directory"))
+        );
+        let claim = backend
+            .claim_workflow_task(
+                WorkerId::new("sqlite-local-upload-failure-worker"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("workflows"),
+                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(claim.is_none());
     });
 }
 
@@ -587,6 +707,19 @@ where
 
 fn large_payload(label: &str) -> String {
     format!("{label}:{}", "x".repeat(64))
+}
+
+fn local_blob_file_count(root: &std::path::Path, prefix: &str) -> usize {
+    let dir = root.join(prefix);
+    fs::read_dir(&dir)
+        .unwrap_or_else(|err| panic!("failed to list local blob dir `{}`: {err}", dir.display()))
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let is_file = entry.file_type().unwrap().is_file();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (is_file && !name.contains(".tmp-")).then_some(())
+        })
+        .count()
 }
 
 async fn payload_gc_removes_unreachable_projection_blob<B>(

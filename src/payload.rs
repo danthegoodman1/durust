@@ -7,6 +7,7 @@ use crate::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecId {
@@ -54,6 +55,7 @@ pub const DEFAULT_INLINE_THRESHOLD_BYTES: usize = 8 * 1024;
 pub struct PayloadStorageConfig {
     pub codec: CodecId,
     pub inline_threshold_bytes: usize,
+    pub blob_store: Option<BlobStoreConfig>,
 }
 
 impl Default for PayloadStorageConfig {
@@ -61,6 +63,7 @@ impl Default for PayloadStorageConfig {
         Self {
             codec: CodecId::MessagePack,
             inline_threshold_bytes: DEFAULT_INLINE_THRESHOLD_BYTES,
+            blob_store: None,
         }
     }
 }
@@ -79,6 +82,17 @@ impl PayloadStorageConfig {
         self.inline_threshold_bytes = threshold;
         self
     }
+
+    pub fn blob_store(mut self, blob_store: BlobStoreConfig) -> Self {
+        self.blob_store = Some(blob_store);
+        self
+    }
+}
+
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlobStoreConfig {
+    LocalDirectory { root: PathBuf, prefix: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
