@@ -129,14 +129,18 @@ Implemented and covered:
   default-bucket mode rather than MinIO.
 - S3 upload-failure coverage proving an unavailable object store does not
   commit a missing external payload ref.
+- Criterion benchmark coverage for Zstd compression/decompression over 64 KiB
+  MessagePack payloads and env-gated Garage object-store put/get over 64 KiB
+  payload blobs. Local Garage fixture measurements were about 1.18 ms for a
+  64 KiB get and 3.48 ms for a unique 64 KiB put; Zstd level 3 was about
+  5.47 us compress / 13.17 us decompress for repetitive payloads and
+  55.33 us compress / 58.64 us decompress for mixed payloads.
 
 Remaining before this phase is done:
 
-- Compression policy for object-store payloads. A local 64 KiB Criterion probe
-  measured Zstd compression around 62 us and compressed decode around 44 us,
-  versus MessagePack encode around 1.08 us and decode around 2.02 us, so
-  compression should remain unimplemented until S3/Garage storage and network
-  benchmarks prove the tradeoff.
+- Compression policy for object-store payloads. Compression remains
+  unimplemented in runtime code until payload corpus, network, storage, and CPU
+  budget data justify a specific default or explicit provider option.
 - Lazy nested payload hydration during replay. Current public reads hydrate
   returned payload refs before handing them to runtime code.
 - Blob-path coverage for side effects once side effects are implemented.
@@ -169,7 +173,9 @@ Remaining before this phase is done:
 
 ## Performance Gate
 
-- Criterion benchmark for MessagePack encode/decode, JSON encode/decode, inline payload refs, blob payload refs, and replay over large blob refs.
+- Criterion benchmark for MessagePack encode/decode, JSON encode/decode, Zstd
+  compression/decompression, inline payload refs, blob payload refs, replay over
+  large blob refs, and env-gated Garage put/get over 64 KiB object-store blobs.
 
 ## Public API Budget
 

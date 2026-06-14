@@ -3,13 +3,14 @@ use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
-    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
-    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
-    WorkflowType,
+    MemoryBackend, Namespace, NewHistoryEvent, PayloadBlobStore, PayloadStorageConfig,
+    SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId,
+    WorkflowTaskCommit, WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::hint::black_box;
 use std::thread;
 use std::time::Duration;
@@ -725,6 +726,83 @@ fn payload_codec(c: &mut Criterion) {
     c.bench_function("payload_decode_json_64kb", |b| {
         b.iter(|| black_box(&json).decode_json::<LargePayload>().unwrap());
     });
+}
+
+fn payload_compression(c: &mut Criterion) {
+    let repetitive = encoded_payload_bytes(&large_payload());
+    let mixed = encoded_payload_bytes(&mixed_large_payload());
+    let repetitive_compressed = zstd::bulk::compress(&repetitive, 3).unwrap();
+    let mixed_compressed = zstd::bulk::compress(&mixed, 3).unwrap();
+
+    let mut group = c.benchmark_group("payload_compression_64kb");
+    group.throughput(Throughput::Bytes(repetitive.len() as u64));
+    group.bench_function("zstd_compress_repetitive_messagepack", |b| {
+        b.iter(|| zstd::bulk::compress(black_box(&repetitive), 3).unwrap());
+    });
+    group.bench_function("zstd_decompress_repetitive_messagepack", |b| {
+        b.iter(|| {
+            zstd::bulk::decompress(black_box(&repetitive_compressed), repetitive.len()).unwrap()
+        });
+    });
+    group.bench_function("zstd_compress_mixed_messagepack", |b| {
+        b.iter(|| zstd::bulk::compress(black_box(&mixed), 3).unwrap());
+    });
+    group.bench_function("zstd_decompress_mixed_messagepack", |b| {
+        b.iter(|| zstd::bulk::decompress(black_box(&mixed_compressed), mixed.len()).unwrap());
+    });
+    group.finish();
+}
+
+fn payload_garage_object_store(c: &mut Criterion) {
+    let Some(config) = garage_config_from_env() else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let store = durust::S3BlobStore::garage(config).unwrap();
+    runtime
+        .block_on(store.list_payload_blob_digests())
+        .expect("Garage S3 benchmark store must be reachable");
+
+    let bytes = encoded_payload_bytes(&large_payload());
+    let digest = durust::digest_bytes(&bytes);
+    runtime
+        .block_on(store.put_payload_blob(digest.clone(), bytes.clone()))
+        .unwrap();
+
+    let mut group = c.benchmark_group("payload_garage_object_store_64kb");
+    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.bench_function("get_existing_blob", |b| {
+        b.iter(|| {
+            let bytes = runtime
+                .block_on(store.get_payload_blob(black_box(digest.clone())))
+                .unwrap();
+            black_box(bytes);
+        });
+    });
+
+    let mut sequence = 0_u64;
+    group.bench_function("put_unique_blob", |b| {
+        b.iter_batched(
+            || {
+                sequence = sequence.saturating_add(1);
+                let mut bytes = bytes.clone();
+                bytes.extend_from_slice(&sequence.to_le_bytes());
+                let digest = durust::digest_bytes(&bytes);
+                (digest, bytes)
+            },
+            |(digest, bytes)| {
+                let uri = runtime
+                    .block_on(store.put_payload_blob(black_box(digest), black_box(bytes)))
+                    .unwrap();
+                black_box(uri);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
 }
 
 fn payload_provider_refs(c: &mut Criterion) {
@@ -1451,6 +1529,41 @@ fn large_payload() -> LargePayload {
     }
 }
 
+fn mixed_large_payload() -> LargePayload {
+    let mut state = 0x1234_5678_u32;
+    let mut body = String::with_capacity(64 * 1024);
+    for _ in 0..64 * 1024 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        body.push(char::from(b' ' + (state % 95) as u8));
+    }
+    LargePayload { body }
+}
+
+fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
+    durust::encode_payload(payload)
+        .unwrap()
+        .inline_bytes()
+        .unwrap()
+        .to_vec()
+}
+
+fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
+    let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
+    let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
+    let access_key_id = env::var("DURUST_GARAGE_ACCESS_KEY_ID").ok()?;
+    let secret_access_key = env::var("DURUST_GARAGE_SECRET_ACCESS_KEY").ok()?;
+    let region = env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned());
+    let prefix = env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "bench/payloads".to_owned());
+    Some(durust::S3BlobStoreConfig {
+        bucket,
+        endpoint,
+        region,
+        prefix,
+        access_key_id,
+        secret_access_key,
+    })
+}
+
 fn setup_payload_history(inline_threshold_bytes: usize) -> (MemoryBackend, durust::RunId) {
     block_on(async {
         let backend = MemoryBackend::with_payload_storage(
@@ -1778,6 +1891,8 @@ criterion_group!(
     sqlite_single_file_mixed_throughput,
     activity_heartbeat,
     payload_codec,
+    payload_compression,
+    payload_garage_object_store,
     payload_provider_refs,
     payload_replay,
     timer_due_scan_wakeup,
