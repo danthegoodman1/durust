@@ -33,6 +33,41 @@ fn payload_thresholds_are_sane_and_reference_existing_benchmarks() {
     }
 }
 
+#[test]
+fn phase_0008_benchmark_profiles_have_stable_names() {
+    let bench_source = include_str!("../benches/replay_core.rs");
+    let required = [
+        ("warm cached workflow", "workflow_cached_wake_poll_memory"),
+        ("recovery", "workflow_replay_small_history_memory"),
+        ("activity claim complete", "activity_claim_complete_memory"),
+        ("signal send consume", "signal_send_consume_memory"),
+        ("timer wakeup", "timer_due_scan_wakeup_memory"),
+        ("child workflow dispatch", "child_start_dispatch_memory"),
+        ("activity map fanout", "activity_map_materialize_memory"),
+        (
+            "activity map completion",
+            "activity_map_item_complete_memory",
+        ),
+        ("payload refs", "payload_blob_history_stream_memory_64kb"),
+        (
+            "payload replay",
+            "workflow_replay_large_payload_blob_memory_64kb",
+        ),
+        ("sqlite baseline", "workflow_one_activity_e2e_sqlite"),
+        (
+            "sqlite mixed throughput",
+            "sqlite_single_file_throughput/drain_1000_mixed_workflows_4_workers",
+        ),
+    ];
+
+    for (profile, benchmark) in required {
+        assert!(
+            benchmark_exists(bench_source, benchmark),
+            "phase 0008 benchmark profile `{profile}` is missing benchmark `{benchmark}`"
+        );
+    }
+}
+
 fn benchmark_exists(source: &str, name: &str) -> bool {
     if let Some((group, function)) = name.split_once('/') {
         source.contains(&format!("benchmark_group(\"{group}\")"))

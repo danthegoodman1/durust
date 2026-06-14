@@ -2718,15 +2718,29 @@ completed workflow cannot append new commands
 ## 22.6 Deterministic simulation
 
 ```rust
-durable_test::sim()
-    .seed(12345)
-    .workers(8)
-    .activity_workers(8)
-    .history_chunk_events(3)
-    .fault_profile(FaultProfile::Aggressive)
-    .run(order_scenario())
-    .assert_invariants();
+durust::run_many_seeds(
+    1,
+    2_048,
+    durust::FaultProfile::Aggressive,
+    |sim| {
+        sim.schedule("recover:workflow-1");
+        sim.run_until_idle(1_000, |sim, step| {
+            if sim.inject(durust::FaultPoint::WorkerCrash) {
+                sim.schedule_after(Duration::from_millis(1), step.label);
+                return Ok(());
+            }
+
+            sim.record("recovered", step.label);
+            Ok(())
+        })?;
+        sim.ensure("workflow_recovered", true, "workflow did not recover")
+    },
+)?;
 ```
+
+`SimRun` owns virtual time, deterministic scheduling, fault injection, trace
+logging, and invariant failure reporting. `SimFailure` includes the failing seed
+and trace so a CI failure can be replayed locally.
 
 Run profiles:
 

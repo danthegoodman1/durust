@@ -685,6 +685,10 @@ network/db calls        -> durust::call_activity!
 
 Replay and command fingerprints remain the correctness backstop.
 
+Runtime and provider fault tests use the deterministic simulator primitives
+(`SimRun`, `FaultProfile`, and `run_many_seeds`) so failures report a seed and
+trace that can be replayed locally.
+
 ## Durability Providers
 
 Durability is a provider trait, not a database mandate.
