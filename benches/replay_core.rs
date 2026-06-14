@@ -41,6 +41,13 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
     Ok(doubled + 1)
 }
 
+#[durust::workflow(name = "bench.large-payload-then-timer", version = 1)]
+async fn large_payload_then_timer(input: LargePayload) -> durust::Result<usize> {
+    let len = input.body.len();
+    durust::sleep(Duration::ZERO).await?;
+    Ok(len)
+}
+
 #[durust::workflow(name = "bench.join-four-activities", version = 1)]
 async fn join_four_activities(input: u64) -> durust::Result<u64> {
     let (first, second, third, fourth) = durust::join!(
@@ -766,6 +773,37 @@ fn payload_provider_refs(c: &mut Criterion) {
     });
 }
 
+fn payload_replay(c: &mut Criterion) {
+    c.bench_function("workflow_replay_large_payload_inline_memory_64kb", |b| {
+        b.iter_batched(
+            || setup_large_payload_timer_replay(usize::MAX),
+            |(backend, run_id)| {
+                block_on(async {
+                    assert_eq!(backend.payload_blob_count(), 0);
+                    let mut recovered = large_payload_replay_worker(backend.clone());
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                    assert_large_payload_workflow_completed(&backend, &run_id).await;
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("workflow_replay_large_payload_blob_memory_64kb", |b| {
+        b.iter_batched(
+            || setup_large_payload_timer_replay(1),
+            |(backend, run_id)| {
+                block_on(async {
+                    assert!(backend.payload_blob_count() > 0);
+                    let mut recovered = large_payload_replay_worker(backend.clone());
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                    assert_large_payload_workflow_completed(&backend, &run_id).await;
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn setup_started_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -1432,6 +1470,50 @@ fn setup_payload_history(inline_threshold_bytes: usize) -> (MemoryBackend, durus
     })
 }
 
+fn setup_large_payload_timer_replay(
+    inline_threshold_bytes: usize,
+) -> (MemoryBackend, durust::RunId) {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            PayloadStorageConfig::new().inline_threshold_bytes(inline_threshold_bytes),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<large_payload_then_timer>(
+                "bench/large-payload-replay",
+                "workflows",
+                large_payload(),
+            )
+            .await
+            .unwrap();
+        let mut worker = large_payload_worker(backend.clone());
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::ZERO);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        (backend, run_id)
+    })
+}
+
+async fn assert_large_payload_workflow_completed(backend: &MemoryBackend, run_id: &durust::RunId) {
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1_000),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowCompleted { result } =
+        &history.last().expect("workflow terminal").data
+    else {
+        panic!("large payload replay workflow did not complete");
+    };
+    assert_eq!(durust::decode_payload::<usize>(result).unwrap(), 64 * 1024);
+}
+
 fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
     ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
@@ -1471,6 +1553,21 @@ fn sqlite_worker(backend: SqliteBackend) -> Worker<SqliteBackend> {
         .activity_task_queue("activities")
         .register_workflow(double_plus_one)
         .register_activity(double)
+        .build()
+}
+
+fn large_payload_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(large_payload_then_timer)
+        .build()
+}
+
+fn large_payload_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .history_chunk_events(1)
+        .register_workflow(large_payload_then_timer)
         .build()
 }
 
@@ -1682,6 +1779,7 @@ criterion_group!(
     activity_heartbeat,
     payload_codec,
     payload_provider_refs,
+    payload_replay,
     timer_due_scan_wakeup,
     signal_send_consume,
     activity_map_materialize,

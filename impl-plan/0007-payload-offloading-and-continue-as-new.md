@@ -84,6 +84,10 @@ Implemented and covered:
 - Runnable `payload_offload` example that forces provider-owned blob storage.
 - Criterion benchmark coverage for MessagePack/JSON encode/decode and
   inline-vs-blob history streaming over 64 KiB payloads.
+- Criterion benchmark coverage for cold workflow replay over a 64 KiB workflow
+  input with inline and provider-blob-backed payload storage. Local memory
+  provider baselines were about 32 us for inline replay and 87 us for blob
+  replay.
 - Criterion single-file SQLite baseline coverage for workflow task claim,
   workflow task append/commit, activity claim/complete, one-activity workflow
   execution, and a 1k mixed-workflow drain with four workers.
@@ -114,7 +118,7 @@ Remaining before this phase is done:
 - Blob-path coverage for side effects once side effects are implemented.
 - Public payload-offload documentation for production object stores once S3
   compatible storage lands.
-- Payload codec/offload benchmark baselines and regression thresholds.
+- Checked-in payload codec/offload benchmark regression thresholds.
 - Partitioned SQLite shard-file throughput baselines remain part of the
   dedicated performance-hardening phase; the current SQLite numbers are
   single-database-file baselines.
