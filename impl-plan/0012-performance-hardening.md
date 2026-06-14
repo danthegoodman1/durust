@@ -62,9 +62,11 @@ Implemented:
 - `benches/baselines/durust-mixed-sqlite.json`, the first checked-in baseline
   artifact. The accepted dimension is single-file SQLite, mixed mode, 1,000
   workflows, 4 workers, shard/concurrency/prefetch dimensions set to 1, and
-  batch 32. The captured release run completed 1,000 workflows, 8,000 semantic
-  mixed actions, 8,000 workflow tasks, and reports about 44.5 processing
-  workflows/sec and 356.3 processing mixed-actions/sec.
+  batch 32. The SQLite provider keeps one configured WAL/FULL connection per
+  backend instance instead of reopening a connection and reapplying pragmas for
+  every operation. The captured release run completed 1,000 workflows, 8,000
+  semantic mixed actions, 8,000 workflow tasks, and reports about 146.7
+  processing workflows/sec and 1,173.8 processing mixed-actions/sec.
 - `benches/baselines/durust-mixed-postgres.json`, the first checked-in
   env-gated Postgres baseline artifact. The accepted dimension is Postgres,
   mixed mode, 1,000 workflows, 4 workers, shard/concurrency/prefetch dimensions
@@ -82,6 +84,11 @@ Remaining:
 - Add comparable benchmark support for additional modes: bare, activity,
   signal, timer, child, activity map, payload refs, recovery, and cached wake
   under recovery load.
+- Add a real write-combining path for hot workflow/activity/timer/child
+  progress so accepted batch dimensions represent fewer durable commits, not
+  merely larger drain loops. This should stay generic at the runtime/backend
+  contract boundary and preserve per-run fencing, event ordering, and crash
+  safety.
 - Decide whether worker-level activation concurrency/prefetch should become
   real runtime knobs before accepting benchmark dimensions with values above 1.
 - Wire CI/performance-job guidance.

@@ -20,47 +20,61 @@ use crate::{
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SqliteBackend {
     path: PathBuf,
     payload_config: PayloadStorageConfig,
+    conn: Arc<Mutex<Connection>>,
+}
+
+impl fmt::Debug for SqliteBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteBackend")
+            .field("path", &self.path)
+            .field("payload_config", &self.payload_config)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SqliteBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let backend = Self {
-            path: path.as_ref().to_path_buf(),
-            payload_config: PayloadStorageConfig::default(),
-        };
-        let conn = backend.connect()?;
+        let path = path.as_ref().to_path_buf();
+        let conn = open_sqlite_connection(&path)?;
         configure_journal_mode(&conn)?;
         init_schema(&conn)?;
-        Ok(backend)
+        Ok(Self {
+            path,
+            payload_config: PayloadStorageConfig::default(),
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub fn open_with_payload_storage(
         path: impl AsRef<Path>,
         payload_config: PayloadStorageConfig,
     ) -> Result<Self> {
-        let backend = Self {
-            path: path.as_ref().to_path_buf(),
-            payload_config,
-        };
-        let conn = backend.connect()?;
+        let path = path.as_ref().to_path_buf();
+        let conn = open_sqlite_connection(&path)?;
         configure_journal_mode(&conn)?;
         init_schema(&conn)?;
-        Ok(backend)
+        Ok(Self {
+            path,
+            payload_config,
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     pub fn payload_blob_count(&self) -> Result<usize> {
-        let conn = self.connect()?;
+        let conn = self.connection()?;
         let sqlite_blobs = conn
             .query_row("select count(*) from payload_blobs", [], |row| {
                 row.get::<_, usize>(0)
@@ -70,13 +84,19 @@ impl SqliteBackend {
         Ok(sqlite_blobs + external_blobs)
     }
 
-    fn connect(&self) -> Result<Connection> {
-        let conn = Connection::open(&self.path).map_err(sqlite_error)?;
-        conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
-            .map_err(sqlite_error)?;
-        configure_connection_defaults(&conn)?;
-        Ok(conn)
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| Error::Backend("sqlite connection mutex poisoned".to_owned()))
     }
+}
+
+fn open_sqlite_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path).map_err(sqlite_error)?;
+    conn.busy_timeout(DEFAULT_BUSY_TIMEOUT)
+        .map_err(sqlite_error)?;
+    configure_connection_defaults(&conn)?;
+    Ok(conn)
 }
 
 impl DurableBackend for SqliteBackend {
@@ -89,7 +109,7 @@ impl DurableBackend for SqliteBackend {
         req: StartWorkflowRequest,
     ) -> BoxFuture<'static, Result<StartWorkflowOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -143,7 +163,7 @@ impl DurableBackend for SqliteBackend {
         req: CancelWorkflowRequest,
     ) -> BoxFuture<'static, Result<CancelWorkflowOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -206,7 +226,7 @@ impl DurableBackend for SqliteBackend {
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -296,7 +316,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             let max_events = req.max_events.max(1);
             let max_bytes = req.max_bytes.max(1);
             let mut stmt = conn
@@ -374,7 +394,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             let max_events = req.max_events.max(1);
             let max_bytes = req.max_bytes.max(1);
             let mut stmt = conn
@@ -448,7 +468,7 @@ impl DurableBackend for SqliteBackend {
 
     fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             hydrate_payload_from_storage(&conn, &self.payload_config, payload)
         })();
         Box::pin(ready(result))
@@ -459,7 +479,7 @@ impl DurableBackend for SqliteBackend {
         payload: PayloadRef,
     ) -> BoxFuture<'static, Result<PayloadRef>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             hydrate_activity_map_result_manifest_from_storage(&conn, &self.payload_config, payload)
         })();
         Box::pin(ready(result))
@@ -471,7 +491,7 @@ impl DurableBackend for SqliteBackend {
         batch: WorkflowTaskCommit,
     ) -> BoxFuture<'static, Result<CommitOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -686,7 +706,7 @@ impl DurableBackend for SqliteBackend {
         release: crate::WorkflowTaskRelease,
     ) -> BoxFuture<'static, Result<()>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -727,7 +747,7 @@ impl DurableBackend for SqliteBackend {
         req: SignalWorkflowRequest,
     ) -> BoxFuture<'static, Result<SignalWorkflowOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -806,7 +826,7 @@ impl DurableBackend for SqliteBackend {
         req: ReadSignalInboxRequest,
     ) -> BoxFuture<'static, Result<Option<SignalInboxRecord>>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             let record = conn
                 .query_row(
                     "select signal_id, signal_name, payload
@@ -847,7 +867,7 @@ impl DurableBackend for SqliteBackend {
         req: FireDueTimersRequest,
     ) -> BoxFuture<'static, Result<FireDueTimersOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -959,7 +979,7 @@ impl DurableBackend for SqliteBackend {
         req: TimeoutDueActivitiesRequest,
     ) -> BoxFuture<'static, Result<TimeoutDueActivitiesOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1017,7 +1037,7 @@ impl DurableBackend for SqliteBackend {
         opts: ClaimActivityOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedActivityTask>>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1109,7 +1129,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::ActivityHeartbeatRequest,
     ) -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1166,7 +1186,7 @@ impl DurableBackend for SqliteBackend {
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, Result<CompleteActivityOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1266,7 +1286,7 @@ impl DurableBackend for SqliteBackend {
         req: FailActivityRequest,
     ) -> BoxFuture<'static, Result<FailActivityOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1384,7 +1404,7 @@ impl DurableBackend for SqliteBackend {
         req: DispatchChildWorkflowStartsRequest,
     ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -1423,7 +1443,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::QueryProjectionRequest,
     ) -> BoxFuture<'static, Result<crate::QueryProjectionOutcome>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             let row = conn
                 .query_row(
                     "select run_id, event_id, payload
@@ -1461,7 +1481,7 @@ impl DurableBackend for SqliteBackend {
         req: WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, Result<WorkflowChangeVersionsOutcome>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             let mut stmt = conn
                 .prepare(
                     "select c.namespace,
@@ -1553,7 +1573,7 @@ impl DurableBackend for SqliteBackend {
 
     fn payload_roots(&self) -> BoxFuture<'static, Result<PayloadRootsOutcome>> {
         let result = (|| {
-            let conn = self.connect()?;
+            let conn = self.connection()?;
             collect_payload_roots(&conn, &self.payload_config)
                 .map(|roots| PayloadRootsOutcome { roots })
         })();
@@ -1565,7 +1585,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::PayloadGarbageCollectionRequest,
     ) -> BoxFuture<'static, Result<crate::PayloadGarbageCollectionOutcome>> {
         let result = (|| {
-            let mut conn = self.connect()?;
+            let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
@@ -4302,7 +4322,7 @@ mod tests {
     fn sqlite_connections_set_default_busy_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let backend = SqliteBackend::open(dir.path().join("busy-timeout.sqlite3")).unwrap();
-        let conn = backend.connect().unwrap();
+        let conn = backend.connection().unwrap();
         let timeout_ms: u64 = conn
             .query_row("pragma busy_timeout", [], |row| row.get(0))
             .unwrap();
@@ -4313,7 +4333,7 @@ mod tests {
     fn sqlite_open_sets_wal_journal_mode() {
         let dir = tempfile::tempdir().unwrap();
         let backend = SqliteBackend::open(dir.path().join("wal.sqlite3")).unwrap();
-        let conn = backend.connect().unwrap();
+        let conn = backend.connection().unwrap();
         let journal_mode: String = conn
             .query_row("pragma journal_mode", [], |row| row.get(0))
             .unwrap();
@@ -4324,7 +4344,7 @@ mod tests {
     fn sqlite_connections_set_full_synchronous_mode() {
         let dir = tempfile::tempdir().unwrap();
         let backend = SqliteBackend::open(dir.path().join("full-sync.sqlite3")).unwrap();
-        let conn = backend.connect().unwrap();
+        let conn = backend.connection().unwrap();
         let synchronous: u8 = conn
             .query_row("pragma synchronous", [], |row| row.get(0))
             .unwrap();

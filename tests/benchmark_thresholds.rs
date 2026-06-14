@@ -174,8 +174,14 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     assert_eq!(baseline["completedWorkflows"], 1000);
     assert_eq!(baseline["activations"], 8000);
     assert_eq!(baseline["mixedActions"], 8000);
-    positive_f64(&baseline, "processingWorkflowsPerSecond");
-    positive_f64(&baseline, "processingMixedActionsPerSecond");
+    assert!(
+        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 100.0,
+        "SQLite mixed baseline should stay above the post-hardening throughput floor"
+    );
+    assert!(
+        positive_f64(&baseline, "processingMixedActionsPerSecond") >= 800.0,
+        "SQLite mixed action baseline should stay above the post-hardening throughput floor"
+    );
 
     let counters = &baseline["counters"];
     for field in [
