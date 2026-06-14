@@ -33,6 +33,24 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     fn stream_history(&self, req: StreamHistoryRequest)
     -> BoxFuture<'static, Result<HistoryChunk>>;
 
+    fn stream_history_for_replay(
+        &self,
+        req: StreamHistoryRequest,
+    ) -> BoxFuture<'static, Result<HistoryChunk>> {
+        self.stream_history(req)
+    }
+
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
+        Box::pin(async move { Ok(payload) })
+    }
+
+    fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        self.hydrate_payload(payload)
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,

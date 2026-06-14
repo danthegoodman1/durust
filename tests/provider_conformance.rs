@@ -136,6 +136,22 @@ fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
 }
 
 #[test]
+fn memory_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydration() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let run_id = start_large_payload_workflow(
+            backend.clone(),
+            "wf/memory-lazy-replay-payload",
+            "memory-lazy-replay-workflows",
+        )
+        .await;
+        assert_replay_stream_payload_hydrates_explicitly(backend, run_id).await;
+    });
+}
+
+#[test]
 fn payload_backend_offloads_large_payloads_and_hydrates_memory_provider_apis() {
     block_on(async {
         let blob_store = durust::MemoryBlobStore::new();
@@ -215,6 +231,26 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
             durust::decode_payload::<String>(input).unwrap(),
             large_payload("workflow-input")
         );
+    });
+}
+
+#[test]
+fn sqlite_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydration_after_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lazy-replay-payload.sqlite3");
+        let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let run_id = start_large_payload_workflow(
+            backend.clone(),
+            "wf/sqlite-lazy-replay-payload",
+            "sqlite-lazy-replay-workflows",
+        )
+        .await;
+        drop(backend);
+
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        assert_replay_stream_payload_hydrates_explicitly(reopened, run_id).await;
     });
 }
 
@@ -826,6 +862,75 @@ where
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
     stale_workflow_task_commit_conflicts(backend.clone()).await;
     activity_claim_filters_and_stale_completion_is_rejected(backend).await;
+}
+
+async fn start_large_payload_workflow<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+) -> durust::RunId
+where
+    B: DurableBackend,
+{
+    backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(workflow_queue),
+            input: durust::encode_payload(&large_payload("workflow-input")).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone()
+}
+
+async fn assert_replay_stream_payload_hydrates_explicitly<B>(backend: B, run_id: durust::RunId)
+where
+    B: DurableBackend,
+{
+    let public_history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &public_history[0].data else {
+        panic!("expected public workflow start");
+    };
+    assert!(matches!(input, durust::PayloadRef::Inline { .. }));
+    assert_eq!(
+        durust::decode_payload::<String>(input).unwrap(),
+        large_payload("workflow-input")
+    );
+
+    let replay_history = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &replay_history[0].data else {
+        panic!("expected replay workflow start");
+    };
+    assert!(matches!(input, durust::PayloadRef::Blob { .. }));
+    let hydrated = backend.hydrate_payload(input.clone()).await.unwrap();
+    assert!(matches!(hydrated, durust::PayloadRef::Inline { .. }));
+    assert_eq!(
+        durust::decode_payload::<String>(&hydrated).unwrap(),
+        large_payload("workflow-input")
+    );
 }
 
 async fn payload_offload_public_api_round_trip<B>(

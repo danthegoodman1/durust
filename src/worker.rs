@@ -275,6 +275,7 @@ where
                     match split_start_event(&first_chunk.events) {
                         Err(err) => Err(err),
                         Ok((input, replay_events)) => {
+                            let input = self.hydrate_payload_for_decode(input).await?;
                             match self.registry.workflow(&claimed.workflow_type) {
                                 None => {
                                     Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()))
@@ -509,7 +510,7 @@ where
             });
         }
         self.backend
-            .stream_history(crate::StreamHistoryRequest {
+            .stream_history_for_replay(crate::StreamHistoryRequest {
                 run_id,
                 after_event_id,
                 up_to_event_id,
@@ -551,6 +552,25 @@ where
                     continue;
                 }
             }
+            let payload_requests = context.take_payload_hydration_requests();
+            if !payload_requests.is_empty() {
+                for request in payload_requests {
+                    let hydrated = match request.kind {
+                        crate::runtime::PayloadHydrationKind::Payload => {
+                            self.backend
+                                .hydrate_payload(request.payload.clone())
+                                .await?
+                        }
+                        crate::runtime::PayloadHydrationKind::ActivityMapResultManifest => {
+                            self.backend
+                                .hydrate_activity_map_result_manifest(request.payload.clone())
+                                .await?
+                        }
+                    };
+                    context.fulfill_payload_hydration(request, hydrated)?;
+                }
+                continue;
+            }
             let Some(after_event_id) = context.needs_more_history_after() else {
                 return Ok(poll);
             };
@@ -564,6 +584,19 @@ where
             }
             context.append_replay_events(chunk.events, chunk.last_event_id);
         }
+    }
+
+    async fn hydrate_payload_for_decode(
+        &self,
+        payload: crate::PayloadRef,
+    ) -> Result<crate::PayloadRef> {
+        let payload = self.backend.hydrate_payload(payload).await?;
+        if matches!(payload, crate::PayloadRef::Blob { .. }) {
+            return Err(Error::PayloadDecode(
+                "backend returned an unresolved blob for workflow input".to_owned(),
+            ));
+        }
+        Ok(payload)
     }
 
     async fn finish_workflow_poll(

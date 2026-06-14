@@ -6,6 +6,7 @@ use durust::{
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,11 @@ struct QueryView {
 struct ContinueInput {
     remaining: u32,
     total: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LargePayload {
+    bytes: Vec<u8>,
 }
 
 #[durust::activity(name = "tests.double")]
@@ -67,6 +73,13 @@ async fn heartbeat_activity_test(input: NumberInput) -> durust::Result<u64> {
     durust::heartbeat_activity().await?;
     durust::heartbeat_activity().await?;
     Ok(input.value * 2)
+}
+
+#[durust::activity(name = "tests.large-payload-result")]
+async fn large_payload_result(_: ()) -> durust::Result<LargePayload> {
+    Ok(LargePayload {
+        bytes: vec![7; 64 * 1024],
+    })
 }
 
 #[durust::activity(name = "tests.version-a")]
@@ -212,6 +225,17 @@ async fn activity_spawn_await_later_workflow(input: u64) -> durust::Result<u64> 
         .spawn()
         .await?;
     first.result().await
+}
+
+#[durust::workflow(name = "tests.sleep-before-large-activity-result", version = 1)]
+async fn sleep_before_large_activity_result(_: ()) -> durust::Result<usize> {
+    let handle = durust::call_activity!(large_payload_result(()))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let payload = handle.result().await?;
+    Ok(payload.bytes.len())
 }
 
 #[durust::workflow(name = "tests.select-all-activity-handles", version = 1)]
@@ -737,6 +761,62 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
             panic!("workflow did not complete");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 41);
+    });
+}
+
+#[test]
+fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner.clone(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<sleep_before_large_activity_result>(
+                "wf/lazy-large-activity-result",
+                "workflows",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let mut worker = lazy_payload_worker(backend.clone(), "lazy-worker-a");
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        assert_eq!(
+            blob_store.get_count(),
+            0,
+            "activity completion upload should not read the blob"
+        );
+
+        let mut replay_before_timer = lazy_payload_worker(backend.clone(), "lazy-worker-b");
+        assert!(replay_before_timer.run_workflow_once().await.unwrap());
+        assert_eq!(
+            blob_store.get_count(),
+            0,
+            "cold replay streamed the completed activity result but the workflow was still blocked on the timer"
+        );
+
+        inner.advance_time(Duration::from_secs(1));
+        assert_eq!(replay_before_timer.run_timers_once().await.unwrap(), 1);
+
+        let mut replay_after_timer = lazy_payload_worker(backend.clone(), "lazy-worker-c");
+        assert!(replay_after_timer.run_workflow_once().await.unwrap());
+        assert_eq!(
+            blob_store.get_count(),
+            1,
+            "the activity result should hydrate exactly when handle.result() observes it"
+        );
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[5].data else {
+            panic!("workflow did not complete after timer and activity result");
+        };
+        assert_eq!(durust::decode_payload::<usize>(result).unwrap(), 64 * 1024);
     });
 }
 
@@ -4216,6 +4296,76 @@ where
         .await
         .unwrap()
         .events
+}
+
+fn lazy_payload_worker(
+    backend: durust::PayloadBackend<MemoryBackend, CountingBlobStore>,
+    worker_id: &str,
+) -> Worker<durust::PayloadBackend<MemoryBackend, CountingBlobStore>> {
+    Worker::builder(backend)
+        .worker_id(worker_id)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(sleep_before_large_activity_result)
+        .register_activity(large_payload_result)
+        .build()
+}
+
+#[derive(Clone, Default)]
+struct CountingBlobStore {
+    blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    gets: Arc<Mutex<usize>>,
+}
+
+impl CountingBlobStore {
+    fn get_count(&self) -> usize {
+        *self.gets.lock().unwrap()
+    }
+}
+
+impl durust::PayloadBlobStore for CountingBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs.lock().unwrap().insert(digest.clone(), bytes);
+            Ok(format!("memory-blob://payload/{digest}"))
+        })
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        let blobs = self.blobs.clone();
+        let gets = self.gets.clone();
+        Box::pin(async move {
+            *gets.lock().unwrap() += 1;
+            blobs
+                .lock()
+                .unwrap()
+                .get(&digest)
+                .cloned()
+                .ok_or_else(|| durust::Error::PayloadDecode(format!("missing blob `{digest}`")))
+        })
+    }
+
+    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move { Ok(blobs.lock().unwrap().keys().cloned().collect()) })
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs.lock().unwrap().remove(&digest);
+            Ok(())
+        })
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        uri.starts_with("memory-blob://payload/")
+    }
 }
 
 fn version_worker<W>(backend: MemoryBackend, workflow: W) -> Worker<MemoryBackend>

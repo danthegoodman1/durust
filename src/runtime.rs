@@ -121,6 +121,8 @@ pub(crate) struct RuntimeContext {
     timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
     consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
+    payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
+    hydrated_payloads: BTreeMap<String, PayloadRef>,
     change_markers: BTreeMap<String, RuntimeChangeMarker>,
     preconsumed_change_markers: BTreeMap<CommandSeq, RuntimeChangeMarker>,
     signal_requests: Vec<LiveSignalRequest>,
@@ -180,6 +182,62 @@ pub(crate) struct RuntimeCommitParts {
     pub cancel_commands: Vec<CommandId>,
     pub query_projection: Option<PayloadRef>,
     pub default_activity_options: ActivityOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PayloadHydrationKind {
+    Payload,
+    ActivityMapResultManifest,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PayloadHydrationRequest {
+    pub kind: PayloadHydrationKind,
+    pub payload: PayloadRef,
+}
+
+impl PayloadHydrationRequest {
+    fn payload(payload: PayloadRef) -> Self {
+        Self {
+            kind: PayloadHydrationKind::Payload,
+            payload,
+        }
+    }
+
+    fn activity_map_result_manifest(payload: PayloadRef) -> Self {
+        Self {
+            kind: PayloadHydrationKind::ActivityMapResultManifest,
+            payload,
+        }
+    }
+
+    pub(crate) fn key(&self) -> String {
+        payload_hydration_key(self.kind, &self.payload)
+    }
+}
+
+fn payload_hydration_key(kind: PayloadHydrationKind, payload: &PayloadRef) -> String {
+    let kind = match kind {
+        PayloadHydrationKind::Payload => "payload",
+        PayloadHydrationKind::ActivityMapResultManifest => "activity-map-result-manifest",
+    };
+    match payload {
+        PayloadRef::Inline { bytes, .. } => {
+            format!("{kind}:inline:{}", crate::digest_bytes(bytes))
+        }
+        PayloadRef::Blob {
+            codec,
+            schema_fingerprint,
+            compression,
+            encryption,
+            digest,
+            size,
+            uri,
+        } => format!(
+            "{kind}:blob:{codec:?}:{}:{compression:?}:{encryption:?}:{digest}:{size}:{uri}",
+            schema_fingerprint.0
+        ),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +311,8 @@ impl RuntimeContext {
             timers,
             consumed_signals,
             live_signals: BTreeMap::new(),
+            payload_hydration_requests: BTreeMap::new(),
+            hydrated_payloads: BTreeMap::new(),
             change_markers,
             preconsumed_change_markers: BTreeMap::new(),
             signal_requests: Vec::new(),
@@ -342,6 +402,26 @@ impl RuntimeContext {
         if let Some(signal) = signal {
             self.live_signals.insert(command_id.seq, signal);
         }
+    }
+
+    pub(crate) fn take_payload_hydration_requests(&mut self) -> Vec<PayloadHydrationRequest> {
+        let requests = self.payload_hydration_requests.values().cloned().collect();
+        self.payload_hydration_requests.clear();
+        requests
+    }
+
+    pub(crate) fn fulfill_payload_hydration(
+        &mut self,
+        request: PayloadHydrationRequest,
+        hydrated: PayloadRef,
+    ) -> Result<()> {
+        if matches!(hydrated, PayloadRef::Blob { .. }) {
+            return Err(Error::PayloadDecode(
+                "backend returned an unresolved blob for an observed replay payload".to_owned(),
+            ));
+        }
+        self.hydrated_payloads.insert(request.key(), hydrated);
+        Ok(())
     }
 
     fn next_command_id(&mut self) -> CommandId {
@@ -460,23 +540,39 @@ impl RuntimeContext {
         self.record_ready_event_id(event_id);
     }
 
+    fn ready_payload_or_request(&mut self, request: PayloadHydrationRequest) -> Option<PayloadRef> {
+        if matches!(request.payload, PayloadRef::Inline { .. }) {
+            return Some(request.payload);
+        }
+        let key = request.key();
+        if let Some(hydrated) = self.hydrated_payloads.remove(&key) {
+            return Some(hydrated);
+        }
+        self.payload_hydration_requests
+            .entry(key)
+            .or_insert(request);
+        None
+    }
+
     fn take_completion(&mut self, command_id: &CommandId) -> Option<PayloadRef> {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::ActivityCompleted(completed) = event.data {
                 if completed.command_id.seq == command_id.seq {
+                    let result = self.ready_payload_or_request(
+                        PayloadHydrationRequest::payload(completed.result),
+                    )?;
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.completions.remove(&command_id.seq);
-                    return Some(completed.result);
+                    return Some(result);
                 }
             }
         }
-        self.completions
-            .remove(&command_id.seq)
-            .map(|(event_id, result)| {
-                self.record_indexed_ready_event_id(event_id);
-                result
-            })
+        let (event_id, result) = self.completions.get(&command_id.seq).cloned()?;
+        let result = self.ready_payload_or_request(PayloadHydrationRequest::payload(result))?;
+        self.completions.remove(&command_id.seq);
+        self.record_indexed_ready_event_id(event_id);
+        Some(result)
     }
 
     fn take_failure(&mut self, command_id: &CommandId) -> Option<ActivityTerminalError> {
@@ -532,6 +628,12 @@ impl RuntimeContext {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::ActivityMapCompleted(completed) = event.data {
                 if completed.command_id.seq == command_id.seq {
+                    let mut completed = completed;
+                    completed.result_manifest = self.ready_payload_or_request(
+                        PayloadHydrationRequest::activity_map_result_manifest(
+                            completed.result_manifest,
+                        ),
+                    )?;
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.map_completions.remove(&command_id.seq);
@@ -539,12 +641,13 @@ impl RuntimeContext {
                 }
             }
         }
-        self.map_completions
-            .remove(&command_id.seq)
-            .map(|(event_id, completed)| {
-                self.record_indexed_ready_event_id(event_id);
-                completed
-            })
+        let (event_id, mut completed) = self.map_completions.get(&command_id.seq).cloned()?;
+        completed.result_manifest = self.ready_payload_or_request(
+            PayloadHydrationRequest::activity_map_result_manifest(completed.result_manifest),
+        )?;
+        self.map_completions.remove(&command_id.seq);
+        self.record_indexed_ready_event_id(event_id);
+        Some(completed)
     }
 
     fn take_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
@@ -589,6 +692,10 @@ impl RuntimeContext {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::ChildWorkflowCompleted(completed) = event.data {
                 if completed.command_id.seq == command_id.seq {
+                    let mut completed = completed;
+                    completed.result = self.ready_payload_or_request(
+                        PayloadHydrationRequest::payload(completed.result),
+                    )?;
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.child_completions.remove(&command_id.seq);
@@ -596,12 +703,12 @@ impl RuntimeContext {
                 }
             }
         }
-        self.child_completions
-            .remove(&command_id.seq)
-            .map(|(event_id, completed)| {
-                self.record_indexed_ready_event_id(event_id);
-                completed
-            })
+        let (event_id, mut completed) = self.child_completions.get(&command_id.seq).cloned()?;
+        completed.result =
+            self.ready_payload_or_request(PayloadHydrationRequest::payload(completed.result))?;
+        self.child_completions.remove(&command_id.seq);
+        self.record_indexed_ready_event_id(event_id);
+        Some(completed)
     }
 
     fn take_child_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
@@ -643,13 +750,21 @@ impl RuntimeContext {
     }
 
     fn take_live_signal(&mut self, command_id: &CommandId) -> Option<SignalInboxRecordForRuntime> {
-        self.live_signals.remove(&command_id.seq)
+        let mut signal = self.live_signals.get(&command_id.seq).cloned()?;
+        signal.payload =
+            self.ready_payload_or_request(PayloadHydrationRequest::payload(signal.payload))?;
+        self.live_signals.remove(&command_id.seq);
+        Some(signal)
     }
 
     fn take_consumed_signal(&mut self, command_id: &CommandId) -> Option<SignalConsumed> {
         if let Some(event) = self.peek_replay_event().cloned() {
             if let HistoryEventData::SignalConsumed(consumed) = event.data {
                 if consumed.command_id.seq == command_id.seq {
+                    let mut consumed = consumed;
+                    consumed.payload = self.ready_payload_or_request(
+                        PayloadHydrationRequest::payload(consumed.payload),
+                    )?;
                     self.advance_replay();
                     self.record_ready_event_id(event.event_id);
                     self.consumed_signals.remove(&command_id.seq);
@@ -657,12 +772,12 @@ impl RuntimeContext {
                 }
             }
         }
-        self.consumed_signals
-            .remove(&command_id.seq)
-            .map(|(event_id, consumed)| {
-                self.record_indexed_ready_event_id(event_id);
-                consumed
-            })
+        let (event_id, mut consumed) = self.consumed_signals.get(&command_id.seq).cloned()?;
+        consumed.payload =
+            self.ready_payload_or_request(PayloadHydrationRequest::payload(consumed.payload))?;
+        self.consumed_signals.remove(&command_id.seq);
+        self.record_indexed_ready_event_id(event_id);
+        Some(consumed)
     }
 
     fn request_signal(&mut self, command_id: CommandId, signal_name: SignalName) {
@@ -2467,15 +2582,9 @@ impl TimerFuture {
             }
             runtime.advance_replay();
 
-            if let Some(next) = runtime.peek_replay_event().cloned() {
-                if let HistoryEventData::TimerFired(fired) = next.data {
-                    if fired.command_id.seq == command_id.seq {
-                        runtime.advance_replay();
-                        runtime.record_ready_event_id(next.event_id);
-                        self.state = TimerFutureState::Done;
-                        return Poll::Ready(Ok(()));
-                    }
-                }
+            if runtime.take_timer(&command_id).is_some() {
+                self.state = TimerFutureState::Done;
+                return Poll::Ready(Ok(()));
             }
 
             self.state = TimerFutureState::Waiting(command_id);
@@ -2621,16 +2730,9 @@ where
                         command_id.seq.0, consumed.command_id.seq.0
                     ))));
                 }
-                if consumed.fingerprint != fingerprint {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "signal command fingerprint changed for command {}",
-                        command_id.seq.0
-                    ))));
-                }
-                runtime.advance_replay();
-                runtime.record_ready_event_id(event.event_id);
-                self.state = SignalFutureState::Done;
-                return Poll::Ready(crate::decode_payload::<T>(&consumed.payload));
+                self.state = SignalFutureState::Waiting(command_id);
+                runtime.request_more_history_if_available();
+                return Poll::Pending;
             }
 
             self.register_wait(runtime, &command_id);
@@ -2660,6 +2762,10 @@ where
         }
         if let Some(event) = runtime.peek_replay_event().cloned() {
             if let HistoryEventData::SignalConsumed(consumed) = event.data {
+                if consumed.command_id.seq == command_id.seq {
+                    runtime.request_more_history_if_available();
+                    return Poll::Pending;
+                }
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected command seq {}, found {}",
                     command_id.seq.0, consumed.command_id.seq.0

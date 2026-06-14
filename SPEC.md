@@ -1227,6 +1227,18 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: StreamHistoryRequest,
     ) -> durust::Result<HistoryChunk>;
 
+    async fn stream_history_for_replay(
+        &self,
+        req: StreamHistoryRequest,
+    ) -> durust::Result<HistoryChunk>;
+
+    async fn hydrate_payload(&self, payload: PayloadRef) -> durust::Result<PayloadRef>;
+
+    async fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> durust::Result<PayloadRef>;
+
     async fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
@@ -2218,6 +2230,17 @@ Tests should use local Garage as the S3-compatible service so
 depending on AWS.
 
 Provider conformance should test both inline and blob-backed payloads through the same public API so application code cannot accidentally depend on where the bytes are stored. Conformance should force both paths by setting a tiny inline threshold and then a larger threshold.
+
+Replay streaming has a separate contract from public reads. Public
+`stream_history` returns provider-hydrated payloads for compatibility with
+debugging, inspection, and conformance helpers. Worker replay uses
+`stream_history_for_replay`, which must preserve compact `PayloadRef::Blob`
+values and avoid fetching large payload bytes until workflow execution reaches a
+payload-observing operation. When the runtime observes such a payload, the
+worker calls `hydrate_payload` or, for paged activity-map result manifests,
+`hydrate_activity_map_result_manifest` at an explicit async boundary before
+polling the workflow again. Workflow polling must not perform hidden object-store
+or database I/O.
 
 Providers should expose generic payload garbage collection for provider-owned
 blob stores. GC treats workflow history, activity tasks, activity map manifests

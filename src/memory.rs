@@ -356,6 +356,65 @@ impl DurableBackend for MemoryBackend {
         })))
     }
 
+    fn stream_history_for_replay(
+        &self,
+        req: crate::StreamHistoryRequest,
+    ) -> BoxFuture<'static, Result<HistoryChunk>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        let Some(run) = state.runs.get(&req.run_id) else {
+            return Box::pin(ready(Err(Error::RunNotFound(req.run_id))));
+        };
+
+        let max_events = req.max_events.max(1);
+        let max_bytes = req.max_bytes.max(1);
+        let mut bytes = 0usize;
+        let mut events = Vec::new();
+        for event in run.history.iter().filter(|event| {
+            event.event_id > req.after_event_id && event.event_id <= req.up_to_event_id
+        }) {
+            let event_bytes = event_payload_len(&event.data).max(1);
+            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
+            {
+                break;
+            }
+            bytes += event_bytes;
+            events.push(event.clone());
+            if events.len() >= max_events {
+                break;
+            }
+        }
+
+        let last_event_id = events
+            .last()
+            .map(|event| event.event_id)
+            .unwrap_or(req.after_event_id);
+        let has_more = run
+            .history
+            .iter()
+            .any(|event| event.event_id > last_event_id && event.event_id <= req.up_to_event_id);
+
+        Box::pin(ready(Ok(HistoryChunk {
+            events,
+            last_event_id,
+            has_more,
+        })))
+    }
+
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        Box::pin(ready(hydrate_payload_from_storage(&state, payload)))
+    }
+
+    fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        Box::pin(ready(hydrate_activity_map_result_manifest_from_storage(
+            &state, payload,
+        )))
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,

@@ -369,6 +369,102 @@ impl DurableBackend for SqliteBackend {
         Box::pin(ready(result))
     }
 
+    fn stream_history_for_replay(
+        &self,
+        req: crate::StreamHistoryRequest,
+    ) -> BoxFuture<'static, Result<HistoryChunk>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            let max_events = req.max_events.max(1);
+            let max_bytes = req.max_bytes.max(1);
+            let mut stmt = conn
+                .prepare(
+                    "select event_id, event_type, data
+                     from history_events
+                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                     order by event_id asc",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map(
+                    params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
+                    |row| {
+                        Ok((
+                            row.get::<_, u64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .map_err(sqlite_error)?;
+
+            let mut events = Vec::new();
+            let mut bytes = 0usize;
+            for row in rows {
+                let (event_id, event_type, data) = row.map_err(sqlite_error)?;
+                let data: HistoryEventData = rmp_serde::from_slice(&data)
+                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+                let event_bytes = event_payload_len(&data).max(1);
+                if !events.is_empty()
+                    && (events.len() >= max_events || bytes + event_bytes > max_bytes)
+                {
+                    break;
+                }
+                bytes += event_bytes;
+                events.push(HistoryEvent {
+                    event_id: EventId(event_id),
+                    event_type: event_type_from_str(&event_type)?,
+                    data,
+                });
+                if events.len() >= max_events {
+                    break;
+                }
+            }
+
+            let last_event_id = events
+                .last()
+                .map(|event| event.event_id)
+                .unwrap_or(req.after_event_id);
+            let has_more = conn
+                .query_row(
+                    "select 1 from history_events
+                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                     limit 1",
+                    params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(sqlite_error)?
+                .is_some();
+
+            Ok(HistoryChunk {
+                events,
+                last_event_id,
+                has_more,
+            })
+        })();
+        Box::pin(ready(result))
+    }
+
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            hydrate_payload_from_storage(&conn, &self.payload_config, payload)
+        })();
+        Box::pin(ready(result))
+    }
+
+    fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let result = (|| {
+            let conn = self.connect()?;
+            hydrate_activity_map_result_manifest_from_storage(&conn, &self.payload_config, payload)
+        })();
+        Box::pin(ready(result))
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,

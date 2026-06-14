@@ -141,6 +141,39 @@ where
         })
     }
 
+    fn stream_history_for_replay(
+        &self,
+        req: crate::StreamHistoryRequest,
+    ) -> BoxFuture<'static, Result<HistoryChunk>> {
+        self.inner.stream_history_for_replay(req)
+    }
+
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let payload = inner.hydrate_payload(payload).await?;
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if blob_store.owns_payload_blob_uri(uri))
+            {
+                hydrate_payload_ref(&blob_store, payload).await
+            } else {
+                Ok(payload)
+            }
+        })
+    }
+
+    fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let payload = inner.hydrate_activity_map_result_manifest(payload).await?;
+            hydrate_activity_map_result_manifest(&blob_store, payload).await
+        })
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,

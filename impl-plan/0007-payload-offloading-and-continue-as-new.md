@@ -135,15 +135,28 @@ Implemented and covered:
   64 KiB get and 3.48 ms for a unique 64 KiB put; Zstd level 3 was about
   5.47 us compress / 13.17 us decompress for repetitive payloads and
   55.33 us compress / 58.64 us decompress for mixed payloads.
+- Raw replay history streaming via `stream_history_for_replay`, with explicit
+  provider hydration APIs for observed payloads and paged activity-map result
+  manifests. Public `stream_history` remains hydrated for inspection APIs, while
+  worker replay keeps large blob refs compact until a workflow reaches the
+  activity, child, signal, or activity-map result that needs the bytes.
+- Provider conformance coverage proving memory and SQLite return blob refs from
+  replay streams and hydrate them only through explicit provider calls, including
+  SQLite close/reopen.
+- Replay-core regression coverage proving a cold replay can stream an
+  activity-completion blob before a timer fires without reading object-store
+  bytes, then hydrates exactly when `ActivityHandle::result()` observes it.
+- Replay-core regression coverage for the ordering bug where `TimerStarted`,
+  another ready event, then `TimerFired` must still let the timer complete via
+  indexed ready events.
 
 Remaining before this phase is done:
 
 - Compression policy for object-store payloads. Compression remains
   unimplemented in runtime code until payload corpus, network, storage, and CPU
   budget data justify a specific default or explicit provider option.
-- Lazy nested payload hydration during replay. Current public reads hydrate
-  returned payload refs before handing them to runtime code.
-- Blob-path coverage for side effects once side effects are implemented.
+- Blob-path and lazy-hydration coverage for side effects once side effects are
+  implemented.
 - Broader production payload-offload documentation after compression and lazy
   hydration policy settle.
 - Checked-in payload codec/offload benchmark regression thresholds.
