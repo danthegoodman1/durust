@@ -3965,6 +3965,258 @@ fn cached_workflow_wake_streams_only_events_after_cached_tail() {
 }
 
 #[test]
+fn cached_workflow_wake_ignores_cold_recovery_saturation() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/cached-recovery-saturated", "workflows", 6)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .max_concurrent_recoveries(0)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        backend.clear_stream_requests();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let requests = backend.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].after_event_id, EventId(2));
+        assert_eq!(requests[0].up_to_event_id, EventId(3));
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+    });
+}
+
+#[test]
+fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/recovery-admission", "workflows", 7)
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+        backend.clear_stream_requests();
+
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .max_concurrent_recoveries(0)
+            .recovery_defer_delay(Duration::from_millis(25))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        assert!(backend.stream_requests().is_empty());
+        let hidden = backend
+            .claim_workflow_task(
+                WorkerId::new("before-recovery-admission-delay"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap();
+        assert!(hidden.is_none());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+
+        std::thread::sleep(Duration::from_millis(40));
+        let visible = backend
+            .claim_workflow_task(
+                WorkerId::new("after-recovery-admission-delay"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap();
+        assert!(visible.is_some());
+    });
+}
+
+#[test]
+fn cold_recovery_event_budget_defers_without_appending_failure() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/recovery-event-budget", "workflows", 5)
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+        backend.clear_stream_requests();
+
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .recovery_replay_event_budget(1)
+            .recovery_defer_delay(Duration::from_millis(25))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        let requests = backend.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_events, 1);
+        assert_eq!(requests[0].after_event_id, EventId::ZERO);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+
+        let hidden = backend
+            .claim_workflow_task(
+                WorkerId::new("before-recovery-budget-delay"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap();
+        assert!(hidden.is_none());
+    });
+}
+
+#[test]
+fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/recovery-byte-budget", "workflows", 5)
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+        backend.clear_stream_requests();
+
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_bytes(usize::MAX)
+            .recovery_replay_byte_budget(1)
+            .recovery_defer_delay(Duration::from_millis(25))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        let requests = backend.stream_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].max_bytes, 1);
+        assert_eq!(requests[0].after_event_id, EventId::ZERO);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+    });
+}
+
+#[test]
+fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", 9)
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        assert!(first_worker.run_activity_once().await.unwrap());
+        drop(first_worker);
+        backend.clear_stream_requests();
+        backend.backpressure_next_replay_stream(Duration::from_millis(25));
+
+        let mut recovered_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(recovered_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 3);
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+        );
+
+        let hidden = backend
+            .claim_workflow_task(
+                WorkerId::new("before-provider-backpressure-delay"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap();
+        assert!(hidden.is_none());
+
+        std::thread::sleep(Duration::from_millis(40));
+        let visible = backend
+            .claim_workflow_task(
+                WorkerId::new("after-provider-backpressure-delay"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap();
+        assert!(visible.is_some());
+    });
+}
+
+#[test]
 fn replay_detects_changed_activity_input_without_appending_failure() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -4521,6 +4773,7 @@ struct RecordingBackend {
     inner: MemoryBackend,
     stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
     conflict_next_commit: Arc<Mutex<bool>>,
+    backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
 }
 
 impl RecordingBackend {
@@ -4529,6 +4782,7 @@ impl RecordingBackend {
             inner,
             stream_requests: Arc::new(Mutex::new(Vec::new())),
             conflict_next_commit: Arc::new(Mutex::new(false)),
+            backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -4542,6 +4796,10 @@ impl RecordingBackend {
 
     fn conflict_next_commit(&self) {
         *self.conflict_next_commit.lock().unwrap() = true;
+    }
+
+    fn backpressure_next_replay_stream(&self, retry_after: Duration) {
+        *self.backpressure_next_replay_stream.lock().unwrap() = Some(retry_after);
     }
 }
 
@@ -4578,6 +4836,23 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
         self.inner.stream_history(req)
+    }
+
+    fn stream_history_for_replay(
+        &self,
+        req: durust::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        self.stream_requests.lock().unwrap().push(req.clone());
+        let retry_after = self.backpressure_next_replay_stream.lock().unwrap().take();
+        if let Some(retry_after) = retry_after {
+            return Box::pin(async move {
+                Err(durust::Error::backpressure(
+                    "recording backend replay stream budget exhausted",
+                    retry_after,
+                ))
+            });
+        }
+        self.inner.stream_history_for_replay(req)
     }
 
     fn commit_workflow_task(

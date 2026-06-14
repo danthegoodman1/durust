@@ -299,6 +299,61 @@ fn crash_replay(c: &mut Criterion) {
     });
 }
 
+fn recovery_flow_control(c: &mut Criterion) {
+    c.bench_function("recovery_defer_no_admission_memory", |b| {
+        b.iter_batched(
+            setup_completed_activity,
+            |(cached_worker, backend)| {
+                drop(cached_worker);
+                block_on(async {
+                    let mut recovered = Worker::builder(backend)
+                        .workflow_task_queue("workflows")
+                        .activity_task_queue("activities")
+                        .max_concurrent_recoveries(0)
+                        .register_workflow(double_plus_one)
+                        .register_activity(double)
+                        .build();
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("recovery_defer_event_budget_memory", |b| {
+        b.iter_batched(
+            setup_completed_activity,
+            |(cached_worker, backend)| {
+                drop(cached_worker);
+                block_on(async {
+                    let mut recovered = Worker::builder(backend)
+                        .workflow_task_queue("workflows")
+                        .activity_task_queue("activities")
+                        .history_chunk_events(1)
+                        .recovery_replay_event_budget(1)
+                        .register_workflow(double_plus_one)
+                        .register_activity(double)
+                        .build();
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("cached_wake_with_recovery_saturated_memory", |b| {
+        b.iter_batched(
+            setup_completed_activity_with_recovery_saturation,
+            |(mut worker, _backend)| {
+                block_on(async {
+                    assert!(worker.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn select_registration(c: &mut Criterion) {
     c.bench_function("select_registration_memory", |b| {
         b.iter_batched(
@@ -915,6 +970,27 @@ fn setup_completed_activity() -> (Worker<MemoryBackend>, MemoryBackend) {
             .await
             .unwrap();
         let mut worker = worker(backend.clone());
+        worker.run_workflow_once().await.unwrap();
+        worker.run_activity_once().await.unwrap();
+        (worker, backend)
+    })
+}
+
+fn setup_completed_activity_with_recovery_saturation() -> (Worker<MemoryBackend>, MemoryBackend) {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .max_concurrent_recoveries(0)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
         worker.run_workflow_once().await.unwrap();
         worker.run_activity_once().await.unwrap();
         (worker, backend)
@@ -1878,6 +1954,7 @@ criterion_group!(
     workflow_task_append_commit,
     cached_wake_poll,
     crash_replay,
+    recovery_flow_control,
     select_registration,
     select_replay,
     bounded_join_fanout,

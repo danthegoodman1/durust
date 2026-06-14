@@ -158,6 +158,8 @@ where
     history_chunk_bytes: usize,
     payload_codec: crate::CodecId,
     nondeterminism_retry_backoff: Duration,
+    recovery_flow_control: RecoveryFlowControl,
+    active_recoveries: usize,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
 }
@@ -167,6 +169,80 @@ struct CachedWorkflow {
     last_event_id: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RecoveryFlowControl {
+    max_concurrent_recoveries: usize,
+    replay_event_budget: usize,
+    replay_byte_budget: usize,
+    prefetch_chunks: usize,
+    defer_delay: Duration,
+}
+
+impl Default for RecoveryFlowControl {
+    fn default() -> Self {
+        Self {
+            max_concurrent_recoveries: usize::MAX,
+            replay_event_budget: usize::MAX,
+            replay_byte_budget: usize::MAX,
+            prefetch_chunks: usize::MAX,
+            defer_delay: Duration::from_millis(100),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RecoveryReplayBudget {
+    remaining_events: usize,
+    remaining_bytes: usize,
+    remaining_chunks: usize,
+}
+
+impl RecoveryReplayBudget {
+    fn new(flow_control: RecoveryFlowControl) -> Self {
+        Self {
+            remaining_events: flow_control.replay_event_budget,
+            remaining_bytes: flow_control.replay_byte_budget,
+            remaining_chunks: flow_control.prefetch_chunks,
+        }
+    }
+
+    fn next_request_limits(
+        &self,
+        chunk_events: usize,
+        chunk_bytes: usize,
+    ) -> Option<(usize, usize)> {
+        if self.remaining_events == 0 || self.remaining_bytes == 0 || self.remaining_chunks == 0 {
+            return None;
+        }
+
+        Some((
+            chunk_events.min(self.remaining_events),
+            chunk_bytes.min(self.remaining_bytes),
+        ))
+    }
+
+    fn record_chunk(&mut self, chunk: &crate::HistoryChunk) {
+        self.remaining_chunks = self.remaining_chunks.saturating_sub(1);
+        self.remaining_events = self.remaining_events.saturating_sub(chunk.events.len());
+        let bytes = chunk
+            .events
+            .iter()
+            .map(|event| crate::runtime::event_payload_len(&event.data).max(1))
+            .sum::<usize>();
+        self.remaining_bytes = self.remaining_bytes.saturating_sub(bytes);
+    }
+}
+
+enum WorkflowTaskOutcome {
+    Finished(Option<CachedWorkflow>),
+    Deferred,
+}
+
+enum WorkflowPollOutcome {
+    Ready(Poll<Result<crate::PayloadRef>>),
+    Deferred,
 }
 
 impl<B> Worker<B>
@@ -184,6 +260,7 @@ where
             history_chunk_events: 128,
             history_chunk_bytes: 256 * 1024,
             nondeterminism_retry_backoff: Duration::from_secs(60),
+            recovery_flow_control: RecoveryFlowControl::default(),
             max_local_activities_per_workflow_task: 0,
         }
     }
@@ -249,81 +326,136 @@ where
                             &mut cached.future,
                             &mut context,
                             claimed.replay_target_event_id,
+                            None,
                         )
                         .await;
                     match poll {
-                        Ok(poll) => {
-                            self.finish_workflow_poll(claimed, cached.future, context, poll)
+                        Ok(poll) => match poll {
+                            WorkflowPollOutcome::Ready(poll) => self
+                                .finish_workflow_poll(claimed, cached.future, context, poll)
                                 .await
-                        }
+                                .map(WorkflowTaskOutcome::Finished),
+                            WorkflowPollOutcome::Deferred => Ok(WorkflowTaskOutcome::Deferred),
+                        },
                         Err(err) => Err(err),
                     }
                 }
                 Err(err) => Err(err),
             }
         } else {
-            let first_chunk = self
-                .stream_history_chunk(
-                    claimed.run_id.clone(),
-                    EventId::ZERO,
-                    claimed.replay_target_event_id,
-                )
-                .await;
-            match first_chunk {
-                Ok(first_chunk) => {
-                    let last_loaded_event_id = first_chunk.last_event_id;
-                    match split_start_event(&first_chunk.events) {
-                        Err(err) => Err(err),
-                        Ok((input, replay_events)) => {
-                            let input = self.hydrate_payload_for_decode(input).await?;
-                            match self.registry.workflow(&claimed.workflow_type) {
-                                None => {
-                                    Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()))
-                                }
-                                Some(registration) => {
-                                    let mut future = registration.run(input, self.payload_codec);
-                                    let mut context = crate::runtime::RuntimeContext::new(
-                                        claimed.run_id.clone(),
-                                        self.workflow_task_queue.clone(),
-                                        self.activity_task_queue.clone(),
-                                        self.payload_codec,
-                                        now,
-                                        replay_events,
-                                        crate::ActivityOptions::default(),
-                                        0,
-                                        last_loaded_event_id,
-                                        claimed.replay_target_event_id,
-                                        change_versions.clone(),
-                                    );
-                                    let poll = self
-                                        .poll_until_history_blocked_or_ready(
-                                            &claimed.run_id,
-                                            &mut future,
-                                            &mut context,
+            let is_recovery = claimed.replay_target_event_id > EventId(1);
+            if is_recovery && !self.try_acquire_recovery() {
+                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                    .await
+            } else {
+                let mut recovery_budget =
+                    is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
+                let first_chunk = match recovery_budget.as_mut() {
+                    Some(budget) => {
+                        self.stream_recovery_history_chunk(
+                            claimed.run_id.clone(),
+                            EventId::ZERO,
+                            claimed.replay_target_event_id,
+                            budget,
+                        )
+                        .await
+                    }
+                    None => self
+                        .stream_history_chunk(
+                            claimed.run_id.clone(),
+                            EventId::ZERO,
+                            claimed.replay_target_event_id,
+                        )
+                        .await
+                        .map(Some),
+                };
+                let result = match first_chunk {
+                    Ok(Some(first_chunk)) => {
+                        let last_loaded_event_id = first_chunk.last_event_id;
+                        match split_start_event(&first_chunk.events) {
+                            Err(err) => Err(err),
+                            Ok((input, replay_events)) => {
+                                let input = self.hydrate_payload_for_decode(input).await?;
+                                match self.registry.workflow(&claimed.workflow_type) {
+                                    None => Err(Error::WorkflowNotRegistered(
+                                        claimed.workflow_type.clone(),
+                                    )),
+                                    Some(registration) => {
+                                        let mut future =
+                                            registration.run(input, self.payload_codec);
+                                        let mut context = crate::runtime::RuntimeContext::new(
+                                            claimed.run_id.clone(),
+                                            self.workflow_task_queue.clone(),
+                                            self.activity_task_queue.clone(),
+                                            self.payload_codec,
+                                            now,
+                                            replay_events,
+                                            crate::ActivityOptions::default(),
+                                            0,
+                                            last_loaded_event_id,
                                             claimed.replay_target_event_id,
-                                        )
-                                        .await;
-                                    match poll {
-                                        Ok(poll) => {
-                                            self.finish_workflow_poll(
-                                                claimed, future, context, poll,
+                                            change_versions.clone(),
+                                        );
+                                        let poll = self
+                                            .poll_until_history_blocked_or_ready(
+                                                &claimed.run_id,
+                                                &mut future,
+                                                &mut context,
+                                                claimed.replay_target_event_id,
+                                                recovery_budget.as_mut(),
                                             )
-                                            .await
+                                            .await;
+                                        match poll {
+                                            Ok(WorkflowPollOutcome::Ready(poll)) => self
+                                                .finish_workflow_poll(
+                                                    claimed, future, context, poll,
+                                                )
+                                                .await
+                                                .map(WorkflowTaskOutcome::Finished),
+                                            Ok(WorkflowPollOutcome::Deferred) => {
+                                                self.defer_workflow_task(
+                                                    claimed.claim,
+                                                    self.recovery_flow_control.defer_delay,
+                                                )
+                                                .await
+                                            }
+                                            Err(err) => Err(err),
                                         }
-                                        Err(err) => Err(err),
                                     }
                                 }
                             }
                         }
                     }
+                    Ok(None) => {
+                        self.defer_workflow_task(
+                            claimed.claim,
+                            self.recovery_flow_control.defer_delay,
+                        )
+                        .await
+                    }
+                    Err(err) => Err(err),
+                };
+                if is_recovery {
+                    self.release_recovery();
                 }
-                Err(err) => Err(err),
+                result
             }
         };
 
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
+                if let Error::Backpressure { retry_after, .. } = &err {
+                    let delay = self.backpressure_delay(*retry_after);
+                    let _ = self
+                        .backend
+                        .release_workflow_task(
+                            claim_for_release,
+                            WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
+                        )
+                        .await;
+                    return Ok(true);
+                }
                 let release = if matches!(
                     &err,
                     Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
@@ -341,6 +473,10 @@ where
                     .await;
                 return Err(err);
             }
+        };
+
+        let WorkflowTaskOutcome::Finished(entry) = entry else {
+            return Ok(true);
         };
 
         if let Some(entry) = entry {
@@ -520,13 +656,49 @@ where
             .await
     }
 
+    async fn stream_recovery_history_chunk(
+        &self,
+        run_id: RunId,
+        after_event_id: EventId,
+        up_to_event_id: EventId,
+        budget: &mut RecoveryReplayBudget,
+    ) -> Result<Option<crate::HistoryChunk>> {
+        if after_event_id >= up_to_event_id {
+            return Ok(Some(crate::HistoryChunk {
+                events: Vec::new(),
+                last_event_id: after_event_id,
+                has_more: false,
+            }));
+        }
+
+        let Some((max_events, max_bytes)) =
+            budget.next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
+        else {
+            return Ok(None);
+        };
+
+        let chunk = self
+            .backend
+            .stream_history_for_replay(crate::StreamHistoryRequest {
+                run_id,
+                after_event_id,
+                up_to_event_id,
+                max_events,
+                max_bytes,
+            })
+            .await?;
+        budget.record_chunk(&chunk);
+        Ok(Some(chunk))
+    }
+
     async fn poll_until_history_blocked_or_ready(
         &self,
         run_id: &RunId,
         future: &mut Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         context: &mut crate::runtime::RuntimeContext,
         replay_target_event_id: EventId,
-    ) -> Result<Poll<Result<crate::PayloadRef>>> {
+        mut recovery_budget: Option<&mut RecoveryReplayBudget>,
+    ) -> Result<WorkflowPollOutcome> {
         loop {
             let poll = poll_cached(future, context);
             let signal_requests = context.take_signal_requests();
@@ -572,17 +744,72 @@ where
                 continue;
             }
             let Some(after_event_id) = context.needs_more_history_after() else {
-                return Ok(poll);
+                return Ok(WorkflowPollOutcome::Ready(poll));
             };
-            let chunk = self
-                .stream_history_chunk(run_id.clone(), after_event_id, replay_target_event_id)
-                .await?;
+            let chunk = match recovery_budget.as_deref_mut() {
+                Some(budget) => {
+                    let Some(chunk) = self
+                        .stream_recovery_history_chunk(
+                            run_id.clone(),
+                            after_event_id,
+                            replay_target_event_id,
+                            budget,
+                        )
+                        .await?
+                    else {
+                        return Ok(WorkflowPollOutcome::Deferred);
+                    };
+                    chunk
+                }
+                None => {
+                    self.stream_history_chunk(
+                        run_id.clone(),
+                        after_event_id,
+                        replay_target_event_id,
+                    )
+                    .await?
+                }
+            };
             if chunk.events.is_empty() && after_event_id < replay_target_event_id {
                 return Err(Error::Backend(format!(
                     "history stream ended at event {after_event_id} before replay target {replay_target_event_id}"
                 )));
             }
             context.append_replay_events(chunk.events, chunk.last_event_id);
+        }
+    }
+
+    async fn defer_workflow_task(
+        &self,
+        claim: crate::WorkflowTaskClaim,
+        delay: Duration,
+    ) -> Result<WorkflowTaskOutcome> {
+        self.backend
+            .release_workflow_task(
+                claim,
+                WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
+            )
+            .await?;
+        Ok(WorkflowTaskOutcome::Deferred)
+    }
+
+    fn try_acquire_recovery(&mut self) -> bool {
+        if self.active_recoveries >= self.recovery_flow_control.max_concurrent_recoveries {
+            return false;
+        }
+        self.active_recoveries += 1;
+        true
+    }
+
+    fn release_recovery(&mut self) {
+        self.active_recoveries = self.active_recoveries.saturating_sub(1);
+    }
+
+    fn backpressure_delay(&self, retry_after: Duration) -> Duration {
+        if retry_after == Duration::ZERO {
+            self.recovery_flow_control.defer_delay
+        } else {
+            retry_after
         }
     }
 
@@ -735,6 +962,7 @@ where
     history_chunk_events: usize,
     history_chunk_bytes: usize,
     nondeterminism_retry_backoff: Duration,
+    recovery_flow_control: RecoveryFlowControl,
     max_local_activities_per_workflow_task: usize,
 }
 
@@ -767,8 +995,38 @@ where
         self
     }
 
+    pub fn history_chunk_bytes(mut self, max_bytes: usize) -> Self {
+        self.history_chunk_bytes = max_bytes.max(1);
+        self
+    }
+
     pub fn nondeterminism_retry_backoff(mut self, backoff: Duration) -> Self {
         self.nondeterminism_retry_backoff = backoff;
+        self
+    }
+
+    pub fn max_concurrent_recoveries(mut self, limit: usize) -> Self {
+        self.recovery_flow_control.max_concurrent_recoveries = limit;
+        self
+    }
+
+    pub fn recovery_replay_event_budget(mut self, max_events: usize) -> Self {
+        self.recovery_flow_control.replay_event_budget = max_events;
+        self
+    }
+
+    pub fn recovery_replay_byte_budget(mut self, max_bytes: usize) -> Self {
+        self.recovery_flow_control.replay_byte_budget = max_bytes;
+        self
+    }
+
+    pub fn recovery_prefetch_chunks(mut self, max_chunks: usize) -> Self {
+        self.recovery_flow_control.prefetch_chunks = max_chunks;
+        self
+    }
+
+    pub fn recovery_defer_delay(mut self, delay: Duration) -> Self {
+        self.recovery_flow_control.defer_delay = delay;
         self
     }
 
@@ -827,6 +1085,8 @@ where
             history_chunk_bytes: self.history_chunk_bytes,
             payload_codec,
             nondeterminism_retry_backoff: self.nondeterminism_retry_backoff,
+            recovery_flow_control: self.recovery_flow_control,
+            active_recoveries: 0,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,
         }

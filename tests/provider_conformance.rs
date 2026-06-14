@@ -116,6 +116,60 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
 }
 
 #[test]
+fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("delayed-visibility.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<workflow>(
+                "wf/sqlite-delayed-visibility",
+                "sqlite-delayed-visibility-workflows",
+                5,
+            )
+            .await
+            .unwrap();
+        let claim_opts = ClaimWorkflowTaskOptions {
+            namespace: Namespace::default(),
+            task_queue: TaskQueue::new("sqlite-delayed-visibility-workflows"),
+            registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed = backend
+            .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-a"), claim_opts.clone())
+            .await
+            .unwrap()
+            .expect("workflow task");
+        backend
+            .release_workflow_task(
+                claimed.claim,
+                durust::WorkflowTaskRelease::delayed(
+                    durust::WorkflowTaskReason::CacheEvicted,
+                    Duration::from_millis(25),
+                ),
+            )
+            .await
+            .unwrap();
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&path).unwrap();
+        let hidden = reopened
+            .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-b"), claim_opts.clone())
+            .await
+            .unwrap();
+        assert!(hidden.is_none());
+
+        std::thread::sleep(Duration::from_millis(40));
+        let visible = reopened
+            .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-c"), claim_opts)
+            .await
+            .unwrap();
+        assert!(visible.is_some());
+    });
+}
+
+#[test]
 fn memory_provider_offloads_large_payloads_and_hydrates_public_apis() {
     block_on(async {
         let backend = MemoryBackend::with_payload_storage(
@@ -2084,7 +2138,7 @@ where
     worker.run_workflow_once().await.unwrap();
     let one_event = backend
         .stream_history(durust::StreamHistoryRequest {
-            run_id,
+            run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(2),
             max_events: 1,
@@ -2094,6 +2148,19 @@ where
         .unwrap();
     assert_eq!(one_event.events.len(), 1);
     assert!(one_event.has_more);
+
+    let one_event_by_byte_budget = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(2),
+            max_events: 100,
+            max_bytes: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(one_event_by_byte_budget.events.len(), 1);
+    assert!(one_event_by_byte_budget.has_more);
 }
 
 async fn stale_workflow_task_commit_conflicts<B>(backend: B)

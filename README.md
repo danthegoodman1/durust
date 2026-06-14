@@ -665,6 +665,14 @@ durable APIs consume recorded facts
 switch to live mode at the tail
 ```
 
+Cold recovery is also flow-controlled by the worker. A worker can cap concurrent
+cold recoveries, clamp each recovery attempt by replay events, replay bytes, and
+history chunks, then defer the workflow task through generic delayed visibility
+when capacity is unavailable. Cached workflow wakes stay on the fast path and do
+not wait behind cold replay saturation. Durability providers remain generic:
+they honor stream bounds and may return retry-after backpressure without knowing
+why the workflow is replaying.
+
 Unconsumed signals, pending timers, activity leases, and ready rows are live
 operational indexes. They are not streamed as replay history until workflow code
 observes a committed fact.

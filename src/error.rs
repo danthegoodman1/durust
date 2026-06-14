@@ -68,6 +68,13 @@ impl DurableFailure {
             Error::PayloadEncode(message) => Self::new("durust.payload_encode", message.clone()),
             Error::PayloadDecode(message) => Self::new("durust.payload_decode", message.clone()),
             Error::Backend(message) => Self::new("durust.backend", message.clone()),
+            Error::Backpressure {
+                message,
+                retry_after,
+            } => Self::new(
+                "durust.backpressure",
+                format!("{message}; retry after {retry_after:?}"),
+            ),
             Error::ActivityNotRegistered(name) => {
                 Self::new("durust.activity_not_registered", name.to_string()).marked_non_retryable()
             }
@@ -174,6 +181,12 @@ pub enum Error {
 
     #[error("backend error: {0}")]
     Backend(String),
+
+    #[error("provider backpressure: {message}; retry after {retry_after:?}")]
+    Backpressure {
+        message: String,
+        retry_after: std::time::Duration,
+    },
 }
 
 impl Error {
@@ -187,6 +200,13 @@ impl Error {
 
     pub fn timeout(message: impl Into<String>) -> Self {
         Self::non_retryable("durust.timeout", message)
+    }
+
+    pub fn backpressure(message: impl Into<String>, retry_after: std::time::Duration) -> Self {
+        Self::Backpressure {
+            message: message.into(),
+            retry_after,
+        }
     }
 
     pub fn with_details<T>(self, details: &T) -> Result<Self>

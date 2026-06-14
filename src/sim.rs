@@ -157,6 +157,8 @@ pub enum FaultPoint {
     TimerDuplicateFire,
     SignalStorm,
     BlobStoreTransient,
+    ProviderBackpressure,
+    RecoveryBudgetExhausted,
     ShardLeaseLoss,
     CrossShardDuplicateDelivery,
     CrossShardDelayedDelivery,
@@ -169,6 +171,7 @@ impl FaultPoint {
             Self::SignalStorm => 5,
             Self::CrossShardDelayedDelivery => 4,
             Self::DispatcherCrash(_) => 5,
+            Self::ProviderBackpressure | Self::RecoveryBudgetExhausted => 4,
             _ => 6,
         }
     }
@@ -177,7 +180,9 @@ impl FaultPoint {
         match self {
             Self::SignalStorm
             | Self::CrossShardDuplicateDelivery
-            | Self::CrossShardDelayedDelivery => 2,
+            | Self::CrossShardDelayedDelivery
+            | Self::ProviderBackpressure
+            | Self::RecoveryBudgetExhausted => 2,
             Self::DispatcherCrash(_) => 3,
             _ => 3,
         }
@@ -499,6 +504,7 @@ mod tests {
             simulate_external_event_idempotency_storm(sim)?;
             simulate_blob_store_transient_errors(sim)?;
             simulate_shard_lease_and_cross_shard_handoff(sim)?;
+            simulate_recovery_flow_control_storm(sim)?;
             Ok(())
         })
         .unwrap();
@@ -626,6 +632,125 @@ mod tests {
             "faults_exercised",
             state.duplicate_attempts > 0,
             "duplicate external event faults did not execute",
+        )
+    }
+
+    #[derive(Default)]
+    struct RecoveryFlowModel {
+        active_recoveries: usize,
+        max_active_recoveries: usize,
+        recovery_attempts: BTreeMap<u64, u32>,
+        recovery_chunks_read: BTreeMap<u64, u32>,
+        completed_recoveries: BTreeSet<u64>,
+        completed_cached_wakes: BTreeSet<u64>,
+        deferred_recoveries: u64,
+        backpressure_retries: u64,
+    }
+
+    fn simulate_recovery_flow_control_storm(sim: &mut SimRun) -> Result<(), SimFailure> {
+        const RECOVERIES: u64 = 10;
+        const CACHED_WAKES: u64 = 6;
+        const MAX_ACTIVE: usize = 2;
+        const CHUNKS_PER_ATTEMPT: u32 = 2;
+        const REQUIRED_CHUNKS: u32 = 5;
+
+        sim.record("scenario", "recovery_flow_control_storm");
+        for id in 1..=RECOVERIES {
+            sim.schedule(format!("recovery-start:{id}"));
+        }
+        for id in 1..=CACHED_WAKES {
+            sim.schedule(format!("cached-wake:{id}"));
+        }
+
+        let mut state = RecoveryFlowModel::default();
+        sim.run_until_idle(8_000, |sim, step| {
+            if let Some(id) = suffix(&step.label, "cached-wake:") {
+                state.completed_cached_wakes.insert(id);
+                sim.record("cached_wake", format!("id={id}"));
+                return Ok(());
+            }
+
+            if let Some(id) = suffix(&step.label, "recovery-start:") {
+                let attempts = state.recovery_attempts.entry(id).or_default();
+                *attempts += 1;
+                if state.active_recoveries >= MAX_ACTIVE {
+                    state.deferred_recoveries += 1;
+                    sim.schedule_after(Duration::from_millis(2), step.label);
+                    return Ok(());
+                }
+
+                state.active_recoveries += 1;
+                state.max_active_recoveries =
+                    state.max_active_recoveries.max(state.active_recoveries);
+                sim.ensure(
+                    "bounded_active_recoveries",
+                    state.active_recoveries <= MAX_ACTIVE,
+                    format!("active recoveries exceeded {MAX_ACTIVE}"),
+                )?;
+                sim.schedule_after(Duration::from_millis(1), format!("recovery-read:{id}"));
+                return Ok(());
+            }
+
+            let id = suffix(&step.label, "recovery-read:").ok_or_else(|| {
+                sim.failure("parse_step", format!("unknown step `{}`", step.label))
+            })?;
+            let fault_budget = state
+                .recovery_attempts
+                .get(&id)
+                .copied()
+                .unwrap_or_default()
+                <= 8;
+
+            if fault_budget && sim.inject(FaultPoint::ProviderBackpressure) {
+                state.backpressure_retries += 1;
+                state.active_recoveries = state.active_recoveries.saturating_sub(1);
+                sim.schedule_after(Duration::from_millis(3), format!("recovery-start:{id}"));
+                return Ok(());
+            }
+
+            let chunks = state.recovery_chunks_read.entry(id).or_default();
+            *chunks = chunks.saturating_add(CHUNKS_PER_ATTEMPT);
+            state.active_recoveries = state.active_recoveries.saturating_sub(1);
+            if *chunks < REQUIRED_CHUNKS
+                || (fault_budget && sim.inject(FaultPoint::RecoveryBudgetExhausted))
+            {
+                state.deferred_recoveries += 1;
+                sim.schedule_after(Duration::from_millis(2), format!("recovery-start:{id}"));
+                return Ok(());
+            }
+
+            state.completed_recoveries.insert(id);
+            sim.record("recovery_complete", format!("id={id} chunks={chunks}"));
+            Ok(())
+        })?;
+
+        sim.ensure(
+            "recovery_limit_exercised",
+            state.max_active_recoveries == MAX_ACTIVE,
+            format!(
+                "max active recoveries was {}, expected {MAX_ACTIVE}",
+                state.max_active_recoveries
+            ),
+        )?;
+        sim.ensure(
+            "recovery_deferral_exercised",
+            state.deferred_recoveries > 0,
+            "no recovery was deferred under flow control",
+        )?;
+        sim.ensure(
+            "provider_backpressure_exercised",
+            state.backpressure_retries > 0,
+            "provider backpressure retry path did not execute",
+        )?;
+        sim.ensure(
+            "cached_wakes_not_starved",
+            state.completed_cached_wakes.len() == CACHED_WAKES as usize,
+            "cached wakes were starved behind cold recovery",
+        )?;
+        sim.ensure(
+            "recoveries_eventually_complete",
+            state.completed_recoveries.len() == RECOVERIES as usize,
+            "not all cold recoveries completed",
         )
     }
 

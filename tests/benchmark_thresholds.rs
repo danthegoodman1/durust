@@ -68,6 +68,32 @@ fn phase_0008_benchmark_profiles_have_stable_names() {
     }
 }
 
+#[test]
+fn phase_0009_recovery_flow_control_benchmark_profiles_have_stable_names() {
+    let bench_source = include_str!("../benches/replay_core.rs");
+    let required = [
+        (
+            "cold recovery admission",
+            "recovery_defer_no_admission_memory",
+        ),
+        (
+            "cold recovery replay budget",
+            "recovery_defer_event_budget_memory",
+        ),
+        (
+            "cached wake under saturation",
+            "cached_wake_with_recovery_saturated_memory",
+        ),
+    ];
+
+    for (profile, benchmark) in required {
+        assert!(
+            benchmark_exists(bench_source, benchmark),
+            "phase 0009 benchmark profile `{profile}` is missing benchmark `{benchmark}`"
+        );
+    }
+}
+
 fn benchmark_exists(source: &str, name: &str) -> bool {
     if let Some((group, function)) = name.split_once('/') {
         source.contains(&format!("benchmark_group(\"{group}\")"))

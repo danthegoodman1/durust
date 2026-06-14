@@ -724,27 +724,29 @@ Those live reads do not mutate correctness state by themselves. The signal remai
 ## 4.6 Recovery flow control
 
 Streaming replay bounds per-workflow memory, but it does not by itself protect
-the durability provider from a fleet-wide recovery storm. Recovery must have
-explicit admission control and throughput limits separate from normal cached
-workflow progress.
+the durability provider from a fleet-wide recovery storm. Recovery therefore has
+explicit admission control and per-attempt read budgets separate from normal
+cached workflow progress.
 
 Worker/runtime policy owns semantic recovery throttling:
 
 ```text
 max_concurrent_recoveries
-max_replay_events_per_second
-max_replay_bytes_per_second
+recovery_replay_event_budget
+recovery_replay_byte_budget
 recovery_prefetch_chunks
-recovery_burst
+recovery_defer_delay
 per_queue or per_namespace recovery limits
 separate cached-wake and cold-replay budgets
 ```
 
-The worker must acquire recovery capacity before recreating a missing workflow
-future and streaming history. Cached workflow wakes should not be starved behind
-cold replay. When recovery budget is unavailable, the worker should release or
-defer the workflow task through generic delayed visibility, not hold leases while
-idle.
+The worker must acquire cold-recovery capacity before recreating a missing
+workflow future and streaming history beyond the start event. Each cold recovery
+attempt clamps replay stream requests by event count, byte count, and chunk
+count. If a replay attempt exhausts its budget before reaching the claimed
+`replay_target_event_id`, the worker releases the workflow task through generic
+delayed visibility and retries later. Cached workflow wakes use their existing
+tail and are not blocked behind cold replay saturation.
 
 Provider implementations own physical protection for the storage system:
 
@@ -761,10 +763,12 @@ restart, nondeterminism retry, or deployment churn. They may expose generic
 mechanisms such as delayed task visibility, recovery permits, stream budgets, or
 retry-after responses. The worker chooses semantic policy and retry timing.
 
-Provider conformance should include delayed release, bounded history stream
-requests, and provider backpressure behavior. Simulation should include recovery
-storms, cache eviction storms, provider read-budget exhaustion, and fairness
-between hot cached workflows and cold recoveries.
+Provider conformance includes delayed release and bounded history stream
+requests. Provider backpressure remains generic: a provider may return a
+retry-after result when its own read budget is exhausted, and the worker defers
+the workflow task without appending workflow failure history. Simulation includes
+recovery storms, cache eviction storms, provider read-budget exhaustion, and
+fairness between hot cached workflows and cold recoveries.
 
 ---
 
