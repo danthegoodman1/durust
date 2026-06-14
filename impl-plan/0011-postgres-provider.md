@@ -16,18 +16,15 @@ This phase is about correctness, durability, operability, and conformance. It
 must include benchmarks for visibility and regression tracking, but hard
 cross-provider performance tuning belongs to `0012-performance-hardening.md`.
 
-## Reference Implementation
+## Production Posture
 
-Use `../durable-phases` as the high-performance reference for this phase. Its
-Postgres provider proves the production posture we want here: pooled async
-connections, fenced append commits, shard-owned hot state, physical partition
-metadata validation, bounded journal catch-up, periodic snapshots, statement and
-lock timeouts, and benchmark scripts that compare happy-path throughput across
-providers.
+The Postgres provider should keep the production posture explicit: pooled async
+connections, fenced append commits, shard-owned hot state, metadata validation,
+bounded journal catch-up, statement and lock timeouts, and benchmark scripts
+that compare happy-path throughput across providers.
 
-Do not copy its public API shape wholesale. Durust's current `DurableBackend`
-contract remains the compatibility boundary for this phase. The reference is for
-the provider invariants and performance model:
+Durust's current `DurableBackend` contract remains the compatibility boundary
+for this phase. The provider invariants and performance model are:
 
 - normal workflow-task progress stays append-first and fenced;
 - SQL indexes are operational visibility aids, not the only authoritative
@@ -35,8 +32,8 @@ the provider invariants and performance model:
 - partitioning choices are durable metadata and must fail fast on mismatch;
 - hot-path claim/commit work avoids broad scans and cross-partition
   transactions;
-- benchmarks must be able to show whether the Rust provider is approaching the
-  known high-performance implementation before phase 0011 closes.
+- benchmarks must be able to show whether the provider is ready for broader
+  performance hardening before phase 0011 closes.
 
 ## Scope
 
@@ -122,10 +119,9 @@ Implemented and covered:
   `ActivityMapCompleted`/`ActivityMapFailed` history, and blob-backed nested
   manifest hydration.
 - Env-gated Postgres provider conformance is registered and passes against the
-  `../durable-phases` Docker Postgres fixture. The shared child-start
-  conformance assertion now validates behavior without requiring an
-  outbox-specific dispatch count, so inline transactional providers remain
-  valid.
+  local Docker Postgres fixture. The shared child-start conformance assertion
+  now validates behavior without requiring an outbox-specific dispatch count,
+  so inline transactional providers remain valid.
 - Workflow task claims now filter registered workflow types in SQL, use a
   stable ready order, and lock at most one visible row with `FOR UPDATE SKIP
   LOCKED` per claim. This keeps concurrent claimers from briefly locking the
@@ -141,8 +137,8 @@ Implemented and covered:
   schedule/complete.
 - The Postgres benchmark harness now uses one schema per benchmark function and
   unique workflow ids per iteration, so Criterion excludes fixture teardown from
-  hot-path timings. A local run against the `../durable-phases` Docker Postgres
-  fixture with sample size 10 produced this baseline:
+  hot-path timings. A local run against the Docker Postgres fixture with sample
+  size 10 produced this baseline:
 
   | Hot path | p50 | p95 | p99 | Throughput |
   | --- | ---: | ---: | ---: | ---: |
@@ -161,8 +157,8 @@ Implemented and covered:
   The activity-map profile schedules one map and completes eight materialized
   item activities per iteration.
 - These DB tests require `DURUST_POSTGRES_URL`; when it is absent they skip the
-  live database portion. The current slice has also been run against the
-  `../durable-phases` Docker Postgres fixture.
+  live database portion. The current slice has also been run against the local
+  Docker Postgres fixture.
 - The production provider implementation lives in one auditable
   `src/postgres.rs` module. The env-gated Postgres test suite lives separately
   in `src/postgres/tests.rs` so test volume does not obscure the provider code.
@@ -170,9 +166,8 @@ Implemented and covered:
 
 Remaining:
 
-- None for this phase. Cross-provider tuning against the high-performance
-  `../durable-phases` dimensions belongs to
-  `0012-performance-hardening.md`.
+- None for this phase. Cross-provider tuning against Durust-owned benchmark
+  dimensions belongs to `0012-performance-hardening.md`.
 
 ## Acceptance
 

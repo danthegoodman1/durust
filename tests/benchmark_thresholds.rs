@@ -152,6 +152,59 @@ fn phase_0011_postgres_provider_benchmark_profiles_have_stable_names() {
     }
 }
 
+#[test]
+fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
+    let baseline: Value = serde_json::from_str(include_str!(
+        "../benches/baselines/durust-mixed-sqlite.json"
+    ))
+    .expect("mixed SQLite benchmark baseline should be valid JSON");
+    assert_eq!(baseline["backend"], "sqlite");
+    assert_eq!(baseline["mode"], "mixed");
+    assert_eq!(baseline["correct"], true);
+    assert_eq!(baseline["sqliteLayout"], "single-file");
+
+    let options = &baseline["options"];
+    assert_eq!(options["workflows"], 1000);
+    assert_eq!(options["workers"], 4);
+    assert_eq!(options["shards"], 1);
+    assert_eq!(options["activationConcurrency"], 1);
+    assert_eq!(options["activationPrefetchLimit"], 1);
+    assert_eq!(options["batch"], 32);
+
+    assert_eq!(baseline["completedWorkflows"], 1000);
+    assert_eq!(baseline["activations"], 8000);
+    assert_eq!(baseline["mixedActions"], 8000);
+    positive_f64(&baseline, "processingWorkflowsPerSecond");
+    positive_f64(&baseline, "processingMixedActionsPerSecond");
+
+    let counters = &baseline["counters"];
+    for field in [
+        "workflowStarts",
+        "signals",
+        "childStarts",
+        "childCompletions",
+        "timerHandlers",
+        "bootActivities",
+        "childActivities",
+        "finishActivities",
+    ] {
+        assert_eq!(counters[field], 1000, "semantic counter `{field}` drifted");
+    }
+    assert_eq!(counters["workflowTasks"], 8000);
+    assert_eq!(counters["activityTasks"], 3000);
+    assert_eq!(counters["timersFired"], 1000);
+    assert_eq!(counters["childWorkflowStartsDispatched"], 1000);
+
+    let workload_source = include_str!("../src/bin/durust-benchmark-workload.rs");
+    assert!(workload_source.contains("bench.workload.parent"));
+    assert!(workload_source.contains("bench.workload.child"));
+    assert!(workload_source.contains("bench.workload.activity"));
+
+    let compare_source = include_str!("../src/bin/durust-benchmark-compare.rs");
+    assert!(compare_source.contains("processingWorkflowsPerSecond"));
+    assert!(compare_source.contains("benchmark dimensions differ"));
+}
+
 fn benchmark_exists(source: &str, name: &str) -> bool {
     if let Some((group, function)) = name.split_once('/') {
         source.contains(&format!("benchmark_group(\"{group}\")"))
@@ -159,6 +212,17 @@ fn benchmark_exists(source: &str, name: &str) -> bool {
     } else {
         source.contains(&format!("bench_function(\"{name}\""))
     }
+}
+
+fn positive_f64(value: &Value, field: &str) -> f64 {
+    let parsed = value[field]
+        .as_f64()
+        .unwrap_or_else(|| panic!("benchmark baseline should include numeric `{field}`"));
+    assert!(
+        parsed.is_finite() && parsed > 0.0,
+        "benchmark baseline field `{field}` must be positive"
+    );
+    parsed
 }
 
 fn positive_u64(benchmark: &Value, field: &str, name: &str) -> u64 {

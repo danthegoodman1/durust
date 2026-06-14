@@ -1,25 +1,26 @@
 ---
 id: 0012
 title: Performance hardening
-status: not_started
+status: in_progress
 depends_on: [0011]
-labels: [performance, benchmarks, sqlite, postgres, durable-phases, regression-gates]
+labels: [performance, benchmarks, sqlite, postgres, regression-gates]
 ---
 
 # Performance Hardening
 
 Make performance a dedicated release gate after the Postgres provider is
 correct, conformant, and covered by simulation. This phase owns benchmark
-parity, bottleneck removal, and regression thresholds across providers.
+baselines, bottleneck removal, and regression thresholds across providers.
 
-The benchmark reference is `../durable-phases`. Durust must meet equivalent
-`../durable-phases` throughput within 5% for comparable workload dimensions
-before this phase is accepted.
+Durust must maintain checked-in benchmark baselines for accepted workload
+dimensions. A benchmark is accepted only when its workload shape, provider,
+worker count, shard count, activation concurrency, prefetch limit, and batch
+size are recorded with the measured result.
 
 ## Scope
 
 - Shared benchmark harness for memory, single-file SQLite, Postgres, and
-  `../durable-phases` comparisons.
+  generic baseline comparisons.
 - Comparable workload dimensions: workflow count, worker count, shard/partition
   count, activation concurrency, prefetch limit, commit batch size, history
   size, payload size, and workload mix.
@@ -35,14 +36,100 @@ before this phase is accepted.
 - Provider startup/rebuild throughput.
 - Regression thresholds and documented benchmark invocation.
 
+## Current State
+
+Implemented:
+
+- `durust-benchmark-report`, a small Criterion sample reporter that reads
+  `target/criterion/<group>/*/new/sample.json`, validates that latency sample
+  data is present and well-formed, and reports p50/p95/p99 plus throughput per
+  benchmark. This is the first reusable reporting primitive for the phase 0012
+  regression gate.
+- `durust-benchmark-compare`, a strict benchmark comparator that reads one
+  candidate JSON file and one baseline JSON file, requires `correct=true`,
+  validates comparable dimensions before comparing throughput, and fails when
+  the candidate is below the configured throughput ratio.
+- `durust-benchmark-workload`, a first JSON workload runner for Durust using a
+  stable result vocabulary. The current runner covers mixed mode against
+  memory, single-file SQLite, and env-gated Postgres. Mixed mode runs every root
+  workflow through a boot activity, child workflow with child activity, buffered
+  signal, zero-duration timer, finish activity, exact output verification, and
+  semantic action counters. The runner emits `backend`, `mode`, `correct`,
+  provider-specific options, nested benchmark dimensions, processing-only
+  throughput, semantic action counters, and Durust worker stats, and rejects
+  unsupported shard, activation-concurrency, and prefetch dimensions instead of
+  reporting misleading numbers.
+- `benches/baselines/durust-mixed-sqlite.json`, the first checked-in baseline
+  artifact. The accepted dimension is single-file SQLite, mixed mode, 1,000
+  workflows, 4 workers, shard/concurrency/prefetch dimensions set to 1, and
+  batch 32. The captured release run completed 1,000 workflows, 8,000 semantic
+  mixed actions, 8,000 workflow tasks, and reports about 44.5 processing
+  workflows/sec and 356.3 processing mixed-actions/sec.
+
+Remaining:
+
+- Run and record env-gated Postgres workload numbers with
+  `DURUST_POSTGRES_URL`.
+- Add comparable benchmark support for additional modes: bare, activity,
+  signal, timer, child, activity map, payload refs, recovery, and cached wake
+  under recovery load.
+- Decide whether worker-level activation concurrency/prefetch should become
+  real runtime knobs before accepting benchmark dimensions with values above 1.
+- Wire CI/performance-job guidance.
+- Add checked-in baseline files or captured-output artifacts for the remaining
+  accepted benchmark dimensions.
+
+## Local Commands
+
+Current Durust mixed SQLite workload:
+
+```bash
+cargo run --release --locked --bin durust-benchmark-workload -- \
+  --backend sqlite \
+  --mode mixed \
+  --workflows 1000 \
+  --workers 4 \
+  --shards 1 \
+  --activation-concurrency 1 \
+  --activation-prefetch-limit 1 \
+  --batch 32 \
+  --json > target/durust-mixed-sqlite.json
+```
+
+Current Durust mixed Postgres workload:
+
+```bash
+DURUST_POSTGRES_URL=postgresql://durable:durable@127.0.0.1:55432/durable \
+  cargo run --release --locked --bin durust-benchmark-workload -- \
+  --backend postgres \
+  --mode mixed \
+  --workflows 1000 \
+  --workers 4 \
+  --shards 1 \
+  --activation-concurrency 1 \
+  --activation-prefetch-limit 1 \
+  --batch 32 \
+  --postgres-pool-size 8 \
+  --json
+```
+
+Regression gate for captured JSON files:
+
+```bash
+cargo run --release --locked --bin durust-benchmark-compare -- \
+  --durust target/durust-mixed-sqlite.json \
+  --baseline benches/baselines/durust-mixed-sqlite.json \
+  --min-ratio 0.95
+```
+
 ## Acceptance
 
 - Benchmarks are reproducible locally with documented commands and environment
   requirements.
-- Benchmark outputs include enough dimensions to compare Durust and
-  `../durable-phases` honestly.
-- For each equivalent benchmark, Durust throughput is no worse than 5% below
-  the relevant `../durable-phases` baseline, or the phase remains open with a
+- Benchmark outputs include enough dimensions to compare a candidate run and a
+  checked-in baseline honestly.
+- For each accepted benchmark, candidate throughput is no worse than 5% below
+  the relevant Durust-owned baseline, or the phase remains open with a
   documented bottleneck and fix plan.
 - Single-file SQLite and Postgres each have provider-specific bottlenecks
   measured and either fixed or explicitly accepted.
@@ -80,9 +167,9 @@ before this phase is accepted.
 
 ## Performance Gate
 
-- Meet `../durable-phases` throughput within 5% for every comparable benchmark
+- Meet checked-in Durust baseline throughput within 5% for every benchmark
   dimension accepted for this phase.
-- Record any benchmark where Durust exceeds `../durable-phases` by more than 5%
-  and keep the benchmark shape as a regression target.
+- Record any benchmark where a candidate run exceeds the baseline by more than
+  5% and keep the benchmark shape as a regression target.
 - Record p50/p95/p99 latency alongside throughput for every hot-path benchmark.
 - Publish baseline files or documented captured output for the accepted run.

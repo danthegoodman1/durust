@@ -18,7 +18,7 @@ No macro-lowered continuation frames
 
 This gets you Temporal-style ergonomics without asking a proc macro to serialize arbitrary Rust locals. Temporal’s own model is based on deterministic workflow code, replay, workflow-safe alternatives for time/concurrency, and history markers for versioning; the Go SDK docs explicitly describe workflows as procedural coordination code whose state is recreated on another worker, with restrictions such as deterministic execution, using SDK time/sleep/select equivalents, and avoiding randomized map iteration. ([Go Packages][1])
 
-`../durable-phases` is useful prior art for the durability posture: keep the happy-path persistence path append-only so durable commits are cheap and backend implementations can optimize around their native log/write model. The deliberate difference here is execution state. This runtime should keep the live workflow future cached on a worker while the workflow is running, and only reconstruct locals by replay after worker loss, cache eviction, or explicit recovery. Recovery from durable storage happens on cache miss or failure, not at every wait boundary.
+The durability posture is append-first: keep the happy-path persistence path append-only so durable commits are cheap and backend implementations can optimize around their native log/write model. The deliberate execution-state choice is that this runtime should keep the live workflow future cached on a worker while the workflow is running, and only reconstruct locals by replay after worker loss, cache eviction, or explicit recovery. Recovery from durable storage happens on cache miss or failure, not at every wait boundary.
 
 The core accepted tradeoff becomes:
 
@@ -1426,7 +1426,7 @@ The worker must drop the cached future and replay from the new tail.
 
 ## 8.4 Append-journal provider shape
 
-The preferred storage shape follows the same performance goal as the durability store in `../durable-phases`: accepted mutations append to a journal/log in the happy path, with operational indexes maintained as derived state.
+The preferred storage shape follows the runtime's performance goal: accepted mutations append to a journal/log in the happy path, with operational indexes maintained as derived state.
 
 Provider requirements:
 
@@ -2867,7 +2867,7 @@ terminal workflow rejects new workflow-visible commands
 
 The suite should include crash/restart variants for each provider that can persist across process boundaries. For SQLite, tests should close and reopen the provider and verify recovery from the append journal, not from in-memory state.
 
-Throughput targets should be equal to or higher than comparable `../durable-phases` benchmark modes. Use the `durable-phases` Rust benchmark dimensions as the baseline vocabulary: workflows per second, activations per second, mixed actions per second, worker count, shard count, activation concurrency, prefetch limit, and commit batch size.
+Throughput targets should meet or exceed checked-in Durust benchmark baselines for comparable workload dimensions. Use a stable benchmark vocabulary: workflows per second, activations per second, mixed actions per second, worker count, shard count, activation concurrency, prefetch limit, and commit batch size.
 
 Benchmark profiles:
 
