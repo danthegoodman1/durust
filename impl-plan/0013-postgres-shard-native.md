@@ -95,23 +95,32 @@ storage layout detail.
 
 ## Implementation Slices
 
-1. Update spec, plan, worker builder knobs, and generic backend batch methods
-   while preserving all existing provider behavior.
-2. Add `PostgresBackendConfig` metadata validation, shard hashing, shard lease
-   tables, and unit tests.
-3. Implement projection load from empty state, snapshot, and journal tail.
-4. Implement shard-local workflow start, claim, release, stream history, and
-   batch commit for the core workflow-task path.
-5. Port external append paths into shard projections: signals, timers,
-   activities, child lifecycle, activity maps, query projections, version
-   markers, delayed visibility, payload roots, and GC.
-6. Register the provider in conformance and add restart tests proving snapshot
-   plus journal tail reconstructs operational state.
-7. Add deterministic fault simulation for lease loss, duplicate/delayed
-   commits, stale workers, worker crash, batched conflicts, timer/signal/
-   activity/child ordering, cross-shard delivery, and lease transfer.
-8. Add benchmark support for multi-shard `postgres` runs and accepted
-   baselines.
+1. **Done:** Update spec, plan, worker builder knobs, and generic backend batch
+   methods while preserving all existing provider behavior.
+2. **Done:** Add `PostgresBackendConfig` metadata validation, shard hashing,
+   shard lease tables, and unit tests.
+3. **Done:** Implement runtime prepare-then-commit workflow-task scheduling so
+   prefetched workflow tasks can be committed through `commit_workflow_tasks`.
+4. **Done:** Implement shard-aware Postgres batch workflow-task claim in one
+   transaction, including unfiltered claim lease acquisition.
+5. **Done:** Implement shard-fenced Postgres batch workflow-task commit in one
+   transaction with ordered per-item committed/conflict/stale results.
+6. **Done:** Append one fenced shard-journal operation per shard/lease epoch for
+   each workflow-task commit batch.
+7. **Done:** Add provider/unit coverage for shard hashing, metadata mismatch,
+   shard-filtered claim, unfiltered shard lease acquisition, stale owner commit
+   rejection, ordered batch commit results, and shard-journal batching.
+8. **Done:** Add benchmark support and checked-in baselines for 1-shard
+   Postgres and 100-shard/10-worker Postgres runs.
+9. **Remaining:** Implement projection load from empty state, snapshot, and
+   journal tail for full operational rebuild from the shard journal.
+10. **Remaining:** Port external append paths into shard projections: signals,
+    timers, activities, child lifecycle, activity maps, query projections,
+    version markers, delayed visibility, payload roots, and GC.
+11. **Remaining:** Add deterministic fault simulation for crash after append
+    before snapshot, snapshot restore/journal catch-up, lease transfer preserving
+    ready work, and unfavorable timer/signal/activity/child ordering under
+    batched commits.
 
 ## Benchmark Gate
 
@@ -127,8 +136,20 @@ Accepted baselines:
   saturation.
 
 Each accepted result records workflows/sec, mixed actions/sec, activations/sec,
-p50/p95/p99 commit latency, WAL bytes/sec, pool wait, active connections, CPU,
-and correctness counters.
+p50/p95/p99 workflow-task commit latency, WAL bytes/sec, active connections,
+and correctness counters. Pool wait and CPU counters remain future benchmark
+fields because the current local harness does not expose pool wait or host CPU
+sampling.
+
+Measured local baselines:
+
+- 1 shard / 4 workers / 1,000 mixed workflows:
+  38.46 processing workflows/sec, 307.68 processing mixed actions/sec, p50/p95/
+  p99 workflow-task commit latency 4.94/7.98/8.87ms.
+- 100 logical shards / 16 physical partitions / 10 workers / 1,000 mixed
+  workflows / prefetch 32 / batch 32:
+  54.48 processing workflows/sec, 435.81 processing mixed actions/sec, p50/p95/
+  p99 workflow-task commit latency 18.63/57.36/122.40ms.
 
 ## Required Tests
 

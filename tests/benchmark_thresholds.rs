@@ -234,6 +234,13 @@ fn phase_0012_mixed_postgres_baseline_is_dimensioned_and_semantic() {
     assert_eq!(baseline["mixedActions"], 8000);
     positive_f64(&baseline, "processingWorkflowsPerSecond");
     positive_f64(&baseline, "processingMixedActionsPerSecond");
+    assert!(
+        baseline["backendMetrics"]["workflowTaskCommitLatency"]["p95Ms"]
+            .as_f64()
+            .unwrap()
+            > 0.0
+    );
+    assert!(baseline["postgresStats"]["walBytes"].as_u64().unwrap() > 0);
 
     let counters = &baseline["counters"];
     for field in [
@@ -252,6 +259,59 @@ fn phase_0012_mixed_postgres_baseline_is_dimensioned_and_semantic() {
         counters["workflowTasks"].as_u64().unwrap() <= 8000,
         "Postgres may coalesce ready events during cold replay, but must not exceed the nominal task target"
     );
+    assert_eq!(counters["activityTasks"], 3000);
+    assert_eq!(counters["timersFired"], 1000);
+}
+
+#[test]
+fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
+    let baseline: Value = serde_json::from_str(include_str!(
+        "../benches/baselines/durust-mixed-postgres-100-shards.json"
+    ))
+    .expect("mixed sharded Postgres benchmark baseline should be valid JSON");
+    assert_eq!(baseline["backend"], "postgres");
+    assert_eq!(baseline["mode"], "mixed");
+    assert_eq!(baseline["correct"], true);
+
+    let options = &baseline["options"];
+    assert_eq!(options["workflows"], 1000);
+    assert_eq!(options["workers"], 10);
+    assert_eq!(options["shards"], 100);
+    assert_eq!(options["physicalPartitions"], 16);
+    assert_eq!(options["activationConcurrency"], 8);
+    assert_eq!(options["activationPrefetchLimit"], 32);
+    assert_eq!(options["batch"], 32);
+    assert_eq!(options["postgresPoolSize"], 24);
+
+    assert_eq!(baseline["completedWorkflows"], 1000);
+    assert_eq!(baseline["mixedActions"], 8000);
+    assert!(
+        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 50.0,
+        "sharded Postgres baseline should prove scale-out improvement over the normalized baseline"
+    );
+    positive_f64(&baseline, "processingMixedActionsPerSecond");
+    assert!(
+        baseline["backendMetrics"]["workflowTaskCommitLatency"]["samples"]
+            .as_u64()
+            .unwrap()
+            < baseline["counters"]["workflowTasks"].as_u64().unwrap(),
+        "batching should reduce workflow task commit calls below workflow task count"
+    );
+    assert!(baseline["postgresStats"]["walBytes"].as_u64().unwrap() > 0);
+
+    let counters = &baseline["counters"];
+    for field in [
+        "workflowStarts",
+        "signals",
+        "childStarts",
+        "childCompletions",
+        "timerHandlers",
+        "bootActivities",
+        "childActivities",
+        "finishActivities",
+    ] {
+        assert_eq!(counters[field], 1000, "semantic counter `{field}` drifted");
+    }
     assert_eq!(counters["activityTasks"], 3000);
     assert_eq!(counters["timersFired"], 1000);
 }

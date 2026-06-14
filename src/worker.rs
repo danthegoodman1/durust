@@ -262,6 +262,22 @@ enum WorkflowTaskOutcome {
     Deferred,
 }
 
+enum PreparedWorkflowTaskOutcome {
+    Prepared(PreparedWorkflowTask),
+    Deferred,
+}
+
+struct PreparedWorkflowTask {
+    run_id: RunId,
+    claim: crate::WorkflowTaskClaim,
+    commit: WorkflowTaskCommit,
+    future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
+    runtime_appended_tail: EventId,
+    next_command_seq: u64,
+    default_activity_options: crate::ActivityOptions,
+    terminal: bool,
+}
+
 enum WorkflowPollOutcome {
     Ready(Poll<Result<crate::PayloadRef>>),
     Deferred,
@@ -340,12 +356,64 @@ where
             return Ok(0);
         }
 
-        let mut processed = 0usize;
+        let mut prepared = Vec::with_capacity(claimed.len());
         for task in claimed {
-            self.run_claimed_workflow_task(task).await?;
-            processed += 1;
+            match self.prepare_claimed_workflow_task(task).await? {
+                PreparedWorkflowTaskOutcome::Prepared(task) => prepared.push(task),
+                PreparedWorkflowTaskOutcome::Deferred => {}
+            }
         }
-        Ok(processed)
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+
+        let mut committed = 0usize;
+        for chunk in prepared.chunks_mut(self.workflow_task_concurrency.commit_batch_size.max(1)) {
+            let commits = chunk
+                .iter()
+                .map(|task| crate::WorkflowTaskCommitInput {
+                    claim: task.claim.clone(),
+                    commit: task.commit.clone(),
+                })
+                .collect::<Vec<_>>();
+            let results = self
+                .backend
+                .commit_workflow_tasks(crate::WorkflowTaskCommitBatch { commits })
+                .await?;
+            for (task, result) in chunk.iter_mut().zip(results.into_iter()) {
+                let crate::CommitOutcome::Committed {
+                    new_tail_event_id: last_event_id,
+                } = result.result?
+                else {
+                    continue;
+                };
+                committed += 1;
+                if task.terminal || last_event_id > task.runtime_appended_tail {
+                    continue;
+                }
+                let future = std::mem::replace(
+                    &mut task.future,
+                    Box::pin(std::future::ready(Err(Error::Backend(
+                        "committed workflow future was already moved".to_owned(),
+                    )))),
+                );
+                self.cache.insert(
+                    task.run_id.clone(),
+                    CachedWorkflow {
+                        future,
+                        last_event_id,
+                        next_command_seq: task.next_command_seq,
+                        default_activity_options: task.default_activity_options.clone(),
+                    },
+                );
+            }
+        }
+
+        if committed > 0 {
+            self.run_local_activities_after_workflow_tasks(committed)
+                .await?;
+        }
+        Ok(committed)
     }
 
     async fn run_claimed_workflow_task(
@@ -551,8 +619,202 @@ where
         if let Some(entry) = entry {
             self.cache.insert(run_id, entry);
         }
-        self.run_local_activities_after_workflow_task().await?;
+        self.run_local_activities_after_workflow_tasks(1).await?;
         Ok(())
+    }
+
+    async fn prepare_claimed_workflow_task(
+        &mut self,
+        claimed: crate::ClaimedWorkflowTask,
+    ) -> Result<PreparedWorkflowTaskOutcome> {
+        let claim_for_release = claimed.claim.clone();
+        let cached = self.cache.remove(&claimed.run_id);
+        let now = self.backend.current_time().await?;
+        let change_versions = self
+            .backend
+            .workflow_change_versions(WorkflowChangeVersionsRequest {
+                namespace: self.namespace.clone(),
+                workflow_id: None,
+                run_id: Some(claimed.run_id.clone()),
+                change_id: None,
+            })
+            .await?
+            .records;
+        let entry_result = if let Some(mut cached) = cached {
+            let chunk = self
+                .stream_history_chunk(
+                    claimed.run_id.clone(),
+                    cached.last_event_id,
+                    claimed.replay_target_event_id,
+                )
+                .await;
+            match chunk {
+                Ok(chunk) => {
+                    let mut context = crate::runtime::RuntimeContext::new(
+                        claimed.run_id.clone(),
+                        self.workflow_task_queue.clone(),
+                        self.activity_task_queue.clone(),
+                        self.payload_codec,
+                        now,
+                        chunk.events,
+                        cached.default_activity_options,
+                        cached.next_command_seq,
+                        chunk.last_event_id,
+                        claimed.replay_target_event_id,
+                        change_versions.clone(),
+                    );
+                    let poll = self
+                        .poll_until_history_blocked_or_ready(
+                            &claimed.run_id,
+                            &mut cached.future,
+                            &mut context,
+                            claimed.replay_target_event_id,
+                            None,
+                        )
+                        .await;
+                    match poll {
+                        Ok(WorkflowPollOutcome::Ready(poll)) => self
+                            .prepare_workflow_poll(claimed, cached.future, context, poll)
+                            .await
+                            .map(PreparedWorkflowTaskOutcome::Prepared),
+                        Ok(WorkflowPollOutcome::Deferred) => {
+                            Ok(PreparedWorkflowTaskOutcome::Deferred)
+                        }
+                        Err(err) => Err(err),
+                    }
+                }
+                Err(err) => Err(err),
+            }
+        } else {
+            let is_recovery = claimed.replay_target_event_id > EventId(1);
+            if is_recovery && !self.try_acquire_recovery() {
+                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                    .await
+                    .map(|_| PreparedWorkflowTaskOutcome::Deferred)
+            } else {
+                let mut recovery_budget =
+                    is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
+                let first_chunk = match recovery_budget.as_mut() {
+                    Some(budget) => {
+                        self.stream_recovery_history_chunk(
+                            claimed.run_id.clone(),
+                            EventId::ZERO,
+                            claimed.replay_target_event_id,
+                            budget,
+                        )
+                        .await
+                    }
+                    None => self
+                        .stream_history_chunk(
+                            claimed.run_id.clone(),
+                            EventId::ZERO,
+                            claimed.replay_target_event_id,
+                        )
+                        .await
+                        .map(Some),
+                };
+                let result = match first_chunk {
+                    Ok(Some(first_chunk)) => {
+                        let last_loaded_event_id = first_chunk.last_event_id;
+                        match split_start_event(&first_chunk.events) {
+                            Err(err) => Err(err),
+                            Ok((input, replay_events)) => {
+                                let input = self.hydrate_payload_for_decode(input).await?;
+                                match self.registry.workflow(&claimed.workflow_type) {
+                                    None => Err(Error::WorkflowNotRegistered(
+                                        claimed.workflow_type.clone(),
+                                    )),
+                                    Some(registration) => {
+                                        let mut future =
+                                            registration.run(input, self.payload_codec);
+                                        let mut context = crate::runtime::RuntimeContext::new(
+                                            claimed.run_id.clone(),
+                                            self.workflow_task_queue.clone(),
+                                            self.activity_task_queue.clone(),
+                                            self.payload_codec,
+                                            now,
+                                            replay_events,
+                                            crate::ActivityOptions::default(),
+                                            0,
+                                            last_loaded_event_id,
+                                            claimed.replay_target_event_id,
+                                            change_versions.clone(),
+                                        );
+                                        let poll = self
+                                            .poll_until_history_blocked_or_ready(
+                                                &claimed.run_id,
+                                                &mut future,
+                                                &mut context,
+                                                claimed.replay_target_event_id,
+                                                recovery_budget.as_mut(),
+                                            )
+                                            .await;
+                                        match poll {
+                                            Ok(WorkflowPollOutcome::Ready(poll)) => self
+                                                .prepare_workflow_poll(
+                                                    claimed, future, context, poll,
+                                                )
+                                                .await
+                                                .map(PreparedWorkflowTaskOutcome::Prepared),
+                                            Ok(WorkflowPollOutcome::Deferred) => self
+                                                .defer_workflow_task(
+                                                    claimed.claim,
+                                                    self.recovery_flow_control.defer_delay,
+                                                )
+                                                .await
+                                                .map(|_| PreparedWorkflowTaskOutcome::Deferred),
+                                            Err(err) => Err(err),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => self
+                        .defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                        .await
+                        .map(|_| PreparedWorkflowTaskOutcome::Deferred),
+                    Err(err) => Err(err),
+                };
+                if is_recovery {
+                    self.release_recovery();
+                }
+                result
+            }
+        };
+
+        match entry_result {
+            Ok(entry) => Ok(entry),
+            Err(err) => {
+                if let Error::Backpressure { retry_after, .. } = &err {
+                    let delay = self.backpressure_delay(*retry_after);
+                    let _ = self
+                        .backend
+                        .release_workflow_task(
+                            claim_for_release,
+                            WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
+                        )
+                        .await;
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+                let release = if matches!(
+                    &err,
+                    Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
+                ) {
+                    WorkflowTaskRelease::delayed(
+                        WorkflowTaskReason::CacheEvicted,
+                        self.nondeterminism_retry_backoff,
+                    )
+                } else {
+                    WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted)
+                };
+                let _ = self
+                    .backend
+                    .release_workflow_task(claim_for_release, release)
+                    .await;
+                Err(err)
+            }
+        }
     }
 
     pub async fn run_activity_once(&mut self) -> Result<bool> {
@@ -903,6 +1165,47 @@ where
         context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
     ) -> Result<Option<CachedWorkflow>> {
+        let prepared = self
+            .prepare_workflow_poll(claimed, future, context, poll)
+            .await?;
+        let runtime_appended_tail = prepared.runtime_appended_tail;
+        let terminal = prepared.terminal;
+        let next_command_seq = prepared.next_command_seq;
+        let default_activity_options = prepared.default_activity_options.clone();
+        let future = prepared.future;
+        let commit = self
+            .backend
+            .commit_workflow_task(prepared.claim, prepared.commit)
+            .await?;
+        let crate::CommitOutcome::Committed {
+            new_tail_event_id: last_event_id,
+        } = commit
+        else {
+            return Ok(None);
+        };
+
+        if terminal {
+            return Ok(None);
+        }
+        if last_event_id > runtime_appended_tail {
+            return Ok(None);
+        }
+
+        Ok(Some(CachedWorkflow {
+            future,
+            last_event_id,
+            next_command_seq,
+            default_activity_options,
+        }))
+    }
+
+    async fn prepare_workflow_poll(
+        &mut self,
+        claimed: crate::ClaimedWorkflowTask,
+        future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
+        context: crate::runtime::RuntimeContext,
+        poll: Poll<Result<crate::PayloadRef>>,
+    ) -> Result<PreparedWorkflowTask> {
         let next_command_seq = context.next_command_seq();
         let parts = context.into_commit_parts();
         let default_activity_options = parts.default_activity_options.clone();
@@ -943,51 +1246,40 @@ where
                 .saturating_add(u64::try_from(append_events.len()).unwrap_or(u64::MAX)),
         );
 
-        let commit = self
-            .backend
-            .commit_workflow_task(
-                claimed.claim,
-                WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
-                    append_events,
-                    upsert_waits: parts.upsert_waits,
-                    schedule_activities: parts.schedule_activities,
-                    schedule_activity_maps: parts.schedule_activity_maps,
-                    start_child_workflows: parts.start_child_workflows,
-                    consume_signals: parts.consume_signals,
-                    delete_waits: parts.delete_waits,
-                    cancel_commands: parts.cancel_commands,
-                    query_projection: parts.query_projection,
-                },
-            )
-            .await?;
-        let crate::CommitOutcome::Committed {
-            new_tail_event_id: last_event_id,
-        } = commit
-        else {
-            return Ok(None);
-        };
-
-        if terminal {
-            return Ok(None);
-        }
-        if last_event_id > runtime_appended_tail {
-            return Ok(None);
-        }
-
-        Ok(Some(CachedWorkflow {
+        Ok(PreparedWorkflowTask {
+            run_id: claimed.run_id,
+            claim: claimed.claim,
+            commit: WorkflowTaskCommit {
+                expected_tail_event_id: claimed.replay_target_event_id,
+                append_events,
+                upsert_waits: parts.upsert_waits,
+                schedule_activities: parts.schedule_activities,
+                schedule_activity_maps: parts.schedule_activity_maps,
+                start_child_workflows: parts.start_child_workflows,
+                consume_signals: parts.consume_signals,
+                delete_waits: parts.delete_waits,
+                cancel_commands: parts.cancel_commands,
+                query_projection: parts.query_projection,
+            },
             future,
-            last_event_id,
+            runtime_appended_tail,
             next_command_seq,
             default_activity_options,
-        }))
+            terminal,
+        })
     }
 
-    async fn run_local_activities_after_workflow_task(&mut self) -> Result<()> {
+    async fn run_local_activities_after_workflow_tasks(
+        &mut self,
+        workflow_tasks: usize,
+    ) -> Result<()> {
         if self.max_local_activities_per_workflow_task == 0 {
             return Ok(());
         }
-        for _ in 0..self.max_local_activities_per_workflow_task {
+        let limit = self
+            .max_local_activities_per_workflow_task
+            .saturating_mul(workflow_tasks.max(1));
+        for _ in 0..limit {
             if self.run_activity_once().await? {
                 self.completed_local_activity_tasks =
                     self.completed_local_activity_tasks.saturating_add(1);

@@ -1353,10 +1353,10 @@ pub struct ClaimActivityOptions {
 The provider should match both queue and registered type/name. If no matching task exists, it returns `Ok(None)`. A task for an unregistered type must remain claimable by another worker that advertises the matching capability.
 
 Batch claim and batch commit methods are a provider-neutral optimization
-surface. Memory, SQLite, and the normalized Postgres layout may implement them
-by looping over the one-at-a-time methods. Shard-native or log-backed provider
-layouts should use them to reduce durable round trips while preserving the same
-lease fencing, event ordering, and conflict semantics as individual calls.
+surface. Memory and SQLite may implement them by looping over the one-at-a-time
+methods. Postgres and other shard-native or log-backed provider layouts should
+use them to reduce durable round trips while preserving the same lease fencing,
+event ordering, and conflict semantics as individual calls.
 
 Batch commit returns one result per input commit in input order:
 
@@ -2934,6 +2934,9 @@ terminal workflow rejects new workflow-visible commands
 The suite should include crash/restart variants for each provider that can persist across process boundaries. For SQLite, tests should close and reopen the provider and verify recovery from the append journal, not from in-memory state.
 
 Throughput targets should meet or exceed checked-in Durust benchmark baselines for comparable workload dimensions. Use a stable benchmark vocabulary: workflows per second, activations per second, mixed actions per second, worker count, shard count, activation concurrency, prefetch limit, and commit batch size.
+Postgres benchmark outputs also report workflow-task commit latency percentiles,
+WAL bytes/sec, and active connections when local server statistics are
+available.
 
 Benchmark profiles:
 

@@ -23,6 +23,7 @@ use deadpool_postgres::{
     Manager, ManagerConfig, Object as PooledPostgresClient, Pool, RecyclingMethod, Runtime,
 };
 use futures::future::{BoxFuture, ready};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -36,6 +37,43 @@ const DEFAULT_PHYSICAL_PARTITIONS: u32 = 1;
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
 const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShardJournalOperation {
+    kind: ShardJournalOperationKind,
+    entries: Vec<ShardJournalEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum ShardJournalOperationKind {
+    WorkflowTaskBatch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShardJournalEntry {
+    run_id: RunId,
+    expected_tail_event_id: EventId,
+    new_tail_event_id: EventId,
+    result: ShardJournalCommitResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum ShardJournalCommitResult {
+    Committed {
+        appended_events: usize,
+        terminal: bool,
+        ready_reason: Option<String>,
+    },
+    Conflict,
+}
+
+#[derive(Clone, Debug)]
+struct AppliedWorkflowTaskCommit {
+    outcome: CommitOutcome,
+    shard_id: i32,
+    lease_epoch: i64,
+    journal_entry: ShardJournalEntry,
+}
 
 #[derive(Clone, Debug)]
 pub struct PostgresBackendConfig {
@@ -587,16 +625,16 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         worker_id: &WorkerId,
         shard_id: i32,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         if self.logical_shards <= 1 {
-            return Ok(());
+            return Ok(0);
         }
         let schema = self.schema_sql();
         let now_ms = unix_epoch_millis();
         let Some(row) = tx
             .query_opt(
                 &format!(
-                    "select owner_id, lease_until_ms
+                    "select owner_id, lease_until_ms, lease_epoch
                      from {schema}.shard_leases
                      where shard_id = $1"
                 ),
@@ -609,10 +647,11 @@ impl PostgresBackend {
         };
         let owner_id: Option<String> = row.get(0);
         let lease_until_ms: Option<i64> = row.get(1);
+        let lease_epoch: i64 = row.get(2);
         if owner_id.as_deref() == Some(worker_id.0.as_str())
             && lease_until_ms.is_some_and(|lease_until_ms| lease_until_ms > now_ms)
         {
-            Ok(())
+            Ok(lease_epoch)
         } else {
             Err(Error::StaleLease)
         }
@@ -687,23 +726,7 @@ impl DurableBackend for PostgresBackend {
         opts: ClaimWorkflowTasksOptions,
     ) -> BoxFuture<'static, Result<Vec<ClaimedWorkflowTask>>> {
         let backend = self.clone();
-        Box::pin(async move {
-            let mut claimed = Vec::new();
-            for _ in 0..opts.limit {
-                let Some(task) = backend
-                    .claim_workflow_task_inner_filtered(
-                        worker_id.clone(),
-                        opts.claim.clone(),
-                        opts.shard_filter.clone(),
-                    )
-                    .await?
-                else {
-                    break;
-                };
-                claimed.push(task);
-            }
-            Ok(claimed)
-        })
+        Box::pin(async move { backend.claim_workflow_tasks_inner(worker_id, opts).await })
     }
 
     fn stream_history(
@@ -746,6 +769,14 @@ impl DurableBackend for PostgresBackend {
     ) -> BoxFuture<'static, Result<CommitOutcome>> {
         let backend = self.clone();
         Box::pin(async move { backend.commit_workflow_task_inner(claim, batch).await })
+    }
+
+    fn commit_workflow_tasks(
+        &self,
+        batch: crate::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, Result<Vec<crate::WorkflowTaskCommitBatchResult>>> {
+        let backend = self.clone();
+        Box::pin(async move { backend.commit_workflow_tasks_inner(batch).await })
     }
 
     fn release_workflow_task(
@@ -987,6 +1018,172 @@ impl PostgresBackend {
             .await
     }
 
+    async fn claim_workflow_tasks_inner(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimWorkflowTasksOptions,
+    ) -> Result<Vec<ClaimedWorkflowTask>> {
+        if opts.limit == 0 || opts.claim.registered_workflow_types.is_empty() {
+            return Ok(Vec::new());
+        }
+        let registered_names = opts
+            .claim
+            .registered_workflow_types
+            .iter()
+            .map(|workflow_type| workflow_type.name.clone())
+            .collect::<Vec<_>>();
+        let registered_versions = opts
+            .claim
+            .registered_workflow_types
+            .iter()
+            .map(|workflow_type| i32::try_from(workflow_type.version).unwrap_or(i32::MAX))
+            .collect::<Vec<_>>();
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(postgres_error)?;
+        let schema = self.schema_sql();
+        let now_ms = unix_epoch_millis();
+        let shard_ids = match opts.shard_filter {
+            Some(shards) => {
+                let owned = self
+                    .refresh_shard_leases_tx(
+                        &tx,
+                        &worker_id,
+                        &shards,
+                        opts.claim.lease_duration,
+                        now_ms,
+                    )
+                    .await?;
+                if owned.is_empty() {
+                    tx.commit().await.map_err(postgres_error)?;
+                    return Ok(Vec::new());
+                }
+                Some(
+                    owned
+                        .into_iter()
+                        .map(|shard| i32::try_from(shard.0).unwrap_or(i32::MAX))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            None => None,
+        };
+
+        let rows = tx
+            .query(
+                &format!(
+                    "select run_id, workflow_id, workflow_name, workflow_version, current_event_id, ready_reason, shard_id
+                     from {schema}.workflow_instances
+                     where namespace = $1
+                       and task_queue = $2
+                       and ready_reason is not null
+                       and ready_at_ms <= $3
+                       and workflow_claim_token is null
+                       and terminal = false
+                       and ($6::integer[] is null or shard_id = any($6::integer[]))
+                       and (workflow_name, workflow_version) in (
+                         select registered.workflow_name, registered.workflow_version
+                         from unnest($4::text[], $5::integer[])
+                              as registered(workflow_name, workflow_version)
+                       )
+                     order by ready_at_ms asc, run_id asc
+                     limit $7
+                     for update skip locked"
+                ),
+                &[
+                    &opts.claim.namespace.0,
+                    &opts.claim.task_queue.0,
+                    &now_ms,
+                    &registered_names,
+                    &registered_versions,
+                    &shard_ids,
+                    &i64::try_from(opts.limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(postgres_error)?;
+
+        let mut selected = rows
+            .into_iter()
+            .map(|row| {
+                let workflow_type = WorkflowType::new(
+                    row.get::<_, String>(2),
+                    u32::try_from(row.get::<_, i32>(3)).unwrap_or(0),
+                );
+                Ok((
+                    RunId::new(row.get::<_, String>(0)),
+                    crate::WorkflowId::new(row.get::<_, String>(1)),
+                    workflow_type,
+                    EventId(row.get::<_, i64>(4).try_into().unwrap_or(u64::MAX)),
+                    reason_from_str(&row.get::<_, String>(5))?,
+                    row.get::<_, i32>(6),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        if selected.is_empty() {
+            tx.commit().await.map_err(postgres_error)?;
+            return Ok(Vec::new());
+        }
+
+        if shard_ids.is_none() && self.logical_shards > 1 {
+            let unique_shards = selected
+                .iter()
+                .map(|(_, _, _, _, _, shard_id)| {
+                    ShardId(u32::try_from(*shard_id).unwrap_or(u32::MAX))
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let owned = self
+                .refresh_shard_leases_tx(
+                    &tx,
+                    &worker_id,
+                    &unique_shards,
+                    opts.claim.lease_duration,
+                    now_ms,
+                )
+                .await?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            selected.retain(|(_, _, _, _, _, shard_id)| {
+                owned.contains(&ShardId(u32::try_from(*shard_id).unwrap_or(u32::MAX)))
+            });
+            if selected.is_empty() {
+                tx.commit().await.map_err(postgres_error)?;
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut claimed = Vec::with_capacity(selected.len());
+        for (run_id, workflow_id, workflow_type, tail, reason, _) in selected {
+            let token = next_counter(&tx, &schema, "claim").await?;
+            tx.execute(
+                &format!(
+                    "update {schema}.workflow_instances
+                     set workflow_claim_token = $1, ready_reason = null, ready_at_ms = 0
+                     where run_id = $2"
+                ),
+                &[&i64::try_from(token).unwrap_or(i64::MAX), &run_id.0],
+            )
+            .await
+            .map_err(postgres_error)?;
+            claimed.push(ClaimedWorkflowTask {
+                run_id: run_id.clone(),
+                workflow_id,
+                workflow_type,
+                claim: WorkflowTaskClaim {
+                    run_id,
+                    worker_id: worker_id.clone(),
+                    token,
+                },
+                replay_target_event_id: tail,
+                reason,
+            });
+        }
+
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(claimed)
+    }
+
     async fn claim_workflow_task_inner_filtered(
         &self,
         worker_id: WorkerId,
@@ -1031,7 +1228,7 @@ impl PostgresBackend {
         let row = tx
             .query_opt(
                 &format!(
-                    "select run_id, workflow_id, workflow_name, workflow_version, current_event_id, ready_reason
+                    "select run_id, workflow_id, workflow_name, workflow_version, current_event_id, ready_reason, shard_id
                      from {schema}.workflow_instances
                      where namespace = $1
                        and task_queue = $2
@@ -1073,14 +1270,32 @@ impl PostgresBackend {
                     workflow_type,
                     EventId(row.get::<_, i64>(4).try_into().unwrap_or(u64::MAX)),
                     reason_from_str(&row.get::<_, String>(5))?,
+                    row.get::<_, i32>(6),
                 ))
             })
             .transpose()?;
 
-        let Some((run_id, workflow_id, workflow_type, tail, reason)) = selected else {
+        let Some((run_id, workflow_id, workflow_type, tail, reason, selected_shard_id)) = selected
+        else {
             tx.commit().await.map_err(postgres_error)?;
             return Ok(None);
         };
+        if shard_ids.is_none() && self.logical_shards > 1 {
+            let selected_shard = ShardId(u32::try_from(selected_shard_id).unwrap_or(u32::MAX));
+            let owned = self
+                .refresh_shard_leases_tx(
+                    &tx,
+                    &worker_id,
+                    &[selected_shard],
+                    opts.lease_duration,
+                    now_ms,
+                )
+                .await?;
+            if owned.is_empty() {
+                tx.commit().await.map_err(postgres_error)?;
+                return Ok(None);
+            }
+        }
         let token = next_counter(&tx, &schema, "claim").await?;
         tx.execute(
             &format!(
@@ -1246,6 +1461,163 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
+        let applied = self
+            .apply_workflow_task_commit_tx(&tx, &schema, claim, batch)
+            .await?;
+        self.append_shard_journal_tx(
+            &tx,
+            applied.shard_id,
+            applied.lease_epoch,
+            ShardJournalOperation {
+                kind: ShardJournalOperationKind::WorkflowTaskBatch,
+                entries: vec![applied.journal_entry],
+            },
+        )
+        .await?;
+        let outcome = applied.outcome;
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(outcome)
+    }
+
+    async fn commit_workflow_tasks_inner(
+        &self,
+        batch: crate::WorkflowTaskCommitBatch,
+    ) -> Result<Vec<crate::WorkflowTaskCommitBatchResult>> {
+        if batch.commits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(postgres_error)?;
+        let schema = self.schema_sql();
+        let mut results = Vec::with_capacity(batch.commits.len());
+        let mut journal_by_shard = BTreeMap::<(i32, i64), Vec<ShardJournalEntry>>::new();
+
+        for input in batch.commits {
+            let claim = input.claim;
+            match self
+                .apply_workflow_task_commit_tx(&tx, &schema, claim.clone(), input.commit)
+                .await
+            {
+                Ok(applied) => {
+                    journal_by_shard
+                        .entry((applied.shard_id, applied.lease_epoch))
+                        .or_default()
+                        .push(applied.journal_entry);
+                    results.push(crate::WorkflowTaskCommitBatchResult {
+                        claim,
+                        result: Ok(applied.outcome),
+                    });
+                }
+                Err(err @ Error::Backend(_)) => return Err(err),
+                Err(err) => {
+                    results.push(crate::WorkflowTaskCommitBatchResult {
+                        claim,
+                        result: Err(err),
+                    });
+                }
+            }
+        }
+
+        for ((shard_id, lease_epoch), entries) in journal_by_shard {
+            self.append_shard_journal_tx(
+                &tx,
+                shard_id,
+                lease_epoch,
+                ShardJournalOperation {
+                    kind: ShardJournalOperationKind::WorkflowTaskBatch,
+                    entries,
+                },
+            )
+            .await?;
+        }
+
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(results)
+    }
+
+    async fn append_shard_journal_tx(
+        &self,
+        tx: &Transaction<'_>,
+        shard_id: i32,
+        lease_epoch: i64,
+        operation: ShardJournalOperation,
+    ) -> Result<u64> {
+        let shard_id_u32 = u32::try_from(shard_id).map_err(|_| {
+            Error::Backend(format!(
+                "invalid postgres shard id {shard_id} for journal append"
+            ))
+        })?;
+        let partition = shard_id_u32 % self.physical_partitions.max(1);
+        let suffix = partition_suffix(partition, self.physical_partitions);
+        let operation_blob = rmp_serde::to_vec_named(&operation)
+            .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+        let schema = self.schema_sql();
+        let now_ms = unix_epoch_millis();
+
+        tx.execute(
+            &format!(
+                "insert into {schema}.shard_heads_{suffix}
+                 (shard_id, journal_seq, snapshot_seq, updated_at_ms)
+                 values ($1, 0, 0, $2)
+                 on conflict(shard_id) do nothing"
+            ),
+            &[&shard_id, &now_ms],
+        )
+        .await
+        .map_err(postgres_error)?;
+
+        let row = tx
+            .query_one(
+                &format!(
+                    "select journal_seq
+                     from {schema}.shard_heads_{suffix}
+                     where shard_id = $1
+                     for update"
+                ),
+                &[&shard_id],
+            )
+            .await
+            .map_err(postgres_error)?;
+        let current_seq = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
+        let next_seq = current_seq.saturating_add(1);
+        let next_seq_i64 = i64::try_from(next_seq).unwrap_or(i64::MAX);
+        tx.execute(
+            &format!(
+                "insert into {schema}.shard_journal_{suffix}
+                 (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
+                 values ($1, $2, $3, $4, $5)"
+            ),
+            &[
+                &shard_id,
+                &next_seq_i64,
+                &lease_epoch,
+                &operation_blob,
+                &now_ms,
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+        tx.execute(
+            &format!(
+                "update {schema}.shard_heads_{suffix}
+                 set journal_seq = $1, updated_at_ms = $2
+                 where shard_id = $3"
+            ),
+            &[&next_seq_i64, &now_ms, &shard_id],
+        )
+        .await
+        .map_err(postgres_error)?;
+        Ok(next_seq)
+    }
+
+    async fn apply_workflow_task_commit_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        claim: WorkflowTaskClaim,
+        batch: WorkflowTaskCommit,
+    ) -> Result<AppliedWorkflowTaskCommit> {
         let Some(row) = tx
             .query_opt(
                 &format!(
@@ -1270,10 +1642,12 @@ impl PostgresBackend {
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
-        self.verify_shard_lease_tx(&tx, &claim.worker_id, shard_id)
+        let lease_epoch = self
+            .verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
             .await?;
         let current_tail = EventId(u64::try_from(current_tail_i64).unwrap_or(u64::MAX));
-        if current_tail != batch.expected_tail_event_id {
+        let expected_tail_event_id = batch.expected_tail_event_id;
+        if current_tail != expected_tail_event_id {
             tx.execute(
                 &format!(
                     "update {schema}.workflow_instances
@@ -1287,8 +1661,17 @@ impl PostgresBackend {
             )
             .await
             .map_err(postgres_error)?;
-            tx.commit().await.map_err(postgres_error)?;
-            return Ok(CommitOutcome::Conflict);
+            return Ok(AppliedWorkflowTaskCommit {
+                outcome: CommitOutcome::Conflict,
+                shard_id,
+                lease_epoch,
+                journal_entry: ShardJournalEntry {
+                    run_id: claim.run_id,
+                    expected_tail_event_id,
+                    new_tail_event_id: current_tail,
+                    result: ShardJournalCommitResult::Conflict,
+                },
+            });
         }
         if terminal && (!batch.append_events.is_empty() || !batch.start_child_workflows.is_empty())
         {
@@ -1498,9 +1881,25 @@ impl PostgresBackend {
                 terminal_event.clone()
             {
                 continue_run_as_new_tx(&tx, &schema, &claim.run_id, event).await?;
-                tx.commit().await.map_err(postgres_error)?;
-                return Ok(CommitOutcome::Committed {
-                    new_tail_event_id: next_event_id,
+                return Ok(AppliedWorkflowTaskCommit {
+                    outcome: CommitOutcome::Committed {
+                        new_tail_event_id: next_event_id,
+                    },
+                    shard_id,
+                    lease_epoch,
+                    journal_entry: ShardJournalEntry {
+                        run_id: claim.run_id,
+                        expected_tail_event_id,
+                        new_tail_event_id: next_event_id,
+                        result: ShardJournalCommitResult::Committed {
+                            appended_events: usize::try_from(
+                                next_event_id.0.saturating_sub(current_tail.0),
+                            )
+                            .unwrap_or(usize::MAX),
+                            terminal: terminal_after_commit,
+                            ready_reason: None,
+                        },
+                    },
                 });
             }
             if let Some(event) = terminal_event {
@@ -1531,9 +1930,25 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
-        tx.commit().await.map_err(postgres_error)?;
-        Ok(CommitOutcome::Committed {
-            new_tail_event_id: next_event_id,
+        Ok(AppliedWorkflowTaskCommit {
+            outcome: CommitOutcome::Committed {
+                new_tail_event_id: next_event_id,
+            },
+            shard_id,
+            lease_epoch,
+            journal_entry: ShardJournalEntry {
+                run_id: claim.run_id,
+                expected_tail_event_id,
+                new_tail_event_id: next_event_id,
+                result: ShardJournalCommitResult::Committed {
+                    appended_events: usize::try_from(
+                        next_event_id.0.saturating_sub(current_tail.0),
+                    )
+                    .unwrap_or(usize::MAX),
+                    terminal: terminal_after_commit,
+                    ready_reason: ready_reason.map(str::to_owned),
+                },
+            },
         })
     }
 
@@ -3526,6 +3941,21 @@ fn quote_ident(identifier: &str) -> String {
 }
 
 fn postgres_error(err: tokio_postgres::Error) -> Error {
+    if let Some(db_error) = err.as_db_error() {
+        return Error::Backend(format!(
+            "postgres error: {:?}: {}{}{}",
+            db_error.code(),
+            db_error.message(),
+            db_error
+                .detail()
+                .map(|detail| format!(" detail: {detail}"))
+                .unwrap_or_default(),
+            db_error
+                .constraint()
+                .map(|constraint| format!(" constraint: {constraint}"))
+                .unwrap_or_default()
+        ));
+    }
     Error::Backend(format!("postgres error: {err}"))
 }
 

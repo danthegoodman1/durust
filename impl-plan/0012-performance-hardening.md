@@ -71,11 +71,20 @@ Implemented:
   env-gated Postgres baseline artifact. The accepted dimension is Postgres,
   mixed mode, 1,000 workflows, 4 workers, shard/concurrency/prefetch dimensions
   set to 1, batch 32, and pool size 8. The captured release run completed 1,000
-  workflows, 8,000 semantic mixed actions, 7,973 workflow tasks, and reports
-  about 41.7 processing workflows/sec and 333.3 processing mixed-actions/sec.
-  Workflow task count is provider/order dependent because cold replay may
-  consume multiple ready history events in one task; semantic mixed actions are
-  the stable cross-provider workload dimension.
+  workflows, 8,000 semantic mixed actions, 7,941 workflow tasks, and reports
+  about 38.5 processing workflows/sec and 307.7 processing mixed-actions/sec
+  with p50/p95/p99 workflow-task commit latency 4.94/7.98/8.87ms. Workflow task
+  count is provider/order dependent because cold replay may consume multiple
+  ready history events in one task; semantic mixed actions are the stable
+  cross-provider workload dimension.
+- `benches/baselines/durust-mixed-postgres-100-shards.json`, the first
+  checked-in high-shard Postgres baseline artifact. The accepted dimension is
+  Postgres, mixed mode, 1,000 workflows, 10 workers, 100 logical shards, 16
+  physical partitions, activation concurrency 8, prefetch 32, batch 32, and pool
+  size 24. The captured release run completed 1,000 workflows, 8,000 semantic
+  mixed actions, 7,953 workflow tasks, and reports about 54.5 processing
+  workflows/sec and 435.8 processing mixed-actions/sec with p50/p95/p99
+  workflow-task commit latency 18.63/57.36/122.40ms.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 
@@ -84,16 +93,13 @@ Remaining:
 - Add comparable benchmark support for additional modes: bare, activity,
   signal, timer, child, activity map, payload refs, recovery, and cached wake
   under recovery load.
-- Add a real write-combining path for hot workflow/activity/timer/child
-  progress so accepted batch dimensions represent fewer durable commits, not
-  merely larger drain loops. This should stay generic at the runtime/backend
-  contract boundary and preserve per-run fencing, event ordering, and crash
-  safety.
-- Implement `0013-postgres-shard-native.md` before accepting Postgres benchmark
-  dimensions with shard count, activation concurrency, prefetch, or batch size
-  above 1. The normalized Postgres layout remains the correctness baseline;
-  the shard-native layout inside `PostgresBackend` owns the scale-out benchmark
-  gate.
+- Extend write-combining beyond workflow-task claim/commit into hot activity,
+  timer, child, and signal progress where the provider can batch without
+  weakening per-run fencing, event ordering, or crash safety.
+- Finish `0013-postgres-shard-native.md` snapshot/journal-tail rebuild before
+  recommending the high-shard Postgres layout as the recovery architecture; the
+  checked-in high-shard baseline currently proves scale-out for claim/commit
+  batching, not full projection rebuild.
 - Wire CI/performance-job guidance.
 - Add checked-in baseline files or captured-output artifacts for the remaining
   accepted benchmark dimensions.
