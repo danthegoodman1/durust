@@ -444,7 +444,11 @@ where
         let now = self.backend.current_time().await?;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
-                .claim_history_chunk(&claimed, cached.last_event_id)
+                .stream_history_chunk(
+                    claimed.run_id.clone(),
+                    cached.last_event_id,
+                    claimed.replay_target_event_id,
+                )
                 .await;
             match chunk {
                 Ok(chunk) => {
@@ -505,21 +509,15 @@ where
                 let mut recovery_budget =
                     is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
                 let first_chunk = match recovery_budget.as_mut() {
-                    Some(budget) => match prefetched_claim_history_chunk(&claimed, EventId::ZERO) {
-                        Some(chunk) => {
-                            budget.record_chunk(&chunk);
-                            Ok(Some(chunk))
-                        }
-                        None => {
-                            self.stream_recovery_history_chunk(
-                                claimed.run_id.clone(),
-                                EventId::ZERO,
-                                claimed.replay_target_event_id,
-                                budget,
-                            )
-                            .await
-                        }
-                    },
+                    Some(budget) => {
+                        self.stream_recovery_history_chunk(
+                            claimed.run_id.clone(),
+                            EventId::ZERO,
+                            claimed.replay_target_event_id,
+                            budget,
+                        )
+                        .await
+                    }
                     None => self
                         .claim_history_chunk(&claimed, EventId::ZERO)
                         .await
