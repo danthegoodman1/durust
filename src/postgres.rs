@@ -82,6 +82,25 @@ struct AppliedWorkflowTaskCommit {
     journal_entry: ShardJournalEntry,
 }
 
+struct LockedActivityCompletion {
+    task: ActivityTask,
+    claim_token: Option<i64>,
+    completed: bool,
+}
+
+struct WorkflowCompletionState {
+    current_event_id: EventId,
+    terminal: bool,
+}
+
+struct NormalActivityCompletionCandidate {
+    input_index: usize,
+    activity_id: ActivityId,
+    run_id: RunId,
+    command_id: CommandId,
+    result: PayloadRef,
+}
+
 #[derive(Clone, Debug)]
 pub struct PostgresBackendConfig {
     database_url: String,
@@ -1905,7 +1924,8 @@ impl PostgresBackend {
         let Some(row) = tx
             .query_opt(
                 &format!(
-                    "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id, shard_id
+                    "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id,
+                            shard_id, workflow_name, workflow_version
                      from {schema}.workflow_instances
                      where run_id = $1
                      for update"
@@ -1923,6 +1943,8 @@ impl PostgresBackend {
         let namespace: String = row.get(3);
         let workflow_id: String = row.get(4);
         let shard_id: i32 = row.get(5);
+        let workflow_name: String = row.get(6);
+        let workflow_version: i32 = row.get(7);
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
@@ -2014,13 +2036,32 @@ impl PostgresBackend {
         let mut became_terminal = false;
         let mut terminal_event = None;
         let mut ready_after_commit = None;
+        let mut append_history = Vec::with_capacity(append_events.len());
         for event in append_events {
             next_event_id = next_event_id.next();
             if is_terminal(&event.data) {
                 became_terminal = true;
                 terminal_event = Some(event.data.clone());
             }
-            insert_history_event(&tx, &schema, &claim.run_id, next_event_id, event.data).await?;
+            append_history.push((next_event_id, event.data));
+        }
+        insert_history_events(&tx, schema, &claim.run_id, &append_history).await?;
+        let marker_context = WorkflowChangeMarkerContext {
+            namespace: &namespace,
+            workflow_id: &workflow_id,
+            workflow_name: &workflow_name,
+            workflow_version,
+        };
+        for (event_id, data) in &append_history {
+            index_workflow_change_marker_with_context(
+                &tx,
+                schema,
+                &claim.run_id,
+                *event_id,
+                data,
+                &marker_context,
+            )
+            .await?;
         }
 
         for message in start_child_workflows {
@@ -2819,16 +2860,290 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let mut results = Vec::with_capacity(req.completions.len());
-        for completion in req.completions {
-            let claim = completion.claim.clone();
-            let outcome = self.complete_activity_tx(&tx, &schema, completion).await?;
-            results.push(CompleteActivityTaskBatchResult {
-                claim,
-                result: Ok(outcome),
-            });
+
+        if has_duplicate_activity_completion_ids(&req.completions) {
+            let results = self
+                .complete_activity_tasks_scalar_tx(&tx, &schema, req.completions)
+                .await?;
+            tx.commit().await.map_err(postgres_error)?;
+            return Ok(results);
         }
+
+        let activity_ids = req
+            .completions
+            .iter()
+            .map(|completion| completion.claim.activity_id.0.clone())
+            .collect::<Vec<_>>();
+        let rows = tx
+            .query(
+                &format!(
+                    "select activity_id, task, claim_token, completed
+                     from {schema}.activity_tasks
+                     where activity_id = any($1::text[])
+                     order by activity_id asc
+                     for update"
+                ),
+                &[&activity_ids],
+            )
+            .await
+            .map_err(postgres_error)?;
+        let mut locked = BTreeMap::<String, LockedActivityCompletion>::new();
+        for row in rows {
+            let activity_id: String = row.get(0);
+            let task_blob: Vec<u8> = row.get(1);
+            let task: ActivityTask = rmp_serde::from_slice(&task_blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            locked.insert(
+                activity_id,
+                LockedActivityCompletion {
+                    task,
+                    claim_token: row.get(2),
+                    completed: row.get(3),
+                },
+            );
+        }
+
+        let mut result_slots = std::iter::repeat_with(|| None)
+            .take(req.completions.len())
+            .collect::<Vec<Option<Result<CompleteActivityOutcome>>>>();
+        let mut pending_indices = Vec::new();
+        let mut has_valid_map_item = false;
+
+        for (index, completion) in req.completions.iter().enumerate() {
+            let Some(row) = locked.get(&completion.claim.activity_id.0) else {
+                result_slots[index] = Some(Err(Error::Backend(format!(
+                    "activity `{}` not found",
+                    completion.claim.activity_id.0
+                ))));
+                continue;
+            };
+            if row.completed {
+                result_slots[index] = Some(Ok(CompleteActivityOutcome::AlreadyCompleted));
+                continue;
+            }
+            if row.claim_token != Some(i64::try_from(completion.claim.token).unwrap_or(i64::MAX)) {
+                result_slots[index] = Some(Err(Error::StaleLease));
+                continue;
+            }
+            if row.task.map_item.is_some() {
+                has_valid_map_item = true;
+                break;
+            }
+            pending_indices.push(index);
+        }
+
+        if has_valid_map_item {
+            let results = self
+                .complete_activity_tasks_scalar_tx(&tx, &schema, req.completions)
+                .await?;
+            tx.commit().await.map_err(postgres_error)?;
+            return Ok(results);
+        }
+
+        if !pending_indices.is_empty() {
+            let run_ids = pending_indices
+                .iter()
+                .filter_map(|index| {
+                    locked
+                        .get(&req.completions[*index].claim.activity_id.0)
+                        .map(|row| row.task.run_id.0.clone())
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let rows = tx
+                .query(
+                    &format!(
+                        "select run_id, current_event_id, terminal
+                         from {schema}.workflow_instances
+                         where run_id = any($1::text[])
+                         order by run_id asc
+                         for update"
+                    ),
+                    &[&run_ids],
+                )
+                .await
+                .map_err(postgres_error)?;
+            let mut workflows = BTreeMap::<String, WorkflowCompletionState>::new();
+            for row in rows {
+                workflows.insert(
+                    row.get(0),
+                    WorkflowCompletionState {
+                        current_event_id: EventId(
+                            u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX),
+                        ),
+                        terminal: row.get(2),
+                    },
+                );
+            }
+
+            let mut candidates = Vec::new();
+            for index in pending_indices {
+                let completion = &req.completions[index];
+                let row = locked
+                    .get(&completion.claim.activity_id.0)
+                    .expect("pending activity row should be locked");
+                let Some(workflow) = workflows.get(&row.task.run_id.0) else {
+                    result_slots[index] = Some(Err(Error::RunNotFound(row.task.run_id.clone())));
+                    continue;
+                };
+                if workflow.terminal {
+                    result_slots[index] = Some(Err(Error::TerminalWorkflow));
+                    continue;
+                }
+                candidates.push(NormalActivityCompletionCandidate {
+                    input_index: index,
+                    activity_id: completion.claim.activity_id.clone(),
+                    run_id: row.task.run_id.clone(),
+                    command_id: row.task.command_id.clone(),
+                    result: completion.result.clone(),
+                });
+            }
+
+            if !candidates.is_empty() {
+                let mut next_event_ids = workflows
+                    .iter()
+                    .map(|(run_id, state)| (run_id.clone(), state.current_event_id))
+                    .collect::<BTreeMap<_, _>>();
+                let mut updated_tails = BTreeMap::<String, EventId>::new();
+                let mut history_events = Vec::with_capacity(candidates.len());
+                let mut completed_activity_ids = Vec::with_capacity(candidates.len());
+
+                for candidate in candidates {
+                    let tail = next_event_ids
+                        .get_mut(&candidate.run_id.0)
+                        .expect("candidate run should have workflow state");
+                    let event_id = tail.next();
+                    *tail = event_id;
+                    updated_tails.insert(candidate.run_id.0.clone(), event_id);
+
+                    let result = self
+                        .normalize_payload_for_storage_tx(&tx, candidate.result)
+                        .await?;
+                    history_events.push((
+                        candidate.run_id.clone(),
+                        event_id,
+                        HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
+                            command_id: candidate.command_id,
+                            result,
+                        }),
+                    ));
+                    completed_activity_ids.push(candidate.activity_id.0);
+                    result_slots[candidate.input_index] =
+                        Some(Ok(CompleteActivityOutcome::Completed { event_id }));
+                }
+
+                let history_inserts = history_events
+                    .iter()
+                    .map(|(run_id, event_id, data)| HistoryEventInsert {
+                        run_id,
+                        event_id: *event_id,
+                        data,
+                    })
+                    .collect::<Vec<_>>();
+                insert_history_event_rows(&tx, &schema, &history_inserts).await?;
+
+                let update_run_ids = updated_tails.keys().cloned().collect::<Vec<_>>();
+                let update_event_ids = updated_tails
+                    .values()
+                    .map(|event_id| i64::try_from(event_id.0).unwrap_or(i64::MAX))
+                    .collect::<Vec<_>>();
+                tx.execute(
+                    &format!(
+                        "with updates(run_id, event_id) as (
+                             select run_id, event_id
+                             from unnest($1::text[], $2::bigint[]) as updates(run_id, event_id)
+                         )
+                         update {schema}.workflow_instances as workflows
+                         set current_event_id = updates.event_id,
+                             ready_reason = $3,
+                             ready_at_ms = 0
+                         from updates
+                         where workflows.run_id = updates.run_id"
+                    ),
+                    &[
+                        &update_run_ids,
+                        &update_event_ids,
+                        &reason_to_str(&WorkflowTaskReason::ActivityCompleted),
+                    ],
+                )
+                .await
+                .map_err(postgres_error)?;
+
+                tx.execute(
+                    &format!(
+                        "update {schema}.activity_tasks
+                         set completed = true,
+                             heartbeat_deadline_at_ms = null
+                         where activity_id = any($1::text[])"
+                    ),
+                    &[&completed_activity_ids],
+                )
+                .await
+                .map_err(postgres_error)?;
+            }
+        }
+
+        let results = req
+            .completions
+            .into_iter()
+            .enumerate()
+            .map(|(index, completion)| CompleteActivityTaskBatchResult {
+                claim: completion.claim,
+                result: result_slots[index]
+                    .take()
+                    .expect("batch activity completion should fill every result slot"),
+            })
+            .collect();
         tx.commit().await.map_err(postgres_error)?;
+        Ok(results)
+    }
+
+    async fn complete_activity_tasks_scalar_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        completions: Vec<CompleteActivityRequest>,
+    ) -> Result<Vec<CompleteActivityTaskBatchResult>> {
+        let mut results = Vec::with_capacity(completions.len());
+        for completion in completions {
+            tx.batch_execute("savepoint durust_complete_activity_item")
+                .await
+                .map_err(postgres_error)?;
+            let claim = completion.claim.clone();
+            match self.complete_activity_tx(tx, schema, completion).await {
+                Ok(outcome) => {
+                    tx.batch_execute("release savepoint durust_complete_activity_item")
+                        .await
+                        .map_err(postgres_error)?;
+                    results.push(CompleteActivityTaskBatchResult {
+                        claim,
+                        result: Ok(outcome),
+                    });
+                }
+                Err(err) if is_activity_completion_item_error(&err) => {
+                    tx.batch_execute("rollback to savepoint durust_complete_activity_item")
+                        .await
+                        .map_err(postgres_error)?;
+                    tx.batch_execute("release savepoint durust_complete_activity_item")
+                        .await
+                        .map_err(postgres_error)?;
+                    results.push(CompleteActivityTaskBatchResult {
+                        claim,
+                        result: Err(err),
+                    });
+                }
+                Err(err) => {
+                    let _ = tx
+                        .batch_execute("rollback to savepoint durust_complete_activity_item")
+                        .await;
+                    let _ = tx
+                        .batch_execute("release savepoint durust_complete_activity_item")
+                        .await;
+                    return Err(err);
+                }
+            }
+        }
         Ok(results)
     }
 
@@ -4878,6 +5193,23 @@ async fn next_run_id(tx: &Transaction<'_>, schema: &str) -> Result<RunId> {
     )))
 }
 
+fn has_duplicate_activity_completion_ids(completions: &[CompleteActivityRequest]) -> bool {
+    let mut seen = BTreeSet::new();
+    completions
+        .iter()
+        .any(|completion| !seen.insert(completion.claim.activity_id.0.as_str()))
+}
+
+fn is_activity_completion_item_error(err: &Error) -> bool {
+    match err {
+        Error::StaleLease | Error::RunNotFound(_) | Error::TerminalWorkflow => true,
+        Error::Backend(message) => {
+            message.starts_with("activity `") && message.ends_with(" not found")
+        }
+        _ => false,
+    }
+}
+
 async fn next_signal_sequence(tx: &Transaction<'_>, schema: &str) -> Result<u64> {
     next_sequence_value(tx, schema, "signal_seq").await
 }
@@ -4911,6 +5243,70 @@ async fn insert_history_event(
     .await
     .map_err(postgres_error)?;
     index_workflow_change_marker(tx, schema, run_id, event_id, &data).await?;
+    Ok(())
+}
+
+async fn insert_history_events(
+    tx: &Transaction<'_>,
+    schema: &str,
+    run_id: &RunId,
+    events: &[(EventId, HistoryEventData)],
+) -> Result<()> {
+    let rows = events
+        .iter()
+        .map(|(event_id, data)| HistoryEventInsert {
+            run_id,
+            event_id: *event_id,
+            data,
+        })
+        .collect::<Vec<_>>();
+    insert_history_event_rows(tx, schema, &rows).await
+}
+
+struct HistoryEventInsert<'a> {
+    run_id: &'a RunId,
+    event_id: EventId,
+    data: &'a HistoryEventData,
+}
+
+async fn insert_history_event_rows(
+    tx: &Transaction<'_>,
+    schema: &str,
+    events: &[HistoryEventInsert<'_>],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let run_ids = events
+        .iter()
+        .map(|event| event.run_id.0.clone())
+        .collect::<Vec<_>>();
+    let event_ids = events
+        .iter()
+        .map(|event| i64::try_from(event.event_id.0).unwrap_or(i64::MAX))
+        .collect::<Vec<_>>();
+    let event_types = events
+        .iter()
+        .map(|event| event_type_to_str(&event.data.event_type()).to_owned())
+        .collect::<Vec<_>>();
+    let payloads = events
+        .iter()
+        .map(|event| rmp_serde::to_vec_named(event.data))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+
+    tx.execute(
+        &format!(
+            "insert into {schema}.history_events(run_id, event_id, event_type, data)
+             select run_id, event_id, event_type, data
+             from unnest($1::text[], $2::bigint[], $3::text[], $4::bytea[])
+                  as event_rows(run_id, event_id, event_type, data)"
+        ),
+        &[&run_ids, &event_ids, &event_types, &payloads],
+    )
+    .await
+    .map_err(postgres_error)?;
     Ok(())
 }
 
@@ -5822,25 +6218,13 @@ async fn index_workflow_change_marker(
     event_id: EventId,
     data: &HistoryEventData,
 ) -> Result<()> {
-    let (change_id, version, marker_kind, command_seq) = match data {
-        HistoryEventData::VersionMarker(marker) => (
-            marker.change_id.clone(),
-            marker.version,
-            WorkflowChangeMarkerKind::Version,
-            marker.command_id.seq,
-        ),
-        HistoryEventData::DeprecatedPatchMarker(marker) => (
-            marker.patch_id.clone(),
-            1,
-            WorkflowChangeMarkerKind::DeprecatedPatch,
-            marker.command_id.seq,
-        ),
-        _ => return Ok(()),
+    let Some(marker) = workflow_change_marker_fields(data) else {
+        return Ok(());
     };
     let Some(row) = tx
         .query_opt(
             &format!(
-                "select namespace, workflow_id, workflow_name, workflow_version, terminal
+                "select namespace, workflow_id, workflow_name, workflow_version
                  from {schema}.workflow_instances
                  where run_id = $1"
             ),
@@ -5855,8 +6239,71 @@ async fn index_workflow_change_marker(
     let workflow_id: String = row.get(1);
     let workflow_name: String = row.get(2);
     let workflow_version: i32 = row.get(3);
-    let marker_kind = marker_kind_to_str(marker_kind);
-    let command_seq = i64::try_from(command_seq.0).unwrap_or(i64::MAX);
+    let context = WorkflowChangeMarkerContext {
+        namespace: &namespace,
+        workflow_id: &workflow_id,
+        workflow_name: &workflow_name,
+        workflow_version,
+    };
+    index_workflow_change_marker_record(tx, schema, run_id, event_id, marker, &context).await
+}
+
+struct WorkflowChangeMarkerContext<'a> {
+    namespace: &'a str,
+    workflow_id: &'a str,
+    workflow_name: &'a str,
+    workflow_version: i32,
+}
+
+struct WorkflowChangeMarkerFields {
+    change_id: String,
+    version: i32,
+    marker_kind: WorkflowChangeMarkerKind,
+    command_seq: CommandSeq,
+}
+
+fn workflow_change_marker_fields(data: &HistoryEventData) -> Option<WorkflowChangeMarkerFields> {
+    match data {
+        HistoryEventData::VersionMarker(marker) => Some(WorkflowChangeMarkerFields {
+            change_id: marker.change_id.clone(),
+            version: marker.version,
+            marker_kind: WorkflowChangeMarkerKind::Version,
+            command_seq: marker.command_id.seq,
+        }),
+        HistoryEventData::DeprecatedPatchMarker(marker) => Some(WorkflowChangeMarkerFields {
+            change_id: marker.patch_id.clone(),
+            version: 1,
+            marker_kind: WorkflowChangeMarkerKind::DeprecatedPatch,
+            command_seq: marker.command_id.seq,
+        }),
+        _ => None,
+    }
+}
+
+async fn index_workflow_change_marker_with_context(
+    tx: &Transaction<'_>,
+    schema: &str,
+    run_id: &RunId,
+    event_id: EventId,
+    data: &HistoryEventData,
+    context: &WorkflowChangeMarkerContext<'_>,
+) -> Result<()> {
+    let Some(marker) = workflow_change_marker_fields(data) else {
+        return Ok(());
+    };
+    index_workflow_change_marker_record(tx, schema, run_id, event_id, marker, context).await
+}
+
+async fn index_workflow_change_marker_record(
+    tx: &Transaction<'_>,
+    schema: &str,
+    run_id: &RunId,
+    event_id: EventId,
+    marker: WorkflowChangeMarkerFields,
+    context: &WorkflowChangeMarkerContext<'_>,
+) -> Result<()> {
+    let marker_kind = marker_kind_to_str(marker.marker_kind);
+    let command_seq = i64::try_from(marker.command_seq.0).unwrap_or(i64::MAX);
     let first_event_id = i64::try_from(event_id.0).unwrap_or(i64::MAX);
     let last_seen_at_ms = unix_epoch_millis();
     tx.execute(
@@ -5873,13 +6320,13 @@ async fn index_workflow_change_marker(
                 last_seen_at_ms = excluded.last_seen_at_ms"
         ),
         &[
-            &namespace,
-            &workflow_id,
-            &workflow_name,
-            &workflow_version,
+            &context.namespace,
+            &context.workflow_id,
+            &context.workflow_name,
+            &context.workflow_version,
             &run_id.0,
-            &change_id,
-            &version,
+            &marker.change_id,
+            &marker.version,
             &marker_kind,
             &command_seq,
             &first_event_id,

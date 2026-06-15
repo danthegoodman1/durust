@@ -206,12 +206,14 @@ Measured local baselines:
   and updates leases, shard-journal append collapses head insert/update plus
   sequence read into one upsert, workflow commit caches shard lease epochs
   within a batch transaction, and workers can opt into batched successful
-  activity completions. A local 100-shard candidate run with activity completion
-  batch 32 reached 123.93 processing workflows/sec and 991.47 mixed actions/sec,
-  with Postgres at 29,247 transactions, 3.66 transactions/action, and 129,519
-  statement calls, or 16.19 statements/action. These reduce statement and
-  transaction pressure without changing replay history semantics; an accepted
-  checked-in baseline should still be recaptured separately.
+  activity completions. Workflow-task commits now bulk insert ordinary appended
+  history events, and Postgres batch activity completion uses a SQL-native
+  normal-activity path with per-item results. The accepted checked-in 100-shard
+  baseline with activity completion batch 32 reached 130.11 processing
+  workflows/sec and 1,040.91 mixed actions/sec, with Postgres at 29,258
+  transactions, 3.66 transactions/action, and 116,235 statement calls, or 14.53
+  statements/action. These reduce statement and transaction pressure without
+  changing replay history semantics.
 - A raw `postgres-write-ceiling` diagnostic mode now runs a DB-only transactional
   write shape with workflow-row locks, history inserts, workflow updates, and
   shard-journal appends. On the same 8,000-operation scale, 10 raw workers

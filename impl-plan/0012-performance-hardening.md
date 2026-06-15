@@ -110,12 +110,15 @@ Implemented:
   instead of one token/update pair per claimed task; shard-journal append
   increments and returns the journal sequence in one head-row upsert; batch
   workflow commit reuses refreshed shard lease epochs inside the transaction;
-  and workers can opt into success-only activity completion batching with
-  `activity_completion_batch_size`. A local 100-shard candidate run with
-  activity completion batch 32 completed 8,000 mixed actions at 123.93
-  processing workflows/sec, 3.66 Postgres transactions/action, and 16.19
-  statements/action. A fresh accepted baseline artifact should be captured
-  before replacing the checked-in transaction/action budget.
+  workflow-task commits bulk insert ordinary appended history events while
+  preserving marker indexes; and Postgres batch activity completion uses a
+  SQL-native normal-activity path with per-item results, falling back to scalar
+  completion for duplicate input ids and activity-map items. A measured
+  100-shard run with activity completion batch 32 completed 8,000 mixed actions
+  at 130.11 processing workflows/sec, 1,040.91 processing mixed-actions/sec,
+  3.66 Postgres transactions/action, and 14.53 statements/action. The checked-in
+  high-shard Postgres baseline artifact uses this activity-completion batching
+  profile.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 

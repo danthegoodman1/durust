@@ -1382,6 +1382,15 @@ but the expected tail was stale. Per-item `Error::StaleLease` means the claim or
 owning shard lease was stale. Providers may fail the outer batch result only
 when the batch could not be evaluated at all.
 
+Batch activity claim and completion methods follow the same optimization
+contract. Batch activity completion returns one result per input completion in
+input order whenever the batch can be evaluated. Per-item
+`CompleteActivityOutcome::AlreadyCompleted` preserves idempotent duplicate
+completion behavior; per-item `Error::StaleLease`, `Error::RunNotFound`, or
+`Error::TerminalWorkflow` report ordinary item-level fencing or workflow state.
+Providers should reserve an outer batch error for transaction, storage, decode,
+or other failures that prevent evaluating the batch safely.
+
 ## 8.2 Workflow task commit
 
 ```rust

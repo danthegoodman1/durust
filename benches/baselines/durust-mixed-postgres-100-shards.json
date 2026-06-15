@@ -13,26 +13,26 @@
     "activationPrefetchLimit": 32,
     "activityDelayMs": 0,
     "batch": 32,
-    "activityCompletionBatch": 1,
+    "activityCompletionBatch": 32,
     "maxRounds": 10000,
     "keepDb": false,
     "postgresPoolSize": 24,
     "json": true
   },
-  "elapsedMs": 13327.086333000001,
-  "setupMs": 3306.333083,
-  "processingMs": 9639.37675,
-  "verifyMs": 381.3765,
+  "elapsedMs": 11886.887250000002,
+  "setupMs": 3748.3288749999997,
+  "processingMs": 7685.582208999999,
+  "verifyMs": 452.97616600000003,
   "rounds": 8,
-  "activations": 7874,
+  "activations": 7865,
   "completedWorkflows": 1000,
   "mixedActions": 8000,
-  "activationsPerSecond": 590.8268171492755,
-  "mixedActionsPerSecond": 600.2812467861575,
-  "workflowsPerSecond": 75.03515584826968,
-  "processingActivationsPerSecond": 816.8577911429802,
-  "processingMixedActionsPerSecond": 829.9291756596192,
-  "processingWorkflowsPerSecond": 103.7411469574524,
+  "activationsPerSecond": 661.6534534724386,
+  "mixedActionsPerSecond": 673.0105057570895,
+  "workflowsPerSecond": 84.12631321963619,
+  "processingActivationsPerSecond": 1023.3447234212,
+  "processingMixedActionsPerSecond": 1040.9100810387285,
+  "processingWorkflowsPerSecond": 130.11376012984107,
   "counters": {
     "workflowStarts": 1000,
     "signals": 1000,
@@ -42,14 +42,14 @@
     "bootActivities": 1000,
     "childActivities": 1000,
     "finishActivities": 1000,
-    "workflowTasks": 7874,
+    "workflowTasks": 7865,
     "activityTasks": 3000,
     "timersFired": 1000,
     "activitiesTimedOut": 0,
     "childWorkflowStartsDispatched": 0
   },
   "workerStats": {
-    "workflowTasks": 7874,
+    "workflowTasks": 7865,
     "activityTasks": 3000,
     "timersFired": 1000,
     "activitiesTimedOut": 0,
@@ -57,330 +57,331 @@
   },
   "backendMetrics": {
     "workflowTaskCommitLatency": {
-      "samples": 1051,
-      "p50Ms": 46.773165999999996,
-      "p95Ms": 65.907667,
-      "p99Ms": 85.07733300000001,
-      "maxMs": 108.925041
+      "samples": 1041,
+      "p50Ms": 42.045167,
+      "p95Ms": 61.2595,
+      "p99Ms": 75.575166,
+      "maxMs": 95.470833
     },
     "operations": {
       "claim_activity_tasks": {
-        "calls": 1109,
+        "calls": 1098,
         "errors": 0,
         "items": 3000,
-        "totalMs": 2753.8845910000005,
-        "itemsPerCall": 2.7051397655545535,
-        "itemsPerSecond": 1089.3702698378618,
+        "totalMs": 2804.878251,
+        "itemsPerCall": 2.73224043715847,
+        "itemsPerSecond": 1069.565140280308,
         "latency": {
-          "samples": 1109,
-          "p50Ms": 2.8471249999999997,
-          "p95Ms": 3.773625,
-          "p99Ms": 4.286625,
-          "maxMs": 8.845
+          "samples": 1098,
+          "p50Ms": 2.836375,
+          "p95Ms": 4.000375,
+          "p99Ms": 4.479625,
+          "maxMs": 10.698667
         }
       },
       "claim_workflow_tasks": {
-        "calls": 1109,
+        "calls": 1098,
         "errors": 0,
-        "items": 7922,
-        "totalMs": 11885.157576,
-        "itemsPerCall": 7.143372407574391,
-        "itemsPerSecond": 666.5456431134827,
+        "items": 7914,
+        "totalMs": 5510.210494,
+        "itemsPerCall": 7.2076502732240435,
+        "itemsPerSecond": 1436.2427730514935,
         "latency": {
-          "samples": 1109,
-          "p50Ms": 11.613416999999998,
-          "p95Ms": 12.927083000000001,
-          "p99Ms": 21.427459,
-          "maxMs": 43.265375
+          "samples": 1098,
+          "p50Ms": 5.103916,
+          "p95Ms": 5.998417,
+          "p99Ms": 14.174333,
+          "maxMs": 26.384
         }
       },
       "commit_workflow_tasks": {
-        "calls": 1051,
+        "calls": 1041,
         "errors": 0,
-        "items": 7922,
-        "totalMs": 48241.549343000006,
-        "itemsPerCall": 7.537583254043768,
-        "itemsPerSecond": 164.21528968056467,
+        "items": 7914,
+        "totalMs": 43518.328292,
+        "itemsPerCall": 7.6023054755043225,
+        "itemsPerSecond": 181.8544119364722,
         "latency": {
-          "samples": 1051,
-          "p50Ms": 46.773165999999996,
-          "p95Ms": 65.907667,
-          "p99Ms": 85.07733300000001,
-          "maxMs": 108.925041
+          "samples": 1041,
+          "p50Ms": 42.045167,
+          "p95Ms": 61.2595,
+          "p99Ms": 75.575166,
+          "maxMs": 95.470833
         }
       },
-      "complete_activity": {
-        "calls": 3000,
+      "complete_activity_tasks": {
+        "calls": 586,
         "errors": 0,
         "items": 3000,
-        "totalMs": 12017.607983,
-        "itemsPerCall": 1.0,
-        "itemsPerSecond": 249.6337044979145,
+        "totalMs": 2724.9690429999996,
+        "itemsPerCall": 5.1194539249146755,
+        "itemsPerSecond": 1100.929938160769,
         "latency": {
-          "samples": 3000,
-          "p50Ms": 4.0167090000000005,
-          "p95Ms": 4.77675,
-          "p99Ms": 5.560541,
-          "maxMs": 16.514625000000002
+          "samples": 586,
+          "p50Ms": 4.704917,
+          "p95Ms": 5.572125,
+          "p99Ms": 6.256832999999999,
+          "maxMs": 6.7064580000000005
         }
       },
       "current_time": {
-        "calls": 9031,
+        "calls": 9012,
         "errors": 0,
-        "items": 9031,
-        "totalMs": 1.860507,
+        "items": 9012,
+        "totalMs": 2.513512,
         "itemsPerCall": 1.0,
-        "itemsPerSecond": 4854053.223126815,
+        "itemsPerSecond": 3585421.513802202,
         "latency": {
-          "samples": 9031,
-          "p50Ms": 0.00020800000000000001,
-          "p95Ms": 0.000375,
-          "p99Ms": 0.000458,
-          "maxMs": 0.003292
+          "samples": 9012,
+          "p50Ms": 0.00025,
+          "p95Ms": 0.000541,
+          "p99Ms": 0.00075,
+          "maxMs": 0.019125
         }
       },
       "dispatch_child_workflow_starts": {
-        "calls": 1109,
+        "calls": 1098,
         "errors": 0,
         "items": 0,
-        "totalMs": 0.203261,
+        "totalMs": 0.290663,
         "itemsPerCall": 0.0,
         "itemsPerSecond": 0.0,
         "latency": {
-          "samples": 1109,
-          "p50Ms": 0.000167,
-          "p95Ms": 0.000334,
-          "p99Ms": 0.000417,
-          "maxMs": 0.005084
+          "samples": 1098,
+          "p50Ms": 0.00025,
+          "p95Ms": 0.000542,
+          "p99Ms": 0.00075,
+          "maxMs": 0.001
         }
       },
       "hydrate_payload": {
-        "calls": 3048,
+        "calls": 3049,
         "errors": 0,
-        "items": 3048,
-        "totalMs": 1.533294,
+        "items": 3049,
+        "totalMs": 1.860836,
         "itemsPerCall": 1.0,
-        "itemsPerSecond": 1987877.080325104,
+        "itemsPerSecond": 1638510.862859489,
         "latency": {
-          "samples": 3048,
-          "p50Ms": 0.000458,
-          "p95Ms": 0.000958,
-          "p99Ms": 0.0012079999999999999,
-          "maxMs": 0.015000000000000001
+          "samples": 3049,
+          "p50Ms": 0.0005,
+          "p95Ms": 0.001209,
+          "p99Ms": 0.001583,
+          "maxMs": 0.011208000000000001
         }
       },
       "read_signal_inbox": {
         "calls": 1000,
         "errors": 0,
         "items": 1000,
-        "totalMs": 597.9328849999999,
+        "totalMs": 636.172889,
         "itemsPerCall": 1.0,
-        "itemsPerSecond": 1672.4285034097097,
+        "itemsPerSecond": 1571.899741864039,
         "latency": {
           "samples": 1000,
-          "p50Ms": 0.5918749999999999,
-          "p95Ms": 0.731917,
-          "p99Ms": 0.820542,
-          "maxMs": 4.003875
+          "p50Ms": 0.626416,
+          "p95Ms": 0.7928339999999999,
+          "p99Ms": 0.90825,
+          "maxMs": 3.068834
         }
       },
       "run_due_maintenance": {
-        "calls": 1109,
+        "calls": 1098,
         "errors": 0,
         "items": 1000,
-        "totalMs": 4475.842945,
-        "itemsPerCall": 0.9017132551848512,
-        "itemsPerSecond": 223.4216017604255,
+        "totalMs": 4801.289079,
+        "itemsPerCall": 0.9107468123861566,
+        "itemsPerSecond": 208.27739874564634,
         "latency": {
-          "samples": 1109,
-          "p50Ms": 1.9938339999999999,
-          "p95Ms": 10.010667,
-          "p99Ms": 13.839083,
-          "maxMs": 22.311999999999998
+          "samples": 1098,
+          "p50Ms": 2.152292,
+          "p95Ms": 11.634125000000001,
+          "p99Ms": 15.872582999999999,
+          "maxMs": 22.971625
         }
       },
       "signal_workflow": {
         "calls": 1000,
         "errors": 0,
         "items": 1000,
-        "totalMs": 1793.08359,
+        "totalMs": 2044.5755820000002,
         "itemsPerCall": 1.0,
-        "itemsPerSecond": 557.6984840957693,
+        "itemsPerSecond": 489.0990623207002,
         "latency": {
           "samples": 1000,
-          "p50Ms": 1.7005,
-          "p95Ms": 2.449042,
-          "p99Ms": 3.051125,
-          "maxMs": 5.405875
+          "p50Ms": 1.9414580000000001,
+          "p95Ms": 2.670792,
+          "p99Ms": 3.269541,
+          "maxMs": 16.403125
         }
       },
       "start_workflow": {
         "calls": 1000,
         "errors": 0,
         "items": 1000,
-        "totalMs": 1510.2475069999998,
+        "totalMs": 1696.3582999999999,
         "itemsPerCall": 1.0,
-        "itemsPerSecond": 662.1431224782681,
+        "itemsPerSecond": 589.498103083529,
         "latency": {
           "samples": 1000,
-          "p50Ms": 1.4100840000000001,
-          "p95Ms": 1.993125,
-          "p99Ms": 2.9867079999999997,
-          "maxMs": 11.541083
+          "p50Ms": 1.609,
+          "p95Ms": 2.238208,
+          "p99Ms": 2.834834,
+          "maxMs": 11.0365
         }
       },
       "stream_history": {
         "calls": 2000,
         "errors": 0,
         "items": 24000,
-        "totalMs": 761.769383,
+        "totalMs": 912.4804800000001,
         "itemsPerCall": 12.0,
-        "itemsPerSecond": 31505.59806628511,
+        "itemsPerSecond": 26301.932508189104,
         "latency": {
           "samples": 2000,
-          "p50Ms": 0.373583,
-          "p95Ms": 0.442959,
-          "p99Ms": 0.504,
-          "maxMs": 1.350916
+          "p50Ms": 0.449334,
+          "p95Ms": 0.534625,
+          "p99Ms": 0.578791,
+          "maxMs": 0.647583
         }
       },
       "stream_history_for_replay": {
-        "calls": 7922,
+        "calls": 7914,
         "errors": 0,
-        "items": 12240,
-        "totalMs": 4643.5539180000005,
-        "itemsPerCall": 1.5450643776824033,
-        "itemsPerSecond": 2635.9121087306817,
+        "items": 12245,
+        "totalMs": 4935.055904000001,
+        "itemsPerCall": 1.5472580237553701,
+        "itemsPerSecond": 2481.228224805941,
         "latency": {
-          "samples": 7922,
-          "p50Ms": 0.579042,
-          "p95Ms": 0.706709,
-          "p99Ms": 0.803166,
-          "maxMs": 4.748208
+          "samples": 7914,
+          "p50Ms": 0.615958,
+          "p95Ms": 0.7717499999999999,
+          "p99Ms": 0.88625,
+          "maxMs": 3.493833
         }
       }
     }
   },
   "postgresStats": {
-    "walBytes": 30355219,
-    "walBytesPerSecond": 3149085.2352046515,
-    "walRecords": 260088,
-    "walRecordsPerSecond": 26981.82742986988,
-    "walFpi": 249,
+    "walBytes": 30291785,
+    "walBytesPerSecond": 3941378.0473947176,
+    "walRecords": 257706,
+    "walRecordsPerSecond": 33531.09666802082,
+    "walFpi": 146,
     "walBuffersFull": 0,
-    "walWrite": 8217,
-    "walSync": 8099,
+    "walWrite": 5861,
+    "walSync": 5713,
     "walWriteTimeMs": 0.0,
     "walSyncTimeMs": 0.0,
-    "xactCommit": 31761,
+    "xactCommit": 29258,
     "xactRollback": 0,
-    "transactionsPerSecond": 3294.9225685156457,
-    "transactionsPerMixedAction": 3.970125,
-    "transactionsPerWorkflow": 31.761,
-    "rowsReturned": 8806115,
-    "rowsFetched": 230028,
-    "rowsInserted": 32881,
-    "rowsUpdated": 42243,
+    "transactionsPerSecond": 3806.86839387889,
+    "transactionsPerMixedAction": 3.65725,
+    "transactionsPerWorkflow": 29.258,
+    "rowsReturned": 9100154,
+    "rowsFetched": 247761,
+    "rowsInserted": 32838,
+    "rowsUpdated": 42041,
     "rowsDeleted": 2000,
-    "blocksRead": 376,
-    "blocksHit": 1861399,
-    "blockCacheHitRatio": 0.9997980421909199,
-    "tempFiles": 0,
-    "tempBytes": 0,
+    "blocksRead": 48,
+    "blocksHit": 1949831,
+    "blockCacheHitRatio": 0.9999753830878737,
+    "tempFiles": 2,
+    "tempBytes": 6393902,
     "deadlocks": 0,
     "blockReadTimeMs": 0.0,
     "blockWriteTimeMs": 0.0,
-    "activeTimeMs": 11153.354999999981,
-    "sessionTimeMs": 117271.66000000015,
+    "activeTimeMs": 10070.398000000045,
+    "sessionTimeMs": 97834.75,
     "activeConnectionsAfter": 1,
     "activitySamples": {
-      "samples": 130,
+      "samples": 116,
       "maxConnections": 10,
-      "maxActive": 5,
+      "maxActive": 4,
       "maxIdle": 10,
       "maxWaiting": 10,
       "waitEventTypeCounts": {
-        "Client": 830,
-        "IO": 40,
-        "LWLock": 8,
-        "Lock": 9
+        "Client": 679,
+        "IO": 29,
+        "LWLock": 4,
+        "Lock": 5
       },
       "waitEventCounts": {
-        "ClientRead": 830,
-        "WALSync": 39,
-        "WALWrite": 9,
-        "transactionid": 9
+        "ClientRead": 679,
+        "WALSync": 28,
+        "WALWrite": 5,
+        "transactionid": 5
       }
     },
     "statementStats": {
-      "calls": 160917,
-      "callsPerMixedAction": 20.114625,
-      "callsPerWorkflow": 160.917,
-      "totalExecTimeMs": 3780.2732789999964,
+      "calls": 116235,
+      "callsPerMixedAction": 14.529375,
+      "callsPerWorkflow": 116.235,
+      "totalExecTimeMs": 4025.6002800000033,
       "topStatements": [
         {
-          "queryId": "-8592854438581438357",
-          "calls": 16000,
-          "totalExecTimeMs": 122.26825299999928,
-          "query": "insert into \"durust_benchmark_8917_1781464809084998_0\".history_events(run_id, event_id, event_type, data) values ($1, $2, $3, $4)"
+          "queryId": "-4829823232538862326",
+          "calls": 9914,
+          "totalExecTimeMs": 112.74989399999987,
+          "query": "select event_id, event_type, data from \"durust_benchmark_12935_1781535884158642_0\".history_events where run_id = $1 and event_id > $2 and event_id <= $3 order by event_id asc"
         },
         {
-          "queryId": "-4594509657608858732",
-          "calls": 10922,
-          "totalExecTimeMs": 28.63192699999959,
-          "query": "select nextval($1::regclass)"
+          "queryId": "-5479681065294517722",
+          "calls": 7914,
+          "totalExecTimeMs": 587.577467,
+          "query": "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id, shard_id, workflow_name, workflow_version from \"durust_benchmark_12935_1781535884158642_0\".workflow_instances "
         },
         {
-          "queryId": "3164113234169251144",
-          "calls": 9922,
-          "totalExecTimeMs": 96.79985300000017,
-          "query": "select event_id, event_type, data from \"durust_benchmark_8917_1781464809084998_0\".history_events where run_id = $1 and event_id > $2 and event_id <= $3 order by event_id asc"
+          "queryId": "6312926462438422502",
+          "calls": 7865,
+          "totalExecTimeMs": 198.86039000000054,
+          "query": "update \"durust_benchmark_12935_1781535884158642_0\".workflow_instances set current_event_id = $1, workflow_claim_token = $5, terminal = $2, ready_reason = $3, "
+        },
+        {
+          "queryId": "6979206518092970068",
+          "calls": 7586,
+          "totalExecTimeMs": 148.19882099999884,
+          "query": "insert into \"durust_benchmark_12935_1781535884158642_0\".history_events(run_id, event_id, event_type, data) select run_id, event_id, event_type, data from unnest($1::text[], $2::bigint[], $3::text[], $4::bytea[]) "
         },
         {
           "queryId": "2064869707185898531",
-          "calls": 9378,
-          "totalExecTimeMs": 2.1674880000000263,
+          "calls": 6921,
+          "totalExecTimeMs": 2.507123999999088,
           "query": "commit"
         },
         {
           "queryId": "7461524595420343917",
-          "calls": 9378,
-          "totalExecTimeMs": 1.497104999999997,
+          "calls": 6921,
+          "totalExecTimeMs": 1.631402000003849,
           "query": "START TRANSACTION"
         },
         {
-          "queryId": "-1209164415173272446",
-          "calls": 7922,
-          "totalExecTimeMs": 719.8671189999988,
-          "query": "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id, shard_id from \"durust_benchmark_8917_1781464809084998_0\".workflow_instances where run_id = $1 fo"
+          "queryId": "6484443695869958557",
+          "calls": 5625,
+          "totalExecTimeMs": 46.86755300000002,
+          "query": "select owner_id, lease_until_ms, lease_epoch from \"durust_benchmark_12935_1781535884158642_0\".shard_leases where shard_id = $1"
         },
         {
-          "queryId": "6631947191986017346",
-          "calls": 7922,
-          "totalExecTimeMs": 175.87791899999974,
-          "query": "update \"durust_benchmark_8917_1781464809084998_0\".workflow_instances set workflow_claim_token = $1, ready_reason = $3, ready_at_ms = $4 where run_id = $2"
-        },
-        {
-          "queryId": "-3925803213378019334",
-          "calls": 7922,
-          "totalExecTimeMs": 57.11012799999971,
-          "query": "select owner_id, lease_until_ms, lease_epoch from \"durust_benchmark_8917_1781464809084998_0\".shard_leases where shard_id = $1"
-        },
-        {
-          "queryId": "-1455559653891807154",
-          "calls": 7874,
-          "totalExecTimeMs": 175.26771199999936,
-          "query": "update \"durust_benchmark_8917_1781464809084998_0\".workflow_instances set current_event_id = $1, workflow_claim_token = $5, terminal = $2, ready_reason = $3, "
-        },
-        {
-          "queryId": "-5617565923479638696",
+          "queryId": "-4783755873335677347",
           "calls": 5000,
-          "totalExecTimeMs": 467.11906300000084,
-          "query": "select current_event_id, terminal from \"durust_benchmark_8917_1781464809084998_0\".workflow_instances where run_id = $1 for update"
+          "totalExecTimeMs": 42.358018,
+          "query": "insert into \"durust_benchmark_12935_1781535884158642_0\".history_events(run_id, event_id, event_type, data) values ($1, $2, $3, $4)"
+        },
+        {
+          "queryId": "-5484826390506758942",
+          "calls": 3000,
+          "totalExecTimeMs": 61.03900699999997,
+          "query": "insert into \"durust_benchmark_12935_1781535884158642_0\".activity_tasks (activity_id, namespace, run_id, activity_name, task_queue, task, claim_token, completed, timeout_at_ms, heartbeat_deadline_at"
+        },
+        {
+          "queryId": "-4594509657608858732",
+          "calls": 3000,
+          "totalExecTimeMs": 12.130505000000085,
+          "query": "select nextval($1::regclass)"
         }
       ]
     }
   },
+  "postgresSchema": "durust_benchmark_12935_1781535884158642_0",
   "dbPath": null,
   "dbBytes": null
 }

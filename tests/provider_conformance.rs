@@ -1,7 +1,8 @@
 use durust::{
     ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ActivityName,
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client,
-    CommitOutcome, CompleteActivityRequest, DurableBackend, Error, EventId, FailActivityRequest,
+    ClaimActivityOptions, ClaimActivityTasksOptions, ClaimWorkflowTaskOptions,
+    ClaimWorkflowTasksOptions, Client, CommitOutcome, CompleteActivityRequest,
+    CompleteActivityTasksRequest, DurableBackend, Error, EventId, FailActivityRequest,
     HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent, PayloadBackend, PostgresBackend,
     PostgresBackendConfig, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
     WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
@@ -1009,6 +1010,7 @@ where
     workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
     stale_workflow_task_commit_conflicts(backend.clone()).await;
     batch_workflow_task_claim_and_commit_results_are_ordered(backend.clone()).await;
+    batch_activity_completion_reports_ordered_duplicate_and_stale_results(backend.clone()).await;
     activity_claim_filters_and_stale_completion_is_rejected(backend).await;
 }
 
@@ -5048,6 +5050,157 @@ where
         .await
         .unwrap();
     assert_eq!(duplicate, durust::CompleteActivityOutcome::AlreadyCompleted);
+}
+
+async fn batch_activity_completion_reports_ordered_duplicate_and_stale_results<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let workflow_type = WorkflowType::new("conformance.batch-activity", 1);
+    let workflow_queue = TaskQueue::new("batch-activity-workflows");
+    let activity_queue = TaskQueue::new("batch-activity-activities");
+    let activity_name = ActivityName::new("conformance.echo");
+    let started = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new("wf/batch-activity-completion"),
+            workflow_type: workflow_type.clone(),
+            task_queue: workflow_queue.clone(),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    let run_id = started.run_id().clone();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: workflow_queue,
+        registered_workflow_types: vec![workflow_type],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("batch-activity-scheduler"), claim_opts)
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let schedules = (0..2_u64)
+        .map(|index| {
+            let input = durust::encode_payload(&Input { value: index }).unwrap();
+            durust::ActivityScheduled {
+                command_id: durust::CommandId {
+                    run_id: run_id.clone(),
+                    seq: durust::CommandSeq(index + 1),
+                },
+                activity_name: activity_name.clone(),
+                task_queue: activity_queue.clone(),
+                retry_policy: durust::RetryPolicy::none(),
+                start_to_close_timeout: Some(Duration::from_secs(30)),
+                heartbeat_timeout: None,
+                fingerprint: durust::activity_fingerprint(
+                    activity_name.clone(),
+                    durust::payload_digest(&input),
+                    format!("batch-activity-{index}"),
+                ),
+                input,
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events: schedules
+                        .iter()
+                        .cloned()
+                        .map(
+                            |scheduled| NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                scheduled,
+                            ))
+                        )
+                        .collect(),
+                    schedule_activities: schedules
+                        .iter()
+                        .map(durust::ActivityTask::from_scheduled)
+                        .collect(),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap(),
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(3)
+        }
+    );
+
+    let mut claimed_activities = backend
+        .claim_activity_tasks(
+            WorkerId::new("batch-activity-worker"),
+            ClaimActivityTasksOptions {
+                claim: ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: activity_queue,
+                    registered_activity_names: vec![activity_name],
+                    lease_duration: Duration::from_secs(30),
+                },
+                limit: 2,
+            },
+        )
+        .await
+        .unwrap();
+    claimed_activities
+        .sort_by(|left, right| left.task.activity_id.0.cmp(&right.task.activity_id.0));
+    assert_eq!(claimed_activities.len(), 2);
+
+    assert_eq!(
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed_activities[0].claim.clone(),
+                result: durust::encode_payload(&1_u64).unwrap(),
+            })
+            .await
+            .unwrap(),
+        durust::CompleteActivityOutcome::Completed {
+            event_id: EventId(4)
+        }
+    );
+
+    let mut stale_claim = claimed_activities[1].claim.clone();
+    stale_claim.token = stale_claim.token.saturating_add(1);
+    let results = backend
+        .complete_activity_tasks(CompleteActivityTasksRequest {
+            completions: vec![
+                CompleteActivityRequest {
+                    claim: claimed_activities[0].claim.clone(),
+                    result: durust::encode_payload(&10_u64).unwrap(),
+                },
+                CompleteActivityRequest {
+                    claim: stale_claim,
+                    result: durust::encode_payload(&20_u64).unwrap(),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0].result.as_ref().unwrap(),
+        &durust::CompleteActivityOutcome::AlreadyCompleted
+    );
+    assert!(matches!(results[1].result, Err(Error::StaleLease)));
+
+    assert_eq!(
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: claimed_activities[1].claim.clone(),
+                result: durust::encode_payload(&2_u64).unwrap(),
+            })
+            .await
+            .unwrap(),
+        durust::CompleteActivityOutcome::Completed {
+            event_id: EventId(5)
+        }
+    );
 }
 
 fn worker<B>(backend: B, workflow_queue: &str, activity_queue: &str) -> Worker<B>

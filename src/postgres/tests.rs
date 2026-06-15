@@ -2762,14 +2762,18 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
                 .is_none()
         );
 
-        assert_eq!(
-            backend
-                .complete_activity(CompleteActivityRequest {
+        let first_outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest {
+                completions: vec![CompleteActivityRequest {
                     claim: first.claim,
                     result: crate::encode_payload(&10_u64).unwrap(),
-                })
-                .await
-                .unwrap(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(first_outcomes.len(), 1);
+        assert_eq!(
+            first_outcomes.into_iter().next().unwrap().result.unwrap(),
             CompleteActivityOutcome::Completed {
                 event_id: EventId(2)
             }
@@ -2783,22 +2787,31 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
             .unwrap()
             .expect("third map item");
         assert_eq!(third.task.map_item.as_ref().unwrap().item_ordinal, 2);
-        backend
-            .complete_activity(CompleteActivityRequest {
-                claim: third.claim,
-                result: crate::encode_payload(&30_u64).unwrap(),
+        let final_outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest {
+                completions: vec![
+                    CompleteActivityRequest {
+                        claim: third.claim,
+                        result: crate::encode_payload(&30_u64).unwrap(),
+                    },
+                    CompleteActivityRequest {
+                        claim: second.claim,
+                        result: crate::encode_payload(&20_u64).unwrap(),
+                    },
+                ],
             })
             .await
             .unwrap();
+        assert_eq!(final_outcomes.len(), 2);
         assert_eq!(
-            backend
-                .complete_activity(CompleteActivityRequest {
-                    claim: second.claim,
-                    result: crate::encode_payload(&20_u64).unwrap(),
-                })
-                .await
-                .unwrap(),
-            CompleteActivityOutcome::Completed {
+            final_outcomes[0].result.as_ref().unwrap(),
+            &CompleteActivityOutcome::Completed {
+                event_id: EventId(2)
+            }
+        );
+        assert_eq!(
+            final_outcomes[1].result.as_ref().unwrap(),
+            &CompleteActivityOutcome::Completed {
                 event_id: EventId(3)
             }
         );
@@ -3401,6 +3414,149 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
 }
 
 #[test]
+fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres bulk history test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("bulk_history");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-bulk-history");
+        let workflow_type = WorkflowType::new("postgres.bulk-history", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-bulk-history-workflows");
+        let started = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"bulk-history").unwrap(),
+            })
+            .await
+            .unwrap();
+        let run_id = started.run_id().clone();
+        let claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed = backend
+            .claim_workflow_task(WorkerId::new("postgres-bulk-history-worker"), claim_opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let version_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(1),
+        };
+        let patch_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(2),
+        };
+        let timer_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(3),
+        };
+
+        let outcome = backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events: vec![
+                        crate::NewHistoryEvent::new(HistoryEventData::VersionMarker(
+                            crate::VersionMarker {
+                                command_id: version_command_id,
+                                change_id: "bulk-version".to_owned(),
+                                version: 7,
+                            },
+                        )),
+                        crate::NewHistoryEvent::new(HistoryEventData::DeprecatedPatchMarker(
+                            crate::DeprecatedPatchMarker {
+                                command_id: patch_command_id,
+                                patch_id: "bulk-patch".to_owned(),
+                            },
+                        )),
+                        crate::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                            crate::TimerStarted {
+                                command_id: timer_command_id,
+                                fire_at: TimestampMs(10),
+                                fingerprint: crate::CommandFingerprint {
+                                    kind: crate::CommandKind::Timer,
+                                    name: "bulk-timer".to_owned(),
+                                    input_digest: None,
+                                    options_digest: "bulk".to_owned(),
+                                },
+                            },
+                        )),
+                    ],
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(4)
+            }
+        );
+
+        let history = backend
+            .stream_history(crate::StreamHistoryRequest {
+                run_id: run_id.clone(),
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(4),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec![EventId(1), EventId(2), EventId(3), EventId(4)]
+        );
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::VersionMarker(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::DeprecatedPatchMarker(_)
+        ));
+        assert!(matches!(history[3].data, HistoryEventData::TimerStarted(_)));
+
+        let versions = backend
+            .workflow_change_versions(crate::WorkflowChangeVersionsRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: Some(workflow_id),
+                run_id: Some(run_id),
+                change_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(versions.records.len(), 2);
+        assert_eq!(versions.records[0].change_id, "bulk-patch");
+        assert_eq!(versions.records[0].version, 1);
+        assert_eq!(versions.records[0].first_event_id, EventId(3));
+        assert_eq!(versions.records[1].change_id, "bulk-version");
+        assert_eq!(versions.records[1].version, 7);
+        assert_eq!(versions.records[1].first_event_id, EventId(2));
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
 fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {
@@ -3556,6 +3712,315 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
             .expect("activity completions should wake workflow");
         assert_eq!(ready.replay_target_event_id, EventId(5));
         assert_eq!(ready.reason, WorkflowTaskReason::ActivityCompleted);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres multi-run batch completion test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_activity_completion_runs");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_type = WorkflowType::new("postgres.batch.multi-run", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-multi-run-workflows");
+        let activity_queue = crate::TaskQueue::new("postgres-batch-multi-run-activities");
+        let activity_name = crate::ActivityName::new("postgres.batch.multi-run");
+        let mut run_ids = Vec::new();
+        for index in 0..2_u64 {
+            let started = backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: crate::Namespace::default(),
+                    workflow_id: crate::WorkflowId::new(format!(
+                        "wf/postgres-batch-multi-run-{index}"
+                    )),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: workflow_queue.clone(),
+                    input: crate::encode_payload(&index).unwrap(),
+                })
+                .await
+                .unwrap();
+            run_ids.push(started.run_id().clone());
+        }
+
+        let workflow_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+        for _ in 0..2 {
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("postgres-batch-multi-run-scheduler"),
+                    workflow_claim_opts.clone(),
+                )
+                .await
+                .unwrap()
+                .expect("workflow task");
+            let scheduled = crate::ActivityScheduled {
+                command_id: CommandId {
+                    run_id: claimed.claim.run_id.clone(),
+                    seq: CommandSeq(1),
+                },
+                activity_name: activity_name.clone(),
+                task_queue: activity_queue.clone(),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: Some(Duration::from_secs(30)),
+                heartbeat_timeout: None,
+                input: crate::encode_payload(&"multi-run").unwrap(),
+                fingerprint: crate::CommandFingerprint {
+                    kind: crate::CommandKind::Activity,
+                    name: activity_name.0.clone(),
+                    input_digest: None,
+                    options_digest: "multi-run".to_owned(),
+                },
+            };
+            assert_eq!(
+                backend
+                    .commit_workflow_task(
+                        claimed.claim,
+                        WorkflowTaskCommit {
+                            expected_tail_event_id: claimed.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::ActivityScheduled(scheduled.clone()),
+                            )],
+                            schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                CommitOutcome::Committed {
+                    new_tail_event_id: EventId(2)
+                }
+            );
+        }
+
+        let activity_opts = ClaimActivityOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: activity_queue,
+            registered_activity_names: vec![activity_name],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed_activities = backend
+            .claim_activity_tasks(
+                WorkerId::new("postgres-batch-multi-run-worker"),
+                ClaimActivityTasksOptions {
+                    claim: activity_opts,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed_activities.len(), 2);
+        let completions = claimed_activities
+            .into_iter()
+            .map(|claimed| crate::CompleteActivityRequest {
+                claim: claimed.claim,
+                result: crate::encode_payload(&"done").unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest { completions })
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for outcome in outcomes {
+            assert_eq!(
+                outcome.result.unwrap(),
+                CompleteActivityOutcome::Completed {
+                    event_id: EventId(3)
+                }
+            );
+        }
+
+        for run_id in run_ids {
+            let history = backend
+                .stream_history(crate::StreamHistoryRequest {
+                    run_id,
+                    after_event_id: EventId::ZERO,
+                    up_to_event_id: EventId(3),
+                    max_events: 100,
+                    max_bytes: usize::MAX,
+                })
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(history.len(), 3);
+            assert!(matches!(
+                history[2].data,
+                HistoryEventData::ActivityCompleted(_)
+            ));
+        }
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_activity_completion_preserves_mixed_result_order() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres mixed batch completion test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_activity_completion_mixed");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-batch-activity-mixed");
+        let workflow_type = WorkflowType::new("postgres.batch.activity-mixed", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-mixed-workflows");
+        let activity_queue = crate::TaskQueue::new("postgres-batch-mixed-activities");
+        let activity_name = crate::ActivityName::new("postgres.batch.mixed");
+        let started = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id,
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"batch-activity-mixed").unwrap(),
+            })
+            .await
+            .unwrap();
+        let run_id = started.run_id().clone();
+        let workflow_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-mixed-scheduler"),
+                workflow_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let schedules = (0..3_u64)
+            .map(|index| crate::ActivityScheduled {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: CommandSeq(index + 1),
+                },
+                activity_name: activity_name.clone(),
+                task_queue: activity_queue.clone(),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: Some(Duration::from_secs(30)),
+                heartbeat_timeout: None,
+                input: crate::encode_payload(&index).unwrap(),
+                fingerprint: crate::CommandFingerprint {
+                    kind: crate::CommandKind::Activity,
+                    name: activity_name.0.clone(),
+                    input_digest: None,
+                    options_digest: format!("mixed-{index}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: claimed.replay_target_event_id,
+                        append_events: schedules
+                            .iter()
+                            .cloned()
+                            .map(|scheduled| {
+                                crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                    scheduled,
+                                ))
+                            })
+                            .collect(),
+                        schedule_activities: schedules
+                            .iter()
+                            .map(ActivityTask::from_scheduled)
+                            .collect(),
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(4)
+            }
+        );
+
+        let activity_opts = ClaimActivityOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: activity_queue,
+            registered_activity_names: vec![activity_name],
+            lease_duration: Duration::from_secs(30),
+        };
+        let mut claimed_activities = backend
+            .claim_activity_tasks(
+                WorkerId::new("postgres-batch-mixed-worker"),
+                ClaimActivityTasksOptions {
+                    claim: activity_opts,
+                    limit: 3,
+                },
+            )
+            .await
+            .unwrap();
+        claimed_activities
+            .sort_by(|left, right| left.task.activity_id.0.cmp(&right.task.activity_id.0));
+        assert_eq!(claimed_activities.len(), 3);
+
+        assert_eq!(
+            backend
+                .complete_activity(CompleteActivityRequest {
+                    claim: claimed_activities[0].claim.clone(),
+                    result: crate::encode_payload(&"first").unwrap(),
+                })
+                .await
+                .unwrap(),
+            CompleteActivityOutcome::Completed {
+                event_id: EventId(5)
+            }
+        );
+        let mut stale_claim = claimed_activities[1].claim.clone();
+        stale_claim.token = stale_claim.token.saturating_add(1);
+        let outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest {
+                completions: vec![
+                    CompleteActivityRequest {
+                        claim: stale_claim,
+                        result: crate::encode_payload(&"stale").unwrap(),
+                    },
+                    CompleteActivityRequest {
+                        claim: claimed_activities[0].claim.clone(),
+                        result: crate::encode_payload(&"duplicate").unwrap(),
+                    },
+                    CompleteActivityRequest {
+                        claim: claimed_activities[2].claim.clone(),
+                        result: crate::encode_payload(&"third").unwrap(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(matches!(outcomes[0].result, Err(Error::StaleLease)));
+        assert_eq!(
+            outcomes[1].result.as_ref().unwrap(),
+            &CompleteActivityOutcome::AlreadyCompleted
+        );
+        assert_eq!(
+            outcomes[2].result.as_ref().unwrap(),
+            &CompleteActivityOutcome::Completed {
+                event_id: EventId(6)
+            }
+        );
 
         backend.drop_schema_for_tests().await.unwrap();
     });
