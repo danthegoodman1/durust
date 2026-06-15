@@ -113,12 +113,15 @@ Implemented:
   workflow-task commits bulk insert ordinary appended history events while
   preserving marker indexes; and Postgres batch activity completion uses a
   SQL-native normal-activity path with per-item results, falling back to scalar
-  completion for duplicate input ids and activity-map items. A measured
-  100-shard run with activity completion batch 32 completed 8,000 mixed actions
-  at 130.11 processing workflows/sec, 1,040.91 processing mixed-actions/sec,
-  3.66 Postgres transactions/action, and 14.53 statements/action. The checked-in
-  high-shard Postgres baseline artifact uses this activity-completion batching
-  profile.
+  completion for duplicate input ids and activity-map items. A later measured
+  100-shard experiment kept only the SQL-native batch workflow commit fast path
+  for non-terminal, non-child, non-map items after bulk activity scheduling,
+  lease preloading, cached prefetch reuse, and timer batching missed the
+  correctness/performance gate. The accepted 3-run median completed 8,000 mixed
+  actions at 141.72 processing workflows/sec, 1,133.77 processing
+  mixed-actions/sec, 3.65 Postgres transactions/action, and 12.82
+  statements/action. The checked-in high-shard Postgres baseline artifact uses
+  this activity-completion plus workflow-commit batching profile.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 

@@ -1358,6 +1358,12 @@ surface. Memory and SQLite may implement them by looping over the one-at-a-time
 methods. Postgres and other shard-native or log-backed provider layouts should
 use them to reduce durable round trips while preserving the same lease fencing,
 event ordering, and conflict semantics as individual calls.
+Providers may internally bulk-apply eligible batch items, such as non-terminal
+single-run workflow commits that only append ordinary workflow-local events and
+update provider-owned wait/activity/query indexes. Items that require broader
+semantics, such as terminal handling, child workflow side effects, activity-map
+state, change-marker indexing, or cancellation cleanup, may fall back to the
+one-at-a-time path inside the same provider implementation.
 
 Batch commit returns one result per input commit in input order:
 

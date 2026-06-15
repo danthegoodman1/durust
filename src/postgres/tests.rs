@@ -3414,6 +3414,336 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
 }
 
 #[test]
+fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres batch workflow fast path test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_workflow_fast_path");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_type = WorkflowType::new("postgres.batch-fast", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-fast-workflows");
+        let activity_queue = crate::TaskQueue::new("postgres-batch-fast-activities");
+        let claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue.clone(),
+            registered_workflow_types: vec![workflow_type.clone()],
+            lease_duration: Duration::from_secs(30),
+        };
+
+        let timer_run = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-timer"),
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"timer").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let activity_run = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-activity"),
+                workflow_type,
+                task_queue: workflow_queue,
+                input: crate::encode_payload(&"activity").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let timer_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-timer-worker"),
+                claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("timer workflow task");
+        let activity_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-activity-worker"),
+                claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("activity workflow task");
+
+        let timer_command = CommandId {
+            run_id: timer_run.clone(),
+            seq: CommandSeq(1),
+        };
+        let activity_command = CommandId {
+            run_id: activity_run.clone(),
+            seq: CommandSeq(1),
+        };
+        let activity_scheduled = crate::ActivityScheduled {
+            command_id: activity_command.clone(),
+            activity_name: crate::ActivityName::new("postgres.batch-fast-activity"),
+            task_queue: activity_queue.clone(),
+            retry_policy: crate::RetryPolicy::none(),
+            input: crate::encode_payload(&"activity-input").unwrap(),
+            fingerprint: crate::CommandFingerprint {
+                kind: crate::CommandKind::Activity,
+                name: "postgres.batch-fast-activity".to_owned(),
+                input_digest: None,
+                options_digest: "fast".to_owned(),
+            },
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+        };
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: vec![
+                    crate::WorkflowTaskCommitInput {
+                        claim: timer_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: timer_claim.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::TimerStarted(crate::TimerStarted {
+                                    command_id: timer_command.clone(),
+                                    fire_at: TimestampMs(10),
+                                    fingerprint: crate::CommandFingerprint {
+                                        kind: crate::CommandKind::Timer,
+                                        name: "timer".to_owned(),
+                                        input_digest: None,
+                                        options_digest: "fast".to_owned(),
+                                    },
+                                }),
+                            )],
+                            upsert_waits: vec![crate::WaitRecord {
+                                wait_id: crate::WaitId::new(format!(
+                                    "{}:{}:timer",
+                                    timer_run.0, timer_command.seq.0
+                                )),
+                                run_id: timer_run.clone(),
+                                command_id: timer_command,
+                                kind: WaitKind::Timer,
+                                key: "timer".to_owned(),
+                                ready_at: Some(TimestampMs(10)),
+                            }],
+                            query_projection: Some(crate::encode_payload(&"fast-view").unwrap()),
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                    crate::WorkflowTaskCommitInput {
+                        claim: activity_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: activity_claim.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::ActivityScheduled(activity_scheduled.clone()),
+                            )],
+                            schedule_activities: vec![ActivityTask::from_scheduled(
+                                &activity_scheduled,
+                            )],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(2)
+            }
+        );
+        assert_eq!(
+            results[1].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(2)
+            }
+        );
+        let projection = backend
+            .query_projection(crate::QueryProjectionRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-timer"),
+            })
+            .await
+            .unwrap();
+        let QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected query projection");
+        };
+        assert_eq!(
+            crate::decode_payload::<String>(&payload).unwrap(),
+            "fast-view"
+        );
+        assert_eq!(
+            backend
+                .fire_due_timers(crate::FireDueTimersRequest {
+                    namespace: crate::Namespace::default(),
+                    now: TimestampMs(10),
+                    limit: 10,
+                })
+                .await
+                .unwrap(),
+            FireDueTimersOutcome { fired: 1 }
+        );
+        let activity = backend
+            .claim_activity_task(
+                WorkerId::new("postgres-batch-fast-activity-claimer"),
+                ClaimActivityOptions {
+                    namespace: crate::Namespace::default(),
+                    task_queue: activity_queue,
+                    registered_activity_names: vec![crate::ActivityName::new(
+                        "postgres.batch-fast-activity",
+                    )],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
+        assert_eq!(activity.task.run_id, activity_run);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!(
+                "skipping Postgres batch workflow stale fast path test; set DURUST_POSTGRES_URL"
+            );
+            return;
+        };
+        let schema = test_schema("batch_workflow_fast_stale");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_type = WorkflowType::new("postgres.batch-fast-stale", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-fast-stale-workflows");
+        let claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue.clone(),
+            registered_workflow_types: vec![workflow_type.clone()],
+            lease_duration: Duration::from_secs(30),
+        };
+        let first = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-stale-ok"),
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"ok").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let second = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-stale-released"),
+                workflow_type,
+                task_queue: workflow_queue,
+                input: crate::encode_payload(&"stale").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let first_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-stale-ok-worker"),
+                claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("first workflow task");
+        let stale_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-stale-released-worker"),
+                claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("second workflow task");
+        backend
+            .release_workflow_task(
+                stale_claim.claim.clone(),
+                crate::WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted),
+            )
+            .await
+            .unwrap();
+
+        let timer_event = |run_id: &RunId, seq: u64| {
+            crate::NewHistoryEvent::new(HistoryEventData::TimerStarted(crate::TimerStarted {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: CommandSeq(seq),
+                },
+                fire_at: TimestampMs(10),
+                fingerprint: crate::CommandFingerprint {
+                    kind: crate::CommandKind::Timer,
+                    name: "timer".to_owned(),
+                    input_digest: None,
+                    options_digest: "stale".to_owned(),
+                },
+            }))
+        };
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: vec![
+                    crate::WorkflowTaskCommitInput {
+                        claim: first_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: first_claim.replay_target_event_id,
+                            append_events: vec![timer_event(&first, 1)],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                    crate::WorkflowTaskCommitInput {
+                        claim: stale_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: stale_claim.replay_target_event_id,
+                            append_events: vec![timer_event(&second, 1)],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results[0].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(2)
+            }
+        );
+        assert!(matches!(results[1].result, Err(Error::StaleLease)));
+        let stale_history = backend
+            .stream_history(crate::StreamHistoryRequest {
+                run_id: second,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(10),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(stale_history.len(), 1);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
 fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {

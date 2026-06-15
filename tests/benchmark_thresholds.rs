@@ -292,7 +292,7 @@ fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
     assert_eq!(baseline["completedWorkflows"], 1000);
     assert_eq!(baseline["mixedActions"], 8000);
     assert!(
-        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 50.0,
+        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 100.0,
         "sharded Postgres baseline should prove scale-out improvement over the normalized baseline"
     );
     positive_f64(&baseline, "processingMixedActionsPerSecond");
@@ -308,14 +308,14 @@ fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
         .as_f64()
         .expect("sharded Postgres baseline should report transactions per mixed action");
     assert!(
-        tx_per_action > 0.0 && tx_per_action <= 3.9,
+        tx_per_action > 0.0 && tx_per_action <= 3.8,
         "sharded Postgres baseline should stay below the accepted transaction budget, got {tx_per_action}"
     );
     let tx_per_workflow = baseline["postgresStats"]["transactionsPerWorkflow"]
         .as_f64()
         .expect("sharded Postgres baseline should report transactions per workflow");
     assert!(
-        tx_per_workflow > 0.0 && tx_per_workflow <= 32.0,
+        tx_per_workflow > 0.0 && tx_per_workflow <= 30.0,
         "sharded Postgres baseline should stay below the accepted transaction budget, got {tx_per_workflow}"
     );
     let statement_stats = &baseline["postgresStats"]["statementStats"];
@@ -323,7 +323,7 @@ fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
         .as_f64()
         .expect("sharded Postgres baseline should report statement calls per mixed action");
     assert!(
-        statement_calls_per_action > 0.0 && statement_calls_per_action <= 16.5,
+        statement_calls_per_action > 0.0 && statement_calls_per_action <= 13.5,
         "sharded Postgres baseline should stay below the accepted statement budget, got {statement_calls_per_action}"
     );
     assert!(

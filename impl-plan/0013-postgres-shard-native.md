@@ -208,12 +208,16 @@ Measured local baselines:
   within a batch transaction, and workers can opt into batched successful
   activity completions. Workflow-task commits now bulk insert ordinary appended
   history events, and Postgres batch activity completion uses a SQL-native
-  normal-activity path with per-item results. The accepted checked-in 100-shard
-  baseline with activity completion batch 32 reached 130.11 processing
-  workflows/sec and 1,040.91 mixed actions/sec, with Postgres at 29,258
-  transactions, 3.66 transactions/action, and 116,235 statement calls, or 14.53
-  statements/action. These reduce statement and transaction pressure without
-  changing replay history semantics.
+  normal-activity path with per-item results. The accepted follow-up workflow
+  commit fast path bulk-locks and bulk-updates eligible non-terminal,
+  non-child, non-map commit items while preserving per-item stale/conflict
+  results and falling back for terminal, child, marker, activity-map, and
+  cancellation semantics. The accepted checked-in 100-shard baseline with
+  activity completion batch 32 reached 141.72 processing workflows/sec and
+  1,133.77 mixed actions/sec, with Postgres at 29,289 transactions, 3.66
+  transactions/action, and 103,081 statement calls, or 12.89 statements/action.
+  The 3-run median was 12.82 statements/action. These reduce statement and
+  transaction pressure without changing replay history semantics.
 - A raw `postgres-write-ceiling` diagnostic mode now runs a DB-only transactional
   write shape with workflow-row locks, history inserts, workflow updates, and
   shard-journal appends. On the same 8,000-operation scale, 10 raw workers

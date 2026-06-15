@@ -82,6 +82,32 @@ struct AppliedWorkflowTaskCommit {
     journal_entry: ShardJournalEntry,
 }
 
+struct LockedWorkflowCommitRow {
+    current_tail: EventId,
+    claim_token: Option<i64>,
+    terminal: bool,
+    namespace: String,
+    workflow_id: String,
+    shard_id: i32,
+}
+
+struct PreparedSimpleWorkflowCommit {
+    input_index: usize,
+    claim: WorkflowTaskClaim,
+    current_tail: EventId,
+    next_event_id: EventId,
+    namespace: String,
+    workflow_id: String,
+    shard_id: i32,
+    lease_epoch: i64,
+    append_history: Vec<(EventId, HistoryEventData)>,
+    schedule_activities: Vec<ActivityTask>,
+    upsert_waits: Vec<crate::WaitRecord>,
+    consume_signals: Vec<crate::SignalId>,
+    delete_waits: Vec<crate::WaitId>,
+    query_projection: Option<PayloadRef>,
+}
+
 struct LockedActivityCompletion {
     task: ActivityTask,
     claim_token: Option<i64>,
@@ -1805,40 +1831,85 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let mut results = Vec::with_capacity(batch.commits.len());
+        let commits = batch.commits;
+        let mut results = (0..commits.len()).map(|_| None).collect::<Vec<_>>();
+        let mut applied_by_index = BTreeMap::<usize, AppliedWorkflowTaskCommit>::new();
         let mut journal_by_shard = BTreeMap::<(i32, i64), Vec<ShardJournalEntry>>::new();
         let mut lease_epoch_cache = BTreeMap::<(WorkerId, i32), i64>::new();
+        let run_counts = commits.iter().fold(BTreeMap::new(), |mut counts, input| {
+            *counts.entry(input.claim.run_id.clone()).or_insert(0usize) += 1;
+            counts
+        });
+        let simple_indices = commits
+            .iter()
+            .enumerate()
+            .filter_map(|(index, input)| {
+                (run_counts.get(&input.claim.run_id) == Some(&1)
+                    && postgres_simple_batch_commit_eligible(&input.commit))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
 
-        for input in batch.commits {
-            let claim = input.claim;
+        if simple_indices.len() > 1 {
+            for (index, result) in self
+                .apply_simple_workflow_task_commits_tx(&tx, &schema, &commits, &simple_indices)
+                .await?
+            {
+                match result {
+                    Ok(applied) => {
+                        results[index] = Some(Ok(applied.outcome.clone()));
+                        applied_by_index.insert(index, applied);
+                    }
+                    Err(err @ Error::Backend(_)) => return Err(err),
+                    Err(err) => {
+                        results[index] = Some(Err(err));
+                    }
+                }
+            }
+        }
+
+        for (index, input) in commits.iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
+            let claim = input.claim.clone();
             match self
                 .apply_workflow_task_commit_tx(
                     &tx,
                     &schema,
                     claim.clone(),
-                    input.commit,
+                    input.commit.clone(),
                     Some(&mut lease_epoch_cache),
                 )
                 .await
             {
                 Ok(applied) => {
-                    journal_by_shard
-                        .entry((applied.shard_id, applied.lease_epoch))
-                        .or_default()
-                        .push(applied.journal_entry);
-                    results.push(crate::WorkflowTaskCommitBatchResult {
-                        claim,
-                        result: Ok(applied.outcome),
-                    });
+                    results[index] = Some(Ok(applied.outcome.clone()));
+                    applied_by_index.insert(index, applied);
                 }
                 Err(err @ Error::Backend(_)) => return Err(err),
                 Err(err) => {
-                    results.push(crate::WorkflowTaskCommitBatchResult {
-                        claim,
-                        result: Err(err),
-                    });
+                    results[index] = Some(Err(err));
                 }
             }
+        }
+
+        let mut batch_results = Vec::with_capacity(commits.len());
+        for (index, input) in commits.iter().enumerate() {
+            if let Some(applied) = applied_by_index.remove(&index) {
+                journal_by_shard
+                    .entry((applied.shard_id, applied.lease_epoch))
+                    .or_default()
+                    .push(applied.journal_entry);
+            }
+            batch_results.push(crate::WorkflowTaskCommitBatchResult {
+                claim: input.claim.clone(),
+                result: results[index].take().unwrap_or_else(|| {
+                    Err(Error::Backend(format!(
+                        "postgres workflow commit batch item {index} was not evaluated"
+                    )))
+                }),
+            });
         }
 
         for ((shard_id, lease_epoch), entries) in journal_by_shard {
@@ -1855,7 +1926,240 @@ impl PostgresBackend {
         }
 
         tx.commit().await.map_err(postgres_error)?;
-        Ok(results)
+        Ok(batch_results)
+    }
+
+    async fn apply_simple_workflow_task_commits_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        commits: &[crate::WorkflowTaskCommitInput],
+        indices: &[usize],
+    ) -> Result<Vec<(usize, Result<AppliedWorkflowTaskCommit>)>> {
+        let run_id_values = indices
+            .iter()
+            .map(|index| commits[*index].claim.run_id.0.clone())
+            .collect::<Vec<_>>();
+        let rows = tx
+            .query(
+                &format!(
+                    "select run_id, current_event_id, workflow_claim_token, terminal,
+                            namespace, workflow_id, shard_id
+                     from {schema}.workflow_instances
+                     where run_id = any($1::text[])
+                     for update"
+                ),
+                &[&run_id_values],
+            )
+            .await
+            .map_err(postgres_error)?;
+        let mut locked = BTreeMap::<RunId, LockedWorkflowCommitRow>::new();
+        for row in rows {
+            let run_id = RunId::new(row.get::<_, String>(0));
+            locked.insert(
+                run_id,
+                LockedWorkflowCommitRow {
+                    current_tail: EventId(u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX)),
+                    claim_token: row.get(2),
+                    terminal: row.get(3),
+                    namespace: row.get(4),
+                    workflow_id: row.get(5),
+                    shard_id: row.get(6),
+                },
+            );
+        }
+
+        let mut item_results = Vec::with_capacity(indices.len());
+        let mut prepared = Vec::<PreparedSimpleWorkflowCommit>::new();
+        let mut conflict_updates = Vec::<(RunId, EventId)>::new();
+        for index in indices {
+            let input = &commits[*index];
+            let claim = input.claim.clone();
+            let Some(row) = locked.get(&claim.run_id) else {
+                item_results.push((*index, Err(Error::RunNotFound(claim.run_id))));
+                continue;
+            };
+            if row.claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
+                item_results.push((*index, Err(Error::StaleLease)));
+                continue;
+            }
+            let lease_epoch = match self
+                .verify_shard_lease_tx(tx, &claim.worker_id, row.shard_id)
+                .await
+            {
+                Ok(lease_epoch) => lease_epoch,
+                Err(err) => {
+                    item_results.push((*index, Err(err)));
+                    continue;
+                }
+            };
+            let expected_tail_event_id = input.commit.expected_tail_event_id;
+            if row.current_tail != expected_tail_event_id {
+                conflict_updates.push((claim.run_id.clone(), row.current_tail));
+                item_results.push((
+                    *index,
+                    Ok(AppliedWorkflowTaskCommit {
+                        outcome: CommitOutcome::Conflict,
+                        shard_id: row.shard_id,
+                        lease_epoch,
+                        journal_entry: ShardJournalEntry {
+                            run_id: claim.run_id,
+                            expected_tail_event_id,
+                            new_tail_event_id: row.current_tail,
+                            result: ShardJournalCommitResult::Conflict,
+                        },
+                    }),
+                ));
+                continue;
+            }
+            if row.terminal
+                && (!input.commit.append_events.is_empty()
+                    || !input.commit.schedule_activities.is_empty()
+                    || !input.commit.upsert_waits.is_empty()
+                    || !input.commit.consume_signals.is_empty()
+                    || !input.commit.delete_waits.is_empty()
+                    || input.commit.query_projection.is_some())
+            {
+                item_results.push((*index, Err(Error::TerminalWorkflow)));
+                continue;
+            }
+
+            let mut next_event_id = row.current_tail;
+            let mut append_history = Vec::with_capacity(input.commit.append_events.len());
+            for event in &input.commit.append_events {
+                let data = self
+                    .normalize_history_event_for_storage_tx(tx, event.data.clone())
+                    .await?;
+                next_event_id = next_event_id.next();
+                append_history.push((next_event_id, data));
+            }
+            let mut schedule_activities =
+                Vec::with_capacity(input.commit.schedule_activities.len());
+            for task in &input.commit.schedule_activities {
+                schedule_activities.push(
+                    self.normalize_activity_task_for_storage_tx(tx, task.clone())
+                        .await?,
+                );
+            }
+            let query_projection = match &input.commit.query_projection {
+                Some(payload) => Some(
+                    self.normalize_payload_for_storage_tx(tx, payload.clone())
+                        .await?,
+                ),
+                None => None,
+            };
+
+            prepared.push(PreparedSimpleWorkflowCommit {
+                input_index: *index,
+                claim,
+                current_tail: row.current_tail,
+                next_event_id,
+                namespace: row.namespace.clone(),
+                workflow_id: row.workflow_id.clone(),
+                shard_id: row.shard_id,
+                lease_epoch,
+                append_history,
+                schedule_activities,
+                upsert_waits: input.commit.upsert_waits.clone(),
+                consume_signals: input.commit.consume_signals.clone(),
+                delete_waits: input.commit.delete_waits.clone(),
+                query_projection,
+            });
+        }
+
+        if !conflict_updates.is_empty() {
+            let run_ids = conflict_updates
+                .iter()
+                .map(|(run_id, _)| run_id.0.clone())
+                .collect::<Vec<_>>();
+            tx.execute(
+                &format!(
+                    "update {schema}.workflow_instances workflows
+                     set workflow_claim_token = null,
+                         ready_reason = $2,
+                         ready_at_ms = 0
+                     where workflows.run_id = any($1::text[])"
+                ),
+                &[&run_ids, &reason_to_str(&WorkflowTaskReason::CacheEvicted)],
+            )
+            .await
+            .map_err(postgres_error)?;
+        }
+
+        let history_rows = prepared
+            .iter()
+            .flat_map(|commit| {
+                commit
+                    .append_history
+                    .iter()
+                    .map(|(event_id, data)| HistoryEventInsert {
+                        run_id: &commit.claim.run_id,
+                        event_id: *event_id,
+                        data,
+                    })
+            })
+            .collect::<Vec<_>>();
+        insert_history_event_rows(tx, schema, &history_rows).await?;
+
+        insert_activity_task_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
+        upsert_wait_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
+        mark_signal_rows_consumed_for_simple_commits_tx(tx, schema, &prepared).await?;
+        delete_wait_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
+        upsert_query_projection_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
+
+        if !prepared.is_empty() {
+            let run_ids = prepared
+                .iter()
+                .map(|commit| commit.claim.run_id.0.clone())
+                .collect::<Vec<_>>();
+            let event_ids = prepared
+                .iter()
+                .map(|commit| i64::try_from(commit.next_event_id.0).unwrap_or(i64::MAX))
+                .collect::<Vec<_>>();
+            tx.execute(
+                &format!(
+                    "update {schema}.workflow_instances workflows
+                     set current_event_id = updates.current_event_id,
+                         workflow_claim_token = null,
+                         terminal = false,
+                         ready_reason = null,
+                         ready_at_ms = 0
+                     from unnest($1::text[], $2::bigint[])
+                          as updates(run_id, current_event_id)
+                     where workflows.run_id = updates.run_id"
+                ),
+                &[&run_ids, &event_ids],
+            )
+            .await
+            .map_err(postgres_error)?;
+        }
+
+        for commit in prepared {
+            item_results.push((
+                commit.input_index,
+                Ok(AppliedWorkflowTaskCommit {
+                    outcome: CommitOutcome::Committed {
+                        new_tail_event_id: commit.next_event_id,
+                    },
+                    shard_id: commit.shard_id,
+                    lease_epoch: commit.lease_epoch,
+                    journal_entry: ShardJournalEntry {
+                        run_id: commit.claim.run_id,
+                        expected_tail_event_id: commit.current_tail,
+                        new_tail_event_id: commit.next_event_id,
+                        result: ShardJournalCommitResult::Committed {
+                            appended_events: usize::try_from(
+                                commit.next_event_id.0.saturating_sub(commit.current_tail.0),
+                            )
+                            .unwrap_or(usize::MAX),
+                            terminal: false,
+                            ready_reason: None,
+                        },
+                    },
+                }),
+            ));
+        }
+        Ok(item_results)
     }
 
     async fn append_shard_journal_tx(
@@ -5304,6 +5608,233 @@ async fn insert_history_event_rows(
                   as event_rows(run_id, event_id, event_type, data)"
         ),
         &[&run_ids, &event_ids, &event_types, &payloads],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+fn postgres_simple_batch_commit_eligible(commit: &WorkflowTaskCommit) -> bool {
+    commit.schedule_activity_maps.is_empty()
+        && commit.start_child_workflows.is_empty()
+        && commit.cancel_commands.is_empty()
+        && commit
+            .append_events
+            .iter()
+            .all(|event| postgres_simple_batch_history_event_eligible(&event.data))
+}
+
+fn postgres_simple_batch_history_event_eligible(data: &HistoryEventData) -> bool {
+    matches!(
+        data,
+        HistoryEventData::ActivityScheduled(_)
+            | HistoryEventData::TimerStarted(_)
+            | HistoryEventData::SignalConsumed(_)
+            | HistoryEventData::SelectWinner(_)
+            | HistoryEventData::SideEffectMarker(_)
+    )
+}
+
+async fn insert_activity_task_rows_for_simple_commits_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    commits: &[PreparedSimpleWorkflowCommit],
+) -> Result<()> {
+    let mut activity_ids = Vec::new();
+    let mut namespaces = Vec::new();
+    let mut run_ids = Vec::new();
+    let mut activity_names = Vec::new();
+    let mut task_queues = Vec::new();
+    let mut task_blobs = Vec::new();
+    let mut timeout_at_ms = Vec::new();
+    for commit in commits {
+        for task in &commit.schedule_activities {
+            activity_ids.push(task.activity_id.0.clone());
+            namespaces.push(commit.namespace.clone());
+            run_ids.push(task.run_id.0.clone());
+            activity_names.push(task.activity_name.0.clone());
+            task_queues.push(task.task_queue.0.clone());
+            task_blobs.push(
+                rmp_serde::to_vec_named(task)
+                    .map_err(|err| Error::PayloadEncode(err.to_string()))?,
+            );
+            timeout_at_ms.push(activity_timeout_at_ms(task.start_to_close_timeout));
+        }
+    }
+    if activity_ids.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!(
+            "insert into {schema}.activity_tasks
+             (activity_id, namespace, run_id, activity_name, task_queue, task,
+              claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
+             select activity_id, namespace, run_id, activity_name, task_queue, task,
+                    null, false, timeout_at_ms, null
+             from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+                         $6::bytea[], $7::bigint[])
+                  as task_rows(activity_id, namespace, run_id, activity_name, task_queue, task,
+                               timeout_at_ms)"
+        ),
+        &[
+            &activity_ids,
+            &namespaces,
+            &run_ids,
+            &activity_names,
+            &task_queues,
+            &task_blobs,
+            &timeout_at_ms,
+        ],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn upsert_wait_rows_for_simple_commits_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    commits: &[PreparedSimpleWorkflowCommit],
+) -> Result<()> {
+    let mut wait_ids = Vec::new();
+    let mut namespaces = Vec::new();
+    let mut run_ids = Vec::new();
+    let mut command_seqs = Vec::new();
+    let mut kinds = Vec::new();
+    let mut keys = Vec::new();
+    let mut ready_at_ms = Vec::new();
+    for commit in commits {
+        for wait in &commit.upsert_waits {
+            wait_ids.push(wait.wait_id.0.clone());
+            namespaces.push(commit.namespace.clone());
+            run_ids.push(wait.run_id.0.clone());
+            command_seqs.push(i64::try_from(wait.command_id.seq.0).unwrap_or(i64::MAX));
+            kinds.push(wait_kind_to_str(&wait.kind).to_owned());
+            keys.push(wait.key.clone());
+            ready_at_ms.push(wait.ready_at.map(|ready_at| ready_at.0));
+        }
+    }
+    if wait_ids.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!(
+            "insert into {schema}.active_waits
+             (wait_id, namespace, run_id, command_seq, kind, wait_key, ready_at_ms)
+             select wait_id, namespace, run_id, command_seq, kind, wait_key, ready_at_ms
+             from unnest($1::text[], $2::text[], $3::text[], $4::bigint[],
+                         $5::text[], $6::text[], $7::bigint[])
+                  as wait_rows(wait_id, namespace, run_id, command_seq, kind, wait_key,
+                               ready_at_ms)
+             on conflict(wait_id) do update set
+                namespace = excluded.namespace,
+                run_id = excluded.run_id,
+                command_seq = excluded.command_seq,
+                kind = excluded.kind,
+                wait_key = excluded.wait_key,
+                ready_at_ms = excluded.ready_at_ms"
+        ),
+        &[
+            &wait_ids,
+            &namespaces,
+            &run_ids,
+            &command_seqs,
+            &kinds,
+            &keys,
+            &ready_at_ms,
+        ],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn mark_signal_rows_consumed_for_simple_commits_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    commits: &[PreparedSimpleWorkflowCommit],
+) -> Result<()> {
+    let signal_ids = commits
+        .iter()
+        .flat_map(|commit| {
+            commit
+                .consume_signals
+                .iter()
+                .map(|signal_id| signal_id.0.clone())
+        })
+        .collect::<Vec<_>>();
+    if signal_ids.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("update {schema}.signals set consumed = true where signal_id = any($1::text[])"),
+        &[&signal_ids],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn delete_wait_rows_for_simple_commits_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    commits: &[PreparedSimpleWorkflowCommit],
+) -> Result<()> {
+    let wait_ids = commits
+        .iter()
+        .flat_map(|commit| commit.delete_waits.iter().map(|wait_id| wait_id.0.clone()))
+        .collect::<Vec<_>>();
+    if wait_ids.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("delete from {schema}.active_waits where wait_id = any($1::text[])"),
+        &[&wait_ids],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn upsert_query_projection_rows_for_simple_commits_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    commits: &[PreparedSimpleWorkflowCommit],
+) -> Result<()> {
+    let mut namespaces = Vec::new();
+    let mut workflow_ids = Vec::new();
+    let mut run_ids = Vec::new();
+    let mut event_ids = Vec::new();
+    let mut payloads = Vec::new();
+    for commit in commits {
+        let Some(payload) = &commit.query_projection else {
+            continue;
+        };
+        namespaces.push(commit.namespace.clone());
+        workflow_ids.push(commit.workflow_id.clone());
+        run_ids.push(commit.claim.run_id.0.clone());
+        event_ids.push(i64::try_from(commit.next_event_id.0).unwrap_or(i64::MAX));
+        payloads.push(
+            rmp_serde::to_vec_named(payload)
+                .map_err(|err| Error::PayloadEncode(err.to_string()))?,
+        );
+    }
+    if namespaces.is_empty() {
+        return Ok(());
+    }
+    tx.execute(
+        &format!(
+            "insert into {schema}.query_projections
+             (namespace, workflow_id, run_id, event_id, payload)
+             select namespace, workflow_id, run_id, event_id, payload
+             from unnest($1::text[], $2::text[], $3::text[], $4::bigint[], $5::bytea[])
+                  as projection_rows(namespace, workflow_id, run_id, event_id, payload)
+             on conflict(namespace, workflow_id) do update set
+                run_id = excluded.run_id,
+                event_id = excluded.event_id,
+                payload = excluded.payload"
+        ),
+        &[&namespaces, &workflow_ids, &run_ids, &event_ids, &payloads],
     )
     .await
     .map_err(postgres_error)?;
