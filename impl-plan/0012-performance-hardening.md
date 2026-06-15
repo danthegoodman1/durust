@@ -68,14 +68,24 @@ Implemented:
   Durust runtime. It records the same Postgres stats envelope as the mixed
   workload so local runs can distinguish Rust-side bottlenecks from the
   machine's Postgres statement/write ceiling.
-- `benches/baselines/durust-mixed-sqlite.json`, the first checked-in baseline
-  artifact. The accepted dimension is single-file SQLite, mixed mode, 1,000
+- `benches/baselines/durust-mixed-sqlite.json`, the checked-in 4-worker
+  single-file SQLite mixed baseline. The accepted dimension is mixed mode, 1,000
   workflows, 4 workers, shard/concurrency/prefetch dimensions set to 1, and
   batch 32. The SQLite provider keeps one configured WAL/FULL connection per
-  backend instance instead of reopening a connection and reapplying pragmas for
-  every operation. The captured release run completed 1,000 workflows, 8,000
-  semantic mixed actions, 8,000 workflow tasks, and reports about 146.7
-  processing workflows/sec and 1,173.8 processing mixed-actions/sec.
+  backend instance and now has ready-workflow and claimable-activity queue
+  indexes. The accepted index experiment completed 1,000 workflows, 8,000
+  semantic mixed actions, and 8,000 workflow tasks at a 3-run median of 206.10
+  processing workflows/sec and 1,648.83 processing mixed-actions/sec.
+- `benches/baselines/durust-mixed-sqlite-1-worker.json`, the checked-in
+  single-worker SQLite-local mixed baseline for the same workload dimensions
+  except `workers = 1`. This profile records the preferred single-file local
+  shape, where the shared SQLite connection avoids multi-worker mutex/cache
+  churn. The accepted index experiment measured a 3-run median of 215.63
+  processing workflows/sec and 1,725.01 processing mixed-actions/sec.
+- A measured SQLite follow-up kept only queue indexes. A combined maintenance
+  transaction improved maintenance p95 but regressed 4-worker throughput beyond
+  the gate, and SQLite batch claim overrides improved activity-claim p95 but
+  regressed both 4-worker and 1-worker throughput, so both were dropped.
 - `benches/baselines/durust-mixed-postgres.json`, the first checked-in
   env-gated Postgres baseline artifact. The accepted dimension is Postgres,
   mixed mode, 1,000 workflows, 4 workers, shard/concurrency/prefetch dimensions
@@ -156,6 +166,17 @@ cargo run --release --locked --bin durust-benchmark-workload -- \
   --activation-prefetch-limit 1 \
   --batch 32 \
   --json > target/durust-mixed-sqlite.json
+
+cargo run --release --locked --bin durust-benchmark-workload -- \
+  --backend sqlite \
+  --mode mixed \
+  --workflows 1000 \
+  --workers 1 \
+  --shards 1 \
+  --activation-concurrency 1 \
+  --activation-prefetch-limit 1 \
+  --batch 32 \
+  --json > target/durust-mixed-sqlite-1-worker.json
 ```
 
 Current Durust mixed Postgres workload:

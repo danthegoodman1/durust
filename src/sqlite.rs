@@ -2956,6 +2956,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
         create index if not exists idx_workflow_change_versions_workflow
             on workflow_change_versions(namespace, workflow_id, change_id);
 
+        create index if not exists idx_workflow_instances_ready
+            on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
+            where ready_reason is not null
+              and workflow_claim_token is null
+              and terminal = 0;
+
         create index if not exists idx_active_waits_timer_due
             on active_waits(kind, ready_at_ms, wait_id);
 
@@ -2980,6 +2986,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
 
         create index if not exists idx_activity_tasks_heartbeat_due
             on activity_tasks(namespace, completed, heartbeat_deadline_at_ms, activity_id);
+
+        create index if not exists idx_activity_tasks_claim
+            on activity_tasks(namespace, task_queue, activity_id)
+            where completed = 0
+              and claim_token is null;
         ",
     )
     .map_err(sqlite_error)?;
@@ -4350,6 +4361,28 @@ mod tests {
             .query_row("pragma synchronous", [], |row| row.get(0))
             .unwrap();
         assert_eq!(synchronous, 2);
+    }
+
+    #[test]
+    fn sqlite_open_creates_queue_perf_indexes_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue-indexes.sqlite3");
+        drop(SqliteBackend::open(&path).unwrap());
+
+        let reopened = SqliteBackend::open(&path).unwrap();
+        let conn = reopened.connection().unwrap();
+        for index_name in ["idx_workflow_instances_ready", "idx_activity_tasks_claim"] {
+            let exists = conn
+                .query_row(
+                    "select 1 from sqlite_master where type = 'index' and name = ?1",
+                    params![index_name],
+                    |_| Ok(()),
+                )
+                .optional()
+                .unwrap()
+                .is_some();
+            assert!(exists, "missing SQLite index `{index_name}`");
+        }
     }
 }
 

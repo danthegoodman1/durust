@@ -1,0 +1,267 @@
+{
+  "backend": "sqlite",
+  "mode": "mixed",
+  "correct": true,
+  "sqliteLayout": "single-file",
+  "options": {
+    "mode": "mixed",
+    "sqliteLayout": "single-file",
+    "workflows": 1000,
+    "workflowOffset": 0,
+    "workers": 1,
+    "shards": 1,
+    "physicalPartitions": 1,
+    "activationConcurrency": 1,
+    "activationPrefetchLimit": 1,
+    "activityDelayMs": 0,
+    "batch": 32,
+    "activityCompletionBatch": 1,
+    "maxRounds": 10000,
+    "keepDb": false,
+    "json": true
+  },
+  "elapsedMs": 4917.2038330000005,
+  "setupMs": 257.50600000000003,
+  "processingMs": 4637.645917000001,
+  "verifyMs": 22.051916000000002,
+  "rounds": 250,
+  "activations": 8000,
+  "completedWorkflows": 1000,
+  "mixedActions": 8000,
+  "activationsPerSecond": 1626.9408939916116,
+  "mixedActionsPerSecond": 1626.9408939916116,
+  "workflowsPerSecond": 203.36761174895145,
+  "processingActivationsPerSecond": 1725.0131086279737,
+  "processingMixedActionsPerSecond": 1725.0131086279737,
+  "processingWorkflowsPerSecond": 215.6266385784967,
+  "counters": {
+    "workflowStarts": 1000,
+    "signals": 1000,
+    "childStarts": 1000,
+    "childCompletions": 1000,
+    "timerHandlers": 1000,
+    "bootActivities": 1000,
+    "childActivities": 1000,
+    "finishActivities": 1000,
+    "workflowTasks": 8000,
+    "activityTasks": 3000,
+    "timersFired": 1000,
+    "activitiesTimedOut": 0,
+    "childWorkflowStartsDispatched": 1000
+  },
+  "workerStats": {
+    "workflowTasks": 8000,
+    "activityTasks": 3000,
+    "timersFired": 1000,
+    "activitiesTimedOut": 0,
+    "childWorkflowStartsDispatched": 1000
+  },
+  "backendMetrics": {
+    "workflowTaskCommitLatency": {
+      "samples": 8000,
+      "p50Ms": 0.093542,
+      "p95Ms": 0.351333,
+      "p99Ms": 1.119125,
+      "maxMs": 2.932708
+    },
+    "operations": {
+      "claim_activity_tasks": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 3000,
+        "totalMs": 394.58755299999996,
+        "itemsPerCall": 0.375,
+        "itemsPerSecond": 7602.875400380407,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.015125,
+          "p95Ms": 0.13362500000000002,
+          "p99Ms": 0.161708,
+          "maxMs": 2.7018329999999997
+        }
+      },
+      "claim_workflow_task": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 8000,
+        "totalMs": 1616.837562,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 4947.930570158291,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.20975,
+          "p95Ms": 0.279042,
+          "p99Ms": 0.968916,
+          "maxMs": 3.442958
+        }
+      },
+      "commit_workflow_task": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 8000,
+        "totalMs": 1308.1718979999998,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 6115.404261650024,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.093542,
+          "p95Ms": 0.351333,
+          "p99Ms": 1.119125,
+          "maxMs": 2.932708
+        }
+      },
+      "complete_activity": {
+        "calls": 3000,
+        "errors": 0,
+        "items": 3000,
+        "totalMs": 321.68697000000003,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 9325.836231414658,
+        "latency": {
+          "samples": 3000,
+          "p50Ms": 0.08512499999999999,
+          "p95Ms": 0.121792,
+          "p99Ms": 0.993125,
+          "maxMs": 2.50025
+        }
+      },
+      "current_time": {
+        "calls": 16000,
+        "errors": 0,
+        "items": 16000,
+        "totalMs": 1.473503,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 10858478.062141713,
+        "latency": {
+          "samples": 16000,
+          "p50Ms": 0.000083,
+          "p95Ms": 0.000125,
+          "p99Ms": 0.000167,
+          "maxMs": 0.000625
+        }
+      },
+      "dispatch_child_workflow_starts": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 257.02811199999996,
+        "itemsPerCall": 0.125,
+        "itemsPerSecond": 3890.625006808594,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.008833,
+          "p95Ms": 0.142583,
+          "p99Ms": 0.18087499999999998,
+          "maxMs": 7.606792
+        }
+      },
+      "hydrate_payload": {
+        "calls": 2000,
+        "errors": 0,
+        "items": 2000,
+        "totalMs": 0.19015300000000002,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 10517846.155464284,
+        "latency": {
+          "samples": 2000,
+          "p50Ms": 0.000083,
+          "p95Ms": 0.000166,
+          "p99Ms": 0.000209,
+          "maxMs": 0.000417
+        }
+      },
+      "read_signal_inbox": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 8.588481,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 116435.02500616814,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 0.008208,
+          "p95Ms": 0.010832999999999999,
+          "p99Ms": 0.012875,
+          "maxMs": 0.016167
+        }
+      },
+      "run_due_maintenance": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 539.71894,
+        "itemsPerCall": 0.125,
+        "itemsPerSecond": 1852.816208376901,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.053625,
+          "p95Ms": 0.131666,
+          "p99Ms": 0.150333,
+          "maxMs": 1.9775
+        }
+      },
+      "signal_workflow": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 135.642897,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 7372.2990448958035,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 0.11225,
+          "p95Ms": 0.13262500000000002,
+          "p99Ms": 1.937125,
+          "maxMs": 2.467791
+        }
+      },
+      "start_workflow": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 1000,
+        "totalMs": 119.9688,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 8335.500563479838,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 0.0915,
+          "p95Ms": 0.118458,
+          "p99Ms": 1.931416,
+          "maxMs": 3.092208
+        }
+      },
+      "stream_history": {
+        "calls": 1000,
+        "errors": 0,
+        "items": 12000,
+        "totalMs": 21.209349999999997,
+        "itemsPerCall": 12.0,
+        "itemsPerSecond": 565788.2019015199,
+        "latency": {
+          "samples": 1000,
+          "p50Ms": 0.020792,
+          "p95Ms": 0.024624999999999998,
+          "p99Ms": 0.028541999999999998,
+          "maxMs": 0.091041
+        }
+      },
+      "stream_history_for_replay": {
+        "calls": 8000,
+        "errors": 0,
+        "items": 8000,
+        "totalMs": 131.793981,
+        "itemsPerCall": 1.0,
+        "itemsPerSecond": 60700.7993786909,
+        "latency": {
+          "samples": 8000,
+          "p50Ms": 0.016375,
+          "p95Ms": 0.019167,
+          "p99Ms": 0.022041,
+          "maxMs": 0.21762499999999999
+        }
+      }
+    }
+  },
+  "dbPath": null,
+  "dbBytes": null
+}

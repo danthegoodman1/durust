@@ -176,11 +176,11 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     assert_eq!(baseline["activations"], 8000);
     assert_eq!(baseline["mixedActions"], 8000);
     assert!(
-        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 100.0,
+        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 175.0,
         "SQLite mixed baseline should stay above the post-hardening throughput floor"
     );
     assert!(
-        positive_f64(&baseline, "processingMixedActionsPerSecond") >= 800.0,
+        positive_f64(&baseline, "processingMixedActionsPerSecond") >= 1400.0,
         "SQLite mixed action baseline should stay above the post-hardening throughput floor"
     );
 
@@ -213,6 +213,57 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
 
     assert!(workload_source.contains("postgres-write-ceiling"));
     assert!(workload_source.contains("ResourceSamplesReport"));
+}
+
+#[test]
+fn phase_0012_mixed_sqlite_one_worker_baseline_is_dimensioned_and_semantic() {
+    let baseline: Value = serde_json::from_str(include_str!(
+        "../benches/baselines/durust-mixed-sqlite-1-worker.json"
+    ))
+    .expect("mixed SQLite one-worker benchmark baseline should be valid JSON");
+    assert_eq!(baseline["backend"], "sqlite");
+    assert_eq!(baseline["mode"], "mixed");
+    assert_eq!(baseline["correct"], true);
+    assert_eq!(baseline["sqliteLayout"], "single-file");
+
+    let options = &baseline["options"];
+    assert_eq!(options["workflows"], 1000);
+    assert_eq!(options["workers"], 1);
+    assert_eq!(options["shards"], 1);
+    assert_eq!(options["activationConcurrency"], 1);
+    assert_eq!(options["activationPrefetchLimit"], 1);
+    assert_eq!(options["batch"], 32);
+    assert_eq!(options["activityCompletionBatch"], 1);
+
+    assert_eq!(baseline["completedWorkflows"], 1000);
+    assert_eq!(baseline["activations"], 8000);
+    assert_eq!(baseline["mixedActions"], 8000);
+    assert!(
+        positive_f64(&baseline, "processingWorkflowsPerSecond") >= 185.0,
+        "SQLite one-worker baseline should stay above the local throughput floor"
+    );
+    assert!(
+        positive_f64(&baseline, "processingMixedActionsPerSecond") >= 1500.0,
+        "SQLite one-worker mixed action baseline should stay above the local throughput floor"
+    );
+
+    let counters = &baseline["counters"];
+    for field in [
+        "workflowStarts",
+        "signals",
+        "childStarts",
+        "childCompletions",
+        "timerHandlers",
+        "bootActivities",
+        "childActivities",
+        "finishActivities",
+    ] {
+        assert_eq!(counters[field], 1000, "semantic counter `{field}` drifted");
+    }
+    assert_eq!(counters["workflowTasks"], 8000);
+    assert_eq!(counters["activityTasks"], 3000);
+    assert_eq!(counters["timersFired"], 1000);
+    assert_eq!(counters["childWorkflowStartsDispatched"], 1000);
 }
 
 #[test]
