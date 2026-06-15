@@ -1612,24 +1612,18 @@ impl PostgresBackend {
                          select run_id, tail_event_id
                          from unnest($1::text[], $2::bigint[])
                               as targets(run_id, tail_event_id)
-                     ),
-                     ranked as (
-                         select h.run_id,
-                                h.event_id,
-                                h.event_type,
-                                h.data,
-                                row_number() over (
-                                    partition by h.run_id
-                                    order by h.event_id desc
-                                ) as ordinal
-                         from {schema}.history_events h
-                         join targets t on t.run_id = h.run_id
-                         where h.event_id <= t.tail_event_id
                      )
-                     select run_id, event_id, event_type, data
-                     from ranked
-                     where ordinal <= $3
-                     order by run_id asc, event_id asc"
+                     select t.run_id, h.event_id, h.event_type, h.data
+                     from targets t
+                     join lateral (
+                         select event_id, event_type, data
+                         from {schema}.history_events h
+                         where h.run_id = t.run_id
+                           and h.event_id <= t.tail_event_id
+                         order by h.event_id desc
+                         limit $3
+                     ) h on true
+                     order by t.run_id asc, h.event_id asc"
                 ),
                 &[
                     &run_ids,
