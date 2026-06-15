@@ -3401,6 +3401,167 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
 }
 
 #[test]
+fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres batch activity completion test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("batch_activity_completion");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-batch-activity-completion");
+        let workflow_type = WorkflowType::new("postgres.batch.activity-completion", 1);
+        let workflow_queue = crate::TaskQueue::new("postgres-batch-completion-workflows");
+        let activity_queue = crate::TaskQueue::new("postgres-batch-completion-activities");
+        let activity_name = crate::ActivityName::new("postgres.batch.completion");
+        let started = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id,
+                workflow_type: workflow_type.clone(),
+                task_queue: workflow_queue.clone(),
+                input: crate::encode_payload(&"batch-activity-completion").unwrap(),
+            })
+            .await
+            .unwrap();
+        let run_id = started.run_id().clone();
+        let workflow_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: workflow_queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-completion-scheduler"),
+                workflow_claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let schedules = (0..2_u64)
+            .map(|index| crate::ActivityScheduled {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: CommandSeq(index + 1),
+                },
+                activity_name: activity_name.clone(),
+                task_queue: activity_queue.clone(),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: Some(Duration::from_secs(30)),
+                heartbeat_timeout: None,
+                input: crate::encode_payload(&index).unwrap(),
+                fingerprint: crate::CommandFingerprint {
+                    kind: crate::CommandKind::Activity,
+                    name: activity_name.0.clone(),
+                    input_digest: None,
+                    options_digest: format!("batch-complete-{index}"),
+                },
+            })
+            .collect::<Vec<_>>();
+        let outcome = backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: claimed.replay_target_event_id,
+                    append_events: schedules
+                        .iter()
+                        .cloned()
+                        .map(|scheduled| {
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                scheduled,
+                            ))
+                        })
+                        .collect(),
+                    schedule_activities: schedules
+                        .iter()
+                        .map(ActivityTask::from_scheduled)
+                        .collect(),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(3)
+            }
+        );
+
+        let activity_opts = ClaimActivityOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: activity_queue,
+            registered_activity_names: vec![activity_name],
+            lease_duration: Duration::from_secs(30),
+        };
+        let claimed_activities = backend
+            .claim_activity_tasks(
+                WorkerId::new("postgres-batch-completion-worker"),
+                ClaimActivityTasksOptions {
+                    claim: activity_opts,
+                    limit: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed_activities.len(), 2);
+
+        let completions = claimed_activities
+            .into_iter()
+            .enumerate()
+            .map(|(index, claimed)| crate::CompleteActivityRequest {
+                claim: claimed.claim,
+                result: crate::encode_payload(&format!("result-{index}")).unwrap(),
+            })
+            .collect::<Vec<_>>();
+        let outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest {
+                completions: completions.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 2);
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            assert_eq!(
+                outcome.result.unwrap(),
+                CompleteActivityOutcome::Completed {
+                    event_id: EventId(4 + u64::try_from(index).unwrap())
+                }
+            );
+        }
+
+        let duplicate_outcomes = backend
+            .complete_activity_tasks(crate::CompleteActivityTasksRequest { completions })
+            .await
+            .unwrap();
+        assert_eq!(duplicate_outcomes.len(), 2);
+        for outcome in duplicate_outcomes {
+            assert_eq!(
+                outcome.result.unwrap(),
+                CompleteActivityOutcome::AlreadyCompleted
+            );
+        }
+
+        let ready = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-completion-ready"),
+                workflow_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("activity completions should wake workflow");
+        assert_eq!(ready.replay_target_event_id, EventId(5));
+        assert_eq!(ready.reason, WorkflowTaskReason::ActivityCompleted);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
 fn postgres_activity_retry_failure_and_timeout_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {
@@ -3635,4 +3796,18 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
 
         backend.drop_schema_for_tests().await.unwrap();
     });
+}
+
+#[test]
+fn postgres_transaction_abort_retry_classifier_matches_only_abort_sqlstates() {
+    assert!(is_retryable_postgres_transaction_abort(&Error::Backend(
+        "postgres error SQLSTATE 40P01: deadlock detected".to_owned()
+    )));
+    assert!(is_retryable_postgres_transaction_abort(&Error::Backend(
+        "postgres error SQLSTATE 40001: serialization failure".to_owned()
+    )));
+    assert!(!is_retryable_postgres_transaction_abort(&Error::Backend(
+        "postgres error SQLSTATE 23505: duplicate key value violates unique constraint".to_owned()
+    )));
+    assert!(!is_retryable_postgres_transaction_abort(&Error::StaleLease));
 }

@@ -306,6 +306,7 @@ impl DurableBackend for SqliteBackend {
                 },
                 replay_target_event_id: tail,
                 reason,
+                prefetched_history: Vec::new(),
             }))
         })();
         Box::pin(ready(result))

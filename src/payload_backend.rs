@@ -4,14 +4,14 @@ use crate::{
     CancelWorkflowRequest, ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
     ChildWorkflowStartRequested, ClaimActivityOptions, ClaimWorkflowTaskOptions,
     ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome, CompleteActivityOutcome,
-    CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
-    DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, FailActivityOutcome,
-    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
-    HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
-    PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
-    PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
-    Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    CompleteActivityRequest, CompleteActivityTaskBatchResult, CompleteActivityTasksRequest,
+    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend,
+    DurableFailure, Error, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome,
+    FireDueTimersRequest, HistoryChunk, HistoryEvent, HistoryEventData, PayloadBlob,
+    PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef,
+    PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest,
+    ReadSignalInboxRequest, Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome,
+    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
     TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
     WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
     digest_bytes,
@@ -274,6 +274,28 @@ where
             let result = normalize_payload_ref(&blob_store, &config, req.result).await?;
             inner
                 .complete_activity(CompleteActivityRequest { result, ..req })
+                .await
+        })
+    }
+
+    fn complete_activity_tasks(
+        &self,
+        req: CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, Result<Vec<CompleteActivityTaskBatchResult>>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        let config = self.payload_config.clone();
+        Box::pin(async move {
+            let mut completions = Vec::with_capacity(req.completions.len());
+            for completion in req.completions {
+                let result = normalize_payload_ref(&blob_store, &config, completion.result).await?;
+                completions.push(CompleteActivityRequest {
+                    result,
+                    ..completion
+                });
+            }
+            inner
+                .complete_activity_tasks(CompleteActivityTasksRequest { completions })
                 .await
         })
     }

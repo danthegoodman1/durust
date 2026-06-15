@@ -2,10 +2,11 @@ use crate::{
     ActivityHeartbeatRequest, ClaimActivityOptions, ClaimActivityTasksOptions,
     ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, CompleteActivityRequest, DurableBackend,
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
-    Namespace, NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunId, ShardId,
-    StartWorkflowRequest, TaskQueue, TimeoutDueActivitiesRequest, WorkerId, Workflow,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
-    WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
+    Namespace, NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunDueMaintenanceRequest,
+    RunId, ShardId, StartWorkflowRequest, TaskQueue, TimeoutDueActivitiesRequest, TimestampMs,
+    WorkerId, Workflow, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit,
+    WorkflowTaskReason, WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -162,6 +163,7 @@ where
     recovery_flow_control: RecoveryFlowControl,
     active_recoveries: usize,
     activity_task_batch_size: usize,
+    activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
 }
@@ -171,6 +173,7 @@ struct CachedWorkflow {
     last_event_id: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
+    change_versions: Vec<WorkflowChangeVersionRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -276,12 +279,20 @@ struct PreparedWorkflowTask {
     runtime_appended_tail: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
+    change_versions: Vec<WorkflowChangeVersionRecord>,
+    appended_change_marker: bool,
     terminal: bool,
 }
 
 enum WorkflowPollOutcome {
     Ready(Poll<Result<crate::PayloadRef>>),
     Deferred,
+}
+
+#[derive(Clone)]
+enum ActivityFinish {
+    Complete(crate::CompleteActivityRequest),
+    Fail(crate::FailActivityRequest),
 }
 
 impl<B> Worker<B>
@@ -302,6 +313,7 @@ where
             workflow_task_concurrency: WorkflowTaskConcurrency::default(),
             recovery_flow_control: RecoveryFlowControl::default(),
             activity_task_batch_size: 1,
+            activity_completion_batch_size: 1,
             max_local_activities_per_workflow_task: 0,
         }
     }
@@ -390,7 +402,10 @@ where
                     continue;
                 };
                 committed += 1;
-                if task.terminal || last_event_id > task.runtime_appended_tail {
+                if task.terminal
+                    || task.appended_change_marker
+                    || last_event_id > task.runtime_appended_tail
+                {
                     continue;
                 }
                 let future = std::mem::replace(
@@ -406,6 +421,7 @@ where
                         last_event_id,
                         next_command_seq: task.next_command_seq,
                         default_activity_options: task.default_activity_options.clone(),
+                        change_versions: task.change_versions.clone(),
                     },
                 );
             }
@@ -426,26 +442,19 @@ where
         let claim_for_release = claimed.claim.clone();
         let cached = self.cache.remove(&claimed.run_id);
         let now = self.backend.current_time().await?;
-        let change_versions = self
-            .backend
-            .workflow_change_versions(WorkflowChangeVersionsRequest {
-                namespace: self.namespace.clone(),
-                workflow_id: None,
-                run_id: Some(claimed.run_id.clone()),
-                change_id: None,
-            })
-            .await?
-            .records;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
-                .stream_history_chunk(
-                    claimed.run_id.clone(),
-                    cached.last_event_id,
-                    claimed.replay_target_event_id,
-                )
+                .claim_history_chunk(&claimed, cached.last_event_id)
                 .await;
             match chunk {
                 Ok(chunk) => {
+                    let change_versions = self
+                        .change_versions_for_loaded_history(
+                            &claimed,
+                            &chunk,
+                            Some(cached.change_versions.clone()),
+                        )
+                        .await?;
                     let mut context = crate::runtime::RuntimeContext::new(
                         claimed.run_id.clone(),
                         self.workflow_task_queue.clone(),
@@ -471,7 +480,13 @@ where
                     match poll {
                         Ok(poll) => match poll {
                             WorkflowPollOutcome::Ready(poll) => self
-                                .finish_workflow_poll(claimed, cached.future, context, poll)
+                                .finish_workflow_poll(
+                                    claimed,
+                                    cached.future,
+                                    context,
+                                    poll,
+                                    change_versions,
+                                )
                                 .await
                                 .map(WorkflowTaskOutcome::Finished),
                             WorkflowPollOutcome::Deferred => Ok(WorkflowTaskOutcome::Deferred),
@@ -490,27 +505,32 @@ where
                 let mut recovery_budget =
                     is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
                 let first_chunk = match recovery_budget.as_mut() {
-                    Some(budget) => {
-                        self.stream_recovery_history_chunk(
-                            claimed.run_id.clone(),
-                            EventId::ZERO,
-                            claimed.replay_target_event_id,
-                            budget,
-                        )
-                        .await
-                    }
+                    Some(budget) => match prefetched_claim_history_chunk(&claimed, EventId::ZERO) {
+                        Some(chunk) => {
+                            budget.record_chunk(&chunk);
+                            Ok(Some(chunk))
+                        }
+                        None => {
+                            self.stream_recovery_history_chunk(
+                                claimed.run_id.clone(),
+                                EventId::ZERO,
+                                claimed.replay_target_event_id,
+                                budget,
+                            )
+                            .await
+                        }
+                    },
                     None => self
-                        .stream_history_chunk(
-                            claimed.run_id.clone(),
-                            EventId::ZERO,
-                            claimed.replay_target_event_id,
-                        )
+                        .claim_history_chunk(&claimed, EventId::ZERO)
                         .await
                         .map(Some),
                 };
                 let result = match first_chunk {
                     Ok(Some(first_chunk)) => {
                         let last_loaded_event_id = first_chunk.last_event_id;
+                        let change_versions = self
+                            .change_versions_for_loaded_history(&claimed, &first_chunk, None)
+                            .await?;
                         match split_start_event(&first_chunk.events) {
                             Err(err) => Err(err),
                             Ok((input, replay_events)) => {
@@ -547,7 +567,11 @@ where
                                         match poll {
                                             Ok(WorkflowPollOutcome::Ready(poll)) => self
                                                 .finish_workflow_poll(
-                                                    claimed, future, context, poll,
+                                                    claimed,
+                                                    future,
+                                                    context,
+                                                    poll,
+                                                    change_versions,
                                                 )
                                                 .await
                                                 .map(WorkflowTaskOutcome::Finished),
@@ -632,16 +656,6 @@ where
         let claim_for_release = claimed.claim.clone();
         let cached = self.cache.remove(&claimed.run_id);
         let now = self.backend.current_time().await?;
-        let change_versions = self
-            .backend
-            .workflow_change_versions(WorkflowChangeVersionsRequest {
-                namespace: self.namespace.clone(),
-                workflow_id: None,
-                run_id: Some(claimed.run_id.clone()),
-                change_id: None,
-            })
-            .await?
-            .records;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
                 .stream_history_chunk(
@@ -652,6 +666,13 @@ where
                 .await;
             match chunk {
                 Ok(chunk) => {
+                    let change_versions = self
+                        .change_versions_for_loaded_history(
+                            &claimed,
+                            &chunk,
+                            Some(cached.change_versions.clone()),
+                        )
+                        .await?;
                     let mut context = crate::runtime::RuntimeContext::new(
                         claimed.run_id.clone(),
                         self.workflow_task_queue.clone(),
@@ -676,7 +697,13 @@ where
                         .await;
                     match poll {
                         Ok(WorkflowPollOutcome::Ready(poll)) => self
-                            .prepare_workflow_poll(claimed, cached.future, context, poll)
+                            .prepare_workflow_poll(
+                                claimed,
+                                cached.future,
+                                context,
+                                poll,
+                                change_versions,
+                            )
                             .await
                             .map(PreparedWorkflowTaskOutcome::Prepared),
                         Ok(WorkflowPollOutcome::Deferred) => {
@@ -718,6 +745,9 @@ where
                 let result = match first_chunk {
                     Ok(Some(first_chunk)) => {
                         let last_loaded_event_id = first_chunk.last_event_id;
+                        let change_versions = self
+                            .change_versions_for_loaded_history(&claimed, &first_chunk, None)
+                            .await?;
                         match split_start_event(&first_chunk.events) {
                             Err(err) => Err(err),
                             Ok((input, replay_events)) => {
@@ -754,7 +784,11 @@ where
                                         match poll {
                                             Ok(WorkflowPollOutcome::Ready(poll)) => self
                                                 .prepare_workflow_poll(
-                                                    claimed, future, context, poll,
+                                                    claimed,
+                                                    future,
+                                                    context,
+                                                    poll,
+                                                    change_versions,
                                                 )
                                                 .await
                                                 .map(PreparedWorkflowTaskOutcome::Prepared),
@@ -867,14 +901,31 @@ where
         }
 
         let mut completed = 0usize;
-        for task in claimed {
-            self.run_claimed_activity(task).await?;
-            completed += 1;
+        if self.activity_completion_batch_size <= 1 {
+            for task in claimed {
+                self.run_claimed_activity(task).await?;
+                completed += 1;
+            }
+        } else {
+            let mut finishes = Vec::with_capacity(claimed.len());
+            for task in claimed {
+                finishes.push(self.prepare_activity_finish(task).await?);
+                completed += 1;
+            }
+            self.finish_activities(finishes).await?;
         }
         Ok(completed)
     }
 
     async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
+        let finish = self.prepare_activity_finish(claimed).await?;
+        self.finish_activity(finish).await
+    }
+
+    async fn prepare_activity_finish(
+        &mut self,
+        claimed: crate::ClaimedActivityTask,
+    ) -> Result<ActivityFinish> {
         let registration = self
             .registry
             .activity(&claimed.task.activity_name)
@@ -896,22 +947,55 @@ where
         })
         .await;
 
-        match result {
-            Ok(result) => {
-                self.backend
-                    .complete_activity(CompleteActivityRequest {
-                        claim: claimed.claim,
-                        result,
-                    })
-                    .await?;
+        Ok(match result {
+            Ok(result) => ActivityFinish::Complete(CompleteActivityRequest {
+                claim: claimed.claim,
+                result,
+            }),
+            Err(err) => ActivityFinish::Fail(FailActivityRequest {
+                claim: claimed.claim,
+                failure: err.durable_failure(),
+            }),
+        })
+    }
+
+    async fn finish_activity(&self, finish: ActivityFinish) -> Result<()> {
+        match finish {
+            ActivityFinish::Complete(req) => {
+                self.backend.complete_activity(req).await?;
             }
-            Err(err) => {
-                self.backend
-                    .fail_activity(FailActivityRequest {
-                        claim: claimed.claim,
-                        failure: err.durable_failure(),
+            ActivityFinish::Fail(req) => {
+                self.backend.fail_activity(req).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn finish_activities(&self, finishes: Vec<ActivityFinish>) -> Result<()> {
+        let batch_size = self.activity_completion_batch_size.max(1);
+        for chunk in finishes.chunks(batch_size) {
+            if chunk
+                .iter()
+                .all(|finish| matches!(finish, ActivityFinish::Complete(_)))
+            {
+                let completions = chunk
+                    .iter()
+                    .filter_map(|finish| match finish {
+                        ActivityFinish::Complete(req) => Some(req.clone()),
+                        ActivityFinish::Fail(_) => None,
                     })
+                    .collect::<Vec<_>>();
+                let results = self
+                    .backend
+                    .complete_activity_tasks(crate::CompleteActivityTasksRequest { completions })
                     .await?;
+                for result in results {
+                    result.result?;
+                }
+            } else {
+                for finish in chunk {
+                    self.finish_activity(finish.clone()).await?;
+                }
             }
         }
         Ok(())
@@ -941,6 +1025,18 @@ where
             })
             .await?;
         Ok(outcome.timed_out)
+    }
+
+    pub async fn run_due_maintenance_once(&mut self) -> Result<crate::RunDueMaintenanceOutcome> {
+        let now = self.backend.current_time().await?;
+        self.backend
+            .run_due_maintenance(RunDueMaintenanceRequest {
+                namespace: self.namespace.clone(),
+                now,
+                timer_limit: 1024,
+                activity_limit: 1024,
+            })
+            .await
     }
 
     pub async fn run_child_workflow_starts_once(&mut self) -> Result<usize> {
@@ -973,14 +1069,13 @@ where
                 stats.activity_tasks += local_activity_tasks;
                 progressed = true;
             }
-            let timers_fired = self.run_timers_once().await?;
-            if timers_fired > 0 {
-                stats.timers_fired += timers_fired;
+            let maintenance = self.run_due_maintenance_once().await?;
+            if maintenance.timers_fired > 0 {
+                stats.timers_fired += maintenance.timers_fired;
                 progressed = true;
             }
-            let activities_timed_out = self.run_activity_timeouts_once().await?;
-            if activities_timed_out > 0 {
-                stats.activities_timed_out += activities_timed_out;
+            if maintenance.activities_timed_out > 0 {
+                stats.activities_timed_out += maintenance.activities_timed_out;
                 progressed = true;
             }
             let child_starts = self.run_child_workflow_starts_once().await?;
@@ -1027,6 +1122,29 @@ where
                 max_bytes: self.history_chunk_bytes,
             })
             .await
+    }
+
+    async fn claim_history_chunk(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        after_event_id: EventId,
+    ) -> Result<crate::HistoryChunk> {
+        if after_event_id >= claimed.replay_target_event_id {
+            return Ok(crate::HistoryChunk {
+                events: Vec::new(),
+                last_event_id: after_event_id,
+                has_more: false,
+            });
+        }
+        if let Some(chunk) = prefetched_claim_history_chunk(claimed, after_event_id) {
+            return Ok(chunk);
+        }
+        self.stream_history_chunk(
+            claimed.run_id.clone(),
+            after_event_id,
+            claimed.replay_target_event_id,
+        )
+        .await
     }
 
     async fn stream_recovery_history_chunk(
@@ -1199,20 +1317,57 @@ where
         Ok(payload)
     }
 
+    async fn change_versions_for_loaded_history(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        chunk: &crate::HistoryChunk,
+        cached: Option<Vec<WorkflowChangeVersionRecord>>,
+    ) -> Result<Vec<WorkflowChangeVersionRecord>> {
+        if chunk.has_more {
+            return Ok(self
+                .backend
+                .workflow_change_versions(WorkflowChangeVersionsRequest {
+                    namespace: self.namespace.clone(),
+                    workflow_id: None,
+                    run_id: Some(claimed.run_id.clone()),
+                    change_id: None,
+                })
+                .await?
+                .records);
+        }
+
+        let mut records = cached.unwrap_or_default();
+        records.extend(change_versions_from_history(
+            &self.namespace,
+            &claimed.workflow_id,
+            &claimed.workflow_type,
+            &claimed.run_id,
+            &chunk.events,
+        ));
+        let mut by_change_id = BTreeMap::new();
+        for record in records {
+            by_change_id.insert(record.change_id.clone(), record);
+        }
+        Ok(by_change_id.into_values().collect())
+    }
+
     async fn finish_workflow_poll(
         &mut self,
         claimed: crate::ClaimedWorkflowTask,
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
+        change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Result<Option<CachedWorkflow>> {
         let prepared = self
-            .prepare_workflow_poll(claimed, future, context, poll)
+            .prepare_workflow_poll(claimed, future, context, poll, change_versions)
             .await?;
         let runtime_appended_tail = prepared.runtime_appended_tail;
         let terminal = prepared.terminal;
+        let appended_change_marker = prepared.appended_change_marker;
         let next_command_seq = prepared.next_command_seq;
         let default_activity_options = prepared.default_activity_options.clone();
+        let change_versions = prepared.change_versions.clone();
         let future = prepared.future;
         let commit = self
             .backend
@@ -1228,6 +1383,9 @@ where
         if terminal {
             return Ok(None);
         }
+        if appended_change_marker {
+            return Ok(None);
+        }
         if last_event_id > runtime_appended_tail {
             return Ok(None);
         }
@@ -1237,6 +1395,7 @@ where
             last_event_id,
             next_command_seq,
             default_activity_options,
+            change_versions,
         }))
     }
 
@@ -1246,6 +1405,7 @@ where
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
+        change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Result<PreparedWorkflowTask> {
         let next_command_seq = context.next_command_seq();
         let parts = context.into_commit_parts();
@@ -1286,6 +1446,12 @@ where
                 .0
                 .saturating_add(u64::try_from(append_events.len()).unwrap_or(u64::MAX)),
         );
+        let appended_change_marker = append_events.iter().any(|event| {
+            matches!(
+                event.data,
+                HistoryEventData::VersionMarker(_) | HistoryEventData::DeprecatedPatchMarker(_)
+            )
+        });
 
         Ok(PreparedWorkflowTask {
             run_id: claimed.run_id,
@@ -1306,6 +1472,8 @@ where
             runtime_appended_tail,
             next_command_seq,
             default_activity_options,
+            change_versions,
+            appended_change_marker,
             terminal,
         })
     }
@@ -1347,6 +1515,45 @@ fn poll_cached(
     poll_with_runtime_context(context, || future.as_mut().poll(&mut task_context))
 }
 
+fn prefetched_claim_history_chunk(
+    claimed: &crate::ClaimedWorkflowTask,
+    after_event_id: EventId,
+) -> Option<crate::HistoryChunk> {
+    if after_event_id >= claimed.replay_target_event_id {
+        return Some(crate::HistoryChunk {
+            events: Vec::new(),
+            last_event_id: after_event_id,
+            has_more: false,
+        });
+    }
+
+    let events = claimed
+        .prefetched_history
+        .iter()
+        .filter(|event| {
+            event.event_id > after_event_id && event.event_id <= claimed.replay_target_event_id
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let first = events.first()?;
+    let last = events.last()?;
+    if first.event_id != after_event_id.next() || last.event_id != claimed.replay_target_event_id {
+        return None;
+    }
+    if events
+        .windows(2)
+        .any(|pair| pair[1].event_id != pair[0].event_id.next())
+    {
+        return None;
+    }
+    let last_event_id = last.event_id;
+    Some(crate::HistoryChunk {
+        events,
+        last_event_id,
+        has_more: false,
+    })
+}
+
 fn split_start_event(events: &[HistoryEvent]) -> Result<(crate::PayloadRef, Vec<HistoryEvent>)> {
     let Some(first) = events.first() else {
         return Err(Error::Backend(
@@ -1359,6 +1566,47 @@ fn split_start_event(events: &[HistoryEvent]) -> Result<(crate::PayloadRef, Vec<
         ));
     };
     Ok((input.clone(), events.iter().skip(1).cloned().collect()))
+}
+
+fn change_versions_from_history(
+    namespace: &Namespace,
+    workflow_id: &WorkflowId,
+    workflow_type: &crate::WorkflowType,
+    run_id: &RunId,
+    events: &[HistoryEvent],
+) -> Vec<WorkflowChangeVersionRecord> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::VersionMarker(marker) => Some(WorkflowChangeVersionRecord {
+                namespace: namespace.clone(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                run_id: run_id.clone(),
+                change_id: marker.change_id.clone(),
+                version: marker.version,
+                marker_kind: WorkflowChangeMarkerKind::Version,
+                status: WorkflowChangeVersionStatus::Open,
+                command_seq: marker.command_id.seq,
+                first_event_id: event.event_id,
+                last_seen_at: TimestampMs(0),
+            }),
+            HistoryEventData::DeprecatedPatchMarker(marker) => Some(WorkflowChangeVersionRecord {
+                namespace: namespace.clone(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                run_id: run_id.clone(),
+                change_id: marker.patch_id.clone(),
+                version: 1,
+                marker_kind: WorkflowChangeMarkerKind::DeprecatedPatch,
+                status: WorkflowChangeVersionStatus::Open,
+                command_seq: marker.command_id.seq,
+                first_event_id: event.event_id,
+                last_seen_at: TimestampMs(0),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 pub struct WorkerBuilder<B>
@@ -1377,6 +1625,7 @@ where
     workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
     activity_task_batch_size: usize,
+    activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
 }
 
@@ -1452,6 +1701,11 @@ where
 
     pub fn max_concurrent_activities(mut self, limit: usize) -> Self {
         self.activity_task_batch_size = limit.max(1);
+        self
+    }
+
+    pub fn activity_completion_batch_size(mut self, limit: usize) -> Self {
+        self.activity_completion_batch_size = limit.max(1);
         self
     }
 
@@ -1539,8 +1793,79 @@ where
             recovery_flow_control: self.recovery_flow_control,
             active_recoveries: 0,
             activity_task_batch_size: self.activity_task_batch_size,
+            activity_completion_batch_size: self.activity_completion_batch_size,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ClaimedWorkflowTask, HistoryEvent, HistoryEventData, HistoryEventType, WorkflowTaskClaim,
+        WorkflowTaskReason,
+    };
+
+    fn event(event_id: u64) -> HistoryEvent {
+        HistoryEvent {
+            event_id: EventId(event_id),
+            event_type: HistoryEventType::WorkflowTaskStarted,
+            data: HistoryEventData::WorkflowTaskStarted,
+        }
+    }
+
+    fn claimed(
+        prefetched_history: Vec<HistoryEvent>,
+        replay_target_event_id: u64,
+    ) -> ClaimedWorkflowTask {
+        ClaimedWorkflowTask {
+            run_id: RunId::new("run"),
+            workflow_id: WorkflowId::new("workflow"),
+            workflow_type: crate::WorkflowType::new("test.workflow", 1),
+            claim: WorkflowTaskClaim {
+                run_id: RunId::new("run"),
+                worker_id: WorkerId::new("worker"),
+                token: 1,
+            },
+            replay_target_event_id: EventId(replay_target_event_id),
+            reason: WorkflowTaskReason::WorkflowStarted,
+            prefetched_history,
+        }
+    }
+
+    #[test]
+    fn prefetched_claim_history_chunk_uses_complete_contiguous_tail() {
+        let claimed = claimed(vec![event(2), event(3), event(4)], 4);
+
+        let chunk = prefetched_claim_history_chunk(&claimed, EventId(1)).unwrap();
+
+        assert_eq!(chunk.last_event_id, EventId(4));
+        assert!(!chunk.has_more);
+        assert_eq!(
+            chunk
+                .events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<Vec<_>>(),
+            vec![EventId(2), EventId(3), EventId(4)]
+        );
+    }
+
+    #[test]
+    fn prefetched_claim_history_chunk_rejects_missing_start_or_target() {
+        let missing_start = claimed(vec![event(3), event(4)], 4);
+        assert!(prefetched_claim_history_chunk(&missing_start, EventId(1)).is_none());
+
+        let missing_target = claimed(vec![event(2), event(3)], 4);
+        assert!(prefetched_claim_history_chunk(&missing_target, EventId(1)).is_none());
+    }
+
+    #[test]
+    fn prefetched_claim_history_chunk_rejects_internal_gaps() {
+        let claimed = claimed(vec![event(2), event(4)], 4);
+
+        assert!(prefetched_claim_history_chunk(&claimed, EventId(1)).is_none());
     }
 }

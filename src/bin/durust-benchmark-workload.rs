@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -59,8 +60,11 @@ struct BenchmarkOptions {
     activation_prefetch_limit: u64,
     activity_delay_ms: u64,
     batch: usize,
+    activity_completion_batch: usize,
     max_rounds: usize,
     keep_db: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    sample_resources: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     postgres_pool_size: Option<usize>,
     json: bool,
@@ -139,6 +143,8 @@ struct PostgresStatsReport {
     xact_commit: u64,
     xact_rollback: u64,
     transactions_per_second: f64,
+    transactions_per_mixed_action: f64,
+    transactions_per_workflow: f64,
     rows_returned: u64,
     rows_fetched: u64,
     rows_inserted: u64,
@@ -157,6 +163,27 @@ struct PostgresStatsReport {
     active_connections_after: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     activity_samples: Option<PostgresActivitySamplesReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement_stats: Option<PostgresStatementStatsReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostgresStatementStatsReport {
+    calls: u64,
+    calls_per_mixed_action: f64,
+    calls_per_workflow: f64,
+    total_exec_time_ms: f64,
+    top_statements: Vec<PostgresStatementReport>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PostgresStatementReport {
+    query_id: String,
+    calls: u64,
+    total_exec_time_ms: f64,
+    query: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -169,6 +196,15 @@ struct PostgresActivitySamplesReport {
     max_waiting: u64,
     wait_event_type_counts: BTreeMap<String, u64>,
     wait_event_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResourceSamplesReport {
+    samples: u64,
+    available_parallelism: u64,
+    max_process_cpu_percent: f64,
+    max_process_rss_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,6 +236,18 @@ struct PostgresStatsSnapshot {
     active_connections: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+struct PostgresStatementStatsSnapshot {
+    statements: BTreeMap<String, PostgresStatementStatsEntry>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PostgresStatementStatsEntry {
+    query: String,
+    calls: u64,
+    total_exec_time_ms: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BenchmarkResult {
@@ -228,6 +276,10 @@ struct BenchmarkResult {
     backend_metrics: BackendMetricsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     postgres_stats: Option<PostgresStatsReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_samples: Option<ResourceSamplesReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postgres_schema: Option<String>,
     db_path: Option<String>,
     db_bytes: Option<u64>,
 }
@@ -639,6 +691,28 @@ where
         })
     }
 
+    fn run_due_maintenance(
+        &self,
+        req: durust::RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::RunDueMaintenanceOutcome>> {
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.run_due_maintenance(req).await;
+            let items = result.as_ref().map_or(0, |outcome| {
+                outcome.timers_fired as u64 + outcome.activities_timed_out as u64
+            });
+            metrics.record_operation(
+                "run_due_maintenance",
+                started.elapsed(),
+                items,
+                result.is_ok(),
+            );
+            result
+        })
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: durust::WorkerId,
@@ -717,6 +791,29 @@ where
                 "complete_activity",
                 started.elapsed(),
                 success_item(&result),
+                result.is_ok(),
+            );
+            result
+        })
+    }
+
+    fn complete_activity_tasks(
+        &self,
+        req: durust::CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::CompleteActivityTaskBatchResult>>> {
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        let input_items = req.completions.len() as u64;
+        Box::pin(async move {
+            let started = Instant::now();
+            let result = inner.complete_activity_tasks(req).await;
+            let items = result
+                .as_ref()
+                .map_or(input_items, |results| results.len() as u64);
+            metrics.record_operation(
+                "complete_activity_tasks",
+                started.elapsed(),
+                items,
                 result.is_ok(),
             );
             result
@@ -948,8 +1045,10 @@ fn default_options() -> BenchmarkOptions {
         activation_prefetch_limit: 1,
         activity_delay_ms: 0,
         batch: DEFAULT_BATCH,
+        activity_completion_batch: 1,
         max_rounds: DEFAULT_MAX_ROUNDS,
         keep_db: false,
+        sample_resources: false,
         postgres_pool_size: None,
         json: false,
     }
@@ -968,9 +1067,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
             }
             "--mode" => {
                 options.mode = next_arg(&mut args, flag, inline_value)?;
-                if options.mode != "mixed" {
-                    return Err("--mode currently supports only `mixed`".to_owned());
-                }
             }
             "--sqlite-layout" => {
                 let sqlite_layout = next_arg(&mut args, flag, inline_value)?;
@@ -1015,6 +1111,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 options.batch =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
             }
+            "--activity-completion-batch" => {
+                options.activity_completion_batch =
+                    parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
             "--max-rounds" => {
                 options.max_rounds =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
@@ -1026,6 +1126,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 )?);
             }
             "--keep-db" => options.keep_db = true,
+            "--sample-resources" => options.sample_resources = true,
             "--json" => options.json = true,
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown argument `{other}`")),
@@ -1044,8 +1145,19 @@ fn validate_supported_dimensions(options: &BenchmarkOptions) -> Result<(), Strin
             "--physical-partitions above 1 currently requires --backend postgres".to_owned(),
         );
     }
-    if options.backend != BenchmarkBackend::Sqlite && options.keep_db {
-        return Err("--keep-db is only meaningful for --backend sqlite".to_owned());
+    if options.backend == BenchmarkBackend::Memory && options.keep_db {
+        return Err("--keep-db is only meaningful for persistent backends".to_owned());
+    }
+    if options.backend != BenchmarkBackend::Postgres && options.mode != "mixed" {
+        return Err("only --backend postgres supports diagnostic modes".to_owned());
+    }
+    match options.mode.as_str() {
+        "mixed" | "postgres-write-ceiling" => {}
+        other => {
+            return Err(format!(
+                "unsupported benchmark mode `{other}`; expected mixed or postgres-write-ceiling"
+            ));
+        }
     }
     Ok(())
 }
@@ -1102,11 +1214,12 @@ fn parse_positive_usize(value: String, flag: &str) -> Result<usize, String> {
 
 fn usage() -> String {
     format!(
-        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed] \
+        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed|postgres-write-ceiling] \
          [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] [--shards 1] \
          [--physical-partitions 1] [--activation-concurrency 1] \
          [--activation-prefetch-limit 1] \
-         [--batch {DEFAULT_BATCH}] [--max-rounds {DEFAULT_MAX_ROUNDS}] [--json]"
+         [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] \
+         [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json]"
     )
 }
 
@@ -1171,11 +1284,17 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         ))
         .map_err(|err| err.to_string())?;
 
+    if options.mode == "postgres-write-ceiling" {
+        return run_postgres_write_ceiling_benchmark(runtime, database_url, schema, options);
+    }
+
     let postgres_stats_before = postgres_stats_snapshot(&runtime, &database_url).ok();
+    let statement_stats_before = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
     let activity_sampler =
         PostgresActivitySampler::start(database_url.clone(), Duration::from_millis(100));
     let mut result = run_backend_benchmark(&runtime, backend, options, None);
     let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
+    let statement_stats_after = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
     let postgres_stats_after = postgres_stats_snapshot(&runtime, &database_url).ok();
     if let (Ok(result), Some(before), Some(after)) =
         (&mut result, postgres_stats_before, postgres_stats_after)
@@ -1185,14 +1304,32 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
             before,
             after,
             processing_seconds,
+            result.completed_workflows,
+            result.mixed_actions,
             activity_samples,
+            statement_stats_before
+                .zip(statement_stats_after)
+                .map(|(before, after)| {
+                    postgres_statement_stats_report(
+                        before,
+                        after,
+                        result.completed_workflows,
+                        result.mixed_actions,
+                    )
+                }),
         ));
+        result.postgres_schema = Some(schema.clone());
     }
-    let cleanup = drop_postgres_schema(&runtime, &database_url, &schema);
-    match (result, cleanup) {
-        (Ok(result), Ok(())) => Ok(result),
-        (Ok(_), Err(err)) => Err(err),
-        (Err(err), _) => Err(err),
+    match result {
+        Ok(result) if result.options.keep_db => Ok(result),
+        Ok(result) => {
+            drop_postgres_schema(&runtime, &database_url, &schema)?;
+            Ok(result)
+        }
+        Err(err) => {
+            let _ = drop_postgres_schema(&runtime, &database_url, &schema);
+            Err(err)
+        }
     }
 }
 
@@ -1200,7 +1337,10 @@ fn postgres_stats_report(
     before: PostgresStatsSnapshot,
     after: PostgresStatsSnapshot,
     processing_seconds: f64,
+    completed_workflows: u64,
+    mixed_actions: u64,
     activity_samples: Option<PostgresActivitySamplesReport>,
+    statement_stats: Option<PostgresStatementStatsReport>,
 ) -> PostgresStatsReport {
     let wal_bytes = after.wal_bytes.saturating_sub(before.wal_bytes);
     let xact_commit = after.xact_commit.saturating_sub(before.xact_commit);
@@ -1224,6 +1364,8 @@ fn postgres_stats_report(
         xact_commit,
         xact_rollback,
         transactions_per_second: (xact_commit + xact_rollback) as f64 / processing_seconds,
+        transactions_per_mixed_action: ratio_u64(xact_commit + xact_rollback, mixed_actions),
+        transactions_per_workflow: ratio_u64(xact_commit + xact_rollback, completed_workflows),
         rows_returned: after.rows_returned.saturating_sub(before.rows_returned),
         rows_fetched: after.rows_fetched.saturating_sub(before.rows_fetched),
         rows_inserted: after.rows_inserted.saturating_sub(before.rows_inserted),
@@ -1245,7 +1387,406 @@ fn postgres_stats_report(
         session_time_ms: (after.session_time_ms - before.session_time_ms).max(0.0),
         active_connections_after: after.active_connections,
         activity_samples,
+        statement_stats,
     }
+}
+
+fn run_postgres_write_ceiling_benchmark(
+    runtime: tokio::runtime::Runtime,
+    database_url: String,
+    schema: String,
+    options: BenchmarkOptions,
+) -> Result<BenchmarkResult, String> {
+    let resource_sampler = options
+        .sample_resources
+        .then(|| ResourceSampler::start(Duration::from_millis(100)))
+        .flatten();
+    let setup_started = Instant::now();
+    let operations = postgres_write_ceiling_operations(&options)?;
+    runtime.block_on(setup_postgres_write_ceiling(
+        &database_url,
+        &schema,
+        &options,
+        operations,
+    ))?;
+    let setup_finished = Instant::now();
+
+    let postgres_stats_before = postgres_stats_snapshot(&runtime, &database_url).ok();
+    let statement_stats_before = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
+    let activity_sampler =
+        PostgresActivitySampler::start(database_url.clone(), Duration::from_millis(100));
+
+    let processing_started = Instant::now();
+    runtime.block_on(run_postgres_write_ceiling_operations(
+        &database_url,
+        &schema,
+        &options,
+        operations,
+    ))?;
+    let processing_finished = Instant::now();
+
+    let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
+    let statement_stats_after = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
+    let postgres_stats_after = postgres_stats_snapshot(&runtime, &database_url).ok();
+
+    let verify_started = processing_finished;
+    let committed = runtime.block_on(verify_postgres_write_ceiling(
+        &database_url,
+        &schema,
+        operations,
+    ))?;
+    let verify_finished = Instant::now();
+
+    let elapsed_ms = duration_ms(verify_finished.duration_since(setup_started));
+    let setup_ms = duration_ms(setup_finished.duration_since(setup_started));
+    let processing_ms = duration_ms(processing_finished.duration_since(processing_started));
+    let verify_ms = duration_ms(verify_finished.duration_since(verify_started));
+    let elapsed_seconds = (elapsed_ms / 1_000.0).max(f64::EPSILON);
+    let processing_seconds = (processing_ms / 1_000.0).max(f64::EPSILON);
+    let operations_u64 = u64::try_from(operations).unwrap_or(u64::MAX);
+    let completed_workflows = options.workflows;
+    let resource_samples = resource_sampler.and_then(|sampler| sampler.stop().ok());
+    let mut result = BenchmarkResult {
+        backend: options.backend.as_str().to_owned(),
+        mode: options.mode.clone(),
+        correct: committed == operations_u64,
+        sqlite_layout: None,
+        options,
+        elapsed_ms,
+        setup_ms,
+        processing_ms,
+        verify_ms,
+        rounds: 1,
+        activations: operations_u64,
+        completed_workflows,
+        mixed_actions: operations_u64,
+        activations_per_second: operations_u64 as f64 / elapsed_seconds,
+        mixed_actions_per_second: operations_u64 as f64 / elapsed_seconds,
+        workflows_per_second: completed_workflows as f64 / elapsed_seconds,
+        processing_activations_per_second: operations_u64 as f64 / processing_seconds,
+        processing_mixed_actions_per_second: operations_u64 as f64 / processing_seconds,
+        processing_workflows_per_second: completed_workflows as f64 / processing_seconds,
+        counters: BenchmarkCounters {
+            workflow_tasks: operations_u64,
+            ..BenchmarkCounters::default()
+        },
+        worker_stats: WorkerStatsReport {
+            workflow_tasks: operations_u64,
+            ..WorkerStatsReport::default()
+        },
+        backend_metrics: BackendMetricsReport::default(),
+        postgres_stats: None,
+        resource_samples,
+        postgres_schema: Some(schema.clone()),
+        db_path: None,
+        db_bytes: None,
+    };
+    if !result.correct {
+        return Err(format!(
+            "postgres write ceiling committed {committed}/{operations_u64} operations"
+        ));
+    }
+    if let (Some(before), Some(after)) = (postgres_stats_before, postgres_stats_after) {
+        result.postgres_stats = Some(postgres_stats_report(
+            before,
+            after,
+            processing_seconds,
+            result.completed_workflows,
+            result.mixed_actions,
+            activity_samples,
+            statement_stats_before
+                .zip(statement_stats_after)
+                .map(|(before, after)| {
+                    postgres_statement_stats_report(
+                        before,
+                        after,
+                        result.completed_workflows,
+                        result.mixed_actions,
+                    )
+                }),
+        ));
+    }
+    if result.options.keep_db {
+        Ok(result)
+    } else {
+        drop_postgres_schema(&runtime, &database_url, &schema)?;
+        Ok(result)
+    }
+}
+
+fn postgres_write_ceiling_operations(options: &BenchmarkOptions) -> Result<usize, String> {
+    let workflows = usize::try_from(options.workflows)
+        .map_err(|_| format!("workflow count {} does not fit usize", options.workflows))?;
+    workflows
+        .checked_mul(8)
+        .ok_or_else(|| "postgres write ceiling operation count overflowed".to_owned())
+}
+
+async fn setup_postgres_write_ceiling(
+    database_url: &str,
+    schema: &str,
+    options: &BenchmarkOptions,
+    operations: usize,
+) -> Result<(), String> {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|err| err.to_string())?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres write ceiling setup connection error: {err}");
+        }
+    });
+    let schema = quote_benchmark_ident(schema);
+    let operations_i64 = i64::try_from(operations).unwrap_or(i64::MAX);
+    let shards_i32 = i32::try_from(options.shards).unwrap_or(i32::MAX).max(1);
+    client
+        .execute(
+            &format!(
+                "insert into {schema}.workflow_instances
+                 (namespace, workflow_id, run_id, shard_id, workflow_name, workflow_version,
+                  task_queue, current_event_id, ready_reason, ready_at_ms, workflow_claim_token,
+                  terminal)
+                 select 'default',
+                        'raw-workflow-' || g::text,
+                        'raw-run-' || g::text,
+                        (g % $2::bigint)::integer,
+                        'raw.workflow',
+                        1,
+                        $3,
+                        1,
+                        null,
+                        0,
+                        g + 1,
+                        false
+                 from generate_series(0::bigint, $1::bigint - 1) as g"
+            ),
+            &[
+                &operations_i64,
+                &i64::from(shards_i32),
+                &WORKFLOW_QUEUE.to_owned(),
+            ],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    let lease_until = i64::MAX / 2;
+    client
+        .execute(
+            &format!(
+                "update {schema}.shard_leases
+                 set owner_id = 'raw-writer',
+                     lease_until_ms = $1,
+                     lease_epoch = greatest(lease_epoch, 1)"
+            ),
+            &[&lease_until],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+async fn run_postgres_write_ceiling_operations(
+    database_url: &str,
+    schema: &str,
+    options: &BenchmarkOptions,
+    operations: usize,
+) -> Result<(), String> {
+    let workers = options.workers.max(1);
+    let futures = (0..workers).map(|worker_index| {
+        run_postgres_write_ceiling_worker(
+            database_url.to_owned(),
+            schema.to_owned(),
+            worker_index,
+            workers,
+            operations,
+            options.physical_partitions,
+        )
+    });
+    let results = futures::future::join_all(futures).await;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+async fn run_postgres_write_ceiling_worker(
+    database_url: String,
+    schema: String,
+    worker_index: usize,
+    workers: usize,
+    operations: usize,
+    physical_partitions: u64,
+) -> Result<(), String> {
+    let (mut client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|err| err.to_string())?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres write ceiling worker connection error: {err}");
+        }
+    });
+    let schema = quote_benchmark_ident(&schema);
+    let physical_partitions_u32 = u32::try_from(physical_partitions)
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let payload_a = vec![1_u8; 64];
+    let payload_b = vec![2_u8; 64];
+    for operation in (worker_index..operations).step_by(workers) {
+        let run_id = format!("raw-run-{operation}");
+        let tx = client.transaction().await.map_err(|err| err.to_string())?;
+        let row = tx
+            .query_one(
+                &format!(
+                    "select current_event_id, workflow_claim_token, shard_id
+                     from {schema}.workflow_instances
+                     where run_id = $1
+                     for update"
+                ),
+                &[&run_id],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        let current_event_id: i64 = row.get(0);
+        let shard_id: i32 = row.get(2);
+        tx.query_one(
+            &format!(
+                "select owner_id, lease_until_ms, lease_epoch
+                 from {schema}.shard_leases
+                 where shard_id = $1"
+            ),
+            &[&shard_id],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let event_ids = vec![current_event_id + 1, current_event_id + 2];
+        let event_types = vec!["raw_event_a".to_owned(), "raw_event_b".to_owned()];
+        let payloads = vec![payload_a.clone(), payload_b.clone()];
+        tx.execute(
+            &format!(
+                "insert into {schema}.history_events(run_id, event_id, event_type, data)
+                 select $1, event_id, event_type, data
+                 from unnest($2::bigint[], $3::text[], $4::bytea[])
+                      as event_rows(event_id, event_type, data)"
+            ),
+            &[&run_id, &event_ids, &event_types, &payloads],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            &format!(
+                "update {schema}.workflow_instances
+                 set current_event_id = $1,
+                     workflow_claim_token = null,
+                     terminal = false,
+                     ready_reason = null,
+                     ready_at_ms = 0
+                 where run_id = $2"
+            ),
+            &[&(current_event_id + 2), &run_id],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let partition = u32::try_from(shard_id.max(0)).unwrap_or(0) % physical_partitions_u32;
+        let suffix = benchmark_partition_suffix(partition, physical_partitions_u32);
+        let now_ms = unix_epoch_millis_benchmark();
+        tx.execute(
+            &format!(
+                "insert into {schema}.shard_heads_{suffix}
+                 (shard_id, journal_seq, snapshot_seq, updated_at_ms)
+                 values ($1, 0, 0, $2)
+                 on conflict(shard_id) do nothing"
+            ),
+            &[&shard_id, &now_ms],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        let row = tx
+            .query_one(
+                &format!(
+                    "select journal_seq
+                     from {schema}.shard_heads_{suffix}
+                     where shard_id = $1
+                     for update"
+                ),
+                &[&shard_id],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        let next_journal_seq = row.get::<_, i64>(0).saturating_add(1);
+        tx.execute(
+            &format!(
+                "insert into {schema}.shard_journal_{suffix}
+                 (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
+                 values ($1, $2, 1, $3, $4)"
+            ),
+            &[&shard_id, &next_journal_seq, &payload_a, &now_ms],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        tx.execute(
+            &format!(
+                "update {schema}.shard_heads_{suffix}
+                 set journal_seq = $1, updated_at_ms = $2
+                 where shard_id = $3"
+            ),
+            &[&next_journal_seq, &now_ms, &shard_id],
+        )
+        .await
+        .map_err(|err| err.to_string())?;
+        tx.commit().await.map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+async fn verify_postgres_write_ceiling(
+    database_url: &str,
+    schema: &str,
+    operations: usize,
+) -> Result<u64, String> {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|err| err.to_string())?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres write ceiling verify connection error: {err}");
+        }
+    });
+    let schema = quote_benchmark_ident(schema);
+    let operations_i64 = i64::try_from(operations).unwrap_or(i64::MAX);
+    let committed = client
+        .query_one(
+            &format!(
+                "select count(*)
+                 from {schema}.workflow_instances
+                 where run_id like 'raw-run-%'
+                   and current_event_id = 3
+                   and workflow_claim_token is null"
+            ),
+            &[],
+        )
+        .await
+        .map_err(|err| err.to_string())?
+        .get::<_, i64>(0);
+    if committed != operations_i64 {
+        return Ok(u64::try_from(committed).unwrap_or(0));
+    }
+    Ok(u64::try_from(committed).unwrap_or(0))
+}
+
+fn quote_benchmark_ident(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn benchmark_partition_suffix(partition: u32, physical_partitions: u32) -> String {
+    let width = physical_partitions.saturating_sub(1).max(1).ilog10() as usize + 1;
+    format!("p{partition:0width$}")
+}
+
+fn unix_epoch_millis_benchmark() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn run_backend_benchmark<B>(
@@ -1259,6 +1800,10 @@ where
 {
     let metrics = BackendMetrics::default();
     let backend = MeasuredBackend::new(backend, metrics.clone());
+    let resource_sampler = options
+        .sample_resources
+        .then(|| ResourceSampler::start(Duration::from_millis(100)))
+        .flatten();
     let setup_started = Instant::now();
     let start_outcome = runtime.block_on(start_workflows(&backend, &options))?;
     let setup_finished = Instant::now();
@@ -1339,6 +1884,7 @@ where
         .as_ref()
         .and_then(|path| sqlite_store_bytes(path).ok())
         .filter(|_| options.keep_db);
+    let resource_samples = resource_sampler.and_then(|sampler| sampler.stop().ok());
     Ok(BenchmarkResult {
         backend: options.backend.as_str().to_owned(),
         mode: options.mode.clone(),
@@ -1363,6 +1909,8 @@ where
         worker_stats: WorkerStatsReport::from(stats),
         backend_metrics: metrics.report(),
         postgres_stats: None,
+        resource_samples,
+        postgres_schema: None,
         db_path: None,
         db_bytes,
     })
@@ -1458,6 +2006,7 @@ where
         )?)
         .workflow_task_commit_batch_size(options.batch)
         .max_concurrent_activities(options.batch)
+        .activity_completion_batch_size(options.activity_completion_batch)
         .register_workflow(benchmark_parent)
         .register_workflow(benchmark_child)
         .register_activity(benchmark_activity);
@@ -1573,14 +2122,13 @@ where
             stats.workflow_tasks += workflow_tasks;
             progressed = true;
         }
-        let timers_fired = worker.run_timers_once().await?;
-        if timers_fired > 0 {
-            stats.timers_fired += timers_fired;
+        let maintenance = worker.run_due_maintenance_once().await?;
+        if maintenance.timers_fired > 0 {
+            stats.timers_fired += maintenance.timers_fired;
             progressed = true;
         }
-        let activities_timed_out = worker.run_activity_timeouts_once().await?;
-        if activities_timed_out > 0 {
-            stats.activities_timed_out += activities_timed_out;
+        if maintenance.activities_timed_out > 0 {
+            stats.activities_timed_out += maintenance.activities_timed_out;
             progressed = true;
         }
         let child_starts = worker.run_child_workflow_starts_once().await?;
@@ -1725,6 +2273,18 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn ratio_u64(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        numerator as f64 / denominator as f64
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn success_item<T>(result: &durust::Result<T>) -> u64 {
     u64::from(result.is_ok())
 }
@@ -1831,6 +2391,79 @@ fn drop_postgres_schema(
             .batch_execute(&format!("drop schema if exists {schema} cascade"))
             .await
             .map_err(|err| err.to_string())
+    })
+}
+
+struct ResourceSampler {
+    stop: Arc<AtomicBool>,
+    handle: JoinHandle<ResourceSamplesReport>,
+}
+
+impl ResourceSampler {
+    fn start(interval: Duration) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("durust-resource-sampler".to_owned())
+            .spawn(move || resource_sampler_loop(interval, thread_stop))
+            .ok()?;
+        Some(Self { stop, handle })
+    }
+
+    fn stop(self) -> Result<ResourceSamplesReport, String> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.handle
+            .join()
+            .map_err(|_| "resource sampler panicked".to_owned())
+    }
+}
+
+fn resource_sampler_loop(interval: Duration, stop: Arc<AtomicBool>) -> ResourceSamplesReport {
+    let mut report = ResourceSamplesReport {
+        available_parallelism: std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get() as u64)
+            .unwrap_or(0),
+        ..ResourceSamplesReport::default()
+    };
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(sample) = process_resource_sample() {
+            report.samples += 1;
+            report.max_process_cpu_percent = report.max_process_cpu_percent.max(sample.cpu_percent);
+            report.max_process_rss_bytes = report.max_process_rss_bytes.max(sample.rss_bytes);
+        }
+        thread::sleep(interval);
+    }
+    report
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProcessResourceSample {
+    cpu_percent: f64,
+    rss_bytes: u64,
+}
+
+fn process_resource_sample() -> Option<ProcessResourceSample> {
+    let output = Command::new("ps")
+        .args([
+            "-o",
+            "rss=",
+            "-o",
+            "pcpu=",
+            "-p",
+            &std::process::id().to_string(),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut parts = stdout.split_whitespace();
+    let rss_kib = parts.next()?.parse::<u64>().ok()?;
+    let cpu_percent = parts.next()?.parse::<f64>().ok()?;
+    Some(ProcessResourceSample {
+        cpu_percent,
+        rss_bytes: rss_kib.saturating_mul(1024),
     })
 }
 
@@ -2016,6 +2649,101 @@ fn postgres_stats_snapshot(
     })
 }
 
+fn postgres_statement_stats_snapshot(
+    runtime: &tokio::runtime::Runtime,
+    database_url: &str,
+) -> Result<PostgresStatementStatsSnapshot, String> {
+    let database_url = database_url.to_owned();
+    runtime.block_on(async move {
+        let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|err| err.to_string())?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                eprintln!("postgres statement stats connection error: {err}");
+            }
+        });
+        if client
+            .batch_execute("create extension if not exists pg_stat_statements")
+            .await
+            .is_err()
+        {
+            return Err("pg_stat_statements extension is unavailable".to_owned());
+        }
+        let rows = client
+            .query(
+                "select coalesce(queryid::text, md5(query)) as query_id,
+                        regexp_replace(left(query, 240), '\\s+', ' ', 'g') as query,
+                        calls::bigint,
+                        total_exec_time::double precision
+                 from pg_stat_statements
+                 where dbid = (select oid from pg_database where datname = current_database())",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        let statements = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    PostgresStatementStatsEntry {
+                        query: row.get(1),
+                        calls: row_u64(&row, 2),
+                        total_exec_time_ms: row.get(3),
+                    },
+                )
+            })
+            .collect();
+        Ok(PostgresStatementStatsSnapshot { statements })
+    })
+}
+
+fn postgres_statement_stats_report(
+    before: PostgresStatementStatsSnapshot,
+    after: PostgresStatementStatsSnapshot,
+    completed_workflows: u64,
+    mixed_actions: u64,
+) -> PostgresStatementStatsReport {
+    let mut calls = 0_u64;
+    let mut total_exec_time_ms = 0.0_f64;
+    let mut top_statements = Vec::new();
+    for (query_id, after_entry) in after.statements {
+        let before_entry = before.statements.get(&query_id);
+        let call_delta = after_entry
+            .calls
+            .saturating_sub(before_entry.map_or(0, |entry| entry.calls));
+        if call_delta == 0 {
+            continue;
+        }
+        let time_delta = (after_entry.total_exec_time_ms
+            - before_entry.map_or(0.0, |entry| entry.total_exec_time_ms))
+        .max(0.0);
+        calls = calls.saturating_add(call_delta);
+        total_exec_time_ms += time_delta;
+        top_statements.push(PostgresStatementReport {
+            query_id,
+            calls: call_delta,
+            total_exec_time_ms: time_delta,
+            query: after_entry.query,
+        });
+    }
+    top_statements.sort_by(|left, right| {
+        right
+            .calls
+            .cmp(&left.calls)
+            .then_with(|| right.total_exec_time_ms.total_cmp(&left.total_exec_time_ms))
+    });
+    top_statements.truncate(10);
+    PostgresStatementStatsReport {
+        calls,
+        calls_per_mixed_action: ratio_u64(calls, mixed_actions),
+        calls_per_workflow: ratio_u64(calls, completed_workflows),
+        total_exec_time_ms,
+        top_statements,
+    }
+}
+
 fn row_u64(row: &tokio_postgres::Row, idx: usize) -> u64 {
     u64::try_from(row.get::<_, i64>(idx)).unwrap_or(0)
 }
@@ -2043,6 +2771,10 @@ fn print_text_result(result: &BenchmarkResult) {
         result.options.activation_prefetch_limit
     );
     println!("  batch: {}", result.options.batch);
+    println!(
+        "  activity completion batch: {}",
+        result.options.activity_completion_batch
+    );
     println!("  rounds: {}", result.rounds);
     println!(
         "  elapsed: {:.2}ms ({:.2}ms setup, {:.2}ms processing, {:.2}ms verify)",
@@ -2105,6 +2837,16 @@ fn print_text_result(result: &BenchmarkResult) {
             postgres.transactions_per_second
         );
         println!(
+            "  transactions/action: {:.3}",
+            postgres.transactions_per_mixed_action
+        );
+        if let Some(statements) = &postgres.statement_stats {
+            println!(
+                "  statements/action: {:.3}",
+                statements.calls_per_mixed_action
+            );
+        }
+        println!(
             "  block cache hit ratio: {:.4}",
             postgres.block_cache_hit_ratio
         );
@@ -2120,6 +2862,14 @@ fn print_text_result(result: &BenchmarkResult) {
             "  active connections after: {}",
             postgres.active_connections_after
         );
+    }
+    if let Some(samples) = &result.resource_samples {
+        println!();
+        println!("Process resources:");
+        println!("  samples: {}", samples.samples);
+        println!("  available parallelism: {}", samples.available_parallelism);
+        println!("  max process CPU: {:.1}%", samples.max_process_cpu_percent);
+        println!("  max process RSS: {} bytes", samples.max_process_rss_bytes);
     }
     println!();
     println!("Counters:");
@@ -2146,6 +2896,14 @@ fn print_text_result(result: &BenchmarkResult) {
         println!("  path: {path}");
         println!("  size: {} bytes", result.db_bytes.unwrap_or(0));
     }
+    if let Some(schema) = &result.postgres_schema {
+        println!();
+        println!("Postgres schema:");
+        println!("  name: {schema}");
+        if result.options.keep_db {
+            println!("  kept: true");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2162,6 +2920,7 @@ mod tests {
         assert_eq!(options.physical_partitions, 1);
         assert_eq!(options.activation_concurrency, 1);
         assert_eq!(options.activation_prefetch_limit, 1);
+        assert_eq!(options.activity_completion_batch, 1);
     }
 
     #[test]
@@ -2188,6 +2947,8 @@ mod tests {
             "4".to_owned(),
             "--activation-prefetch-limit".to_owned(),
             "8".to_owned(),
+            "--activity-completion-batch".to_owned(),
+            "7".to_owned(),
         ])
         .unwrap();
         assert_eq!(options.backend, BenchmarkBackend::Postgres);
@@ -2196,6 +2957,39 @@ mod tests {
         assert_eq!(options.physical_partitions, 16);
         assert_eq!(options.activation_concurrency, 4);
         assert_eq!(options.activation_prefetch_limit, 8);
+        assert_eq!(options.activity_completion_batch, 7);
+    }
+
+    #[test]
+    fn parses_postgres_write_ceiling_mode() {
+        let options = parse_args([
+            "--backend".to_owned(),
+            "postgres".to_owned(),
+            "--mode".to_owned(),
+            "postgres-write-ceiling".to_owned(),
+            "--workflows".to_owned(),
+            "4".to_owned(),
+            "--keep-db".to_owned(),
+            "--sample-resources".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(options.backend, BenchmarkBackend::Postgres);
+        assert_eq!(options.mode, "postgres-write-ceiling");
+        assert!(options.keep_db);
+        assert!(options.sample_resources);
+        assert_eq!(postgres_write_ceiling_operations(&options).unwrap(), 32);
+    }
+
+    #[test]
+    fn rejects_diagnostic_modes_for_non_postgres_backends() {
+        let err = parse_args([
+            "--backend".to_owned(),
+            "sqlite".to_owned(),
+            "--mode".to_owned(),
+            "postgres-write-ceiling".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("only --backend postgres supports diagnostic modes"));
     }
 
     #[test]

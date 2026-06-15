@@ -55,14 +55,17 @@ compose them without either unbounded in-memory queues or extra durable reads:
 - `max_concurrent_activities` bounds activity claim batching in worker loops so
   activity-heavy runs do not burn one durable claim round trip per empty worker
   slot;
+- `activity_completion_batch_size` bounds success-only activity completion
+  batching so activity-heavy runs can trade a small completion fan-in delay for
+  fewer durable completion transactions;
 - an optional shard ownership filter makes deployments and tests deliberately
   target only selected logical shards.
 
 The backend contract change is generic: providers may implement batch workflow
-claim, batch workflow commit, and batch activity claim, while memory, SQLite,
-and the normalized Postgres layout retain default one-at-a-time
-implementations. Runtime semantics do not mention Postgres tables, partitions,
-or shard journals.
+claim, batch workflow commit, batch activity claim, and batch activity
+completion, while memory, SQLite, and the normalized Postgres layout retain
+default one-at-a-time implementations. Runtime semantics do not mention
+Postgres tables, partitions, or shard journals.
 
 ## Scope
 
@@ -155,11 +158,17 @@ Measured local baselines:
   p99 workflow-task commit latency 4.94/7.98/8.87ms.
 - 100 logical shards / 16 physical partitions / 10 workers / 1,000 mixed
   workflows / prefetch 32 / batch 32:
-  89.27 processing workflows/sec, 714.17 processing mixed actions/sec, p50/p95/
-  p99 workflow-task commit latency 46.86/65.82/88.11ms. This accepted baseline
-  uses sequence-backed run IDs, signal receive sequences, and claim tokens,
-  refreshes only selected shards instead of every shard assigned to a worker,
-  and uses Postgres batch activity claim.
+  103.74 processing workflows/sec, 829.93 processing mixed actions/sec, p50/p95/
+  p99 workflow-task commit latency 46.77/65.91/85.08ms. Postgres reported
+  31,761 total transactions, or 3.97 transactions per mixed action and 31.76
+  transactions per completed workflow, plus 160,917 statement calls, or 20.11
+  statements per mixed action. This accepted baseline uses
+  sequence-backed run IDs, signal receive sequences, and claim tokens, refreshes
+  only selected shards instead of every shard assigned to a worker, uses
+  Postgres batch activity claim, derives complete-history workflow change
+  markers from loaded history, streams history with one query instead of a
+  second `has_more` query, and combines timer firing plus activity timeout
+  maintenance into one provider method.
 - Before batch activity claim, an instrumented single-process run of that same
   benchmark reached about 59.45 processing workflows/sec and 475.57 mixed
   actions/sec. Durust-side backend metrics showed underfilled workflow commit
@@ -181,8 +190,50 @@ Measured local baselines:
   `run_id_seq`, signal inbox ordering uses `signal_seq`, and claim tokens use
   `claim_token_seq`; migration initializes each sequence from existing metadata
   and table state for compatibility. The final 100-shard checked-in baseline
-  reached 89.27 processing workflows/sec and commit p95/p99 65.82/88.11ms, with
-  sampled `transactionid` waits down to 9.
+  after the sequence fix reached 89.27 processing workflows/sec and commit
+  p95/p99 65.82/88.11ms, with sampled `transactionid` waits down to 9.
+- Reducing avoidable provider transactions in the runtime and Postgres backend
+  moved the checked-in 100-shard baseline from 68,517 Postgres transactions for
+  8,000 semantic mixed actions to 31,761 transactions for the same action count.
+  The removed work was not correctness-critical durable state: complete loaded
+  histories no longer re-query `workflow_change_versions`, history streaming no
+  longer performs a second existence query just to compute `has_more`, and the
+  worker uses one combined due-maintenance backend call instead of separate
+  timer and activity-timeout transactions. The resulting baseline reached
+  103.74 processing workflows/sec and 829.93 mixed actions/sec.
+- Follow-up durability-path reductions are implemented: workflow claims prefetch
+  a bounded contiguous history tail, batch workflow claim bulk-allocates tokens
+  and updates leases, shard-journal append collapses head insert/update plus
+  sequence read into one upsert, workflow commit caches shard lease epochs
+  within a batch transaction, and workers can opt into batched successful
+  activity completions. A local 100-shard candidate run with activity completion
+  batch 32 reached 123.93 processing workflows/sec and 991.47 mixed actions/sec,
+  with Postgres at 29,247 transactions, 3.66 transactions/action, and 129,519
+  statement calls, or 16.19 statements/action. These reduce statement and
+  transaction pressure without changing replay history semantics; an accepted
+  checked-in baseline should still be recaptured separately.
+- A raw `postgres-write-ceiling` diagnostic mode now runs a DB-only transactional
+  write shape with workflow-row locks, history inserts, workflow updates, and
+  shard-journal appends. On the same 8,000-operation scale, 10 raw workers
+  reached 1,647.26 operations/sec at 10.01 statements/op, or about 16.48k
+  statements/sec. The Durust 10-worker mixed run reached 830.46 actions/sec at
+  19.65 statements/action, or about 16.32k statements/sec. This strongly points
+  to a current local Postgres statement/write throughput ceiling rather than
+  hidden Rust-side idle time for the accepted 10-worker shape.
+- Increasing concurrency proves more throughput is available only by accepting
+  worse commit tail latency. Raw 20-worker writes reached about 20.30k
+  statements/sec. Durust 20 workers with pool size 24 reached 1,031.97 mixed
+  actions/sec, but commit p95/p99 rose to 87.33/103.51ms versus the accepted
+  baseline 65.91/85.08ms. A 12-worker middle point stayed closer on latency
+  at 71.23/89.94ms but only reached 864.73 mixed actions/sec. The practical
+  next throughput work is therefore reducing statements/action in the commit
+  shape, not adding workers, connections, or shards.
+- One 10-worker rerun hit a transient Postgres deadlock under load and the
+  immediate rerun completed. The provider now retries only transaction-abort
+  SQLSTATEs `40P01` (deadlock detected) and `40001` (serialization failure)
+  around fenced, idempotent Postgres transaction bodies. Non-transaction-abort
+  backend errors, stale leases, conflicts, terminal-workflow errors, and
+  payload errors still fail immediately.
 - Two concurrent copies of the post-batch benchmark against separate schemas
   reached about 102.48 combined processing workflows/sec and 819.86 combined
   mixed actions/sec, not 2x the 71.86 single-process baseline. Per-process

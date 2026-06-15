@@ -563,6 +563,7 @@ let worker = durust::Worker::builder(backend.clone())
     .max_cached_workflows(10_000)
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
+    .activity_completion_batch_size(32)
     .run()
     .await?;
 ```
@@ -2933,7 +2934,7 @@ terminal workflow rejects new workflow-visible commands
 
 The suite should include crash/restart variants for each provider that can persist across process boundaries. For SQLite, tests should close and reopen the provider and verify recovery from the append journal, not from in-memory state.
 
-Throughput targets should meet or exceed checked-in Durust benchmark baselines for comparable workload dimensions. Use a stable benchmark vocabulary: workflows per second, activations per second, mixed actions per second, worker count, shard count, activation concurrency, prefetch limit, and commit batch size.
+Throughput targets should meet or exceed checked-in Durust benchmark baselines for comparable workload dimensions. Use a stable benchmark vocabulary: workflows per second, activations per second, mixed actions per second, worker count, shard count, activation concurrency, prefetch limit, commit batch size, and activity completion batch size.
 Postgres benchmark outputs also report workflow-task commit latency percentiles,
 WAL bytes/sec, and active connections when local server statistics are
 available.

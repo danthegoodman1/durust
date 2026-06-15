@@ -128,6 +128,33 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: TimeoutDueActivitiesRequest,
     ) -> BoxFuture<'static, Result<TimeoutDueActivitiesOutcome>>;
 
+    fn run_due_maintenance(
+        &self,
+        req: RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, Result<RunDueMaintenanceOutcome>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let timers = backend
+                .fire_due_timers(FireDueTimersRequest {
+                    namespace: req.namespace.clone(),
+                    now: req.now,
+                    limit: req.timer_limit,
+                })
+                .await?;
+            let activities = backend
+                .timeout_due_activities(TimeoutDueActivitiesRequest {
+                    namespace: req.namespace,
+                    now: req.now,
+                    limit: req.activity_limit,
+                })
+                .await?;
+            Ok(RunDueMaintenanceOutcome {
+                timers_fired: timers.fired,
+                activities_timed_out: activities.timed_out,
+            })
+        })
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -164,6 +191,22 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, Result<CompleteActivityOutcome>>;
+
+    fn complete_activity_tasks(
+        &self,
+        req: CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, Result<Vec<CompleteActivityTaskBatchResult>>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(req.completions.len());
+            for completion in req.completions {
+                let claim = completion.claim.clone();
+                let result = backend.complete_activity(completion).await;
+                results.push(CompleteActivityTaskBatchResult { claim, result });
+            }
+            Ok(results)
+        })
+    }
 
     fn fail_activity(
         &self,
@@ -295,6 +338,7 @@ pub struct ClaimedWorkflowTask {
     pub claim: WorkflowTaskClaim,
     pub replay_target_event_id: EventId,
     pub reason: WorkflowTaskReason,
+    pub prefetched_history: Vec<crate::HistoryEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -457,9 +501,34 @@ pub struct TimeoutDueActivitiesOutcome {
 }
 
 #[derive(Clone, Debug)]
+pub struct RunDueMaintenanceRequest {
+    pub namespace: Namespace,
+    pub now: TimestampMs,
+    pub timer_limit: usize,
+    pub activity_limit: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RunDueMaintenanceOutcome {
+    pub timers_fired: usize,
+    pub activities_timed_out: usize,
+}
+
+#[derive(Clone, Debug)]
 pub struct CompleteActivityRequest {
     pub claim: ActivityTaskClaim,
     pub result: PayloadRef,
+}
+
+#[derive(Clone, Debug)]
+pub struct CompleteActivityTasksRequest {
+    pub completions: Vec<CompleteActivityRequest>,
+}
+
+#[derive(Debug)]
+pub struct CompleteActivityTaskBatchResult {
+    pub claim: ActivityTaskClaim,
+    pub result: Result<CompleteActivityOutcome>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

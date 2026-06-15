@@ -22,8 +22,8 @@ size are recorded with the measured result.
 - Shared benchmark harness for memory, single-file SQLite, Postgres, and
   generic baseline comparisons.
 - Comparable workload dimensions: workflow count, worker count, shard/partition
-  count, activation concurrency, prefetch limit, commit batch size, history
-  size, payload size, and workload mix.
+  count, activation concurrency, prefetch limit, commit batch size, activity
+  completion batch size, history size, payload size, and workload mix.
 - Happy-path workflow execution throughput.
 - Warm cached workflow wake latency.
 - Cold recovery throughput and provider read pressure.
@@ -58,8 +58,16 @@ Implemented:
   provider-specific options, nested benchmark dimensions, processing-only
   throughput, semantic action counters, Durust worker stats, per-backend-method
   latency/count/item metrics, and Postgres transaction/WAL/block/activity-wait
-  counters. It rejects unsupported shard, activation-concurrency, and prefetch
-  dimensions instead of reporting misleading numbers.
+  counters, and statement-call density. It can also collect best-effort local
+  process CPU/RSS samples when run with `--sample-resources`; resource sampling
+  is opt-in so accepted throughput baselines are not perturbed by shell-based
+  sampling overhead. It rejects unsupported shard, activation-concurrency, and
+  prefetch dimensions instead of reporting misleading numbers.
+- `durust-benchmark-workload --mode postgres-write-ceiling`, a Postgres-only
+  diagnostic that exercises a comparable transactional write shape without the
+  Durust runtime. It records the same Postgres stats envelope as the mixed
+  workload so local runs can distinguish Rust-side bottlenecks from the
+  machine's Postgres statement/write ceiling.
 - `benches/baselines/durust-mixed-sqlite.json`, the first checked-in baseline
   artifact. The accepted dimension is single-file SQLite, mixed mode, 1,000
   workflows, 4 workers, shard/concurrency/prefetch dimensions set to 1, and
@@ -83,13 +91,31 @@ Implemented:
   Postgres, mixed mode, 1,000 workflows, 10 workers, 100 logical shards, 16
   physical partitions, activation concurrency 8, prefetch 32, batch 32, and pool
   size 24. The captured release run completed 1,000 workflows, 8,000 semantic
-  mixed actions, 7,865 workflow tasks, and reports about 89.3 processing
-  workflows/sec and 714.2 processing mixed-actions/sec with p50/p95/p99
-  workflow-task commit latency 46.86/65.82/88.11ms. This run includes
-  sequence-backed run IDs, signal receive sequences, and claim tokens,
-  selected-shard-only lease refresh, and batched activity claims, removing hot
-  `meta` counter locks, idle shard lease churn, and thousands of individual
-  activity claim round trips from the sharded workload.
+  mixed actions, 7,874 workflow tasks, and reports about 103.7 processing
+  workflows/sec and 829.9 processing mixed-actions/sec with p50/p95/p99
+  workflow-task commit latency 46.77/65.91/85.08ms. Postgres reported 31,761
+  total transactions, or 3.97 transactions per mixed action and 31.76
+  transactions per completed workflow, plus 160,917 statement calls, or 20.11
+  statements per mixed action. This run includes sequence-backed run
+  IDs, signal receive sequences, and claim tokens, selected-shard-only lease
+  refresh, batched activity claims, single-query history streaming, derived
+  complete-history workflow change markers, and combined timer/activity
+  maintenance, removing hot `meta` counter locks, idle shard lease churn,
+  thousands of individual activity claim round trips, and avoidable metadata
+  transactions from the sharded workload.
+- Postgres durability-path transaction and statement reductions after the
+  accepted sharded baseline: claimed workflow tasks can carry a bounded,
+  contiguous tail of prefetched history so cache misses avoid a separate history
+  read; batch workflow claim uses one sequence query plus one bulk lease update
+  instead of one token/update pair per claimed task; shard-journal append
+  increments and returns the journal sequence in one head-row upsert; batch
+  workflow commit reuses refreshed shard lease epochs inside the transaction;
+  and workers can opt into success-only activity completion batching with
+  `activity_completion_batch_size`. A local 100-shard candidate run with
+  activity completion batch 32 completed 8,000 mixed actions at 123.93
+  processing workflows/sec, 3.66 Postgres transactions/action, and 16.19
+  statements/action. A fresh accepted baseline artifact should be captured
+  before replacing the checked-in transaction/action budget.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 

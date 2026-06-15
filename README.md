@@ -181,6 +181,7 @@ let worker = durust::Worker::builder(backend.clone())
     .max_cached_workflows(10_000)
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
+    .activity_completion_batch_size(32)
     .run()
     .await?;
 ```

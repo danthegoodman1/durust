@@ -170,6 +170,7 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     assert_eq!(options["activationConcurrency"], 1);
     assert_eq!(options["activationPrefetchLimit"], 1);
     assert_eq!(options["batch"], 32);
+    assert_eq!(options["activityCompletionBatch"], 1);
 
     assert_eq!(baseline["completedWorkflows"], 1000);
     assert_eq!(baseline["activations"], 8000);
@@ -209,6 +210,9 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     let compare_source = include_str!("../src/bin/durust-benchmark-compare.rs");
     assert!(compare_source.contains("processingWorkflowsPerSecond"));
     assert!(compare_source.contains("benchmark dimensions differ"));
+
+    assert!(workload_source.contains("postgres-write-ceiling"));
+    assert!(workload_source.contains("ResourceSamplesReport"));
 }
 
 #[test]
@@ -228,6 +232,7 @@ fn phase_0012_mixed_postgres_baseline_is_dimensioned_and_semantic() {
     assert_eq!(options["activationConcurrency"], 1);
     assert_eq!(options["activationPrefetchLimit"], 1);
     assert_eq!(options["batch"], 32);
+    assert_eq!(options["activityCompletionBatch"], 1);
     assert_eq!(options["postgresPoolSize"], 8);
 
     assert_eq!(baseline["completedWorkflows"], 1000);
@@ -281,6 +286,7 @@ fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
     assert_eq!(options["activationConcurrency"], 8);
     assert_eq!(options["activationPrefetchLimit"], 32);
     assert_eq!(options["batch"], 32);
+    assert_eq!(options["activityCompletionBatch"], 1);
     assert_eq!(options["postgresPoolSize"], 24);
 
     assert_eq!(baseline["completedWorkflows"], 1000);
@@ -298,6 +304,46 @@ fn phase_0013_mixed_postgres_sharded_baseline_is_dimensioned_and_semantic() {
         "batching should reduce workflow task commit calls below workflow task count"
     );
     assert!(baseline["postgresStats"]["walBytes"].as_u64().unwrap() > 0);
+    let tx_per_action = baseline["postgresStats"]["transactionsPerMixedAction"]
+        .as_f64()
+        .expect("sharded Postgres baseline should report transactions per mixed action");
+    assert!(
+        tx_per_action > 0.0 && tx_per_action <= 4.2,
+        "sharded Postgres baseline should stay below the accepted transaction budget, got {tx_per_action}"
+    );
+    let tx_per_workflow = baseline["postgresStats"]["transactionsPerWorkflow"]
+        .as_f64()
+        .expect("sharded Postgres baseline should report transactions per workflow");
+    assert!(
+        tx_per_workflow > 0.0 && tx_per_workflow <= 34.0,
+        "sharded Postgres baseline should stay below the accepted transaction budget, got {tx_per_workflow}"
+    );
+    let statement_stats = &baseline["postgresStats"]["statementStats"];
+    let statement_calls_per_action = statement_stats["callsPerMixedAction"]
+        .as_f64()
+        .expect("sharded Postgres baseline should report statement calls per mixed action");
+    assert!(
+        statement_calls_per_action > 0.0 && statement_calls_per_action <= 22.0,
+        "sharded Postgres baseline should stay below the accepted statement budget, got {statement_calls_per_action}"
+    );
+    assert!(
+        !statement_stats["topStatements"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "sharded Postgres baseline should include pg_stat_statements top statements"
+    );
+    assert!(
+        baseline["backendMetrics"]["operations"]["workflow_change_versions"].is_null(),
+        "normal complete-history workflow tasks should derive change markers without a provider metadata query"
+    );
+    assert!(
+        baseline["backendMetrics"]["operations"]["run_due_maintenance"]["calls"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "mixed benchmark should exercise the combined timer/activity maintenance path"
+    );
 
     let counters = &baseline["counters"];
     for field in [

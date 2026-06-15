@@ -15,6 +15,7 @@
     "activationPrefetchLimit": 1,
     "activityDelayMs": 0,
     "batch": 32,
+    "activityCompletionBatch": 1,
     "maxRounds": 10000,
     "keepDb": false,
     "json": true

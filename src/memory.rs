@@ -292,6 +292,16 @@ impl DurableBackend for MemoryBackend {
             .last()
             .map(|event| event.event_id)
             .unwrap_or(EventId::ZERO);
+        let prefetched_history = run
+            .history
+            .iter()
+            .rev()
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
 
         Box::pin(ready(Ok(Some(ClaimedWorkflowTask {
             run_id: run_id.clone(),
@@ -304,6 +314,7 @@ impl DurableBackend for MemoryBackend {
             },
             replay_target_event_id,
             reason,
+            prefetched_history,
         }))))
     }
 

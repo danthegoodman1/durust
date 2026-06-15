@@ -5,18 +5,20 @@ use crate::{
     CancelWorkflowRequest, ChildStartOutboxMessage, ClaimActivityOptions,
     ClaimActivityTasksOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions,
     ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome,
-    CompleteActivityOutcome, CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
+    CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
+    CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
     DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, EventId,
     FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
     HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, Namespace, ParentClosePolicy,
     PayloadBlob, PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef,
     PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome,
-    QueryProjectionRequest, ReadSignalInboxRequest, Result, RunId, ShardId, SignalInboxRecord,
-    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
-    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
-    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
+    QueryProjectionRequest, ReadSignalInboxRequest, Result, RunDueMaintenanceOutcome,
+    RunDueMaintenanceRequest, RunId, ShardId, SignalInboxRecord, SignalWorkflowOutcome,
+    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
+    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
+    WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
     encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use deadpool_postgres::{
@@ -26,6 +28,7 @@ use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_postgres::{NoTls, Transaction};
 
@@ -37,6 +40,10 @@ const DEFAULT_PHYSICAL_PARTITIONS: u32 = 1;
 const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
 const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const POSTGRES_TRANSACTION_RETRY_ATTEMPTS: usize = 3;
+const POSTGRES_TRANSACTION_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
+const CLAIM_HISTORY_PREFETCH_EVENTS: usize = 16;
+const CLAIM_HISTORY_PREFETCH_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ShardJournalOperation {
@@ -874,6 +881,14 @@ impl DurableBackend for PostgresBackend {
         Box::pin(async move { backend.timeout_due_activities_inner(req).await })
     }
 
+    fn run_due_maintenance(
+        &self,
+        req: RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, Result<RunDueMaintenanceOutcome>> {
+        let backend = self.clone();
+        Box::pin(async move { backend.run_due_maintenance_inner(req).await })
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -906,6 +921,14 @@ impl DurableBackend for PostgresBackend {
     ) -> BoxFuture<'static, Result<CompleteActivityOutcome>> {
         let backend = self.clone();
         Box::pin(async move { backend.complete_activity_inner(req).await })
+    }
+
+    fn complete_activity_tasks(
+        &self,
+        req: CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, Result<Vec<CompleteActivityTaskBatchResult>>> {
+        let backend = self.clone();
+        Box::pin(async move { backend.complete_activity_tasks_inner(req).await })
     }
 
     fn fail_activity(
@@ -956,10 +979,40 @@ impl DurableBackend for PostgresBackend {
 }
 
 impl PostgresBackend {
+    async fn retry_transaction<T, F, Fut>(&self, _operation: &'static str, mut body: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let mut attempt = 0usize;
+        loop {
+            match body().await {
+                Err(err)
+                    if is_retryable_postgres_transaction_abort(&err)
+                        && attempt + 1 < POSTGRES_TRANSACTION_RETRY_ATTEMPTS =>
+                {
+                    let shift = u32::try_from(attempt).unwrap_or(u32::MAX).min(10);
+                    let multiplier = 1_u32.checked_shl(shift).unwrap_or(1);
+                    tokio::time::sleep(POSTGRES_TRANSACTION_RETRY_BASE_DELAY * multiplier).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
     async fn start_workflow_inner(
         &self,
         req: StartWorkflowRequest,
     ) -> Result<StartWorkflowOutcome> {
+        self.retry_transaction("start_workflow", || {
+            let req = req.clone();
+            async move { self.start_workflow_once(req).await }
+        })
+        .await
+    }
+
+    async fn start_workflow_once(&self, req: StartWorkflowRequest) -> Result<StartWorkflowOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
@@ -1017,6 +1070,17 @@ impl PostgresBackend {
     }
 
     async fn cancel_workflow_inner(
+        &self,
+        req: CancelWorkflowRequest,
+    ) -> Result<CancelWorkflowOutcome> {
+        self.retry_transaction("cancel_workflow", || {
+            let req = req.clone();
+            async move { self.cancel_workflow_once(req).await }
+        })
+        .await
+    }
+
+    async fn cancel_workflow_once(
         &self,
         req: CancelWorkflowRequest,
     ) -> Result<CancelWorkflowOutcome> {
@@ -1082,6 +1146,19 @@ impl PostgresBackend {
     }
 
     async fn claim_workflow_tasks_inner(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimWorkflowTasksOptions,
+    ) -> Result<Vec<ClaimedWorkflowTask>> {
+        self.retry_transaction("claim_workflow_tasks", || {
+            let worker_id = worker_id.clone();
+            let opts = opts.clone();
+            async move { self.claim_workflow_tasks_once(worker_id, opts).await }
+        })
+        .await
+    }
+
+    async fn claim_workflow_tasks_once(
         &self,
         worker_id: WorkerId,
         opts: ClaimWorkflowTasksOptions,
@@ -1207,19 +1284,65 @@ impl PostgresBackend {
             }
         }
 
-        let mut claimed = Vec::with_capacity(selected.len());
-        for (run_id, workflow_id, workflow_type, tail, reason, _) in selected {
-            let token = next_claim_token(&tx, &schema).await?;
-            tx.execute(
+        let history_targets = selected
+            .iter()
+            .map(|(run_id, _, _, tail, _, _)| (run_id.clone(), *tail))
+            .collect::<Vec<_>>();
+        let prefetched_histories = self
+            .prefetch_claim_histories_tx(&tx, &schema, &history_targets)
+            .await?;
+
+        let token_rows = tx
+            .query(
                 &format!(
-                    "update {schema}.workflow_instances
-                     set workflow_claim_token = $1, ready_reason = null, ready_at_ms = 0
-                     where run_id = $2"
+                    "select nextval('{schema}.claim_token_seq'::regclass)
+                     from generate_series(1::bigint, $1::bigint)"
                 ),
-                &[&i64::try_from(token).unwrap_or(i64::MAX), &run_id.0],
+                &[&i64::try_from(selected.len()).unwrap_or(i64::MAX)],
             )
             .await
             .map_err(postgres_error)?;
+        let tokens = token_rows
+            .into_iter()
+            .map(|row| {
+                let token: i64 = row.get(0);
+                u64::try_from(token).map_err(|_| {
+                    Error::Backend(format!(
+                        "postgres claim token sequence returned invalid value {token}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let run_ids = selected
+            .iter()
+            .map(|(run_id, _, _, _, _, _)| run_id.0.clone())
+            .collect::<Vec<_>>();
+        let token_values = tokens
+            .iter()
+            .map(|token| i64::try_from(*token).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "update {schema}.workflow_instances workflows
+                 set workflow_claim_token = claimed.claim_token,
+                     ready_reason = null,
+                     ready_at_ms = 0
+                 from unnest($1::text[], $2::bigint[]) as claimed(run_id, claim_token)
+                 where workflows.run_id = claimed.run_id"
+            ),
+            &[&run_ids, &token_values],
+        )
+        .await
+        .map_err(postgres_error)?;
+
+        let mut claimed = Vec::with_capacity(selected.len());
+        for ((run_id, workflow_id, workflow_type, tail, reason, _), token) in
+            selected.into_iter().zip(tokens.into_iter())
+        {
+            let prefetched_history = prefetched_histories
+                .get(&run_id)
+                .cloned()
+                .unwrap_or_default();
             claimed.push(ClaimedWorkflowTask {
                 run_id: run_id.clone(),
                 workflow_id,
@@ -1231,6 +1354,7 @@ impl PostgresBackend {
                 },
                 replay_target_event_id: tail,
                 reason,
+                prefetched_history,
             });
         }
 
@@ -1239,6 +1363,24 @@ impl PostgresBackend {
     }
 
     async fn claim_workflow_task_inner_filtered(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimWorkflowTaskOptions,
+        shard_filter: Option<Vec<ShardId>>,
+    ) -> Result<Option<ClaimedWorkflowTask>> {
+        self.retry_transaction("claim_workflow_task", || {
+            let worker_id = worker_id.clone();
+            let opts = opts.clone();
+            let shard_filter = shard_filter.clone();
+            async move {
+                self.claim_workflow_task_once_filtered(worker_id, opts, shard_filter)
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn claim_workflow_task_once_filtered(
         &self,
         worker_id: WorkerId,
         opts: ClaimWorkflowTaskOptions,
@@ -1358,6 +1500,11 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
+        let prefetched_history = self
+            .prefetch_claim_histories_tx(&tx, &schema, &[(run_id.clone(), tail)])
+            .await?
+            .remove(&run_id)
+            .unwrap_or_default();
         tx.commit().await.map_err(postgres_error)?;
         Ok(Some(ClaimedWorkflowTask {
             run_id: run_id.clone(),
@@ -1370,6 +1517,7 @@ impl PostgresBackend {
             },
             replay_target_event_id: tail,
             reason,
+            prefetched_history,
         }))
     }
 
@@ -1379,30 +1527,29 @@ impl PostgresBackend {
         hydrate: bool,
     ) -> Result<HistoryChunk> {
         let schema = self.schema_sql();
-        let rows = {
-            let client = self.client().await?;
-            client
-                .query(
-                    &format!(
-                        "select event_id, event_type, data
-                         from {schema}.history_events
-                         where run_id = $1 and event_id > $2 and event_id <= $3
-                         order by event_id asc"
-                    ),
-                    &[
-                        &req.run_id.0,
-                        &i64::try_from(req.after_event_id.0).unwrap_or(i64::MAX),
-                        &i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX),
-                    ],
-                )
-                .await
-                .map_err(postgres_error)?
-        };
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                &format!(
+                    "select event_id, event_type, data
+                     from {schema}.history_events
+                     where run_id = $1 and event_id > $2 and event_id <= $3
+                     order by event_id asc"
+                ),
+                &[
+                    &req.run_id.0,
+                    &i64::try_from(req.after_event_id.0).unwrap_or(i64::MAX),
+                    &i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(postgres_error)?;
         let max_events = req.max_events.max(1);
         let max_bytes = req.max_bytes.max(1);
         let mut events = Vec::new();
         let mut bytes = 0usize;
-        for row in rows {
+        let mut consumed_rows = 0usize;
+        for row in &rows {
             let event_id = EventId(row.get::<_, i64>(0).try_into().unwrap_or(u64::MAX));
             let event_type = row.get::<_, String>(1);
             let blob = row.get::<_, Vec<u8>>(2);
@@ -1413,6 +1560,7 @@ impl PostgresBackend {
             {
                 break;
             }
+            consumed_rows += 1;
             if hydrate {
                 data = self.hydrate_history_event_from_storage(data).await?;
             }
@@ -1431,25 +1579,7 @@ impl PostgresBackend {
             .last()
             .map(|event| event.event_id)
             .unwrap_or(req.after_event_id);
-        let has_more = {
-            let client = self.client().await?;
-            client
-                .query_opt(
-                    &format!(
-                        "select 1 from {schema}.history_events
-                         where run_id = $1 and event_id > $2 and event_id <= $3
-                         limit 1"
-                    ),
-                    &[
-                        &req.run_id.0,
-                        &i64::try_from(last_event_id.0).unwrap_or(i64::MAX),
-                        &i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX),
-                    ],
-                )
-                .await
-                .map_err(postgres_error)?
-                .is_some()
-        };
+        let has_more = consumed_rows < rows.len();
         Ok(HistoryChunk {
             events,
             last_event_id,
@@ -1457,7 +1587,104 @@ impl PostgresBackend {
         })
     }
 
+    async fn prefetch_claim_histories_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        targets: &[(RunId, EventId)],
+    ) -> Result<BTreeMap<RunId, Vec<HistoryEvent>>> {
+        if targets.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
+        let run_ids = targets
+            .iter()
+            .map(|(run_id, _)| run_id.0.clone())
+            .collect::<Vec<_>>();
+        let tail_event_ids = targets
+            .iter()
+            .map(|(_, tail)| i64::try_from(tail.0).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        let rows = tx
+            .query(
+                &format!(
+                    "with targets(run_id, tail_event_id) as (
+                         select run_id, tail_event_id
+                         from unnest($1::text[], $2::bigint[])
+                              as targets(run_id, tail_event_id)
+                     ),
+                     ranked as (
+                         select h.run_id,
+                                h.event_id,
+                                h.event_type,
+                                h.data,
+                                row_number() over (
+                                    partition by h.run_id
+                                    order by h.event_id desc
+                                ) as ordinal
+                         from {schema}.history_events h
+                         join targets t on t.run_id = h.run_id
+                         where h.event_id <= t.tail_event_id
+                     )
+                     select run_id, event_id, event_type, data
+                     from ranked
+                     where ordinal <= $3
+                     order by run_id asc, event_id asc"
+                ),
+                &[
+                    &run_ids,
+                    &tail_event_ids,
+                    &i64::try_from(CLAIM_HISTORY_PREFETCH_EVENTS).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(postgres_error)?;
+
+        let mut by_run = BTreeMap::<RunId, Vec<HistoryEvent>>::new();
+        let mut bytes_by_run = BTreeMap::<RunId, usize>::new();
+        for row in rows {
+            let run_id = RunId::new(row.get::<_, String>(0));
+            let event_id = EventId(row.get::<_, i64>(1).try_into().unwrap_or(u64::MAX));
+            let event_type = row.get::<_, String>(2);
+            let blob = row.get::<_, Vec<u8>>(3);
+            let data: HistoryEventData = rmp_serde::from_slice(&blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let event_bytes = event_payload_len(&data).max(1);
+            let events = by_run.entry(run_id.clone()).or_default();
+            let bytes = bytes_by_run.entry(run_id).or_default();
+            events.push(HistoryEvent {
+                event_id,
+                event_type: event_type_from_str(&event_type)?,
+                data,
+            });
+            *bytes = bytes.saturating_add(event_bytes);
+        }
+
+        for (run_id, events) in &mut by_run {
+            let mut bytes = *bytes_by_run.get(run_id).unwrap_or(&0);
+            while events.len() > 1 && bytes > CLAIM_HISTORY_PREFETCH_BYTES {
+                let removed = events.remove(0);
+                bytes = bytes.saturating_sub(event_payload_len(&removed.data).max(1));
+            }
+        }
+
+        Ok(by_run)
+    }
+
     async fn release_workflow_task_inner(
+        &self,
+        claim: WorkflowTaskClaim,
+        release: crate::WorkflowTaskRelease,
+    ) -> Result<()> {
+        self.retry_transaction("release_workflow_task", || {
+            let claim = claim.clone();
+            let release = release.clone();
+            async move { self.release_workflow_task_once(claim, release).await }
+        })
+        .await
+    }
+
+    async fn release_workflow_task_once(
         &self,
         claim: WorkflowTaskClaim,
         release: crate::WorkflowTaskRelease,
@@ -1509,11 +1736,24 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> Result<CommitOutcome> {
+        self.retry_transaction("commit_workflow_task", || {
+            let claim = claim.clone();
+            let batch = batch.clone();
+            async move { self.commit_workflow_task_once(claim, batch).await }
+        })
+        .await
+    }
+
+    async fn commit_workflow_task_once(
+        &self,
+        claim: WorkflowTaskClaim,
+        batch: WorkflowTaskCommit,
+    ) -> Result<CommitOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
         let applied = self
-            .apply_workflow_task_commit_tx(&tx, &schema, claim, batch)
+            .apply_workflow_task_commit_tx(&tx, &schema, claim, batch, None)
             .await?;
         self.append_shard_journal_tx(
             &tx,
@@ -1534,6 +1774,17 @@ impl PostgresBackend {
         &self,
         batch: crate::WorkflowTaskCommitBatch,
     ) -> Result<Vec<crate::WorkflowTaskCommitBatchResult>> {
+        self.retry_transaction("commit_workflow_tasks", || {
+            let batch = batch.clone();
+            async move { self.commit_workflow_tasks_once(batch).await }
+        })
+        .await
+    }
+
+    async fn commit_workflow_tasks_once(
+        &self,
+        batch: crate::WorkflowTaskCommitBatch,
+    ) -> Result<Vec<crate::WorkflowTaskCommitBatchResult>> {
         if batch.commits.is_empty() {
             return Ok(Vec::new());
         }
@@ -1543,11 +1794,18 @@ impl PostgresBackend {
         let schema = self.schema_sql();
         let mut results = Vec::with_capacity(batch.commits.len());
         let mut journal_by_shard = BTreeMap::<(i32, i64), Vec<ShardJournalEntry>>::new();
+        let mut lease_epoch_cache = BTreeMap::<(WorkerId, i32), i64>::new();
 
         for input in batch.commits {
             let claim = input.claim;
             match self
-                .apply_workflow_task_commit_tx(&tx, &schema, claim.clone(), input.commit)
+                .apply_workflow_task_commit_tx(
+                    &tx,
+                    &schema,
+                    claim.clone(),
+                    input.commit,
+                    Some(&mut lease_epoch_cache),
+                )
                 .await
             {
                 Ok(applied) => {
@@ -1606,32 +1864,22 @@ impl PostgresBackend {
         let schema = self.schema_sql();
         let now_ms = unix_epoch_millis();
 
-        tx.execute(
-            &format!(
-                "insert into {schema}.shard_heads_{suffix}
-                 (shard_id, journal_seq, snapshot_seq, updated_at_ms)
-                 values ($1, 0, 0, $2)
-                 on conflict(shard_id) do nothing"
-            ),
-            &[&shard_id, &now_ms],
-        )
-        .await
-        .map_err(postgres_error)?;
-
         let row = tx
             .query_one(
                 &format!(
-                    "select journal_seq
-                     from {schema}.shard_heads_{suffix}
-                     where shard_id = $1
-                     for update"
+                    "insert into {schema}.shard_heads_{suffix}
+                     (shard_id, journal_seq, snapshot_seq, updated_at_ms)
+                     values ($1, 1, 0, $2)
+                     on conflict(shard_id) do update set
+                        journal_seq = shard_heads_{suffix}.journal_seq + 1,
+                        updated_at_ms = excluded.updated_at_ms
+                     returning journal_seq"
                 ),
-                &[&shard_id],
+                &[&shard_id, &now_ms],
             )
             .await
             .map_err(postgres_error)?;
-        let current_seq = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
-        let next_seq = current_seq.saturating_add(1);
+        let next_seq = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
         let next_seq_i64 = i64::try_from(next_seq).unwrap_or(i64::MAX);
         tx.execute(
             &format!(
@@ -1649,16 +1897,6 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
-        tx.execute(
-            &format!(
-                "update {schema}.shard_heads_{suffix}
-                 set journal_seq = $1, updated_at_ms = $2
-                 where shard_id = $3"
-            ),
-            &[&next_seq_i64, &now_ms, &shard_id],
-        )
-        .await
-        .map_err(postgres_error)?;
         Ok(next_seq)
     }
 
@@ -1668,6 +1906,7 @@ impl PostgresBackend {
         schema: &str,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
+        mut lease_epoch_cache: Option<&mut BTreeMap<(WorkerId, i32), i64>>,
     ) -> Result<AppliedWorkflowTaskCommit> {
         let Some(row) = tx
             .query_opt(
@@ -1693,9 +1932,24 @@ impl PostgresBackend {
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
-        let lease_epoch = self
-            .verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
-            .await?;
+        let lease_epoch = match lease_epoch_cache.as_deref_mut() {
+            Some(cache) => {
+                let key = (claim.worker_id.clone(), shard_id);
+                if let Some(lease_epoch) = cache.get(&key).copied() {
+                    lease_epoch
+                } else {
+                    let lease_epoch = self
+                        .verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
+                        .await?;
+                    cache.insert(key, lease_epoch);
+                    lease_epoch
+                }
+            }
+            None => {
+                self.verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
+                    .await?
+            }
+        };
         let current_tail = EventId(u64::try_from(current_tail_i64).unwrap_or(u64::MAX));
         let expected_tail_event_id = batch.expected_tail_event_id;
         if current_tail != expected_tail_event_id {
@@ -1817,7 +2071,7 @@ impl PostgresBackend {
                 InlineChildStartOutcome::Skipped => continue,
             };
             next_event_id = next_event_id.next();
-            insert_history_event(&tx, &schema, &claim.run_id, next_event_id, event_data).await?;
+            insert_history_event(tx, schema, &claim.run_id, next_event_id, event_data).await?;
             ready_after_commit = Some(reason);
         }
 
@@ -2007,6 +2261,17 @@ impl PostgresBackend {
         &self,
         req: SignalWorkflowRequest,
     ) -> Result<SignalWorkflowOutcome> {
+        self.retry_transaction("signal_workflow", || {
+            let req = req.clone();
+            async move { self.signal_workflow_once(req).await }
+        })
+        .await
+    }
+
+    async fn signal_workflow_once(
+        &self,
+        req: SignalWorkflowRequest,
+    ) -> Result<SignalWorkflowOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
@@ -2135,116 +2400,21 @@ impl PostgresBackend {
         &self,
         req: FireDueTimersRequest,
     ) -> Result<FireDueTimersOutcome> {
+        self.retry_transaction("fire_due_timers", || {
+            let req = req.clone();
+            async move { self.fire_due_timers_once(req).await }
+        })
+        .await
+    }
+
+    async fn fire_due_timers_once(
+        &self,
+        req: FireDueTimersRequest,
+    ) -> Result<FireDueTimersOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let rows = tx
-            .query(
-                &format!(
-                    "select wait_id, run_id, command_seq
-                     from {schema}.active_waits
-                     where namespace = $1
-                       and kind = $2
-                       and ready_at_ms is not null
-                       and ready_at_ms <= $3
-                     order by ready_at_ms asc, wait_id asc
-                     limit $4
-                     for update skip locked"
-                ),
-                &[
-                    &req.namespace.0,
-                    &wait_kind_to_str(&WaitKind::Timer),
-                    &req.now.0,
-                    &i64::try_from(req.limit.max(1)).unwrap_or(i64::MAX),
-                ],
-            )
-            .await
-            .map_err(postgres_error)?;
-
-        let due = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get::<_, String>(0),
-                    RunId::new(row.get::<_, String>(1)),
-                    CommandSeq(u64::try_from(row.get::<_, i64>(2)).unwrap_or(u64::MAX)),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let mut fired = 0usize;
-        for (wait_id, run_id, command_seq) in due {
-            let Some(row) = tx
-                .query_opt(
-                    &format!(
-                        "select current_event_id, terminal
-                         from {schema}.workflow_instances
-                         where run_id = $1
-                         for update"
-                    ),
-                    &[&run_id.0],
-                )
-                .await
-                .map_err(postgres_error)?
-            else {
-                tx.execute(
-                    &format!("delete from {schema}.active_waits where wait_id = $1"),
-                    &[&wait_id],
-                )
-                .await
-                .map_err(postgres_error)?;
-                continue;
-            };
-            let tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
-            let terminal: bool = row.get(1);
-            if terminal {
-                tx.execute(
-                    &format!("delete from {schema}.active_waits where wait_id = $1"),
-                    &[&wait_id],
-                )
-                .await
-                .map_err(postgres_error)?;
-                continue;
-            }
-
-            let event_id = tail.next();
-            insert_history_event(
-                &tx,
-                &schema,
-                &run_id,
-                event_id,
-                HistoryEventData::TimerFired(crate::TimerFired {
-                    command_id: CommandId {
-                        run_id: run_id.clone(),
-                        seq: command_seq,
-                    },
-                    fired_at: req.now,
-                }),
-            )
-            .await?;
-            tx.execute(
-                &format!(
-                    "update {schema}.workflow_instances
-                     set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
-                     where run_id = $3"
-                ),
-                &[
-                    &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-                    &reason_to_str(&WorkflowTaskReason::TimerFired),
-                    &run_id.0,
-                ],
-            )
-            .await
-            .map_err(postgres_error)?;
-            tx.execute(
-                &format!("delete from {schema}.active_waits where wait_id = $1"),
-                &[&wait_id],
-            )
-            .await
-            .map_err(postgres_error)?;
-            fired += 1;
-        }
-
+        let fired = fire_due_timers_tx(&tx, &schema, req).await?;
         tx.commit().await.map_err(postgres_error)?;
         Ok(FireDueTimersOutcome { fired })
     }
@@ -2253,54 +2423,85 @@ impl PostgresBackend {
         &self,
         req: TimeoutDueActivitiesRequest,
     ) -> Result<TimeoutDueActivitiesOutcome> {
+        self.retry_transaction("timeout_due_activities", || {
+            let req = req.clone();
+            async move { self.timeout_due_activities_once(req).await }
+        })
+        .await
+    }
+
+    async fn timeout_due_activities_once(
+        &self,
+        req: TimeoutDueActivitiesRequest,
+    ) -> Result<TimeoutDueActivitiesOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let rows = tx
-            .query(
-                &format!(
-                    "select activity_id
-                     from {schema}.activity_tasks
-                     where namespace = $1
-                       and completed = false
-                       and (
-                         (timeout_at_ms is not null and timeout_at_ms <= $2)
-                         or
-                         (heartbeat_deadline_at_ms is not null and heartbeat_deadline_at_ms <= $2)
-                       )
-                     order by least(
-                         coalesce(timeout_at_ms, 9223372036854775807),
-                         coalesce(heartbeat_deadline_at_ms, 9223372036854775807)
-                       ) asc,
-                       activity_id asc
-                     limit $3
-                     for update skip locked"
-                ),
-                &[
-                    &req.namespace.0,
-                    &req.now.0,
-                    &i64::try_from(req.limit.max(1)).unwrap_or(i64::MAX),
-                ],
-            )
-            .await
-            .map_err(postgres_error)?;
-        let activity_ids = rows
-            .into_iter()
-            .map(|row| ActivityId(row.get::<_, String>(0)))
-            .collect::<Vec<_>>();
-
-        let mut timed_out = 0usize;
-        for activity_id in activity_ids {
-            if timeout_activity_tx(&tx, &schema, activity_id, req.now).await? {
-                timed_out += 1;
-            }
-        }
-
+        let timed_out = timeout_due_activities_tx(&tx, &schema, req).await?;
         tx.commit().await.map_err(postgres_error)?;
         Ok(TimeoutDueActivitiesOutcome { timed_out })
     }
 
+    async fn run_due_maintenance_inner(
+        &self,
+        req: RunDueMaintenanceRequest,
+    ) -> Result<RunDueMaintenanceOutcome> {
+        self.retry_transaction("run_due_maintenance", || {
+            let req = req.clone();
+            async move { self.run_due_maintenance_once(req).await }
+        })
+        .await
+    }
+
+    async fn run_due_maintenance_once(
+        &self,
+        req: RunDueMaintenanceRequest,
+    ) -> Result<RunDueMaintenanceOutcome> {
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(postgres_error)?;
+        let schema = self.schema_sql();
+        let now = req.now;
+        let timers_fired = fire_due_timers_tx(
+            &tx,
+            &schema,
+            FireDueTimersRequest {
+                namespace: req.namespace.clone(),
+                now,
+                limit: req.timer_limit,
+            },
+        )
+        .await?;
+        let activities_timed_out = timeout_due_activities_tx(
+            &tx,
+            &schema,
+            TimeoutDueActivitiesRequest {
+                namespace: req.namespace,
+                now,
+                limit: req.activity_limit,
+            },
+        )
+        .await?;
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(RunDueMaintenanceOutcome {
+            timers_fired,
+            activities_timed_out,
+        })
+    }
+
     async fn claim_activity_task_inner(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimActivityOptions,
+    ) -> Result<Option<ClaimedActivityTask>> {
+        self.retry_transaction("claim_activity_task", || {
+            let worker_id = worker_id.clone();
+            let opts = opts.clone();
+            async move { self.claim_activity_task_once(worker_id, opts).await }
+        })
+        .await
+    }
+
+    async fn claim_activity_task_once(
         &self,
         worker_id: WorkerId,
         opts: ClaimActivityOptions,
@@ -2376,6 +2577,19 @@ impl PostgresBackend {
     }
 
     async fn claim_activity_tasks_inner(
+        &self,
+        worker_id: WorkerId,
+        opts: ClaimActivityTasksOptions,
+    ) -> Result<Vec<ClaimedActivityTask>> {
+        self.retry_transaction("claim_activity_tasks", || {
+            let worker_id = worker_id.clone();
+            let opts = opts.clone();
+            async move { self.claim_activity_tasks_once(worker_id, opts).await }
+        })
+        .await
+    }
+
+    async fn claim_activity_tasks_once(
         &self,
         worker_id: WorkerId,
         opts: ClaimActivityTasksOptions,
@@ -2504,6 +2718,17 @@ impl PostgresBackend {
         &self,
         req: ActivityHeartbeatRequest,
     ) -> Result<ActivityHeartbeatOutcome> {
+        self.retry_transaction("heartbeat_activity", || {
+            let req = req.clone();
+            async move { self.heartbeat_activity_once(req).await }
+        })
+        .await
+    }
+
+    async fn heartbeat_activity_once(
+        &self,
+        req: ActivityHeartbeatRequest,
+    ) -> Result<ActivityHeartbeatOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
@@ -2559,12 +2784,58 @@ impl PostgresBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> Result<CompleteActivityOutcome> {
+        self.retry_transaction("complete_activity", || {
+            let req = req.clone();
+            async move { self.complete_activity_once(req).await }
+        })
+        .await
+    }
+
+    async fn complete_activity_once(
+        &self,
+        req: CompleteActivityRequest,
+    ) -> Result<CompleteActivityOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
         let outcome = self.complete_activity_tx(&tx, &schema, req).await?;
         tx.commit().await.map_err(postgres_error)?;
         Ok(outcome)
+    }
+
+    async fn complete_activity_tasks_inner(
+        &self,
+        req: CompleteActivityTasksRequest,
+    ) -> Result<Vec<CompleteActivityTaskBatchResult>> {
+        self.retry_transaction("complete_activity_tasks", || {
+            let req = req.clone();
+            async move { self.complete_activity_tasks_once(req).await }
+        })
+        .await
+    }
+
+    async fn complete_activity_tasks_once(
+        &self,
+        req: CompleteActivityTasksRequest,
+    ) -> Result<Vec<CompleteActivityTaskBatchResult>> {
+        if req.completions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut client = self.client().await?;
+        let tx = client.transaction().await.map_err(postgres_error)?;
+        let schema = self.schema_sql();
+        let mut results = Vec::with_capacity(req.completions.len());
+        for completion in req.completions {
+            let claim = completion.claim.clone();
+            let outcome = self.complete_activity_tx(&tx, &schema, completion).await?;
+            results.push(CompleteActivityTaskBatchResult {
+                claim,
+                result: Ok(outcome),
+            });
+        }
+        tx.commit().await.map_err(postgres_error)?;
+        Ok(results)
     }
 
     async fn complete_activity_tx(
@@ -2682,6 +2953,14 @@ impl PostgresBackend {
     }
 
     async fn fail_activity_inner(&self, req: FailActivityRequest) -> Result<FailActivityOutcome> {
+        self.retry_transaction("fail_activity", || {
+            let req = req.clone();
+            async move { self.fail_activity_once(req).await }
+        })
+        .await
+    }
+
+    async fn fail_activity_once(&self, req: FailActivityRequest) -> Result<FailActivityOutcome> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
@@ -4127,8 +4406,8 @@ fn quote_ident(identifier: &str) -> String {
 fn postgres_error(err: tokio_postgres::Error) -> Error {
     if let Some(db_error) = err.as_db_error() {
         return Error::Backend(format!(
-            "postgres error: {:?}: {}{}{}",
-            db_error.code(),
+            "postgres error SQLSTATE {}: {}{}{}",
+            db_error.code().code(),
             db_error.message(),
             db_error
                 .detail()
@@ -4141,6 +4420,14 @@ fn postgres_error(err: tokio_postgres::Error) -> Error {
         ));
     }
     Error::Backend(format!("postgres error: {err}"))
+}
+
+fn is_retryable_postgres_transaction_abort(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Backend(message)
+            if message.contains("SQLSTATE 40P01") || message.contains("SQLSTATE 40001")
+    )
 }
 
 fn ready_at_ms_for_delay(delay: Duration) -> i64 {
@@ -5235,6 +5522,167 @@ async fn activity_map_results_tx(
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
         })
         .collect()
+}
+
+async fn fire_due_timers_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    req: FireDueTimersRequest,
+) -> Result<usize> {
+    let rows = tx
+        .query(
+            &format!(
+                "select wait_id, run_id, command_seq
+                 from {schema}.active_waits
+                 where namespace = $1
+                   and kind = $2
+                   and ready_at_ms is not null
+                   and ready_at_ms <= $3
+                 order by ready_at_ms asc, wait_id asc
+                 limit $4
+                 for update skip locked"
+            ),
+            &[
+                &req.namespace.0,
+                &wait_kind_to_str(&WaitKind::Timer),
+                &req.now.0,
+                &i64::try_from(req.limit.max(1)).unwrap_or(i64::MAX),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+
+    let due = rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                RunId::new(row.get::<_, String>(1)),
+                CommandSeq(u64::try_from(row.get::<_, i64>(2)).unwrap_or(u64::MAX)),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut fired = 0usize;
+    for (wait_id, run_id, command_seq) in due {
+        let Some(row) = tx
+            .query_opt(
+                &format!(
+                    "select current_event_id, terminal
+                     from {schema}.workflow_instances
+                     where run_id = $1
+                     for update"
+                ),
+                &[&run_id.0],
+            )
+            .await
+            .map_err(postgres_error)?
+        else {
+            tx.execute(
+                &format!("delete from {schema}.active_waits where wait_id = $1"),
+                &[&wait_id],
+            )
+            .await
+            .map_err(postgres_error)?;
+            continue;
+        };
+        let tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
+        let terminal: bool = row.get(1);
+        if terminal {
+            tx.execute(
+                &format!("delete from {schema}.active_waits where wait_id = $1"),
+                &[&wait_id],
+            )
+            .await
+            .map_err(postgres_error)?;
+            continue;
+        }
+
+        let event_id = tail.next();
+        insert_history_event(
+            tx,
+            schema,
+            &run_id,
+            event_id,
+            HistoryEventData::TimerFired(crate::TimerFired {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: command_seq,
+                },
+                fired_at: req.now,
+            }),
+        )
+        .await?;
+        tx.execute(
+            &format!(
+                "update {schema}.workflow_instances
+                 set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
+                 where run_id = $3"
+            ),
+            &[
+                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
+                &reason_to_str(&WorkflowTaskReason::TimerFired),
+                &run_id.0,
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+        tx.execute(
+            &format!("delete from {schema}.active_waits where wait_id = $1"),
+            &[&wait_id],
+        )
+        .await
+        .map_err(postgres_error)?;
+        fired += 1;
+    }
+    Ok(fired)
+}
+
+async fn timeout_due_activities_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    req: TimeoutDueActivitiesRequest,
+) -> Result<usize> {
+    let rows = tx
+        .query(
+            &format!(
+                "select activity_id
+                 from {schema}.activity_tasks
+                 where namespace = $1
+                   and completed = false
+                   and (
+                     (timeout_at_ms is not null and timeout_at_ms <= $2)
+                     or
+                     (heartbeat_deadline_at_ms is not null and heartbeat_deadline_at_ms <= $2)
+                   )
+                 order by least(
+                     coalesce(timeout_at_ms, 9223372036854775807),
+                     coalesce(heartbeat_deadline_at_ms, 9223372036854775807)
+                   ) asc,
+                   activity_id asc
+                 limit $3
+                 for update skip locked"
+            ),
+            &[
+                &req.namespace.0,
+                &req.now.0,
+                &i64::try_from(req.limit.max(1)).unwrap_or(i64::MAX),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let activity_ids = rows
+        .into_iter()
+        .map(|row| ActivityId(row.get::<_, String>(0)))
+        .collect::<Vec<_>>();
+
+    let mut timed_out = 0usize;
+    for activity_id in activity_ids {
+        if timeout_activity_tx(tx, schema, activity_id, req.now).await? {
+            timed_out += 1;
+        }
+    }
+    Ok(timed_out)
 }
 
 async fn timeout_activity_tx(
