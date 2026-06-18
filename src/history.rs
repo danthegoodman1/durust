@@ -18,6 +18,7 @@ pub enum CommandKind {
     Activity,
     ActivityMap,
     ChildWorkflow,
+    ChildWorkflowMap,
     Timer,
     Signal,
     VersionMarker,
@@ -130,6 +131,13 @@ pub struct ActivityMapFailed {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChildWorkflowMapFailureMode {
+    #[default]
+    FailFast,
+    CollectAll,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParentClosePolicy {
     #[default]
     Cancel,
@@ -170,6 +178,56 @@ pub struct ChildWorkflowFailed {
 pub struct ChildWorkflowCancelled {
     pub command_id: CommandId,
     pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapScheduled {
+    pub command_id: CommandId,
+    pub workflow_type: WorkflowType,
+    pub task_queue: TaskQueue,
+    pub input_manifest: PayloadRef,
+    pub result_manifest_name: String,
+    pub workflow_id_prefix: String,
+    pub max_in_flight: usize,
+    pub parent_close_policy: ParentClosePolicy,
+    pub failure_mode: ChildWorkflowMapFailureMode,
+    pub fingerprint: CommandFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapCompleted {
+    pub command_id: CommandId,
+    pub result_manifest: PayloadRef,
+    pub item_count: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub cancellation_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapFailed {
+    pub command_id: CommandId,
+    pub failure: DurableFailure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapResultManifest {
+    pub name: String,
+    pub item_count: usize,
+    pub page_lengths: Vec<usize>,
+    pub pages: Vec<PayloadRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapResultPage {
+    pub outcomes: Vec<ChildWorkflowMapItemOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChildWorkflowMapItemOutcome {
+    Succeeded { result: PayloadRef },
+    Failed { failure: DurableFailure },
+    Cancelled { reason: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +289,9 @@ pub enum HistoryEventData {
     ChildWorkflowCompleted(ChildWorkflowCompleted),
     ChildWorkflowFailed(ChildWorkflowFailed),
     ChildWorkflowCancelled(ChildWorkflowCancelled),
+    ChildWorkflowMapScheduled(ChildWorkflowMapScheduled),
+    ChildWorkflowMapCompleted(ChildWorkflowMapCompleted),
+    ChildWorkflowMapFailed(ChildWorkflowMapFailed),
     TimerStarted(TimerStarted),
     TimerFired(TimerFired),
     SignalConsumed(SignalConsumed),
@@ -267,6 +328,9 @@ pub enum HistoryEventType {
     ChildWorkflowCompleted,
     ChildWorkflowFailed,
     ChildWorkflowCancelled,
+    ChildWorkflowMapScheduled,
+    ChildWorkflowMapCompleted,
+    ChildWorkflowMapFailed,
     TimerStarted,
     TimerFired,
     SignalConsumed,
@@ -297,6 +361,9 @@ impl HistoryEventData {
             Self::ChildWorkflowCompleted(_) => HistoryEventType::ChildWorkflowCompleted,
             Self::ChildWorkflowFailed(_) => HistoryEventType::ChildWorkflowFailed,
             Self::ChildWorkflowCancelled(_) => HistoryEventType::ChildWorkflowCancelled,
+            Self::ChildWorkflowMapScheduled(_) => HistoryEventType::ChildWorkflowMapScheduled,
+            Self::ChildWorkflowMapCompleted(_) => HistoryEventType::ChildWorkflowMapCompleted,
+            Self::ChildWorkflowMapFailed(_) => HistoryEventType::ChildWorkflowMapFailed,
             Self::TimerStarted(_) => HistoryEventType::TimerStarted,
             Self::TimerFired(_) => HistoryEventType::TimerFired,
             Self::SignalConsumed(_) => HistoryEventType::SignalConsumed,
@@ -372,6 +439,25 @@ pub struct ActivityMapTask {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapItem {
+    pub map_command_id: CommandId,
+    pub item_ordinal: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildWorkflowMapTask {
+    pub map_command_id: CommandId,
+    pub workflow_type: WorkflowType,
+    pub task_queue: TaskQueue,
+    pub input_manifest: PayloadRef,
+    pub result_manifest_name: String,
+    pub workflow_id_prefix: String,
+    pub max_in_flight: usize,
+    pub parent_close_policy: ParentClosePolicy,
+    pub failure_mode: ChildWorkflowMapFailureMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildStartOutboxMessage {
     pub command_id: CommandId,
     pub workflow_type: WorkflowType,
@@ -379,6 +465,7 @@ pub struct ChildStartOutboxMessage {
     pub task_queue: TaskQueue,
     pub input: PayloadRef,
     pub parent_close_policy: ParentClosePolicy,
+    pub child_map_item: Option<ChildWorkflowMapItem>,
 }
 
 impl ChildStartOutboxMessage {
@@ -390,6 +477,7 @@ impl ChildStartOutboxMessage {
             task_queue: requested.task_queue.clone(),
             input: requested.input.clone(),
             parent_close_policy: requested.parent_close_policy,
+            child_map_item: None,
         }
     }
 }
@@ -438,6 +526,27 @@ pub fn child_workflow_fingerprint(
         options_digest: format!(
             "workflow_id={}:task_queue={}:parent_close_policy={:?}",
             workflow_id.0, task_queue.0, parent_close_policy
+        ),
+    }
+}
+
+pub fn child_workflow_map_fingerprint(
+    workflow_type: WorkflowType,
+    input_manifest_digest: String,
+    result_manifest_name: String,
+    workflow_id_prefix: String,
+    max_in_flight: usize,
+    task_queue: TaskQueue,
+    parent_close_policy: ParentClosePolicy,
+    failure_mode: ChildWorkflowMapFailureMode,
+) -> CommandFingerprint {
+    CommandFingerprint {
+        kind: CommandKind::ChildWorkflowMap,
+        name: format!("{}@{}", workflow_type.name, workflow_type.version),
+        input_digest: Some(input_manifest_digest),
+        options_digest: format!(
+            "result={result_manifest_name}:prefix={workflow_id_prefix}:max={max_in_flight}:task_queue={}:parent_close_policy={:?}:failure_mode={:?}",
+            task_queue.0, parent_close_policy, failure_mode
         ),
     }
 }
@@ -628,4 +737,108 @@ pub fn decode_activity_map_result_refs(manifest_ref: &PayloadRef) -> Result<Vec<
     }
     Ok(results)
 }
+
+pub fn encode_child_workflow_map_result_manifest(
+    name: String,
+    outcomes: Vec<ChildWorkflowMapItemOutcome>,
+    page_lengths: &[usize],
+) -> Result<PayloadRef> {
+    encode_child_workflow_map_result_manifest_with_codec(
+        name,
+        outcomes,
+        page_lengths,
+        crate::CodecId::MessagePack,
+    )
+}
+
+pub fn encode_child_workflow_map_result_manifest_with_codec(
+    name: String,
+    outcomes: Vec<ChildWorkflowMapItemOutcome>,
+    page_lengths: &[usize],
+    codec: crate::CodecId,
+) -> Result<PayloadRef> {
+    let item_count = outcomes.len();
+    let expected: usize = page_lengths.iter().copied().sum();
+    if expected != item_count {
+        return Err(Error::PayloadEncode(format!(
+            "child workflow map result page lengths cover {expected} items, expected {item_count}"
+        )));
+    }
+
+    let mut pages = Vec::new();
+    let mut offset = 0usize;
+    for page_len in page_lengths {
+        let end = offset + page_len;
+        pages.push(crate::encode_payload_with_codec(
+            &ChildWorkflowMapResultPage {
+                outcomes: outcomes[offset..end].to_vec(),
+            },
+            codec,
+        )?);
+        offset = end;
+    }
+
+    crate::encode_payload_with_codec(
+        &ChildWorkflowMapResultManifest {
+            name,
+            item_count,
+            page_lengths: page_lengths.to_vec(),
+            pages,
+        },
+        codec,
+    )
+}
+
+pub fn decode_child_workflow_map_outcomes(
+    manifest_ref: &PayloadRef,
+) -> Result<Vec<ChildWorkflowMapItemOutcome>> {
+    let manifest: ChildWorkflowMapResultManifest = crate::decode_payload(manifest_ref)?;
+    let mut outcomes = Vec::with_capacity(manifest.item_count);
+    for (page_index, page_ref) in manifest.pages.iter().enumerate() {
+        let page: ChildWorkflowMapResultPage = crate::decode_payload(page_ref)?;
+        let expected_len = manifest
+            .page_lengths
+            .get(page_index)
+            .copied()
+            .ok_or_else(|| {
+                Error::PayloadDecode(format!(
+                    "child workflow map result manifest missing page length {page_index}"
+                ))
+            })?;
+        if page.outcomes.len() != expected_len {
+            return Err(Error::PayloadDecode(format!(
+                "child workflow map result page {page_index} has {} outcomes, expected {expected_len}",
+                page.outcomes.len()
+            )));
+        }
+        outcomes.extend(page.outcomes);
+    }
+    if outcomes.len() != manifest.item_count {
+        return Err(Error::PayloadDecode(format!(
+            "child workflow map result manifest decoded {} outcomes, expected {}",
+            outcomes.len(),
+            manifest.item_count
+        )));
+    }
+    Ok(outcomes)
+}
+
+pub fn decode_child_workflow_map_success_refs(
+    manifest_ref: &PayloadRef,
+) -> Result<Vec<PayloadRef>> {
+    decode_child_workflow_map_outcomes(manifest_ref)?
+        .into_iter()
+        .map(|outcome| match outcome {
+            ChildWorkflowMapItemOutcome::Succeeded { result } => Ok(result),
+            ChildWorkflowMapItemOutcome::Failed { failure } => {
+                Err(Error::ChildWorkflowFailed(failure))
+            }
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Err(Error::ChildWorkflowCancelled(reason))
+            }
+        })
+        .collect()
+}
+
 pub const ACTIVITY_MAP_MANIFEST_PAGE_SIZE: usize = 1024;
+pub const CHILD_WORKFLOW_MAP_MANIFEST_PAGE_SIZE: usize = 1024;

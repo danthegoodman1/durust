@@ -204,6 +204,7 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),

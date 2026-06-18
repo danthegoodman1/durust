@@ -63,6 +63,11 @@ Implemented:
   is opt-in so accepted throughput baselines are not perturbed by shell-based
   sampling overhead. It rejects unsupported shard, activation-concurrency, and
   prefetch dimensions instead of reporting misleading numbers.
+- `durust-benchmark-workload --mode child-map`, a manifest-backed child
+  workflow map workload with configurable `--child-map-items` and
+  `--child-map-max-in-flight`. It exercises compact parent history, provider
+  map descriptors, child start materialization, result manifest writes, and
+  ordered child-map completion accounting across memory, SQLite, and Postgres.
 - `durust-benchmark-workload --mode postgres-write-ceiling`, a Postgres-only
   diagnostic that exercises a comparable transactional write shape without the
   Durust runtime. It records the same Postgres stats envelope as the mixed
@@ -139,7 +144,8 @@ Remaining:
 
 - Add comparable benchmark support for additional modes: bare, activity,
   signal, timer, child, activity map, payload refs, recovery, and cached wake
-  under recovery load.
+  under recovery load. Child workflow map fanout now has an initial workload
+  mode; checked-in thresholds remain pending measured baselines.
 - Extend write-combining beyond workflow-task claim/commit into hot activity,
   timer, child, and signal progress where the provider can batch without
   weakening per-run fencing, event ordering, or crash safety.
@@ -250,6 +256,7 @@ cargo run --release --locked --bin durust-benchmark-compare -- \
 - Signal-heavy workflows.
 - Child workflow fanout.
 - Activity map fanout and completion fan-in.
+- Child workflow map fanout and completion fan-in.
 - Mixed workload with activities, timers, signals, child workflows, select, and
   join.
 - Recovery after worker crash with long histories.

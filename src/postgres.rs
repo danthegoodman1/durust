@@ -2,7 +2,8 @@ use crate::{
     ActivityFailed, ActivityHeartbeatOutcome, ActivityHeartbeatRequest, ActivityId,
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem, ActivityMapResultManifest,
     ActivityMapResultPage, ActivityMapTask, ActivityTask, ActivityTaskClaim, CancelWorkflowOutcome,
-    CancelWorkflowRequest, ChildStartOutboxMessage, ClaimActivityOptions,
+    CancelWorkflowRequest, ChildStartOutboxMessage, ChildWorkflowMapFailureMode,
+    ChildWorkflowMapItem, ChildWorkflowMapItemOutcome, ChildWorkflowMapTask, ClaimActivityOptions,
     ClaimActivityTasksOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions,
     ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome,
     CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
@@ -19,7 +20,8 @@ use crate::{
     WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
     WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
     WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
+    encode_activity_map_result_manifest_with_codec,
+    encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use deadpool_postgres::{
     Manager, ManagerConfig, Object as PooledPostgresClient, Pool, RecyclingMethod, Runtime,
@@ -358,11 +360,15 @@ impl PostgresBackend {
                     parent_run_id text,
                     parent_command_seq bigint,
                     parent_close_policy text,
+                    parent_child_map_ordinal bigint,
                     unique(namespace, workflow_id)
                 );
 
                 alter table {schema}.workflow_instances
                     add column if not exists shard_id integer not null default 0;
+
+                alter table {schema}.workflow_instances
+                    add column if not exists parent_child_map_ordinal bigint;
 
                 create table if not exists {schema}.history_events (
                     run_id text not null,
@@ -411,6 +417,25 @@ impl PostgresBackend {
                     map_command_id text not null,
                     item_ordinal bigint not null,
                     result bytea not null,
+                    primary key(map_command_id, item_ordinal)
+                );
+
+                create table if not exists {schema}.child_workflow_maps (
+                    map_command_id text primary key,
+                    namespace text not null,
+                    run_id text not null,
+                    command_seq bigint not null,
+                    task bytea not null,
+                    item_count bigint not null,
+                    next_ordinal bigint not null,
+                    in_flight bigint not null,
+                    completed boolean not null
+                );
+
+                create table if not exists {schema}.child_workflow_map_results (
+                    map_command_id text not null,
+                    item_ordinal bigint not null,
+                    outcome bytea not null,
                     primary key(map_command_id, item_ordinal)
                 );
 
@@ -868,6 +893,18 @@ impl DurableBackend for PostgresBackend {
         })
     }
 
+    fn hydrate_child_workflow_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            backend
+                .hydrate_child_workflow_map_result_manifest_from_storage(payload)
+                .await
+        })
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
@@ -1176,7 +1213,7 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
-        handle_terminal_run_tx(&tx, &schema, &run_id, &terminal_event).await?;
+        handle_terminal_run_tx(self, &tx, &schema, &run_id, &terminal_event).await?;
         tx.commit().await.map_err(postgres_error)?;
         Ok(CancelWorkflowOutcome::Cancelled { run_id, event_id })
     }
@@ -2298,7 +2335,10 @@ impl PostgresBackend {
                 },
             });
         }
-        if terminal && (!batch.append_events.is_empty() || !batch.start_child_workflows.is_empty())
+        if terminal
+            && (!batch.append_events.is_empty()
+                || !batch.start_child_workflows.is_empty()
+                || !batch.schedule_child_workflow_maps.is_empty())
         {
             return Err(Error::TerminalWorkflow);
         }
@@ -2321,6 +2361,14 @@ impl PostgresBackend {
         for task in batch.schedule_activity_maps {
             schedule_activity_maps.push(
                 self.normalize_activity_map_task_for_storage_tx(&tx, task)
+                    .await?,
+            );
+        }
+        let mut schedule_child_workflow_maps =
+            Vec::with_capacity(batch.schedule_child_workflow_maps.len());
+        for task in batch.schedule_child_workflow_maps {
+            schedule_child_workflow_maps.push(
+                self.normalize_child_workflow_map_task_for_storage_tx(&tx, task)
                     .await?,
             );
         }
@@ -2443,6 +2491,18 @@ impl PostgresBackend {
             materialize_activity_map_items_tx(self, &tx, &schema, &map_task.map_command_id).await?;
         }
 
+        for map_task in schedule_child_workflow_maps {
+            insert_child_workflow_map_tx(self, &tx, &schema, &namespace, &map_task).await?;
+            materialize_child_workflow_map_items_tx(
+                self,
+                &tx,
+                &schema,
+                &namespace,
+                &map_task.map_command_id,
+            )
+            .await?;
+        }
+
         for wait in batch.upsert_waits {
             tx.execute(
                 &format!(
@@ -2547,7 +2607,7 @@ impl PostgresBackend {
                 });
             }
             if let Some(event) = terminal_event {
-                handle_terminal_run_tx(&tx, &schema, &claim.run_id, &event).await?;
+                handle_terminal_run_tx(self, &tx, &schema, &claim.run_id, &event).await?;
             }
         }
         let ready_reason = if terminal_after_commit {
@@ -3940,6 +4000,43 @@ impl PostgresBackend {
 
         let rows = tx
             .query(
+                &format!(
+                    "select task from {schema}.child_workflow_maps order by map_command_id asc"
+                ),
+                &[],
+            )
+            .await
+            .map_err(postgres_error)?;
+        for row in rows {
+            let blob: Vec<u8> = row.get(0);
+            let task: ChildWorkflowMapTask = rmp_serde::from_slice(&blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            roots.push(PayloadRootRef::ActivityMapInputManifest(
+                self.activity_map_input_root_for_roots_tx(tx, task.input_manifest)
+                    .await?,
+            ));
+        }
+
+        let rows = tx
+            .query(
+                &format!(
+                    "select outcome
+                     from {schema}.child_workflow_map_results
+                     order by map_command_id asc, item_ordinal asc"
+                ),
+                &[],
+            )
+            .await
+            .map_err(postgres_error)?;
+        for row in rows {
+            let blob: Vec<u8> = row.get(0);
+            let outcome: ChildWorkflowMapItemOutcome = rmp_serde::from_slice(&blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            collect_child_workflow_map_outcome_payload_roots(&outcome, &mut roots);
+        }
+
+        let rows = tx
+            .query(
                 &format!("select payload from {schema}.signals order by signal_id asc"),
                 &[],
             )
@@ -4047,6 +4144,42 @@ impl PostgresBackend {
 
         let rows = tx
             .query(
+                &format!(
+                    "select task from {schema}.child_workflow_maps order by map_command_id asc"
+                ),
+                &[],
+            )
+            .await
+            .map_err(postgres_error)?;
+        for row in rows {
+            let blob: Vec<u8> = row.get(0);
+            let task: ChildWorkflowMapTask = rmp_serde::from_slice(&blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            self.collect_activity_map_input_manifest_ref_tx(tx, &task.input_manifest, reachable)
+                .await?;
+        }
+
+        let rows = tx
+            .query(
+                &format!(
+                    "select outcome
+                     from {schema}.child_workflow_map_results
+                     order by map_command_id asc, item_ordinal asc"
+                ),
+                &[],
+            )
+            .await
+            .map_err(postgres_error)?;
+        for row in rows {
+            let blob: Vec<u8> = row.get(0);
+            let outcome: ChildWorkflowMapItemOutcome = rmp_serde::from_slice(&blob)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            self.collect_child_workflow_map_outcome_payload_blobs_tx(tx, &outcome, reachable)
+                .await?;
+        }
+
+        let rows = tx
+            .query(
                 &format!("select payload from {schema}.signals order by signal_id asc"),
                 &[],
             )
@@ -4118,6 +4251,24 @@ impl PostgresBackend {
                 ));
             }
             HistoryEventData::ActivityMapFailed(failed) => {
+                collect_failure_payload_roots(&failed.failure, roots);
+            }
+            HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+                roots.push(PayloadRootRef::ActivityMapInputManifest(
+                    self.activity_map_input_root_for_roots_tx(tx, scheduled.input_manifest.clone())
+                        .await?,
+                ));
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+                roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
+                    self.child_workflow_map_result_root_for_roots_tx(
+                        tx,
+                        completed.result_manifest.clone(),
+                    )
+                    .await?,
+                ));
+            }
+            HistoryEventData::ChildWorkflowMapFailed(failed) => {
                 collect_failure_payload_roots(&failed.failure, roots);
             }
             HistoryEventData::ActivityCompleted(completed) => {
@@ -4198,6 +4349,26 @@ impl PostgresBackend {
                 self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
                     .await
             }
+            HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+                self.collect_activity_map_input_manifest_ref_tx(
+                    tx,
+                    &scheduled.input_manifest,
+                    reachable,
+                )
+                .await
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+                self.collect_child_workflow_map_result_manifest_ref_tx(
+                    tx,
+                    &completed.result_manifest,
+                    reachable,
+                )
+                .await
+            }
+            HistoryEventData::ChildWorkflowMapFailed(failed) => {
+                self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
+                    .await
+            }
             HistoryEventData::ActivityCompleted(completed) => {
                 self.collect_payload_blob_ref_tx(tx, &completed.result, reachable)
                     .await
@@ -4261,9 +4432,9 @@ impl PostgresBackend {
             return Ok(());
         };
         if uri.starts_with("postgres://payload/") {
-            self.load_payload_blob_tx(tx, payload).await?;
+            self.load_payload_blob_tx(tx, payload, false).await?;
         } else if !is_opaque_external_payload_ref(payload) {
-            self.load_payload_blob_tx(tx, payload).await?;
+            self.load_payload_blob_tx(tx, payload, false).await?;
         }
         reachable.insert(digest.clone());
         Ok(())
@@ -4290,6 +4461,18 @@ impl PostgresBackend {
             return Ok(payload);
         }
         self.hydrate_activity_map_result_manifest_from_storage_tx(tx, payload)
+            .await
+    }
+
+    async fn child_workflow_map_result_root_for_roots_tx(
+        &self,
+        tx: &Transaction<'_>,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        if is_opaque_external_payload_ref(&payload) {
+            return Ok(payload);
+        }
+        self.hydrate_child_workflow_map_result_manifest_from_storage_tx(tx, payload)
             .await
     }
 
@@ -4355,6 +4538,67 @@ impl PostgresBackend {
         Ok(())
     }
 
+    async fn collect_child_workflow_map_result_manifest_ref_tx(
+        &self,
+        tx: &Transaction<'_>,
+        payload: &PayloadRef,
+        reachable: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        self.collect_payload_blob_ref_tx(tx, payload, reachable)
+            .await?;
+        if is_opaque_external_payload_ref(payload) {
+            return Ok(());
+        }
+        let manifest_payload = self
+            .hydrate_payload_from_storage_tx(tx, payload.clone())
+            .await?;
+        let manifest: crate::ChildWorkflowMapResultManifest =
+            crate::decode_payload(&manifest_payload)?;
+        for page in manifest.pages {
+            self.collect_payload_blob_ref_tx(tx, &page, reachable)
+                .await?;
+            if is_opaque_external_payload_ref(&page) {
+                continue;
+            }
+            let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
+            let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
+            for outcome in page.outcomes {
+                match outcome {
+                    crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                        self.collect_payload_blob_ref_tx(tx, &result, reachable)
+                            .await?;
+                    }
+                    crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
+                        self.collect_failure_payload_blobs_tx(tx, &failure, reachable)
+                            .await?;
+                    }
+                    crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn collect_child_workflow_map_outcome_payload_blobs_tx(
+        &self,
+        tx: &Transaction<'_>,
+        outcome: &ChildWorkflowMapItemOutcome,
+        reachable: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        match outcome {
+            ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                self.collect_payload_blob_ref_tx(tx, result, reachable)
+                    .await?;
+            }
+            ChildWorkflowMapItemOutcome::Failed { failure } => {
+                self.collect_failure_payload_blobs_tx(tx, failure, reachable)
+                    .await?;
+            }
+            ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+        }
+        Ok(())
+    }
+
     async fn normalize_payload_for_storage_tx(
         &self,
         tx: &Transaction<'_>,
@@ -4404,7 +4648,7 @@ impl PostgresBackend {
             payload @ PayloadRef::Inline { .. } => Ok(payload),
             payload @ PayloadRef::Blob { .. } => {
                 if !is_opaque_external_payload_ref(&payload) {
-                    self.load_payload_blob_tx(tx, &payload).await?;
+                    self.load_payload_blob_tx(tx, &payload, true).await?;
                 }
                 Ok(payload)
             }
@@ -4428,7 +4672,7 @@ impl PostgresBackend {
                 else {
                     unreachable!();
                 };
-                let blob = self.load_payload_blob(&payload).await?;
+                let blob = self.load_payload_blob(&payload, false).await?;
                 Ok(PayloadRef::Inline {
                     codec: *codec,
                     schema_fingerprint: schema_fingerprint.clone(),
@@ -4461,7 +4705,7 @@ impl PostgresBackend {
                 else {
                     unreachable!();
                 };
-                let blob = self.load_payload_blob_tx(tx, &payload).await?;
+                let blob = self.load_payload_blob_tx(tx, &payload, false).await?;
                 Ok(PayloadRef::Inline {
                     codec: *codec,
                     schema_fingerprint: schema_fingerprint.clone(),
@@ -4527,6 +4771,58 @@ impl PostgresBackend {
         self.normalize_payload_for_storage_tx(tx, root).await
     }
 
+    async fn normalize_child_workflow_map_result_manifest_for_storage_tx(
+        &self,
+        tx: &Transaction<'_>,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        if is_opaque_external_payload_ref(&payload) {
+            return Ok(payload);
+        }
+        let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
+        let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+        let mut pages = Vec::with_capacity(manifest.pages.len());
+        for page in manifest.pages {
+            let page = self.hydrate_payload_from_storage_tx(tx, page).await?;
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            let mut outcomes = Vec::with_capacity(page.outcomes.len());
+            for outcome in page.outcomes {
+                outcomes.push(
+                    self.normalize_child_workflow_map_outcome_for_storage_tx(tx, outcome)
+                        .await?,
+                );
+            }
+            page.outcomes = outcomes;
+            let page = crate::encode_payload_with_codec(&page, self.payload_config.codec)?;
+            pages.push(self.normalize_payload_for_storage_tx(tx, page).await?);
+        }
+        manifest.pages = pages;
+        let root = crate::encode_payload_with_codec(&manifest, self.payload_config.codec)?;
+        self.normalize_payload_for_storage_tx(tx, root).await
+    }
+
+    async fn normalize_child_workflow_map_outcome_for_storage_tx(
+        &self,
+        tx: &Transaction<'_>,
+        outcome: ChildWorkflowMapItemOutcome,
+    ) -> Result<ChildWorkflowMapItemOutcome> {
+        match outcome {
+            ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                    result: self.normalize_payload_for_storage_tx(tx, result).await?,
+                })
+            }
+            ChildWorkflowMapItemOutcome::Failed { failure } => {
+                Ok(ChildWorkflowMapItemOutcome::Failed {
+                    failure: self.normalize_failure_for_storage_tx(tx, failure).await?,
+                })
+            }
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+            }
+        }
+    }
+
     async fn hydrate_activity_map_input_manifest_from_storage(
         &self,
         payload: PayloadRef,
@@ -4577,6 +4873,57 @@ impl PostgresBackend {
         }
         manifest.pages = pages;
         crate::encode_payload_with_codec(&manifest, root_codec)
+    }
+
+    async fn hydrate_child_workflow_map_result_manifest_from_storage(
+        &self,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        if is_opaque_external_payload_ref(&payload) {
+            return Ok(payload);
+        }
+        let root = self.hydrate_payload_from_storage(payload).await?;
+        let root_codec = root.codec();
+        let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+        let mut pages = Vec::with_capacity(manifest.pages.len());
+        for page in manifest.pages {
+            let page = self.hydrate_payload_from_storage(page).await?;
+            let page_codec = page.codec();
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            let mut outcomes = Vec::with_capacity(page.outcomes.len());
+            for outcome in page.outcomes {
+                outcomes.push(
+                    self.hydrate_child_workflow_map_outcome_from_storage(outcome)
+                        .await?,
+                );
+            }
+            page.outcomes = outcomes;
+            pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
+        }
+        manifest.pages = pages;
+        crate::encode_payload_with_codec(&manifest, root_codec)
+    }
+
+    async fn hydrate_child_workflow_map_outcome_from_storage(
+        &self,
+        outcome: crate::ChildWorkflowMapItemOutcome,
+    ) -> Result<crate::ChildWorkflowMapItemOutcome> {
+        match outcome {
+            crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                Ok(crate::ChildWorkflowMapItemOutcome::Succeeded {
+                    result: self.hydrate_payload_from_storage(result).await?,
+                })
+            }
+            crate::ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+                if let Some(details) = failure.details.take() {
+                    failure.details = Some(self.hydrate_payload_from_storage(details).await?);
+                }
+                Ok(crate::ChildWorkflowMapItemOutcome::Failed { failure })
+            }
+            crate::ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Ok(crate::ChildWorkflowMapItemOutcome::Cancelled { reason })
+            }
+        }
     }
 
     async fn hydrate_activity_map_input_manifest_from_storage_tx(
@@ -4631,6 +4978,60 @@ impl PostgresBackend {
         }
         manifest.pages = pages;
         crate::encode_payload_with_codec(&manifest, root_codec)
+    }
+
+    async fn hydrate_child_workflow_map_result_manifest_from_storage_tx(
+        &self,
+        tx: &Transaction<'_>,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        if is_opaque_external_payload_ref(&payload) {
+            return Ok(payload);
+        }
+        let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
+        let root_codec = root.codec();
+        let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+        let mut pages = Vec::with_capacity(manifest.pages.len());
+        for page in manifest.pages {
+            let page = self.hydrate_payload_from_storage_tx(tx, page).await?;
+            let page_codec = page.codec();
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            let mut outcomes = Vec::with_capacity(page.outcomes.len());
+            for outcome in page.outcomes {
+                outcomes.push(
+                    self.hydrate_child_workflow_map_outcome_from_storage_tx(tx, outcome)
+                        .await?,
+                );
+            }
+            page.outcomes = outcomes;
+            pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
+        }
+        manifest.pages = pages;
+        crate::encode_payload_with_codec(&manifest, root_codec)
+    }
+
+    async fn hydrate_child_workflow_map_outcome_from_storage_tx(
+        &self,
+        tx: &Transaction<'_>,
+        outcome: crate::ChildWorkflowMapItemOutcome,
+    ) -> Result<crate::ChildWorkflowMapItemOutcome> {
+        match outcome {
+            crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                Ok(crate::ChildWorkflowMapItemOutcome::Succeeded {
+                    result: self.hydrate_payload_from_storage_tx(tx, result).await?,
+                })
+            }
+            crate::ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+                if let Some(details) = failure.details.take() {
+                    failure.details =
+                        Some(self.hydrate_payload_from_storage_tx(tx, details).await?);
+                }
+                Ok(crate::ChildWorkflowMapItemOutcome::Failed { failure })
+            }
+            crate::ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Ok(crate::ChildWorkflowMapItemOutcome::Cancelled { reason })
+            }
+        }
     }
 
     async fn normalize_history_event_for_storage_tx(
@@ -4689,6 +5090,30 @@ impl PostgresBackend {
                     .await?;
                 Ok(HistoryEventData::ActivityMapFailed(failed))
             }
+            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+                scheduled.input_manifest = self
+                    .normalize_activity_map_input_manifest_for_storage_tx(
+                        tx,
+                        scheduled.input_manifest,
+                    )
+                    .await?;
+                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+                completed.result_manifest = self
+                    .normalize_child_workflow_map_result_manifest_for_storage_tx(
+                        tx,
+                        completed.result_manifest,
+                    )
+                    .await?;
+                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
+            }
+            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
+                failed.failure = self
+                    .normalize_failure_for_storage_tx(tx, failed.failure)
+                    .await?;
+                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
+            }
             HistoryEventData::ActivityCompleted(mut completed) => {
                 completed.result = self
                     .normalize_payload_for_storage_tx(tx, completed.result)
@@ -4745,6 +5170,17 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         mut task: ActivityMapTask,
     ) -> Result<ActivityMapTask> {
+        task.input_manifest = self
+            .normalize_activity_map_input_manifest_for_storage_tx(tx, task.input_manifest)
+            .await?;
+        Ok(task)
+    }
+
+    async fn normalize_child_workflow_map_task_for_storage_tx(
+        &self,
+        tx: &Transaction<'_>,
+        mut task: ChildWorkflowMapTask,
+    ) -> Result<ChildWorkflowMapTask> {
         task.input_manifest = self
             .normalize_activity_map_input_manifest_for_storage_tx(tx, task.input_manifest)
             .await?;
@@ -4827,6 +5263,24 @@ impl PostgresBackend {
                 failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
                 Ok(HistoryEventData::ActivityMapFailed(failed))
             }
+            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+                scheduled.input_manifest = self
+                    .hydrate_activity_map_input_manifest_from_storage(scheduled.input_manifest)
+                    .await?;
+                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+                completed.result_manifest = self
+                    .hydrate_child_workflow_map_result_manifest_from_storage(
+                        completed.result_manifest,
+                    )
+                    .await?;
+                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
+            }
+            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
+                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
+                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
+            }
             HistoryEventData::ActivityCompleted(mut completed) => {
                 completed.result = self.hydrate_payload_from_storage(completed.result).await?;
                 Ok(HistoryEventData::ActivityCompleted(completed))
@@ -4869,6 +5323,7 @@ impl PostgresBackend {
         &self,
         tx: &Transaction<'_>,
         payload: &PayloadRef,
+        require_schema_fingerprint_match: bool,
     ) -> Result<PayloadBlob> {
         let PayloadRef::Blob {
             codec: ref_codec,
@@ -4911,10 +5366,15 @@ impl PostgresBackend {
             ref_encryption,
             digest,
             *size,
+            require_schema_fingerprint_match,
         )
     }
 
-    async fn load_payload_blob(&self, payload: &PayloadRef) -> Result<PayloadBlob> {
+    async fn load_payload_blob(
+        &self,
+        payload: &PayloadRef,
+        require_schema_fingerprint_match: bool,
+    ) -> Result<PayloadBlob> {
         let PayloadRef::Blob {
             codec: ref_codec,
             schema_fingerprint: ref_schema_fingerprint,
@@ -4957,6 +5417,7 @@ impl PostgresBackend {
             ref_encryption,
             digest,
             *size,
+            require_schema_fingerprint_match,
         )
     }
 
@@ -5142,16 +5603,27 @@ async fn cleanup_run_operational_state_tx(
     )
     .await
     .map_err(postgres_error)?;
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set completed = true, in_flight = 0
+             where run_id = $1"
+        ),
+        &[&run_id.0],
+    )
+    .await
+    .map_err(postgres_error)?;
     Ok(())
 }
 
 async fn handle_terminal_run_tx(
+    backend: &PostgresBackend,
     tx: &Transaction<'_>,
     schema: &str,
     run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) -> Result<()> {
-    notify_parent_of_child_terminal_tx(tx, schema, run_id, terminal_event).await?;
+    notify_parent_of_child_terminal_tx(backend, tx, schema, run_id, terminal_event).await?;
     cancel_children_for_parent_tx(tx, schema, run_id).await?;
     Ok(())
 }
@@ -5218,6 +5690,7 @@ async fn continue_run_as_new_tx(
 }
 
 async fn notify_parent_of_child_terminal_tx(
+    backend: &PostgresBackend,
     tx: &Transaction<'_>,
     schema: &str,
     child_run_id: &RunId,
@@ -5226,7 +5699,7 @@ async fn notify_parent_of_child_terminal_tx(
     let Some(row) = tx
         .query_opt(
             &format!(
-                "select parent_run_id, parent_command_seq
+                "select parent_run_id, parent_command_seq, parent_child_map_ordinal
                  from {schema}.workflow_instances
                  where run_id = $1"
             ),
@@ -5239,9 +5712,16 @@ async fn notify_parent_of_child_terminal_tx(
     };
     let parent_run_id: Option<String> = row.get(0);
     let parent_command_seq: Option<i64> = row.get(1);
-    let Some((parent_run_id, parent_command_seq)) = parent_run_id
+    let parent_child_map_ordinal: Option<i64> = row.get(2);
+    let Some((parent_run_id, parent_command_seq, parent_child_map_ordinal)) = parent_run_id
         .zip(parent_command_seq)
-        .and_then(|(run_id, seq)| Some((RunId::new(run_id), CommandSeq(u64::try_from(seq).ok()?))))
+        .and_then(|(run_id, seq)| {
+            Some((
+                RunId::new(run_id),
+                CommandSeq(u64::try_from(seq).ok()?),
+                parent_child_map_ordinal.and_then(|ordinal| u64::try_from(ordinal).ok()),
+            ))
+        })
     else {
         return Ok(());
     };
@@ -5249,6 +5729,35 @@ async fn notify_parent_of_child_terminal_tx(
         run_id: parent_run_id.clone(),
         seq: parent_command_seq,
     };
+    if let Some(item_ordinal) = parent_child_map_ordinal {
+        let outcome = match terminal_event {
+            HistoryEventData::WorkflowCompleted { result } => {
+                ChildWorkflowMapItemOutcome::Succeeded {
+                    result: result.clone(),
+                }
+            }
+            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
+                failure: failure.clone(),
+            },
+            HistoryEventData::WorkflowCancelled { reason } => {
+                ChildWorkflowMapItemOutcome::Cancelled {
+                    reason: reason.clone(),
+                }
+            }
+            _ => return Ok(()),
+        };
+        return complete_child_workflow_map_item_tx(
+            backend,
+            tx,
+            schema,
+            ChildWorkflowMapItem {
+                map_command_id: command_id,
+                item_ordinal,
+            },
+            outcome,
+        )
+        .await;
+    }
     if child_terminal_event_exists_tx(tx, schema, &command_id).await? {
         return Ok(());
     }
@@ -5439,6 +5948,16 @@ async fn cancel_command_operational_state_tx(
     )
     .await
     .map_err(postgres_error)?;
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set completed = true, in_flight = 0
+             where map_command_id = $1"
+        ),
+        &[&map_command_key(command_id)],
+    )
+    .await
+    .map_err(postgres_error)?;
     Ok(())
 }
 
@@ -5616,6 +6135,7 @@ async fn insert_history_event_rows(
 
 fn postgres_simple_batch_commit_eligible(commit: &WorkflowTaskCommit) -> bool {
     commit.schedule_activity_maps.is_empty()
+        && commit.schedule_child_workflow_maps.is_empty()
         && commit.start_child_workflows.is_empty()
         && commit.cancel_commands.is_empty()
         && commit
@@ -5855,14 +6375,18 @@ async fn start_child_workflow_inline_tx(
     message: &ChildStartOutboxMessage,
 ) -> Result<InlineChildStartOutcome> {
     let run_id = next_run_id(tx, schema).await?;
+    let parent_child_map_ordinal = message
+        .child_map_item
+        .as_ref()
+        .map(|item| i64::try_from(item.item_ordinal).unwrap_or(i64::MAX));
     let inserted = tx
         .query_opt(
             &format!(
                 "insert into {schema}.workflow_instances
                  (namespace, workflow_id, run_id, shard_id, workflow_name, workflow_version, task_queue,
                   current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal,
-                  parent_run_id, parent_command_seq, parent_close_policy)
-                 values ($1, $2, $3, $4, $5, $6, $7, 1, $8, 0, null, false, $9, $10, $11)
+                  parent_run_id, parent_command_seq, parent_close_policy, parent_child_map_ordinal)
+                 values ($1, $2, $3, $4, $5, $6, $7, 1, $8, 0, null, false, $9, $10, $11, $12)
                  on conflict(namespace, workflow_id) do nothing
                  returning run_id"
             ),
@@ -5878,6 +6402,7 @@ async fn start_child_workflow_inline_tx(
                 &message.command_id.run_id.0,
                 &i64::try_from(message.command_id.seq.0).unwrap_or(i64::MAX),
                 &parent_close_policy_to_str(message.parent_close_policy),
+                &parent_child_map_ordinal,
             ],
         )
         .await
@@ -5901,7 +6426,7 @@ async fn start_child_workflow_inline_tx(
     let Some(row) = tx
         .query_opt(
             &format!(
-                "select run_id, parent_run_id, parent_command_seq
+                "select run_id, parent_run_id, parent_command_seq, parent_child_map_ordinal
                  from {schema}.workflow_instances
                  where namespace = $1 and workflow_id = $2
                  for update"
@@ -5916,9 +6441,15 @@ async fn start_child_workflow_inline_tx(
     let existing_run_id = RunId::new(row.get::<_, String>(0));
     let parent_run_id: Option<String> = row.get(1);
     let parent_command_seq: Option<i64> = row.get(2);
+    let parent_map_ordinal: Option<i64> = row.get(3);
+    let expected_map_ordinal = message
+        .child_map_item
+        .as_ref()
+        .map(|item| i64::try_from(item.item_ordinal).unwrap_or(i64::MAX));
     let same_child = parent_run_id.as_deref() == Some(message.command_id.run_id.0.as_str())
         && parent_command_seq.and_then(|seq| u64::try_from(seq).ok())
-            == Some(message.command_id.seq.0);
+            == Some(message.command_id.seq.0)
+        && parent_map_ordinal == expected_map_ordinal;
     if same_child {
         return Ok(InlineChildStartOutcome::Started(existing_run_id));
     }
@@ -6114,6 +6645,560 @@ async fn materialize_activity_map_items_tx(
     .await
     .map_err(postgres_error)?;
     Ok(())
+}
+
+async fn insert_child_workflow_map_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    namespace: &str,
+    map_task: &ChildWorkflowMapTask,
+) -> Result<()> {
+    let manifest_payload = backend
+        .hydrate_activity_map_input_manifest_from_storage_tx(tx, map_task.input_manifest.clone())
+        .await?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    let task_blob =
+        rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
+    tx.execute(
+        &format!(
+            "insert into {schema}.child_workflow_maps
+             (map_command_id, namespace, run_id, command_seq, task, item_count,
+              next_ordinal, in_flight, completed)
+             values ($1, $2, $3, $4, $5, $6, 0, 0, false)
+             on conflict(map_command_id) do nothing"
+        ),
+        &[
+            &map_command_key(&map_task.map_command_id),
+            &namespace,
+            &map_task.map_command_id.run_id.0,
+            &i64::try_from(map_task.map_command_id.seq.0).unwrap_or(i64::MAX),
+            &task_blob,
+            &i64::try_from(manifest.item_count).unwrap_or(i64::MAX),
+        ],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn materialize_child_workflow_map_items_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    namespace: &str,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    let key = map_command_key(map_command_id);
+    let Some(row) = tx
+        .query_opt(
+            &format!(
+                "select namespace, task, item_count, next_ordinal, in_flight, completed
+                 from {schema}.child_workflow_maps
+                 where map_command_id = $1
+                 for update"
+            ),
+            &[&key],
+        )
+        .await
+        .map_err(postgres_error)?
+    else {
+        return Ok(());
+    };
+    let stored_namespace: String = row.get(0);
+    let task_blob: Vec<u8> = row.get(1);
+    let item_count = u64::try_from(row.get::<_, i64>(2)).unwrap_or(u64::MAX);
+    let mut next_ordinal = u64::try_from(row.get::<_, i64>(3)).unwrap_or(u64::MAX);
+    let mut in_flight = u64::try_from(row.get::<_, i64>(4)).unwrap_or(u64::MAX);
+    let completed: bool = row.get(5);
+    if completed {
+        return Ok(());
+    }
+
+    let task: ChildWorkflowMapTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
+    let manifest_payload = backend
+        .hydrate_activity_map_input_manifest_from_storage_tx(tx, task.input_manifest.clone())
+        .await?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    let namespace = if stored_namespace.is_empty() {
+        namespace
+    } else {
+        stored_namespace.as_str()
+    };
+
+    while in_flight < max_in_flight && next_ordinal < item_count {
+        let ordinal = next_ordinal;
+        let input = activity_map_input_at(&manifest, ordinal)?;
+        let child_map_item = ChildWorkflowMapItem {
+            map_command_id: map_command_id.clone(),
+            item_ordinal: ordinal,
+        };
+        let message = ChildStartOutboxMessage {
+            command_id: map_command_id.clone(),
+            workflow_type: task.workflow_type.clone(),
+            workflow_id: WorkflowId::new(format!("{}/{}", task.workflow_id_prefix, ordinal)),
+            task_queue: task.task_queue.clone(),
+            input,
+            parent_close_policy: task.parent_close_policy,
+            child_map_item: Some(child_map_item.clone()),
+        };
+        let message = backend
+            .normalize_child_start_message_for_storage_tx(tx, message)
+            .await?;
+        let child_shard_id = i32::try_from(
+            backend
+                .shard_for_workflow(&Namespace::new(namespace.to_owned()), &message.workflow_id)
+                .0,
+        )
+        .unwrap_or(i32::MAX);
+        let start =
+            start_child_workflow_inline_tx(tx, schema, namespace, child_shard_id, &message).await?;
+        next_ordinal = next_ordinal.saturating_add(1);
+        match start {
+            InlineChildStartOutcome::Started(_) => {
+                in_flight = in_flight.saturating_add(1);
+            }
+            InlineChildStartOutcome::Skipped => {}
+            InlineChildStartOutcome::Failed(failure) => {
+                tx.execute(
+                    &format!(
+                        "update {schema}.child_workflow_maps
+                         set next_ordinal = $1, in_flight = $2
+                         where map_command_id = $3"
+                    ),
+                    &[
+                        &i64::try_from(next_ordinal).unwrap_or(i64::MAX),
+                        &i64::try_from(in_flight).unwrap_or(i64::MAX),
+                        &key,
+                    ],
+                )
+                .await
+                .map_err(postgres_error)?;
+                Box::pin(complete_child_workflow_map_item_tx(
+                    backend,
+                    tx,
+                    schema,
+                    child_map_item,
+                    ChildWorkflowMapItemOutcome::Failed { failure },
+                ))
+                .await?;
+                return Ok(());
+            }
+        }
+    }
+
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set next_ordinal = $1, in_flight = $2
+             where map_command_id = $3"
+        ),
+        &[
+            &i64::try_from(next_ordinal).unwrap_or(i64::MAX),
+            &i64::try_from(in_flight).unwrap_or(i64::MAX),
+            &key,
+        ],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn complete_child_workflow_map_item_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    map_item: ChildWorkflowMapItem,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<()> {
+    let key = map_command_key(&map_item.map_command_id);
+    let Some(row) = tx
+        .query_opt(
+            &format!(
+                "select namespace, task, item_count, completed
+                 from {schema}.child_workflow_maps
+                 where map_command_id = $1
+                 for update"
+            ),
+            &[&key],
+        )
+        .await
+        .map_err(postgres_error)?
+    else {
+        return Err(Error::Backend(format!(
+            "child workflow map `{}`:{} not found",
+            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
+        )));
+    };
+    let namespace: String = row.get(0);
+    let task_blob: Vec<u8> = row.get(1);
+    let item_count = u64::try_from(row.get::<_, i64>(2)).unwrap_or(u64::MAX);
+    let completed: bool = row.get(3);
+    if completed {
+        return Ok(());
+    }
+    if map_item.item_ordinal >= item_count {
+        return Err(Error::Backend(format!(
+            "child workflow map item ordinal {} out of bounds",
+            map_item.item_ordinal
+        )));
+    }
+
+    let map_task: ChildWorkflowMapTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let outcome = backend
+        .normalize_child_workflow_map_outcome_for_storage_tx(tx, outcome)
+        .await?;
+    let outcome_blob =
+        rmp_serde::to_vec_named(&outcome).map_err(|err| Error::PayloadEncode(err.to_string()))?;
+    let inserted = tx
+        .query_opt(
+            &format!(
+                "insert into {schema}.child_workflow_map_results(map_command_id, item_ordinal, outcome)
+                 values ($1, $2, $3)
+                 on conflict(map_command_id, item_ordinal) do nothing
+                 returning item_ordinal"
+            ),
+            &[
+                &key,
+                &i64::try_from(map_item.item_ordinal).unwrap_or(i64::MAX),
+                &outcome_blob,
+            ],
+        )
+        .await
+        .map_err(postgres_error)?
+        .is_some();
+    if !inserted {
+        return Ok(());
+    }
+
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set in_flight = case when in_flight > 0 then in_flight - 1 else 0 end
+             where map_command_id = $1"
+        ),
+        &[&key],
+    )
+    .await
+    .map_err(postgres_error)?;
+
+    if map_task.failure_mode == ChildWorkflowMapFailureMode::FailFast {
+        let failure = match &outcome {
+            ChildWorkflowMapItemOutcome::Failed { failure } => Some(failure.clone()),
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Some(DurableFailure::non_retryable(
+                    "durust.child_workflow_cancelled",
+                    format!(
+                        "child workflow map item {} was cancelled: {reason}",
+                        map_item.item_ordinal
+                    ),
+                ))
+            }
+            ChildWorkflowMapItemOutcome::Succeeded { .. } => None,
+        };
+        if let Some(failure) = failure {
+            append_child_workflow_map_failed_tx(
+                backend,
+                tx,
+                schema,
+                &map_item.map_command_id,
+                failure,
+            )
+            .await?;
+            cancel_child_workflow_map_children_tx(tx, schema, &map_item.map_command_id).await?;
+            return Ok(());
+        }
+    }
+
+    let outcome_count = tx
+        .query_one(
+            &format!(
+                "select count(*)
+                 from {schema}.child_workflow_map_results
+                 where map_command_id = $1"
+            ),
+            &[&key],
+        )
+        .await
+        .map_err(postgres_error)?
+        .get::<_, i64>(0);
+    let outcome_count = u64::try_from(outcome_count).unwrap_or(u64::MAX);
+    if outcome_count < item_count {
+        Box::pin(materialize_child_workflow_map_items_tx(
+            backend,
+            tx,
+            schema,
+            &namespace,
+            &map_item.map_command_id,
+        ))
+        .await?;
+        return Ok(());
+    }
+
+    let outcomes = child_workflow_map_outcomes_tx(tx, schema, &key).await?;
+    append_child_workflow_map_completed_tx(backend, tx, schema, &map_task, item_count, outcomes)
+        .await
+}
+
+async fn append_child_workflow_map_completed_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    map_task: &ChildWorkflowMapTask,
+    item_count: u64,
+    outcomes: Vec<ChildWorkflowMapItemOutcome>,
+) -> Result<()> {
+    let input_manifest_payload = backend
+        .hydrate_activity_map_input_manifest_from_storage_tx(tx, map_task.input_manifest.clone())
+        .await?;
+    let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
+    let result_manifest = encode_child_workflow_map_result_manifest_with_codec(
+        map_task.result_manifest_name.clone(),
+        outcomes.clone(),
+        &input_manifest.page_lengths,
+        backend.payload_config.codec,
+    )?;
+    let result_manifest = backend
+        .normalize_child_workflow_map_result_manifest_for_storage_tx(tx, result_manifest)
+        .await?;
+    let Some(row) = tx
+        .query_opt(
+            &format!(
+                "select current_event_id, terminal
+                 from {schema}.workflow_instances
+                 where run_id = $1
+                 for update"
+            ),
+            &[&map_task.map_command_id.run_id.0],
+        )
+        .await
+        .map_err(postgres_error)?
+    else {
+        return Err(Error::RunNotFound(map_task.map_command_id.run_id.clone()));
+    };
+    let tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
+    let terminal: bool = row.get(1);
+    if terminal {
+        return Ok(());
+    }
+    let event_id = tail.next();
+    let success_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. }))
+        .count();
+    let failure_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Failed { .. }))
+        .count();
+    let cancellation_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Cancelled { .. }))
+        .count();
+    insert_history_event(
+        tx,
+        schema,
+        &map_task.map_command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
+            command_id: map_task.map_command_id.clone(),
+            result_manifest,
+            item_count: usize::try_from(item_count).unwrap_or(usize::MAX),
+            success_count,
+            failure_count,
+            cancellation_count,
+        }),
+    )
+    .await?;
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set completed = true, in_flight = 0
+             where map_command_id = $1"
+        ),
+        &[&map_command_key(&map_task.map_command_id)],
+    )
+    .await
+    .map_err(postgres_error)?;
+    set_workflow_ready_tx(
+        tx,
+        schema,
+        &map_task.map_command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowMapCompleted,
+    )
+    .await
+}
+
+async fn append_child_workflow_map_failed_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    map_command_id: &CommandId,
+    failure: DurableFailure,
+) -> Result<()> {
+    let Some(row) = tx
+        .query_opt(
+            &format!(
+                "select current_event_id, terminal
+                 from {schema}.workflow_instances
+                 where run_id = $1
+                 for update"
+            ),
+            &[&map_command_id.run_id.0],
+        )
+        .await
+        .map_err(postgres_error)?
+    else {
+        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    };
+    let tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
+    let terminal: bool = row.get(1);
+    if terminal {
+        return Ok(());
+    }
+    let event_id = tail.next();
+    let failure = backend
+        .normalize_failure_for_storage_tx(tx, failure)
+        .await?;
+    insert_history_event(
+        tx,
+        schema,
+        &map_command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
+            command_id: map_command_id.clone(),
+            failure,
+        }),
+    )
+    .await?;
+    tx.execute(
+        &format!(
+            "update {schema}.child_workflow_maps
+             set completed = true, in_flight = 0
+             where map_command_id = $1"
+        ),
+        &[&map_command_key(map_command_id)],
+    )
+    .await
+    .map_err(postgres_error)?;
+    set_workflow_ready_tx(
+        tx,
+        schema,
+        &map_command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowMapFailed,
+    )
+    .await
+}
+
+async fn cancel_child_workflow_map_children_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    let rows = tx
+        .query(
+            &format!(
+                "select run_id, current_event_id
+                 from {schema}.workflow_instances
+                 where parent_run_id = $1
+                   and parent_command_seq = $2
+                   and parent_child_map_ordinal is not null
+                   and terminal = false
+                   and not exists (
+                     select 1
+                     from {schema}.history_events h
+                     where h.run_id = workflow_instances.run_id
+                       and h.event_type = any($3::text[])
+                   )
+                 order by run_id asc
+                 for update"
+            ),
+            &[
+                &map_command_id.run_id.0,
+                &i64::try_from(map_command_id.seq.0).unwrap_or(i64::MAX),
+                &vec![
+                    event_type_to_str(&HistoryEventType::WorkflowCompleted),
+                    event_type_to_str(&HistoryEventType::WorkflowFailed),
+                    event_type_to_str(&HistoryEventType::WorkflowCancelled),
+                    event_type_to_str(&HistoryEventType::WorkflowContinuedAsNew),
+                ],
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let children = rows
+        .into_iter()
+        .map(|row| {
+            (
+                RunId::new(row.get::<_, String>(0)),
+                EventId(u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX)),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (child_run_id, tail) in children {
+        let event_id = tail.next();
+        insert_history_event(
+            tx,
+            schema,
+            &child_run_id,
+            event_id,
+            HistoryEventData::WorkflowCancelled {
+                reason: format!(
+                    "child workflow map `{}`:{} failed",
+                    map_command_id.run_id, map_command_id.seq.0
+                ),
+            },
+        )
+        .await?;
+        cleanup_run_operational_state_tx(tx, schema, &child_run_id).await?;
+        tx.execute(
+            &format!(
+                "update {schema}.workflow_instances
+                 set current_event_id = $1,
+                     workflow_claim_token = null,
+                     terminal = true,
+                     ready_reason = null,
+                     ready_at_ms = 0
+                 where run_id = $2"
+            ),
+            &[
+                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
+                &child_run_id.0,
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    }
+    Ok(())
+}
+
+async fn child_workflow_map_outcomes_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    map_command_key: &str,
+) -> Result<Vec<ChildWorkflowMapItemOutcome>> {
+    let rows = tx
+        .query(
+            &format!(
+                "select outcome
+                 from {schema}.child_workflow_map_results
+                 where map_command_id = $1
+                 order by item_ordinal asc"
+            ),
+            &[&map_command_key],
+        )
+        .await
+        .map_err(postgres_error)?;
+    rows.into_iter()
+        .map(|row| {
+            let blob: Vec<u8> = row.get(0);
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
+        })
+        .collect()
 }
 
 async fn complete_map_item_tx(
@@ -6888,11 +7973,12 @@ fn decode_payload_blob_row(
     stored_size: i64,
     bytes: Vec<u8>,
     ref_codec: crate::CodecId,
-    ref_schema_fingerprint: &crate::SchemaFingerprint,
+    _ref_schema_fingerprint: &crate::SchemaFingerprint,
     ref_compression: crate::CompressionId,
     ref_encryption: &Option<crate::EncryptionMetadata>,
     digest: &str,
     size: u64,
+    require_schema_fingerprint_match: bool,
 ) -> Result<PayloadBlob> {
     let actual_digest = digest_bytes(&bytes);
     if actual_digest != digest {
@@ -6914,7 +8000,7 @@ fn decode_payload_blob_row(
         bytes,
     };
     if blob.codec != ref_codec
-        || blob.schema_fingerprint != *ref_schema_fingerprint
+        || (require_schema_fingerprint_match && blob.schema_fingerprint != *_ref_schema_fingerprint)
         || blob.compression != ref_compression
         || blob.encryption != *ref_encryption
     {
@@ -6989,6 +8075,8 @@ fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
         WorkflowTaskReason::ChildWorkflowCompleted => "child_workflow_completed",
         WorkflowTaskReason::ChildWorkflowFailed => "child_workflow_failed",
         WorkflowTaskReason::ChildWorkflowCancelled => "child_workflow_cancelled",
+        WorkflowTaskReason::ChildWorkflowMapCompleted => "child_workflow_map_completed",
+        WorkflowTaskReason::ChildWorkflowMapFailed => "child_workflow_map_failed",
         WorkflowTaskReason::TimerFired => "timer_fired",
         WorkflowTaskReason::SignalReceived => "signal_received",
         WorkflowTaskReason::CacheEvicted => "cache_evicted",
@@ -7007,6 +8095,8 @@ fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
         "child_workflow_completed" => Ok(WorkflowTaskReason::ChildWorkflowCompleted),
         "child_workflow_failed" => Ok(WorkflowTaskReason::ChildWorkflowFailed),
         "child_workflow_cancelled" => Ok(WorkflowTaskReason::ChildWorkflowCancelled),
+        "child_workflow_map_completed" => Ok(WorkflowTaskReason::ChildWorkflowMapCompleted),
+        "child_workflow_map_failed" => Ok(WorkflowTaskReason::ChildWorkflowMapFailed),
         "timer_fired" => Ok(WorkflowTaskReason::TimerFired),
         "signal_received" => Ok(WorkflowTaskReason::SignalReceived),
         "cache_evicted" => Ok(WorkflowTaskReason::CacheEvicted),
@@ -7044,6 +8134,21 @@ fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKind> {
     }
 }
 
+fn collect_child_workflow_map_outcome_payload_roots(
+    outcome: &ChildWorkflowMapItemOutcome,
+    roots: &mut Vec<PayloadRootRef>,
+) {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            collect_failure_payload_roots(failure, roots);
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+    }
+}
+
 fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
     match event_type {
         HistoryEventType::WorkflowStarted => "workflow_started",
@@ -7064,6 +8169,9 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::ChildWorkflowCompleted => "child_workflow_completed",
         HistoryEventType::ChildWorkflowFailed => "child_workflow_failed",
         HistoryEventType::ChildWorkflowCancelled => "child_workflow_cancelled",
+        HistoryEventType::ChildWorkflowMapScheduled => "child_workflow_map_scheduled",
+        HistoryEventType::ChildWorkflowMapCompleted => "child_workflow_map_completed",
+        HistoryEventType::ChildWorkflowMapFailed => "child_workflow_map_failed",
         HistoryEventType::TimerStarted => "timer_started",
         HistoryEventType::TimerFired => "timer_fired",
         HistoryEventType::SignalConsumed => "signal_consumed",
@@ -7094,6 +8202,9 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "child_workflow_completed" => Ok(HistoryEventType::ChildWorkflowCompleted),
         "child_workflow_failed" => Ok(HistoryEventType::ChildWorkflowFailed),
         "child_workflow_cancelled" => Ok(HistoryEventType::ChildWorkflowCancelled),
+        "child_workflow_map_scheduled" => Ok(HistoryEventType::ChildWorkflowMapScheduled),
+        "child_workflow_map_completed" => Ok(HistoryEventType::ChildWorkflowMapCompleted),
+        "child_workflow_map_failed" => Ok(HistoryEventType::ChildWorkflowMapFailed),
         "timer_started" => Ok(HistoryEventType::TimerStarted),
         "timer_fired" => Ok(HistoryEventType::TimerFired),
         "signal_consumed" => Ok(HistoryEventType::SignalConsumed),

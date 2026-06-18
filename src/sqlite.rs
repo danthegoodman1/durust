@@ -2,20 +2,22 @@ use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
     ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
     ActivityTaskClaim, BlobStoreConfig, CancelWorkflowOutcome, CancelWorkflowRequest,
-    ChildStartOutboxMessage, ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask,
-    ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome, CompleteActivityOutcome,
-    CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
-    DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
-    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
-    HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob, PayloadRef, PayloadRootRef,
-    PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId,
-    SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
-    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
-    WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
-    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
-    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, WorkflowType,
-    activity_map_input_at, digest_bytes, encode_activity_map_result_manifest_with_codec,
-    event_payload_len, is_terminal,
+    ChildStartOutboxMessage, ChildWorkflowMapFailureMode, ChildWorkflowMapItem,
+    ChildWorkflowMapItemOutcome, ChildWorkflowMapTask, ClaimActivityOptions,
+    ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq,
+    CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
+    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
+    EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
+    HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob,
+    PayloadRef, PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest,
+    Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
+    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
+    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
+    WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
+    encode_activity_map_result_manifest_with_codec,
+    encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -209,7 +211,7 @@ impl DurableBackend for SqliteBackend {
                 params![event_id.0, run_id.0],
             )
             .map_err(sqlite_error)?;
-            handle_terminal_run(&tx, &run_id, &terminal_event)?;
+            handle_terminal_run(&tx, &self.payload_config, &run_id, &terminal_event)?;
             tx.commit().map_err(sqlite_error)?;
             Ok(CancelWorkflowOutcome::Cancelled { run_id, event_id })
         })();
@@ -486,6 +488,21 @@ impl DurableBackend for SqliteBackend {
         Box::pin(ready(result))
     }
 
+    fn hydrate_child_workflow_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let result = (|| {
+            let conn = self.connection()?;
+            hydrate_child_workflow_map_result_manifest_from_storage(
+                &conn,
+                &self.payload_config,
+                payload,
+            )
+        })();
+        Box::pin(ready(result))
+    }
+
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
@@ -533,7 +550,10 @@ impl DurableBackend for SqliteBackend {
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(CommitOutcome::Conflict);
             }
-            if terminal && !batch.append_events.is_empty() {
+            if terminal
+                && (!batch.append_events.is_empty()
+                    || !batch.schedule_child_workflow_maps.is_empty())
+            {
                 return Err(Error::TerminalWorkflow);
             }
 
@@ -546,6 +566,11 @@ impl DurableBackend for SqliteBackend {
                 .schedule_activity_maps
                 .into_iter()
                 .map(|task| normalize_activity_map_task_for_storage(&tx, &config, task))
+                .collect::<Result<Vec<_>>>()?;
+            let schedule_child_workflow_maps = batch
+                .schedule_child_workflow_maps
+                .into_iter()
+                .map(|task| normalize_child_workflow_map_task_for_storage(&tx, &config, task))
                 .collect::<Result<Vec<_>>>()?;
             let start_child_workflows = batch
                 .start_child_workflows
@@ -592,6 +617,10 @@ impl DurableBackend for SqliteBackend {
             for map_task in schedule_activity_maps {
                 insert_activity_map(&tx, &config, namespace.as_str(), &map_task)?;
                 materialize_activity_map_items(&tx, &config, &map_task.map_command_id)?;
+            }
+            for map_task in schedule_child_workflow_maps {
+                insert_child_workflow_map(&tx, &config, namespace.as_str(), &map_task)?;
+                materialize_child_workflow_map_items(&tx, &config, &map_task.map_command_id)?;
             }
             for message in start_child_workflows {
                 insert_child_outbox(&tx, namespace.as_str(), &message)?;
@@ -669,7 +698,7 @@ impl DurableBackend for SqliteBackend {
                     });
                 }
                 if let Some(event) = terminal_event {
-                    handle_terminal_run(&tx, &claim.run_id, &event)?;
+                    handle_terminal_run(&tx, &config, &claim.run_id, &event)?;
                 }
             }
             let ready_reason = if !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)? {
@@ -1430,7 +1459,7 @@ impl DurableBackend for SqliteBackend {
             };
             let mut dispatched = 0usize;
             for outbox_id in outbox_ids {
-                dispatch_child_start(&tx, &outbox_id)?;
+                dispatch_child_start(&tx, &self.payload_config, &outbox_id)?;
                 dispatched += 1;
             }
             tx.commit().map_err(sqlite_error)?;
@@ -1657,6 +1686,7 @@ fn collect_reachable_payload_blobs(
     collect_history_payload_blobs(conn, config, reachable)?;
     collect_activity_payload_blobs(conn, config, reachable)?;
     collect_activity_map_payload_blobs(conn, config, reachable)?;
+    collect_child_workflow_map_payload_blobs(conn, config, reachable)?;
     collect_child_outbox_payload_blobs(conn, config, reachable)?;
     collect_signal_payload_blobs(conn, config, reachable)?;
     collect_query_projection_payload_blobs(conn, config, reachable)?;
@@ -1671,6 +1701,7 @@ fn collect_payload_roots(
     collect_history_payload_roots(conn, config, &mut roots)?;
     collect_activity_payload_roots(conn, &mut roots)?;
     collect_activity_map_payload_roots(conn, config, &mut roots)?;
+    collect_child_workflow_map_payload_roots(conn, config, &mut roots)?;
     collect_child_outbox_payload_roots(conn, &mut roots)?;
     collect_signal_payload_roots(conn, &mut roots)?;
     collect_query_projection_payload_roots(conn, &mut roots)?;
@@ -1752,6 +1783,60 @@ fn collect_activity_map_payload_roots(
         roots.push(PayloadRootRef::Payload(result));
     }
     Ok(())
+}
+
+fn collect_child_workflow_map_payload_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    roots: &mut Vec<PayloadRootRef>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from child_workflow_maps order by map_command_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ChildWorkflowMapTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        roots.push(PayloadRootRef::ActivityMapInputManifest(
+            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+        ));
+    }
+    drop(stmt);
+
+    let mut stmt = conn
+        .prepare(
+            "select outcome from child_workflow_map_results
+             order by map_command_id asc, item_ordinal asc",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let outcome: ChildWorkflowMapItemOutcome =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_child_workflow_map_outcome_payload_roots(&outcome, roots);
+    }
+    Ok(())
+}
+
+fn collect_child_workflow_map_outcome_payload_roots(
+    outcome: &ChildWorkflowMapItemOutcome,
+    roots: &mut Vec<PayloadRootRef>,
+) {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            collect_failure_payload_roots(failure, roots);
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+    }
 }
 
 fn collect_child_outbox_payload_roots(
@@ -1841,6 +1926,19 @@ fn collect_history_event_payload_roots(
         HistoryEventData::ActivityMapFailed(failed) => {
             collect_failure_payload_roots(&failed.failure, roots);
         }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+            roots.push(PayloadRootRef::ActivityMapInputManifest(
+                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
+            ));
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+            roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
+                child_workflow_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
+            ));
+        }
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
         HistoryEventData::ActivityCompleted(completed) => {
             roots.push(PayloadRootRef::Payload(completed.result.clone()));
         }
@@ -1902,6 +2000,17 @@ fn activity_map_result_root_for_roots(
         return Ok(payload.clone());
     }
     hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
+}
+
+fn child_workflow_map_result_root_for_roots(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_child_workflow_map_result_manifest_from_storage(conn, config, payload.clone())
 }
 
 fn collect_history_payload_blobs(
@@ -1976,6 +2085,61 @@ fn collect_activity_map_payload_blobs(
         let result: PayloadRef =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
         collect_payload_blob_ref(conn, config, &result, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_child_workflow_map_payload_blobs(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare("select task from child_workflow_maps order by map_command_id asc")
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let task: ChildWorkflowMapTask =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
+    }
+    drop(stmt);
+
+    let mut stmt = conn
+        .prepare(
+            "select outcome from child_workflow_map_results
+             order by map_command_id asc, item_ordinal asc",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    for row in rows {
+        let blob = row.map_err(sqlite_error)?;
+        let outcome: ChildWorkflowMapItemOutcome =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        collect_child_workflow_map_outcome_payload_blobs(conn, config, &outcome, reachable)?;
+    }
+    Ok(())
+}
+
+fn collect_child_workflow_map_outcome_payload_blobs(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    outcome: &ChildWorkflowMapItemOutcome,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            collect_payload_blob_ref(conn, config, result, reachable)?;
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            collect_failure_payload_blobs(conn, config, failure, reachable)?;
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
     }
     Ok(())
 }
@@ -2082,6 +2246,25 @@ fn collect_history_event_payload_blobs(
         HistoryEventData::ActivityMapFailed(failed) => {
             collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
         }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+            collect_activity_map_input_manifest_ref(
+                conn,
+                config,
+                &scheduled.input_manifest,
+                reachable,
+            )
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+            collect_child_workflow_map_result_manifest_ref(
+                conn,
+                config,
+                &completed.result_manifest,
+                reachable,
+            )
+        }
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
+            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
+        }
         HistoryEventData::ActivityCompleted(completed) => {
             collect_payload_blob_ref(conn, config, &completed.result, reachable)
         }
@@ -2134,9 +2317,9 @@ fn collect_payload_blob_ref(
 ) -> Result<()> {
     if let PayloadRef::Blob { digest, uri, .. } = payload {
         if is_sqlite_payload_uri(uri) {
-            load_payload_blob(conn, config, payload)?;
+            load_payload_blob(conn, config, payload, false)?;
         } else if !is_opaque_external_payload_uri(uri) {
-            load_payload_blob(conn, config, payload)?;
+            load_payload_blob(conn, config, payload, false)?;
         }
         reachable.insert(digest.clone());
     }
@@ -2195,6 +2378,40 @@ fn collect_activity_map_result_manifest_ref(
     Ok(())
 }
 
+fn collect_child_workflow_map_result_manifest_ref(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(conn, config, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
+    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
+    let manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&manifest_payload)?;
+    for page in &manifest.pages {
+        collect_payload_blob_ref(conn, config, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
+        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
+        let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
+        for outcome in &page.outcomes {
+            match outcome {
+                crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                    collect_payload_blob_ref(conn, config, result, reachable)?;
+                }
+                crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
+                    collect_failure_payload_blobs(conn, config, failure, reachable)?;
+                }
+                crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_history_event_for_storage(
     conn: &Connection,
     config: &PayloadStorageConfig,
@@ -2220,6 +2437,27 @@ fn normalize_history_event_for_storage(
                 )?;
             }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
+                    conn,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest =
+                    normalize_child_workflow_map_result_manifest_for_storage(
+                        conn,
+                        config,
+                        completed.result_manifest,
+                    )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
             normalize_payload_for_storage(conn, config, payload)
@@ -2252,6 +2490,27 @@ fn hydrate_history_event_from_storage(
                 )?;
             }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
+                    conn,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest =
+                    hydrate_child_workflow_map_result_manifest_from_storage(
+                        conn,
+                        config,
+                        completed.result_manifest,
+                    )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
             hydrate_payload_from_storage(conn, config, payload)
@@ -2295,6 +2554,16 @@ fn normalize_activity_map_task_for_storage(
     config: &PayloadStorageConfig,
     mut task: ActivityMapTask,
 ) -> Result<ActivityMapTask> {
+    task.input_manifest =
+        normalize_activity_map_input_manifest_for_storage(conn, config, task.input_manifest)?;
+    Ok(task)
+}
+
+fn normalize_child_workflow_map_task_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    mut task: ChildWorkflowMapTask,
+) -> Result<ChildWorkflowMapTask> {
     task.input_manifest =
         normalize_activity_map_input_manifest_for_storage(conn, config, task.input_manifest)?;
     Ok(task)
@@ -2384,6 +2653,62 @@ fn normalize_activity_map_result_manifest_for_storage(
     )
 }
 
+fn normalize_child_workflow_map_result_manifest_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(conn, config, payload)?;
+    let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(conn, config, page)?;
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            page.outcomes = page
+                .outcomes
+                .into_iter()
+                .map(|outcome| {
+                    normalize_child_workflow_map_outcome_for_storage(conn, config, outcome)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            normalize_payload_for_storage(
+                conn,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_payload_for_storage(
+        conn,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
+}
+
+fn normalize_child_workflow_map_outcome_for_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    outcome: crate::ChildWorkflowMapItemOutcome,
+) -> Result<crate::ChildWorkflowMapItemOutcome> {
+    match outcome {
+        crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(crate::ChildWorkflowMapItemOutcome::Succeeded {
+                result: normalize_payload_for_storage(conn, config, result)?,
+            })
+        }
+        crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
+            Ok(crate::ChildWorkflowMapItemOutcome::Failed {
+                failure: normalize_failure_for_storage(conn, config, failure)?,
+            })
+        }
+        crate::ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(crate::ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
+}
+
 fn hydrate_activity_map_input_manifest_from_storage(
     conn: &Connection,
     config: &PayloadStorageConfig,
@@ -2414,6 +2739,57 @@ fn hydrate_activity_map_result_manifest_from_storage(
         &mut hydrate_leaf,
         &mut finish_container,
     )
+}
+
+fn hydrate_child_workflow_map_result_manifest_from_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(conn, config, payload)?;
+    let root_codec = root.codec();
+    let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(conn, config, page)?;
+            let page_codec = page.codec();
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            page.outcomes = page
+                .outcomes
+                .into_iter()
+                .map(|outcome| {
+                    hydrate_child_workflow_map_outcome_from_storage(conn, config, outcome)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            crate::encode_payload_with_codec(&page, page_codec)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::encode_payload_with_codec(&manifest, root_codec)
+}
+
+fn hydrate_child_workflow_map_outcome_from_storage(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    outcome: crate::ChildWorkflowMapItemOutcome,
+) -> Result<crate::ChildWorkflowMapItemOutcome> {
+    match outcome {
+        crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(crate::ChildWorkflowMapItemOutcome::Succeeded {
+                result: hydrate_payload_from_storage(conn, config, result)?,
+            })
+        }
+        crate::ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+            if let Some(details) = failure.details.take() {
+                failure.details = Some(hydrate_payload_from_storage(conn, config, details)?);
+            }
+            Ok(crate::ChildWorkflowMapItemOutcome::Failed { failure })
+        }
+        crate::ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(crate::ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
 }
 
 fn normalize_payload_for_storage(
@@ -2466,7 +2842,7 @@ fn normalize_payload_for_storage(
         payload @ PayloadRef::Blob { .. } => {
             if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
             {
-                load_payload_blob(conn, config, &payload)?;
+                load_payload_blob(conn, config, &payload, true)?;
             }
             Ok(payload)
         }
@@ -2495,7 +2871,7 @@ fn hydrate_payload_from_storage(
             else {
                 unreachable!();
             };
-            let blob = load_payload_blob(conn, config, &payload)?;
+            let blob = load_payload_blob(conn, config, &payload, false)?;
             Ok(PayloadRef::Inline {
                 codec: *codec,
                 schema_fingerprint: schema_fingerprint.clone(),
@@ -2511,6 +2887,7 @@ fn load_payload_blob(
     conn: &Connection,
     config: &PayloadStorageConfig,
     payload: &PayloadRef,
+    require_schema_fingerprint_match: bool,
 ) -> Result<PayloadBlob> {
     let PayloadRef::Blob {
         codec: ref_codec,
@@ -2583,7 +2960,7 @@ fn load_payload_blob(
         bytes,
     };
     if blob.codec != *ref_codec
-        || blob.schema_fingerprint != *ref_schema_fingerprint
+        || (require_schema_fingerprint_match && blob.schema_fingerprint != *ref_schema_fingerprint)
         || blob.compression != *ref_compression
         || blob.encryption != *ref_encryption
     {
@@ -2849,6 +3226,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             parent_run_id text,
             parent_command_seq integer,
             parent_close_policy text,
+            parent_child_map_ordinal integer,
             unique(namespace, workflow_id)
         );
 
@@ -2899,6 +3277,25 @@ fn init_schema(conn: &Connection) -> Result<()> {
             map_command_id text not null,
             item_ordinal integer not null,
             result blob not null,
+            primary key(map_command_id, item_ordinal)
+        );
+
+        create table if not exists child_workflow_maps (
+            map_command_id text primary key,
+            namespace text not null,
+            run_id text not null,
+            command_seq integer not null,
+            task blob not null,
+            item_count integer not null,
+            next_ordinal integer not null,
+            in_flight integer not null,
+            completed integer not null
+        );
+
+        create table if not exists child_workflow_map_results (
+            map_command_id text not null,
+            item_ordinal integer not null,
+            outcome blob not null,
             primary key(map_command_id, item_ordinal)
         );
 
@@ -3003,6 +3400,12 @@ fn init_schema(conn: &Connection) -> Result<()> {
     ensure_column(conn, "workflow_instances", "parent_run_id", "text")?;
     ensure_column(conn, "workflow_instances", "parent_command_seq", "integer")?;
     ensure_column(conn, "workflow_instances", "parent_close_policy", "text")?;
+    ensure_column(
+        conn,
+        "workflow_instances",
+        "parent_child_map_ordinal",
+        "integer",
+    )?;
     ensure_column(
         conn,
         "child_outbox",
@@ -3122,15 +3525,23 @@ fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
+    tx.execute(
+        "update child_workflow_maps
+         set completed = 1, in_flight = 0
+         where run_id = ?1",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
     Ok(())
 }
 
 fn handle_terminal_run(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) -> Result<()> {
-    notify_parent_of_child_terminal(tx, run_id, terminal_event)?;
+    notify_parent_of_child_terminal(tx, config, run_id, terminal_event)?;
     cancel_children_for_parent(tx, run_id)?;
     Ok(())
 }
@@ -3188,12 +3599,13 @@ fn continue_run_as_new(
 
 fn notify_parent_of_child_terminal(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     child_run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) -> Result<()> {
-    let Some((parent_run_id, parent_command_seq)) = tx
+    let Some((parent_run_id, parent_command_seq, parent_child_map_ordinal)) = tx
         .query_row(
-            "select parent_run_id, parent_command_seq
+            "select parent_run_id, parent_command_seq, parent_child_map_ordinal
              from workflow_instances
              where run_id = ?1",
             params![child_run_id.0],
@@ -3201,12 +3613,13 @@ fn notify_parent_of_child_terminal(
                 Ok((
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, Option<u64>>(2)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error)?
-        .and_then(|(run_id, seq)| Some((RunId::new(run_id?), CommandSeq(seq?))))
+        .and_then(|(run_id, seq, ordinal)| Some((RunId::new(run_id?), CommandSeq(seq?), ordinal)))
     else {
         return Ok(());
     };
@@ -3214,6 +3627,33 @@ fn notify_parent_of_child_terminal(
         run_id: parent_run_id.clone(),
         seq: parent_command_seq,
     };
+    if let Some(item_ordinal) = parent_child_map_ordinal {
+        let outcome = match terminal_event {
+            HistoryEventData::WorkflowCompleted { result } => {
+                ChildWorkflowMapItemOutcome::Succeeded {
+                    result: result.clone(),
+                }
+            }
+            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
+                failure: failure.clone(),
+            },
+            HistoryEventData::WorkflowCancelled { reason } => {
+                ChildWorkflowMapItemOutcome::Cancelled {
+                    reason: reason.clone(),
+                }
+            }
+            _ => return Ok(()),
+        };
+        return complete_child_workflow_map_item(
+            tx,
+            config,
+            ChildWorkflowMapItem {
+                map_command_id: command_id,
+                item_ordinal,
+            },
+            outcome,
+        );
+    }
     if child_terminal_event_exists(tx, &command_id)? {
         return Ok(());
     }
@@ -3366,16 +3806,38 @@ fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId
     )
     .map_err(sqlite_error)?;
     tx.execute(
+        "update child_workflow_maps
+         set completed = 1, in_flight = 0
+         where map_command_id = ?1",
+        params![map_command_key(command_id)],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
         "update child_outbox
          set dispatched = 1
-         where outbox_id = ?1",
-        params![child_outbox_id(command_id)],
+         where outbox_id = ?1
+            or (parent_run_id = ?2 and command_seq = ?3)",
+        params![
+            child_outbox_id_for_command(command_id),
+            command_id.run_id.0,
+            command_id.seq.0
+        ],
     )
     .map_err(sqlite_error)?;
     Ok(())
 }
 
-fn child_outbox_id(command_id: &CommandId) -> String {
+fn child_outbox_id(message: &ChildStartOutboxMessage) -> String {
+    if let Some(item) = &message.child_map_item {
+        return format!(
+            "{}:{}:child-map:{}",
+            item.map_command_id.run_id, item.map_command_id.seq.0, item.item_ordinal
+        );
+    }
+    child_outbox_id_for_command(&message.command_id)
+}
+
+fn child_outbox_id_for_command(command_id: &CommandId) -> String {
     format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
 }
 
@@ -3418,6 +3880,38 @@ fn insert_activity_map(
     Ok(())
 }
 
+fn insert_child_workflow_map(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    namespace: &str,
+    map_task: &ChildWorkflowMapTask,
+) -> Result<()> {
+    let manifest_payload = hydrate_activity_map_input_manifest_from_storage(
+        tx,
+        config,
+        map_task.input_manifest.clone(),
+    )?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    let task_blob =
+        rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
+    tx.execute(
+        "insert into child_workflow_maps
+         (map_command_id, namespace, run_id, command_seq, task, item_count,
+          next_ordinal, in_flight, completed)
+         values (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0)",
+        params![
+            map_command_key(&map_task.map_command_id),
+            namespace,
+            map_task.map_command_id.run_id.0,
+            map_task.map_command_id.seq.0,
+            task_blob,
+            u64::try_from(manifest.item_count).unwrap_or(u64::MAX),
+        ],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
 fn insert_child_outbox(
     tx: &Transaction<'_>,
     namespace: &str,
@@ -3430,10 +3924,10 @@ fn insert_child_outbox(
          (outbox_id, namespace, parent_run_id, command_seq, child_workflow_id,
           parent_close_policy, message,
           dispatched, child_run_id)
-         values (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, null)
+        values (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, null)
          on conflict(outbox_id) do nothing",
         params![
-            child_outbox_id(&message.command_id),
+            child_outbox_id(message),
             namespace,
             message.command_id.run_id.0,
             message.command_id.seq.0,
@@ -3446,7 +3940,11 @@ fn insert_child_outbox(
     Ok(())
 }
 
-fn dispatch_child_start(tx: &Transaction<'_>, outbox_id: &str) -> Result<()> {
+fn dispatch_child_start(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    outbox_id: &str,
+) -> Result<()> {
     let Some((message_blob, dispatched)) = tx
         .query_row(
             "select message, dispatched from child_outbox where outbox_id = ?1",
@@ -3481,7 +3979,7 @@ fn dispatch_child_start(tx: &Transaction<'_>, outbox_id: &str) -> Result<()> {
 
     let existing = tx
         .query_row(
-            "select run_id, parent_run_id, parent_command_seq
+            "select run_id, parent_run_id, parent_command_seq, parent_child_map_ordinal
              from workflow_instances
              where namespace = ?1 and workflow_id = ?2",
             params![namespace.as_str(), message.workflow_id.0],
@@ -3490,31 +3988,44 @@ fn dispatch_child_start(tx: &Transaction<'_>, outbox_id: &str) -> Result<()> {
                     RunId::new(row.get::<_, String>(0)?),
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<u64>>(2)?,
+                    row.get::<_, Option<u64>>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error)?;
 
-    let child_run_id = if let Some((run_id, parent_run_id, parent_seq)) = existing {
-        let same_child = parent_run_id.as_deref() == Some(message.command_id.run_id.0.as_str())
-            && parent_seq == Some(message.command_id.seq.0);
-        if !same_child {
-            append_child_start_failed(
-                tx,
-                &message.command_id,
-                crate::DurableFailure::non_retryable(
+    let child_run_id =
+        if let Some((run_id, parent_run_id, parent_seq, parent_map_ordinal)) = existing {
+            let expected_map_ordinal = message
+                .child_map_item
+                .as_ref()
+                .map(|item| item.item_ordinal);
+            let same_child = parent_run_id.as_deref() == Some(message.command_id.run_id.0.as_str())
+                && parent_seq == Some(message.command_id.seq.0)
+                && parent_map_ordinal == expected_map_ordinal;
+            if !same_child {
+                let failure = crate::DurableFailure::non_retryable(
                     "durust.child_workflow_id_conflict",
                     format!("workflow id `{}` is already started", message.workflow_id),
-                ),
-            )?;
-            mark_child_outbox_dispatched(tx, outbox_id, None)?;
-            return Ok(());
-        }
-        run_id
-    } else {
-        start_child_run(tx, &namespace, &message)?
-    };
+                );
+                if let Some(item) = message.child_map_item.clone() {
+                    complete_child_workflow_map_item(
+                        tx,
+                        config,
+                        item,
+                        ChildWorkflowMapItemOutcome::Failed { failure },
+                    )?;
+                } else {
+                    append_child_start_failed(tx, &message.command_id, failure)?;
+                }
+                mark_child_outbox_dispatched(tx, outbox_id, None)?;
+                return Ok(());
+            }
+            run_id
+        } else {
+            start_child_run(tx, &namespace, &message)?
+        };
 
     append_child_started(tx, &message, &child_run_id)?;
     mark_child_outbox_dispatched(tx, outbox_id, Some(&child_run_id))?;
@@ -3527,12 +4038,16 @@ fn start_child_run(
     message: &ChildStartOutboxMessage,
 ) -> Result<RunId> {
     let run_id = RunId::new(format!("run-{}", next_counter(tx, "run")?));
+    let parent_child_map_ordinal = message
+        .child_map_item
+        .as_ref()
+        .map(|item| i64::try_from(item.item_ordinal).unwrap_or(i64::MAX));
     tx.execute(
         "insert into workflow_instances
          (namespace, workflow_id, run_id, workflow_name, workflow_version, task_queue,
           current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal,
-          parent_run_id, parent_command_seq, parent_close_policy)
-         values (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, null, 0, ?8, ?9, ?10)",
+          parent_run_id, parent_command_seq, parent_close_policy, parent_child_map_ordinal)
+         values (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, 0, null, 0, ?8, ?9, ?10, ?11)",
         params![
             namespace,
             message.workflow_id.0,
@@ -3543,7 +4058,8 @@ fn start_child_run(
             reason_to_str(&WorkflowTaskReason::WorkflowStarted),
             message.command_id.run_id.0,
             message.command_id.seq.0,
-            parent_close_policy_to_str(message.parent_close_policy)
+            parent_close_policy_to_str(message.parent_close_policy),
+            parent_child_map_ordinal
         ],
     )
     .map_err(sqlite_error)?;
@@ -3564,6 +4080,9 @@ fn append_child_started(
     message: &ChildStartOutboxMessage,
     child_run_id: &RunId,
 ) -> Result<()> {
+    if message.child_map_item.is_some() {
+        return Ok(());
+    }
     if child_event_exists(tx, &message.command_id)? {
         return Ok(());
     }
@@ -3794,6 +4313,375 @@ fn materialize_activity_map_items(
     )
     .map_err(sqlite_error)?;
     Ok(())
+}
+
+fn materialize_child_workflow_map_items(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    let key = map_command_key(map_command_id);
+    let Some((namespace, task_blob, item_count, mut next_ordinal, mut in_flight, completed)) = tx
+        .query_row(
+            "select namespace, task, item_count, next_ordinal, in_flight, completed
+             from child_workflow_maps
+             where map_command_id = ?1",
+            params![key.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Ok(());
+    };
+    if completed {
+        return Ok(());
+    }
+
+    let task: ChildWorkflowMapTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
+    let manifest_payload =
+        hydrate_activity_map_input_manifest_from_storage(tx, config, task.input_manifest.clone())?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+
+    while in_flight < max_in_flight && next_ordinal < item_count {
+        let input = activity_map_input_at(&manifest, next_ordinal)?;
+        let child_map_item = ChildWorkflowMapItem {
+            map_command_id: map_command_id.clone(),
+            item_ordinal: next_ordinal,
+        };
+        let message = ChildStartOutboxMessage {
+            command_id: map_command_id.clone(),
+            workflow_type: task.workflow_type.clone(),
+            workflow_id: WorkflowId::new(format!("{}/{}", task.workflow_id_prefix, next_ordinal)),
+            task_queue: task.task_queue.clone(),
+            input,
+            parent_close_policy: task.parent_close_policy,
+            child_map_item: Some(child_map_item),
+        };
+        let message = normalize_child_start_message_for_storage(tx, config, message)?;
+        insert_child_outbox(tx, namespace.as_str(), &message)?;
+        next_ordinal = next_ordinal.saturating_add(1);
+        in_flight = in_flight.saturating_add(1);
+    }
+
+    tx.execute(
+        "update child_workflow_maps
+         set next_ordinal = ?1, in_flight = ?2
+         where map_command_id = ?3",
+        params![next_ordinal, in_flight, key.as_str()],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn complete_child_workflow_map_item(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_item: ChildWorkflowMapItem,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<()> {
+    let key = map_command_key(&map_item.map_command_id);
+    let Some((task_blob, item_count, completed)) = tx
+        .query_row(
+            "select task, item_count, completed
+             from child_workflow_maps
+             where map_command_id = ?1",
+            params![key.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Err(Error::Backend(format!(
+            "child workflow map `{}`:{} not found",
+            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
+        )));
+    };
+    if completed {
+        return Ok(());
+    }
+    if map_item.item_ordinal >= item_count {
+        return Err(Error::Backend(format!(
+            "child workflow map item ordinal {} out of bounds",
+            map_item.item_ordinal
+        )));
+    }
+
+    let map_task: ChildWorkflowMapTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let outcome = normalize_child_workflow_map_outcome_for_storage(tx, config, outcome)?;
+    let outcome_blob =
+        rmp_serde::to_vec_named(&outcome).map_err(|err| Error::PayloadEncode(err.to_string()))?;
+    let inserted = tx
+        .execute(
+            "insert or ignore into child_workflow_map_results(map_command_id, item_ordinal, outcome)
+             values (?1, ?2, ?3)",
+            params![key.as_str(), map_item.item_ordinal, outcome_blob],
+        )
+        .map_err(sqlite_error)?;
+    if inserted == 0 {
+        return Ok(());
+    }
+
+    tx.execute(
+        "update child_workflow_maps
+         set in_flight = case when in_flight > 0 then in_flight - 1 else 0 end
+         where map_command_id = ?1",
+        params![key.as_str()],
+    )
+    .map_err(sqlite_error)?;
+
+    if map_task.failure_mode == ChildWorkflowMapFailureMode::FailFast {
+        let failure = match &outcome {
+            ChildWorkflowMapItemOutcome::Failed { failure } => Some(failure.clone()),
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Some(crate::DurableFailure::non_retryable(
+                    "durust.child_workflow_cancelled",
+                    format!(
+                        "child workflow map item {} was cancelled: {reason}",
+                        map_item.item_ordinal
+                    ),
+                ))
+            }
+            ChildWorkflowMapItemOutcome::Succeeded { .. } => None,
+        };
+        if let Some(failure) = failure {
+            append_child_workflow_map_failed(tx, config, &map_item.map_command_id, failure)?;
+            cancel_child_workflow_map_children(tx, &map_item.map_command_id)?;
+            return Ok(());
+        }
+    }
+
+    let outcome_count = tx
+        .query_row(
+            "select count(*) from child_workflow_map_results where map_command_id = ?1",
+            params![key.as_str()],
+            |row| row.get::<_, u64>(0),
+        )
+        .map_err(sqlite_error)?;
+    if outcome_count < item_count {
+        materialize_child_workflow_map_items(tx, config, &map_item.map_command_id)?;
+        return Ok(());
+    }
+
+    let outcomes = child_workflow_map_outcomes(tx, key.as_str())?;
+    append_child_workflow_map_completed(tx, config, &map_task, item_count, outcomes)
+}
+
+fn append_child_workflow_map_completed(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_task: &ChildWorkflowMapTask,
+    item_count: u64,
+    outcomes: Vec<ChildWorkflowMapItemOutcome>,
+) -> Result<()> {
+    let input_manifest_payload = hydrate_activity_map_input_manifest_from_storage(
+        tx,
+        config,
+        map_task.input_manifest.clone(),
+    )?;
+    let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
+    let result_manifest = encode_child_workflow_map_result_manifest_with_codec(
+        map_task.result_manifest_name.clone(),
+        outcomes.clone(),
+        &input_manifest.page_lengths,
+        config.codec,
+    )?;
+    let result_manifest =
+        normalize_child_workflow_map_result_manifest_for_storage(tx, config, result_manifest)?;
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &map_task.map_command_id.run_id)?
+    else {
+        return Err(Error::RunNotFound(map_task.map_command_id.run_id.clone()));
+    };
+    if terminal {
+        return Ok(());
+    }
+    let event_id = EventId(tail).next();
+    let success_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. }))
+        .count();
+    let failure_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Failed { .. }))
+        .count();
+    let cancellation_count = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Cancelled { .. }))
+        .count();
+    insert_history_event(
+        tx,
+        &map_task.map_command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
+            command_id: map_task.map_command_id.clone(),
+            result_manifest,
+            item_count: usize::try_from(item_count).unwrap_or(usize::MAX),
+            success_count,
+            failure_count,
+            cancellation_count,
+        }),
+    )?;
+    tx.execute(
+        "update child_workflow_maps
+         set completed = 1, in_flight = 0
+         where map_command_id = ?1",
+        params![map_command_key(&map_task.map_command_id)],
+    )
+    .map_err(sqlite_error)?;
+    set_workflow_ready(
+        tx,
+        &map_task.map_command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowMapCompleted,
+    )
+}
+
+fn append_child_workflow_map_failed(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_command_id: &CommandId,
+    failure: crate::DurableFailure,
+) -> Result<()> {
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &map_command_id.run_id)? else {
+        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    };
+    if terminal {
+        return Ok(());
+    }
+    let event_id = EventId(tail).next();
+    let failure = normalize_failure_for_storage(tx, config, failure)?;
+    insert_history_event(
+        tx,
+        &map_command_id.run_id,
+        event_id,
+        HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
+            command_id: map_command_id.clone(),
+            failure,
+        }),
+    )?;
+    tx.execute(
+        "update child_workflow_maps
+         set completed = 1, in_flight = 0
+         where map_command_id = ?1",
+        params![map_command_key(map_command_id)],
+    )
+    .map_err(sqlite_error)?;
+    set_workflow_ready(
+        tx,
+        &map_command_id.run_id,
+        event_id,
+        WorkflowTaskReason::ChildWorkflowMapFailed,
+    )
+}
+
+fn cancel_child_workflow_map_children(
+    tx: &Transaction<'_>,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    tx.execute(
+        "update child_outbox
+         set dispatched = 1
+         where parent_run_id = ?1
+           and command_seq = ?2
+           and child_run_id is null",
+        params![map_command_id.run_id.0, map_command_id.seq.0],
+    )
+    .map_err(sqlite_error)?;
+
+    let children = {
+        let mut stmt = tx
+            .prepare(
+                "select run_id, current_event_id
+                 from workflow_instances
+                 where parent_run_id = ?1
+                   and parent_command_seq = ?2
+                   and parent_child_map_ordinal is not null
+                   and terminal = 0
+                   and not exists (
+                     select 1
+                     from history_events h
+                     where h.run_id = workflow_instances.run_id
+                       and h.event_type in (
+                         'workflow_completed',
+                         'workflow_failed',
+                         'workflow_cancelled',
+                         'workflow_continued_as_new'
+                       )
+                   )",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(
+                params![map_command_id.run_id.0, map_command_id.seq.0],
+                |row| Ok((RunId::new(row.get::<_, String>(0)?), row.get::<_, u64>(1)?)),
+            )
+            .map_err(sqlite_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?
+    };
+    for (child_run_id, tail) in children {
+        let terminal_event = HistoryEventData::WorkflowCancelled {
+            reason: format!(
+                "child workflow map `{}`:{} failed",
+                map_command_id.run_id, map_command_id.seq.0
+            ),
+        };
+        let event_id = EventId(tail).next();
+        insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
+        cleanup_run_operational_state(tx, &child_run_id)?;
+        tx.execute(
+            "update workflow_instances
+             set current_event_id = ?1,
+                 workflow_claim_token = null,
+                 terminal = 1,
+                 ready_reason = null,
+                 ready_at_ms = 0
+             where run_id = ?2",
+            params![event_id.0, child_run_id.0],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn child_workflow_map_outcomes(
+    tx: &Transaction<'_>,
+    map_command_key: &str,
+) -> Result<Vec<ChildWorkflowMapItemOutcome>> {
+    let mut stmt = tx
+        .prepare(
+            "select outcome
+             from child_workflow_map_results
+             where map_command_id = ?1
+             order by item_ordinal asc",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map(params![map_command_key], |row| row.get::<_, Vec<u8>>(0))
+        .map_err(sqlite_error)?;
+    rows.map(|row| {
+        let blob = row.map_err(sqlite_error)?;
+        rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
+    })
+    .collect()
 }
 
 fn complete_map_item(
@@ -4398,6 +5286,8 @@ fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
         WorkflowTaskReason::ChildWorkflowCompleted => "child_workflow_completed",
         WorkflowTaskReason::ChildWorkflowFailed => "child_workflow_failed",
         WorkflowTaskReason::ChildWorkflowCancelled => "child_workflow_cancelled",
+        WorkflowTaskReason::ChildWorkflowMapCompleted => "child_workflow_map_completed",
+        WorkflowTaskReason::ChildWorkflowMapFailed => "child_workflow_map_failed",
         WorkflowTaskReason::TimerFired => "timer_fired",
         WorkflowTaskReason::SignalReceived => "signal_received",
         WorkflowTaskReason::CacheEvicted => "cache_evicted",
@@ -4416,6 +5306,8 @@ fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
         "child_workflow_completed" => Ok(WorkflowTaskReason::ChildWorkflowCompleted),
         "child_workflow_failed" => Ok(WorkflowTaskReason::ChildWorkflowFailed),
         "child_workflow_cancelled" => Ok(WorkflowTaskReason::ChildWorkflowCancelled),
+        "child_workflow_map_completed" => Ok(WorkflowTaskReason::ChildWorkflowMapCompleted),
+        "child_workflow_map_failed" => Ok(WorkflowTaskReason::ChildWorkflowMapFailed),
         "timer_fired" => Ok(WorkflowTaskReason::TimerFired),
         "signal_received" => Ok(WorkflowTaskReason::SignalReceived),
         "cache_evicted" => Ok(WorkflowTaskReason::CacheEvicted),
@@ -4462,6 +5354,9 @@ fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
         HistoryEventType::ChildWorkflowCompleted => "child_workflow_completed",
         HistoryEventType::ChildWorkflowFailed => "child_workflow_failed",
         HistoryEventType::ChildWorkflowCancelled => "child_workflow_cancelled",
+        HistoryEventType::ChildWorkflowMapScheduled => "child_workflow_map_scheduled",
+        HistoryEventType::ChildWorkflowMapCompleted => "child_workflow_map_completed",
+        HistoryEventType::ChildWorkflowMapFailed => "child_workflow_map_failed",
         HistoryEventType::TimerStarted => "timer_started",
         HistoryEventType::TimerFired => "timer_fired",
         HistoryEventType::SignalConsumed => "signal_consumed",
@@ -4492,6 +5387,9 @@ fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
         "child_workflow_completed" => Ok(HistoryEventType::ChildWorkflowCompleted),
         "child_workflow_failed" => Ok(HistoryEventType::ChildWorkflowFailed),
         "child_workflow_cancelled" => Ok(HistoryEventType::ChildWorkflowCancelled),
+        "child_workflow_map_scheduled" => Ok(HistoryEventType::ChildWorkflowMapScheduled),
+        "child_workflow_map_completed" => Ok(HistoryEventType::ChildWorkflowMapCompleted),
+        "child_workflow_map_failed" => Ok(HistoryEventType::ChildWorkflowMapFailed),
         "timer_started" => Ok(HistoryEventType::TimerStarted),
         "timer_fired" => Ok(HistoryEventType::TimerFired),
         "signal_consumed" => Ok(HistoryEventType::SignalConsumed),

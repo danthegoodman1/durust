@@ -2,6 +2,7 @@ use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
     ActivityMapResultPage, ActivityMapScheduled, ActivityScheduled, ActivityTask,
     ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
+    ChildWorkflowMapCompleted, ChildWorkflowMapFailed, ChildWorkflowMapScheduled,
     ChildWorkflowStartRequested, DurableFailure, Error, HistoryEventData, Result, SideEffectMarker,
     SignalConsumed,
 };
@@ -485,6 +486,24 @@ where
         HistoryEventData::ChildWorkflowCancelled(cancelled) => {
             HistoryEventData::ChildWorkflowCancelled(cancelled)
         }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+            HistoryEventData::ChildWorkflowMapScheduled(map_child_workflow_map_scheduled_payloads(
+                scheduled,
+                map_payload,
+            )?)
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+            HistoryEventData::ChildWorkflowMapCompleted(map_child_workflow_map_completed_payloads(
+                completed,
+                map_payload,
+            )?)
+        }
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
+            HistoryEventData::ChildWorkflowMapFailed(map_child_workflow_map_failed_payloads(
+                failed,
+                map_payload,
+            )?)
+        }
         HistoryEventData::TimerStarted(timer) => HistoryEventData::TimerStarted(timer),
         HistoryEventData::TimerFired(timer) => HistoryEventData::TimerFired(timer),
         HistoryEventData::SignalConsumed(signal) => {
@@ -550,6 +569,39 @@ fn map_child_failed_payloads<F>(
     mut failed: ChildWorkflowFailed,
     map_payload: &mut F,
 ) -> Result<ChildWorkflowFailed>
+where
+    F: FnMut(PayloadRef) -> Result<PayloadRef>,
+{
+    failed.failure = map_failure_payloads(failed.failure, map_payload)?;
+    Ok(failed)
+}
+
+fn map_child_workflow_map_scheduled_payloads<F>(
+    mut scheduled: ChildWorkflowMapScheduled,
+    map_payload: &mut F,
+) -> Result<ChildWorkflowMapScheduled>
+where
+    F: FnMut(PayloadRef) -> Result<PayloadRef>,
+{
+    scheduled.input_manifest = map_payload(scheduled.input_manifest)?;
+    Ok(scheduled)
+}
+
+fn map_child_workflow_map_completed_payloads<F>(
+    mut completed: ChildWorkflowMapCompleted,
+    map_payload: &mut F,
+) -> Result<ChildWorkflowMapCompleted>
+where
+    F: FnMut(PayloadRef) -> Result<PayloadRef>,
+{
+    completed.result_manifest = map_payload(completed.result_manifest)?;
+    Ok(completed)
+}
+
+fn map_child_workflow_map_failed_payloads<F>(
+    mut failed: ChildWorkflowMapFailed,
+    map_payload: &mut F,
+) -> Result<ChildWorkflowMapFailed>
 where
     F: FnMut(PayloadRef) -> Result<PayloadRef>,
 {

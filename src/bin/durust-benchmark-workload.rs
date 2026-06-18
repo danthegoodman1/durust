@@ -61,6 +61,8 @@ struct BenchmarkOptions {
     activity_delay_ms: u64,
     batch: usize,
     activity_completion_batch: usize,
+    child_map_items: u64,
+    child_map_max_in_flight: usize,
     max_rounds: usize,
     keep_db: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -955,6 +957,21 @@ struct ParentOutput {
     finished: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ChildMapInput {
+    index: u64,
+    items: u64,
+    max_in_flight: usize,
+    activity_delay_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ChildMapOutput {
+    index: u64,
+    sum: u64,
+    items: u64,
+}
+
 #[durust::activity(name = "bench.workload.activity")]
 async fn benchmark_activity(input: ActivityInput) -> durust::Result<u64> {
     if input.delay_ms > 0 {
@@ -1006,6 +1023,35 @@ async fn benchmark_parent(input: WorkflowInput) -> durust::Result<ParentOutput> 
     })
 }
 
+#[durust::workflow(name = "bench.workload.child-map-parent", version = 1)]
+async fn benchmark_child_map_parent(input: ChildMapInput) -> durust::Result<ChildMapOutput> {
+    let items = (0..input.items)
+        .map(|offset| WorkflowInput {
+            index: input.index.saturating_mul(1_000_000).saturating_add(offset),
+            activity_delay_ms: input.activity_delay_ms,
+        })
+        .collect::<Vec<_>>();
+    let input_manifest = durust::child_workflow_map_manifest(items)?;
+    let mapped = durust::child_workflow_map::<benchmark_child>()
+        .task_queue(WORKFLOW_QUEUE)
+        .workflow_id_prefix(format!("child-map-{}", input.index))
+        .input_manifest(input_manifest)
+        .max_in_flight(input.max_in_flight)
+        .result_manifest("child-map-results")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok(sum.saturating_add(durust::decode_payload::<u64>(payload)?))
+    })?;
+    Ok(ChildMapOutput {
+        index: input.index,
+        sum,
+        items: input.items,
+    })
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -1046,6 +1092,8 @@ fn default_options() -> BenchmarkOptions {
         activity_delay_ms: 0,
         batch: DEFAULT_BATCH,
         activity_completion_batch: 1,
+        child_map_items: 32,
+        child_map_max_in_flight: 8,
         max_rounds: DEFAULT_MAX_ROUNDS,
         keep_db: false,
         sample_resources: false,
@@ -1115,6 +1163,14 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 options.activity_completion_batch =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
             }
+            "--child-map-items" => {
+                options.child_map_items =
+                    parse_positive_u64(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
+            "--child-map-max-in-flight" => {
+                options.child_map_max_in_flight =
+                    parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
             "--max-rounds" => {
                 options.max_rounds =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
@@ -1148,14 +1204,17 @@ fn validate_supported_dimensions(options: &BenchmarkOptions) -> Result<(), Strin
     if options.backend == BenchmarkBackend::Memory && options.keep_db {
         return Err("--keep-db is only meaningful for persistent backends".to_owned());
     }
-    if options.backend != BenchmarkBackend::Postgres && options.mode != "mixed" {
+    if options.backend != BenchmarkBackend::Postgres
+        && options.mode != "mixed"
+        && options.mode != "child-map"
+    {
         return Err("only --backend postgres supports diagnostic modes".to_owned());
     }
     match options.mode.as_str() {
-        "mixed" | "postgres-write-ceiling" => {}
+        "mixed" | "child-map" | "postgres-write-ceiling" => {}
         other => {
             return Err(format!(
-                "unsupported benchmark mode `{other}`; expected mixed or postgres-write-ceiling"
+                "unsupported benchmark mode `{other}`; expected mixed, child-map, or postgres-write-ceiling"
             ));
         }
     }
@@ -1214,11 +1273,12 @@ fn parse_positive_usize(value: String, flag: &str) -> Result<usize, String> {
 
 fn usage() -> String {
     format!(
-        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed|postgres-write-ceiling] \
+        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed|child-map|postgres-write-ceiling] \
          [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] [--shards 1] \
          [--physical-partitions 1] [--activation-concurrency 1] \
          [--activation-prefetch-limit 1] \
          [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] \
+         [--child-map-items 32] [--child-map-max-in-flight 8] \
          [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json]"
     )
 }
@@ -1840,7 +1900,11 @@ where
             break;
         }
         if !made_progress {
-            match runtime.block_on(verify_completed_workflows(&backend, &start_outcome.runs)) {
+            match runtime.block_on(verify_completed_workflows(
+                &backend,
+                &start_outcome.runs,
+                &options,
+            )) {
                 Ok(completed_workflows) if completed_workflows == options.workflows => break,
                 Ok(completed_workflows) => {
                     return Err(format!(
@@ -1860,18 +1924,21 @@ where
     let processing_finished = Instant::now();
 
     let verify_started = processing_finished;
-    let completed_workflows =
-        runtime.block_on(verify_completed_workflows(&backend, &start_outcome.runs))?;
+    let completed_workflows = runtime.block_on(verify_completed_workflows(
+        &backend,
+        &start_outcome.runs,
+        &options,
+    ))?;
     if completed_workflows != options.workflows {
         return Err(format!(
             "benchmark completed {completed_workflows}/{} workflows",
             options.workflows
         ));
     }
-    assert_mixed_stats(&stats, options.workflows)?;
+    assert_workload_stats(&stats, &options)?;
     let verify_finished = Instant::now();
 
-    let counters = counters_from_stats(&start_outcome, &stats);
+    let counters = counters_from_stats(&start_outcome, &stats, &options);
     let elapsed_ms = duration_ms(verify_finished.duration_since(setup_started));
     let setup_ms = duration_ms(setup_finished.duration_since(setup_started));
     let processing_ms = duration_ms(processing_finished.duration_since(processing_started));
@@ -1917,13 +1984,26 @@ where
 }
 
 fn nominal_workflow_task_target(options: &BenchmarkOptions) -> Result<usize, String> {
-    if options.mode != "mixed" {
-        return Err(format!("unsupported benchmark mode `{}`", options.mode));
-    }
     let workflows = usize::try_from(options.workflows)
         .map_err(|_| format!("workflow count {} does not fit usize", options.workflows))?;
+    let per_workflow = match options.mode.as_str() {
+        "mixed" => 8,
+        "child-map" => {
+            let items = usize::try_from(options.child_map_items).map_err(|_| {
+                format!(
+                    "--child-map-items {} does not fit usize",
+                    options.child_map_items
+                )
+            })?;
+            items
+                .checked_mul(2)
+                .and_then(|tasks| tasks.checked_add(2))
+                .ok_or_else(|| "nominal child-map workflow task count overflowed".to_owned())?
+        }
+        other => return Err(format!("unsupported benchmark mode `{other}`")),
+    };
     workflows
-        .checked_mul(8)
+        .checked_mul(per_workflow)
         .ok_or_else(|| "nominal workflow task count overflowed".to_owned())
 }
 
@@ -1947,25 +2027,47 @@ where
     let mut signals = 0_u64;
     for local_index in 0..options.workflows {
         let index = options.workflow_offset + local_index;
-        let workflow_id = format!("mixed-bench-{index}");
-        let input = WorkflowInput {
-            index,
-            activity_delay_ms: options.activity_delay_ms,
+        let workflow_id = format!("{}-bench-{index}", options.mode);
+        let run_id = match options.mode.as_str() {
+            "mixed" => {
+                let input = WorkflowInput {
+                    index,
+                    activity_delay_ms: options.activity_delay_ms,
+                };
+                let run_id = client
+                    .start_workflow::<benchmark_parent>(&workflow_id, WORKFLOW_QUEUE, input)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                client
+                    .signal_workflow(
+                        &workflow_id,
+                        "finish",
+                        format!("signal-{index}"),
+                        index + 1_000,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?;
+                signals += 1;
+                run_id
+            }
+            "child-map" => {
+                let input = ChildMapInput {
+                    index,
+                    items: options.child_map_items,
+                    max_in_flight: options.child_map_max_in_flight,
+                    activity_delay_ms: options.activity_delay_ms,
+                };
+                client
+                    .start_workflow::<benchmark_child_map_parent>(
+                        &workflow_id,
+                        WORKFLOW_QUEUE,
+                        input,
+                    )
+                    .await
+                    .map_err(|err| err.to_string())?
+            }
+            other => return Err(format!("unsupported benchmark mode `{other}`")),
         };
-        let run_id = client
-            .start_workflow::<benchmark_parent>(&workflow_id, WORKFLOW_QUEUE, input)
-            .await
-            .map_err(|err| err.to_string())?;
-        client
-            .signal_workflow(
-                &workflow_id,
-                "finish",
-                format!("signal-{index}"),
-                index + 1_000,
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-        signals += 1;
         runs.push(ExpectedRun { run_id, index });
     }
     Ok(StartOutcome {
@@ -2008,6 +2110,7 @@ where
         .max_concurrent_activities(options.batch)
         .activity_completion_batch_size(options.activity_completion_batch)
         .register_workflow(benchmark_parent)
+        .register_workflow(benchmark_child_map_parent)
         .register_workflow(benchmark_child)
         .register_activity(benchmark_activity);
     if options.backend == BenchmarkBackend::Postgres && options.shards > 1 {
@@ -2149,7 +2252,11 @@ where
     Ok(stats)
 }
 
-async fn verify_completed_workflows<B>(backend: &B, runs: &[ExpectedRun]) -> Result<u64, String>
+async fn verify_completed_workflows<B>(
+    backend: &B,
+    runs: &[ExpectedRun],
+    options: &BenchmarkOptions,
+) -> Result<u64, String>
 where
     B: DurableBackend,
 {
@@ -2170,19 +2277,39 @@ where
         };
         match &last.data {
             HistoryEventData::WorkflowCompleted { result } => {
-                let output = durust::decode_payload::<ParentOutput>(result)
-                    .map_err(|err| err.to_string())?;
-                let expected_output = ParentOutput {
-                    index: expected.index,
-                    child_value: expected.index * 10,
-                    signal_value: expected.index + 1_000,
-                    finished: true,
-                };
-                if output != expected_output {
-                    return Err(format!(
-                        "run {:?} completed with unexpected output {output:?}, expected {expected_output:?}",
-                        expected.run_id
-                    ));
+                match options.mode.as_str() {
+                    "mixed" => {
+                        let output = durust::decode_payload::<ParentOutput>(result)
+                            .map_err(|err| err.to_string())?;
+                        let expected_output = ParentOutput {
+                            index: expected.index,
+                            child_value: expected.index * 10,
+                            signal_value: expected.index + 1_000,
+                            finished: true,
+                        };
+                        if output != expected_output {
+                            return Err(format!(
+                                "run {:?} completed with unexpected output {output:?}, expected {expected_output:?}",
+                                expected.run_id
+                            ));
+                        }
+                    }
+                    "child-map" => {
+                        let output = durust::decode_payload::<ChildMapOutput>(result)
+                            .map_err(|err| err.to_string())?;
+                        let expected_output = ChildMapOutput {
+                            index: expected.index,
+                            sum: expected_child_map_sum(expected.index, options.child_map_items),
+                            items: options.child_map_items,
+                        };
+                        if output != expected_output {
+                            return Err(format!(
+                                "run {:?} completed with unexpected child-map output {output:?}, expected {expected_output:?}",
+                                expected.run_id
+                            ));
+                        }
+                    }
+                    other => return Err(format!("unsupported benchmark mode `{other}`")),
                 }
                 completed += 1;
             }
@@ -2203,7 +2330,8 @@ where
     Ok(completed)
 }
 
-fn assert_mixed_stats(stats: &WorkerRunStats, workflows: u64) -> Result<(), String> {
+fn assert_workload_stats(stats: &WorkerRunStats, options: &BenchmarkOptions) -> Result<(), String> {
+    let workflows = options.workflows;
     if stats.workflow_tasks < workflows as usize {
         return Err(format!(
             "expected at least one workflow task per workflow, got {stats:?}"
@@ -2212,29 +2340,56 @@ fn assert_mixed_stats(stats: &WorkerRunStats, workflows: u64) -> Result<(), Stri
     if stats.activity_tasks == 0 {
         return Err(format!("expected activity work, got {stats:?}"));
     }
-    if stats.timers_fired == 0 {
+    if options.mode == "mixed" && stats.timers_fired == 0 {
         return Err(format!("expected timer work, got {stats:?}"));
     }
     Ok(())
 }
 
-fn counters_from_stats(start: &StartOutcome, stats: &WorkerRunStats) -> BenchmarkCounters {
+fn counters_from_stats(
+    start: &StartOutcome,
+    stats: &WorkerRunStats,
+    options: &BenchmarkOptions,
+) -> BenchmarkCounters {
     let completed = start.runs.len() as u64;
-    BenchmarkCounters {
+    let mut counters = BenchmarkCounters {
         workflow_starts: start.workflow_starts,
         signals: start.signals,
-        child_starts: completed,
-        child_completions: completed,
-        timer_handlers: completed,
-        boot_activities: completed,
-        child_activities: completed,
-        finish_activities: completed,
         workflow_tasks: stats.workflow_tasks as u64,
         activity_tasks: stats.activity_tasks as u64,
         timers_fired: stats.timers_fired as u64,
         activities_timed_out: stats.activities_timed_out as u64,
         child_workflow_starts_dispatched: stats.child_workflow_starts_dispatched as u64,
+        ..BenchmarkCounters::default()
+    };
+    match options.mode.as_str() {
+        "mixed" => {
+            counters.child_starts = completed;
+            counters.child_completions = completed;
+            counters.timer_handlers = completed;
+            counters.boot_activities = completed;
+            counters.child_activities = completed;
+            counters.finish_activities = completed;
+        }
+        "child-map" => {
+            counters.child_starts = completed.saturating_mul(options.child_map_items);
+            counters.child_completions = counters.child_starts;
+            counters.child_activities = counters.child_starts;
+        }
+        _ => {}
     }
+    counters
+}
+
+fn expected_child_map_sum(index: u64, items: u64) -> u64 {
+    (0..items).fold(0_u64, |sum, offset| {
+        sum.saturating_add(
+            index
+                .saturating_mul(1_000_000)
+                .saturating_add(offset)
+                .saturating_mul(10),
+        )
+    })
 }
 
 impl From<WorkerRunStats> for WorkerStatsReport {

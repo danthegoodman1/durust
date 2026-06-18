@@ -465,6 +465,7 @@ fn projection_update(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: Vec::new(),
+                                schedule_child_workflow_maps: Vec::new(),
                                 start_child_workflows: Vec::new(),
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
@@ -846,6 +847,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                         upsert_waits: Vec::new(),
                                         schedule_activities: Vec::new(),
                                         schedule_activity_maps: Vec::new(),
+                                        schedule_child_workflow_maps: Vec::new(),
                                         start_child_workflows: Vec::new(),
                                         consume_signals: Vec::new(),
                                         delete_waits: Vec::new(),
@@ -940,6 +942,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                         upsert_waits: Vec::new(),
                                         schedule_activities: Vec::new(),
                                         schedule_activity_maps: vec![map_task],
+                                        schedule_child_workflow_maps: Vec::new(),
                                         start_child_workflows: Vec::new(),
                                         consume_signals: Vec::new(),
                                         delete_waits: Vec::new(),
@@ -1068,6 +1071,7 @@ fn signal_send_consume(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: Vec::new(),
+                                schedule_child_workflow_maps: Vec::new(),
                                 start_child_workflows: Vec::new(),
                                 consume_signals: vec![inbox.signal_id],
                                 delete_waits: Vec::new(),
@@ -1102,6 +1106,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
                                 schedule_activity_maps: vec![map_task],
+                                schedule_child_workflow_maps: Vec::new(),
                                 start_child_workflows: Vec::new(),
                                 consume_signals: Vec::new(),
                                 delete_waits: Vec::new(),
@@ -1141,6 +1146,78 @@ fn activity_map_item_complete(c: &mut Criterion) {
                         completed,
                         durust::CompleteActivityOutcome::Completed { .. }
                     ));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn child_workflow_map_materialize(c: &mut Criterion) {
+    c.bench_function("child_workflow_map_materialize_memory", |b| {
+        b.iter_batched(
+            setup_claimed_child_workflow_map_workflow,
+            |(backend, claimed, map_task, scheduled)| {
+                block_on(async {
+                    let outcome = backend
+                        .commit_workflow_task(
+                            claimed.claim,
+                            WorkflowTaskCommit {
+                                expected_tail_event_id: EventId(1),
+                                append_events: vec![NewHistoryEvent::new(
+                                    HistoryEventData::ChildWorkflowMapScheduled(scheduled),
+                                )],
+                                upsert_waits: Vec::new(),
+                                schedule_activities: Vec::new(),
+                                schedule_activity_maps: Vec::new(),
+                                schedule_child_workflow_maps: vec![map_task],
+                                start_child_workflows: Vec::new(),
+                                consume_signals: Vec::new(),
+                                delete_waits: Vec::new(),
+                                cancel_commands: Vec::new(),
+                                query_projection: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn child_workflow_map_item_complete(c: &mut Criterion) {
+    c.bench_function("child_workflow_map_item_complete_memory", |b| {
+        b.iter_batched(
+            setup_materialized_child_workflow_map,
+            |(backend, child_claim)| {
+                block_on(async {
+                    let outcome = backend
+                        .commit_workflow_task(
+                            child_claim.claim,
+                            WorkflowTaskCommit {
+                                expected_tail_event_id: EventId(1),
+                                append_events: vec![NewHistoryEvent::new(
+                                    HistoryEventData::WorkflowCompleted {
+                                        result: durust::encode_payload(&20_u64).unwrap(),
+                                    },
+                                )],
+                                upsert_waits: Vec::new(),
+                                schedule_activities: Vec::new(),
+                                schedule_activity_maps: Vec::new(),
+                                schedule_child_workflow_maps: Vec::new(),
+                                start_child_workflows: Vec::new(),
+                                consume_signals: Vec::new(),
+                                delete_waits: Vec::new(),
+                                cancel_commands: Vec::new(),
+                                query_projection: None,
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
                 });
             },
             BatchSize::SmallInput,
@@ -1537,6 +1614,7 @@ fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
@@ -1651,6 +1729,7 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![activity_task],
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -1697,6 +1776,7 @@ fn setup_claimed_workflow_for_commit_sqlite() -> SqliteAppendCommitBenchState {
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![activity_task],
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -1779,6 +1859,7 @@ fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskCla
                     upsert_waits: Vec::new(),
                     schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
                     schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
@@ -1834,6 +1915,7 @@ fn setup_due_timer() -> MemoryBackend {
                     }],
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
@@ -1883,6 +1965,7 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
                     }],
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
@@ -1961,6 +2044,7 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
                     schedule_activity_maps: vec![map_task],
+                    schedule_child_workflow_maps: Vec::new(),
                     start_child_workflows: Vec::new(),
                     consume_signals: Vec::new(),
                     delete_waits: Vec::new(),
@@ -1978,7 +2062,114 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
     })
 }
 
+fn setup_claimed_child_workflow_map_workflow() -> (
+    MemoryBackend,
+    ClaimedWorkflowTask,
+    durust::ChildWorkflowMapTask,
+    durust::ChildWorkflowMapScheduled,
+) {
+    block_on(async {
+        let (backend, worker_id, opts) = create_claimable_workflow().await;
+        let claimed = backend
+            .claim_workflow_task(worker_id, opts)
+            .await
+            .unwrap()
+            .expect("workflow task");
+        let command_id = durust::command_id(&claimed.run_id, 1);
+        let input_manifest = child_workflow_map_input_manifest(128);
+        let workflow_type = WorkflowType::new("bench.child-double", 1);
+        let task_queue = TaskQueue::new("workflows");
+        let workflow_id_prefix = format!("bench/child-map/{}", claimed.run_id.0);
+        let parent_close_policy = durust::ParentClosePolicy::Cancel;
+        let failure_mode = durust::ChildWorkflowMapFailureMode::FailFast;
+        let scheduled = durust::ChildWorkflowMapScheduled {
+            command_id: command_id.clone(),
+            workflow_type: workflow_type.clone(),
+            task_queue: task_queue.clone(),
+            input_manifest: input_manifest.clone(),
+            result_manifest_name: "bench-results".to_owned(),
+            workflow_id_prefix: workflow_id_prefix.clone(),
+            max_in_flight: 64,
+            parent_close_policy,
+            failure_mode,
+            fingerprint: durust::child_workflow_map_fingerprint(
+                workflow_type.clone(),
+                durust::payload_digest(&input_manifest),
+                "bench-results".to_owned(),
+                workflow_id_prefix.clone(),
+                64,
+                task_queue.clone(),
+                parent_close_policy,
+                failure_mode,
+            ),
+        };
+        let map_task = durust::ChildWorkflowMapTask {
+            map_command_id: command_id,
+            workflow_type,
+            task_queue,
+            input_manifest,
+            result_manifest_name: "bench-results".to_owned(),
+            workflow_id_prefix,
+            max_in_flight: 64,
+            parent_close_policy,
+            failure_mode,
+        };
+        (backend, claimed, map_task, scheduled)
+    })
+}
+
+fn setup_materialized_child_workflow_map() -> (MemoryBackend, ClaimedWorkflowTask) {
+    let (backend, claimed, map_task, scheduled) = setup_claimed_child_workflow_map_workflow();
+    block_on(async {
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![NewHistoryEvent::new(
+                        HistoryEventData::ChildWorkflowMapScheduled(scheduled),
+                    )],
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: vec![map_task],
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: None,
+                },
+            )
+            .await
+            .unwrap();
+        let dispatched = backend
+            .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+                namespace: Namespace::default(),
+                limit: 64,
+            })
+            .await
+            .unwrap();
+        assert_eq!(dispatched.dispatched, 64);
+        let child_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("bench-child-map-worker"),
+                child_workflow_claim_options(),
+            )
+            .await
+            .unwrap()
+            .expect("child workflow task");
+        (backend, child_claim)
+    })
+}
+
 fn activity_map_input_manifest(items: u64) -> durust::PayloadRef {
+    let inputs = (0..items)
+        .map(|value| durust::encode_payload(&BenchInput { value }).unwrap())
+        .collect::<Vec<_>>();
+    durust::encode_activity_map_input_manifest(inputs, 32).unwrap()
+}
+
+fn child_workflow_map_input_manifest(items: u64) -> durust::PayloadRef {
     let inputs = (0..items)
         .map(|value| durust::encode_payload(&BenchInput { value }).unwrap())
         .collect::<Vec<_>>();
@@ -2094,6 +2285,15 @@ fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
         task_queue: TaskQueue::new("workflows"),
         registered_workflow_types: vec![WorkflowType::new("bench.double-plus-one", 1)],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+fn child_workflow_claim_options() -> ClaimWorkflowTaskOptions {
+    ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("workflows"),
+        registered_workflow_types: vec![WorkflowType::new("bench.child-double", 1)],
         lease_duration: Duration::from_secs(30),
     }
 }
@@ -2424,6 +2624,7 @@ fn setup_postgres_claimed_workflow_for_commit(
             upsert_waits: Vec::new(),
             schedule_activities: vec![activity_task],
             schedule_activity_maps: Vec::new(),
+            schedule_child_workflow_maps: Vec::new(),
             start_child_workflows: Vec::new(),
             consume_signals: Vec::new(),
             delete_waits: Vec::new(),
@@ -2474,6 +2675,7 @@ fn setup_postgres_claimed_heartbeat_activity(
                 upsert_waits: Vec::new(),
                 schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -2523,6 +2725,7 @@ fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
                 }],
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -2560,6 +2763,7 @@ fn setup_postgres_signal_wait(
                 }],
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -2604,6 +2808,7 @@ fn setup_postgres_projection_read(
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -2634,6 +2839,7 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
                 schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: Vec::new(),
                 consume_signals: Vec::new(),
                 delete_waits: Vec::new(),
@@ -2681,6 +2887,7 @@ fn setup_postgres_child_start(
             upsert_waits: Vec::new(),
             schedule_activities: Vec::new(),
             schedule_activity_maps: Vec::new(),
+            schedule_child_workflow_maps: Vec::new(),
             start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
                 &requested,
             )],
@@ -2846,6 +3053,8 @@ criterion_group!(
     timer_due_scan_wakeup,
     signal_send_consume,
     activity_map_materialize,
-    activity_map_item_complete
+    activity_map_item_complete,
+    child_workflow_map_materialize,
+    child_workflow_map_item_complete
 );
 criterion_main!(benches);

@@ -82,7 +82,8 @@ async fn run_example() -> durust::Result<DocumentSummary> {
             "payload offload workflow did not complete".to_owned(),
         ));
     };
-    durust::decode_payload(result)
+    let hydrated = backend.hydrate_payload(result.clone()).await?;
+    durust::decode_payload(&hydrated)
 }
 
 async fn stream_history(

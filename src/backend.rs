@@ -1,8 +1,8 @@
 use crate::{
     ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
-    DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef, PayloadStorageConfig,
-    Result, RunId, ShardId, SignalId, SignalName, TaskQueue, TimestampMs, WaitId, WorkerId,
-    WorkflowId, WorkflowType,
+    ChildWorkflowMapTask, DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef,
+    PayloadStorageConfig, Result, RunId, ShardId, SignalId, SignalName, TaskQueue, TimestampMs,
+    WaitId, WorkerId, WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
@@ -72,6 +72,13 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     }
 
     fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        self.hydrate_payload(payload)
+    }
+
+    fn hydrate_child_workflow_map_result_manifest(
         &self,
         payload: PayloadRef,
     ) -> BoxFuture<'static, Result<PayloadRef>> {
@@ -299,6 +306,8 @@ pub enum WorkflowTaskReason {
     ChildWorkflowCompleted,
     ChildWorkflowFailed,
     ChildWorkflowCancelled,
+    ChildWorkflowMapCompleted,
+    ChildWorkflowMapFailed,
     TimerFired,
     SignalReceived,
     CacheEvicted,
@@ -364,6 +373,7 @@ pub struct WorkflowTaskCommit {
     pub upsert_waits: Vec<WaitRecord>,
     pub schedule_activities: Vec<ActivityTask>,
     pub schedule_activity_maps: Vec<ActivityMapTask>,
+    pub schedule_child_workflow_maps: Vec<ChildWorkflowMapTask>,
     pub start_child_workflows: Vec<ChildStartOutboxMessage>,
     pub consume_signals: Vec<SignalId>,
     pub delete_waits: Vec<WaitId>,
@@ -615,6 +625,7 @@ pub enum PayloadRootRef {
     Payload(PayloadRef),
     ActivityMapInputManifest(PayloadRef),
     ActivityMapResultManifest(PayloadRef),
+    ChildWorkflowMapResultManifest(PayloadRef),
 }
 
 impl PayloadRootRef {
@@ -622,7 +633,8 @@ impl PayloadRootRef {
         match self {
             Self::Payload(payload)
             | Self::ActivityMapInputManifest(payload)
-            | Self::ActivityMapResultManifest(payload) => payload,
+            | Self::ActivityMapResultManifest(payload)
+            | Self::ChildWorkflowMapResultManifest(payload) => payload,
         }
     }
 }

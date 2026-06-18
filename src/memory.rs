@@ -2,8 +2,9 @@ use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
     ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
     ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ChildStartOutboxMessage,
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask,
-    CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
+    ChildWorkflowMapFailureMode, ChildWorkflowMapItem, ChildWorkflowMapItemOutcome,
+    ChildWorkflowMapTask, ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask,
+    ClaimedWorkflowTask, CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
     HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy, PayloadBlob,
@@ -14,7 +15,8 @@ use crate::{
     WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
     WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
     WorkflowTaskCommit, WorkflowTaskReason, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec, event_payload_len, is_terminal,
+    encode_activity_map_result_manifest_with_codec,
+    encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -74,6 +76,7 @@ struct MemoryState {
     runs: BTreeMap<RunId, RunRecord>,
     activities: BTreeMap<ActivityId, ActivityRecord>,
     activity_maps: BTreeMap<crate::CommandId, ActivityMapRecord>,
+    child_workflow_maps: BTreeMap<crate::CommandId, ChildWorkflowMapRecord>,
     child_outbox: BTreeMap<String, ChildOutboxRecord>,
     waits: BTreeMap<WaitId, WaitRecord>,
     signals: BTreeMap<SignalId, SignalRecord>,
@@ -100,6 +103,7 @@ struct ChildParentLink {
     parent_run_id: RunId,
     command_id: crate::CommandId,
     parent_close_policy: ParentClosePolicy,
+    child_map_item: Option<ChildWorkflowMapItem>,
 }
 
 struct ChildOutboxRecord {
@@ -120,6 +124,15 @@ struct ActivityMapRecord {
     task: ActivityMapTask,
     input_manifest: ActivityMapInputManifest,
     results: BTreeMap<u64, crate::PayloadRef>,
+    next_ordinal: u64,
+    in_flight: usize,
+    completed: bool,
+}
+
+struct ChildWorkflowMapRecord {
+    task: ChildWorkflowMapTask,
+    input_manifest: ActivityMapInputManifest,
+    outcomes: BTreeMap<u64, ChildWorkflowMapItemOutcome>,
     next_ordinal: u64,
     in_flight: usize,
     completed: bool,
@@ -238,7 +251,8 @@ impl DurableBackend for MemoryBackend {
             event_id
         };
         cleanup_run_operational_state(&mut state, &run_id);
-        handle_terminal_run(&mut state, &run_id, &terminal_event);
+        let config = self.payload_config.clone();
+        handle_terminal_run(&mut state, &config, &run_id, &terminal_event);
 
         Box::pin(ready(Ok(CancelWorkflowOutcome::Cancelled {
             run_id,
@@ -490,6 +504,28 @@ impl DurableBackend for MemoryBackend {
             };
             decoded_maps.push((map_task, manifest));
         }
+        let mut decoded_child_maps = Vec::with_capacity(batch.schedule_child_workflow_maps.len());
+        for map_task in batch.schedule_child_workflow_maps {
+            let map_task = match normalize_child_workflow_map_task_for_storage(
+                &mut state, &config, map_task,
+            ) {
+                Ok(map_task) => map_task,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            let manifest_payload = match hydrate_activity_map_input_manifest_from_storage(
+                &state,
+                map_task.input_manifest.clone(),
+            ) {
+                Ok(payload) => payload,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            let manifest: ActivityMapInputManifest = match crate::decode_payload(&manifest_payload)
+            {
+                Ok(manifest) => manifest,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            decoded_child_maps.push((map_task, manifest));
+        }
         let upsert_waits = batch.upsert_waits;
         let consume_signals = batch.consume_signals;
         let delete_waits = batch.delete_waits;
@@ -597,9 +633,27 @@ impl DurableBackend for MemoryBackend {
                 return Box::pin(ready(Err(err)));
             }
         }
+        for (map_task, manifest) in decoded_child_maps {
+            state.child_workflow_maps.insert(
+                map_task.map_command_id.clone(),
+                ChildWorkflowMapRecord {
+                    task: map_task.clone(),
+                    input_manifest: manifest,
+                    outcomes: BTreeMap::new(),
+                    next_ordinal: 0,
+                    in_flight: 0,
+                    completed: false,
+                },
+            );
+            if let Err(err) =
+                materialize_child_workflow_map_items(&mut state, &config, &map_task.map_command_id)
+            {
+                return Box::pin(ready(Err(err)));
+            }
+        }
         for message in start_child_workflows {
             state.child_outbox.insert(
-                child_outbox_id(&message.command_id),
+                child_outbox_id(&message),
                 ChildOutboxRecord {
                     message,
                     dispatched: false,
@@ -627,7 +681,7 @@ impl DurableBackend for MemoryBackend {
                 if matches!(event, HistoryEventData::WorkflowContinuedAsNew { .. }) {
                     continue_run_as_new(&mut state, &claim.run_id, event);
                 } else {
-                    handle_terminal_run(&mut state, &claim.run_id, &event);
+                    handle_terminal_run(&mut state, &config, &claim.run_id, &event);
                 }
             }
         }
@@ -1069,6 +1123,7 @@ impl DurableBackend for MemoryBackend {
     ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>> {
         let result = (|| {
             let mut state = self.state.lock().expect("memory backend mutex poisoned");
+            let config = self.payload_config.clone();
             let mut dispatched = 0usize;
             let limit = req.limit.max(1);
             while dispatched < limit {
@@ -1082,7 +1137,7 @@ impl DurableBackend for MemoryBackend {
                 }) else {
                     break;
                 };
-                dispatch_child_start(&mut state, &outbox_id)?;
+                dispatch_child_start(&mut state, &config, &outbox_id)?;
                 dispatched += 1;
             }
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
@@ -1333,9 +1388,19 @@ fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {
             map.in_flight = 0;
         }
     }
+    for map in state.child_workflow_maps.values_mut() {
+        if &map.task.map_command_id.run_id == run_id {
+            map.completed = true;
+            map.in_flight = 0;
+        }
+    }
 }
 
-fn dispatch_child_start(state: &mut MemoryState, outbox_id: &str) -> Result<()> {
+fn dispatch_child_start(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    outbox_id: &str,
+) -> Result<()> {
     let message = {
         let Some(record) = state.child_outbox.get(outbox_id) else {
             return Ok(());
@@ -1376,16 +1441,25 @@ fn dispatch_child_start(state: &mut MemoryState, outbox_id: &str) -> Result<()> 
                 .runs
                 .get(&existing_run_id)
                 .and_then(|run| run.parent.as_ref())
-                .is_some_and(|parent| parent.command_id == message.command_id);
+                .is_some_and(|parent| {
+                    parent.command_id == message.command_id
+                        && parent.child_map_item == message.child_map_item
+                });
             if !same_child {
-                append_child_start_failed(
-                    state,
-                    &message.command_id,
-                    crate::DurableFailure::non_retryable(
-                        "durust.child_workflow_id_conflict",
-                        format!("workflow id `{}` is already started", message.workflow_id),
-                    ),
-                )?;
+                let failure = crate::DurableFailure::non_retryable(
+                    "durust.child_workflow_id_conflict",
+                    format!("workflow id `{}` is already started", message.workflow_id),
+                );
+                if let Some(map_item) = message.child_map_item.clone() {
+                    complete_child_workflow_map_item(
+                        state,
+                        config,
+                        map_item,
+                        ChildWorkflowMapItemOutcome::Failed { failure },
+                    )?;
+                } else {
+                    append_child_start_failed(state, &message.command_id, failure)?;
+                }
                 if let Some(record) = state.child_outbox.get_mut(outbox_id) {
                     record.dispatched = true;
                 }
@@ -1439,6 +1513,7 @@ fn start_child_run(state: &mut MemoryState, message: &ChildStartOutboxMessage) -
                 parent_run_id: message.command_id.run_id.clone(),
                 command_id: message.command_id.clone(),
                 parent_close_policy: message.parent_close_policy,
+                child_map_item: message.child_map_item.clone(),
             }),
         },
     );
@@ -1450,6 +1525,9 @@ fn append_child_started(
     message: &ChildStartOutboxMessage,
     child_run_id: RunId,
 ) -> Result<()> {
+    if message.child_map_item.is_some() {
+        return Ok(());
+    }
     if child_event_exists(state, &message.command_id) {
         return Ok(());
     }
@@ -1526,8 +1604,13 @@ fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> boo
     })
 }
 
-fn handle_terminal_run(state: &mut MemoryState, run_id: &RunId, terminal_event: &HistoryEventData) {
-    notify_parent_of_child_terminal(state, run_id, terminal_event);
+fn handle_terminal_run(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    run_id: &RunId,
+    terminal_event: &HistoryEventData,
+) {
+    notify_parent_of_child_terminal(state, config, run_id, terminal_event);
     cancel_children_for_parent(state, run_id);
 }
 
@@ -1575,6 +1658,7 @@ fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: Histo
 
 fn notify_parent_of_child_terminal(
     state: &mut MemoryState,
+    config: &PayloadStorageConfig,
     child_run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) {
@@ -1585,6 +1669,26 @@ fn notify_parent_of_child_terminal(
     else {
         return;
     };
+    if let Some(map_item) = parent.child_map_item.clone() {
+        let outcome = match terminal_event {
+            HistoryEventData::WorkflowCompleted { result } => {
+                ChildWorkflowMapItemOutcome::Succeeded {
+                    result: result.clone(),
+                }
+            }
+            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
+                failure: failure.clone(),
+            },
+            HistoryEventData::WorkflowCancelled { reason } => {
+                ChildWorkflowMapItemOutcome::Cancelled {
+                    reason: reason.clone(),
+                }
+            }
+            _ => return,
+        };
+        let _ = complete_child_workflow_map_item(state, config, map_item, outcome);
+        return;
+    }
     if child_terminal_event_exists(state, &parent.command_id) {
         return;
     }
@@ -1716,13 +1820,340 @@ fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate:
         map.completed = true;
         map.in_flight = 0;
     }
-    if let Some(record) = state.child_outbox.get_mut(&child_outbox_id(command_id)) {
+    if let Some(map) = state.child_workflow_maps.get_mut(command_id) {
+        map.completed = true;
+        map.in_flight = 0;
+    }
+    for record in state.child_outbox.values_mut() {
+        let matches_command = record.message.command_id == *command_id;
+        let matches_child_map = record
+            .message
+            .child_map_item
+            .as_ref()
+            .is_some_and(|item| item.map_command_id == *command_id);
+        if matches_command || matches_child_map {
+            record.dispatched = true;
+        }
+    }
+    if let Some(record) = state
+        .child_outbox
+        .get_mut(&child_outbox_id_for_command(command_id))
+    {
         record.dispatched = true;
     }
 }
 
-fn child_outbox_id(command_id: &crate::CommandId) -> String {
+fn child_outbox_id(message: &ChildStartOutboxMessage) -> String {
+    if let Some(item) = &message.child_map_item {
+        return format!(
+            "{}:{}:child-map:{}",
+            item.map_command_id.run_id, item.map_command_id.seq.0, item.item_ordinal
+        );
+    }
+    child_outbox_id_for_command(&message.command_id)
+}
+
+fn child_outbox_id_for_command(command_id: &crate::CommandId) -> String {
     format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
+}
+
+fn materialize_child_workflow_map_items(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_command_id: &crate::CommandId,
+) -> Result<()> {
+    loop {
+        let Some((item_ordinal, task, input)) = ({
+            let Some(map) = state.child_workflow_maps.get_mut(map_command_id) else {
+                return Ok(());
+            };
+            if map.completed || map.in_flight >= map.task.max_in_flight.max(1) {
+                return Ok(());
+            }
+            while map.outcomes.contains_key(&map.next_ordinal) {
+                map.next_ordinal = map.next_ordinal.saturating_add(1);
+            }
+            if usize::try_from(map.next_ordinal).unwrap_or(usize::MAX)
+                >= map.input_manifest.item_count
+            {
+                return Ok(());
+            }
+            let item_ordinal = map.next_ordinal;
+            let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
+            Some((item_ordinal, map.task.clone(), input))
+        }) else {
+            return Ok(());
+        };
+        let child_map_item = ChildWorkflowMapItem {
+            map_command_id: map_command_id.clone(),
+            item_ordinal,
+        };
+        let message = ChildStartOutboxMessage {
+            command_id: map_command_id.clone(),
+            workflow_type: task.workflow_type.clone(),
+            workflow_id: crate::WorkflowId::new(format!(
+                "{}/{}",
+                task.workflow_id_prefix, item_ordinal
+            )),
+            task_queue: task.task_queue.clone(),
+            input,
+            parent_close_policy: task.parent_close_policy,
+            child_map_item: Some(child_map_item),
+        };
+        let message = crate::payload::map_child_start_payloads(message, &mut |payload| {
+            normalize_payload_for_storage(state, config, payload)
+        })?;
+        let outbox_id = child_outbox_id(&message);
+        state
+            .child_outbox
+            .entry(outbox_id)
+            .or_insert(ChildOutboxRecord {
+                message,
+                dispatched: false,
+                child_run_id: None,
+            });
+        if let Some(map) = state.child_workflow_maps.get_mut(map_command_id) {
+            if map.next_ordinal == item_ordinal {
+                map.next_ordinal = map.next_ordinal.saturating_add(1);
+                map.in_flight = map.in_flight.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn complete_child_workflow_map_item(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_item: ChildWorkflowMapItem,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<()> {
+    let mut fail_fast_failure = None;
+    let mut completed_map = None;
+    {
+        let Some(map) = state.child_workflow_maps.get_mut(&map_item.map_command_id) else {
+            return Err(Error::Backend(format!(
+                "child workflow map `{}`:{} not found",
+                map_item.map_command_id.run_id, map_item.map_command_id.seq.0
+            )));
+        };
+        if map.completed {
+            return Ok(());
+        }
+        let index = usize::try_from(map_item.item_ordinal).unwrap_or(usize::MAX);
+        if index >= map.input_manifest.item_count {
+            return Err(Error::Backend(format!(
+                "child workflow map item ordinal {} out of bounds",
+                map_item.item_ordinal
+            )));
+        }
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            map.outcomes.entry(map_item.item_ordinal)
+        {
+            let is_failure = !matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. });
+            let failure = match &outcome {
+                ChildWorkflowMapItemOutcome::Failed { failure } => Some(failure.clone()),
+                ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                    Some(crate::DurableFailure::non_retryable(
+                        "durust.child_workflow_cancelled",
+                        reason.clone(),
+                    ))
+                }
+                ChildWorkflowMapItemOutcome::Succeeded { .. } => None,
+            };
+            entry.insert(outcome);
+            map.in_flight = map.in_flight.saturating_sub(1);
+            if is_failure && map.task.failure_mode == ChildWorkflowMapFailureMode::FailFast {
+                map.completed = true;
+                fail_fast_failure = failure;
+            } else if map.outcomes.len() == map.input_manifest.item_count {
+                map.completed = true;
+                let outcomes = (0..map.input_manifest.item_count)
+                    .map(|ordinal| {
+                        map.outcomes.get(&(ordinal as u64)).cloned().ok_or_else(|| {
+                            Error::Backend(format!(
+                                "missing child workflow map outcome for item {ordinal}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let success_count = outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. })
+                    })
+                    .count();
+                let failure_count = outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Failed { .. }))
+                    .count();
+                let cancellation_count = outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        matches!(outcome, ChildWorkflowMapItemOutcome::Cancelled { .. })
+                    })
+                    .count();
+                let result_manifest = encode_child_workflow_map_result_manifest_with_codec(
+                    map.task.result_manifest_name.clone(),
+                    outcomes,
+                    &map.input_manifest.page_lengths,
+                    config.codec,
+                )?;
+                completed_map = Some((
+                    result_manifest,
+                    map.input_manifest.item_count,
+                    success_count,
+                    failure_count,
+                    cancellation_count,
+                ));
+            }
+        }
+    }
+
+    if let Some(failure) = fail_fast_failure {
+        append_child_workflow_map_failed(state, config, &map_item.map_command_id, failure)?;
+        cancel_child_workflow_map_children(state, &map_item.map_command_id);
+    } else if let Some((
+        result_manifest,
+        item_count,
+        success_count,
+        failure_count,
+        cancellation_count,
+    )) = completed_map
+    {
+        let result_manifest = normalize_child_workflow_map_result_manifest_for_storage(
+            state,
+            config,
+            result_manifest,
+        )?;
+        append_child_workflow_map_completed(
+            state,
+            &map_item.map_command_id,
+            result_manifest,
+            item_count,
+            success_count,
+            failure_count,
+            cancellation_count,
+        )?;
+    } else {
+        materialize_child_workflow_map_items(state, config, &map_item.map_command_id)?;
+    }
+    Ok(())
+}
+
+fn append_child_workflow_map_completed(
+    state: &mut MemoryState,
+    map_command_id: &crate::CommandId,
+    result_manifest: PayloadRef,
+    item_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    cancellation_count: usize,
+) -> Result<()> {
+    let Some(parent) = state.runs.get_mut(&map_command_id.run_id) else {
+        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    };
+    if parent.terminal {
+        return Ok(());
+    }
+    let event_id = parent
+        .history
+        .last()
+        .map(|event| event.event_id.next())
+        .unwrap_or(EventId(1));
+    parent.history.push(HistoryEvent {
+        event_id,
+        event_type: crate::HistoryEventType::ChildWorkflowMapCompleted,
+        data: HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
+            command_id: map_command_id.clone(),
+            result_manifest,
+            item_count,
+            success_count,
+            failure_count,
+            cancellation_count,
+        }),
+    });
+    parent.ready = Some(WorkflowTaskReason::ChildWorkflowMapCompleted);
+    parent.ready_at = None;
+    Ok(())
+}
+
+fn append_child_workflow_map_failed(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_command_id: &crate::CommandId,
+    failure: crate::DurableFailure,
+) -> Result<()> {
+    let failure = normalize_failure_for_storage(state, config, failure)?;
+    let Some(parent) = state.runs.get_mut(&map_command_id.run_id) else {
+        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    };
+    if parent.terminal {
+        return Ok(());
+    }
+    let event_id = parent
+        .history
+        .last()
+        .map(|event| event.event_id.next())
+        .unwrap_or(EventId(1));
+    parent.history.push(HistoryEvent {
+        event_id,
+        event_type: crate::HistoryEventType::ChildWorkflowMapFailed,
+        data: HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
+            command_id: map_command_id.clone(),
+            failure,
+        }),
+    });
+    parent.ready = Some(WorkflowTaskReason::ChildWorkflowMapFailed);
+    parent.ready_at = None;
+    Ok(())
+}
+
+fn cancel_child_workflow_map_children(state: &mut MemoryState, map_command_id: &crate::CommandId) {
+    for record in state.child_outbox.values_mut() {
+        if record
+            .message
+            .child_map_item
+            .as_ref()
+            .is_some_and(|item| item.map_command_id == *map_command_id)
+            && record.child_run_id.is_none()
+        {
+            record.dispatched = true;
+        }
+    }
+
+    let children = state
+        .runs
+        .iter()
+        .filter_map(|(run_id, run)| {
+            run.parent
+                .as_ref()
+                .and_then(|parent| parent.child_map_item.as_ref())
+                .is_some_and(|item| item.map_command_id == *map_command_id)
+                .then_some((run_id.clone(), run.terminal))
+        })
+        .filter_map(|(run_id, terminal)| (!terminal).then_some(run_id))
+        .collect::<Vec<_>>();
+    for child_run_id in children {
+        if let Some(child) = state.runs.get_mut(&child_run_id) {
+            let event_id = child
+                .history
+                .last()
+                .map(|event| event.event_id.next())
+                .unwrap_or(EventId(1));
+            child.history.push(HistoryEvent {
+                event_id,
+                event_type: crate::HistoryEventType::WorkflowCancelled,
+                data: HistoryEventData::WorkflowCancelled {
+                    reason: format!("child workflow map `{}` failed", map_command_id.seq.0),
+                },
+            });
+            child.terminal = true;
+            child.ready = None;
+            child.ready_at = None;
+            child.workflow_claim = None;
+        }
+        cleanup_run_operational_state(state, &child_run_id);
+    }
 }
 
 fn complete_map_item(
@@ -1984,6 +2415,13 @@ fn collect_reachable_payload_blobs(
             collect_payload_blob_ref(state, result, reachable)?;
         }
     }
+    for map in state.child_workflow_maps.values() {
+        collect_activity_map_input_manifest_ref(state, &map.task.input_manifest, reachable)?;
+        collect_activity_map_input_manifest(state, &map.input_manifest, reachable)?;
+        for outcome in map.outcomes.values() {
+            collect_child_workflow_map_outcome_payload_blobs(state, outcome, reachable)?;
+        }
+    }
     for record in state.child_outbox.values() {
         collect_payload_blob_ref(state, &record.message.input, reachable)?;
     }
@@ -2012,6 +2450,14 @@ fn collect_payload_roots(state: &MemoryState) -> Result<Vec<PayloadRootRef>> {
         ));
         for result in map.results.values() {
             roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+    }
+    for map in state.child_workflow_maps.values() {
+        roots.push(PayloadRootRef::ActivityMapInputManifest(
+            activity_map_input_root_for_roots(state, &map.task.input_manifest)?,
+        ));
+        for outcome in map.outcomes.values() {
+            collect_child_workflow_map_outcome_payload_roots(outcome, &mut roots);
         }
     }
     for record in state.child_outbox.values() {
@@ -2056,6 +2502,19 @@ fn collect_history_event_payload_roots(
             ));
         }
         HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_roots(&failed.failure, roots);
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+            roots.push(PayloadRootRef::ActivityMapInputManifest(
+                activity_map_input_root_for_roots(state, &scheduled.input_manifest)?,
+            ));
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+            roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
+                child_workflow_map_result_root_for_roots(state, &completed.result_manifest)?,
+            ));
+        }
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
             collect_failure_payload_roots(&failed.failure, roots);
         }
         HistoryEventData::ActivityCompleted(completed) => {
@@ -2119,6 +2578,16 @@ fn activity_map_result_root_for_roots(
     hydrate_activity_map_result_manifest_from_storage(state, payload.clone())
 }
 
+fn child_workflow_map_result_root_for_roots(
+    state: &MemoryState,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(payload) {
+        return Ok(payload.clone());
+    }
+    hydrate_child_workflow_map_result_manifest_from_storage(state, payload.clone())
+}
+
 fn collect_history_event_payload_blobs(
     state: &MemoryState,
     data: &HistoryEventData,
@@ -2148,6 +2617,19 @@ fn collect_history_event_payload_blobs(
             collect_activity_map_result_manifest_ref(state, &completed.result_manifest, reachable)
         }
         HistoryEventData::ActivityMapFailed(failed) => {
+            collect_failure_payload_blobs(state, &failed.failure, reachable)
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
+            collect_activity_map_input_manifest_ref(state, &scheduled.input_manifest, reachable)
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+            collect_child_workflow_map_result_manifest_ref(
+                state,
+                &completed.result_manifest,
+                reachable,
+            )
+        }
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
             collect_failure_payload_blobs(state, &failed.failure, reachable)
         }
         HistoryEventData::ActivityCompleted(completed) => {
@@ -2200,9 +2682,9 @@ fn collect_payload_blob_ref(
 ) -> Result<()> {
     if let PayloadRef::Blob { digest, uri, .. } = payload {
         if is_memory_payload_uri(uri) {
-            verify_payload_blob(state, payload)?;
+            verify_payload_blob(state, payload, false)?;
         } else if !is_opaque_external_payload_uri(uri) {
-            verify_payload_blob(state, payload)?;
+            verify_payload_blob(state, payload, false)?;
         }
         reachable.insert(digest.clone());
     }
@@ -2267,6 +2749,62 @@ fn collect_activity_map_result_manifest_ref(
     Ok(())
 }
 
+fn collect_child_workflow_map_result_manifest_ref(
+    state: &MemoryState,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    collect_payload_blob_ref(state, payload, reachable)?;
+    if is_external_payload_ref(payload) {
+        return Ok(());
+    }
+    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
+    let manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&manifest_payload)?;
+    for page in &manifest.pages {
+        collect_payload_blob_ref(state, page, reachable)?;
+        if is_external_payload_ref(page) {
+            continue;
+        }
+        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
+        let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
+        for outcome in &page.outcomes {
+            collect_child_workflow_map_outcome_payload_blobs(state, outcome, reachable)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_child_workflow_map_outcome_payload_roots(
+    outcome: &ChildWorkflowMapItemOutcome,
+    roots: &mut Vec<PayloadRootRef>,
+) {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            collect_failure_payload_roots(failure, roots);
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+    }
+}
+
+fn collect_child_workflow_map_outcome_payload_blobs(
+    state: &MemoryState,
+    outcome: &ChildWorkflowMapItemOutcome,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            collect_payload_blob_ref(state, result, reachable)
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            collect_failure_payload_blobs(state, failure, reachable)
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { .. } => Ok(()),
+    }
+}
+
 fn normalize_history_event_for_storage(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
@@ -2292,6 +2830,27 @@ fn normalize_history_event_for_storage(
                 )?;
             }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
+                    state,
+                    config,
+                    scheduled.input_manifest,
+                )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest =
+                    normalize_child_workflow_map_result_manifest_for_storage(
+                        state,
+                        config,
+                        completed.result_manifest,
+                    )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
             normalize_payload_for_storage(state, config, payload)
@@ -2321,6 +2880,25 @@ fn hydrate_history_event_from_storage(
                 )?;
             }
             Ok(HistoryEventData::ActivityMapCompleted(completed))
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            if !is_external_payload_ref(&scheduled.input_manifest) {
+                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
+                    state,
+                    scheduled.input_manifest,
+                )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            if !is_external_payload_ref(&completed.result_manifest) {
+                completed.result_manifest =
+                    hydrate_child_workflow_map_result_manifest_from_storage(
+                        state,
+                        completed.result_manifest,
+                    )?;
+            }
+            Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
         }
         data => crate::payload::map_history_event_payloads(data, &mut |payload| {
             hydrate_payload_from_storage(state, payload)
@@ -2363,6 +2941,16 @@ fn normalize_activity_map_task_for_storage(
     config: &PayloadStorageConfig,
     mut task: ActivityMapTask,
 ) -> Result<ActivityMapTask> {
+    task.input_manifest =
+        normalize_activity_map_input_manifest_for_storage(state, config, task.input_manifest)?;
+    Ok(task)
+}
+
+fn normalize_child_workflow_map_task_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    mut task: ChildWorkflowMapTask,
+) -> Result<ChildWorkflowMapTask> {
     task.input_manifest =
         normalize_activity_map_input_manifest_for_storage(state, config, task.input_manifest)?;
     Ok(task)
@@ -2457,6 +3045,62 @@ fn normalize_activity_map_result_manifest_for_storage(
     )
 }
 
+fn normalize_child_workflow_map_result_manifest_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(state, payload)?;
+    let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(state, page)?;
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            page.outcomes = page
+                .outcomes
+                .into_iter()
+                .map(|outcome| {
+                    normalize_child_workflow_map_outcome_for_storage(state, config, outcome)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            normalize_payload_for_storage(
+                state,
+                config,
+                crate::encode_payload_with_codec(&page, config.codec)?,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalize_payload_for_storage(
+        state,
+        config,
+        crate::encode_payload_with_codec(&manifest, config.codec)?,
+    )
+}
+
+fn normalize_child_workflow_map_outcome_for_storage(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<ChildWorkflowMapItemOutcome> {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                result: normalize_payload_for_storage(state, config, result)?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            Ok(ChildWorkflowMapItemOutcome::Failed {
+                failure: normalize_failure_for_storage(state, config, failure)?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
+}
+
 fn hydrate_activity_map_input_manifest_from_storage(
     state: &MemoryState,
     payload: PayloadRef,
@@ -2485,6 +3129,51 @@ fn hydrate_activity_map_result_manifest_from_storage(
         &mut hydrate_leaf,
         &mut finish_container,
     )
+}
+
+fn hydrate_child_workflow_map_result_manifest_from_storage(
+    state: &MemoryState,
+    payload: PayloadRef,
+) -> Result<PayloadRef> {
+    let root = hydrate_payload_from_storage(state, payload)?;
+    let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    manifest.pages = manifest
+        .pages
+        .into_iter()
+        .map(|page| {
+            let page = hydrate_payload_from_storage(state, page)?;
+            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+            page.outcomes = page
+                .outcomes
+                .into_iter()
+                .map(|outcome| hydrate_child_workflow_map_outcome_from_storage(state, outcome))
+                .collect::<Result<Vec<_>>>()?;
+            crate::encode_payload_with_codec(&page, root.codec())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::encode_payload_with_codec(&manifest, root.codec())
+}
+
+fn hydrate_child_workflow_map_outcome_from_storage(
+    state: &MemoryState,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<ChildWorkflowMapItemOutcome> {
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                result: hydrate_payload_from_storage(state, result)?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+            if let Some(details) = failure.details.take() {
+                failure.details = Some(hydrate_payload_from_storage(state, details)?);
+            }
+            Ok(ChildWorkflowMapItemOutcome::Failed { failure })
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
 }
 
 fn normalize_payload_for_storage(
@@ -2526,7 +3215,7 @@ fn normalize_payload_for_storage(
         payload @ PayloadRef::Blob { .. } => {
             if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
             {
-                verify_payload_blob(state, &payload)?;
+                verify_payload_blob(state, &payload, true)?;
             }
             Ok(payload)
         }
@@ -2551,7 +3240,7 @@ fn hydrate_payload_from_storage(state: &MemoryState, payload: PayloadRef) -> Res
             else {
                 unreachable!();
             };
-            let blob = verify_payload_blob(state, &payload)?;
+            let blob = verify_payload_blob(state, &payload, false)?;
             Ok(PayloadRef::Inline {
                 codec: *codec,
                 schema_fingerprint: schema_fingerprint.clone(),
@@ -2578,10 +3267,11 @@ fn is_opaque_external_payload_uri(uri: &str) -> bool {
 fn verify_payload_blob<'a>(
     state: &'a MemoryState,
     payload: &PayloadRef,
+    require_schema_fingerprint_match: bool,
 ) -> Result<&'a PayloadBlob> {
     let PayloadRef::Blob {
         codec,
-        schema_fingerprint,
+        schema_fingerprint: _schema_fingerprint,
         compression,
         encryption,
         digest,
@@ -2599,7 +3289,7 @@ fn verify_payload_blob<'a>(
         )));
     };
     if blob.codec != *codec
-        || blob.schema_fingerprint != *schema_fingerprint
+        || (require_schema_fingerprint_match && blob.schema_fingerprint != *_schema_fingerprint)
         || blob.compression != *compression
         || blob.encryption != *encryption
     {
@@ -2644,5 +3334,61 @@ fn ready_at_for_delay(delay: Duration) -> Option<Instant> {
     } else {
         let now = Instant::now();
         Some(now.checked_add(delay).unwrap_or(now))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CodecId, CompressionId, SchemaFingerprint};
+
+    #[test]
+    fn content_addressed_payload_blobs_allow_distinct_schema_fingerprints() {
+        let config = PayloadStorageConfig::new().inline_threshold_bytes(0);
+        let bytes = vec![0x2a];
+        let mut state = MemoryState::default();
+
+        let first = normalize_payload_for_storage(
+            &mut state,
+            &config,
+            PayloadRef::Inline {
+                codec: CodecId::MessagePack,
+                schema_fingerprint: SchemaFingerprint("schema:first".to_owned()),
+                compression: CompressionId::None,
+                encryption: None,
+                bytes: bytes.clone(),
+            },
+        )
+        .unwrap();
+        let second = normalize_payload_for_storage(
+            &mut state,
+            &config,
+            PayloadRef::Inline {
+                codec: CodecId::MessagePack,
+                schema_fingerprint: SchemaFingerprint("schema:second".to_owned()),
+                compression: CompressionId::None,
+                encryption: None,
+                bytes,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.payload_blobs.len(), 1);
+        let first_hydrated = hydrate_payload_from_storage(&state, first).unwrap();
+        let second_hydrated = hydrate_payload_from_storage(&state, second).unwrap();
+        assert!(matches!(
+            first_hydrated,
+            PayloadRef::Inline {
+                schema_fingerprint: SchemaFingerprint(ref schema),
+                ..
+            } if schema == "schema:first"
+        ));
+        assert!(matches!(
+            second_hydrated,
+            PayloadRef::Inline {
+                schema_fingerprint: SchemaFingerprint(ref schema),
+                ..
+            } if schema == "schema:second"
+        ));
     }
 }
