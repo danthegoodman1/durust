@@ -26,6 +26,10 @@ struct BenchInput {
     value: u64,
 }
 
+fn bench_input(value: u64) -> BenchInput {
+    BenchInput { value }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LargePayload {
     body: String,
@@ -37,7 +41,8 @@ async fn double(input: BenchInput) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "bench.double-plus-one", version = 1)]
-async fn double_plus_one(input: u64) -> durust::Result<u64> {
+async fn double_plus_one(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     let doubled = durust::call_activity!(double(BenchInput { value: input }))
         .task_queue("activities")
         .await?;
@@ -52,7 +57,8 @@ async fn large_payload_then_timer(input: LargePayload) -> durust::Result<usize> 
 }
 
 #[durust::workflow(name = "bench.join-four-activities", version = 1)]
-async fn join_four_activities(input: u64) -> durust::Result<u64> {
+async fn join_four_activities(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     let (first, second, third, fourth) = durust::join!(
         durust::call_activity!(double(BenchInput { value: input })).task_queue("activities"),
         durust::call_activity!(double(BenchInput { value: input + 1 })).task_queue("activities"),
@@ -64,7 +70,8 @@ async fn join_four_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "bench.select-all-activities", version = 1)]
-async fn select_all_activities(input: u64) -> durust::Result<u64> {
+async fn select_all_activities(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     let mut branches = Vec::new();
     for offset in 0..4_u64 {
         let handle = durust::call_activity!(double(BenchInput {
@@ -80,7 +87,8 @@ async fn select_all_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "bench.join-all-activities", version = 1)]
-async fn join_all_activities(input: u64) -> durust::Result<u64> {
+async fn join_all_activities(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     let mut branches = Vec::new();
     for offset in 0..4_u64 {
         let handle = durust::call_activity!(double(BenchInput {
@@ -96,7 +104,8 @@ async fn join_all_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "bench.version-branch", version = 1)]
-async fn version_branch(input: u64) -> durust::Result<u64> {
+async fn version_branch(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     if durust::patched("bench-double-v2")? {
         durust::call_activity!(double(BenchInput { value: input + 1 }))
             .task_queue("activities")
@@ -109,13 +118,15 @@ async fn version_branch(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "bench.child-double", version = 1)]
-async fn child_double(input: u64) -> durust::Result<u64> {
+async fn child_double(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
     Ok(input * 2)
 }
 
 #[durust::workflow(name = "bench.child-start", version = 1)]
-async fn child_start(input: u64) -> durust::Result<()> {
-    let _child = durust::child!(child_double(input))
+async fn child_start(input: BenchInput) -> durust::Result<()> {
+    let input = input.value;
+    let _child = durust::child!(child_double(bench_input(input)))
         .workflow_id(format!("bench/child/{input}"))
         .spawn()
         .await?;
@@ -123,7 +134,8 @@ async fn child_start(input: u64) -> durust::Result<()> {
 }
 
 #[durust::workflow(name = "bench.select-signal-timer", version = 1)]
-async fn select_signal_timer(input: u64) -> durust::Result<String> {
+async fn select_signal_timer(input: BenchInput) -> durust::Result<String> {
+    let input = input.value;
     let outcome = durust::select! {
         signal = durust::signal::<String>("ready") => {
             format!("signal:{}", signal?)
@@ -137,12 +149,13 @@ async fn select_signal_timer(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "bench.select-all-mixed", version = 1)]
-async fn select_all_mixed(input: u64) -> durust::Result<String> {
+async fn select_all_mixed(input: BenchInput) -> durust::Result<String> {
+    let input = input.value;
     let activity = durust::call_activity!(double(BenchInput { value: input }))
         .task_queue("activities")
         .spawn()
         .await?;
-    let child = durust::child!(child_double(input + 10_000))
+    let child = durust::child!(child_double(bench_input(input + 10_000)))
         .workflow_id(format!("bench/mixed-child/{input}"))
         .parent_close_policy(durust::ParentClosePolicy::Abandon)
         .spawn()
@@ -166,7 +179,8 @@ async fn select_all_mixed(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "bench.select-then-wait", version = 1)]
-async fn select_then_wait(input: u64) -> durust::Result<String> {
+async fn select_then_wait(input: BenchInput) -> durust::Result<String> {
+    let input = input.value;
     let first = durust::select! {
         signal = durust::signal::<String>("ready") => {
             format!("signal:{}", signal?)
@@ -1405,7 +1419,7 @@ fn setup_started_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", bench_input(10))
             .await
             .unwrap();
         (worker(backend.clone()), backend)
@@ -1417,7 +1431,7 @@ fn setup_started_sqlite_worker() -> (tempfile::TempDir, Worker<SqliteBackend>) {
         let (dir, backend) = sqlite_backend();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", bench_input(10))
             .await
             .unwrap();
         (dir, sqlite_worker(backend))
@@ -1429,7 +1443,7 @@ fn setup_completed_activity() -> (Worker<MemoryBackend>, MemoryBackend) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", bench_input(10))
             .await
             .unwrap();
         let mut worker = worker(backend.clone());
@@ -1444,7 +1458,7 @@ fn setup_completed_activity_with_recovery_saturation() -> (Worker<MemoryBackend>
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("bench/workflow", "workflows", 10)
+            .start_workflow::<double_plus_one>("bench/workflow", "workflows", bench_input(10))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1465,7 +1479,11 @@ fn setup_select_registration_worker() -> (Worker<MemoryBackend>, MemoryBackend) 
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<select_signal_timer>("bench/select-registration", "workflows", 10)
+            .start_workflow::<select_signal_timer>(
+                "bench/select-registration",
+                "workflows",
+                bench_input(10),
+            )
             .await
             .unwrap();
         (select_worker(backend.clone()), backend)
@@ -1477,7 +1495,7 @@ fn setup_select_replay() -> MemoryBackend {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<select_then_wait>("bench/select-replay", "workflows", 10)
+            .start_workflow::<select_then_wait>("bench/select-replay", "workflows", bench_input(10))
             .await
             .unwrap();
         let mut worker = select_replay_worker(backend.clone());
@@ -1504,7 +1522,7 @@ fn setup_child_start_outbox() -> MemoryBackend {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<child_start>("bench/child-parent", "workflows", 42)
+            .start_workflow::<child_start>("bench/child-parent", "workflows", bench_input(42))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1521,7 +1539,7 @@ fn setup_version_marker_replay() -> MemoryBackend {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<version_branch>("bench/version-branch", "workflows", 10)
+            .start_workflow::<version_branch>("bench/version-branch", "workflows", bench_input(10))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1541,7 +1559,11 @@ fn setup_join_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<join_four_activities>("bench/join-fanout", "workflows", 10)
+            .start_workflow::<join_four_activities>(
+                "bench/join-fanout",
+                "workflows",
+                bench_input(10),
+            )
             .await
             .unwrap();
         (join_worker(backend.clone()), backend)
@@ -1553,7 +1575,11 @@ fn setup_join_all_fanout_worker() -> (Worker<MemoryBackend>, MemoryBackend) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<join_all_activities>("bench/join-all-fanout", "workflows", 10)
+            .start_workflow::<join_all_activities>(
+                "bench/join-all-fanout",
+                "workflows",
+                bench_input(10),
+            )
             .await
             .unwrap();
         (join_all_worker(backend.clone()), backend)
@@ -1565,7 +1591,11 @@ fn setup_select_all_activity_race() -> (Worker<MemoryBackend>, MemoryBackend) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<select_all_activities>("bench/select-all", "workflows", 10)
+            .start_workflow::<select_all_activities>(
+                "bench/select-all",
+                "workflows",
+                bench_input(10),
+            )
             .await
             .unwrap();
         let mut worker = select_all_worker(backend.clone());
@@ -1642,7 +1672,7 @@ async fn create_claimable_workflow() -> (MemoryBackend, WorkerId, ClaimWorkflowT
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<double_plus_one>("bench/claim", "workflows", 10)
+        .start_workflow::<double_plus_one>("bench/claim", "workflows", bench_input(10))
         .await
         .unwrap();
     (
@@ -1670,7 +1700,7 @@ async fn create_claimable_workflow_sqlite() -> (
     let (dir, backend) = sqlite_backend();
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<double_plus_one>("bench/claim", "workflows", 10)
+        .start_workflow::<double_plus_one>("bench/claim", "workflows", bench_input(10))
         .await
         .unwrap();
     (
@@ -1934,7 +1964,7 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("bench/signal", "workflows", 10)
+            .start_workflow::<double_plus_one>("bench/signal", "workflows", bench_input(10))
             .await
             .unwrap();
         let claimed = backend
@@ -2364,7 +2394,7 @@ async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize)
                     .start_workflow::<double_plus_one>(
                         format!("bench/sqlite-mixed/double/{index}"),
                         "workflows",
-                        input,
+                        bench_input(input),
                     )
                     .await
                     .unwrap();
@@ -2374,7 +2404,7 @@ async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize)
                     .start_workflow::<join_all_activities>(
                         format!("bench/sqlite-mixed/join-all/{index}"),
                         "workflows",
-                        input,
+                        bench_input(input),
                     )
                     .await
                     .unwrap();
@@ -2384,7 +2414,7 @@ async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize)
                     .start_workflow::<select_all_activities>(
                         format!("bench/sqlite-mixed/select-all/{index}"),
                         "workflows",
-                        input,
+                        bench_input(input),
                     )
                     .await
                     .unwrap();
@@ -2394,7 +2424,7 @@ async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize)
                     .start_workflow::<child_start>(
                         format!("bench/sqlite-mixed/child-start/{index}"),
                         "workflows",
-                        input,
+                        bench_input(input),
                     )
                     .await
                     .unwrap();
@@ -2404,7 +2434,7 @@ async fn start_sqlite_mixed_workflows(backend: &SqliteBackend, workflows: usize)
                     .start_workflow::<select_all_mixed>(
                         format!("bench/sqlite-mixed/mixed/{index}"),
                         "workflows",
-                        input,
+                        bench_input(input),
                     )
                     .await
                     .unwrap();

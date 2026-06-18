@@ -12,6 +12,11 @@ struct WorkItem {
     value: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CollectWorkInput {
+    items: Vec<WorkItem>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WorkOutput {
     id: String,
@@ -27,9 +32,9 @@ async fn work_item(input: WorkItem) -> durust::Result<WorkOutput> {
 }
 
 #[durust::workflow(name = "examples.activity-spawn-join-all", version = 1)]
-async fn collect_work(items: Vec<WorkItem>) -> durust::Result<String> {
+async fn collect_work(input: CollectWorkInput) -> durust::Result<String> {
     let mut branches = Vec::new();
-    for item in items {
+    for item in input.items {
         let handle = durust::call_activity!(work_item(item))
             .task_queue("workers")
             .spawn()
@@ -61,20 +66,22 @@ async fn run_example() -> durust::Result<String> {
         .start_workflow::<collect_work>(
             "join-all/1",
             "workflows",
-            vec![
-                WorkItem {
-                    id: "a".to_owned(),
-                    value: 10,
-                },
-                WorkItem {
-                    id: "b".to_owned(),
-                    value: 11,
-                },
-                WorkItem {
-                    id: "c".to_owned(),
-                    value: 12,
-                },
-            ],
+            CollectWorkInput {
+                items: vec![
+                    WorkItem {
+                        id: "a".to_owned(),
+                        value: 10,
+                    },
+                    WorkItem {
+                        id: "b".to_owned(),
+                        value: 11,
+                    },
+                    WorkItem {
+                        id: "c".to_owned(),
+                        value: 12,
+                    },
+                ],
+            },
         )
         .await?;
     let mut worker = Worker::builder(backend.clone())

@@ -6,15 +6,21 @@ struct ItemInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SumChildWorkflowMapInput {
+    values: Vec<u64>,
+}
+
 #[durust::workflow(name = "examples.child-map-item", version = 1)]
 async fn child_map_item(input: ItemInput) -> durust::Result<u64> {
     Ok(input.value * input.value)
 }
 
 #[durust::workflow(name = "examples.child-workflow-map", version = 1)]
-async fn sum_child_workflow_map(values: Vec<u64>) -> durust::Result<u64> {
-    let input_manifest =
-        durust::child_workflow_map_manifest(values.into_iter().map(|value| ItemInput { value }))?;
+async fn sum_child_workflow_map(input: SumChildWorkflowMapInput) -> durust::Result<u64> {
+    let input_manifest = durust::child_workflow_map_manifest(
+        input.values.into_iter().map(|value| ItemInput { value }),
+    )?;
     let mapped = durust::child_workflow_map::<child_map_item>()
         .task_queue("workflows")
         .workflow_id_prefix("child-map/items")
@@ -38,7 +44,9 @@ fn main() -> durust::Result<()> {
             .start_workflow::<sum_child_workflow_map>(
                 "examples/child-workflow-map",
                 "workflows",
-                vec![2, 3, 4],
+                SumChildWorkflowMapInput {
+                    values: vec![2, 3, 4],
+                },
             )
             .await?;
 

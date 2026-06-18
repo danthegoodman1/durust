@@ -1,5 +1,5 @@
 error: unknown await in workflow code; use durable APIs such as durust::call_activity!
- --> tests/ui/unknown_await.rs:3:5
+ --> tests/ui/unknown_await.rs:6:5
   |
-3 |     std::future::ready(()).await;
+6 |     std::future::ready(()).await;
   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

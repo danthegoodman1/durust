@@ -204,6 +204,42 @@ export manifest metadata for the binary that links them. Use
 `durust::exported_manifest()` with `durust::write_manifest(...)` to materialize a
 current `durable.manifest.json` candidate for review.
 
+Workflow and activity handlers take exactly one named input struct. Wrap scalar,
+tuple, collection, and no-input cases in an explicit request type so durable
+inputs can evolve by adding named fields without changing the handler shape:
+
+```rust
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NoInput {}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChargeInput {
+    pub order_id: String,
+    pub amount_cents: u64,
+}
+```
+
+When evolving an input type, prefer additive fields that old history payloads can
+deserialize. Optional fields should normally use `Option<T>` plus Serde defaults:
+
+```rust
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChargeInput {
+    pub order_id: String,
+    pub amount_cents: u64,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_scope: Option<String>,
+}
+```
+
+With this shape, workflows or activities started before the field existed replay
+with `idempotency_scope: None`, while new callers can set it explicitly. For
+non-optional fields, give Serde a deterministic default with `#[serde(default)]`
+only when that default preserves the old semantics. Breaking input changes should
+use the normal Durust versioning tools rather than relying on replay to reinterpret
+old payloads.
+
 If an activity is registered locally on the workflow worker and
 `max_local_activities_per_workflow_task` has available slots, Durust executes
 that activity in the workflow worker process before remote workers can claim

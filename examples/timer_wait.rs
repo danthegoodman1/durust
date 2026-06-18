@@ -1,11 +1,17 @@
 use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
 use futures::executor::block_on;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SleepInput {
+    millis: u64,
+}
+
 #[durust::workflow(name = "examples.timer-wait", version = 1)]
-async fn sleep_then_return(input: u64) -> durust::Result<u64> {
-    durust::sleep(Duration::from_millis(input)).await?;
-    Ok(input + 1)
+async fn sleep_then_return(input: SleepInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(input.millis)).await?;
+    Ok(input.millis + 1)
 }
 
 fn main() {
@@ -19,7 +25,7 @@ async fn run_example() -> durust::Result<u64> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<sleep_then_return>("timer/1", "workflows", 50)
+        .start_workflow::<sleep_then_return>("timer/1", "workflows", SleepInput { millis: 50 })
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

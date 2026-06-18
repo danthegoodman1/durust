@@ -7,14 +7,19 @@ struct GreetingInput {
     name: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct HelloInput {
+    name: String,
+}
+
 #[durust::activity(name = "examples.greet")]
 async fn greet(input: GreetingInput) -> durust::Result<String> {
     Ok(format!("hello, {}", input.name))
 }
 
 #[durust::workflow(name = "examples.hello-activity", version = 1)]
-async fn hello(name: String) -> durust::Result<String> {
-    durust::call_activity!(greet(GreetingInput { name }))
+async fn hello(input: HelloInput) -> durust::Result<String> {
+    durust::call_activity!(greet(GreetingInput { name: input.name }))
         .task_queue("activities")
         .await
 }
@@ -24,7 +29,13 @@ fn main() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<hello>("hello/1", "workflows", "durust".to_owned())
+            .start_workflow::<hello>(
+                "hello/1",
+                "workflows",
+                HelloInput {
+                    name: "durust".to_owned(),
+                },
+            )
             .await
             .expect("start workflow");
         let mut worker = Worker::builder(backend.clone())

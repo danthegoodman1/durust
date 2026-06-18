@@ -64,6 +64,26 @@ struct NumberInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct UnitInput {}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ValuesInput {
+    values: Vec<u64>,
+}
+
+fn number(value: u64) -> NumberInput {
+    NumberInput { value }
+}
+
+fn unit() -> UnitInput {
+    UnitInput {}
+}
+
+fn values(values: Vec<u64>) -> ValuesInput {
+    ValuesInput { values }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct QueryView {
     status: String,
@@ -92,12 +112,12 @@ async fn map_double(input: NumberInput) -> durust::Result<u64> {
 }
 
 #[durust::activity(name = "tests.fail")]
-async fn fail_activity(_: ()) -> durust::Result<u64> {
+async fn fail_activity(_: UnitInput) -> durust::Result<u64> {
     Err(durust::Error::Backend("boom".to_owned()))
 }
 
 #[durust::activity(name = "tests.non-retryable")]
-async fn non_retryable_activity(_: ()) -> durust::Result<u64> {
+async fn non_retryable_activity(_: UnitInput) -> durust::Result<u64> {
     Err(durust::Error::non_retryable(
         "tests.validation",
         "validation failed",
@@ -105,7 +125,7 @@ async fn non_retryable_activity(_: ()) -> durust::Result<u64> {
 }
 
 #[durust::activity(name = "tests.flaky")]
-async fn flaky_activity(_: ()) -> durust::Result<u64> {
+async fn flaky_activity(_: UnitInput) -> durust::Result<u64> {
     let mut attempts = FLAKY_ATTEMPTS.lock().unwrap();
     *attempts += 1;
     if *attempts == 1 {
@@ -123,24 +143,25 @@ async fn heartbeat_activity_test(input: NumberInput) -> durust::Result<u64> {
 }
 
 #[durust::activity(name = "tests.large-payload-result")]
-async fn large_payload_result(_: ()) -> durust::Result<LargePayload> {
+async fn large_payload_result(_: UnitInput) -> durust::Result<LargePayload> {
     Ok(LargePayload {
         bytes: vec![7; 64 * 1024],
     })
 }
 
 #[durust::activity(name = "tests.version-a")]
-async fn version_activity_a(_: ()) -> durust::Result<String> {
+async fn version_activity_a(_: UnitInput) -> durust::Result<String> {
     Ok("a".to_owned())
 }
 
 #[durust::activity(name = "tests.version-b")]
-async fn version_activity_b(_: ()) -> durust::Result<String> {
+async fn version_activity_b(_: UnitInput) -> durust::Result<String> {
     Ok("b".to_owned())
 }
 
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
-async fn double_plus_one(input: u64) -> durust::Result<u64> {
+async fn double_plus_one(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let doubled = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .await?;
@@ -148,61 +169,64 @@ async fn double_plus_one(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
-async fn version_original(_: ()) -> durust::Result<String> {
-    durust::call_activity!(version_activity_a(()))
+async fn version_original(_: UnitInput) -> durust::Result<String> {
+    durust::call_activity!(version_activity_a(UnitInput {}))
         .task_queue("activities")
         .await
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
-async fn version_patched(_: ()) -> durust::Result<String> {
+async fn version_patched(_: UnitInput) -> durust::Result<String> {
     if durust::patched("replace-a-with-b")? {
-        durust::call_activity!(version_activity_b(()))
+        durust::call_activity!(version_activity_b(UnitInput {}))
             .task_queue("activities")
             .await
     } else {
-        durust::call_activity!(version_activity_a(()))
+        durust::call_activity!(version_activity_a(UnitInput {}))
             .task_queue("activities")
             .await
     }
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
-async fn version_min_two(_: ()) -> durust::Result<String> {
+async fn version_min_two(_: UnitInput) -> durust::Result<String> {
     let _ = durust::get_version("replace-a-with-b", 2, 2)?;
-    durust::call_activity!(version_activity_b(()))
+    durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
-async fn version_deprecated(_: ()) -> durust::Result<String> {
+async fn version_deprecated(_: UnitInput) -> durust::Result<String> {
     durust::deprecate_patch("replace-a-with-b")?;
-    durust::call_activity!(version_activity_b(()))
+    durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
-async fn version_removed(_: ()) -> durust::Result<String> {
-    durust::call_activity!(version_activity_b(()))
+async fn version_removed(_: UnitInput) -> durust::Result<String> {
+    durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
 }
 
 #[durust::workflow(name = "tests.child-double", version = 1)]
-async fn child_double_workflow(input: u64) -> durust::Result<u64> {
+async fn child_double_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     Ok(input * 2)
 }
 
 #[durust::workflow(name = "tests.child-triple", version = 1)]
-async fn child_triple_workflow(input: u64) -> durust::Result<u64> {
+async fn child_triple_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     Ok(input * 3)
 }
 
 #[durust::workflow(name = "tests.child-spawn-wait", version = 1)]
-async fn child_spawn_wait_workflow(input: u64) -> durust::Result<u64> {
-    let child = durust::child!(child_double_workflow(input))
+async fn child_spawn_wait_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/child-spawn-wait/{input}"))
         .spawn()
         .await?;
@@ -210,8 +234,9 @@ async fn child_spawn_wait_workflow(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.postgres-inline-child-signal-timer", version = 1)]
-async fn postgres_inline_child_signal_timer(input: u64) -> durust::Result<String> {
-    let child = durust::child!(child_double_workflow(input))
+async fn postgres_inline_child_signal_timer(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/postgres-inline-child-signal-timer/{input}"))
         .spawn()
         .await?;
@@ -222,8 +247,9 @@ async fn postgres_inline_child_signal_timer(input: u64) -> durust::Result<String
 }
 
 #[durust::workflow(name = "tests.child-spawn-abandon", version = 1)]
-async fn child_spawn_abandon_workflow(input: u64) -> durust::Result<String> {
-    let child = durust::child!(child_double_workflow(input))
+async fn child_spawn_abandon_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/child-spawn-abandon/{input}"))
         .parent_close_policy(durust::ParentClosePolicy::Abandon)
         .spawn()
@@ -232,8 +258,9 @@ async fn child_spawn_abandon_workflow(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.child-spawn-cancel", version = 1)]
-async fn child_spawn_cancel_workflow(input: u64) -> durust::Result<String> {
-    let child = durust::child!(child_double_workflow(input))
+async fn child_spawn_cancel_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/child-spawn-cancel/{input}"))
         .parent_close_policy(durust::ParentClosePolicy::Cancel)
         .spawn()
@@ -242,8 +269,9 @@ async fn child_spawn_cancel_workflow(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-child-result", version = 1)]
-async fn select_child_result_workflow(input: u64) -> durust::Result<String> {
-    let child = durust::child!(child_double_workflow(input))
+async fn select_child_result_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/select-child-result/{input}"))
         .spawn()
         .await?;
@@ -260,8 +288,9 @@ async fn select_child_result_workflow(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-timer-before-child-result", version = 1)]
-async fn select_timer_before_child_result_workflow(input: u64) -> durust::Result<String> {
-    let child = durust::child!(child_double_workflow(input))
+async fn select_timer_before_child_result_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/select-timer-before-child-result/{input}"))
         .parent_close_policy(durust::ParentClosePolicy::Abandon)
         .spawn()
@@ -279,7 +308,8 @@ async fn select_timer_before_child_result_workflow(input: u64) -> durust::Result
 }
 
 #[durust::workflow(name = "tests.activity-spawn-await-later", version = 1)]
-async fn activity_spawn_await_later_workflow(input: u64) -> durust::Result<u64> {
+async fn activity_spawn_await_later_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let first = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .spawn()
@@ -292,8 +322,8 @@ async fn activity_spawn_await_later_workflow(input: u64) -> durust::Result<u64> 
 }
 
 #[durust::workflow(name = "tests.sleep-before-large-activity-result", version = 1)]
-async fn sleep_before_large_activity_result(_: ()) -> durust::Result<usize> {
-    let handle = durust::call_activity!(large_payload_result(()))
+async fn sleep_before_large_activity_result(_: UnitInput) -> durust::Result<usize> {
+    let handle = durust::call_activity!(large_payload_result(UnitInput {}))
         .task_queue("activities")
         .spawn()
         .await?;
@@ -303,7 +333,7 @@ async fn sleep_before_large_activity_result(_: ()) -> durust::Result<usize> {
 }
 
 #[durust::workflow(name = "tests.side-effect-then-sleep", version = 1)]
-async fn side_effect_then_sleep_workflow(_: ()) -> durust::Result<String> {
+async fn side_effect_then_sleep_workflow(_: UnitInput) -> durust::Result<String> {
     let value = durust::side_effect("make-id", || {
         let mut counter = SIDE_EFFECT_COUNTER.lock().unwrap();
         *counter += 1;
@@ -315,7 +345,7 @@ async fn side_effect_then_sleep_workflow(_: ()) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.oversized-side-effect", version = 1)]
-async fn oversized_side_effect_workflow(_: ()) -> durust::Result<()> {
+async fn oversized_side_effect_workflow(_: UnitInput) -> durust::Result<()> {
     let _: String = durust::side_effect("too-large", || {
         "x".repeat(durust::MAX_SIDE_EFFECT_PAYLOAD_BYTES + 1)
     })
@@ -324,7 +354,8 @@ async fn oversized_side_effect_workflow(_: ()) -> durust::Result<()> {
 }
 
 #[durust::workflow(name = "tests.select-all-activity-handles", version = 1)]
-async fn select_all_activity_handles_workflow(input: u64) -> durust::Result<String> {
+async fn select_all_activity_handles_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let mut branches = Vec::new();
     for offset in 0..3_u64 {
         let handle = durust::call_activity!(double(NumberInput {
@@ -340,12 +371,13 @@ async fn select_all_activity_handles_workflow(input: u64) -> durust::Result<Stri
 }
 
 #[durust::workflow(name = "tests.select-all-mixed-branches", version = 1)]
-async fn select_all_mixed_branches_workflow(input: u64) -> durust::Result<String> {
+async fn select_all_mixed_branches_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let activity = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .spawn()
         .await?;
-    let child = durust::child!(child_double_workflow(input + 10))
+    let child = durust::child!(child_double_workflow(number(input + 10)))
         .workflow_id(format!("wf/select-all-mixed-child/{input}"))
         .parent_close_policy(durust::ParentClosePolicy::Abandon)
         .spawn()
@@ -369,7 +401,8 @@ async fn select_all_mixed_branches_workflow(input: u64) -> durust::Result<String
 }
 
 #[durust::workflow(name = "tests.join-all-activity-handles", version = 1)]
-async fn join_all_activity_handles_workflow(input: u64) -> durust::Result<String> {
+async fn join_all_activity_handles_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let mut branches = Vec::new();
     for offset in 0..3_u64 {
         let handle = durust::call_activity!(double(NumberInput {
@@ -389,7 +422,8 @@ async fn join_all_activity_handles_workflow(input: u64) -> durust::Result<String
 }
 
 #[durust::workflow(name = "tests.join-all-mixed-branches", version = 1)]
-async fn join_all_mixed_branches_workflow(input: u64) -> durust::Result<String> {
+async fn join_all_mixed_branches_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let activity = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .spawn()
@@ -408,12 +442,13 @@ async fn join_all_mixed_branches_workflow(input: u64) -> durust::Result<String> 
 }
 
 #[durust::workflow(name = "tests.child-first-select-then-timer", version = 1)]
-async fn child_first_select_then_timer_workflow(input: u64) -> durust::Result<String> {
+async fn child_first_select_then_timer_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let activity = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .spawn()
         .await?;
-    let child = durust::child!(child_double_workflow(input + 10))
+    let child = durust::child!(child_double_workflow(number(input + 10)))
         .workflow_id(format!("wf/child-first-select/{input}"))
         .spawn()
         .await?;
@@ -433,7 +468,8 @@ async fn child_first_select_then_timer_workflow(input: u64) -> durust::Result<St
 }
 
 #[durust::workflow(name = "tests.timer-first-select-then-timer", version = 1)]
-async fn timer_first_select_then_timer_workflow(input: u64) -> durust::Result<String> {
+async fn timer_first_select_then_timer_workflow(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let activity = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .spawn()
@@ -453,7 +489,8 @@ async fn timer_first_select_then_timer_workflow(input: u64) -> durust::Result<St
 }
 
 #[durust::workflow(name = "tests.join-two-activities", version = 1)]
-async fn join_two_activities(input: u64) -> durust::Result<u64> {
+async fn join_two_activities(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let (left, right) = durust::join!(
         durust::call_activity!(double(NumberInput { value: input })).task_queue("activities"),
         durust::call_activity!(double(NumberInput { value: input + 1 })).task_queue("activities"),
@@ -463,7 +500,8 @@ async fn join_two_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.join-four-activities", version = 1)]
-async fn join_four_activities(input: u64) -> durust::Result<u64> {
+async fn join_four_activities(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let (first, second, third, fourth) = durust::join!(
         durust::call_activity!(double(NumberInput { value: input })).task_queue("activities"),
         durust::call_activity!(double(NumberInput { value: input + 1 })).task_queue("activities"),
@@ -475,7 +513,8 @@ async fn join_four_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.sequential-two-activities", version = 1)]
-async fn sequential_two_activities(input: u64) -> durust::Result<u64> {
+async fn sequential_two_activities(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let first = durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .await?;
@@ -486,7 +525,8 @@ async fn sequential_two_activities(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.join-signal-timer", version = 1)]
-async fn join_signal_timer(input: u64) -> durust::Result<String> {
+async fn join_signal_timer(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let (signal, _) = durust::join!(
         durust::signal::<String>("ready"),
         durust::sleep(Duration::from_millis(input)),
@@ -496,7 +536,8 @@ async fn join_signal_timer(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.join-signal-timer-then-timer", version = 1)]
-async fn join_signal_timer_then_timer(input: u64) -> durust::Result<String> {
+async fn join_signal_timer_then_timer(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let (signal, _) = durust::join!(
         durust::signal::<String>("ready"),
         durust::sleep(Duration::from_millis(input)),
@@ -507,7 +548,8 @@ async fn join_signal_timer_then_timer(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-signal-timer", version = 1)]
-async fn select_signal_timer(input: u64) -> durust::Result<String> {
+async fn select_signal_timer(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let outcome = durust::select! {
         signal = durust::signal::<String>("ready") => {
             format!("signal:{}", signal?)
@@ -521,7 +563,8 @@ async fn select_signal_timer(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-activity-timer", version = 1)]
-async fn select_activity_timer(input: u64) -> durust::Result<u64> {
+async fn select_activity_timer(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let outcome = durust::select! {
         activity = durust::call_activity!(double(NumberInput { value: input })).task_queue("activities") => {
             activity?
@@ -535,7 +578,8 @@ async fn select_activity_timer(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.select-timer-before-activity", version = 1)]
-async fn select_timer_before_activity(input: u64) -> durust::Result<String> {
+async fn select_timer_before_activity(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let outcome = durust::select! {
         activity = durust::call_activity!(double(NumberInput { value: input })).task_queue("activities") => {
             format!("activity:{}", activity?)
@@ -549,7 +593,8 @@ async fn select_timer_before_activity(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-same-tick-timers", version = 1)]
-async fn select_same_tick_timers(input: u64) -> durust::Result<String> {
+async fn select_same_tick_timers(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let outcome = durust::select! {
         left = durust::sleep(Duration::from_millis(input)) => {
             left?;
@@ -564,7 +609,7 @@ async fn select_same_tick_timers(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-fourth-signal", version = 1)]
-async fn select_fourth_signal(_: ()) -> durust::Result<String> {
+async fn select_fourth_signal(_: UnitInput) -> durust::Result<String> {
     let outcome = durust::select! {
         first = durust::sleep(Duration::from_secs(1)) => {
             first?;
@@ -586,7 +631,8 @@ async fn select_fourth_signal(_: ()) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-reorder", version = 1)]
-async fn select_then_wait(input: u64) -> durust::Result<String> {
+async fn select_then_wait(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let first = durust::select! {
         signal = durust::signal::<String>("ready") => {
             format!("signal:{}", signal?)
@@ -601,7 +647,8 @@ async fn select_then_wait(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.select-reorder", version = 1)]
-async fn select_then_wait_reordered(input: u64) -> durust::Result<String> {
+async fn select_then_wait_reordered(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
     let first = durust::select! {
         timer = durust::sleep(Duration::from_millis(input)) => {
             timer?;
@@ -616,26 +663,27 @@ async fn select_then_wait_reordered(input: u64) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "tests.failing-activity", version = 1)]
-async fn failing_activity_workflow(_: ()) -> durust::Result<u64> {
-    durust::call_activity!(fail_activity(())).await
+async fn failing_activity_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::call_activity!(fail_activity(UnitInput {})).await
 }
 
 #[durust::workflow(name = "tests.retry-activity", version = 1)]
-async fn retry_activity_workflow(_: ()) -> durust::Result<u64> {
-    durust::call_activity!(flaky_activity(()))
+async fn retry_activity_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::call_activity!(flaky_activity(UnitInput {}))
         .retry(durust::RetryPolicy::exponential().max_attempts(2))
         .await
 }
 
 #[durust::workflow(name = "tests.non-retryable-activity", version = 1)]
-async fn non_retryable_activity_workflow(_: ()) -> durust::Result<u64> {
-    durust::call_activity!(non_retryable_activity(()))
+async fn non_retryable_activity_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::call_activity!(non_retryable_activity(UnitInput {}))
         .retry(durust::RetryPolicy::exponential().max_attempts(5))
         .await
 }
 
 #[durust::workflow(name = "tests.timeout-activity", version = 1)]
-async fn timeout_activity_workflow(input: u64) -> durust::Result<u64> {
+async fn timeout_activity_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::call_activity!(double(NumberInput { value: input }))
         .task_queue("activities")
         .timeout(Duration::from_millis(10))
@@ -643,7 +691,8 @@ async fn timeout_activity_workflow(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.heartbeat-activity", version = 1)]
-async fn heartbeat_activity_workflow(input: u64) -> durust::Result<u64> {
+async fn heartbeat_activity_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::call_activity!(heartbeat_activity_test(NumberInput { value: input }))
         .task_queue("activities")
         .heartbeat_timeout(Duration::from_secs(30))
@@ -651,7 +700,8 @@ async fn heartbeat_activity_workflow(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.double-plus-one", version = 1)]
-async fn double_plus_one_changed(input: u64) -> durust::Result<u64> {
+async fn double_plus_one_changed(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     let doubled = durust::call_activity!(double(NumberInput { value: input + 1 }))
         .task_queue("activities")
         .await?;
@@ -659,7 +709,8 @@ async fn double_plus_one_changed(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.default-activity-options", version = 1)]
-async fn default_activity_options_workflow(input: u64) -> durust::Result<u64> {
+async fn default_activity_options_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::set_default_activity_options(
         durust::ActivityOptions::new()
             .task_queue("preferred-activities")
@@ -669,7 +720,8 @@ async fn default_activity_options_workflow(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.override-activity-options", version = 1)]
-async fn override_activity_options_workflow(input: u64) -> durust::Result<u64> {
+async fn override_activity_options_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::set_default_activity_options(
         durust::ActivityOptions::new()
             .task_queue("default-activities")
@@ -682,7 +734,8 @@ async fn override_activity_options_workflow(input: u64) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.cached-default-activity-options", version = 1)]
-async fn cached_default_activity_options_workflow(input: u64) -> durust::Result<u64> {
+async fn cached_default_activity_options_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::set_default_activity_options(
         durust::ActivityOptions::new()
             .task_queue("sticky-activities")
@@ -693,7 +746,8 @@ async fn cached_default_activity_options_workflow(input: u64) -> durust::Result<
 }
 
 #[durust::workflow(name = "tests.query-projection", version = 1, query_state = QueryView)]
-async fn query_projection_workflow(input: u64) -> durust::Result<u64> {
+async fn query_projection_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::publish(&QueryView {
         status: "started".to_owned(),
         value: input,
@@ -712,7 +766,8 @@ fn query_status(view: &QueryView) -> String {
 }
 
 #[durust::workflow(name = "tests.provider-json-codec", version = 1, query_state = QueryView)]
-async fn provider_json_codec_workflow(input: u64) -> durust::Result<u64> {
+async fn provider_json_codec_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::publish(&QueryView {
         status: "started".to_owned(),
         value: input,
@@ -779,20 +834,21 @@ async fn parent_waits_continued_child(input: ContinueInput) -> durust::Result<u6
 }
 
 #[durust::workflow(name = "tests.sleep-then-return", version = 1)]
-async fn sleep_then_return(input: u64) -> durust::Result<u64> {
+async fn sleep_then_return(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
     durust::sleep(Duration::from_millis(input)).await?;
     Ok(input + 1)
 }
 
 #[durust::workflow(name = "tests.await-signal", version = 1)]
-async fn await_signal(_: ()) -> durust::Result<String> {
+async fn await_signal(_: UnitInput) -> durust::Result<String> {
     durust::signal::<String>("ready").await
 }
 
 #[durust::workflow(name = "tests.activity-map-sum", version = 1)]
-async fn activity_map_sum(input: Vec<u64>) -> durust::Result<u64> {
+async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
     let input_manifest =
-        durust::activity_map_manifest(input.into_iter().map(|value| NumberInput { value }))?;
+        durust::activity_map_manifest(input.values.into_iter().map(|value| NumberInput { value }))?;
     let mapped = durust::activity_map(map_double)
         .task_queue("map-activities")
         .input_manifest(input_manifest)
@@ -818,9 +874,10 @@ macro_rules! child_workflow_map_sum_body {
         $failure_mode:expr,
         $input_offset:expr $(,)?
     ) => {{
-        let input_manifest = durust::child_workflow_map_manifest(
-            $input.into_iter().map(|value| value + $input_offset),
-        )?;
+        let input_manifest =
+            durust::child_workflow_map_manifest($input.into_iter().map(|value| NumberInput {
+                value: value + $input_offset,
+            }))?;
         let mapped = durust::child_workflow_map::<$workflow>()
             .task_queue($task_queue)
             .workflow_id_prefix($workflow_id_prefix)
@@ -840,7 +897,8 @@ macro_rules! child_workflow_map_sum_body {
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -854,7 +912,8 @@ async fn child_workflow_map_sum(input: Vec<u64>) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_child_type(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_child_type(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_triple_workflow,
@@ -868,7 +927,8 @@ async fn child_workflow_map_sum_changed_child_type(input: Vec<u64>) -> durust::R
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_input_manifest(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_input_manifest(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -882,7 +942,8 @@ async fn child_workflow_map_sum_changed_input_manifest(input: Vec<u64>) -> durus
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_prefix(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_prefix(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -896,7 +957,8 @@ async fn child_workflow_map_sum_changed_prefix(input: Vec<u64>) -> durust::Resul
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_task_queue(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_task_queue(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -910,7 +972,8 @@ async fn child_workflow_map_sum_changed_task_queue(input: Vec<u64>) -> durust::R
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_max_in_flight(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_max_in_flight(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -925,8 +988,9 @@ async fn child_workflow_map_sum_changed_max_in_flight(input: Vec<u64>) -> durust
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
 async fn child_workflow_map_sum_changed_parent_close_policy(
-    input: Vec<u64>,
+    input: ValuesInput,
 ) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -940,7 +1004,8 @@ async fn child_workflow_map_sum_changed_parent_close_policy(
 }
 
 #[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
-async fn child_workflow_map_sum_changed_failure_mode(input: Vec<u64>) -> durust::Result<u64> {
+async fn child_workflow_map_sum_changed_failure_mode(input: ValuesInput) -> durust::Result<u64> {
+    let input = input.values;
     child_workflow_map_sum_body!(
         input,
         child_double_workflow,
@@ -959,7 +1024,7 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/simple", "workflows", 20)
+            .start_workflow::<double_plus_one>("wf/simple", "workflows", number(20))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1010,7 +1075,7 @@ fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
             .start_workflow::<sleep_before_large_activity_result>(
                 "wf/lazy-large-activity-result",
                 "workflows",
-                (),
+                unit(),
             )
             .await
             .unwrap();
@@ -1063,7 +1128,7 @@ fn side_effect_replays_recorded_marker_without_rerunning_closure() {
             .start_workflow::<side_effect_then_sleep_workflow>(
                 "wf/side-effect-replay",
                 "workflows",
-                (),
+                unit(),
             )
             .await
             .unwrap();
@@ -1118,7 +1183,7 @@ fn oversized_side_effect_fails_without_recording_marker() {
             .start_workflow::<oversized_side_effect_workflow>(
                 "wf/oversized-side-effect",
                 "workflows",
-                (),
+                unit(),
             )
             .await
             .unwrap();
@@ -1151,7 +1216,11 @@ fn activity_can_heartbeat_through_worker_context() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<heartbeat_activity_workflow>("wf/heartbeat-activity", "workflows", 20)
+            .start_workflow::<heartbeat_activity_workflow>(
+                "wf/heartbeat-activity",
+                "workflows",
+                number(20),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1189,7 +1258,11 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<child_spawn_wait_workflow>("wf/child-wait-parent", "workflows", 11)
+            .start_workflow::<child_spawn_wait_workflow>(
+                "wf/child-wait-parent",
+                "workflows",
+                number(11),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -1242,7 +1315,7 @@ fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when
             .start_workflow::<postgres_inline_child_signal_timer>(
                 "wf/postgres-inline-child-cache",
                 "workflows",
-                11,
+                number(11),
             )
             .await
             .unwrap();
@@ -1304,7 +1377,7 @@ fn child_workflow_abandon_lets_child_continue_after_parent_exit() {
             .start_workflow::<child_spawn_abandon_workflow>(
                 "wf/child-abandon-parent",
                 "workflows",
-                12,
+                number(12),
             )
             .await
             .unwrap();
@@ -1349,7 +1422,7 @@ fn child_workflow_cancel_policy_cancels_child_on_parent_exit() {
             .start_workflow::<child_spawn_cancel_workflow>(
                 "wf/child-cancel-parent",
                 "workflows",
-                13,
+                number(13),
             )
             .await
             .unwrap();
@@ -1398,7 +1471,7 @@ fn child_workflow_result_can_win_select() {
             .start_workflow::<select_child_result_workflow>(
                 "wf/select-child-result-parent",
                 "workflows",
-                14,
+                number(14),
             )
             .await
             .unwrap();
@@ -1443,7 +1516,7 @@ fn losing_child_workflow_result_select_branch_does_not_cancel_child() {
             .start_workflow::<select_timer_before_child_result_workflow>(
                 "wf/select-child-result-loses-parent",
                 "workflows",
-                15,
+                number(15),
             )
             .await
             .unwrap();
@@ -1494,7 +1567,7 @@ fn activity_spawn_handle_launches_before_result_is_awaited() {
             .start_workflow::<activity_spawn_await_later_workflow>(
                 "wf/activity-spawn-await-later",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -1577,7 +1650,7 @@ fn select_all_races_spawned_activity_handles_and_cancels_pending_losers() {
             .start_workflow::<select_all_activity_handles_workflow>(
                 "wf/select-all-activity-handles",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -1661,7 +1734,7 @@ fn select_all_can_mix_activity_child_and_timer_branches() {
             .start_workflow::<select_all_mixed_branches_workflow>(
                 "wf/select-all-mixed-branches",
                 "workflows",
-                8,
+                number(8),
             )
             .await
             .unwrap();
@@ -1728,7 +1801,7 @@ fn replay_skips_child_start_consumed_out_of_order_before_later_timer_command() {
             .start_workflow::<select_all_mixed_branches_workflow>(
                 "wf/out-of-order-child-start",
                 "workflows",
-                8,
+                number(8),
             )
             .await
             .unwrap();
@@ -1795,7 +1868,7 @@ fn replay_skips_child_completion_consumed_out_of_order_before_later_timer_comman
             .start_workflow::<child_first_select_then_timer_workflow>(
                 "wf/out-of-order-child-completion",
                 "workflows",
-                9,
+                number(9),
             )
             .await
             .unwrap();
@@ -1880,7 +1953,7 @@ fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
             .start_workflow::<timer_first_select_then_timer_workflow>(
                 "wf/out-of-order-timer-fired",
                 "workflows",
-                7,
+                number(7),
             )
             .await
             .unwrap();
@@ -1948,7 +2021,7 @@ fn join_all_collects_spawned_activity_results_in_input_order_after_crash() {
             .start_workflow::<join_all_activity_handles_workflow>(
                 "wf/join-all-activity-handles",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -2045,7 +2118,7 @@ fn join_all_can_collect_boxed_mixed_durable_branches() {
             .start_workflow::<join_all_mixed_branches_workflow>(
                 "wf/join-all-mixed-branches",
                 "workflows",
-                9,
+                number(9),
             )
             .await
             .unwrap();
@@ -2104,7 +2177,7 @@ fn cancelling_pending_workflow_cleans_activity_without_workflow_failure() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/cancel-pending", "workflows", 20)
+            .start_workflow::<double_plus_one>("wf/cancel-pending", "workflows", number(20))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2178,7 +2251,7 @@ fn join_registers_all_branches_before_waiting() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<join_two_activities>("wf/join-register", "workflows", 10)
+            .start_workflow::<join_two_activities>("wf/join-register", "workflows", number(10))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2226,7 +2299,11 @@ fn sequential_awaits_do_not_register_later_activity_before_waiting() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<sequential_two_activities>("wf/sequential-awaits", "workflows", 10)
+            .start_workflow::<sequential_two_activities>(
+                "wf/sequential-awaits",
+                "workflows",
+                number(10),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2253,7 +2330,7 @@ fn join_accepts_more_than_three_branches() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<join_four_activities>("wf/join-four", "workflows", 10)
+            .start_workflow::<join_four_activities>("wf/join-four", "workflows", number(10))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2283,7 +2360,7 @@ fn join_waits_for_signal_and_timer_branches() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<join_signal_timer>("wf/join-signal-timer", "workflows", 10)
+            .start_workflow::<join_signal_timer>("wf/join-signal-timer", "workflows", number(10))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2324,7 +2401,7 @@ fn join_replays_signal_consumed_after_timer_fired_before_later_timer_command() {
             .start_workflow::<join_signal_timer_then_timer>(
                 "wf/join-signal-timer-replay-order",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -2383,7 +2460,7 @@ fn join_replays_interleaved_branch_completions_after_crash() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<join_two_activities>("wf/join-replay", "workflows", 10)
+            .start_workflow::<join_two_activities>("wf/join-replay", "workflows", number(10))
             .await
             .unwrap();
         let mut scheduling_worker = Worker::builder(backend.clone())
@@ -2469,7 +2546,7 @@ fn select_chooses_earliest_ready_event_before_lexical_order() {
             .start_workflow::<select_timer_before_activity>(
                 "wf/select-event-order",
                 "workflows",
-                20,
+                number(20),
             )
             .await
             .unwrap();
@@ -2535,7 +2612,11 @@ fn select_same_tick_timer_race_is_deterministic() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<select_same_tick_timers>("wf/select-same-tick", "workflows", 10)
+            .start_workflow::<select_same_tick_timers>(
+                "wf/select-same-tick",
+                "workflows",
+                number(10),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2572,7 +2653,7 @@ fn select_signal_winner_cancels_losing_timer_wait() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<select_signal_timer>("wf/select-signal", "workflows", 50)
+            .start_workflow::<select_signal_timer>("wf/select-signal", "workflows", number(50))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2616,7 +2697,11 @@ fn select_timer_winner_cancels_in_flight_activity() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<select_activity_timer>("wf/select-activity-timer", "workflows", 20)
+            .start_workflow::<select_activity_timer>(
+                "wf/select-activity-timer",
+                "workflows",
+                number(20),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2686,7 +2771,7 @@ fn select_accepts_more_than_three_branches() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<select_fourth_signal>("wf/select-four", "workflows", ())
+            .start_workflow::<select_fourth_signal>("wf/select-four", "workflows", unit())
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -2730,7 +2815,7 @@ fn select_replays_recorded_winner_after_worker_crash() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<select_then_wait>("wf/select-replay-winner", "workflows", 10)
+            .start_workflow::<select_then_wait>("wf/select-replay-winner", "workflows", number(10))
             .await
             .unwrap();
         let mut original_worker = Worker::builder(backend.clone())
@@ -2786,7 +2871,7 @@ fn select_branch_reorder_is_detected_on_replay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<select_then_wait>("wf/select-reorder", "workflows", 10)
+            .start_workflow::<select_then_wait>("wf/select-reorder", "workflows", number(10))
             .await
             .unwrap();
         let mut original_worker = Worker::builder(backend.clone())
@@ -2820,7 +2905,7 @@ fn get_version_returns_default_for_old_history_without_marker() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_original>("wf/version-old", "workflows", ())
+            .start_workflow::<version_original>("wf/version-old", "workflows", unit())
             .await
             .unwrap();
         let mut old_worker = version_worker(backend.clone(), version_original);
@@ -2857,7 +2942,7 @@ fn patched_records_marker_and_takes_new_branch_for_new_history() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_patched>("wf/version-new", "workflows", ())
+            .start_workflow::<version_patched>("wf/version-new", "workflows", unit())
             .await
             .unwrap();
         let mut worker = version_worker(backend.clone(), version_patched);
@@ -2901,7 +2986,7 @@ fn recorded_version_is_stable_across_streamed_replay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_patched>("wf/version-replay", "workflows", ())
+            .start_workflow::<version_patched>("wf/version-replay", "workflows", unit())
             .await
             .unwrap();
         let mut first_worker = version_worker(backend.clone(), version_patched);
@@ -2940,7 +3025,7 @@ fn unsupported_min_version_aborts_task_without_workflow_failed() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_patched>("wf/version-unsupported", "workflows", ())
+            .start_workflow::<version_patched>("wf/version-unsupported", "workflows", unit())
             .await
             .unwrap();
         let mut first_worker = version_worker(backend.clone(), version_patched);
@@ -2975,7 +3060,7 @@ fn deprecate_patch_bridges_existing_patched_histories() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_patched>("wf/version-deprecated", "workflows", ())
+            .start_workflow::<version_patched>("wf/version-deprecated", "workflows", unit())
             .await
             .unwrap();
         let mut first_worker = version_worker(backend.clone(), version_patched);
@@ -3011,7 +3096,7 @@ fn deprecate_patch_records_bridge_marker_for_new_histories() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_deprecated>("wf/version-deprecated-new", "workflows", ())
+            .start_workflow::<version_deprecated>("wf/version-deprecated-new", "workflows", unit())
             .await
             .unwrap();
         let mut worker = version_worker(backend.clone(), version_deprecated);
@@ -3051,7 +3136,7 @@ fn removing_patch_bridge_too_early_is_nondeterministic() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<version_patched>("wf/version-removed-too-early", "workflows", ())
+            .start_workflow::<version_patched>("wf/version-removed-too-early", "workflows", unit())
             .await
             .unwrap();
         let mut first_worker = version_worker(backend.clone(), version_patched);
@@ -3086,7 +3171,7 @@ fn workflow_default_activity_options_apply_to_scheduled_activity() {
             .start_workflow::<default_activity_options_workflow>(
                 "wf/default-activity-options",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -3132,7 +3217,7 @@ fn per_call_activity_options_override_workflow_defaults() {
             .start_workflow::<override_activity_options_workflow>(
                 "wf/override-activity-options",
                 "workflows",
-                10,
+                number(10),
             )
             .await
             .unwrap();
@@ -3181,7 +3266,7 @@ fn workflow_default_activity_options_survive_cached_wake_and_crash_replay() {
             .start_workflow::<cached_default_activity_options_workflow>(
                 "wf/cached-default-activity-options",
                 "workflows",
-                4,
+                number(4),
             )
             .await
             .unwrap();
@@ -3230,7 +3315,11 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<query_projection_workflow>("wf/query-projection", "workflows", 41)
+            .start_workflow::<query_projection_workflow>(
+                "wf/query-projection",
+                "workflows",
+                number(41),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -3330,7 +3419,7 @@ fn provider_configured_json_codec_round_trips_typed_runtime_apis() {
             .start_workflow::<provider_json_codec_workflow>(
                 "wf/provider-json-codec",
                 "json-workflows",
-                21,
+                number(21),
             )
             .await
             .unwrap();
@@ -3346,7 +3435,10 @@ fn provider_configured_json_codec_round_trips_typed_runtime_apis() {
             panic!("expected WorkflowStarted");
         };
         assert_eq!(input.codec(), durust::CodecId::Json);
-        assert_eq!(durust::decode_payload::<u64>(input).unwrap(), 21);
+        assert_eq!(
+            durust::decode_payload::<NumberInput>(input).unwrap(),
+            NumberInput { value: 21 }
+        );
 
         assert!(worker.run_workflow_once().await.unwrap());
         let query = backend
@@ -3621,7 +3713,7 @@ fn timer_fires_after_virtual_time_and_replays_after_worker_crash() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<sleep_then_return>("wf/timer-recovery", "workflows", 50)
+            .start_workflow::<sleep_then_return>("wf/timer-recovery", "workflows", number(50))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -3661,7 +3753,7 @@ fn failed_activity_records_failure_and_workflow_failure_on_replay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<failing_activity_workflow>("wf/activity-failure", "workflows", ())
+            .start_workflow::<failing_activity_workflow>("wf/activity-failure", "workflows", unit())
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -3708,7 +3800,7 @@ fn retryable_activity_failure_does_not_append_failure_history() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<retry_activity_workflow>("wf/activity-retry", "workflows", ())
+            .start_workflow::<retry_activity_workflow>("wf/activity-retry", "workflows", unit())
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -3753,7 +3845,7 @@ fn non_retryable_activity_failure_skips_retries_and_restores_failure() {
             .start_workflow::<non_retryable_activity_workflow>(
                 "wf/activity-non-retryable",
                 "workflows",
-                (),
+                unit(),
             )
             .await
             .unwrap();
@@ -3795,7 +3887,11 @@ fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<timeout_activity_workflow>("wf/activity-timeout", "workflows", 5)
+            .start_workflow::<timeout_activity_workflow>(
+                "wf/activity-timeout",
+                "workflows",
+                number(5),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -3835,7 +3931,7 @@ fn signal_before_wait_buffers_and_completes_without_extra_task() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<await_signal>("wf/signal-before", "workflows", ())
+            .start_workflow::<await_signal>("wf/signal-before", "workflows", unit())
             .await
             .unwrap();
         let outcome = client
@@ -3877,7 +3973,7 @@ fn signal_after_wait_wakes_and_consumes_atomically() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<await_signal>("wf/signal-after", "workflows", ())
+            .start_workflow::<await_signal>("wf/signal-after", "workflows", unit())
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -3919,7 +4015,7 @@ fn worker_loop_runs_workflow_and_activity_until_idle() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/loop", "workflows", 8)
+            .start_workflow::<double_plus_one>("wf/loop", "workflows", number(8))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -3948,7 +4044,7 @@ fn configured_local_activity_preference_runs_before_remote_worker_can_claim() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/local-activity", "workflows", 5)
+            .start_workflow::<double_plus_one>("wf/local-activity", "workflows", number(5))
             .await
             .unwrap();
         let mut workflow_worker = Worker::builder(backend.clone())
@@ -3994,7 +4090,7 @@ fn zero_local_activity_capacity_falls_back_to_remote_worker() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/remote-fallback", "workflows", 6)
+            .start_workflow::<double_plus_one>("wf/remote-fallback", "workflows", number(6))
             .await
             .unwrap();
         let mut workflow_worker = Worker::builder(backend.clone())
@@ -4036,7 +4132,11 @@ fn activity_map_workflow_runs_with_compact_history() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<activity_map_sum>("wf/activity-map-sum", "workflows", vec![1, 2, 3])
+            .start_workflow::<activity_map_sum>(
+                "wf/activity-map-sum",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -4081,7 +4181,7 @@ fn child_workflow_map_runs_with_compact_parent_history() {
             .start_workflow::<child_workflow_map_sum>(
                 "wf/child-workflow-map-sum",
                 "workflows",
-                vec![1, 2, 3],
+                values(vec![1, 2, 3]),
             )
             .await
             .unwrap();
@@ -4165,7 +4265,7 @@ async fn assert_child_workflow_map_replay_change_is_nondeterministic<W>(
     case: &str,
     changed_workflow: W,
 ) where
-    W: durust::Workflow<Input = Vec<u64>, Output = u64> + Default,
+    W: durust::Workflow<Input = ValuesInput, Output = u64> + Default,
 {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
@@ -4173,7 +4273,7 @@ async fn assert_child_workflow_map_replay_change_is_nondeterministic<W>(
         .start_workflow::<child_workflow_map_sum>(
             format!("wf/child-workflow-map-replay/{case}"),
             "workflows",
-            vec![1, 2],
+            values(vec![1, 2]),
         )
         .await
         .unwrap();
@@ -4252,7 +4352,11 @@ fn configured_local_activity_preference_applies_to_activity_map_items() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<activity_map_sum>("wf/local-activity-map", "workflows", vec![1, 2, 3])
+            .start_workflow::<activity_map_sum>(
+                "wf/local-activity-map",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
             .await
             .unwrap();
         let mut workflow_worker = Worker::builder(backend.clone())
@@ -4310,7 +4414,7 @@ fn worker_crash_recovers_by_streaming_history() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/replay", "workflows", 7)
+            .start_workflow::<double_plus_one>("wf/replay", "workflows", number(7))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4349,7 +4453,7 @@ fn recovery_fetches_history_incrementally_in_configured_chunks() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/chunked-replay", "workflows", 5)
+            .start_workflow::<double_plus_one>("wf/chunked-replay", "workflows", number(5))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4393,7 +4497,7 @@ fn cached_workflow_wake_streams_only_events_after_cached_tail() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/cached-wake", "workflows", 6)
+            .start_workflow::<double_plus_one>("wf/cached-wake", "workflows", number(6))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -4424,7 +4528,11 @@ fn cached_workflow_wake_ignores_cold_recovery_saturation() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/cached-recovery-saturated", "workflows", 6)
+            .start_workflow::<double_plus_one>(
+                "wf/cached-recovery-saturated",
+                "workflows",
+                number(6),
+            )
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -4457,7 +4565,7 @@ fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/recovery-admission", "workflows", 7)
+            .start_workflow::<double_plus_one>("wf/recovery-admission", "workflows", number(7))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4517,7 +4625,7 @@ fn cold_recovery_event_budget_defers_without_appending_failure() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/recovery-event-budget", "workflows", 5)
+            .start_workflow::<double_plus_one>("wf/recovery-event-budget", "workflows", number(5))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4572,7 +4680,7 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/recovery-byte-budget", "workflows", 5)
+            .start_workflow::<double_plus_one>("wf/recovery-byte-budget", "workflows", number(5))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4618,7 +4726,7 @@ fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", 9)
+            .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", number(9))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4676,7 +4784,7 @@ fn replay_detects_changed_activity_input_without_appending_failure() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/nondeterminism", "workflows", 7)
+            .start_workflow::<double_plus_one>("wf/nondeterminism", "workflows", number(7))
             .await
             .unwrap();
         let mut original_worker = Worker::builder(backend.clone())
@@ -4726,7 +4834,7 @@ fn configured_nondeterminism_backoff_releases_workflow_after_delay() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("wf/nondeterminism-backoff", "workflows", 7)
+            .start_workflow::<double_plus_one>("wf/nondeterminism-backoff", "workflows", number(7))
             .await
             .unwrap();
         let mut original_worker = Worker::builder(backend.clone())
@@ -4779,7 +4887,7 @@ fn provider_claims_only_registered_workflow_and_activity_types() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         client
-            .start_workflow::<double_plus_one>("wf/filtering", "workflows", 1)
+            .start_workflow::<double_plus_one>("wf/filtering", "workflows", number(1))
             .await
             .unwrap();
 
@@ -4828,7 +4936,7 @@ fn sqlite_backend_recovers_after_close_and_reopen() {
         let backend = SqliteBackend::open(&db_path).unwrap();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/sqlite-replay", "workflows", 11)
+            .start_workflow::<double_plus_one>("wf/sqlite-replay", "workflows", number(11))
             .await
             .unwrap();
         let mut first_worker = Worker::builder(backend.clone())
@@ -4948,7 +5056,7 @@ fn sqlite_activity_map_recovers_after_close_and_reopen() {
             .start_workflow::<activity_map_sum>(
                 "wf/sqlite-map-recovery",
                 "workflows",
-                vec![2, 4, 6],
+                values(vec![2, 4, 6]),
             )
             .await
             .unwrap();
@@ -5005,7 +5113,7 @@ fn sqlite_child_workflow_map_recovers_after_close_and_reopen() {
             .start_workflow::<child_workflow_map_sum>(
                 "wf/sqlite-child-map-recovery",
                 "workflows",
-                vec![2, 4, 6],
+                values(vec![2, 4, 6]),
             )
             .await
             .unwrap();
@@ -5061,7 +5169,7 @@ fn sqlite_child_outbox_recovers_after_close_and_reopen() {
             .start_workflow::<child_spawn_wait_workflow>(
                 "wf/sqlite-child-recovery",
                 "workflows",
-                14,
+                number(14),
             )
             .await
             .unwrap();
@@ -5104,7 +5212,7 @@ fn sqlite_worker_loop_runs_until_idle() {
         let backend = SqliteBackend::open(&db_path).unwrap();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/sqlite-loop", "workflows", 13)
+            .start_workflow::<double_plus_one>("wf/sqlite-loop", "workflows", number(13))
             .await
             .unwrap();
         let mut worker = Worker::builder(backend.clone())
@@ -5134,7 +5242,7 @@ fn worker_drops_cache_and_retries_after_workflow_task_commit_conflict() {
         let backend = RecordingBackend::new(inner);
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<double_plus_one>("wf/commit-conflict", "workflows", 11)
+            .start_workflow::<double_plus_one>("wf/commit-conflict", "workflows", number(11))
             .await
             .unwrap();
         backend.conflict_next_commit();

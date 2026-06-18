@@ -22,6 +22,10 @@ struct Input {
     value: u64,
 }
 
+fn input(value: u64) -> Input {
+    Input { value }
+}
+
 fn postgres_url_from_env() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
@@ -61,20 +65,23 @@ async fn echo(input: Input) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "conformance.workflow", version = 1)]
-async fn workflow(input: u64) -> durust::Result<u64> {
-    durust::call_activity!(echo(Input { value: input })).await
+async fn workflow(input: Input) -> durust::Result<u64> {
+    durust::call_activity!(echo(Input { value: input.value })).await
 }
 
 mod default_name_handlers {
     #[durust::activity]
-    pub async fn default_activity(_: ()) -> durust::Result<()> {
+    pub async fn default_activity(_: DefaultInput) -> durust::Result<()> {
         Ok(())
     }
 
     #[durust::workflow(version = 1)]
-    pub async fn default_workflow(_: ()) -> durust::Result<()> {
+    pub async fn default_workflow(_: DefaultInput) -> durust::Result<()> {
         Ok(())
     }
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    pub struct DefaultInput {}
 }
 
 #[test]
@@ -180,7 +187,7 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             .start_workflow::<workflow>(
                 "wf/sqlite-delayed-visibility",
                 "sqlite-delayed-visibility-workflows",
-                5,
+                input(5),
             )
             .await
             .unwrap();
@@ -914,7 +921,11 @@ fn registry_generates_manifest_metadata_from_handlers() {
             .rust_path
             .ends_with("provider_conformance::workflow")
     );
-    assert!(manifest.workflows[0].input_type.ends_with("u64"));
+    assert!(
+        manifest.workflows[0]
+            .input_type
+            .ends_with("provider_conformance::Input")
+    );
     assert!(
         manifest.workflows[0]
             .input_schema_hash
@@ -2322,7 +2333,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/claim-filter", "claim-filter-workflows", 9)
+        .start_workflow::<workflow>("wf/claim-filter", "claim-filter-workflows", input(9))
         .await
         .unwrap();
 
@@ -2375,11 +2386,11 @@ where
 {
     let client = Client::new(backend.clone());
     let first = client
-        .start_workflow::<workflow>("wf/idempotent", "idempotent-workflows", 1)
+        .start_workflow::<workflow>("wf/idempotent", "idempotent-workflows", input(1))
         .await
         .unwrap();
     let second = client
-        .start_workflow::<workflow>("wf/idempotent", "idempotent-workflows", 1)
+        .start_workflow::<workflow>("wf/idempotent", "idempotent-workflows", input(1))
         .await
         .unwrap();
     assert_eq!(first, second);
@@ -2391,7 +2402,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/stream", "stream-workflows", 2)
+        .start_workflow::<workflow>("wf/stream", "stream-workflows", input(2))
         .await
         .unwrap();
     let start_only = backend
@@ -2442,7 +2453,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/stale-commit", "stale-workflows", 3)
+        .start_workflow::<workflow>("wf/stale-commit", "stale-workflows", input(3))
         .await
         .unwrap();
     let claimed = backend
@@ -2486,11 +2497,11 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/batch-commit-a", "batch-workflows", 11)
+        .start_workflow::<workflow>("wf/batch-commit-a", "batch-workflows", input(11))
         .await
         .unwrap();
     client
-        .start_workflow::<workflow>("wf/batch-commit-b", "batch-workflows", 12)
+        .start_workflow::<workflow>("wf/batch-commit-b", "batch-workflows", input(12))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -2558,7 +2569,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/release", "release-workflows", 5)
+        .start_workflow::<workflow>("wf/release", "release-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -2593,7 +2604,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/delayed-release", "delayed-release-workflows", 5)
+        .start_workflow::<workflow>("wf/delayed-release", "delayed-release-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -2638,7 +2649,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/query-raw", "query-raw-workflows", 5)
+        .start_workflow::<workflow>("wf/query-raw", "query-raw-workflows", input(5))
         .await
         .unwrap();
     let req = durust::QueryProjectionRequest {
@@ -2746,7 +2757,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", 5)
+        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", input(5))
         .await
         .unwrap();
     let claimed = backend
@@ -2911,7 +2922,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/version-index", "version-index-workflows", 5)
+        .start_workflow::<workflow>("wf/version-index", "version-index-workflows", input(5))
         .await
         .unwrap();
     let claimed = backend
@@ -3018,7 +3029,7 @@ where
 {
     let client = Client::new(backend.clone());
     let first_run_id = client
-        .start_workflow::<workflow>("wf/continue-conformance", "continue-workflows", 5)
+        .start_workflow::<workflow>("wf/continue-conformance", "continue-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3115,7 +3126,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/signal-inbox", "signal-inbox-workflows", 5)
+        .start_workflow::<workflow>("wf/signal-inbox", "signal-inbox-workflows", input(5))
         .await
         .unwrap();
     let accepted = client
@@ -3210,7 +3221,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/timer-wait", "timer-workflows", 5)
+        .start_workflow::<workflow>("wf/timer-wait", "timer-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3315,7 +3326,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/activity-retry", "retry-workflows", 5)
+        .start_workflow::<workflow>("wf/activity-retry", "retry-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3452,7 +3463,11 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/activity-non-retryable", "non-retryable-workflows", 5)
+        .start_workflow::<workflow>(
+            "wf/activity-non-retryable",
+            "non-retryable-workflows",
+            input(5),
+        )
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3570,7 +3585,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/activity-timeout", "timeout-workflows", 5)
+        .start_workflow::<workflow>("wf/activity-timeout", "timeout-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3933,7 +3948,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>(workflow_id, workflow_queue, 5)
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -3999,7 +4014,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/cancel-command", "cancel-command-workflows", 5)
+        .start_workflow::<workflow>("wf/cancel-command", "cancel-command-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -4294,7 +4309,11 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/child-conflict-child", "conflict-child-workflows", 1)
+        .start_workflow::<workflow>(
+            "wf/child-conflict-child",
+            "conflict-child-workflows",
+            input(1),
+        )
         .await
         .unwrap();
     let (parent_run_id, _command_id) = schedule_child_start(
@@ -4449,7 +4468,7 @@ where
 {
     let client = Client::new(backend.clone());
     let parent_run_id = client
-        .start_workflow::<workflow>(parent_workflow_id, "child-parent-workflows", 1)
+        .start_workflow::<workflow>(parent_workflow_id, "child-parent-workflows", input(1))
         .await
         .unwrap();
     let claimed = backend
@@ -4526,7 +4545,7 @@ where
 {
     let client = Client::new(backend.clone());
     let parent_run_id = client
-        .start_workflow::<workflow>(parent_workflow_id, parent_queue, 1)
+        .start_workflow::<workflow>(parent_workflow_id, parent_queue, input(1))
         .await
         .unwrap();
     let parent_opts = workflow_claim_opts(parent_queue);
@@ -4735,7 +4754,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/activity-map", "map-workflows", 5)
+        .start_workflow::<workflow>("wf/activity-map", "map-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -4955,7 +4974,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/activity-map-failure", "map-failure-workflows", 5)
+        .start_workflow::<workflow>("wf/activity-map-failure", "map-failure-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -5392,7 +5411,7 @@ where
 {
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<workflow>("wf/cancel-cleanup", "cancel-workflows", 5)
+        .start_workflow::<workflow>("wf/cancel-cleanup", "cancel-workflows", input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
@@ -5652,7 +5671,7 @@ where
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/activity-filter", "activity-workflows", 4)
+        .start_workflow::<workflow>("wf/activity-filter", "activity-workflows", input(4))
         .await
         .unwrap();
     let mut workflow_worker = worker(backend.clone(), "activity-workflows", "activity-activities");

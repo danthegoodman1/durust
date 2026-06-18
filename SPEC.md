@@ -128,6 +128,28 @@ pub async fn order(input: OrderInput) -> durust::Result<OrderOutput> {
 
 No `WorkflowCtx` parameter is required. Durable APIs use task-local workflow context internally.
 
+Workflow and activity handlers must take exactly one named input struct. Scalar
+root inputs, tuple inputs, collection root inputs, references, and `()` are not
+valid handler inputs. Use explicit request objects even for no-input handlers:
+
+```rust
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct NoInput {}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ChargeInput {
+    pub order_id: String,
+    pub amount_cents: u64,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_scope: Option<String>,
+}
+```
+
+Durust enforces the single named input shape. Field-level backward
+compatibility, defaulting, and semantic versioning of those input types remain
+the application developer's responsibility.
+
 The `#[workflow]` macro should **not** lower the function into continuation frames. It should only generate:
 
 ```text

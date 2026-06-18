@@ -7,14 +7,19 @@ struct ChargeInput {
     cents: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CheckoutInput {
+    cents: u64,
+}
+
 #[durust::activity(name = "examples.charge-card")]
 async fn charge_card(input: ChargeInput) -> durust::Result<String> {
     Ok(format!("charge:{}", input.cents))
 }
 
 #[durust::workflow(name = "examples.checkout", version = 1)]
-async fn checkout(cents: u64) -> durust::Result<String> {
-    durust::call_activity!(charge_card(ChargeInput { cents }))
+async fn checkout(input: CheckoutInput) -> durust::Result<String> {
+    durust::call_activity!(charge_card(ChargeInput { cents: input.cents }))
         .task_queue("payments")
         .await
 }
@@ -24,7 +29,7 @@ fn main() {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
         let run_id = client
-            .start_workflow::<checkout>("order/1", "orders", 4200)
+            .start_workflow::<checkout>("order/1", "orders", CheckoutInput { cents: 4200 })
             .await
             .expect("start checkout");
 

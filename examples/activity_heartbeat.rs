@@ -9,6 +9,11 @@ struct RenderInput {
     frames: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RenderWorkflowInput {
+    frames: u64,
+}
+
 #[durust::activity(name = "examples.render")]
 async fn render(input: RenderInput) -> durust::Result<u64> {
     for _ in 0..3 {
@@ -19,11 +24,13 @@ async fn render(input: RenderInput) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "examples.activity-heartbeat", version = 1)]
-async fn render_workflow(frames: u64) -> durust::Result<u64> {
-    durust::call_activity!(render(RenderInput { frames }))
-        .task_queue("render")
-        .heartbeat_timeout(Duration::from_secs(2))
-        .await
+async fn render_workflow(input: RenderWorkflowInput) -> durust::Result<u64> {
+    durust::call_activity!(render(RenderInput {
+        frames: input.frames
+    }))
+    .task_queue("render")
+    .heartbeat_timeout(Duration::from_secs(2))
+    .await
 }
 
 fn main() {
@@ -37,7 +44,11 @@ async fn run_example() -> durust::Result<(u64, usize)> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<render_workflow>("render/1", "workflows", 120)
+        .start_workflow::<render_workflow>(
+            "render/1",
+            "workflows",
+            RenderWorkflowInput { frames: 120 },
+        )
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

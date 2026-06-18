@@ -8,18 +8,23 @@ struct OrderView {
     total_cents: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OrderInput {
+    total_cents: u64,
+}
+
 #[durust::workflow(name = "examples.query-projection", version = 1, query_state = OrderView)]
-async fn order_workflow(total_cents: u64) -> durust::Result<u64> {
+async fn order_workflow(input: OrderInput) -> durust::Result<u64> {
     durust::publish(&OrderView {
         status: "created".to_owned(),
-        total_cents,
+        total_cents: input.total_cents,
     })?;
     let status = durust::signal::<String>("status").await?;
     durust::publish(&OrderView {
         status,
-        total_cents,
+        total_cents: input.total_cents,
     })?;
-    Ok(total_cents)
+    Ok(input.total_cents)
 }
 
 #[durust::query(workflow = order_workflow)]
@@ -38,7 +43,7 @@ async fn run_example() -> durust::Result<String> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<order_workflow>("order/1", "workflows", 4_200)
+        .start_workflow::<order_workflow>("order/1", "workflows", OrderInput { total_cents: 4_200 })
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

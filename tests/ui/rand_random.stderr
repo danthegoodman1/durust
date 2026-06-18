@@ -1,5 +1,5 @@
 error: nondeterministic workflow API detected; use durust::side_effect(...).await instead
- --> tests/ui/rand_random.rs:2:10
+ --> tests/ui/rand_random.rs:5:10
   |
-2 | async fn bad(_: ()) -> durust::Result<()> {
+5 | async fn bad(_: BadInput) -> durust::Result<()> {
   |          ^^^

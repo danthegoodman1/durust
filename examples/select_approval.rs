@@ -13,6 +13,11 @@ struct Cancel {
     reason: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ApprovalWorkflowInput {
+    deadline_ms: u64,
+}
+
 enum ApprovalDecision {
     Approved(Approval),
     Cancelled(Cancel),
@@ -20,7 +25,7 @@ enum ApprovalDecision {
 }
 
 #[durust::workflow(name = "examples.select-approval", version = 1)]
-async fn approval_workflow(deadline_ms: u64) -> durust::Result<String> {
+async fn approval_workflow(input: ApprovalWorkflowInput) -> durust::Result<String> {
     let decision = durust::select! {
         approval = durust::signal::<Approval>("approved") => {
             ApprovalDecision::Approved(approval?)
@@ -30,7 +35,7 @@ async fn approval_workflow(deadline_ms: u64) -> durust::Result<String> {
             ApprovalDecision::Cancelled(cancel?)
         }
 
-        timer = durust::sleep(Duration::from_millis(deadline_ms)) => {
+        timer = durust::sleep(Duration::from_millis(input.deadline_ms)) => {
             timer?;
             ApprovalDecision::TimedOut
         }
@@ -54,7 +59,13 @@ async fn run_example() -> durust::Result<String> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<approval_workflow>("approval/1", "workflows", 30_000)
+        .start_workflow::<approval_workflow>(
+            "approval/1",
+            "workflows",
+            ApprovalWorkflowInput {
+                deadline_ms: 30_000,
+            },
+        )
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

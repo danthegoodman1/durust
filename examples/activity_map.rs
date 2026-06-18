@@ -7,15 +7,20 @@ struct NumberInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SumSquaresInput {
+    values: Vec<u64>,
+}
+
 #[durust::activity(name = "examples.square")]
 async fn square(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * input.value)
 }
 
 #[durust::workflow(name = "examples.activity-map", version = 1)]
-async fn sum_squares(input: Vec<u64>) -> durust::Result<u64> {
+async fn sum_squares(input: SumSquaresInput) -> durust::Result<u64> {
     let manifest =
-        durust::activity_map_manifest(input.into_iter().map(|value| NumberInput { value }))?;
+        durust::activity_map_manifest(input.values.into_iter().map(|value| NumberInput { value }))?;
     let mapped = durust::activity_map(square)
         .task_queue("mappers")
         .input_manifest(manifest)
@@ -41,7 +46,13 @@ async fn run_example() -> durust::Result<u64> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<sum_squares>("activity-map/1", "workflows", vec![2, 3, 4])
+        .start_workflow::<sum_squares>(
+            "activity-map/1",
+            "workflows",
+            SumSquaresInput {
+                values: vec![2, 3, 4],
+            },
+        )
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

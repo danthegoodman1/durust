@@ -1,8 +1,12 @@
 use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
 use futures::executor::block_on;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct SignalWaitInput {}
 
 #[durust::workflow(name = "examples.signal-wait", version = 1)]
-async fn wait_for_signal(_: ()) -> durust::Result<String> {
+async fn wait_for_signal(_: SignalWaitInput) -> durust::Result<String> {
     durust::signal::<String>("ready").await
 }
 
@@ -17,7 +21,7 @@ async fn run_example() -> durust::Result<String> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<wait_for_signal>("signal/1", "workflows", ())
+        .start_workflow::<wait_for_signal>("signal/1", "workflows", SignalWaitInput {})
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

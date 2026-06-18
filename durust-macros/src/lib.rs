@@ -5,7 +5,7 @@ use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
     parse_macro_input, Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn,
-    Lit, LitStr, Meta, Pat, Path, PathArguments, ReturnType, Token, Type,
+    Lit, LitStr, Meta, Pat, Path, PathArguments, ReturnType, Token, Type, TypePath,
 };
 
 struct MacroArgs {
@@ -190,6 +190,7 @@ fn expand_handler_inner(
     let impl_ident = format_ident!("__durust_impl_{}", ident);
     let manifest_ident = format_ident!("__durust_manifest_{}", ident);
     let (input_binding, input) = extract_single_input(&item_fn)?;
+    validate_single_struct_input(&input)?;
     let output = extract_result_output(&item_fn)?;
     let query_state = parsed
         .query_state
@@ -697,6 +698,58 @@ fn extract_single_input(item_fn: &ItemFn) -> syn::Result<(Pat, Type)> {
             "durust handlers cannot take self",
         )),
     }
+}
+
+fn validate_single_struct_input(input: &Type) -> syn::Result<()> {
+    const MESSAGE: &str = "durust handlers must take exactly one named input struct; wrap primitives, tuples, collections, and no-input handlers in a struct";
+
+    match input {
+        Type::Path(type_path) if is_named_input_path(type_path) => Ok(()),
+        Type::Path(_) => Err(syn::Error::new_spanned(input, MESSAGE)),
+        _ => Err(syn::Error::new_spanned(input, MESSAGE)),
+    }
+}
+
+fn is_named_input_path(type_path: &TypePath) -> bool {
+    if type_path.qself.is_some() {
+        return false;
+    }
+
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    let ident = segment.ident.to_string();
+    !matches!(
+        ident.as_str(),
+        "()" | "bool"
+            | "char"
+            | "str"
+            | "String"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f32"
+            | "f64"
+            | "Vec"
+            | "Option"
+            | "Result"
+            | "HashMap"
+            | "BTreeMap"
+            | "HashSet"
+            | "BTreeSet"
+            | "Box"
+            | "Arc"
+            | "Rc"
+    )
 }
 
 fn extract_result_output(item_fn: &ItemFn) -> syn::Result<Type> {

@@ -1,24 +1,28 @@
 use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
 use futures::executor::block_on;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct ChargeInput {}
 
 #[durust::activity(name = "examples.charge-v1")]
-async fn charge_v1(_: ()) -> durust::Result<String> {
+async fn charge_v1(_: ChargeInput) -> durust::Result<String> {
     Ok("charge-v1".to_owned())
 }
 
 #[durust::activity(name = "examples.charge-v2")]
-async fn charge_v2(_: ()) -> durust::Result<String> {
+async fn charge_v2(_: ChargeInput) -> durust::Result<String> {
     Ok("charge-v2".to_owned())
 }
 
 #[durust::workflow(name = "examples.versioned-charge", version = 1)]
-async fn charge_workflow(_: ()) -> durust::Result<String> {
+async fn charge_workflow(_: ChargeInput) -> durust::Result<String> {
     if durust::patched("charge-v2")? {
-        durust::call_activity!(charge_v2(()))
+        durust::call_activity!(charge_v2(ChargeInput {}))
             .task_queue("activities")
             .await
     } else {
-        durust::call_activity!(charge_v1(()))
+        durust::call_activity!(charge_v1(ChargeInput {}))
             .task_queue("activities")
             .await
     }
@@ -35,7 +39,7 @@ async fn run_example() -> durust::Result<String> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<charge_workflow>("charge/1", "workflows", ())
+        .start_workflow::<charge_workflow>("charge/1", "workflows", ChargeInput {})
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

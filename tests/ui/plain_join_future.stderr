@@ -1,11 +1,11 @@
 error[E0277]: the trait bound `std::future::Ready<Result<(), durust::Error>>: DurableJoinBranch` is not satisfied
- --> tests/ui/plain_join_future.rs:3:13
+ --> tests/ui/plain_join_future.rs:6:13
   |
-3 |       let _ = durust::join!(
+6 |       let _ = durust::join!(
   |  _____________^
-4 | |         std::future::ready(Ok::<(), durust::Error>(())),
-5 | |         durust::sleep(std::time::Duration::from_millis(1)),
-6 | |     )
+7 | |         std::future::ready(Ok::<(), durust::Error>(())),
+8 | |         durust::sleep(std::time::Duration::from_millis(1)),
+9 | |     )
   | |_____^ the trait `DurableJoinBranch` is not implemented for `std::future::Ready<Result<(), durust::Error>>`
   |
   = help: the following other types implement trait `DurableJoinBranch`:

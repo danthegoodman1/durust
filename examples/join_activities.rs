@@ -7,16 +7,24 @@ struct NumberInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct JoinInput {
+    value: u64,
+}
+
 #[durust::activity(name = "examples.join-double")]
 async fn double(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
 }
 
 #[durust::workflow(name = "examples.join-activities", version = 1)]
-async fn join_activities(input: u64) -> durust::Result<u64> {
+async fn join_activities(input: JoinInput) -> durust::Result<u64> {
     let (left, right) = durust::join!(
-        durust::call_activity!(double(NumberInput { value: input })).task_queue("activities"),
-        durust::call_activity!(double(NumberInput { value: input + 1 })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput { value: input.value })).task_queue("activities"),
+        durust::call_activity!(double(NumberInput {
+            value: input.value + 1
+        }))
+        .task_queue("activities"),
     )
     .await?;
     Ok(left + right)
@@ -33,7 +41,7 @@ async fn run_example() -> durust::Result<u64> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<join_activities>("join/1", "workflows", 20)
+        .start_workflow::<join_activities>("join/1", "workflows", JoinInput { value: 20 })
         .await?;
     let mut worker = Worker::builder(backend.clone())
         .workflow_task_queue("workflows")

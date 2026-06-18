@@ -19,6 +19,7 @@ providers.
 - `Activity` trait.
 - `#[workflow]` registration macro.
 - `#[activity]` registration macro.
+- Single named input struct validation for workflow and activity handlers.
 - Durable manifest generation, check, diff, and accept CLI.
 - Task-local workflow context.
 - History event model.

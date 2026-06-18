@@ -11,14 +11,19 @@ struct NumberInput {
     value: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct DoubleWorkflowInput {
+    value: u64,
+}
+
 #[durust::activity(name = "examples.local-remote-double")]
 async fn double(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value * 2)
 }
 
 #[durust::workflow(name = "examples.local-remote-activity", version = 1)]
-async fn double_workflow(input: u64) -> durust::Result<u64> {
-    durust::call_activity!(double(NumberInput { value: input }))
+async fn double_workflow(input: DoubleWorkflowInput) -> durust::Result<u64> {
+    durust::call_activity!(double(NumberInput { value: input.value }))
         .task_queue("compute")
         .await
 }
@@ -40,7 +45,11 @@ async fn run_with_local_preference() -> durust::Result<u64> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<double_workflow>("local-activity/1", "workflows", 21)
+        .start_workflow::<double_workflow>(
+            "local-activity/1",
+            "workflows",
+            DoubleWorkflowInput { value: 21 },
+        )
         .await?;
     let mut workflow_worker = Worker::builder(backend.clone())
         .worker_id("workflow-worker")
@@ -73,7 +82,11 @@ async fn run_with_remote_fallback() -> durust::Result<u64> {
     let backend = MemoryBackend::new();
     let client = Client::new(backend.clone());
     let run_id = client
-        .start_workflow::<double_workflow>("remote-activity/1", "workflows", 21)
+        .start_workflow::<double_workflow>(
+            "remote-activity/1",
+            "workflows",
+            DoubleWorkflowInput { value: 21 },
+        )
         .await?;
     let mut workflow_worker = Worker::builder(backend.clone())
         .worker_id("workflow-worker")

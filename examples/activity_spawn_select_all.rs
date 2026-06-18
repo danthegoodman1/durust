@@ -13,6 +13,11 @@ struct Candidate {
     score: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct FirstScoreInput {
+    candidates: Vec<Candidate>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ScoredCandidate {
     id: String,
@@ -25,9 +30,9 @@ async fn score_candidate(candidate: Candidate) -> durust::Result<u64> {
 }
 
 #[durust::workflow(name = "examples.activity-spawn-select-all", version = 1)]
-async fn first_score(candidates: Vec<Candidate>) -> durust::Result<String> {
+async fn first_score(input: FirstScoreInput) -> durust::Result<String> {
     let mut branches: Vec<BoxSelectBranch<ScoredCandidate>> = Vec::new();
-    for candidate in candidates {
+    for candidate in input.candidates {
         let id = candidate.id.clone();
         let handle = durust::call_activity!(score_candidate(candidate))
             .task_queue("scoring")
@@ -64,20 +69,22 @@ async fn run_example() -> durust::Result<String> {
         .start_workflow::<first_score>(
             "score/1",
             "workflows",
-            vec![
-                Candidate {
-                    id: "slow-a".to_owned(),
-                    score: 10,
-                },
-                Candidate {
-                    id: "fast-b".to_owned(),
-                    score: 99,
-                },
-                Candidate {
-                    id: "slow-c".to_owned(),
-                    score: 30,
-                },
-            ],
+            FirstScoreInput {
+                candidates: vec![
+                    Candidate {
+                        id: "slow-a".to_owned(),
+                        score: 10,
+                    },
+                    Candidate {
+                        id: "fast-b".to_owned(),
+                        score: 99,
+                    },
+                    Candidate {
+                        id: "slow-c".to_owned(),
+                        score: 30,
+                    },
+                ],
+            },
         )
         .await?;
     let mut worker = Worker::builder(backend.clone())

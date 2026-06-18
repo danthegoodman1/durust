@@ -7,6 +7,11 @@ struct ShipInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckoutInput {
+    order_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ShipOutput {
     shipment_id: String,
 }
@@ -19,11 +24,11 @@ async fn ship_order(input: ShipInput) -> durust::Result<ShipOutput> {
 }
 
 #[durust::workflow(name = "examples.checkout-with-child", version = 1)]
-async fn checkout_with_child(order_id: String) -> durust::Result<String> {
+async fn checkout_with_child(input: CheckoutInput) -> durust::Result<String> {
     let child = durust::child!(ship_order(ShipInput {
-        order_id: order_id.clone(),
+        order_id: input.order_id.clone(),
     }))
-    .workflow_id(format!("ship/{order_id}"))
+    .workflow_id(format!("ship/{}", input.order_id))
     .spawn()
     .await?;
     let shipment = child.result().await?;
@@ -31,11 +36,11 @@ async fn checkout_with_child(order_id: String) -> durust::Result<String> {
 }
 
 #[durust::workflow(name = "examples.checkout-abandon-child", version = 1)]
-async fn checkout_abandon_child(order_id: String) -> durust::Result<String> {
+async fn checkout_abandon_child(input: CheckoutInput) -> durust::Result<String> {
     let child = durust::child!(ship_order(ShipInput {
-        order_id: order_id.clone(),
+        order_id: input.order_id.clone(),
     }))
-    .workflow_id(format!("receipt/{order_id}"))
+    .workflow_id(format!("receipt/{}", input.order_id))
     .parent_close_policy(durust::ParentClosePolicy::Abandon)
     .spawn()
     .await?;
@@ -47,7 +52,13 @@ fn main() -> durust::Result<()> {
         let backend = durust::MemoryBackend::new();
         let client = durust::Client::new(backend.clone());
         client
-            .start_workflow::<checkout_with_child>("order/123", "orders", "123".to_owned())
+            .start_workflow::<checkout_with_child>(
+                "order/123",
+                "orders",
+                CheckoutInput {
+                    order_id: "123".to_owned(),
+                },
+            )
             .await?;
 
         let mut worker = durust::Worker::builder(backend)
@@ -74,7 +85,9 @@ mod tests {
                 .start_workflow::<checkout_with_child>(
                     "order/child-wait",
                     "orders",
-                    "123".to_owned(),
+                    CheckoutInput {
+                        order_id: "123".to_owned(),
+                    },
                 )
                 .await
                 .unwrap();
@@ -117,7 +130,9 @@ mod tests {
                 .start_workflow::<checkout_abandon_child>(
                     "order/child-abandon",
                     "orders",
-                    "456".to_owned(),
+                    CheckoutInput {
+                        order_id: "456".to_owned(),
+                    },
                 )
                 .await
                 .unwrap();

@@ -1,0 +1,5 @@
+error: durust handlers must take exactly one named input struct; wrap primitives, tuples, collections, and no-input handlers in a struct
+ --> tests/ui/collection_input.rs:2:21
+  |
+2 | async fn bad(input: Vec<u64>) -> durust::Result<()> {
+  |                     ^^^^^^^^

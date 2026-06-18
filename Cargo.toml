@@ -1,6 +1,6 @@
 [package]
 name = "durust"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A durable workflow runtime for Rust services."
 license = "MIT"
@@ -8,7 +8,7 @@ repository = "https://github.com/danthegoodman1/durust"
 
 [dependencies]
 deadpool-postgres = "0.14.1"
-durust-macros = { version = "0.1.1", path = "durust-macros" }
+durust-macros = { version = "0.1.2", path = "durust-macros" }
 futures = "0.3.32"
 hex = "0.4.3"
 inventory = "0.3.24"
