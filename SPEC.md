@@ -829,6 +829,9 @@ pub enum HistoryEventType {
     ActivityMapCompleted,
     ActivityMapFailed,
     ActivityMapCancelled,
+    ChildWorkflowMapScheduled,
+    ChildWorkflowMapCompleted,
+    ChildWorkflowMapFailed,
     ActivityCompleted,
     ActivityFailed,
     ActivityTimedOut,
@@ -903,6 +906,32 @@ ActivityMapCompleted {
 }
 ```
 
+Example child workflow map lifecycle:
+
+```text
+ChildWorkflowMapScheduled {
+  command_id,
+  command_seq,
+  workflow_name,
+  input_manifest_ref,
+  workflow_id_prefix,
+  result_manifest_ref,
+  max_in_flight,
+  parent_close_policy,
+  failure_mode,
+  options_hash,
+}
+
+ChildWorkflowMapCompleted {
+  command_id,
+  result_manifest_ref,
+  item_count,
+  success_count,
+  failure_count,
+  cancelled_count,
+}
+```
+
 Why record scheduling?
 
 ```text
@@ -918,8 +947,9 @@ differs from workflow polling order, for example `TimerFired` before
 When replay consumes a ready fact before the cursor reaches that event, the
 runtime records the consumed `event_id` and skips that exact event when the
 cursor advances. This rule applies to activity completion/failure/timeout,
-activity-map completion/failure, child workflow start/completion/failure/cancel,
-timer fire, and signal consumption facts.
+activity-map completion/failure, child-workflow-map completion/failure, child
+workflow start/completion/failure/cancel, timer fire, and signal consumption
+facts.
 
 ---
 
@@ -1136,7 +1166,65 @@ selected task queue.
 
 Provider implementations must enforce manifest page limits, `max_in_flight`, retry policy, cancellation, and result manifest writes without loading all inputs or results into workflow memory or a single durable row.
 
-## 6.5 Activity dispatch locality
+## 6.5 Child workflow map scheduling
+
+Large fanout where each item owns durable multi-step orchestration should not
+write one parent child workflow lifecycle per item. Provide one
+manifest-backed API for map-style child fanout:
+
+```rust
+let mapped = durust::child_workflow_map::<ProcessPartitionWorkflow>()
+    .task_queue("partition-workers")
+    .workflow_id_prefix(format!("jobs/{}/partitions", job_id))
+    .input_manifest(partitions.manifest_ref)
+    .max_in_flight(256)
+    .result_manifest("partition-results")
+    .parent_close_policy(ParentClosePolicy::Cancel)
+    .failure_mode(ChildWorkflowMapFailureMode::FailFast)
+    .spawn()
+    .await?;
+
+let results = mapped.result_manifest().await?;
+```
+
+The workflow type parameter selects the child workflow type. Each input manifest
+item starts one child workflow with deterministic workflow id
+`{workflow_id_prefix}/{ordinal}`. The provider persists the map descriptor,
+materializes child starts up to `max_in_flight`, and routes terminal child
+results back into provider-owned map item state.
+
+Semantics:
+
+```text
+one durable command schedules one manifest-backed child workflow map
+the map command increments command_seq once
+the map fingerprint includes workflow type, input manifest digest/ref, result manifest config, workflow_id_prefix, task queue, max_in_flight, parent_close_policy, failure_mode, and options digest
+workflow history records ChildWorkflowMapScheduled and terminal ChildWorkflowMapCompleted/Failed facts
+workflow history does not record ChildWorkflowStarted, ChildWorkflowCompleted, ChildWorkflowFailed, or ChildWorkflowCancelled facts per map item
+the provider pages through the input manifest and materializes child starts up to max_in_flight
+each item gets deterministic identity: map_command_id + manifest item ordinal
+each child workflow gets deterministic workflow id: workflow_id_prefix + "/" + item ordinal
+per-item state lives in provider child-map descriptor/result tables and indexes
+results are written to the result manifest, not collected into workflow memory
+replay reconstructs the same map handle from ChildWorkflowMapScheduled
+```
+
+Failure mode controls map terminal behavior. `FailFast` records
+`ChildWorkflowMapFailed`, wakes waiters with `Error::ChildWorkflowMapFailed`,
+and cancels pending/running map children according to the map's parent close
+policy. `CollectAll` records success, failure, and cancellation outcomes in
+ordinal order, continues materializing remaining items, and completes with an
+outcome manifest once every item is terminal.
+
+Child workflow maps use the same paged manifest model as activity maps. Input
+items are payload refs, result pages contain ordered item outcomes, and
+providers must not load all inputs or results into workflow memory or a single
+durable row. When a `PayloadBackend` object-store wrapper is configured, input
+manifests, result pages, terminal events, and child-map descriptors are
+normalized through the same inline-threshold/offload path as other payload
+roots.
+
+## 6.6 Activity dispatch locality
 
 Activity workers do not need to run on the same machine as the workflow worker.
 
@@ -1246,6 +1334,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     async fn hydrate_payload(&self, payload: PayloadRef) -> durust::Result<PayloadRef>;
 
     async fn hydrate_activity_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> durust::Result<PayloadRef>;
+
+    async fn hydrate_child_workflow_map_result_manifest(
         &self,
         payload: PayloadRef,
     ) -> durust::Result<PayloadRef>;
@@ -1410,6 +1503,7 @@ pub struct WorkflowTaskCommit {
 
     pub schedule_activities: Vec<ActivityTask>,
     pub schedule_activity_maps: Vec<ActivityMapTask>,
+    pub schedule_child_workflow_maps: Vec<ChildWorkflowMapTask>,
     pub start_child_workflows: Vec<ChildStartOutboxMessage>,
 
     pub consume_signals: Vec<SignalId>,
@@ -1449,17 +1543,42 @@ payloads. The runtime contract is that each item is independently claimable,
 lease-fenced, retryable, and completable by `ActivityMapItemId`, while workflow
 history remains compact at the map-operation level.
 
+```rust
+pub struct ChildWorkflowMapTask {
+    pub map_command_id: CommandId,
+    pub workflow_name: WorkflowName,
+    pub task_queue: TaskQueue,
+    pub workflow_id_prefix: String,
+    pub input_manifest: PayloadRef,
+    pub result_manifest_name: String,
+    pub max_in_flight: usize,
+    pub parent_close_policy: ParentClosePolicy,
+    pub failure_mode: ChildWorkflowMapFailureMode,
+    pub options_hash: Sha256,
+}
+```
+
+The provider persists a compact child-map descriptor and materializes child
+workflow starts from manifest pages subject to `max_in_flight`. Map item child
+starts reuse ordinary child workflow start semantics and idempotency, but they
+are tagged with the map item ordinal. Terminal child events update the
+provider-owned child-map item state and do not append per-item child lifecycle
+facts to the parent history. The parent sees only the scheduled map and its
+terminal map event.
+
 `dispatch_child_workflow_starts` is the provider-neutral child-start handoff
 drain for providers that cannot apply the child-side state in the same local
 transaction as the parent workflow-task commit. It claims a bounded number of
 durable child-start messages, starts each child idempotently, and appends the
 corresponding `ChildWorkflowStarted` or `ChildWorkflowFailed` fact to the parent
-run. Providers that keep both parent and child state inside one transactional
-store boundary, such as one Postgres database connection, may apply the child
-start and parent wake event inline during `commit_workflow_task`; for those
-providers this drain is a no-op. Providers must keep either path generic: the
-runtime chooses child options and parent close policy; the provider only
-persists and dispatches durable visibility.
+run for ordinary child workflow commands. Map-item child starts skip those
+per-item parent facts and update child-map state instead. Providers that keep
+both parent and child state inside one transactional store boundary, such as
+one Postgres database connection, may apply the child start and parent wake
+event inline during `commit_workflow_task`; for those providers this drain is a
+no-op. Providers must keep either path generic: the runtime chooses child
+options and parent close policy; the provider only persists and dispatches
+durable visibility.
 
 ## 8.3 Atomicity requirement
 
@@ -1472,10 +1591,11 @@ The backend must atomically:
 4. update active waits
 5. create activity tasks
 6. create activity map descriptors
-7. enqueue child handoff messages or apply inline child starts
-8. consume signals
-9. update query projection
-10. mark workflow ready/not ready
+7. create child workflow map descriptors
+8. enqueue child handoff messages or apply inline child starts
+9. consume signals
+10. update query projection
+11. mark workflow ready/not ready
 ```
 
 If another event was appended concurrently, return:
@@ -2354,28 +2474,31 @@ debugging, inspection, and conformance helpers. Worker replay uses
 values and avoid fetching large payload bytes until workflow execution reaches a
 payload-observing operation. When the runtime observes such a payload, the
 worker calls `hydrate_payload` or, for paged activity-map result manifests,
-`hydrate_activity_map_result_manifest` at an explicit async boundary before
-polling the workflow again. Workflow polling must not perform hidden object-store
-or database I/O.
+`hydrate_activity_map_result_manifest` or
+`hydrate_child_workflow_map_result_manifest` at an explicit async boundary
+before polling the workflow again. Workflow polling must not perform hidden
+object-store or database I/O.
 
 Providers should expose generic payload garbage collection for provider-owned
 blob stores. GC treats workflow history, activity tasks, activity map manifests
-and results, child outbox entries, signal inbox rows, and query projections as
-roots. A dry-run mode must report retained and deleted blob counts without
-mutating storage. Counts are for blobs owned by the GC target: concrete providers
-count provider-owned blobs, while wrapper GC counts wrapper-owned object-store
-blobs. If a committed reachable `PayloadRef::Blob` is missing or fails
+and results, child workflow map manifests and results, child outbox entries,
+signal inbox rows, and query projections as roots. A dry-run mode must report
+retained and deleted blob counts without mutating storage. Counts are for blobs
+owned by the GC target: concrete providers count provider-owned blobs, while
+wrapper GC counts wrapper-owned object-store blobs. If a committed reachable
+`PayloadRef::Blob` is missing or fails
 digest/size validation, GC must fail rather than deleting unrelated blobs.
 
 For provider-agnostic object stores, concrete providers also expose durable
 payload roots without object-store policy. Roots are typed so an outer
 `PayloadBackend` can recursively traverse activity-map input and result
-manifests, validate wrapper-owned blob refs through `PayloadBlobStore`, and
-delete only unreachable wrapper-owned objects. Concrete providers may persist
-unknown external blob refs opaquely and must not know whether they point at S3,
-Garage, or another object store. Operational activity-map task state still
-requires provider-decodable manifest containers so providers can materialize
-bounded map items without object-store-specific logic.
+manifests and child-workflow-map input and result manifests, validate
+wrapper-owned blob refs through `PayloadBlobStore`, and delete only unreachable
+wrapper-owned objects. Concrete providers may persist unknown external blob refs
+opaquely and must not know whether they point at S3, Garage, or another object
+store. Operational map task state still requires provider-decodable manifest
+containers so providers can materialize bounded map items without
+object-store-specific logic.
 
 ---
 
@@ -2927,6 +3050,13 @@ activity map materializes deterministic item tasks from manifest pages
 activity map item completions are idempotent by map_command_id and item_ordinal
 activity map replay reconstructs the same map handle without per-item history
 activity map respects max_in_flight across retries and worker restarts
+child workflow map scheduling creates a compact map descriptor
+child workflow map materializes deterministic child starts from manifest pages
+child workflow map uses deterministic child workflow ids by prefix and ordinal
+child workflow map item completions are idempotent by map_command_id and item_ordinal
+child workflow map replay reconstructs the same map handle without per-item child lifecycle history
+child workflow map respects max_in_flight across worker restarts
+child workflow map fail-fast cancellation and collect-all outcomes are ordered and durable
 external activity completion is idempotent
 stale activity lease completion is rejected
 signal send idempotency key returns first signal record
@@ -2965,6 +3095,7 @@ signal-heavy
 timer-heavy
 child-workflow fanout
 manifest-backed activity map fanout
+manifest-backed child workflow map fanout
 large payload refs without DB row inflation
 SQLite test backend
 production-oriented append backend

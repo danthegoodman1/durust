@@ -31,8 +31,12 @@ struct WordCountOutput {
 
 #[durust::activity(name = "examples.partition-input")]
 async fn partition_input(input: WordCountInput) -> durust::Result<PartitionOutput> {
-    let manifest_ref =
-        durust::activity_map_manifest(input.chunks.into_iter().map(|chunk| WorkInput { chunk }))?;
+    let items = input
+        .chunks
+        .into_iter()
+        .map(|chunk| durust::encode_payload(&WorkInput { chunk }))
+        .collect::<durust::Result<Vec<_>>>()?;
+    let manifest_ref = durust::encode_activity_map_input_manifest(items, 128)?;
     Ok(PartitionOutput { manifest_ref })
 }
 

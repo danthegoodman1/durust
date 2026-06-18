@@ -41,7 +41,9 @@ impl DurableFailure {
             Error::ActivityTimedOut(message) => {
                 Self::new("durust.activity_timed_out", message.clone())
             }
-            Error::ChildWorkflowFailed(failure) => failure.clone(),
+            Error::ChildWorkflowFailed(failure) | Error::ChildWorkflowMapFailed(failure) => {
+                failure.clone()
+            }
             Error::ChildWorkflowCancelled(reason) => {
                 Self::new("durust.child_workflow_cancelled", reason.clone()).marked_non_retryable()
             }
@@ -157,6 +159,9 @@ pub enum Error {
     #[error("child workflow cancelled: {0}")]
     ChildWorkflowCancelled(String),
 
+    #[error("child workflow map failed: {0}")]
+    ChildWorkflowMapFailed(DurableFailure),
+
     #[error("workflow continued as new")]
     ContinueAsNew { input: PayloadRef },
 
@@ -225,7 +230,8 @@ impl Error {
         match self {
             Self::Application(failure)
             | Self::ActivityFailed(failure)
-            | Self::ChildWorkflowFailed(failure) => failure.non_retryable,
+            | Self::ChildWorkflowFailed(failure)
+            | Self::ChildWorkflowMapFailed(failure) => failure.non_retryable,
             _ => false,
         }
     }

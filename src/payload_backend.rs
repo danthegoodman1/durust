@@ -2,16 +2,18 @@ use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
     ActivityMapResultPage, ActivityScheduled, ActivityTask, CancelWorkflowOutcome,
     CancelWorkflowRequest, ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
-    ChildWorkflowStartRequested, ClaimActivityOptions, ClaimWorkflowTaskOptions,
-    ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome, CompleteActivityOutcome,
-    CompleteActivityRequest, CompleteActivityTaskBatchResult, CompleteActivityTasksRequest,
-    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend,
-    DurableFailure, Error, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome,
-    FireDueTimersRequest, HistoryChunk, HistoryEvent, HistoryEventData, PayloadBlob,
-    PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef,
-    PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest,
-    ReadSignalInboxRequest, Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome,
-    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest, ChildWorkflowMapResultPage,
+    ChildWorkflowMapTask, ChildWorkflowStartRequested, ClaimActivityOptions,
+    ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome,
+    CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
+    CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
+    DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, FailActivityOutcome,
+    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
+    HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
+    PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
+    PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
+    Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
+    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
     TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
     WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
     digest_bytes,
@@ -171,6 +173,20 @@ where
         Box::pin(async move {
             let payload = inner.hydrate_activity_map_result_manifest(payload).await?;
             hydrate_activity_map_result_manifest(&blob_store, payload).await
+        })
+    }
+
+    fn hydrate_child_workflow_map_result_manifest(
+        &self,
+        payload: PayloadRef,
+    ) -> BoxFuture<'static, Result<PayloadRef>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let payload = inner
+                .hydrate_child_workflow_map_result_manifest(payload)
+                .await?;
+            hydrate_child_workflow_map_result_manifest(&blob_store, payload).await
         })
     }
 
@@ -414,6 +430,13 @@ where
         schedule_activity_maps.push(normalize_activity_map_task(blob_store, config, task).await?);
     }
 
+    let mut schedule_child_workflow_maps =
+        Vec::with_capacity(batch.schedule_child_workflow_maps.len());
+    for task in batch.schedule_child_workflow_maps {
+        schedule_child_workflow_maps
+            .push(normalize_child_workflow_map_task(blob_store, config, task).await?);
+    }
+
     let mut start_child_workflows = Vec::with_capacity(batch.start_child_workflows.len());
     for message in batch.start_child_workflows {
         start_child_workflows
@@ -429,6 +452,7 @@ where
         append_events,
         schedule_activities,
         schedule_activity_maps,
+        schedule_child_workflow_maps,
         start_child_workflows,
         query_projection,
         ..batch
@@ -483,6 +507,25 @@ where
         HistoryEventData::ActivityMapFailed(mut failed) => {
             failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
             HistoryEventData::ActivityMapFailed(failed)
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            scheduled.input_manifest =
+                normalize_activity_map_input_manifest(blob_store, config, scheduled.input_manifest)
+                    .await?;
+            HistoryEventData::ChildWorkflowMapScheduled(scheduled)
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            completed.result_manifest = normalize_child_workflow_map_result_manifest(
+                blob_store,
+                config,
+                completed.result_manifest,
+            )
+            .await?;
+            HistoryEventData::ChildWorkflowMapCompleted(completed)
+        }
+        HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
+            failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
+            HistoryEventData::ChildWorkflowMapFailed(failed)
         }
         HistoryEventData::ActivityCompleted(mut completed) => {
             completed.result = normalize_payload_ref(blob_store, config, completed.result).await?;
@@ -569,6 +612,21 @@ where
             failed.failure = hydrate_failure(blob_store, failed.failure).await?;
             HistoryEventData::ActivityMapFailed(failed)
         }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            scheduled.input_manifest =
+                hydrate_activity_map_input_manifest(blob_store, scheduled.input_manifest).await?;
+            HistoryEventData::ChildWorkflowMapScheduled(scheduled)
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            completed.result_manifest =
+                hydrate_child_workflow_map_result_manifest(blob_store, completed.result_manifest)
+                    .await?;
+            HistoryEventData::ChildWorkflowMapCompleted(completed)
+        }
+        HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
+            failed.failure = hydrate_failure(blob_store, failed.failure).await?;
+            HistoryEventData::ChildWorkflowMapFailed(failed)
+        }
         HistoryEventData::ActivityCompleted(mut completed) => {
             completed.result = hydrate_payload_ref(blob_store, completed.result).await?;
             HistoryEventData::ActivityCompleted(completed)
@@ -649,6 +707,23 @@ async fn normalize_activity_map_task<S>(
     config: &PayloadStorageConfig,
     mut task: crate::ActivityMapTask,
 ) -> Result<crate::ActivityMapTask>
+where
+    S: PayloadBlobStore,
+{
+    task.input_manifest = normalize_activity_map_input_manifest_for_operations(
+        blob_store,
+        config,
+        task.input_manifest,
+    )
+    .await?;
+    Ok(task)
+}
+
+async fn normalize_child_workflow_map_task<S>(
+    blob_store: &S,
+    config: &PayloadStorageConfig,
+    mut task: ChildWorkflowMapTask,
+) -> Result<ChildWorkflowMapTask>
 where
     S: PayloadBlobStore,
 {
@@ -943,6 +1018,120 @@ where
     crate::encode_payload_with_codec(&manifest, root_codec)
 }
 
+async fn normalize_child_workflow_map_result_manifest<S>(
+    blob_store: &S,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef>
+where
+    S: PayloadBlobStore,
+{
+    let root = hydrate_payload_ref(blob_store, payload).await?;
+    let root_codec = root.codec();
+    let mut manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    let mut pages = Vec::with_capacity(manifest.pages.len());
+    for page in manifest.pages {
+        let page = hydrate_payload_ref(blob_store, page).await?;
+        let page_codec = page.codec();
+        let mut page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+        let mut outcomes = Vec::with_capacity(page.outcomes.len());
+        for outcome in page.outcomes {
+            outcomes.push(normalize_child_workflow_map_outcome(blob_store, config, outcome).await?);
+        }
+        page.outcomes = outcomes;
+        pages.push(
+            normalize_payload_ref(
+                blob_store,
+                config,
+                crate::encode_payload_with_codec(&page, page_codec)?,
+            )
+            .await?,
+        );
+    }
+    manifest.pages = pages;
+    normalize_payload_ref(
+        blob_store,
+        config,
+        crate::encode_payload_with_codec(&manifest, root_codec)?,
+    )
+    .await
+}
+
+async fn hydrate_child_workflow_map_result_manifest<S>(
+    blob_store: &S,
+    payload: PayloadRef,
+) -> Result<PayloadRef>
+where
+    S: PayloadBlobStore,
+{
+    let root = hydrate_payload_ref(blob_store, payload).await?;
+    let root_codec = root.codec();
+    let mut manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    let mut pages = Vec::with_capacity(manifest.pages.len());
+    for page in manifest.pages {
+        let page = hydrate_payload_ref(blob_store, page).await?;
+        let page_codec = page.codec();
+        let mut page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+        let mut outcomes = Vec::with_capacity(page.outcomes.len());
+        for outcome in page.outcomes {
+            outcomes.push(hydrate_child_workflow_map_outcome(blob_store, outcome).await?);
+        }
+        page.outcomes = outcomes;
+        pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
+    }
+    manifest.pages = pages;
+    crate::encode_payload_with_codec(&manifest, root_codec)
+}
+
+async fn normalize_child_workflow_map_outcome<S>(
+    blob_store: &S,
+    config: &PayloadStorageConfig,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<ChildWorkflowMapItemOutcome>
+where
+    S: PayloadBlobStore,
+{
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                result: normalize_payload_ref(blob_store, config, result).await?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            Ok(ChildWorkflowMapItemOutcome::Failed {
+                failure: normalize_failure(blob_store, config, failure).await?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
+}
+
+async fn hydrate_child_workflow_map_outcome<S>(
+    blob_store: &S,
+    outcome: ChildWorkflowMapItemOutcome,
+) -> Result<ChildWorkflowMapItemOutcome>
+where
+    S: PayloadBlobStore,
+{
+    match outcome {
+        ChildWorkflowMapItemOutcome::Succeeded { result } => {
+            Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                result: hydrate_payload_ref(blob_store, result).await?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Failed { failure } => {
+            Ok(ChildWorkflowMapItemOutcome::Failed {
+                failure: hydrate_failure(blob_store, failure).await?,
+            })
+        }
+        ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+            Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+        }
+    }
+}
+
 async fn collect_reachable_external_blobs<S>(
     blob_store: &S,
     roots: Vec<PayloadRootRef>,
@@ -961,6 +1150,12 @@ where
             }
             PayloadRootRef::ActivityMapResultManifest(payload) => {
                 collect_reachable_external_result_manifest(blob_store, payload, reachable).await?;
+            }
+            PayloadRootRef::ChildWorkflowMapResultManifest(payload) => {
+                collect_reachable_external_child_workflow_map_result_manifest(
+                    blob_store, payload, reachable,
+                )
+                .await?;
             }
         }
     }
@@ -1068,6 +1263,48 @@ where
         let page: ActivityMapResultPage = crate::decode_payload(&page)?;
         for result in page.results {
             collect_reachable_external_payload(blob_store, &result, reachable).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn collect_reachable_external_child_workflow_map_result_manifest<S>(
+    blob_store: &S,
+    payload: PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()>
+where
+    S: PayloadBlobStore,
+{
+    let root = load_external_container(
+        blob_store,
+        payload,
+        reachable,
+        "child workflow map result manifest root",
+    )
+    .await?;
+    let manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+    for page in manifest.pages {
+        let page = load_external_container(
+            blob_store,
+            page,
+            reachable,
+            "child workflow map result manifest page",
+        )
+        .await?;
+        let page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+        for outcome in page.outcomes {
+            match outcome {
+                ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                    collect_reachable_external_payload(blob_store, &result, reachable).await?;
+                }
+                ChildWorkflowMapItemOutcome::Failed { failure } => {
+                    if let Some(details) = failure.details {
+                        collect_reachable_external_payload(blob_store, &details, reachable).await?;
+                    }
+                }
+                ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
+            }
         }
     }
     Ok(())

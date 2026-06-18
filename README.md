@@ -536,6 +536,31 @@ bounded workflow history
 
 Workflow history stays compact by recording the map operation.
 
+When each map item needs durable multi-step orchestration, use
+`child_workflow_map` instead of recording one child lifecycle in the parent per
+item:
+
+```rust
+let mapped = durust::child_workflow_map::<ProcessPartitionWorkflow>()
+    .task_queue("partition-workers")
+    .workflow_id_prefix(format!("word-count/{}/partitions", input.job_id))
+    .input_manifest(partitions.manifest_ref)
+    .max_in_flight(256)
+    .result_manifest("partition-results")
+    .spawn()
+    .await?;
+
+let partials = mapped.result_manifest().await?;
+```
+
+Child workflow maps use deterministic child workflow ids of the form
+`{workflow_id_prefix}/{ordinal}`. The parent history records only
+`ChildWorkflowMapScheduled` and a terminal map event; provider-owned map item
+state tracks child starts, completions, cancellation, and ordered result
+manifests. The input and result manifests use the normal `PayloadRef` path, so
+large manifests are offloaded by the configured payload backend when they exceed
+the inline threshold.
+
 ### Continue As New
 
 Use `continue_as_new` to cap recovery latency for workflows that naturally run
@@ -711,6 +736,7 @@ active wait indexes
 workflow and activity leases
 signal inboxes
 activity map state
+child workflow map state
 child workflow outbox and parent notifications
 query projections
 payload refs
@@ -748,4 +774,5 @@ patterns. Each example is small, runnable, and copyable into a new project.
 - [`query_projection.rs`](examples/query_projection.rs)
 - [`local_remote_activity.rs`](examples/local_remote_activity.rs)
 - [`activity_map.rs`](examples/activity_map.rs)
+- [`child_workflow_map.rs`](examples/child_workflow_map.rs)
 - [`map_reduce.rs`](examples/map_reduce.rs)

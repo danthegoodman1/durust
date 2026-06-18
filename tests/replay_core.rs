@@ -195,6 +195,11 @@ async fn child_double_workflow(input: u64) -> durust::Result<u64> {
     Ok(input * 2)
 }
 
+#[durust::workflow(name = "tests.child-triple", version = 1)]
+async fn child_triple_workflow(input: u64) -> durust::Result<u64> {
+    Ok(input * 3)
+}
+
 #[durust::workflow(name = "tests.child-spawn-wait", version = 1)]
 async fn child_spawn_wait_workflow(input: u64) -> durust::Result<u64> {
     let child = durust::child!(child_double_workflow(input))
@@ -800,6 +805,152 @@ async fn activity_map_sum(input: Vec<u64>) -> durust::Result<u64> {
     result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })
+}
+
+macro_rules! child_workflow_map_sum_body {
+    (
+        $input:expr,
+        $workflow:ty,
+        $workflow_id_prefix:expr,
+        $task_queue:expr,
+        $max_in_flight:expr,
+        $parent_close_policy:expr,
+        $failure_mode:expr,
+        $input_offset:expr $(,)?
+    ) => {{
+        let input_manifest = durust::child_workflow_map_manifest(
+            $input.into_iter().map(|value| value + $input_offset),
+        )?;
+        let mapped = durust::child_workflow_map::<$workflow>()
+            .task_queue($task_queue)
+            .workflow_id_prefix($workflow_id_prefix)
+            .input_manifest(input_manifest)
+            .max_in_flight($max_in_flight)
+            .result_manifest("child-doubled")
+            .parent_close_policy($parent_close_policy)
+            .failure_mode($failure_mode)
+            .spawn()
+            .await?;
+        let result_manifest = mapped.result_manifest().await?;
+        let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+        result_refs.iter().try_fold(0_u64, |sum, payload| {
+            Ok(sum + durust::decode_payload::<u64>(payload)?)
+        })
+    }};
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_child_type(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_triple_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_input_manifest(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        1,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_prefix(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/changed-item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_task_queue(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "other-workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_max_in_flight(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        3,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_parent_close_policy(
+    input: Vec<u64>,
+) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Abandon,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        0,
+    )
+}
+
+#[durust::workflow(name = "tests.child-workflow-map-sum", version = 1)]
+async fn child_workflow_map_sum_changed_failure_mode(input: Vec<u64>) -> durust::Result<u64> {
+    child_workflow_map_sum_body!(
+        input,
+        child_double_workflow,
+        "wf/child-workflow-map-sum/item",
+        "workflows",
+        2,
+        durust::ParentClosePolicy::Cancel,
+        durust::ChildWorkflowMapFailureMode::CollectAll,
+        0,
+    )
 }
 
 #[test]
@@ -3922,6 +4073,180 @@ fn activity_map_workflow_runs_with_compact_history() {
 }
 
 #[test]
+fn child_workflow_map_runs_with_compact_parent_history() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_workflow_map_sum>(
+                "wf/child-workflow-map-sum",
+                "workflows",
+                vec![1, 2, 3],
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(child_workflow_map_sum)
+            .register_workflow(child_double_workflow)
+            .build();
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 5);
+        assert_eq!(stats.activity_tasks, 0);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ChildWorkflowMapScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ChildWorkflowMapCompleted(_)
+        ));
+        assert!(!history.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::ChildWorkflowStarted(_)
+                | HistoryEventData::ChildWorkflowCompleted(_)
+                | HistoryEventData::ChildWorkflowFailed(_)
+                | HistoryEventData::ChildWorkflowCancelled(_)
+        )));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("child workflow map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
+    });
+}
+
+#[test]
+fn child_workflow_map_replay_rejects_changed_fingerprint_fields() {
+    block_on(async {
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "child-type",
+            child_workflow_map_sum_changed_child_type,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "input-manifest",
+            child_workflow_map_sum_changed_input_manifest,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "prefix",
+            child_workflow_map_sum_changed_prefix,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "task-queue",
+            child_workflow_map_sum_changed_task_queue,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "max-in-flight",
+            child_workflow_map_sum_changed_max_in_flight,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "parent-close-policy",
+            child_workflow_map_sum_changed_parent_close_policy,
+        )
+        .await;
+        assert_child_workflow_map_replay_change_is_nondeterministic(
+            "failure-mode",
+            child_workflow_map_sum_changed_failure_mode,
+        )
+        .await;
+    });
+}
+
+async fn assert_child_workflow_map_replay_change_is_nondeterministic<W>(
+    case: &str,
+    changed_workflow: W,
+) where
+    W: durust::Workflow<Input = Vec<u64>, Output = u64> + Default,
+{
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<child_workflow_map_sum>(
+            format!("wf/child-workflow-map-replay/{case}"),
+            "workflows",
+            vec![1, 2],
+        )
+        .await
+        .unwrap();
+    let mut original_worker = Worker::builder(backend.clone())
+        .worker_id(format!("original-child-map-{case}"))
+        .workflow_task_queue("workflows")
+        .register_workflow(child_workflow_map_sum)
+        .build();
+    assert!(original_worker.run_workflow_once().await.unwrap());
+
+    let after_schedule = stream_all(&backend, &run_id).await;
+    assert_eq!(after_schedule.len(), 2);
+    assert!(matches!(
+        after_schedule[1].data,
+        HistoryEventData::ChildWorkflowMapScheduled(_)
+    ));
+
+    assert_eq!(
+        original_worker
+            .run_child_workflow_starts_once()
+            .await
+            .unwrap(),
+        2
+    );
+    drop(original_worker);
+
+    let mut child_worker = Worker::builder(backend.clone())
+        .worker_id(format!("child-map-child-{case}"))
+        .workflow_task_queue("workflows")
+        .register_workflow(child_double_workflow)
+        .build();
+    let child_stats = child_worker.run_until_idle().await.unwrap();
+    assert_eq!(child_stats.workflow_tasks, 2);
+    drop(child_worker);
+
+    let before_changed_replay = stream_all(&backend, &run_id).await;
+    assert!(
+        before_changed_replay
+            .iter()
+            .any(|event| { matches!(event.data, HistoryEventData::ChildWorkflowMapCompleted(_)) })
+    );
+    assert!(
+        !before_changed_replay
+            .iter()
+            .any(|event| matches!(event.data, HistoryEventData::WorkflowCompleted { .. }))
+    );
+
+    let mut changed_worker = Worker::builder(backend.clone())
+        .worker_id(format!("changed-child-map-{case}"))
+        .workflow_task_queue("workflows")
+        .history_chunk_events(1)
+        .register_workflow(changed_workflow)
+        .build();
+    let err = changed_worker.run_workflow_once().await.unwrap_err();
+    assert!(
+        matches!(err, durust::Error::Nondeterminism(_)),
+        "{case} should be nondeterministic, got {err:?}"
+    );
+
+    let history = stream_all(&backend, &run_id).await;
+    assert!(
+        !history
+            .iter()
+            .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|event| matches!(event.data, HistoryEventData::WorkflowCompleted { .. }))
+    );
+}
+
+#[test]
 fn configured_local_activity_preference_applies_to_activity_map_items() {
     block_on(async {
         let backend = MemoryBackend::new();
@@ -4664,6 +4989,62 @@ fn sqlite_activity_map_recovers_after_close_and_reopen() {
         ));
         let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
             panic!("SQLite map workflow did not complete after reopen replay");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 24);
+    });
+}
+
+#[test]
+fn sqlite_child_workflow_map_recovers_after_close_and_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("durust-child-map.sqlite3");
+        let backend = SqliteBackend::open(&db_path).unwrap();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<child_workflow_map_sum>(
+                "wf/sqlite-child-map-recovery",
+                "workflows",
+                vec![2, 4, 6],
+            )
+            .await
+            .unwrap();
+        let mut first_worker = Worker::builder(backend.clone())
+            .worker_id("sqlite-child-map-before-crash")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(child_workflow_map_sum)
+            .register_workflow(child_double_workflow)
+            .build();
+        assert!(first_worker.run_workflow_once().await.unwrap());
+        drop(first_worker);
+        drop(backend);
+
+        let reopened = SqliteBackend::open(&db_path).unwrap();
+        let mut recovered_worker = Worker::builder(reopened.clone())
+            .worker_id("sqlite-child-map-after-crash")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .register_workflow(child_workflow_map_sum)
+            .register_workflow(child_double_workflow)
+            .build();
+        let stats = recovered_worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 4);
+        assert_eq!(stats.activity_tasks, 0);
+
+        let history = stream_all(&reopened, &run_id).await;
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::ChildWorkflowMapScheduled(_)
+        ));
+        assert!(matches!(
+            history[2].data,
+            HistoryEventData::ChildWorkflowMapCompleted(_)
+        ));
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("SQLite child map workflow did not complete after reopen replay");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 24);
     });

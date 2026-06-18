@@ -48,6 +48,14 @@ fn phase_0008_benchmark_profiles_have_stable_names() {
             "activity map completion",
             "activity_map_item_complete_memory",
         ),
+        (
+            "child workflow map fanout",
+            "child_workflow_map_materialize_memory",
+        ),
+        (
+            "child workflow map completion",
+            "child_workflow_map_item_complete_memory",
+        ),
         ("payload refs", "payload_blob_history_stream_memory_64kb"),
         (
             "payload replay",

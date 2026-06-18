@@ -1227,6 +1227,11 @@ where
                                 .hydrate_activity_map_result_manifest(request.payload.clone())
                                 .await?
                         }
+                        crate::runtime::PayloadHydrationKind::ChildWorkflowMapResultManifest => {
+                            self.backend
+                                .hydrate_child_workflow_map_result_manifest(request.payload.clone())
+                                .await?
+                        }
                     };
                     context.fulfill_payload_hydration(request, hydrated)?;
                 }
@@ -1460,6 +1465,7 @@ where
                 upsert_waits: parts.upsert_waits,
                 schedule_activities: parts.schedule_activities,
                 schedule_activity_maps: parts.schedule_activity_maps,
+                schedule_child_workflow_maps: parts.schedule_child_workflow_maps,
                 start_child_workflows: parts.start_child_workflows,
                 consume_signals: parts.consume_signals,
                 delete_waits: parts.delete_waits,
