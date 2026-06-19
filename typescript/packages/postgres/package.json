@@ -1,0 +1,30 @@
+{
+  "name": "@durust/postgres",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@durust/core": "0.0.0",
+    "@types/pg": "^8.20.0",
+    "pg": "^8.21.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/postgres/test"
+  },
+  "devDependencies": {
+    "@durust/payload": "^0.0.0",
+    "@durust/testing": "^0.0.0"
+  }
+}

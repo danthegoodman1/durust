@@ -1,0 +1,81 @@
+{
+  "historyEvents": [
+    {
+      "eventId": 1,
+      "eventType": "WorkflowStarted",
+      "data": {
+        "kind": "WorkflowStarted",
+        "workflowType": {
+          "name": "orders.checkout",
+          "version": 1
+        },
+        "input": {
+          "kind": "Inline",
+          "codec": "Json",
+          "schemaFingerprint": "sha256:checkout-input",
+          "compression": "None",
+          "encryption": null,
+          "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        }
+      }
+    },
+    {
+      "eventId": 2,
+      "eventType": "ActivityScheduled",
+      "data": {
+        "kind": "ActivityScheduled",
+        "scheduled": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 1
+          },
+          "activityName": "payments.price-quote",
+          "taskQueue": "payments",
+          "retryPolicy": {
+            "initialIntervalMs": 1000,
+            "maxIntervalMs": 60000,
+            "maxAttempts": 5,
+            "backoffCoefficient": 2,
+            "nonRetryableErrorTypes": []
+          },
+          "startToCloseTimeoutMs": null,
+          "heartbeatTimeoutMs": null,
+          "input": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:quote-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 115, 107, 117, 34, 58, 34, 115, 107, 117, 45, 49, 34, 125]
+          },
+          "fingerprint": {
+            "kind": "Activity",
+            "name": "payments.price-quote",
+            "inputDigest": "sha256:quote-input-digest",
+            "optionsDigest": "sha256:activity-options"
+          }
+        }
+      }
+    }
+  ],
+  "fingerprints": {
+    "timer": {
+      "kind": "Timer",
+      "name": "sleep_until",
+      "inputDigest": null,
+      "optionsDigest": "timestamp-ms:1781821484000"
+    },
+    "signal": {
+      "kind": "Signal",
+      "name": "approved",
+      "inputDigest": null,
+      "optionsDigest": "sha256:default"
+    },
+    "versionMarker": {
+      "kind": "VersionMarker",
+      "name": "checkout-v2",
+      "inputDigest": null,
+      "optionsDigest": "version:2"
+    }
+  }
+}

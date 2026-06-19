@@ -1,0 +1,24 @@
+{
+  "name": "@durust/eslint-plugin",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/eslint-plugin/test"
+  },
+  "peerDependencies": {
+    "eslint": ">=8.57.0 || >=9.0.0"
+  }
+}

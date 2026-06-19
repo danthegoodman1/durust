@@ -1,0 +1,70 @@
+{
+  "name": "memory-child-map-smoke",
+  "kind": "smoke",
+  "profile": {
+    "backend": "memory",
+    "mode": "child-map",
+    "workflows": 2,
+    "workers": 1,
+    "batch": 8,
+    "child_map_items": 3,
+    "child_map_max_in_flight": 2
+  },
+  "result": {
+    "completed_workflows": 2,
+    "mixed_actions": 20,
+    "counters": {
+      "workflow_starts": 2,
+      "signals": 0,
+      "child_starts": 6,
+      "child_completions": 6,
+      "timer_handlers": 0,
+      "boot_activities": 0,
+      "child_activities": 6,
+      "finish_activities": 0
+    },
+    "processing_mixed_actions_per_second": 4864.601,
+    "processing_workflows_per_second": 486.46,
+    "workflow_task_commit_p95_ms": 0.65,
+    "operations": {
+      "claimWorkflowTask": {
+        "calls": 16,
+        "errors": 0
+      },
+      "commitWorkflowTask": {
+        "calls": 16,
+        "errors": 0
+      },
+      "completeActivity": {
+        "calls": 6,
+        "errors": 0
+      }
+    }
+  },
+  "thresholds": {
+    "require_correct": true,
+    "require_profile_match": true,
+    "require_exact_completed_workflows": true,
+    "require_exact_mixed_actions": true,
+    "require_exact_counters": [
+      "workflow_starts",
+      "signals",
+      "child_starts",
+      "child_completions",
+      "timer_handlers",
+      "boot_activities",
+      "child_activities",
+      "finish_activities"
+    ],
+    "required_operation_names": [
+      "claimWorkflowTask",
+      "commitWorkflowTask",
+      "completeActivity"
+    ],
+    "allow_operation_errors": false,
+    "min_processing_mixed_actions_per_second_ratio": 0.01,
+    "min_processing_workflows_per_second_ratio": 0.01,
+    "max_workflow_task_commit_p95_ratio": 100,
+    "max_workflow_task_commit_p95_ms": 1000
+  }
+}

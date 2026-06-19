@@ -1,0 +1,30 @@
+{
+  "name": "@durust/benchmark",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "durust-benchmark-workload": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/benchmark/test"
+  },
+  "dependencies": {
+    "@durust/core": "^0.0.0",
+    "@durust/payload": "^0.0.0",
+    "@durust/postgres": "^0.0.0",
+    "@durust/sqlite": "^0.0.0"
+  }
+}

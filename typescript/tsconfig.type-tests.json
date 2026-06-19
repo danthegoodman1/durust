@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "@durust/core": ["packages/core/src/index.ts"],
+      "@durust/testing": ["packages/testing/src/index.ts"]
+    }
+  },
+  "include": [
+    "test-d/**/*.ts"
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "name": "durust-typescript-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --config vitest.config.ts",
+    "test:benchmark-thresholds": "vitest run --config vitest.config.ts packages/benchmark/test/thresholds.test.ts",
+    "lint:determinism": "npm run build --workspace @durust/eslint-plugin && node scripts/determinism-lint.mjs",
+    "test:types": "tsc -p tsconfig.type-tests.json --noEmit",
+    "check": "npm run build && npm run test && npm run test:types && npm run lint:determinism"
+  },
+  "durust": {
+    "workflowSources": [
+      "test-d/determinism/valid/**/*.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tinyglobby": "^0.2.17",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

@@ -1,1 +1,5 @@
 target/
+typescript/node_modules/
+typescript/packages/*/dist/
+typescript/packages/*/tsconfig.tsbuildinfo
+typescript/coverage/
