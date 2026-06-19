@@ -655,19 +655,6 @@ pub fn activity_map_input_at(
     )))
 }
 
-pub fn encode_activity_map_result_manifest(
-    name: String,
-    results: Vec<PayloadRef>,
-    page_lengths: &[usize],
-) -> Result<PayloadRef> {
-    encode_activity_map_result_manifest_with_codec(
-        name,
-        results,
-        page_lengths,
-        crate::CodecId::MessagePack,
-    )
-}
-
 pub fn encode_activity_map_result_manifest_with_codec(
     name: String,
     results: Vec<PayloadRef>,
@@ -736,19 +723,6 @@ pub fn decode_activity_map_result_refs(manifest_ref: &PayloadRef) -> Result<Vec<
         )));
     }
     Ok(results)
-}
-
-pub fn encode_child_workflow_map_result_manifest(
-    name: String,
-    outcomes: Vec<ChildWorkflowMapItemOutcome>,
-    page_lengths: &[usize],
-) -> Result<PayloadRef> {
-    encode_child_workflow_map_result_manifest_with_codec(
-        name,
-        outcomes,
-        page_lengths,
-        crate::CodecId::MessagePack,
-    )
 }
 
 pub fn encode_child_workflow_map_result_manifest_with_codec(

@@ -550,7 +550,7 @@ export class SqliteBackend implements DurableBackend {
           heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, now),
           expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
         };
-        this.#saveActivity(activity);
+        this.#insertActivity(activity);
         return { task: activity.task, claim };
       }
       return null;
@@ -586,7 +586,7 @@ export class SqliteBackend implements DurableBackend {
       return { kind: "AlreadyCompleted" };
     }
     if (!this.#activityClaimMatches(activity, req.claim)) {
-      this.#saveActivity(activity);
+      this.#insertActivity(activity);
       return { kind: "StaleLease" };
     }
 
@@ -608,7 +608,7 @@ export class SqliteBackend implements DurableBackend {
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     this.#saveWorkflow(workflow);
-    this.#saveActivity(activity);
+    this.#insertActivity(activity);
     return { kind: "Completed", eventId: event.eventId };
   }
 
@@ -620,7 +620,7 @@ export class SqliteBackend implements DurableBackend {
         return { kind: "AlreadyCompleted" };
       }
       if (!this.#activityClaimMatches(activity, req.claim)) {
-        this.#saveActivity(activity);
+        this.#insertActivity(activity);
         throw new Error("stale activity task lease");
       }
 
@@ -632,7 +632,7 @@ export class SqliteBackend implements DurableBackend {
         activity.task = retry.task;
         activity.availableAtMs = retry.readyAtMs;
         activity.claim = null;
-        this.#saveActivity(activity);
+        this.#insertActivity(activity);
         return {
           kind: "RetryScheduled",
           attempt: retry.task.attempt,
@@ -658,7 +658,7 @@ export class SqliteBackend implements DurableBackend {
       activity.terminalEventId = event.eventId;
       activity.claim = null;
       this.#saveWorkflow(workflow);
-      this.#saveActivity(activity);
+      this.#insertActivity(activity);
       return { kind: "Failed", eventId: event.eventId };
     });
   }
@@ -671,7 +671,7 @@ export class SqliteBackend implements DurableBackend {
         return { kind: "AlreadyCompleted" };
       }
       if (!this.#activityClaimMatches(activity, req.claim)) {
-        this.#saveActivity(activity);
+        this.#insertActivity(activity);
         throw new Error("stale activity task lease");
       }
       const currentClaim = activity.claim;
@@ -682,7 +682,7 @@ export class SqliteBackend implements DurableBackend {
         ...currentClaim,
         heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
       };
-      this.#saveActivity(activity);
+      this.#insertActivity(activity);
       return { kind: "Recorded" };
     });
   }
@@ -753,7 +753,7 @@ export class SqliteBackend implements DurableBackend {
           activity.task = retry.task;
           activity.availableAtMs = retry.readyAtMs;
           activity.claim = null;
-          this.#saveActivity(activity);
+          this.#insertActivity(activity);
           timedOut += 1;
           continue;
         }
@@ -770,7 +770,7 @@ export class SqliteBackend implements DurableBackend {
         activity.terminalEventId = event.eventId;
         activity.claim = null;
         this.#saveWorkflow(workflow);
-        this.#saveActivity(activity);
+        this.#insertActivity(activity);
         timedOut += 1;
       }
       return { timedOut };
@@ -1304,10 +1304,6 @@ export class SqliteBackend implements DurableBackend {
     );
   }
 
-  #saveActivity(activity: ActivityState): void {
-    this.#insertActivity(activity);
-  }
-
   #activityForId(activityId: string): ActivityState {
     const activity = this.#activityForIdOrNull(activityId);
     if (!activity) {
@@ -1488,7 +1484,7 @@ export class SqliteBackend implements DurableBackend {
     if (map.terminal) {
       activity.terminalEventId = tailEventId(this.#stateForRun(map.runId));
       activity.claim = null;
-      this.#saveActivity(activity);
+      this.#insertActivity(activity);
       return activity.terminalEventId;
     }
     const ordinal = activity.task.mapItem.itemOrdinal;
@@ -1496,7 +1492,7 @@ export class SqliteBackend implements DurableBackend {
     map.inFlight.delete(ordinal);
     activity.terminalEventId = tailEventId(this.#stateForRun(map.runId));
     activity.claim = null;
-    this.#saveActivity(activity);
+    this.#insertActivity(activity);
     this.#materializeActivityMapItems(map);
     return this.#completeActivityMapIfDone(map);
   }
@@ -1509,7 +1505,7 @@ export class SqliteBackend implements DurableBackend {
     if (map.terminal) {
       activity.terminalEventId = tailEventId(this.#stateForRun(map.runId));
       activity.claim = null;
-      this.#saveActivity(activity);
+      this.#insertActivity(activity);
       return activity.terminalEventId;
     }
     map.terminal = true;
@@ -1527,7 +1523,7 @@ export class SqliteBackend implements DurableBackend {
     workflow.history.push(event);
     workflow.readyReason = "ActivityMapFailed";
     this.#saveWorkflow(workflow);
-    this.#saveActivity(activity);
+    this.#insertActivity(activity);
     this.#insertActivityMap(map);
     return event.eventId;
   }
@@ -1999,9 +1995,15 @@ function workflowStateFromRowWithHistory(
 
 function historyEventFromRow(row: HistoryEventRow): HistoryEvent {
   const data = parseJson<HistoryEventData>(row.data);
+  const expectedType = historyEventType(data);
+  if (row.event_type !== expectedType) {
+    throw new Error(
+      `history event type mismatch: row has ${row.event_type}, data has ${expectedType}`
+    );
+  }
   return {
     eventId: eventId(row.event_id),
-    eventType: historyEventType(data),
+    eventType: row.event_type,
     data
   };
 }

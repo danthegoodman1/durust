@@ -64,20 +64,8 @@ export function runId(value: string): RunId {
   return value as RunId;
 }
 
-export function workerId(value: string): WorkerId {
-  return value as WorkerId;
-}
-
 export function taskQueue(value = "default"): TaskQueue {
   return value as TaskQueue;
-}
-
-export function activityName(value: string): ActivityName {
-  return value as ActivityName;
-}
-
-export function signalName(value: string): SignalName {
-  return value as SignalName;
 }
 
 export function signalId(value: string): SignalId {

@@ -12,6 +12,7 @@ export {
   ChildWorkflowFailureError,
   ChildWorkflowMapFailureError,
   DEFAULT_VERSION,
+  HotWorkflowExecution,
   UnsupportedWorkflowVersionError,
   WorkflowCancelledError,
   WorkflowFailureError,
@@ -19,7 +20,6 @@ export {
   deprecatePatch,
   getVersion,
   patched,
-  prepareWorkflowTaskCommit,
   publish,
   sideEffect
 } from "./runtime.js";

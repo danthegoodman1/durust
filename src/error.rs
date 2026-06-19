@@ -195,10 +195,6 @@ pub enum Error {
 }
 
 impl Error {
-    pub fn application(error_type: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::Application(DurableFailure::new(error_type, message))
-    }
-
     pub fn non_retryable(error_type: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Application(DurableFailure::non_retryable(error_type, message))
     }
@@ -223,16 +219,6 @@ impl Error {
             other => Ok(Self::Application(
                 DurableFailure::from_error(&other).with_details(details)?,
             )),
-        }
-    }
-
-    pub fn is_non_retryable(&self) -> bool {
-        match self {
-            Self::Application(failure)
-            | Self::ActivityFailed(failure)
-            | Self::ChildWorkflowFailed(failure)
-            | Self::ChildWorkflowMapFailed(failure) => failure.non_retryable,
-            _ => false,
         }
     }
 

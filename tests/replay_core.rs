@@ -1060,6 +1060,62 @@ fn simple_workflow_schedules_activity_and_completes_from_cache() {
     });
 }
 
+// Exercises the concurrent/batched workflow-task fork. With prefetch and commit
+// batching above one, `run_until_idle` drives `run_workflow_batch_once`, which
+// claims, prepares, and batch-commits several runs' tasks together rather than
+// taking the single-claim shortcut. Both callers now share one prepare/commit
+// path, so this guards the previously untested batched fork against regressions.
+#[test]
+fn batched_workflow_tasks_commit_multiple_runs_together() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let mut run_ids = Vec::new();
+        for index in 0..3u32 {
+            let run_id = client
+                .start_workflow::<double_plus_one>(
+                    format!("wf/batch-{index}"),
+                    "workflows",
+                    number(20),
+                )
+                .await
+                .unwrap();
+            run_ids.push(run_id);
+        }
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("batch-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .workflow_task_commit_batch_size(4)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+
+        // The first batch must claim, prepare, and commit all three runs' schedule
+        // tasks together. The single-claim fallback (taken only when the effective
+        // limit collapses to one) could commit at most one per call, so committing 3
+        // here proves the batched fork actually ran.
+        let scheduled = worker.run_workflow_batch_once().await.unwrap();
+        assert_eq!(scheduled, 3, "all three schedule tasks should commit in one batch");
+        let stats = worker.run_until_idle().await.unwrap();
+        // The first batch plus the three completion tasks account for every commit.
+        assert_eq!(scheduled + stats.workflow_tasks, 6);
+
+        for run_id in &run_ids {
+            let history = stream_all(&backend, run_id).await;
+            let HistoryEventData::WorkflowCompleted { result } =
+                &history[history.len() - 1].data
+            else {
+                panic!("batched workflow run did not complete");
+            };
+            assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 41);
+        }
+    });
+}
+
 #[test]
 fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
     block_on(async {

@@ -5,7 +5,6 @@ import {
   decodePayload,
   eventId,
   namespace,
-  prepareWorkflowTaskCommit,
   publish,
   signal,
   taskQueue,
@@ -13,6 +12,7 @@ import {
   workflowId
 } from "@durust/core";
 import type { SchemaAdapter } from "@durust/core";
+import { prepareWorkflowTaskCommit } from "@durust/testing";
 
 interface Input {
   readonly value: string;

@@ -8,7 +8,9 @@ import {
   childWorkflow,
   childWorkflowMap,
   encodePayload,
+  decodePayload,
   decodeActivityMapResults,
+  decodeChildWorkflowMapOutcomes,
   join,
   joinAll,
   select,
@@ -20,6 +22,8 @@ import {
   type ActivityMapInputManifest,
   type ChildWorkflowHandle,
   type ChildWorkflowMapHandle,
+  type ChildWorkflowMapResultManifest,
+  type ChildWorkflowMapResultPage,
   type ChildWorkflowStart,
   type DurablePromise,
   type SchemaAdapter,
@@ -237,5 +241,48 @@ describe("typed public API contract", () => {
   it("keeps definition metadata inspectable without invoking runtime stubs", () => {
     expect(priceQuote.name).toBe("payments.price-quote");
     expect(shipOrder.workflowType).toEqual({ name: "orders.ship", version: 1 });
+  });
+
+  it("decodes mixed child-workflow-map outcomes for the CollectAll path", () => {
+    // decodeChildWorkflowMapOutcomes is the only reader that surfaces failed and
+    // cancelled CollectAll map items, so exercise all three outcome kinds and the
+    // manifest invariants directly.
+    const succeeded = encodePayload<ShipOutput>({ shipmentId: "shipment/o-1" });
+    const page = encodePayload<ChildWorkflowMapResultPage<ShipOutput>>({
+      outcomes: [
+        { kind: "Succeeded", result: succeeded },
+        {
+          kind: "Failed",
+          failure: { errorType: "ShipError", message: "no truck", nonRetryable: false }
+        },
+        { kind: "Cancelled", reason: "parent closed" }
+      ]
+    });
+    const manifest = encodePayload<ChildWorkflowMapResultManifest<ShipOutput>>({
+      name: "shipments",
+      itemCount: 3,
+      pageLengths: [3],
+      pages: [page]
+    });
+
+    const outcomes = decodeChildWorkflowMapOutcomes(manifest);
+    expect(outcomes.map((outcome) => outcome.kind)).toEqual([
+      "Succeeded",
+      "Failed",
+      "Cancelled"
+    ]);
+    const first = outcomes[0];
+    if (first.kind !== "Succeeded") {
+      throw new Error("expected first outcome to be Succeeded");
+    }
+    expect(decodePayload(first.result)).toEqual({ shipmentId: "shipment/o-1" });
+
+    const mismatched = encodePayload<ChildWorkflowMapResultManifest<ShipOutput>>({
+      name: "shipments",
+      itemCount: 5,
+      pageLengths: [3],
+      pages: [page]
+    });
+    expect(() => decodeChildWorkflowMapOutcomes(mismatched)).toThrow(/item count mismatch/);
   });
 });

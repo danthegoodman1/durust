@@ -18,6 +18,7 @@ use crate::{
     encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
+use crate::provider_util::{should_retry_activity, timeout_message};
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -2357,10 +2358,6 @@ fn timeout_activity(
     Ok(true)
 }
 
-fn should_retry_activity(task: &ActivityTask) -> bool {
-    task.attempt < task.retry_policy.max_attempts.max(1)
-}
-
 fn activity_timeout_at(now: TimestampMs, timeout: Option<Duration>) -> Option<TimestampMs> {
     timeout.map(|timeout| {
         TimestampMs(
@@ -3310,22 +3307,6 @@ fn verify_payload_blob<'a>(
         )));
     }
     Ok(blob)
-}
-
-fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
-    if heartbeat {
-        format!(
-            "activity `{}` missed heartbeat on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    } else {
-        format!(
-            "activity `{}` timed out on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    }
 }
 
 fn ready_at_for_delay(delay: Duration) -> Option<Instant> {

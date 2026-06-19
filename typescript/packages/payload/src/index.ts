@@ -323,12 +323,25 @@ export async function encodePayloadWithStorage<T>(
   value: T,
   options: EncodePayloadWithStorageOptions<T>
 ): Promise<PayloadRef<T>> {
-  const payload = encodePayload(value, options);
-  if (payload.kind === "Blob" || payload.bytes.byteLength <= options.inlineThresholdBytes) {
+  return offloadEncodedPayload(
+    encodePayload(value, options),
+    options.blobStore,
+    options.inlineThresholdBytes
+  );
+}
+
+// Offload tail shared by the public encode helper and PayloadBackend's per-ref
+// offload so inline-vs-blob thresholds and blob URIs stay identical across both.
+async function offloadEncodedPayload<T>(
+  payload: PayloadRef<T>,
+  blobStore: PayloadBlobStore,
+  inlineThresholdBytes: number
+): Promise<PayloadRef<T>> {
+  if (payload.kind === "Blob" || payload.bytes.byteLength <= inlineThresholdBytes) {
     return payload;
   }
   const digest = digestBytes(payload.bytes);
-  const uri = await options.blobStore.put(payload.bytes, digest);
+  const uri = await blobStore.put(payload.bytes, digest);
   return toBlobRef(payload, uri);
 }
 
@@ -491,12 +504,7 @@ export class PayloadBackend implements DurableBackend {
   }
 
   async #offloadPayloadRef<T>(payload: PayloadRef<T>): Promise<PayloadRef<T>> {
-    if (payload.kind === "Blob" || payload.bytes.byteLength <= this.#inlineThresholdBytes) {
-      return payload;
-    }
-    const digest = digestBytes(payload.bytes);
-    const uri = await this.#blobStore.put(payload.bytes, digest);
-    return toBlobRef(payload, uri);
+    return offloadEncodedPayload(payload, this.#blobStore, this.#inlineThresholdBytes);
   }
 
   async #hydratePayloadRefDeep<T>(payload: PayloadRef<T>): Promise<PayloadRef<T>> {

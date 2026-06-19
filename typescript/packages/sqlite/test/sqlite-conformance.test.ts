@@ -22,7 +22,6 @@ import {
   eventId,
   namespace,
   payloadDigest,
-  prepareWorkflowTaskCommit,
   signal,
   signalId,
   sleep,
@@ -39,7 +38,7 @@ import {
   type PayloadRef
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend, collectPayloadRefs } from "@durust/payload";
-import { basicProviderConformanceCases } from "@durust/testing";
+import { basicProviderConformanceCases, prepareWorkflowTaskCommit } from "@durust/testing";
 import { SqliteBackend } from "@durust/sqlite";
 
 const roots: string[] = [];

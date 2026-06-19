@@ -15,6 +15,7 @@ import {
   type SignalId,
   type SignalName
 } from "./types.js";
+import { commandKey, sameCommandId } from "./internal.js";
 import type {
   ActivityMapTask,
   ActivityTask,
@@ -1396,13 +1397,6 @@ function workflowTypeKey(workflowType: WorkflowType): string {
   return `${workflowType.name}@${workflowType.version}`;
 }
 
-function commandKey(id: CommandId): string {
-  return `${id.runId}:${id.seq}`;
-}
-
-function sameCommandId(left: CommandId, right: CommandId): boolean {
-  return left.runId === right.runId && Number(left.seq) === Number(right.seq);
-}
 
 function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);

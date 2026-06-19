@@ -25,7 +25,6 @@ import {
   joinAll,
   patched,
   namespace,
-  prepareWorkflowTaskCommit,
   publish,
   runId,
   select,
@@ -43,6 +42,7 @@ import {
   type SchemaAdapter
 } from "@durust/core";
 import { HotWorkflowExecution } from "../src/runtime.js";
+import { prepareWorkflowTaskCommit } from "@durust/testing";
 
 interface QuoteInput {
   readonly sku: string;

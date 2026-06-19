@@ -50,7 +50,6 @@ export interface ActivityCallOptions {
   readonly retry?: RetryPolicy;
   readonly startToCloseTimeoutMs?: number;
   readonly heartbeatTimeoutMs?: number;
-  readonly idempotencyKey?: string;
 }
 
 export interface ChildWorkflowOptions {

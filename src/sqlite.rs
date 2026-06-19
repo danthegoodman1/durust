@@ -19,6 +19,12 @@ use crate::{
     encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
+use crate::provider_util::{
+    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
+    compression_from_str, compression_to_str, decode_encryption_metadata,
+    encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
+    unix_epoch_millis,
+};
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::BTreeSet;
@@ -27,7 +33,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -3151,58 +3157,6 @@ fn is_opaque_external_payload_uri(uri: &str) -> bool {
     uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
 }
 
-fn encode_encryption_metadata(
-    encryption: &Option<crate::EncryptionMetadata>,
-) -> Result<Option<Vec<u8>>> {
-    encryption
-        .as_ref()
-        .map(|metadata| {
-            rmp_serde::to_vec_named(metadata).map_err(|err| Error::PayloadEncode(err.to_string()))
-        })
-        .transpose()
-}
-
-fn decode_encryption_metadata(blob: Option<Vec<u8>>) -> Result<Option<crate::EncryptionMetadata>> {
-    blob.map(|blob| {
-        rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
-    })
-    .transpose()
-}
-
-fn codec_to_str(codec: crate::CodecId) -> &'static str {
-    match codec {
-        crate::CodecId::MessagePack => "messagepack",
-        crate::CodecId::Json => "json",
-        crate::CodecId::Protobuf => "protobuf",
-    }
-}
-
-fn codec_from_str(value: &str) -> Result<crate::CodecId> {
-    match value {
-        "messagepack" => Ok(crate::CodecId::MessagePack),
-        "json" => Ok(crate::CodecId::Json),
-        "protobuf" => Ok(crate::CodecId::Protobuf),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload codec `{other}`"
-        ))),
-    }
-}
-
-fn compression_to_str(compression: crate::CompressionId) -> &'static str {
-    match compression {
-        crate::CompressionId::None => "none",
-    }
-}
-
-fn compression_from_str(value: &str) -> Result<crate::CompressionId> {
-    match value {
-        "none" => Ok(crate::CompressionId::None),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload compression `{other}`"
-        ))),
-    }
-}
-
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -3439,50 +3393,6 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
     )
     .map_err(sqlite_error)?;
     Ok(())
-}
-
-fn ready_at_ms_for_delay(delay: Duration) -> i64 {
-    if delay.is_zero() {
-        0
-    } else {
-        unix_epoch_millis().saturating_add(duration_millis_i64(delay))
-    }
-}
-
-fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
-    activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
-}
-
-fn activity_timeout_at_ms_from(now: TimestampMs, timeout: Option<Duration>) -> Option<i64> {
-    timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
-}
-
-fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
-    if heartbeat {
-        format!(
-            "activity `{}` missed heartbeat on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    } else {
-        format!(
-            "activity `{}` timed out on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    }
-}
-
-fn duration_millis_i64(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn unix_epoch_millis() -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn signal_wait_ready(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
@@ -5064,10 +4974,6 @@ fn activity_map_is_completed(tx: &Transaction<'_>, map_command_id: &CommandId) -
 
 fn map_command_key(command_id: &CommandId) -> String {
     format!("{}:{}", command_id.run_id, command_id.seq.0)
-}
-
-fn should_retry_activity(task: &ActivityTask) -> bool {
-    task.attempt < task.retry_policy.max_attempts.max(1)
 }
 
 fn next_counter(tx: &Transaction<'_>, key: &str) -> Result<u64> {

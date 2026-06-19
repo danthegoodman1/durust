@@ -1110,7 +1110,6 @@ fn codec_from_fixture(value: &str) -> durust::CodecId {
     match value {
         "MessagePack" => durust::CodecId::MessagePack,
         "Json" => durust::CodecId::Json,
-        "Protobuf" => durust::CodecId::Protobuf,
         other => panic!("unsupported fixture codec {other}"),
     }
 }

@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { decode, encode } from "@msgpack/msgpack";
 
-export type CodecId = "MessagePack" | "Json" | "Protobuf";
+export type CodecId = "MessagePack" | "Json";
 export type CompressionId = "None";
 
 export interface EncryptionMetadata {
@@ -44,7 +44,7 @@ export interface BlobPayloadRef<T = unknown> {
 
 export function digestBytes(bytes: Uint8Array | string): string {
   const hasher = createHash("sha256");
-  hasher.update(typeof bytes === "string" ? Buffer.from(bytes) : Buffer.from(bytes));
+  hasher.update(Buffer.from(bytes));
   return `sha256:${hasher.digest("hex")}`;
 }
 
@@ -181,8 +181,6 @@ function encodeValue(value: unknown, codec: CodecId): Uint8Array {
       return encode(value);
     case "Json":
       return new TextEncoder().encode(JSON.stringify(value));
-    case "Protobuf":
-      throw new Error("protobuf payload codec is not enabled");
   }
 }
 
@@ -192,7 +190,5 @@ function decodeValue(bytes: Uint8Array, codec: CodecId): unknown {
       return decode(bytes);
     case "Json":
       return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
-    case "Protobuf":
-      throw new Error("protobuf payload codec is not enabled");
   }
 }

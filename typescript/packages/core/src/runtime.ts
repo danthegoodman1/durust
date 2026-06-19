@@ -50,6 +50,7 @@ import type { HistoryEvent } from "./history.js";
 import { RetryPolicy, type ActivityCallOptions, type ChildWorkflowOptions } from "./options.js";
 import { decodePayload, digestBytes, encodePayload, payloadDigest, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { commandId, eventId, timestampMs, waitId, type CommandId, type DurableInput, type EventId, type RunId, type WaitId, type WorkflowId } from "./types.js";
+import { assertDurableInputValue, commandKey, sameCommandId } from "./internal.js";
 
 const runtimeStorage = new AsyncLocalStorage<WorkflowRuntimeContext>();
 let nondeterminismGuardsInstalled = false;
@@ -110,13 +111,6 @@ interface Deferred<T> {
   readonly promise: Promise<T>;
   resolve(value: T): void;
   reject(error: unknown): void;
-}
-
-class WorkflowSuspended extends Error {
-  constructor() {
-    super("workflow task suspended on durable operation");
-    this.name = "WorkflowSuspended";
-  }
 }
 
 export const DEFAULT_VERSION = -1;
@@ -234,39 +228,6 @@ export function continueAsNew<Input extends object>(input: DurableInput<Input>):
   return currentWorkflowRuntimeContext().continueAsNew(input);
 }
 
-export async function prepareWorkflowTaskCommit<
-  W extends WorkflowDefinition<any, any, any, string>
->(
-  workflowDefinition: W,
-  input: WorkflowInput<W>,
-  claimed: ClaimedWorkflowTask,
-  options: PrepareWorkflowTaskOptions = {}
-): Promise<WorkflowTaskCommit> {
-  installNondeterminismGuards();
-  const context = new WorkflowRuntimeContext(
-    claimed,
-    options,
-    workflowDefinition.inputSchema,
-    workflowDefinition.queryStateSchema
-  );
-  try {
-    const output = await runtimeStorage.run(context, () => workflowDefinition.handler(input));
-    context.completeWorkflow(output as WorkflowOutput<W>, workflowDefinition);
-  } catch (error) {
-    if (error instanceof ContinueAsNewRequested) {
-      return context.toCommit();
-    }
-    if (error instanceof WorkflowSuspended) {
-      return context.toCommit();
-    }
-    if (isWorkflowTaskFatalError(error)) {
-      throw error;
-    }
-    context.failWorkflow(durableFailureFromUnknown(error));
-  }
-  return context.toCommit();
-}
-
 export class HotWorkflowExecution {
   readonly #context: WorkflowRuntimeContext;
   #observedProgressVersion: number;
@@ -285,8 +246,7 @@ export class HotWorkflowExecution {
       claimed,
       options,
       workflowDefinition.inputSchema,
-      workflowDefinition.queryStateSchema,
-      "hot"
+      workflowDefinition.queryStateSchema
     );
     this.#observedProgressVersion = this.#context.hotProgressVersion();
     void runtimeStorage.run(this.#context, () => workflowDefinition.handler(input))
@@ -297,13 +257,6 @@ export class HotWorkflowExecution {
       .catch((error: unknown) => {
         if (error instanceof ContinueAsNewRequested) {
           this.#terminalCommitPending = true;
-          return;
-        }
-        if (error instanceof WorkflowSuspended) {
-          this.#fatalError = new Error(
-            "hot workflow execution encountered an unsupported durable suspension"
-          );
-          this.#context.notifyHotProgress();
           return;
         }
         if (isWorkflowTaskFatalError(error)) {
@@ -931,7 +884,6 @@ class WorkflowRuntimeContext {
   readonly #scheduleChildWorkflowMaps: ChildWorkflowMapTask[] = [];
   #queryProjection: PayloadRef | null = null;
   #allowNondeterministicGlobalsDepth = 0;
-  readonly #mode: "replay" | "hot";
   readonly #hotWaiters = new Map<string, HotWaiter>();
   #hotProgressVersion = 0;
   #hotProgressWaiters: Deferred<void>[] = [];
@@ -940,8 +892,7 @@ class WorkflowRuntimeContext {
     claimed: ClaimedWorkflowTask,
     options: PrepareWorkflowTaskOptions,
     workflowInputSchema?: SchemaAdapter<unknown>,
-    queryStateSchema?: SchemaAdapter<unknown>,
-    mode: "replay" | "hot" = "replay"
+    queryStateSchema?: SchemaAdapter<unknown>
   ) {
     this.#claimed = claimed;
     this.#defaultActivityTaskQueue = options.defaultActivityTaskQueue ?? "default";
@@ -951,7 +902,6 @@ class WorkflowRuntimeContext {
     this.#queryStateSchema = queryStateSchema;
     this.#nowMs = options.nowMs ?? 0;
     this.#liveSignals = [...(options.liveSignals ?? [])];
-    this.#mode = mode;
     this.#replayEvents = claimed.prefetchedHistory.filter(
       (event) =>
         event.eventType !== "WorkflowStarted" &&
@@ -1012,18 +962,11 @@ class WorkflowRuntimeContext {
     }
   }
 
-  isHot(): boolean {
-    return this.#mode === "hot";
-  }
-
   hotProgressVersion(): number {
     return this.#hotProgressVersion;
   }
 
   notifyHotProgress(): void {
-    if (!this.isHot()) {
-      return;
-    }
     this.#hotProgressVersion += 1;
     const waiters = this.#hotProgressWaiters;
     this.#hotProgressWaiters = [];
@@ -1033,9 +976,6 @@ class WorkflowRuntimeContext {
   }
 
   async waitForHotProgressAfter(version: number): Promise<void> {
-    if (!this.isHot()) {
-      throw new Error("hot progress can only be awaited for hot workflow execution");
-    }
     if (this.#hotProgressVersion > version) {
       return;
     }
@@ -1055,9 +995,6 @@ class WorkflowRuntimeContext {
     key: string,
     resolve: () => HotSuspendResolution<T>
   ): Promise<T> {
-    if (!this.isHot()) {
-      throw new WorkflowSuspended();
-    }
     const immediate = resolve();
     if (immediate.kind === "Resolved") {
       return Promise.resolve(immediate.value);
@@ -1096,9 +1033,6 @@ class WorkflowRuntimeContext {
     claimed: ClaimedWorkflowTask,
     options: HotWorkflowTaskOptions
   ): void {
-    if (!this.isHot()) {
-      throw new Error("advanceHotClaim requires hot workflow execution");
-    }
     this.#claimed = claimed;
     this.#nowMs = options.nowMs ?? this.#nowMs;
     this.#liveSignals = [...(options.liveSignals ?? [])];
@@ -1107,9 +1041,6 @@ class WorkflowRuntimeContext {
   }
 
   markHotCommitAccepted(newTailEventId: EventId): void {
-    if (!this.isHot()) {
-      throw new Error("markHotCommitAccepted requires hot workflow execution");
-    }
     this.#claimed = {
       ...this.#claimed,
       replayTargetEventId: newTailEventId
@@ -2244,13 +2175,10 @@ class ActivityDurablePromise<A extends ActivityDefinition<any, any, string>>
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        resolution.commandId,
-        () => context.resolveHotActivity(this.#activityDefinition, resolution.commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotActivity(this.#activityDefinition, resolution.commandId)
+    ).then(onfulfilled, _onrejected);
   }
 
   __durustRegisterJoinBranch(context: WorkflowRuntimeContext): JoinBranchResolution<ActivityOutput<A>> {
@@ -2337,13 +2265,10 @@ class ActivityHandleResultDurablePromise<A extends ActivityDefinition<any, any, 
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        this.#commandId,
-        () => context.resolveHotActivity(this.#activityDefinition, this.#commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      this.#commandId,
+      () => context.resolveHotActivity(this.#activityDefinition, this.#commandId)
+    ).then(onfulfilled, _onrejected);
   }
 }
 
@@ -2396,13 +2321,10 @@ class ActivityMapResultDurablePromise<A extends ActivityDefinition<any, any, str
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        resolution.commandId,
-        () => context.resolveHotActivityMapResult<A>(resolution.commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotActivityMapResult<A>(resolution.commandId)
+    ).then(onfulfilled, _onrejected);
   }
 }
 
@@ -2455,13 +2377,10 @@ class ChildWorkflowMapResultDurablePromise<W extends WorkflowDefinition<any, any
     if (resolution.kind === "Failed") {
       throw new ChildWorkflowMapFailureError(resolution.failure);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        resolution.commandId,
-        () => context.resolveHotChildWorkflowMapResult<W>(resolution.commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotChildWorkflowMapResult<W>(resolution.commandId)
+    ).then(onfulfilled, _onrejected);
   }
 }
 
@@ -2523,16 +2442,13 @@ class ChildWorkflowSpawnDurablePromise<W extends WorkflowDefinition<any, any, an
     if (resolution.kind === "Failed") {
       throw new ChildWorkflowFailureError(resolution.failure);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        resolution.commandId,
-        () => context.resolveHotChildWorkflowStart(
-          this.#workflowDefinition,
-          resolution.commandId
-        )
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotChildWorkflowStart(
+        this.#workflowDefinition,
+        resolution.commandId
+      )
+    ).then(onfulfilled, _onrejected);
   }
 }
 
@@ -2593,13 +2509,10 @@ class ChildWorkflowResultDurablePromise<W extends WorkflowDefinition<any, any, a
     if (resolution.kind === "Cancelled") {
       throw new ChildWorkflowCancelledError(resolution.reason);
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        this.#commandId,
-        () => context.resolveHotChildWorkflowResult(this.#workflowDefinition, this.#commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      this.#commandId,
+      () => context.resolveHotChildWorkflowResult(this.#workflowDefinition, this.#commandId)
+    ).then(onfulfilled, _onrejected);
   }
 }
 
@@ -2620,13 +2533,10 @@ class TimerDurablePromise implements DurableBranch<void> {
     if (resolution.kind === "Fired") {
       return Promise.resolve(onfulfilled ? onfulfilled(undefined) : (undefined as TResult1));
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
-        resolution.commandId,
-        () => context.resolveHotTimer(resolution.commandId)
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotTimer(resolution.commandId)
+    ).then(onfulfilled, _onrejected);
   }
 
   __durustRegisterJoinBranch(context: WorkflowRuntimeContext): JoinBranchResolution<void> {
@@ -2667,17 +2577,14 @@ class SignalDurablePromise<Payload extends object, const Name extends string = s
         onfulfilled ? onfulfilled(resolution.value) : (resolution.value as unknown as TResult1)
       );
     }
-    if (context.isHot()) {
-      return context.hotSuspend(
+    return context.hotSuspend(
+      resolution.commandId,
+      () => context.resolveHotSignal<Payload>(
+        this.name,
         resolution.commandId,
-        () => context.resolveHotSignal<Payload>(
-          this.name,
-          resolution.commandId,
-          this.payloadSchema
-        )
-      ).then(onfulfilled, _onrejected);
-    }
-    throw new WorkflowSuspended();
+        this.payloadSchema
+      )
+    ).then(onfulfilled, _onrejected);
   }
 
   __durustRegisterJoinBranch(context: WorkflowRuntimeContext): JoinBranchResolution<Payload> {
@@ -2736,13 +2643,10 @@ class JoinDurablePromise implements PromiseLike<Record<string, unknown>> {
       }
     }
     if (pending.length > 0) {
-      if (context.isHot()) {
-        return context.hotSuspendByKey(
-          hotCompositeWaitKey("join", pending),
-          () => resolveHotJoin(values, pending)
-        ).then(onfulfilled, _onrejected);
-      }
-      throw new WorkflowSuspended();
+      return context.hotSuspendByKey(
+        hotCompositeWaitKey("join", pending),
+        () => resolveHotJoin(values, pending)
+      ).then(onfulfilled, _onrejected);
     }
     return Promise.resolve(onfulfilled ? onfulfilled(values) : (values as TResult1));
   }
@@ -2787,13 +2691,10 @@ class JoinAllDurablePromise implements PromiseLike<readonly unknown[]> {
       }
     });
     if (pending.length > 0) {
-      if (context.isHot()) {
-        return context.hotSuspendByKey(
-          hotCompositeWaitKey("joinAll", pending),
-          () => resolveHotJoinAll(values, pending)
-        ).then(onfulfilled, _onrejected);
-      }
-      throw new WorkflowSuspended();
+      return context.hotSuspendByKey(
+        hotCompositeWaitKey("joinAll", pending),
+        () => resolveHotJoinAll(values, pending)
+      ).then(onfulfilled, _onrejected);
     }
     return Promise.resolve(onfulfilled ? onfulfilled(values) : (values as TResult1));
   }
@@ -2851,13 +2752,10 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
     });
 
     if (ready.length === 0) {
-      if (context.isHot()) {
-        return context.hotSuspendByKey(
-          hotCompositeWaitKey("select", pending),
-          () => resolveHotSelect(context, keys, ready, pending)
-        ).then(onfulfilled, _onrejected);
-      }
-      throw new WorkflowSuspended();
+      return context.hotSuspendByKey(
+        hotCompositeWaitKey("select", pending),
+        () => resolveHotSelect(context, keys, ready, pending)
+      ).then(onfulfilled, _onrejected);
     }
 
     const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
@@ -2916,14 +2814,11 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
     });
 
     if (ready.length === 0) {
-      if (context.isHot()) {
-        const keys = this.#branches.map((_, index) => String(index));
-        return context.hotSuspendByKey(
-          hotCompositeWaitKey("selectAll", pending),
-          () => resolveHotSelectAll(context, keys, ready, pending)
-        ).then(onfulfilled, _onrejected);
-      }
-      throw new WorkflowSuspended();
+      const keys = this.#branches.map((_, index) => String(index));
+      return context.hotSuspendByKey(
+        hotCompositeWaitKey("selectAll", pending),
+        () => resolveHotSelectAll(context, keys, ready, pending)
+      ).then(onfulfilled, _onrejected);
     }
 
     const keys = this.#branches.map((_, index) => String(index));
@@ -3082,14 +2977,6 @@ function createDeferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 
-function sameCommandId(left: CommandId, right: CommandId): boolean {
-  return left.runId === right.runId && left.seq === right.seq;
-}
-
-function commandKey(id: CommandId): string {
-  return `${id.runId}:${id.seq}`;
-}
-
 function sameEventId(left: EventId, right: EventId): boolean {
   return Number(left) === Number(right);
 }
@@ -3145,12 +3032,6 @@ function validateMarkerCommand(changeId: string, expected: CommandId, recorded: 
   }
 }
 
-function assertDurableInputValue(value: unknown, label: string): void {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be a durable input object`);
-  }
-}
-
 function isWorkflowTaskFatalError(error: unknown): boolean {
   if (error instanceof UnsupportedWorkflowVersionError) {
     return true;
@@ -3162,7 +3043,7 @@ function isWorkflowTaskFatalError(error: unknown): boolean {
   );
 }
 
-function durableFailureFromUnknown(error: unknown): DurableFailure {
+export function durableFailureFromUnknown(error: unknown): DurableFailure {
   if (error instanceof ActivityFailureError) {
     return error.failure;
   }

@@ -23,6 +23,12 @@ use crate::{
     encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
+use crate::provider_util::{
+    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
+    compression_from_str, compression_to_str, decode_encryption_metadata, duration_millis_i64,
+    encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
+    unix_epoch_millis,
+};
 use deadpool_postgres::{
     Manager, ManagerConfig, Object as PooledPostgresClient, Pool, RecyclingMethod, Runtime,
 };
@@ -31,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
 const POSTGRES_SCHEMA_VERSION: i64 = 1;
@@ -1061,7 +1067,7 @@ impl DurableBackend for PostgresBackend {
 }
 
 impl PostgresBackend {
-    async fn retry_transaction<T, F, Fut>(&self, _operation: &'static str, mut body: F) -> Result<T>
+    async fn retry_transaction<T, F, Fut>(&self, mut body: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -1087,7 +1093,7 @@ impl PostgresBackend {
         &self,
         req: StartWorkflowRequest,
     ) -> Result<StartWorkflowOutcome> {
-        self.retry_transaction("start_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.start_workflow_once(req).await }
         })
@@ -1155,7 +1161,7 @@ impl PostgresBackend {
         &self,
         req: CancelWorkflowRequest,
     ) -> Result<CancelWorkflowOutcome> {
-        self.retry_transaction("cancel_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.cancel_workflow_once(req).await }
         })
@@ -1232,7 +1238,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimWorkflowTasksOptions,
     ) -> Result<Vec<ClaimedWorkflowTask>> {
-        self.retry_transaction("claim_workflow_tasks", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_workflow_tasks_once(worker_id, opts).await }
@@ -1450,7 +1456,7 @@ impl PostgresBackend {
         opts: ClaimWorkflowTaskOptions,
         shard_filter: Option<Vec<ShardId>>,
     ) -> Result<Option<ClaimedWorkflowTask>> {
-        self.retry_transaction("claim_workflow_task", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             let shard_filter = shard_filter.clone();
@@ -1752,7 +1758,7 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         release: crate::WorkflowTaskRelease,
     ) -> Result<()> {
-        self.retry_transaction("release_workflow_task", || {
+        self.retry_transaction(|| {
             let claim = claim.clone();
             let release = release.clone();
             async move { self.release_workflow_task_once(claim, release).await }
@@ -1812,7 +1818,7 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> Result<CommitOutcome> {
-        self.retry_transaction("commit_workflow_task", || {
+        self.retry_transaction(|| {
             let claim = claim.clone();
             let batch = batch.clone();
             async move { self.commit_workflow_task_once(claim, batch).await }
@@ -1850,7 +1856,7 @@ impl PostgresBackend {
         &self,
         batch: crate::WorkflowTaskCommitBatch,
     ) -> Result<Vec<crate::WorkflowTaskCommitBatchResult>> {
-        self.retry_transaction("commit_workflow_tasks", || {
+        self.retry_transaction(|| {
             let batch = batch.clone();
             async move { self.commit_workflow_tasks_once(batch).await }
         })
@@ -2660,7 +2666,7 @@ impl PostgresBackend {
         &self,
         req: SignalWorkflowRequest,
     ) -> Result<SignalWorkflowOutcome> {
-        self.retry_transaction("signal_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.signal_workflow_once(req).await }
         })
@@ -2799,7 +2805,7 @@ impl PostgresBackend {
         &self,
         req: FireDueTimersRequest,
     ) -> Result<FireDueTimersOutcome> {
-        self.retry_transaction("fire_due_timers", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.fire_due_timers_once(req).await }
         })
@@ -2822,7 +2828,7 @@ impl PostgresBackend {
         &self,
         req: TimeoutDueActivitiesRequest,
     ) -> Result<TimeoutDueActivitiesOutcome> {
-        self.retry_transaction("timeout_due_activities", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.timeout_due_activities_once(req).await }
         })
@@ -2845,7 +2851,7 @@ impl PostgresBackend {
         &self,
         req: RunDueMaintenanceRequest,
     ) -> Result<RunDueMaintenanceOutcome> {
-        self.retry_transaction("run_due_maintenance", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.run_due_maintenance_once(req).await }
         })
@@ -2892,7 +2898,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimActivityOptions,
     ) -> Result<Option<ClaimedActivityTask>> {
-        self.retry_transaction("claim_activity_task", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_activity_task_once(worker_id, opts).await }
@@ -2980,7 +2986,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimActivityTasksOptions,
     ) -> Result<Vec<ClaimedActivityTask>> {
-        self.retry_transaction("claim_activity_tasks", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_activity_tasks_once(worker_id, opts).await }
@@ -3117,7 +3123,7 @@ impl PostgresBackend {
         &self,
         req: ActivityHeartbeatRequest,
     ) -> Result<ActivityHeartbeatOutcome> {
-        self.retry_transaction("heartbeat_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.heartbeat_activity_once(req).await }
         })
@@ -3183,7 +3189,7 @@ impl PostgresBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> Result<CompleteActivityOutcome> {
-        self.retry_transaction("complete_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.complete_activity_once(req).await }
         })
@@ -3206,7 +3212,7 @@ impl PostgresBackend {
         &self,
         req: CompleteActivityTasksRequest,
     ) -> Result<Vec<CompleteActivityTaskBatchResult>> {
-        self.retry_transaction("complete_activity_tasks", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.complete_activity_tasks_once(req).await }
         })
@@ -3626,7 +3632,7 @@ impl PostgresBackend {
     }
 
     async fn fail_activity_inner(&self, req: FailActivityRequest) -> Result<FailActivityOutcome> {
-        self.retry_transaction("fail_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.fail_activity_once(req).await }
         })
@@ -5039,119 +5045,8 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         data: HistoryEventData,
     ) -> Result<HistoryEventData> {
-        match data {
-            HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input,
-            } => Ok(HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input: self.normalize_payload_for_storage_tx(tx, input).await?,
-            }),
-            HistoryEventData::WorkflowCompleted { result } => {
-                Ok(HistoryEventData::WorkflowCompleted {
-                    result: self.normalize_payload_for_storage_tx(tx, result).await?,
-                })
-            }
-            HistoryEventData::WorkflowFailed { failure } => Ok(HistoryEventData::WorkflowFailed {
-                failure: self.normalize_failure_for_storage_tx(tx, failure).await?,
-            }),
-            HistoryEventData::WorkflowContinuedAsNew { input } => {
-                Ok(HistoryEventData::WorkflowContinuedAsNew {
-                    input: self.normalize_payload_for_storage_tx(tx, input).await?,
-                })
-            }
-            HistoryEventData::ActivityScheduled(mut scheduled) => {
-                scheduled.input = self
-                    .normalize_payload_for_storage_tx(tx, scheduled.input)
-                    .await?;
-                Ok(HistoryEventData::ActivityScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .normalize_activity_map_input_manifest_for_storage_tx(
-                        tx,
-                        scheduled.input_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .normalize_activity_map_result_manifest_for_storage_tx(
-                        tx,
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ActivityMapCompleted(completed))
-            }
-            HistoryEventData::ActivityMapFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .normalize_activity_map_input_manifest_for_storage_tx(
-                        tx,
-                        scheduled.input_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .normalize_child_workflow_map_result_manifest_for_storage_tx(
-                        tx,
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
-            }
-            HistoryEventData::ActivityCompleted(mut completed) => {
-                completed.result = self
-                    .normalize_payload_for_storage_tx(tx, completed.result)
-                    .await?;
-                Ok(HistoryEventData::ActivityCompleted(completed))
-            }
-            HistoryEventData::ActivityFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ActivityFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowStartRequested(mut requested) => {
-                requested.input = self
-                    .normalize_payload_for_storage_tx(tx, requested.input)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowStartRequested(requested))
-            }
-            HistoryEventData::ChildWorkflowCompleted(mut completed) => {
-                completed.result = self
-                    .normalize_payload_for_storage_tx(tx, completed.result)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowFailed(failed))
-            }
-            HistoryEventData::SignalConsumed(mut signal) => {
-                signal.payload = self
-                    .normalize_payload_for_storage_tx(tx, signal.payload)
-                    .await?;
-                Ok(HistoryEventData::SignalConsumed(signal))
-            }
-            other => Ok(other),
-        }
+        let mut rewriter = PostgresNormalizeRewriter { backend: self, tx };
+        crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
     }
 
     async fn normalize_activity_task_for_storage_tx(
@@ -5222,101 +5117,8 @@ impl PostgresBackend {
         &self,
         data: HistoryEventData,
     ) -> Result<HistoryEventData> {
-        match data {
-            HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input,
-            } => Ok(HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input: self.hydrate_payload_from_storage(input).await?,
-            }),
-            HistoryEventData::WorkflowCompleted { result } => {
-                Ok(HistoryEventData::WorkflowCompleted {
-                    result: self.hydrate_payload_from_storage(result).await?,
-                })
-            }
-            HistoryEventData::WorkflowFailed { failure } => Ok(HistoryEventData::WorkflowFailed {
-                failure: self.hydrate_failure_from_storage(failure).await?,
-            }),
-            HistoryEventData::WorkflowContinuedAsNew { input } => {
-                Ok(HistoryEventData::WorkflowContinuedAsNew {
-                    input: self.hydrate_payload_from_storage(input).await?,
-                })
-            }
-            HistoryEventData::ActivityScheduled(mut scheduled) => {
-                scheduled.input = self.hydrate_payload_from_storage(scheduled.input).await?;
-                Ok(HistoryEventData::ActivityScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .hydrate_activity_map_input_manifest_from_storage(scheduled.input_manifest)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .hydrate_activity_map_result_manifest_from_storage(completed.result_manifest)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapCompleted(completed))
-            }
-            HistoryEventData::ActivityMapFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ActivityMapFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .hydrate_activity_map_input_manifest_from_storage(scheduled.input_manifest)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .hydrate_child_workflow_map_result_manifest_from_storage(
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
-            }
-            HistoryEventData::ActivityCompleted(mut completed) => {
-                completed.result = self.hydrate_payload_from_storage(completed.result).await?;
-                Ok(HistoryEventData::ActivityCompleted(completed))
-            }
-            HistoryEventData::ActivityFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ActivityFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowStartRequested(mut requested) => {
-                requested.input = self.hydrate_payload_from_storage(requested.input).await?;
-                Ok(HistoryEventData::ChildWorkflowStartRequested(requested))
-            }
-            HistoryEventData::ChildWorkflowCompleted(mut completed) => {
-                completed.result = self.hydrate_payload_from_storage(completed.result).await?;
-                Ok(HistoryEventData::ChildWorkflowCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ChildWorkflowFailed(failed))
-            }
-            HistoryEventData::SignalConsumed(mut signal) => {
-                signal.payload = self.hydrate_payload_from_storage(signal.payload).await?;
-                Ok(HistoryEventData::SignalConsumed(signal))
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn hydrate_failure_from_storage(
-        &self,
-        mut failure: DurableFailure,
-    ) -> Result<DurableFailure> {
-        if let Some(details) = failure.details.take() {
-            failure.details = Some(self.hydrate_payload_from_storage(details).await?);
-        }
-        Ok(failure)
+        let mut rewriter = PostgresHydrateRewriter { backend: self };
+        crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
     }
 
     async fn load_payload_blob_tx(
@@ -5502,46 +5304,6 @@ fn is_retryable_postgres_transaction_abort(err: &Error) -> bool {
         Error::Backend(message)
             if message.contains("SQLSTATE 40P01") || message.contains("SQLSTATE 40001")
     )
-}
-
-fn ready_at_ms_for_delay(delay: Duration) -> i64 {
-    if delay.is_zero() {
-        0
-    } else {
-        unix_epoch_millis().saturating_add(duration_millis_i64(delay))
-    }
-}
-
-fn duration_millis_i64(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
-    activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
-}
-
-fn activity_timeout_at_ms_from(now: TimestampMs, timeout: Option<Duration>) -> Option<i64> {
-    timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
-}
-
-fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
-    if heartbeat {
-        format!(
-            "activity `{}` missed heartbeat on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    } else {
-        format!(
-            "activity `{}` timed out on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    }
-}
-
-fn should_retry_activity(task: &ActivityTask) -> bool {
-    task.attempt < task.retry_policy.max_attempts.max(1)
 }
 
 fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
@@ -5983,14 +5745,6 @@ async fn set_workflow_ready_tx(
     .await
     .map_err(postgres_error)?;
     Ok(())
-}
-
-fn unix_epoch_millis() -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 async fn next_sequence_value(tx: &Transaction<'_>, schema: &str, sequence: &str) -> Result<u64> {
@@ -8011,55 +7765,70 @@ fn decode_payload_blob_row(
     Ok(blob)
 }
 
-fn encode_encryption_metadata(
-    encryption: &Option<crate::EncryptionMetadata>,
-) -> Result<Option<Vec<u8>>> {
-    encryption
-        .as_ref()
-        .map(|metadata| {
-            rmp_serde::to_vec_named(metadata).map_err(|err| Error::PayloadEncode(err.to_string()))
-        })
-        .transpose()
+// Rewriters bind the shared `rewrite_history_event_payloads` visitor to Postgres's
+// in-transaction normalize and connection-scoped hydrate leaf operations.
+struct PostgresNormalizeRewriter<'a, 'tx> {
+    backend: &'a PostgresBackend,
+    tx: &'a Transaction<'tx>,
 }
 
-fn decode_encryption_metadata(blob: Option<Vec<u8>>) -> Result<Option<crate::EncryptionMetadata>> {
-    blob.map(|blob| {
-        rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
-    })
-    .transpose()
-}
+impl crate::payload::PayloadRewrite for PostgresNormalizeRewriter<'_, '_> {
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_payload_for_storage_tx(self.tx, payload)
+            .await
+    }
 
-fn codec_to_str(codec: crate::CodecId) -> &'static str {
-    match codec {
-        crate::CodecId::MessagePack => "messagepack",
-        crate::CodecId::Json => "json",
-        crate::CodecId::Protobuf => "protobuf",
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_activity_map_input_manifest_for_storage_tx(self.tx, manifest)
+            .await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_activity_map_result_manifest_for_storage_tx(self.tx, manifest)
+            .await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        self.backend
+            .normalize_child_workflow_map_result_manifest_for_storage_tx(self.tx, manifest)
+            .await
     }
 }
 
-fn codec_from_str(value: &str) -> Result<crate::CodecId> {
-    match value {
-        "messagepack" => Ok(crate::CodecId::MessagePack),
-        "json" => Ok(crate::CodecId::Json),
-        "protobuf" => Ok(crate::CodecId::Protobuf),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload codec `{other}`"
-        ))),
-    }
+struct PostgresHydrateRewriter<'a> {
+    backend: &'a PostgresBackend,
 }
 
-fn compression_to_str(compression: crate::CompressionId) -> &'static str {
-    match compression {
-        crate::CompressionId::None => "none",
+impl crate::payload::PayloadRewrite for PostgresHydrateRewriter<'_> {
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        self.backend.hydrate_payload_from_storage(payload).await
     }
-}
 
-fn compression_from_str(value: &str) -> Result<crate::CompressionId> {
-    match value {
-        "none" => Ok(crate::CompressionId::None),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload compression `{other}`"
-        ))),
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_activity_map_input_manifest_from_storage(manifest)
+            .await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_activity_map_result_manifest_from_storage(manifest)
+            .await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_child_workflow_map_result_manifest_from_storage(manifest)
+            .await
     }
 }
 

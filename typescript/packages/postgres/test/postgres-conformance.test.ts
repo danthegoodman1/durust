@@ -25,7 +25,6 @@ import {
   eventId,
   namespace,
   payloadDigest,
-  prepareWorkflowTaskCommit,
   signal,
   signalId,
   sleep,
@@ -49,7 +48,7 @@ import {
   encodePayloadWithStorage
 } from "@durust/payload";
 import { PostgresBackend } from "@durust/postgres";
-import { basicProviderConformanceCases } from "@durust/testing";
+import { basicProviderConformanceCases, prepareWorkflowTaskCommit } from "@durust/testing";
 
 const postgresUrl = process.env.DURUST_POSTGRES_URL;
 const describePostgres = postgresUrl === undefined ? describe.skip : describe;

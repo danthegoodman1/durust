@@ -18,6 +18,7 @@ import type {
   ParentClosePolicy
 } from "./options.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
+import { assertDurableInputValue } from "./internal.js";
 import {
   createActivityDurablePromise,
   createActivityMapHandle,
@@ -61,7 +62,6 @@ export interface WorkflowDefinition<
   readonly inputSchema?: SchemaAdapter<Input>;
   readonly outputSchema?: SchemaAdapter<Output>;
   readonly queryStateSchema?: SchemaAdapter<QueryState>;
-  readonly queryState?: unknown;
   readonly sourcePath?: string;
   readonly __queryState?: QueryState;
 }
@@ -139,7 +139,6 @@ export interface WorkflowConfig<
   readonly inputSchema?: SchemaAdapter<DurableHandlerInput<Handler>>;
   readonly outputSchema?: SchemaAdapter<Awaited<ReturnType<Handler>>>;
   readonly queryStateSchema?: SchemaAdapter<QueryState>;
-  readonly queryState?: unknown;
   readonly queryStateType?: QueryState;
   readonly sourcePath?: string;
 }
@@ -194,7 +193,6 @@ export function workflow<
     ...(config.inputSchema === undefined ? {} : { inputSchema: config.inputSchema }),
     ...(config.outputSchema === undefined ? {} : { outputSchema: config.outputSchema }),
     ...(config.queryStateSchema === undefined ? {} : { queryStateSchema: config.queryStateSchema }),
-    ...(config.queryState === undefined ? {} : { queryState: config.queryState }),
     ...(config.sourcePath === undefined ? {} : { sourcePath: config.sourcePath })
   };
 }
@@ -495,27 +493,47 @@ export interface ActivityMapResultPage<Output> {
   readonly results: readonly PayloadRef<Output>[];
 }
 
-export function decodeActivityMapResultRefs<Output>(
-  manifestRef: PayloadRef<ActivityMapResultManifest<Output>>
-): readonly PayloadRef<Output>[] {
-  const manifest = decodePayload<ActivityMapResultManifest<Output>>(manifestRef);
-  const results: PayloadRef<Output>[] = [];
+interface PagedManifest<Page> {
+  readonly itemCount: number;
+  readonly pageLengths: readonly number[];
+  readonly pages: readonly PayloadRef<Page>[];
+}
+
+// Single paged-manifest reader for the activity-map and child-workflow-map result
+// manifests: walk pages, flatten items, and enforce the item-count and page-length
+// invariants once instead of in each decoder.
+function decodePagedManifestItems<Page, Item>(
+  manifestRef: PayloadRef<PagedManifest<Page>>,
+  pageItems: (page: Page) => readonly Item[],
+  label: string
+): readonly Item[] {
+  const manifest = decodePayload<PagedManifest<Page>>(manifestRef);
+  const items: Item[] = [];
   for (const pageRef of manifest.pages) {
-    const page = decodePayload<ActivityMapResultPage<Output>>(pageRef);
-    results.push(...page.results);
+    items.push(...pageItems(decodePayload<Page>(pageRef)));
   }
-  if (results.length !== manifest.itemCount) {
+  if (items.length !== manifest.itemCount) {
     throw new Error(
-      `activity map result manifest item count mismatch: expected ${manifest.itemCount}, got ${results.length}`
+      `${label} item count mismatch: expected ${manifest.itemCount}, got ${items.length}`
     );
   }
   const pageItemCount = manifest.pageLengths.reduce((sum, count) => sum + count, 0);
   if (pageItemCount !== manifest.itemCount) {
     throw new Error(
-      `activity map result manifest page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
+      `${label} page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
     );
   }
-  return results;
+  return items;
+}
+
+function decodeActivityMapResultRefs<Output>(
+  manifestRef: PayloadRef<ActivityMapResultManifest<Output>>
+): readonly PayloadRef<Output>[] {
+  return decodePagedManifestItems(
+    manifestRef,
+    (page: ActivityMapResultPage<Output>) => page.results,
+    "activity map result manifest"
+  );
 }
 
 export function decodeActivityMapResults<Output>(
@@ -609,27 +627,14 @@ export interface ChildWorkflowMapResultPage<Output> {
 export function decodeChildWorkflowMapOutcomes<Output>(
   manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>
 ): readonly ChildWorkflowMapItemOutcome<Output>[] {
-  const manifest = decodePayload<ChildWorkflowMapResultManifest<Output>>(manifestRef);
-  const outcomes: ChildWorkflowMapItemOutcome<Output>[] = [];
-  for (const pageRef of manifest.pages) {
-    const page = decodePayload<ChildWorkflowMapResultPage<Output>>(pageRef);
-    outcomes.push(...page.outcomes);
-  }
-  if (outcomes.length !== manifest.itemCount) {
-    throw new Error(
-      `child workflow map result manifest item count mismatch: expected ${manifest.itemCount}, got ${outcomes.length}`
-    );
-  }
-  const pageItemCount = manifest.pageLengths.reduce((sum, count) => sum + count, 0);
-  if (pageItemCount !== manifest.itemCount) {
-    throw new Error(
-      `child workflow map result manifest page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
-    );
-  }
-  return outcomes;
+  return decodePagedManifestItems(
+    manifestRef,
+    (page: ChildWorkflowMapResultPage<Output>) => page.outcomes,
+    "child workflow map result manifest"
+  );
 }
 
-export function decodeChildWorkflowMapSuccessRefs<Output>(
+function decodeChildWorkflowMapSuccessRefs<Output>(
   manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>
 ): readonly PayloadRef<Output>[] {
   return decodeChildWorkflowMapOutcomes(manifestRef).map((outcome, index) => {
@@ -691,12 +696,6 @@ function assertObjectInputSchema(schema: SchemaAdapter<any> | undefined, label: 
 function assertOneInputHandler(handler: (...args: readonly any[]) => unknown, label: string): void {
   if (handler.length !== 1) {
     throw new Error(`${label} must accept exactly one durable input object`);
-  }
-}
-
-function assertDurableInputValue(value: unknown, label: string): void {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be a durable input object`);
   }
 }
 

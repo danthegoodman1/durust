@@ -1,5 +1,15 @@
-import type { DurableBackend, HistoryEvent, WorkflowTaskClaim } from "@durust/core";
+import type {
+  ClaimedWorkflowTask,
+  DurableBackend,
+  HistoryEvent,
+  PrepareWorkflowTaskOptions,
+  WorkflowDefinition,
+  WorkflowInput,
+  WorkflowTaskClaim,
+  WorkflowTaskCommit
+} from "@durust/core";
 import {
+  HotWorkflowExecution,
   RetryPolicy,
   activityMapFingerprint,
   activityMapManifest,
@@ -33,6 +43,20 @@ import type {
   ChildWorkflowMapResultManifest,
   ChildWorkflowMapResultPage
 } from "@durust/core";
+
+// Drives a single workflow task to its commit through the production hot
+// execution driver. Tests use this instead of reaching into runtime internals
+// so they exercise the same path the worker runs.
+export async function prepareWorkflowTaskCommit<
+  W extends WorkflowDefinition<any, any, any, string>
+>(
+  workflowDefinition: W,
+  input: WorkflowInput<W>,
+  claimed: ClaimedWorkflowTask,
+  options: PrepareWorkflowTaskOptions = {}
+): Promise<WorkflowTaskCommit> {
+  return new HotWorkflowExecution(workflowDefinition, input, claimed, options).nextCommit();
+}
 
 export function assertHistoryEventTypeMatches(event: HistoryEvent): void {
   const derived = historyEventType(event.data);

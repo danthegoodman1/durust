@@ -9,13 +9,13 @@ import type {
   WorkflowTaskCommit
 } from "./backend.js";
 import type { SignalInboxRecord } from "./backend.js";
-import type { DurableFailure, WorkflowDefinition } from "./api.js";
+import type { WorkflowDefinition } from "./api.js";
 import { runWithActivityExecutionContext } from "./activity-context.js";
 import type { HistoryEvent } from "./history.js";
 import { historyEventType } from "./history.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef } from "./payload.js";
 import type { Registry } from "./registry.js";
-import { HotWorkflowExecution } from "./runtime.js";
+import { HotWorkflowExecution, durableFailureFromUnknown } from "./runtime.js";
 import {
   eventId,
   type ActivityName,
@@ -1052,37 +1052,6 @@ async function sleepWithAbort(
     };
     signal?.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-function durableFailureFromUnknown(error: unknown): DurableFailure {
-  if (
-    error &&
-    typeof error === "object" &&
-    "errorType" in error &&
-    "message" in error &&
-    typeof (error as { readonly errorType?: unknown }).errorType === "string" &&
-    typeof (error as { readonly message?: unknown }).message === "string"
-  ) {
-    const failure = error as DurableFailure;
-    return {
-      errorType: failure.errorType,
-      message: failure.message,
-      nonRetryable: failure.nonRetryable,
-      ...(failure.details === undefined ? {} : { details: failure.details })
-    };
-  }
-  if (error instanceof Error) {
-    return {
-      errorType: error.name || "Error",
-      message: error.message,
-      nonRetryable: false
-    };
-  }
-  return {
-    errorType: "Error",
-    message: String(error),
-    nonRetryable: false
-  };
 }
 
 function workerErrorInfo(error: unknown): WorkerErrorInfo {
