@@ -634,27 +634,6 @@ export interface DurableFailure {
   readonly details?: PayloadRef<unknown>;
 }
 
-function unsupportedDurablePromise<T>(operation: string): DurablePromise<T> {
-  return {
-    durableKind: "durable-promise",
-    durableBranchKind: "activity",
-    then(): PromiseLike<never> {
-      throw new Error(`${operation} requires a workflow runtime context`);
-    },
-    spawn(): PromiseLike<ActivityHandle<T>> {
-      return unsupportedThenable<ActivityHandle<T>>(`${operation}.spawn`);
-    }
-  };
-}
-
-function unsupportedThenable<T>(operation: string): PromiseLike<T> {
-  return {
-    then(): PromiseLike<never> {
-      throw new Error(`${operation} requires a runtime context`);
-    }
-  };
-}
-
 function assertObjectInputSchema(schema: SchemaAdapter<any> | undefined, label: string): void {
   if (schema?.rootKind !== undefined && schema.rootKind !== "object") {
     throw new Error(`${label} must describe an object root`);
