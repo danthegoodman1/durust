@@ -48,7 +48,7 @@ export class Registry {
   }
 }
 
-export function workflowRegistryKey(
+function workflowRegistryKey(
   definition: Pick<WorkflowDefinition<any, any, any, string>, "name" | "version">
 ): string {
   return `${definition.name}@${definition.version}`;

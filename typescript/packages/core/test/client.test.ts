@@ -3,7 +3,6 @@ import {
   Client,
   MemoryBackend,
   decodePayload,
-  encodePayload,
   eventId,
   namespace,
   prepareWorkflowTaskCommit,
@@ -13,6 +12,7 @@ import {
   workflow,
   workflowId
 } from "@durust/core";
+import type { SchemaAdapter } from "@durust/core";
 
 interface Input {
   readonly value: string;
@@ -40,6 +40,26 @@ const queryWorkflow = workflow({
   name: "client.query",
   version: 1,
   queryStateType: {} as EchoView,
+  handler: async (input: Input): Promise<Output> => {
+    publish({ status: input.value });
+    return input;
+  }
+});
+
+const queryViewSchema: SchemaAdapter<EchoView> = {
+  fingerprint: "sha256:query-view",
+  rootKind: "object",
+  encode: (value) => ({ wire_status: value.status }),
+  decode: (value) => ({
+    status: (value as { readonly wire_status: string }).wire_status
+  })
+};
+
+const schemaQueryWorkflow = workflow({
+  name: "client.schema-query",
+  version: 1,
+  queryStateType: {} as EchoView,
+  queryStateSchema: queryViewSchema,
   handler: async (input: Input): Promise<Output> => {
     publish({ status: input.value });
     return input;
@@ -168,5 +188,45 @@ describe("backend-backed Client", () => {
       status: "running"
     });
     await expect(handle.query()).resolves.toEqual({ status: "running" });
+  });
+
+  it("encodes query projections through workflow query-state schema", async () => {
+    const backend = new MemoryBackend();
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const handle = await client.startWorkflow(
+      schemaQueryWorkflow,
+      workflowId("wf/schema-query"),
+      "workflows",
+      { value: "encoded-running" }
+    );
+
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [schemaQueryWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected workflow claim");
+    }
+    const commit = await prepareWorkflowTaskCommit(
+      schemaQueryWorkflow,
+      { value: "encoded-running" },
+      claim,
+      { payloadCodec: "Json" }
+    );
+    expect(commit.queryProjection?.schemaFingerprint).toBe("sha256:query-view");
+    if (commit.queryProjection === undefined) {
+      throw new Error("expected query projection payload");
+    }
+    expect(decodePayload<{ readonly wire_status: string }>(commit.queryProjection)).toEqual({
+      wire_status: "encoded-running"
+    });
+    await backend.commitWorkflowTask(claim.claim, commit);
+
+    await expect(
+      client.queryWorkflow(schemaQueryWorkflow, workflowId("wf/schema-query"))
+    ).resolves.toEqual({ status: "encoded-running" });
+    await expect(handle.query()).resolves.toEqual({ status: "encoded-running" });
   });
 });

@@ -9,60 +9,60 @@ import {
   workflow
 } from "@durust/core";
 
-export interface CheckoutInput {
+interface CheckoutInput {
   readonly orderId: string;
   readonly sku: string;
   readonly quantity: number;
 }
 
-export interface CheckoutOutput {
+interface CheckoutOutput {
   readonly orderId: string;
   readonly paymentId: string;
   readonly shipmentId: string;
 }
 
-export interface PriceQuoteInput {
+interface PriceQuoteInput {
   readonly sku: string;
   readonly quantity: number;
 }
 
-export interface PriceQuoteOutput {
+interface PriceQuoteOutput {
   readonly amountCents: number;
 }
 
-export interface ChargeCardInput {
+interface ChargeCardInput {
   readonly orderId: string;
   readonly amountCents: number;
 }
 
-export interface ChargeCardOutput {
+interface ChargeCardOutput {
   readonly paymentId: string;
 }
 
-export interface ShipOrderInput {
+interface ShipOrderInput {
   readonly orderId: string;
   readonly paymentId: string;
 }
 
-export interface ShipOrderOutput {
+interface ShipOrderOutput {
   readonly shipmentId: string;
 }
 
-export const priceQuote = activity({
+const priceQuote = activity({
   name: "examples.price-quote",
   handler: async (input: PriceQuoteInput): Promise<PriceQuoteOutput> => ({
     amountCents: input.sku.length * input.quantity * 100
   })
 });
 
-export const chargeCard = activity({
+const chargeCard = activity({
   name: "examples.charge-card",
   handler: async (input: ChargeCardInput): Promise<ChargeCardOutput> => ({
     paymentId: `payment/${input.orderId}/${input.amountCents}`
   })
 });
 
-export const shipOrder = workflow({
+const shipOrder = workflow({
   name: "examples.ship-order",
   version: 1,
   handler: async (input: ShipOrderInput): Promise<ShipOrderOutput> => ({
@@ -70,7 +70,7 @@ export const shipOrder = workflow({
   })
 });
 
-export const checkout = workflow({
+const checkout = workflow({
   name: "examples.checkout",
   version: 1,
   handler: async (input: CheckoutInput): Promise<CheckoutOutput> => {

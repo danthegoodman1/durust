@@ -5,15 +5,23 @@ import { relative, resolve } from "node:path";
 import ts from "typescript";
 import { glob } from "tinyglobby";
 import {
+  checkActivityOnlyWorkflowApi,
+  checkAwaitExpression,
   checkConstructor,
   checkIdentifierCall,
+  checkIdentifierReference,
+  checkImportBinding,
   checkModuleSpecifier,
-  checkStaticCall
+  checkStaticCall,
+  checkStaticRead,
+  checkStaticReference
 } from "../packages/eslint-plugin/dist/index.js";
 
 const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts"]);
 const DEFAULT_CONFIG_FILES = ["durust.config.json", "package.json"];
 const DEFAULT_IGNORES = ["**/node_modules/**", "**/dist/**", "**/coverage/**"];
+const DURUST_CORE_MODULES = new Set(["@durust/core"]);
+const ACTIVITY_ONLY_WORKFLOW_APIS = new Set(["heartbeat"]);
 
 function usage() {
   return [
@@ -181,6 +189,8 @@ async function lintFile(path) {
   const text = await readFile(path, "utf8");
   const sourceFile = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true);
   const diagnostics = [];
+  const durableAwaitIdentifiers = collectDurableAwaitIdentifiers(sourceFile);
+  const durustImports = collectDurustWorkflowApiImports(sourceFile);
 
   function report(node, code, message) {
     const position = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
@@ -200,10 +210,17 @@ async function lintFile(path) {
   }
 
   function visit(node) {
+    if (ts.isVariableDeclaration(node)) {
+      reportForbiddenStaticReferenceAliases(node);
+    }
+
     if (ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) {
       const moduleName = moduleSpecifierText(node.moduleSpecifier);
       if (moduleName !== null) {
         reportViolation(node, checkModuleSpecifier(moduleName));
+      }
+      if (ts.isImportDeclaration(node) && moduleName !== null) {
+        reportForbiddenImportBindings(node, moduleName);
       }
     }
 
@@ -215,6 +232,13 @@ async function lintFile(path) {
           reportViolation(node, checkModuleSpecifier(moduleName));
         }
       } else if (ts.isIdentifier(expression)) {
+        const activityOnlyApi = durustImports.activityOnlyIdentifiers.get(expression.text);
+        if (activityOnlyApi !== undefined) {
+          reportViolation(
+            node,
+            checkActivityOnlyWorkflowApi(activityOnlyApi, `${expression.text}()`)
+          );
+        }
         if (expression.text === "require") {
           const moduleName = firstStringArgument(node);
           if (moduleName !== null) {
@@ -222,23 +246,159 @@ async function lintFile(path) {
           }
         }
         reportViolation(node, checkIdentifierCall(expression.text));
-      } else if (ts.isPropertyAccessExpression(expression)) {
-        const staticName = propertyAccessName(expression);
+      } else if (isMemberAccessExpression(expression)) {
+        const activityOnlyViolation = checkDurustCoreNamespaceActivityOnlyCall(
+          expression,
+          durustImports.durustCoreNamespaces
+        );
+        if (activityOnlyViolation !== null) {
+          reportViolation(node, activityOnlyViolation);
+        }
+        const staticName = memberAccessName(expression);
         if (staticName !== null) {
           reportViolation(node, checkStaticCall(staticName));
         }
       }
     }
 
+    if (isMemberAccessExpression(node)) {
+      const staticName = memberAccessName(node);
+      if (staticName !== null) {
+        reportViolation(node, checkStaticRead(staticName));
+      }
+    }
+
     if (ts.isNewExpression(node) && ts.isIdentifier(node.expression)) {
-      reportViolation(node, checkConstructor(node.expression.text));
+      reportViolation(node, checkConstructor(node.expression.text, {
+        argumentCount: node.arguments?.length ?? 0
+      }));
+    }
+    if (ts.isNewExpression(node) && isMemberAccessExpression(node.expression)) {
+      const staticName = memberAccessName(node.expression);
+      if (staticName !== null) {
+        reportViolation(node, checkConstructor(staticName, {
+          argumentCount: node.arguments?.length ?? 0
+        }));
+      }
+    }
+
+    if (ts.isAwaitExpression(node)) {
+      reportViolation(
+        node,
+        checkAwaitExpression(awaitDescriptor(node.expression, durableAwaitIdentifiers, sourceFile))
+      );
     }
 
     ts.forEachChild(node, visit);
   }
 
+  function reportForbiddenStaticReferenceAliases(node) {
+    const initializer = node.initializer;
+    if (initializer === undefined) {
+      return;
+    }
+    if (isMemberAccessExpression(initializer)) {
+      const staticName = memberAccessName(initializer);
+      if (staticName !== null) {
+        reportViolation(node, checkStaticReference(staticName));
+      }
+      return;
+    }
+    if (ts.isIdentifier(initializer) && !ts.isObjectBindingPattern(node.name)) {
+      reportViolation(node, checkIdentifierReference(initializer.text));
+      return;
+    }
+    if (!ts.isObjectBindingPattern(node.name) || !ts.isIdentifier(initializer)) {
+      return;
+    }
+    for (const element of node.name.elements) {
+      const propertyName = objectBindingElementPropertyName(element);
+      if (propertyName !== null) {
+        reportViolation(element, checkStaticReference(`${initializer.text}.${propertyName}`));
+      }
+    }
+  }
+
+  function reportForbiddenImportBindings(node, moduleName) {
+    const importClause = node.importClause;
+    if (importClause === undefined || importClause.isTypeOnly) {
+      return;
+    }
+    if (importClause.name !== undefined) {
+      reportViolation(importClause.name, checkImportBinding(moduleName, "default"));
+    }
+    const namedBindings = importClause.namedBindings;
+    if (namedBindings === undefined) {
+      return;
+    }
+    if (ts.isNamespaceImport(namedBindings)) {
+      reportViolation(namedBindings, checkImportBinding(moduleName, "*"));
+      return;
+    }
+    for (const element of namedBindings.elements) {
+      if (element.isTypeOnly) {
+        continue;
+      }
+      const importedName = (element.propertyName ?? element.name).text;
+      reportViolation(element, checkImportBinding(moduleName, importedName));
+    }
+  }
+
   visit(sourceFile);
   return diagnostics;
+}
+
+function collectDurustWorkflowApiImports(sourceFile) {
+  const activityOnlyIdentifiers = new Map();
+  const durustCoreNamespaces = new Set();
+
+  function visit(node) {
+    if (ts.isImportDeclaration(node)) {
+      const moduleName = moduleSpecifierText(node.moduleSpecifier);
+      if (moduleName !== null && DURUST_CORE_MODULES.has(moduleName)) {
+        const importClause = node.importClause;
+        if (importClause !== undefined && !importClause.isTypeOnly) {
+          const namedBindings = importClause.namedBindings;
+          if (namedBindings !== undefined) {
+            if (ts.isNamespaceImport(namedBindings)) {
+              durustCoreNamespaces.add(namedBindings.name.text);
+            } else {
+              for (const element of namedBindings.elements) {
+                if (element.isTypeOnly) {
+                  continue;
+                }
+                const importedName = (element.propertyName ?? element.name).text;
+                if (ACTIVITY_ONLY_WORKFLOW_APIS.has(importedName)) {
+                  activityOnlyIdentifiers.set(element.name.text, importedName);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  }
+
+  visit(sourceFile);
+  return { activityOnlyIdentifiers, durustCoreNamespaces };
+}
+
+function collectDurableAwaitIdentifiers(sourceFile) {
+  const identifiers = new Set();
+  function visit(node) {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.initializer !== undefined &&
+      checkAwaitExpression(awaitDescriptor(node.initializer, identifiers, sourceFile)) === null
+    ) {
+      identifiers.add(node.name.text);
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  return identifiers;
 }
 
 function moduleSpecifierText(moduleSpecifier) {
@@ -253,11 +413,90 @@ function firstStringArgument(node) {
   return first !== undefined && ts.isStringLiteralLike(first) ? first.text : null;
 }
 
-function propertyAccessName(node) {
+function isMemberAccessExpression(node) {
+  return ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node);
+}
+
+function memberAccessName(node) {
+  const objectName = memberAccessObjectName(node.expression);
+  if (objectName === null) {
+    return null;
+  }
+  const propertyName = ts.isPropertyAccessExpression(node)
+    ? node.name.text
+    : elementAccessStringName(node);
+  return propertyName === null ? null : `${objectName}.${propertyName}`;
+}
+
+function memberAccessObjectName(node) {
+  if (ts.isIdentifier(node)) {
+    return node.text;
+  }
+  if (isMemberAccessExpression(node)) {
+    return memberAccessName(node);
+  }
+  return null;
+}
+
+function elementAccessStringName(node) {
+  const argument = node.argumentExpression;
+  return argument !== undefined && ts.isStringLiteralLike(argument) ? argument.text : null;
+}
+
+function objectBindingElementPropertyName(element) {
+  const name = element.propertyName ?? element.name;
+  if (ts.isIdentifier(name) || ts.isStringLiteralLike(name)) {
+    return name.text;
+  }
+  return null;
+}
+
+function checkDurustCoreNamespaceActivityOnlyCall(node, durustCoreNamespaces) {
   if (!ts.isIdentifier(node.expression)) {
     return null;
   }
-  return `${node.expression.text}.${node.name.text}`;
+  const objectName = node.expression.text;
+  if (!durustCoreNamespaces.has(objectName)) {
+    return null;
+  }
+  const apiName = ts.isPropertyAccessExpression(node)
+    ? node.name.text
+    : elementAccessStringName(node);
+  if (apiName === null) {
+    return null;
+  }
+  return checkActivityOnlyWorkflowApi(apiName, `${objectName}.${apiName}()`);
+}
+
+function awaitDescriptor(node, durableAwaitIdentifiers, sourceFile) {
+  if (ts.isIdentifier(node)) {
+    return durableAwaitIdentifiers.has(node.text)
+      ? { kind: "durableIdentifier", name: node.text }
+      : { kind: "identifier", name: node.text };
+  }
+  if (ts.isCallExpression(node)) {
+    const expression = node.expression;
+    if (ts.isIdentifier(expression)) {
+      return { kind: "call", name: expression.text };
+    }
+    if (isMemberAccessExpression(expression)) {
+      return {
+        kind: "memberCall",
+        name: ts.isPropertyAccessExpression(expression)
+          ? expression.name.text
+          : elementAccessStringName(expression) ?? "member",
+        displayName: expression.getText(sourceFile)
+      };
+    }
+    return { kind: "other", name: "call expression" };
+  }
+  if (isMemberAccessExpression(node)) {
+    return { kind: "other", name: node.getText(sourceFile) };
+  }
+  if (ts.isNewExpression(node)) {
+    return { kind: "other", name: node.getText(sourceFile) };
+  }
+  return { kind: "other", name: ts.SyntaxKind[node.kind] ?? "expression" };
 }
 
 function formatDiagnostic(diagnostic) {

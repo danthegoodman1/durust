@@ -294,6 +294,10 @@ Current checkpoint:
   `@durust/payload`, `@durust/sqlite`, `@durust/postgres`,
   `@durust/benchmark`, `@durust/eslint-plugin`, and `@durust/examples`
   packages.
+- `@durust/core` now ships a `durust-manifest` bin with `write`, `check`,
+  `diff`, and `accept` commands. The command loads an ESM module exporting a
+  `Registry`, a manifest object, or a function returning either value, then
+  writes or compares a stable `durable.manifest.json` baseline.
 - `@durust/eslint-plugin` exports a `no-workflow-nondeterminism` rule plus a
   recommended flat config. The rule flags hidden filesystem/network I/O,
   worker threads, child processes, native timer APIs, native promise
@@ -322,6 +326,46 @@ Rust and TypeScript tests must both consume these fixtures. Parity means the two
 runtimes agree on durable identity, event ordering, command fingerprints,
 payload-root traversal, and public benchmark vocabulary, even when each provider
 uses different internal SQL.
+
+Current checkpoint:
+
+- The TypeScript contract fixture now covers every public history event type,
+  every public command fingerprint helper (`Activity`, `ActivityMap`,
+  `ChildWorkflow`, `ChildWorkflowMap`, `Timer`, `Signal`, and
+  `VersionMarker`), plus inline JSON, inline MessagePack, blob payload refs,
+  and durable failure shapes. Vitest verifies complete event-type coverage,
+  event-type derivation, fingerprint helper output, inline payload decode,
+  payload-ref JSON round trips, MessagePack decode, and detailed durable failure
+  payloads against the neutral fixture.
+- Rust integration coverage now consumes the same neutral fixture and verifies
+  complete Rust event type names, command fingerprint helper output, inline JSON
+  and MessagePack payload decode, blob payload-ref digest/size/URI shape, and
+  durable failures with optional details against it.
+- The shared core fixture now also includes neutral manifest root/page payload
+  refs for activity-map input manifests, activity-map result manifests, and
+  child-workflow-map outcome manifests. TypeScript and Rust both decode the
+  root-to-page-to-item traversal from the same fixture while adapting only the
+  runtime-specific manifest struct spelling.
+- A neutral provider I/O fixture now covers shared backend vocabulary for
+  workflow start/idempotent start, workflow task claim, history streaming,
+  workflow task commit/conflict, signal delivery/duplicates/inbox records,
+  activity completion/batch/failure/retry outcomes, timer maintenance, query
+  projection, child-start dispatch counts, payload roots, and payload GC summary
+  shapes. Vitest and Rust integration tests both consume this fixture, adapting
+  only language-specific field spelling where the current Rust and TypeScript
+  provider contracts intentionally differ.
+- A neutral benchmark fixture now covers TypeScript benchmark result/baseline
+  and threshold-comparison JSON, plus Rust workload result and comparison JSON
+  vocabulary including camelCase counters, backend metrics, optional Postgres
+  statement stats, and resource samples. The fixture also covers hot execution
+  cache worker-stat fields and forbidden-operation threshold vocabulary so
+  benchmark gates can assert both required and absent provider operation classes.
+  `@durust/benchmark` Vitest coverage and Rust integration coverage both consume
+  the fixture.
+- The TypeScript workspace now exposes `npm run check:fixtures`, which runs the
+  TypeScript neutral fixture tests and Rust `cargo test --test contract_fixtures`
+  together. The aggregate release gate includes this command, so future shared
+  fixture edits must stay accepted by both runtimes before publish.
 
 ## Implementation Slices
 
@@ -365,6 +409,47 @@ Acceptance gate:
 - Add README and SPEC updates showing Rust and idiomatic TypeScript versions of
   the same checkout workflow.
 
+Current checkpoint:
+
+- Public TypeScript definitions preserve workflow, activity, signal, query,
+  activity-map, and child-workflow-map input/output types through registration
+  and call sites. Positive Vitest `expectTypeOf` coverage verifies inference for
+  activity calls, child workflow starts/results, client workflow starts,
+  queries, signals, joins, selects, and map handles.
+- Negative `tsc --noEmit` fixtures reject primitive, missing, positional,
+  array, tuple, nullish, and mismatched inputs at durable boundaries, including
+  named empty-object workflow/activity/signal calls, query projection publishes,
+  continue-as-new requests, and map manifest item mismatches.
+- `activity(...)` and `workflow(...)` now also enforce handler arity at runtime,
+  rejecting JavaScript or unsafe TypeScript handlers that do not expose exactly
+  one input parameter. Registration tests cover zero-parameter and
+  multi-parameter activity and workflow handlers.
+- Public runtime call sites now reject JavaScript or unsafe TypeScript values
+  whose durable input root is primitive, nullish, an array, or a function.
+  Coverage checks activity calls, child workflow starts, workflow starts,
+  signal sends, continue-as-new inputs, and manifest item encoding while
+  preserving the named empty object shape.
+- Signal definitions now accept optional payload schema adapters with
+  `signal<T>("name", { schema })`. The runtime rejects known non-object signal
+  schema roots, `Client.sendSignal` encodes through the signal schema and
+  records its fingerprint, and workflow signal awaits decode through the same
+  schema while preserving the existing typed `signal<T>("name")` form.
+- Workflow query projections declared with `queryStateSchema` now encode
+  `publish(...)` payloads through the query-state schema and record the schema
+  fingerprint, matching the existing client-side query decode path. `publish`
+  rejects primitive, nullish, array, and function projection values at compile
+  time for TypeScript callers and at runtime for JavaScript or unsafe
+  TypeScript callers, preserving the object-shaped query-state contract.
+- Manifest helpers now accept optional item schema metadata:
+  `activityMapManifest(items, { itemSchema, itemCodec })` encodes each item
+  payload through the schema adapter and records the item schema fingerprint,
+  while map result helper decoders accept optional output schemas for
+  schema-transformed activity-map and child-workflow-map result refs.
+- Public map scheduling helpers now reject invalid descriptor options before
+  history scheduling: empty result manifest names, non-positive or non-integer
+  `maxInFlight`, and empty child workflow map ID prefixes. Focused runtime
+  tests cover both activity-map and child-workflow-map public call sites.
+
 Acceptance gate:
 
 - Manifest output is deterministic.
@@ -405,19 +490,51 @@ Acceptance gate:
 
 Current checkpoint:
 
-- Workflow execution installs runtime guards for `Date.now()`, `Math.random()`,
-  native timer scheduling (`setTimeout`, `setInterval`, `queueMicrotask`), and
-  native promise combinators (`Promise.all`, `Promise.race`,
-  `Promise.allSettled`, `Promise.any`). The guards throw nondeterminism failures
-  only when an `AsyncLocalStorage` workflow context is active, so ordinary
-  provider/worker code outside workflow execution keeps normal Node behavior.
+- Workflow execution installs runtime guards for replay-unsafe time/random APIs
+  (`Date.now()`, `Date()`, zero-argument `new Date()`, `performance.now()`,
+  `Math.random()`, Web Crypto random APIs, and `process.hrtime()` /
+  `process.hrtime.bigint()`), native timer/scheduling APIs (`setTimeout`,
+  `setInterval`, `setImmediate`, `process.nextTick`, `queueMicrotask`, and
+  available browser frame or idle callbacks), native promise combinators (`Promise.all`,
+  `Promise.race`, `Promise.allSettled`, `Promise.any`), `fetch()`, and available
+  browser network constructors (`WebSocket`, `EventSource`, and
+  `XMLHttpRequest`). Runtime guards also wrap process-global state APIs:
+  workflow code cannot read, enumerate, or mutate `process.env` except for
+  value-producing reads recorded through `sideEffect()`, cannot call
+  `process.cwd()` except through `sideEffect()`, and cannot call
+  `process.chdir()` in workflow context. Process runtime usage reads such as
+  `process.cpuUsage()`, `process.memoryUsage()`, `process.resourceUsage()`, and
+  `process.uptime()` are also blocked unless recorded through `sideEffect()`.
+  The guards throw nondeterminism failures only when an `AsyncLocalStorage`
+  workflow context is active, so ordinary provider/worker code outside workflow
+  execution keeps normal Node behavior. Deterministic `new Date(timestamp)`
+  construction remains allowed.
 - `sideEffect()` temporarily permits nondeterministic globals while recording a
   marker, and replay returns the recorded marker value without rerunning the
   closure.
-- Vitest coverage rejects `Date.now()`, direct `Math.random()`, native timer
-  APIs, and native promise combinators inside workflow code, verifies globals
-  remain usable outside workflow context, and verifies `Math.random()` is
-  replay-safe when wrapped in `sideEffect()`.
+- Core runtime now includes an internal `HotWorkflowExecution` primitive that
+  keeps a JavaScript async workflow frame alive across committed durable waits.
+  The first slices support sequential `callActivity`, `sleep`/`sleepUntil`, and
+  `signal` awaits plus durable `join`, `joinAll`, `select`, and `selectAll`
+  combinators over activity/timer/signal branches, plus child workflow
+  `spawn()` and handle `result()` waits. The primitive uses an explicit
+  commit-acknowledgement handshake: start or resume produces a
+  `WorkflowTaskCommit`, successful backend commit advances the cached execution
+  tail, and later wake history resolves the still-pending await without
+  reissuing commands. Focused Vitest coverage proves local workflow state before
+  the first await/combinator is not rerun when an activity completes, a timer
+  fires, a signal is delivered, join branches all complete, select/selectAll
+  choose a winner, a child workflow starts and completes, or a child workflow
+  start fails. Coverage now also proves provider-owned activity-map and
+  child-workflow-map result manifests resume the same hot parent frame after map
+  completion. `Worker` now uses the primitive as a bounded hot execution cache
+  after successful provider commit acknowledgement, while still falling back to
+  replay on cache miss, restart, stale lineage, or provider conflict.
+- Vitest coverage rejects the guarded time/random APIs, native timer APIs,
+  native promise combinators, and network APIs inside workflow code, verifies
+  deterministic `new Date(timestamp)` still works, verifies globals remain
+  usable outside workflow context, and verifies value-producing nondeterministic
+  globals are replay-safe when wrapped in `sideEffect()`.
 - A dev-only TypeScript AST scanner, `scripts/determinism-lint.mjs`, checks
   workflow source fixtures for hidden filesystem/network I/O imports, worker
   thread and child-process APIs, native timer APIs, native promise combinators,
@@ -433,6 +550,63 @@ Current checkpoint:
   `workflowSources` from `durust.config.json` or `package.json`
   `durust.workflowSources`. The root workspace uses package configuration for
   its determinism lint gate.
+- The packaged ESLint rule and standalone workflow-source scanner now share a
+  classifier for unknown awaits. Durable await roots such as `callActivity`,
+  `sleep`, `signal`, `select`, `join`, `childWorkflow(...).spawn()`, and
+  durable handle result methods are allowed, while native promises, arbitrary
+  async helpers, and identifier-held native promises are reported as
+  `durust/no-unknown-await`.
+- The packaged ESLint rule and standalone workflow-source scanner also report
+  obvious aliases of forbidden static APIs at declaration time, such as
+  `const now = Date.now`, `const { random } = Math`, and
+  `const { all } = Promise`, so workflow code cannot bypass the direct-call
+  checks by invoking those APIs through local variables. Plugin unit tests and
+  the invalid workflow-source fixture cover both member-reference and
+  destructuring forms.
+- Static determinism coverage now also rejects additional replay-unsafe
+  time/random/native async APIs that are easy to miss in TypeScript workflow
+  source: zero-argument `new Date()`, `Date()` calls, `performance.now()`,
+  Web Crypto random APIs, `process.hrtime()` / `process.hrtime.bigint()`,
+  `process.cwd()`, `process.chdir()`, process runtime usage calls, process
+  identity/argument reads, `process.env` reads, `node:os` imports,
+  `process.nextTick()`, `setImmediate()`, `requestAnimationFrame()`, and
+  `requestIdleCallback()`. The shared classifier handles nested static member
+  names such as `process.hrtime.bigint`, `process.memoryUsage.rss`, and
+  `globalThis.process.env`, including computed string forms like `Date["now"]`,
+  `Promise["all"]`, and `process["env"]`. Plugin unit tests and workflow-source
+  fixtures cover direct calls, direct reads, obvious aliases, and computed
+  string member access.
+- Static determinism coverage now additionally rejects native timer and host
+  timing modules (`node:timers`, `node:timers/promises`, `node:perf_hooks`),
+  network/process/terminal/debugger modules (`node:http2`, `node:dgram`,
+  `node:readline/promises`, `node:repl`, `node:inspector`, and
+  `node:cluster`), native worker/message-channel constructors,
+  `AbortSignal.timeout()`, `Atomics.wait()`, browser storage/cache/database
+  calls, browser navigation and history mutation, DOM reads, browser
+  location/cookie/navigator state reads, clipboard/geolocation/service-worker
+  APIs, and `navigator.sendBeacon()`. The invalid workflow-source fixture and
+  plugin unit tests pin the standalone scanner and packaged classifier to this
+  broader replay-safety policy.
+- Static determinism coverage now also rejects replay-visible host output and
+  process-control APIs that runtime guards cannot reliably intercept, including
+  `console.*` output/timing calls, `process.stdout`/`stderr` writes,
+  `process.stdin` reads, process warning/report calls, and process
+  termination/signalling APIs such as `process.exit()`, `process.abort()`, and
+  `process.kill()`.
+- Static determinism coverage now rejects named and namespace imports of Node
+  crypto random/key-generation APIs from `crypto` and `node:crypto`, including
+  `randomBytes`, `randomUUID`, `randomInt`, random fill helpers, key generation
+  helpers, and `webcrypto`, while leaving deterministic named imports such as
+  hashing helpers available for applications that need pure computations.
+- Static determinism coverage now also rejects dynamic/native code execution
+  surfaces that cannot be made replay-safe by runtime trapping: direct
+  `eval()`, `Function()` and `new Function(...)`, aliases of those identifier
+  APIs, `node:vm` / `vm` imports, and WebAssembly compile, instantiate,
+  validate, streaming, module, and instance paths.
+- Static determinism coverage now also rejects workflow-source calls to
+  activity-only Durust APIs such as `heartbeat()`, including direct named
+  imports and `@durust/core` namespace imports, so activity liveness recording
+  remains confined to activity handler context.
 - Remaining determinism work: extend static coverage for any remaining
   Node/browser APIs that cannot be reliably trapped with runtime guards.
 
@@ -512,10 +686,26 @@ Current checkpoint:
   `synchronous=FULL`, explicit `BEGIN IMMEDIATE` transactions, provider
   conformance coverage, and close/reopen recovery tests for started workflows,
   activity-map descriptors, and child-workflow-map descriptors.
-- Complex provider facts are JSON-encoded in SQLite for the first correctness
-  pass. Before claiming the SQLite slice complete, replace this with the
-  intended append/index table layout, add payload-root traversal, and measure
-  the 1-worker and 4-worker local profiles.
+- SQLite workflow replay history is streamed from normalized `history_events`
+  rows, and workflow task claim selection filters registered workflow types in
+  SQL before hydrating replay history.
+- SQLite query projections live in `query_projections`, and payload roots read
+  workflow-visible payload refs from normalized history, query, signal,
+  activity, activity-map item, and child-workflow-map item rows.
+- SQLite activity task claim filters use stored queue columns for namespace,
+  task queue, registered activity names, availability, terminal state, lease
+  state, map-item identity, and input payload before hydrating the task record.
+- SQLite waits carry namespace, command-id, and ready-time columns so timer
+  maintenance and signal wake checks use indexed rows instead of scanning
+  workflow history.
+- SQLite activity-map and child-workflow-map item inputs, results, outcomes,
+  in-flight state, and terminal state live in item rows so map progress and
+  payload-root traversal stay bounded.
+- Remaining SQLite provider facts use compact rows in the same database until
+  the final production-grade SQLite schema is completed. Before claiming the
+  SQLite slice complete, replace the remaining hot payload state with the
+  intended append/index table layout where it matters, and measure the
+  1-worker and 4-worker local profiles.
 
 Acceptance gate:
 
@@ -559,11 +749,22 @@ Current checkpoint:
   GC validates reachable blob digest/size before deleting unreachable objects
   and fails without deleting when a reachable blob is missing or corrupt.
 - `MemoryBackend` and `SqliteBackend` expose `payloadRoots()`, shared provider
-  conformance verifies history, queue, signal, and query roots, and
-  `PayloadBackend.planGarbageCollection()` / `collectGarbage()` use those roots
-  directly.
-- Before claiming the payload slice complete, add provider-owned roots plus
-  blob-backed conformance for Postgres.
+  conformance verifies history, queue, signal, query, activity-map item, and
+  child-workflow-map item roots, and `PayloadBackend.planGarbageCollection()` /
+  `collectGarbage()` use those roots directly.
+- Payload outage recovery coverage now forces a blob-store hydration failure
+  after a workflow-task claim, verifies no durable commit is written, verifies a
+  replacement worker cannot reclaim until the failed claim lease expires, and
+  verifies recovery succeeds once the blob store is healthy again.
+- Env-gated Postgres coverage runs the same forced-offload
+  `PayloadBackend(PostgresBackend)` provider conformance suite and now verifies
+  local-directory GC uses roots exposed by Postgres: a workflow input stored as
+  a blob is retained, an orphan blob in the same store is deleted, and the raw
+  Postgres history still contains the retained blob ref.
+- `PostgresBackend.payloadRoots()` reads roots from normalized history, query,
+  signal, activity, activity-map item, and child-workflow-map item tables.
+  Env-gated coverage verifies GC planning retains reachable blobs from those
+  normalized roots across provider reopen boundaries.
 
 Acceptance gate:
 
@@ -586,25 +787,37 @@ Acceptance gate:
 
 Current checkpoint:
 
-- `@durust/postgres` exists as a correctness-first Postgres provider package
-  using `pg`. It persists provider state in one transactionally locked text
-  state row per configured table, which keeps Postgres behind the shared
-  `DurableBackend` contract while normalized append/index tables are still
-  pending.
-- The provider supports workflow starts/claims/commits, history streaming,
-  activity claims/completion/failure, timers, signals, query projections,
-  child workflows, activity maps, child workflow maps, and `payloadRoots()`
-  through the shared state-transition logic.
-- Env-gated Vitest coverage runs shared provider conformance, blob-backed
-  `PayloadBackend(PostgresBackend)` conformance with forced offload, and a
-  close/reopen workflow persistence test when `DURUST_POSTGRES_URL` is set.
-- Package-local workspace tests now work for `@durust/postgres`, and the root
-  TS check type-checks the Postgres tests while skipping them without
-  `DURUST_POSTGRES_URL`.
-- Remaining work before the Postgres slice is complete: replace the state-row
-  implementation with normalized append/index tables and migrations, port Rust
-  durability-path optimizations, add Postgres-specific restart/fault tests, and
-  add TypeScript Postgres benchmarks/baselines.
+- `@durust/postgres` uses normalized SQL tables as the durable authority. It
+  stores provider counters in `{table}_counters`, append history in
+  `{table}_history_events`, current workflow IDs in `{table}_workflow_ids`,
+  workflow run state in `{table}_workflow_runs`, query projections in
+  `{table}_query_projections`, waits in `{table}_waits`, signals in
+  `{table}_signals`, activity tasks in `{table}_activity_tasks`, and map
+  descriptors/items in activity-map and child-workflow-map tables.
+- Workflow starts, claims, commits, activity claims/completions/failures,
+  heartbeats, timers, activity timeouts, signal delivery/consumption, child
+  notifications, map progress, query reads, history streaming, and payload-root
+  traversal all read and update normalized rows in Postgres transactions.
+- The normalized schema creates partial indexes for ready and expired workflow
+  claims, due timer waits, unconsumed signal inbox reads, unclaimed and expired
+  activity claims, and due activity timeouts. Derived table and index names use
+  stable short hash suffixes when needed so long user/test table names do not
+  collide under Postgres's 63-byte identifier limit.
+- Env-gated Vitest coverage runs shared provider conformance,
+  blob-backed `PayloadBackend(PostgresBackend)` conformance with forced
+  offload, normalized schema/index tests, normalized row tests for workflow,
+  query, signal, wait, activity, and map state, and close/reopen recovery
+  coverage for mixed workflows, child workflow parent notification, activity
+  maps, and child-workflow maps.
+- Postgres initialization best-effort installs `pg_stat_statements` when the
+  database supports it, while preserving non-fatal fallback behavior for
+  managed databases without extension privileges or preload. Env-gated coverage
+  verifies `statsSnapshot()` after real provider writes and checks positive
+  statement calls when the extension is available.
+- Remaining Postgres work before release readiness: port Rust durability-path
+  batching optimizations where they still apply to the normalized TypeScript
+  provider, add strict accepted TypeScript Postgres benchmarks/baselines, and
+  run the accepted Postgres profile at release scale.
 
 Acceptance gate:
 
@@ -648,8 +861,8 @@ Current checkpoint:
   maintenance limits, and an `onError` hook. The loop returns aggregate
   workflow/activity/timer/error/idle counters.
 - Vitest worker coverage verifies the loop completes workflow/activity
-  progress, fires due timers, stops cleanly during idle backoff when aborted,
-  and continues after a transient backend claim error.
+  progress, fires due timers, stops cleanly during idle and error backoff when
+  aborted, and continues after a transient backend claim error.
 - `Worker` now supports bounded local activity preference with
   `maxLocalActivitiesPerWorkflowTask`. After a successful workflow task commit,
   the worker claims and completes locally registered activities from its
@@ -667,6 +880,36 @@ Current checkpoint:
   verifies `activityCompletionBatchSize` groups multiple successful activity
   completions into one provider call, and benchmark smoke coverage verifies
   `--activity-completion-batch` reaches the batch operation path.
+- Shared provider conformance now verifies workflow and activity lease expiry:
+  expired workflow-task claims are reclaimable with the original wake reason,
+  replacement claims receive fresh tokens, old workflow commits are fenced, and
+  expired activity claims are reclaimable while old completions remain stale.
+  Memory, SQLite, Postgres, and payload-wrapped providers implement internal
+  lease expiry; SQLite also persists lease expiry/reason across close/reopen.
+- Normal activity retry attempts are now provider-owned for memory, SQLite, and
+  Postgres: retryable failures reschedule the same activity task with an
+  incremented attempt without appending an intermediate parent history failure,
+  exhausted retries append the terminal `ActivityFailed`, and shared provider
+  conformance verifies no premature workflow wake. Memory coverage also
+  verifies exponential retry delay with an injected deterministic clock.
+- Normal activity start-to-close and heartbeat timeouts are now provider-owned
+  for memory, SQLite, and Postgres: activity claims record an attempt start
+  timestamp and heartbeat deadline, activity handlers can call `heartbeat()`
+  through a claim-scoped worker context, retryable timeout attempts reschedule
+  without intermediate parent history, terminal timeouts append
+  `ActivityTimedOut`, and workflow replay/hot execution surfaces the timeout as
+  `ActivityFailureError` with `errorType: "ActivityTimedOut"`. Shared provider
+  conformance verifies start-to-close and heartbeat timeout retry behavior,
+  heartbeat recording, stale heartbeat fencing, and terminal wakeup; worker
+  coverage verifies activity-context heartbeat calls and outside-context
+  rejection. SQLite and env-gated Postgres persistence coverage now close and
+  reopen after a refreshed heartbeat, then verifies the persisted deadline is
+  honored before terminal heartbeat timeout.
+- Activity-map item retries use the same provider-owned attempt accounting:
+  retryable item failures keep the same ordinal in flight and reschedule the
+  same activity task, while exhausted retries append one compact
+  `ActivityMapFailed` parent event. Shared provider conformance verifies no
+  premature parent wake and no intermediate parent failure history.
 - `Worker` now exposes a structured `onEvent` hook and cumulative
   `metrics()` snapshot for workflow claims/commits/conflicts, activity
   claims/completions/failures, activity completion batches, timer fires, loop
@@ -675,12 +918,97 @@ Current checkpoint:
 - Vitest worker coverage verifies normal event/metric recording and verifies
   that a failing event sink does not prevent a committed workflow from
   completing.
+- `Worker` now treats workflow-task claim prefetch as an optimization instead
+  of a correctness requirement. If the claim contains only a contiguous prefix
+  of the replay history, the worker streams missing history in bounded
+  `streamHistory` chunks up to the replay target before running workflow code.
+  Vitest coverage truncates claim prefetch to one event and verifies multi-chunk
+  replay streaming, final workflow completion, and streamed chunk/event metrics.
+- `Worker` now maintains a bounded replay-history cache by run id. It fills
+  partial workflow-task claim prefetch from cached contiguous history before
+  calling `streamHistory`, updates the cache after committed workflow tasks, and
+  exposes cache hit/miss/eviction counts through `metrics()`. Vitest coverage
+  proves a cached partial-prefetch replay streams only the newly appended event,
+  and proves least-recent cache eviction falls back to bounded streaming.
+  Seeded simulation coverage now also runs multiple concurrent mixed workflows
+  through a one-worker, two-entry replay-history cache with truncated claim
+  prefetch, duplicate idempotent signals, activities, child workflows, timers,
+  cache evictions, and bounded streaming metrics. This is an incremental
+  replay-work reduction, not the final hot async workflow-future cache.
+- `Worker` now maintains a bounded hot workflow execution cache by run id,
+  separate from the replay-history cache. The worker uses a cached
+  `HotWorkflowExecution` only when the new history delta contains provider-owned
+  wake facts that the live frame can ingest directly; if another worker has
+  committed command events for the run, the stale hot frame is evicted and the
+  task cold-replays from authoritative history. Metrics now expose hot execution
+  cache hits, misses, and evictions. Vitest coverage proves hot resume avoids
+  rerunning pre-await workflow state, worker restart falls back to replay, cache
+  capacity evicts old hot executions, provider commit conflict invalidates a hot
+  frame, and seeded multi-worker simulations continue to pass with child
+  workflows, signals, timers, and cache churn. Focused coverage now also stops
+  a worker loop by abort signal while a hot workflow frame is parked on an
+  activity wait, completes the activity on another worker, and resumes the
+  original hot frame without rerunning pre-await workflow code. Shutdown
+  coverage also verifies aborting with that hot frame parked on a durable wait
+  does not emit an unhandled rejection before later completion resumes the same
+  frame. Worker shutdown
+  coverage now also verifies that an abort requested after a workflow-task
+  commit stops the loop before it starts activity polling or timer maintenance
+  in the same iteration, and that local activity preference is skipped when a
+  loop abort is requested while the workflow task is being processed. Local
+  activity preference coverage also verifies that an abort requested after one
+  local activity completes stops before the next local activity claim when
+  capacity remains. Coverage also verifies that an already-aborted signal
+  prevents initial polling, that an abort requested after activity completion
+  stops the loop before due timer maintenance can run in that iteration, and
+  that an abort requested after timer maintenance fires stops the loop before
+  activity-timeout maintenance can process unrelated claimed activities in the
+  same iteration. Batched activity-polling shutdown coverage verifies that an
+  abort requested after one batched activity is claimed lets that claimed
+  activity complete and flushes its completion, but stops before claiming
+  another activity in the same batch; the same coverage now also exercises a
+  mixed success/failure batch, proving successful completions flush before a
+  failed activity is recorded and an abort stops before the next queued activity
+  claim. Separate shutdown coverage now also verifies an abort requested from
+  `onError` or during transient-error backoff returns promptly instead of
+  waiting out the configured error backoff.
 - SQLite persistence coverage now exercises public `Worker` recovery across
   close/reopen boundaries: one worker schedules an activity, a reopened worker
   completes the activity, and another reopened worker replays the wake and
   commits workflow completion.
-- Remaining work before the worker-runtime slice is complete: cache eviction,
-  child-dispatch loops, and long-running crash/restart/fault integration tests.
+- SQLite persistent recovery coverage now includes a mixed workflow that
+  repeatedly closes and reopens the provider between start, workflow-task
+  commit, activity completion, signal delivery, timer firing, another activity
+  completion, and final workflow completion. This verifies append history and
+  active indexes recover together across process boundaries for activity,
+  signal, timer, and replay progress.
+- The current TypeScript providers do not use a separate child-start dispatcher
+  or outbox loop; ordinary child workflow starts are materialized
+  synchronously and atomically during parent workflow-task commit. SQLite
+  recovery coverage now closes and reopens between parent child-start commit,
+  child workflow execution, parent notification, and parent completion to prove
+  that provider-owned child state and parent wake history recover together.
+- Postgres recovery coverage now exercises the same child-start and parent
+  notification close/reopen path through public `Worker` polling.
+- Postgres persistent-provider recovery tests now also cover activity-map and
+  child-workflow-map descriptor state across close/reopen boundaries, including
+  bounded item materialization after one item completes and final ordered
+  manifest decoding.
+- Focused seeded fault coverage now runs hot execution cache restart, commit
+  conflicts, cache evictions, duplicate signals, child workflows, timers,
+  activities, truncated claim prefetch, and bounded `streamHistory` recovery
+  across three deterministic seeds. Each seed uses multiple worker-driver
+  generations to simulate restarts before final recovery, and verifies compact
+  per-run history counts for activity, child, signal, timer, and terminal
+  events.
+- The workspace now exposes `npm run test:soak`, an opt-in long-running Vitest
+  profile enabled by `DURUST_LONG_SOAK=1`. The default profile runs a larger
+  hot execution cache crash/restart/fault matrix with configurable seed,
+  workflow, generation, step, final-step, and conflict counts. Normal
+  `npm run test` keeps this block skipped so the fast gate stays fast.
+  Remaining work before the worker-runtime slice is complete: broaden shutdown
+  behavior beyond the focused Vitest regressions and run the soak at release
+  scale on release hardware.
 
 ### 11. Benchmarks And Regression Gates
 
@@ -707,32 +1035,95 @@ Current checkpoint:
 - `@durust/benchmark` adds a private TypeScript benchmark package with a
   `durust-benchmark-workload` bin and root Vitest alias.
 - The current CLI supports `--backend memory|sqlite|postgres`, `--mode mixed`,
-  `activity`, `signal`, `timer`, `child`, `activity-map`, `child-map`,
-  `recovery`, and `payload`, Rust-compatible flags for the accepted mixed
-  profile (`--workflows`, `--workers`, `--shards`, `--physical-partitions`,
-  `--activation-concurrency`, `--activation-prefetch-limit`, `--batch`,
-  `--activity-completion-batch`, `--postgres-pool-size`, `--json`), and stable
-  JSON output with Rust-aligned top-level throughput/counter fields.
+  `activity`, `activity-heartbeat`, `signal`, `timer`, `child`,
+  `activity-map`, `child-map`, `recovery`, `payload`, and `write-ceiling`,
+  Rust-compatible flags for the accepted mixed profile (`--workflows`,
+  `--workers`, `--shards`,
+  `--physical-partitions`, `--activation-concurrency`,
+  `--activation-prefetch-limit`, `--batch`, `--activity-completion-batch`,
+  `--postgres-pool-size`, `--json`), and stable JSON output with Rust-aligned
+  top-level throughput/counter fields.
 - The mixed workload covers workflow start, signal, child workflow start/result,
   timer firing, boot activity, child activity, finish activity, workflow tasks,
   activity tasks, and backend operation latency instrumentation.
 - The child-map workload covers manifest-backed child workflow maps with bounded
   `maxInFlight` and ordered success result decoding. Additional focused modes
-  cover single-activity, signal-only, timer-only, child-only, manifest-backed
-  activity-map, replay-heavy recovery, and blob-backed payload-offload paths.
+  cover single-activity, activity heartbeat, signal-only, timer-only,
+  child-only, manifest-backed activity-map, replay-heavy recovery, blob-backed
+  payload-offload, and a write-ceiling profile that isolates provider workflow
+  start plus immediate workflow-task commit overhead.
 - Vitest benchmark smoke coverage runs small memory profiles for every
   implemented mode and parser compatibility checks. A built CLI smoke run also
   produces JSON for a tiny memory mixed profile.
 - Benchmark threshold comparison exists via `compareBenchmarkToBaseline(...)`,
-  checked-in smoke baselines for memory `mixed` and `child-map`, and a named
-  `npm run test:benchmark-thresholds` gate. The smoke baselines validate stable
-  JSON shape, logical counters, required backend operation metrics, operation
-  error counts, and loose throughput/commit-latency thresholds; they are not the
-  accepted machine/profile baselines.
-- Remaining work before the benchmark slice is complete: add a Postgres
-  write-ceiling mode if it proves useful; add strict checked-in accepted
-  baselines; collect provider-specific Postgres counters; and run accepted
-  memory/SQLite/Postgres profiles.
+  checked-in smoke baselines for memory `mixed`, `activity-heartbeat`,
+  `child-map`, and `write-ceiling`, and a named
+  `npm run test:benchmark-thresholds` gate. The heartbeat smoke baseline
+  requires `heartbeatActivity` provider metrics so activity heartbeat recording
+  stays in benchmark coverage. The smoke baselines validate stable JSON shape,
+  logical counters, required backend operation metrics, forbidden-operation
+  absence where a profile is meant to isolate a path, operation error counts,
+  and loose throughput/commit-latency thresholds; they are not the accepted
+  machine/profile baselines.
+- Benchmark worker stats now include bounded replay-history stream chunk/event
+  counts and replay-history cache hit/miss/eviction counts. The checked-in
+  benchmark baselines and neutral benchmark fixture require exact worker-stat
+  values, so future prefetch/cache changes cannot silently add replay streaming
+  work to profiles that should be fully prefetched or hide cache-behavior drift.
+- TypeScript Postgres benchmark runs now report provider-specific
+  `postgres_stats` instead of `null` when the Postgres backend is selected. The
+  report diffs before/after `pg_stat_database` and `pg_stat_wal` snapshots into
+  WAL, transaction, row, block-cache, temp-file, deadlock, and derived
+  per-second/per-action/per-workflow counters. When `pg_stat_statements` is
+  installed and loaded, the same report includes statement call/exec-time
+  deltas, calls per mixed action/workflow, and the top statement list; otherwise
+  statement stats remain `null`. The neutral benchmark fixture documents the
+  TypeScript Postgres stats vocabulary.
+- A 1000-workflow, 4-worker memory mixed accepted-local baseline is checked in
+  alongside the smoke baselines. The threshold gate verifies exact logical
+  counters, exact replay-stream worker stats, required backend operation
+  coverage, operation error counts, and loose local throughput/commit-latency
+  bounds.
+- SQLite mixed-workload accepted-local baselines are now checked in for
+  100-workflow, 1-worker and 4-worker profiles. The threshold gate runs both
+  profiles with exact logical counters and required backend operation coverage,
+  plus loose local throughput and workflow-task commit p95 bounds. These are
+  local regression baselines, not final release performance claims.
+- An env-gated Postgres mixed smoke baseline is checked in for the normalized
+  provider. The threshold gate skips it unless `DURUST_POSTGRES_URL` is set,
+  then verifies exact logical counters, exact replay-stream worker stats,
+  required backend operation coverage, operation error counts, non-null
+  Postgres stats, and positive statement calls when `pg_stat_statements` is
+  available.
+- The root workspace now exposes `npm run check:postgres` as the explicit
+  env-gated Postgres release check. It requires `DURUST_POSTGRES_URL`, runs the
+  Postgres provider conformance suite, then runs the benchmark threshold gate so
+  the checked-in Postgres smoke and accepted baselines cannot be accidentally
+  skipped.
+- The Postgres provider now uses SQL-native durability paths for the mixed
+  benchmark hot operations that fit the TypeScript provider shape: workflow
+  starts, workflow claims, normal workflow-task commits, ordinary child
+  workflow start and terminal notification, normal activity claims,
+  success-only activity completion batches, signal delivery, and due timer
+  firing. Complex paths such as activity maps, child workflow maps,
+  continue-as-new, and parent-close cancellation still fall back to the
+  correctness-first normalized path.
+- Strict accepted benchmark baselines are checked in for the documented local
+  profiles: 1000-workflow memory mixed with 4 workers, 100-workflow SQLite mixed
+  with 1 worker and 4 workers, and 1000-workflow Postgres mixed with 10 workers,
+  batch 32, activity completion batch 32, and pool size 24. Accepted Postgres
+  threshold coverage requires normalized schema stats, statement stats, exact
+  logical counters, exact replay-stream worker stats, required operation
+  coverage, no backend operation errors, and bounded transactions/statement
+  calls per mixed action.
+- Current measured medians on June 19, 2026, Node v24.15.0, Darwin 25.5.0
+  arm64: memory mixed local 4-worker 8859.109 mixed actions/sec with commit p95
+  0.012 ms; SQLite mixed local 1-worker 719.137 mixed actions/sec with commit
+  p95 2.098 ms; SQLite mixed local 4-worker 842.354 mixed actions/sec with
+  commit p95 2.104 ms; Postgres mixed accepted 129.48 mixed actions/sec with
+  commit p95 2.468 ms, 9.257 transactions/action, and 28.251 statement
+  calls/action against PostgreSQL 16.11 from
+  `tests/fixtures/postgres.compose.yml`.
 
 ### 12. Documentation, Examples, And Release
 
@@ -758,8 +1149,85 @@ Current checkpoint:
   idiomatic TypeScript API, forced named object inputs, activities, child
   workflow start/result handling, `Worker`, `Client`, `Registry`, and bounded
   local activity preference against the memory backend.
-- Root Vitest coverage runs the checkout example end to end, so examples are
-  not only type-checked.
+- `@durust/examples` also includes a compile-checked fanout example that uses
+  manifest-backed `activityMap` and `childWorkflowMap` together, decodes ordered
+  result manifests, and runs against the memory backend.
+- `@durust/examples` includes a compile-checked approval example that combines
+  `signal`, durable `sleep`, deterministic `select`, query projection
+  publishing, typed `Client.sendSignal`, and typed `WorkflowHandle.query()`.
+- `@durust/examples` includes a compile-checked versioning example that combines
+  `patched` version markers with `continueAsNew`, showing the compact first run
+  and completed continued run through public `Worker` and `Client` paths.
+- The versioning examples also cover explicit numeric `getVersion(...)`
+  markers and `deprecatePatch(...)` bridge markers through public `Worker` and
+  `Client` paths.
+- `@durust/examples` includes a compile-checked control-flow example that
+  combines `join`, `joinAll`, `selectAll`, `sideEffect`, activity fan-in,
+  signal delivery, and durable timers through public `Worker` and `Client`
+  paths.
+- `@durust/examples` includes a compile-checked retry example that runs
+  provider-owned activity retry backoff through public `Worker` and `Client`
+  paths, proves the delayed retry is not claimable early, and verifies parent
+  history stays compact without an intermediate `ActivityFailed` event.
+- `@durust/examples` includes a compile-checked heartbeat example that calls
+  activity-side `heartbeat()` through the public worker activity context,
+  verifies the provider records the heartbeat, and verifies parent history stays
+  compact.
+- `@durust/examples` includes a compile-checked payload-offload example that
+  wraps `MemoryBackend` in `PayloadBackend`, stores oversized workflow/activity
+  payloads through `LocalDirectoryBlobStore`, and verifies raw history stores
+  blob refs while public workflow/activity code still sees typed values.
+- `@durust/examples` includes a compile-checked parent-close-policy example
+  showing child workflow `Cancel` versus `Abandon` behavior through public
+  `Worker` and `Client` paths.
+- Root Vitest coverage runs the checkout, approval, fanout, versioning,
+  control-flow, retry, heartbeat, payload-offload, and parent-close-policy
+  examples end to end, so examples are not only type-checked.
+- Root `npm run check` now includes `npm run package:dry-run`, which runs
+  `npm pack --dry-run --json` against the publishable TypeScript workspace
+  packages using an isolated temp npm cache. The validator fails if artifacts
+  include source, tests, lockfiles, hidden build metadata such as
+  `.tsbuildinfo`, or files outside the intended built `dist` JS/declaration
+  artifact set. The validator also requires release metadata on every
+  publish-surface package: MIT license, repository type `git`, and the Durust
+  GitHub repository URL. The private `@durust/examples` package is intentionally
+  skipped because it has no publish surface.
+- `typescript/README.md` now documents the TypeScript package layout, Node/npm
+  runtime floor, forced single named object input rule, worker/client usage,
+  deterministic workflow restrictions, payload offload, provider status,
+  benchmark commands, and current production-readiness gaps.
+- `typescript/README.md` now also includes migration and production-readiness
+  checklists for TypeScript users. The migration checklist covers stable
+  durable names, forced single named object inputs, application-owned schema
+  compatibility, durable replacements for nondeterministic workflow APIs,
+  manifest review, provider selection, payload offload, and required test
+  coverage. The production checklist names the release gates for `npm run
+  check:release`, `npm run check`, `npm run test:soak`, env-gated Postgres
+  checks, conformance, persistent recovery, determinism enforcement, payload GC,
+  worker deployment configuration, accepted benchmark baselines, normalized
+  Postgres storage, and production-length hot-cache soak coverage.
+- The workspace and publishable package metadata now declare a conservative
+  Node `>=24.0.0` runtime floor; the root workspace declares npm `>=11.0.0`
+  and `packageManager: npm@11.12.1`.
+- The root workspace now exposes `npm run lint` as the release-gate lint command
+  and wires `npm run check` through that public alias. `npm run lint` delegates
+  to the deterministic workflow-source scanner, so the acceptance gate command
+  named in this plan exists directly.
+- The root workspace now exposes `npm run test:soak` as the opt-in
+  release-candidate soak command for the worker hot execution cache. The soak is
+  skipped in ordinary Vitest runs unless `DURUST_LONG_SOAK=1` is set, and
+  exposes environment variables for seed count, workflow count, worker-driver
+  generations, step budgets, and injected conflict count.
+- The root workspace now exposes `npm run check:release` as the aggregate
+  pre-publish gate. It runs `npm run check`, `npm run check:fixtures`,
+  `npm run test:soak`, and `npm run check:postgres`, fails fast when
+  `DURUST_POSTGRES_URL` is missing, and supports
+  `node scripts/check-release.mjs --dry-run` for local command-list
+  verification.
+- Vitest release-script coverage now verifies `check-release.mjs --dry-run`
+  prints the aggregate command list without requiring Postgres, and verifies
+  both aggregate and standalone Postgres gates fail before running provider
+  work when `DURUST_POSTGRES_URL` is absent.
 
 ## Correctness Gate
 
@@ -782,12 +1250,63 @@ Current checkpoint:
 - Seeded memory worker/provider simulations now cover randomized workflow-task,
   activity-task, and virtual-timer interleavings for a mixed workflow using an
   activity, signal, timer, child workflow, and child activity.
+- Deterministic crash/restart simulations now cover a workflow worker that
+  claims a workflow task and crashes before commit, plus an activity worker that
+  claims an activity task and crashes before completion. Both cases use an
+  injected provider clock to force lease expiry, verify replacement workers can
+  recover progress, and verify stale old claims remain fenced.
+- Deterministic replay-first fault soak coverage now combines stale workflow
+  claim fencing, stale activity claim fencing, replacement worker recovery,
+  duplicate idempotent signal delivery, child workflow completion, timer firing,
+  and final activity completion in one seeded mixed workflow run. This exercises
+  the current replay-first worker path without pretending that the TypeScript
+  runtime has a workflow cache layer.
+- Worker-level replay-history cache coverage now proves cache hits reduce
+  backend history streaming for partial claim prefetch, and proves bounded cache
+  eviction falls back to streaming instead of weakening replay correctness.
+- SQLite persistent-provider recovery tests now replay a mixed activity,
+  signal, timer, and second-activity workflow across repeated close/reopen
+  boundaries, verifying durable history and active indexes remain consistent.
+- Postgres persistent-provider recovery tests now replay the same mixed
+  activity, signal, timer, and second-activity workflow across repeated
+  close/reopen boundaries, verifying normalized history and projections stay
+  consistent across process boundaries.
+- SQLite child recovery tests cover repeated close/reopen boundaries around the
+  current synchronous provider-owned child start model: parent child-start
+  commit, child execution, parent notification, and parent completion.
 - Additional seeded simulations cover bounded materialization for activity maps
   and compact parent history for child workflow maps.
+- Provider conformance now covers expired workflow/activity lease reclamation
+  and stale old-claim fencing across memory, SQLite, Postgres, and
+  payload-wrapped providers; SQLite persistence tests also cover reclaiming
+  expired leases after close/reopen.
+- Provider conformance covers normal activity retry rescheduling and terminal
+  retry failure accounting across memory, SQLite, Postgres, and payload-wrapped
+  providers; a deterministic memory test covers retry backoff timing.
+- Provider conformance covers normal activity start-to-close and heartbeat
+  timeout maintenance, heartbeat recording, stale heartbeat fencing, timeout
+  retry rescheduling, workflow wakeup, compact `ActivityTimedOut` history, and
+  late completion/heartbeat fencing across memory, SQLite, Postgres, and
+  payload-wrapped providers. SQLite and Postgres persistence tests also verify
+  refreshed heartbeat deadlines survive close/reopen boundaries.
+- Provider conformance covers activity-map item retry rescheduling and terminal
+  compact map failure accounting across memory, SQLite, Postgres, and
+  payload-wrapped providers.
+- Payload-store outage recovery is covered with a deterministic worker-level
+  test that fails blob hydration, advances lease time, and then completes the
+  workflow after storage recovery.
 - The simulation driver records seed traces and uses deterministic virtual time;
-  remaining simulation gaps are lease fencing/stale claims, retries, worker
-  crash/restart, persistent-provider recovery, child dispatcher crashes, and
-  payload-store outage/recovery.
+  bounded cache-eviction soak now covers concurrent mixed workflows with
+  truncated prefetch, replay streaming, duplicate idempotent signals, child
+  workflows, timers, and activities. Hot execution cache fault soak now runs
+  multiple deterministic seeds with multiple simulated worker restarts, commit
+  conflicts, cache evictions, truncated prefetch, duplicate signals, child
+  workflows, timers, and compact history assertions. An opt-in
+  `npm run test:soak` profile now scales that scenario beyond the fast default
+  suite for release-candidate burn-in. Remaining fault-simulation work is to
+  run and record that profile at release scale, plus add any provider-specific
+  outage scenarios that need their own long soak rather than focused recovery
+  tests.
 
 ## Performance Gate
 
@@ -818,6 +1337,8 @@ runtime shape and keep only proven wins.
 The TypeScript implementation is not production-ready until all of these are
 true:
 
+- the aggregate `npm run check:release` gate passes with `DURUST_POSTGRES_URL`
+  pointed at the supported Postgres test database;
 - public API docs and examples cover an idiomatic TypeScript equivalent for
   every stable Rust primitive;
 - workflow determinism restrictions are enforced by lint and runtime checks;
@@ -838,13 +1359,15 @@ Resolve these in slice 1 before runtime code expands:
 - whether TypeScript providers must be storage-compatible with existing Rust
   Postgres/SQLite schemas, or only contract-compatible at the history/payload
   level;
-- exact package manager and Node LTS floor;
+- exact package manager and Node LTS floor: current decision is npm with
+  `packageManager: npm@11.12.1`, npm `>=11.0.0`, and Node `>=24.0.0`;
 - whether the first SQLite provider uses Node's built-in SQLite module, a native
-  dependency, or an async wrapper, based on WAL/FULL durability, transaction
-  control, and benchmark evidence;
+  dependency, or an async wrapper: current decision is Node's built-in
+  `node:sqlite` `DatabaseSync` with a Node 24+ floor;
 - whether TypeScript manifest schema metadata uses a required user-supplied
   schema library, optional adapters, or opaque type names plus codec
-  fingerprints for v1;
+  fingerprints for v1: current decision is optional schema adapters plus codec
+  and schema-fingerprint metadata, with no globally required schema library;
 - exact TypeScript public call shapes for activity, child workflow, activity
   map, child workflow map, `select`, `join`, `joinAll`, and `selectAll`, with
   semantic mapping tests against Rust fixtures before implementation expands;

@@ -213,11 +213,6 @@ export interface ChildWorkflowMapScheduled {
   readonly fingerprint: CommandFingerprint;
 }
 
-export interface ChildWorkflowMapItem {
-  readonly mapCommandId: CommandId;
-  readonly itemOrdinal: number;
-}
-
 export interface ChildWorkflowMapTask {
   readonly mapCommandId: CommandId;
   readonly workflowType: WorkflowType;

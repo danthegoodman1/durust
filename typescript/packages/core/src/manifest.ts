@@ -35,7 +35,7 @@ export function exportManifest(
   };
 }
 
-export function workflowManifestEntry(
+function workflowManifestEntry(
   definition: WorkflowDefinition<any, any, any, string>
 ): WorkflowManifestEntry {
   return {
@@ -48,7 +48,7 @@ export function workflowManifestEntry(
   };
 }
 
-export function activityManifestEntry(
+function activityManifestEntry(
   definition: ActivityDefinition<any, any, string>
 ): ActivityManifestEntry {
   return {

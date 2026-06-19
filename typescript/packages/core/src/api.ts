@@ -32,6 +32,7 @@ import {
   WorkflowCancelledError,
   WorkflowFailureError
 } from "./runtime.js";
+export { heartbeat } from "./activity-context.js";
 
 export interface ActivityDefinition<
   Input extends DurableInputObject,
@@ -89,6 +90,7 @@ export interface SignalDefinition<Payload extends DurableInputObject, Name exten
   readonly durableBranchKind: "signal";
   readonly kind: "signal";
   readonly name: Name;
+  readonly payloadSchema?: SchemaAdapter<Payload>;
   readonly __payload?: Payload;
 }
 
@@ -154,6 +156,7 @@ export function activity<
     readonly sourcePath?: string;
   }
 ): ActivityDefinition<DurableHandlerInput<Handler>, Awaited<ReturnType<Handler>>, Name> {
+  assertOneInputHandler(config.handler, `activity ${config.name} handler`);
   assertObjectInputSchema(config.inputSchema, `activity ${config.name} input schema`);
   return {
     kind: "activity",
@@ -174,7 +177,12 @@ export function workflow<
 >(
   config: WorkflowConfig<Name, Handler, QueryState>
 ): WorkflowDefinition<DurableHandlerInput<Handler>, Awaited<ReturnType<Handler>>, QueryState, Name> {
+  assertOneInputHandler(config.handler, `workflow ${config.name} handler`);
   assertObjectInputSchema(config.inputSchema, `workflow ${config.name} input schema`);
+  assertObjectInputSchema(
+    config.queryStateSchema,
+    `workflow ${config.name} query state schema`
+  );
   return {
     kind: "workflow",
     name: config.name,
@@ -199,6 +207,7 @@ export function callActivity<
   input: DurableCallInput<ActivityInput<A>, Input>,
   options: ActivityCallOptions = {}
 ): DurablePromise<ActivityOutput<A>> {
+  assertDurableInputValue(input, `activity ${activityDefinition.name} input`);
   return createActivityDurablePromise(activityDefinition, input, options);
 }
 
@@ -264,17 +273,24 @@ export function childWorkflow<
   input: DurableCallInput<WorkflowInput<W>, Input>,
   options: ChildWorkflowOptions
 ): ChildWorkflowStart<WorkflowOutput<W>> {
+  assertDurableInputValue(input, `child workflow ${workflowDefinition.name} input`);
   return createChildWorkflowStart(workflowDefinition, input, options);
 }
 
+export interface SignalOptions<Payload extends DurableInputObject> {
+  readonly schema?: SchemaAdapter<Payload>;
+}
+
 export function signal<Payload extends DurableInputObject, const Name extends string = string>(
-  name: DurableInput<Payload> extends never ? never : Name
+  name: DurableInput<Payload> extends never ? never : Name,
+  options: SignalOptions<DurableInput<Payload>> = {}
 ): SignalDefinition<DurableInput<Payload>, Name> {
-  return createSignalDurablePromise<DurableInput<Payload>, Name>(name);
+  assertObjectInputSchema(options.schema, `signal ${name} payload schema`);
+  return createSignalDurablePromise<DurableInput<Payload>, Name>(name, options.schema);
 }
 
 export interface SendSignalRequest<
-  S extends SignalDefinition<DurableInputObject, string>,
+  S extends SignalDefinition<any, string>,
   Payload extends SignalPayload<S> = SignalPayload<S>
 > {
   readonly workflowId: WorkflowId | string;
@@ -316,6 +332,7 @@ export class Client {
     input: DurableCallInput<WorkflowInput<W>, Input>
   ): Promise<WorkflowHandle<WorkflowOutput<W>, WorkflowQueryState<W>>> {
     const backend = this.#requireBackend("Client.startWorkflow");
+    assertDurableInputValue(input, `workflow ${workflowDefinition.name} input`);
     const encodedInput = encodePayload(input, {
       codec: this.#payloadCodec,
       ...(workflowDefinition.inputSchema === undefined
@@ -339,18 +356,24 @@ export class Client {
   }
 
   async sendSignal<
-    S extends SignalDefinition<DurableInputObject, string>,
+    S extends SignalDefinition<any, string>,
     Payload extends SignalPayload<S>
   >(
     request: SendSignalRequest<S, Payload>
   ): Promise<void> {
     const backend = this.#requireBackend("Client.sendSignal");
+    assertDurableInputValue(request.payload, `signal ${request.signal.name} payload`);
     await backend.signalWorkflow({
       namespace: this.#namespace,
       workflowId: request.workflowId,
       signalId: signalId(request.idempotencyKey ?? this.#signalIdFactory()),
       signalName: request.signal.name,
-      payload: encodePayload(request.payload, { codec: this.#payloadCodec })
+      payload: encodePayload(request.payload, {
+        codec: this.#payloadCodec,
+        ...(request.signal.payloadSchema === undefined
+          ? {}
+          : { schema: request.signal.payloadSchema })
+      })
     });
   }
 
@@ -496,10 +519,11 @@ export function decodeActivityMapResultRefs<Output>(
 }
 
 export function decodeActivityMapResults<Output>(
-  manifestRef: PayloadRef<ActivityMapResultManifest<Output>>
+  manifestRef: PayloadRef<ActivityMapResultManifest<Output>>,
+  schema?: SchemaAdapter<Output>
 ): readonly Output[] {
   return decodeActivityMapResultRefs(manifestRef).map((resultRef) =>
-    decodePayload<Output>(resultRef)
+    decodePayload<Output>(resultRef, schema)
   );
 }
 
@@ -519,16 +543,29 @@ export function activityMap<A extends ActivityDefinition<any, any, string>>(
   activityDefinition: A,
   options: ActivityMapOptions<ActivityInput<A>>
 ): ActivityMapHandle<ActivityOutput<A>> {
+  assertMapOptions("activityMap", options);
   return createActivityMapHandle(activityDefinition, options);
+}
+
+export interface ActivityMapManifestOptions<Input extends DurableInputObject> {
+  readonly pageSize?: number;
+  readonly itemCodec?: CodecId;
+  readonly itemSchema?: SchemaAdapter<Input>;
 }
 
 export function activityMapManifest<Input extends DurableInputObject>(
   items: readonly (DurableInput<Input> extends never ? never : Input)[],
-  pageSize = 128
+  pageSizeOrOptions: number | ActivityMapManifestOptions<Input> = 128
 ): PayloadRef<ActivityMapInputManifest<Input>> {
+  const options = typeof pageSizeOrOptions === "number"
+    ? { pageSize: pageSizeOrOptions }
+    : pageSizeOrOptions;
+  const pageSize = options.pageSize ?? 128;
   if (pageSize <= 0 || !Number.isInteger(pageSize)) {
     throw new Error("activityMapManifest pageSize must be a positive integer");
   }
+  assertObjectInputSchema(options.itemSchema, "activityMapManifest item schema");
+  const itemCodec = options.itemCodec;
   const pages: PayloadRef<ActivityMapInputPage<Input>>[] = [];
   const pageLengths: number[] = [];
   for (let index = 0; index < items.length; index += pageSize) {
@@ -536,7 +573,13 @@ export function activityMapManifest<Input extends DurableInputObject>(
     pageLengths.push(pageItems.length);
     pages.push(
       encodePayload<ActivityMapInputPage<Input>>({
-        items: pageItems.map((item) => encodePayload(item))
+        items: pageItems.map((item, itemIndex) => {
+          assertDurableInputValue(item, `activityMapManifest item ${index + itemIndex}`);
+          return encodePayload(item, {
+            ...(itemCodec === undefined ? {} : { codec: itemCodec }),
+            ...(options.itemSchema === undefined ? {} : { schema: options.itemSchema })
+          });
+        })
       })
     );
   }
@@ -598,10 +641,11 @@ export function decodeChildWorkflowMapSuccessRefs<Output>(
 }
 
 export function decodeChildWorkflowMapSuccesses<Output>(
-  manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>
+  manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>,
+  schema?: SchemaAdapter<Output>
 ): readonly Output[] {
   return decodeChildWorkflowMapSuccessRefs(manifestRef).map((resultRef) =>
-    decodePayload<Output>(resultRef)
+    decodePayload<Output>(resultRef, schema)
   );
 }
 
@@ -624,6 +668,10 @@ export function childWorkflowMap<W extends WorkflowDefinition<any, any, any, str
   workflowDefinition: W,
   options: ChildWorkflowMapOptions<WorkflowInput<W>>
 ): ChildWorkflowMapHandle<WorkflowOutput<W>> {
+  assertMapOptions("childWorkflowMap", options);
+  if (options.workflowIdPrefix.trim().length === 0) {
+    throw new Error("childWorkflowMap workflowIdPrefix must not be empty");
+  }
   return createChildWorkflowMapHandle(workflowDefinition, options);
 }
 
@@ -637,5 +685,29 @@ export interface DurableFailure {
 function assertObjectInputSchema(schema: SchemaAdapter<any> | undefined, label: string): void {
   if (schema?.rootKind !== undefined && schema.rootKind !== "object") {
     throw new Error(`${label} must describe an object root`);
+  }
+}
+
+function assertOneInputHandler(handler: (...args: readonly any[]) => unknown, label: string): void {
+  if (handler.length !== 1) {
+    throw new Error(`${label} must accept exactly one durable input object`);
+  }
+}
+
+function assertDurableInputValue(value: unknown, label: string): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a durable input object`);
+  }
+}
+
+function assertMapOptions(
+  label: "activityMap" | "childWorkflowMap",
+  options: { readonly resultManifest: string; readonly maxInFlight: number }
+): void {
+  if (options.resultManifest.trim().length === 0) {
+    throw new Error(`${label} resultManifest must not be empty`);
+  }
+  if (options.maxInFlight <= 0 || !Number.isInteger(options.maxInFlight)) {
+    throw new Error(`${label} maxInFlight must be a positive integer`);
   }
 }

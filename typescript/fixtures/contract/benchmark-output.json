@@ -1,0 +1,481 @@
+{
+  "typescriptResult": {
+    "backend": "memory",
+    "mode": "mixed",
+    "correct": true,
+    "options": {
+      "backend": "memory",
+      "mode": "mixed",
+      "workflows": 4,
+      "workers": 1,
+      "batch": 8,
+      "max_rounds": 200,
+      "json": true,
+      "keep_db": false,
+      "activity_delay_ms": 0,
+      "workflow_offset": 0,
+      "child_map_items": 3,
+      "child_map_max_in_flight": 2,
+      "shards": 1,
+      "physical_partitions": 1,
+      "activation_concurrency": 1,
+      "activation_prefetch_limit": 1,
+      "activity_completion_batch": 1,
+      "postgres_pool_size": 24
+    },
+    "elapsed_ms": 20,
+    "setup_ms": 5,
+    "processing_ms": 10,
+    "verify_ms": 5,
+    "rounds": 3,
+    "activations": 32,
+    "completed_workflows": 4,
+    "mixed_actions": 32,
+    "activations_per_second": 1600,
+    "mixed_actions_per_second": 1600,
+    "workflows_per_second": 200,
+    "processing_activations_per_second": 3200,
+    "processing_mixed_actions_per_second": 3200,
+    "processing_workflows_per_second": 400,
+    "counters": {
+      "workflow_starts": 4,
+      "signals": 4,
+      "child_starts": 4,
+      "child_completions": 4,
+      "timer_handlers": 4,
+      "boot_activities": 4,
+      "activity_heartbeats": 0,
+      "child_activities": 4,
+      "finish_activities": 4,
+      "workflow_tasks": 32,
+      "activity_tasks": 12,
+      "timers_fired": 4,
+      "activities_timed_out": 0,
+      "child_workflow_starts_dispatched": 4
+    },
+    "worker_stats": {
+      "workflowTasks": 32,
+      "activityTasks": 12,
+      "workflowHistoryCacheHits": 0,
+      "workflowHistoryCacheMisses": 32,
+      "workflowHistoryCacheEvictions": 0,
+      "workflowExecutionCacheHits": 24,
+      "workflowExecutionCacheMisses": 8,
+      "workflowExecutionCacheEvictions": 0,
+      "historyStreamChunks": 0,
+      "historyStreamEvents": 0,
+      "timersFired": 4,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 4
+    },
+    "backend_metrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 32,
+        "p50Ms": 0.01,
+        "p95Ms": 0.05,
+        "p99Ms": 0.08,
+        "maxMs": 0.1
+      },
+      "operations": {
+        "claimWorkflowTask": {
+          "calls": 32,
+          "errors": 0,
+          "items": 32,
+          "totalMs": 1.6,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 20000,
+          "latency": {
+            "samples": 32,
+            "p50Ms": 0.01,
+            "p95Ms": 0.04,
+            "p99Ms": 0.05,
+            "maxMs": 0.06
+          }
+        },
+        "commitWorkflowTask": {
+          "calls": 32,
+          "errors": 0,
+          "items": 32,
+          "totalMs": 2.4,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 13333.333,
+          "latency": {
+            "samples": 32,
+            "p50Ms": 0.02,
+            "p95Ms": 0.05,
+            "p99Ms": 0.08,
+            "maxMs": 0.1
+          }
+        },
+        "completeActivity": {
+          "calls": 12,
+          "errors": 0,
+          "items": 12,
+          "totalMs": 0.6,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 20000,
+          "latency": {
+            "samples": 12,
+            "p50Ms": 0.01,
+            "p95Ms": 0.03,
+            "p99Ms": 0.04,
+            "maxMs": 0.05
+          }
+        }
+      }
+    },
+    "postgres_stats": null,
+    "resource_samples": null,
+    "postgres_schema": null,
+    "db_path": null,
+    "db_bytes": null
+  },
+  "typescriptBaseline": {
+    "name": "contract-memory-mixed",
+    "kind": "smoke",
+    "profile": {
+      "backend": "memory",
+      "mode": "mixed",
+      "workflows": 4,
+      "workers": 1,
+      "batch": 8
+    },
+    "result": {
+      "completed_workflows": 4,
+      "mixed_actions": 32,
+      "counters": {
+        "workflow_starts": 4,
+        "signals": 4,
+        "child_starts": 4,
+        "child_completions": 4,
+        "timer_handlers": 4,
+        "boot_activities": 4,
+        "activity_heartbeats": 0,
+        "child_activities": 4,
+        "finish_activities": 4
+      },
+      "worker_stats": {
+        "workflowHistoryCacheHits": 0,
+        "workflowHistoryCacheMisses": 32,
+        "workflowHistoryCacheEvictions": 0,
+        "workflowExecutionCacheHits": 24,
+        "workflowExecutionCacheMisses": 8,
+        "workflowExecutionCacheEvictions": 0,
+        "historyStreamChunks": 0,
+        "historyStreamEvents": 0
+      },
+      "processing_mixed_actions_per_second": 3200,
+      "processing_workflows_per_second": 400,
+      "workflow_task_commit_p95_ms": 0.05,
+      "operations": {
+        "claimWorkflowTask": {
+          "calls": 32,
+          "errors": 0
+        },
+        "commitWorkflowTask": {
+          "calls": 32,
+          "errors": 0
+        },
+        "completeActivity": {
+          "calls": 12,
+          "errors": 0
+        }
+      }
+    },
+    "thresholds": {
+      "require_correct": true,
+      "require_profile_match": true,
+      "require_exact_completed_workflows": true,
+      "require_exact_mixed_actions": true,
+      "require_exact_counters": [
+        "workflow_starts",
+        "signals",
+        "child_starts",
+        "child_completions",
+        "timer_handlers",
+        "boot_activities",
+        "activity_heartbeats",
+        "child_activities",
+        "finish_activities"
+      ],
+      "require_exact_worker_stats": [
+        "workflowHistoryCacheHits",
+        "workflowHistoryCacheMisses",
+        "workflowHistoryCacheEvictions",
+        "workflowExecutionCacheHits",
+        "workflowExecutionCacheMisses",
+        "workflowExecutionCacheEvictions",
+        "historyStreamChunks",
+        "historyStreamEvents"
+      ],
+      "required_operation_names": [
+        "claimWorkflowTask",
+        "commitWorkflowTask",
+        "completeActivity"
+      ],
+      "forbidden_operation_names": [
+        "failActivity"
+      ],
+      "allow_operation_errors": false,
+      "min_processing_mixed_actions_per_second_ratio": 0.01,
+      "min_processing_workflows_per_second_ratio": 0.01,
+      "max_workflow_task_commit_p95_ratio": 100,
+      "max_workflow_task_commit_p95_ms": 1000
+    }
+  },
+  "typescriptComparison": {
+    "passed": true,
+    "baseline": "contract-memory-mixed",
+    "failures": []
+  },
+  "typescriptPostgresStats": {
+    "walBytes": 4096,
+    "walBytesPerSecond": 4096,
+    "walRecords": 8,
+    "walRecordsPerSecond": 8,
+    "walFpi": 1,
+    "walBuffersFull": 0,
+    "walWrite": 0,
+    "walSync": 0,
+    "walWriteTimeMs": 0,
+    "walSyncTimeMs": 0,
+    "xactCommit": 12,
+    "xactRollback": 1,
+    "transactionsPerSecond": 13,
+    "transactionsPerMixedAction": 1.3,
+    "transactionsPerWorkflow": 6.5,
+    "rowsReturned": 7,
+    "rowsFetched": 6,
+    "rowsInserted": 5,
+    "rowsUpdated": 4,
+    "rowsDeleted": 3,
+    "blocksRead": 1,
+    "blocksHit": 9,
+    "blockCacheHitRatio": 0.9,
+    "tempFiles": 0,
+    "tempBytes": 256,
+    "deadlocks": 0,
+    "blockReadTimeMs": 1.5,
+    "blockWriteTimeMs": 0,
+    "activeTimeMs": 0,
+    "sessionTimeMs": 0,
+    "activeConnectionsAfter": 2,
+    "statementStats": {
+      "calls": 8,
+      "callsPerMixedAction": 0.8,
+      "callsPerWorkflow": 4,
+      "totalExecTimeMs": 3.25,
+      "topStatements": [
+        {
+          "queryId": "select-1",
+          "calls": 5,
+          "totalExecTimeMs": 1.25,
+          "query": "select 1"
+        },
+        {
+          "queryId": "update-state",
+          "calls": 3,
+          "totalExecTimeMs": 2,
+          "query": "update state"
+        }
+      ]
+    }
+  },
+  "rustResult": {
+    "backend": "sqlite",
+    "mode": "mixed",
+    "correct": true,
+    "sqliteLayout": "single-file",
+    "options": {
+      "mode": "mixed",
+      "sqliteLayout": "single-file",
+      "workflows": 4,
+      "workflowOffset": 0,
+      "workers": 1,
+      "shards": 1,
+      "physicalPartitions": 1,
+      "activationConcurrency": 1,
+      "activationPrefetchLimit": 1,
+      "activityDelayMs": 0,
+      "batch": 8,
+      "activityCompletionBatch": 1,
+      "childMapItems": 3,
+      "childMapMaxInFlight": 2,
+      "maxRounds": 200,
+      "keepDb": false,
+      "json": true
+    },
+    "elapsedMs": 20,
+    "setupMs": 5,
+    "processingMs": 10,
+    "verifyMs": 5,
+    "rounds": 3,
+    "activations": 32,
+    "completedWorkflows": 4,
+    "mixedActions": 32,
+    "activationsPerSecond": 1600,
+    "mixedActionsPerSecond": 1600,
+    "workflowsPerSecond": 200,
+    "processingActivationsPerSecond": 3200,
+    "processingMixedActionsPerSecond": 3200,
+    "processingWorkflowsPerSecond": 400,
+    "counters": {
+      "workflowStarts": 4,
+      "signals": 4,
+      "childStarts": 4,
+      "childCompletions": 4,
+      "timerHandlers": 4,
+      "bootActivities": 4,
+      "childActivities": 4,
+      "finishActivities": 4,
+      "workflowTasks": 32,
+      "activityTasks": 12,
+      "timersFired": 4,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 4
+    },
+    "workerStats": {
+      "workflowTasks": 32,
+      "activityTasks": 12,
+      "historyStreamChunks": 0,
+      "historyStreamEvents": 0,
+      "timersFired": 4,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 4
+    },
+    "backendMetrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 32,
+        "p50Ms": 0.01,
+        "p95Ms": 0.05,
+        "p99Ms": 0.08,
+        "maxMs": 0.1
+      },
+      "operations": {
+        "claim_workflow_tasks": {
+          "calls": 32,
+          "errors": 0,
+          "items": 32,
+          "totalMs": 1.6,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 20000,
+          "latency": {
+            "samples": 32,
+            "p50Ms": 0.01,
+            "p95Ms": 0.04,
+            "p99Ms": 0.05,
+            "maxMs": 0.06
+          }
+        },
+        "commit_workflow_tasks": {
+          "calls": 32,
+          "errors": 0,
+          "items": 32,
+          "totalMs": 2.4,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 13333.333,
+          "latency": {
+            "samples": 32,
+            "p50Ms": 0.02,
+            "p95Ms": 0.05,
+            "p99Ms": 0.08,
+            "maxMs": 0.1
+          }
+        },
+        "complete_activity": {
+          "calls": 12,
+          "errors": 0,
+          "items": 12,
+          "totalMs": 0.6,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 20000,
+          "latency": {
+            "samples": 12,
+            "p50Ms": 0.01,
+            "p95Ms": 0.03,
+            "p99Ms": 0.04,
+            "maxMs": 0.05
+          }
+        }
+      }
+    },
+    "postgresStats": {
+      "walBytes": 0,
+      "walBytesPerSecond": 0,
+      "walRecords": 0,
+      "walRecordsPerSecond": 0,
+      "walFpi": 0,
+      "walBuffersFull": 0,
+      "walWrite": 0,
+      "walSync": 0,
+      "walWriteTimeMs": 0,
+      "walSyncTimeMs": 0,
+      "xactCommit": 32,
+      "xactRollback": 0,
+      "transactionsPerSecond": 3200,
+      "transactionsPerMixedAction": 1,
+      "transactionsPerWorkflow": 8,
+      "rowsReturned": 0,
+      "rowsFetched": 0,
+      "rowsInserted": 0,
+      "rowsUpdated": 0,
+      "rowsDeleted": 0,
+      "blocksRead": 0,
+      "blocksHit": 0,
+      "blockCacheHitRatio": 1,
+      "tempFiles": 0,
+      "tempBytes": 0,
+      "deadlocks": 0,
+      "blockReadTimeMs": 0,
+      "blockWriteTimeMs": 0,
+      "activeTimeMs": 0,
+      "sessionTimeMs": 0,
+      "activeConnectionsAfter": 1,
+      "statementStats": {
+        "calls": 96,
+        "callsPerMixedAction": 3,
+        "callsPerWorkflow": 24,
+        "totalExecTimeMs": 2.4,
+        "topStatements": [
+          {
+            "queryId": "fixture-query",
+            "calls": 32,
+            "totalExecTimeMs": 1.2,
+            "query": "select fixture"
+          }
+        ]
+      }
+    },
+    "resourceSamples": {
+      "samples": 1,
+      "availableParallelism": 8,
+      "maxProcessCpuPercent": 12.5,
+      "maxProcessRssBytes": 104857600
+    },
+    "postgresSchema": "fixture_schema",
+    "dbPath": null,
+    "dbBytes": null
+  },
+  "rustComparison": {
+    "dimensions": {
+      "backend": "sqlite",
+      "mode": "mixed",
+      "workflows": 4,
+      "workers": 1,
+      "batch": 8
+    },
+    "durust": {
+      "score": 400,
+      "processingWorkflowsPerSecond": 400,
+      "processingMixedActionsPerSecond": 3200
+    },
+    "baseline": {
+      "score": 400,
+      "processingWorkflowsPerSecond": 400,
+      "processingMixedActionsPerSecond": 3200
+    },
+    "ratio": 1,
+    "minRatio": 0.95,
+    "passed": true
+  }
+}

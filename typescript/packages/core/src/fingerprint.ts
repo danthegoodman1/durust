@@ -1,4 +1,3 @@
-import { activityName, signalName, timestampMs, workflowType, workflowId, taskQueue } from "./types.js";
 import type { ActivityName, SignalName, TimestampMs, WorkflowId, WorkflowType, TaskQueue } from "./types.js";
 import type { ChildWorkflowMapFailureMode, ParentClosePolicy } from "./options.js";
 
@@ -113,10 +112,3 @@ function activityNameValue(name: ActivityName | string): string {
 function signalNameValue(name: SignalName | string): string {
   return name as string;
 }
-
-void activityName;
-void signalName;
-void timestampMs;
-void workflowType;
-void workflowId;
-void taskQueue;

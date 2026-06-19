@@ -1,0 +1,383 @@
+{
+  "startWorkflow": {
+    "request": {
+      "namespace": "default",
+      "workflowId": "wf/provider",
+      "workflowType": {
+        "name": "orders.checkout",
+        "version": 1
+      },
+      "taskQueue": "workflows",
+      "input": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    },
+    "started": {
+      "kind": "Started",
+      "runId": "run-1"
+    },
+    "alreadyStarted": {
+      "kind": "AlreadyStarted",
+      "runId": "run-1"
+    }
+  },
+  "claimWorkflowTask": {
+    "workerId": "worker-a",
+    "options": {
+      "namespace": "default",
+      "taskQueue": "workflows",
+      "registeredWorkflowTypes": [
+        {
+          "name": "orders.checkout",
+          "version": 1
+        }
+      ],
+      "leaseDurationMs": 30000
+    },
+    "claimed": {
+      "runId": "run-1",
+      "workflowId": "wf/provider",
+      "workflowType": {
+        "name": "orders.checkout",
+        "version": 1
+      },
+      "claim": {
+        "runId": "run-1",
+        "workerId": "worker-a",
+        "token": 7
+      },
+      "replayTargetEventId": 1,
+      "reason": "WorkflowStarted",
+      "prefetchedHistory": [
+        {
+          "eventId": 1,
+          "eventType": "WorkflowStarted",
+          "data": {
+            "kind": "WorkflowStarted",
+            "workflowType": {
+              "name": "orders.checkout",
+              "version": 1
+            },
+            "input": {
+              "kind": "Inline",
+              "codec": "Json",
+              "schemaFingerprint": "sha256:checkout-input",
+              "compression": "None",
+              "encryption": null,
+              "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "streamHistory": {
+    "request": {
+      "runId": "run-1",
+      "afterEventId": 0,
+      "upToEventId": 28,
+      "maxEvents": 128,
+      "maxBytes": 1048576
+    },
+    "chunk": {
+      "events": [
+        {
+          "eventId": 1,
+          "eventType": "WorkflowStarted",
+          "data": {
+            "kind": "WorkflowStarted",
+            "workflowType": {
+              "name": "orders.checkout",
+              "version": 1
+            },
+            "input": {
+              "kind": "Inline",
+              "codec": "Json",
+              "schemaFingerprint": "sha256:checkout-input",
+              "compression": "None",
+              "encryption": null,
+              "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+            }
+          }
+        }
+      ],
+      "lastEventId": 1,
+      "hasMore": true
+    }
+  },
+  "commitWorkflowTask": {
+    "claim": {
+      "runId": "run-1",
+      "workerId": "worker-a",
+      "token": 7
+    },
+    "commit": {
+      "expectedTailEventId": 1,
+      "appendEvents": [
+        {
+          "data": {
+            "kind": "WorkflowTaskStarted"
+          }
+        }
+      ],
+      "upsertWaits": [
+        {
+          "waitId": "run-1:timer:5",
+          "runId": "run-1",
+          "commandId": {
+            "runId": "run-1",
+            "seq": 5
+          },
+          "kind": "Timer",
+          "key": "timer:1781821484000",
+          "readyAt": 1781821484000
+        }
+      ],
+      "deleteWaits": ["run-1:signal:6"],
+      "consumeSignals": ["signal-1"],
+      "queryProjection": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    },
+    "committed": {
+      "kind": "Committed",
+      "newTailEventId": 2
+    },
+    "conflict": {
+      "kind": "Conflict"
+    }
+  },
+  "signalWorkflow": {
+    "request": {
+      "namespace": "default",
+      "workflowId": "wf/provider",
+      "signalId": "signal-1",
+      "signalName": "approved",
+      "payload": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    },
+    "accepted": {
+      "kind": "Accepted"
+    },
+    "duplicate": {
+      "kind": "Duplicate"
+    },
+    "inboxRecord": {
+      "signalId": "signal-1",
+      "signalName": "approved",
+      "payload": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    }
+  },
+  "activityCompletion": {
+    "claim": {
+      "activityId": "run-1:1",
+      "workerId": "activity-worker-a",
+      "token": 11
+    },
+    "completeRequest": {
+      "claim": {
+        "activityId": "run-1:1",
+        "workerId": "activity-worker-a",
+        "token": 11
+      },
+      "result": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    },
+    "completed": {
+      "kind": "Completed",
+      "eventId": 11
+    },
+    "alreadyCompleted": {
+      "kind": "AlreadyCompleted"
+    },
+    "batchRequest": {
+      "completions": [
+        {
+          "claim": {
+            "activityId": "run-1:1",
+            "workerId": "activity-worker-a",
+            "token": 11
+          },
+          "result": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          }
+        }
+      ]
+    },
+    "batchOutcome": {
+      "results": [
+        {
+          "kind": "Completed",
+          "eventId": 11
+        },
+        {
+          "kind": "StaleLease"
+        },
+        {
+          "kind": "NotFound"
+        }
+      ]
+    },
+    "failRequest": {
+      "claim": {
+        "activityId": "run-1:1",
+        "workerId": "activity-worker-a",
+        "token": 11
+      },
+      "failure": {
+        "errorType": "ActivityError",
+        "message": "activity failed",
+        "nonRetryable": false
+      }
+    },
+    "failed": {
+      "kind": "Failed",
+      "eventId": 12
+    },
+    "retryScheduled": {
+      "kind": "RetryScheduled",
+      "attempt": 2,
+      "readyAtMs": 1781821485000
+    }
+  },
+  "timers": {
+    "request": {
+      "namespace": "default",
+      "now": 1781821484000,
+      "limit": 64
+    },
+    "outcome": {
+      "fired": 1
+    }
+  },
+  "queryWorkflow": {
+    "request": {
+      "namespace": "default",
+      "workflowId": "wf/provider"
+    },
+    "found": {
+      "kind": "Found",
+      "runId": "run-1",
+      "eventId": 2,
+      "projection": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    },
+    "notFound": {
+      "kind": "NotFound"
+    },
+    "noProjection": {
+      "kind": "NoProjection"
+    }
+  },
+  "childDispatch": {
+    "request": {
+      "namespace": "default",
+      "limit": 32
+    },
+    "outcome": {
+      "dispatched": 1
+    }
+  },
+  "payloadRoots": [
+    {
+      "kind": "Payload",
+      "payload": {
+        "kind": "Blob",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "digest": "sha256:80ea8a979b50c50b35a32bbb085f8524a79f780c52d4d5cbe560831a413769cb",
+        "size": 17,
+        "uri": "s3://durust-fixtures/payloads/checkout-input.bin"
+      }
+    },
+    {
+      "kind": "ActivityMapInputManifest",
+      "payload": {
+        "kind": "Blob",
+        "codec": "MessagePack",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "digest": "sha256:bab762bc7d1a3e80f19fdeb23818f044cdba95d238a829907b94661e4ac12234",
+        "size": 13,
+        "uri": "s3://durust-fixtures/payloads/checkout-input.msgpack"
+      }
+    }
+  ],
+  "payloadGarbageCollection": {
+    "request": {
+      "dryRun": true
+    },
+    "rustProviderOutcome": {
+      "scannedBlobs": 3,
+      "retainedBlobs": 2,
+      "deletedBlobs": 0
+    },
+    "typescriptPlan": {
+      "reachableUris": [
+        "s3://durust-fixtures/payloads/checkout-input.bin",
+        "s3://durust-fixtures/payloads/checkout-input.msgpack"
+      ],
+      "unreachableUris": [
+        "s3://durust-fixtures/payloads/stale.bin"
+      ],
+      "retainedCount": 2,
+      "unreachableCount": 1
+    },
+    "typescriptCollectOutcome": {
+      "reachableUris": [
+        "s3://durust-fixtures/payloads/checkout-input.bin",
+        "s3://durust-fixtures/payloads/checkout-input.msgpack"
+      ],
+      "unreachableUris": [
+        "s3://durust-fixtures/payloads/stale.bin"
+      ],
+      "retainedCount": 2,
+      "unreachableCount": 1,
+      "deletedUris": [],
+      "deletedCount": 0
+    }
+  }
+}

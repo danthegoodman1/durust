@@ -21,6 +21,16 @@
       "child_activities": 4,
       "finish_activities": 4
     },
+    "worker_stats": {
+      "workflowHistoryCacheHits": 0,
+      "workflowHistoryCacheMisses": 8,
+      "workflowHistoryCacheEvictions": 0,
+      "workflowExecutionCacheHits": 24,
+      "workflowExecutionCacheMisses": 8,
+      "workflowExecutionCacheEvictions": 0,
+      "historyStreamChunks": 0,
+      "historyStreamEvents": 0
+    },
     "processing_mixed_actions_per_second": 8288.545,
     "processing_workflows_per_second": 1036.068,
     "workflow_task_commit_p95_ms": 0.06,
@@ -53,6 +63,16 @@
       "boot_activities",
       "child_activities",
       "finish_activities"
+    ],
+    "require_exact_worker_stats": [
+      "workflowHistoryCacheHits",
+      "workflowHistoryCacheMisses",
+      "workflowHistoryCacheEvictions",
+      "workflowExecutionCacheHits",
+      "workflowExecutionCacheMisses",
+      "workflowExecutionCacheEvictions",
+      "historyStreamChunks",
+      "historyStreamEvents"
     ],
     "required_operation_names": [
       "claimWorkflowTask",

@@ -6,7 +6,8 @@
     "composite": true
   },
   "references": [
-    { "path": "../core" }
+    { "path": "../core" },
+    { "path": "../payload" }
   ],
   "include": [
     "src/**/*.ts"

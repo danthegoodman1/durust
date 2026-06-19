@@ -47,6 +47,9 @@ describe("TypeScript benchmark workload", () => {
       postgres_pool_size: 24,
       json: true
     });
+    expect(parseBenchmarkOptions(["--mode", "activity-heartbeat"])).toMatchObject({
+      mode: "activity-heartbeat"
+    });
   });
 
   it("runs the memory mixed workload and emits stable JSON fields", async () => {
@@ -71,6 +74,8 @@ describe("TypeScript benchmark workload", () => {
     expect(result.counters.finish_activities).toBe(4);
     expect(result.worker_stats.workflowTasks).toBeGreaterThan(0);
     expect(result.worker_stats.activityTasks).toBeGreaterThan(0);
+    expect(result.worker_stats.historyStreamChunks).toBe(0);
+    expect(result.worker_stats.historyStreamEvents).toBe(0);
     expect(result.backend_metrics.workflowTaskCommitLatency.samples).toBeGreaterThan(0);
     expect(result.backend_metrics.operations.commitWorkflowTask.calls).toBeGreaterThan(0);
     expect(result.backend_metrics.operations.completeActivities.calls).toBeGreaterThan(0);
@@ -99,12 +104,14 @@ describe("TypeScript benchmark workload", () => {
 
   it.each([
     ["activity", 4, { boot_activities: 2 }],
+    ["activity-heartbeat", 6, { boot_activities: 2, activity_heartbeats: 2 }],
     ["signal", 4, { signals: 2 }],
     ["timer", 4, { timer_handlers: 2 }],
     ["child", 8, { child_starts: 2, child_completions: 2, child_activities: 2 }],
     ["activity-map", 8, { boot_activities: 6 }],
     ["recovery", 12, { boot_activities: 6, timer_handlers: 4 }],
-    ["payload", 4, { boot_activities: 2 }]
+    ["payload", 4, { boot_activities: 2 }],
+    ["write-ceiling", 2, {}]
   ] as const)("runs the memory %s workload", async (mode, mixedActions, expectedCounters) => {
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
@@ -127,5 +134,13 @@ describe("TypeScript benchmark workload", () => {
     });
     expect(result.backend_metrics.operations.claimWorkflowTask.calls).toBeGreaterThan(0);
     expect(result.backend_metrics.operations.commitWorkflowTask.calls).toBeGreaterThan(0);
+    if (mode === "write-ceiling") {
+      expect(result.backend_metrics.operations.claimActivityTask).toBeUndefined();
+      expect(result.backend_metrics.operations.fireDueTimers).toBeUndefined();
+      expect(result.backend_metrics.operations.readSignalInbox).toBeUndefined();
+    }
+    if (mode === "activity-heartbeat") {
+      expect(result.backend_metrics.operations.heartbeatActivity?.calls).toBe(2);
+    }
   });
 });

@@ -1,15 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  Client,
   MemoryBackend,
   ActivityFailureError,
+  ChildWorkflowFailureError,
   DEFAULT_VERSION,
   RetryPolicy,
   UnsupportedWorkflowVersionError,
   activity,
+  activityMap,
   activityMapManifest,
   callActivity,
+  childWorkflow,
   childWorkflowMap,
   continueAsNew,
+  decodeActivityMapResults,
+  decodeChildWorkflowMapSuccesses,
   decodePayload,
   deprecatePatch,
   encodePayload,
@@ -20,6 +26,7 @@ import {
   patched,
   namespace,
   prepareWorkflowTaskCommit,
+  publish,
   runId,
   select,
   selectAll,
@@ -32,8 +39,10 @@ import {
   workflow,
   workflowId,
   workflowType,
-  type ClaimedWorkflowTask
+  type ClaimedWorkflowTask,
+  type SchemaAdapter
 } from "@durust/core";
+import { HotWorkflowExecution } from "../src/runtime.js";
 
 interface QuoteInput {
   readonly sku: string;
@@ -60,6 +69,14 @@ const priceQuote = activity({
   })
 });
 
+const childEchoWorkflow = workflow({
+  name: "orders.runtime-child-echo",
+  version: 1,
+  handler: async (input: { readonly value: string }): Promise<{ readonly value: string }> => ({
+    value: `${input.value}/child`
+  })
+});
+
 const versionActivityA = activity({
   name: "tests.version-a",
   handler: async (_input: {}): Promise<string> => "a"
@@ -83,6 +100,13 @@ const fakeClaimed: ClaimedWorkflowTask = {
   reason: "WorkflowStarted",
   prefetchedHistory: []
 };
+
+function committedTail(outcome: { readonly kind: string; readonly newTailEventId?: unknown }) {
+  if (outcome.kind !== "Committed" || typeof outcome.newTailEventId !== "number") {
+    throw new Error(`expected committed outcome, got ${outcome.kind}`);
+  }
+  return eventId(outcome.newTailEventId);
+}
 
 describe("minimal workflow runtime", () => {
   it("rejects durable activity awaits outside workflow context", async () => {
@@ -356,6 +380,497 @@ describe("minimal workflow runtime", () => {
     ]);
   });
 
+  it("keeps a hot async workflow frame alive across activity completion", async () => {
+    const trace: string[] = [];
+    const checkout = workflow({
+      name: "orders.hot-checkout",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        trace.push(`start:${input.sku}`);
+        const quote = await callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" });
+        trace.push(`after:${quote.cents}`);
+        return { cents: quote.cents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-activity"),
+      workflowType: checkout.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [checkout.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(checkout, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled"
+    ]);
+    expect(trace).toEqual(["start:sku-1"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
+    );
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
+    });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [checkout.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual(["start:sku-1", "after:1234"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
+  it("keeps a hot async workflow frame alive across child workflow completion", async () => {
+    const trace: string[] = [];
+    const parent = workflow({
+      name: "orders.hot-child-parent",
+      version: 1,
+      handler: async (input: { readonly value: string }): Promise<{ readonly value: string }> => {
+        trace.push(`before-spawn:${input.value}`);
+        const child = await childWorkflow(
+          childEchoWorkflow,
+          { value: input.value },
+          { workflowId: `child/${input.value}`, taskQueue: "workflows" }
+        ).spawn();
+        trace.push(`started:${child.runId}`);
+        const result = await child.result();
+        trace.push(`after-child:${result.value}`);
+        return { value: result.value };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-child-parent"),
+      workflowType: parent.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ value: "order-1" }, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [parent.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first parent claim");
+    }
+    const hot = new HotWorkflowExecution(parent, { value: "order-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const requestCommit = await hot.nextCommit();
+    expect(requestCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ChildWorkflowStartRequested"
+    ]);
+    expect(requestCommit.startChildWorkflows).toHaveLength(1);
+    expect(trace).toEqual(["before-spawn:order-1"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, requestCommit))
+    );
+
+    const startedClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [parent.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!startedClaim) {
+      throw new Error("expected child-start parent claim");
+    }
+    const waitForResultCommit = await hot.advance(startedClaim);
+    expect(waitForResultCommit.appendEvents).toEqual([]);
+    expect(waitForResultCommit.startChildWorkflows).toEqual([]);
+    expect(trace).toEqual(["before-spawn:order-1", "started:run-2"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(startedClaim.claim, waitForResultCommit))
+    );
+
+    const childClaim = await backend.claimWorkflowTask("worker-child", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [childEchoWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!childClaim) {
+      throw new Error("expected child workflow claim");
+    }
+    const childCommit = await prepareWorkflowTaskCommit(
+      childEchoWorkflow,
+      { value: "order-1" },
+      childClaim,
+      { payloadCodec: "Json" }
+    );
+    expect(childCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    await backend.commitWorkflowTask(childClaim.claim, childCommit);
+
+    const completedClaim = await backend.claimWorkflowTask("worker-c", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [parent.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!completedClaim) {
+      throw new Error("expected child-complete parent claim");
+    }
+    const completionCommit = await hot.advance(completedClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual([
+      "before-spawn:order-1",
+      "started:run-2",
+      "after-child:order-1/child"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(completedClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+
+    const history = await backend.streamHistory({
+      runId: firstClaim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(20),
+      maxEvents: 20,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map((event) => event.eventType)).toEqual([
+      "WorkflowStarted",
+      "ChildWorkflowStartRequested",
+      "ChildWorkflowStarted",
+      "ChildWorkflowCompleted",
+      "WorkflowCompleted"
+    ]);
+  });
+
+  it("keeps a hot async workflow frame alive across child workflow start failure", async () => {
+    const trace: string[] = [];
+    const parent = workflow({
+      name: "orders.hot-child-conflict-parent",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly errorType: string }> => {
+        trace.push("before-spawn");
+        try {
+          await childWorkflow(
+            childEchoWorkflow,
+            { value: "conflict" },
+            { workflowId: "child/hot-conflict", taskQueue: "workflows" }
+          ).spawn();
+          return { errorType: "none" };
+        } catch (error) {
+          if (error instanceof ChildWorkflowFailureError) {
+            trace.push(`caught:${error.failure.errorType}`);
+            return { errorType: error.failure.errorType };
+          }
+          throw error;
+        }
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("child/hot-conflict"),
+      workflowType: childEchoWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ value: "already-running" }, { codec: "Json" })
+    });
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-child-conflict-parent"),
+      workflowType: parent.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [parent.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first parent claim");
+    }
+    const hot = new HotWorkflowExecution(parent, {}, firstClaim, { payloadCodec: "Json" });
+    const requestCommit = await hot.nextCommit();
+    expect(requestCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ChildWorkflowStartRequested"
+    ]);
+    expect(trace).toEqual(["before-spawn"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, requestCommit))
+    );
+
+    const failedClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [parent.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!failedClaim) {
+      throw new Error("expected child-failed parent claim");
+    }
+    const completionCommit = await hot.advance(failedClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual([
+      "before-spawn",
+      "caught:durust.child_workflow_id_conflict"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(failedClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
+  it("keeps a hot async workflow frame alive across activity-map completion", async () => {
+    const trace: string[] = [];
+    const mappedWorkflow = workflow({
+      name: "orders.hot-activity-map",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly totalCents: number }> => {
+        trace.push("before-map");
+        const mapped = activityMap(priceQuote, {
+          inputManifest: activityMapManifest([{ sku: "a" }, { sku: "abcd" }], 2),
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 2
+        });
+        const manifestRef = await mapped.resultManifest();
+        const totalCents = decodeActivityMapResults<QuoteOutput>(manifestRef).reduce(
+          (sum, result) => sum + result.cents,
+          0
+        );
+        trace.push(`after-map:${totalCents}`);
+        return { totalCents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-activity-map"),
+      workflowType: mappedWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [mappedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first map claim");
+    }
+    const hot = new HotWorkflowExecution(mappedWorkflow, {}, firstClaim, { payloadCodec: "Json" });
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityMapScheduled"
+    ]);
+    expect(scheduleCommit.scheduleActivityMaps).toHaveLength(1);
+    expect(trace).toEqual(["before-map"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
+    );
+
+    const firstActivity = await backend.claimActivityTask("activity-worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!firstActivity) {
+      throw new Error("expected first map activity");
+    }
+    await backend.completeActivity({
+      claim: firstActivity.claim,
+      result: encodePayload<QuoteOutput>({ cents: 100 }, { codec: "Json" })
+    });
+    const secondActivity = await backend.claimActivityTask("activity-worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!secondActivity) {
+      throw new Error("expected second map activity");
+    }
+    await backend.completeActivity({
+      claim: secondActivity.claim,
+      result: encodePayload<QuoteOutput>({ cents: 250 }, { codec: "Json" })
+    });
+
+    const completedClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [mappedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!completedClaim) {
+      throw new Error("expected map-complete claim");
+    }
+    const completionCommit = await hot.advance(completedClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual(["before-map", "after-map:350"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(completedClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
+  it("keeps a hot async workflow frame alive across child-workflow-map completion", async () => {
+    const trace: string[] = [];
+    const mappedWorkflow = workflow({
+      name: "orders.hot-child-workflow-map",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly values: readonly string[] }> => {
+        trace.push("before-child-map");
+        const mapped = childWorkflowMap(childEchoWorkflow, {
+          inputManifest: activityMapManifest([{ value: "a" }, { value: "b" }], 2),
+          resultManifest: "child-values",
+          workflowIdPrefix: "child-map/hot",
+          taskQueue: "workflows",
+          maxInFlight: 2
+        });
+        const manifestRef = await mapped.resultManifest();
+        const values = decodeChildWorkflowMapSuccesses<{ readonly value: string }>(manifestRef)
+          .map((result) => result.value);
+        trace.push(`after-child-map:${values.join(",")}`);
+        return { values };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-child-workflow-map"),
+      workflowType: mappedWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [mappedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first child-map claim");
+    }
+    const hot = new HotWorkflowExecution(mappedWorkflow, {}, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ChildWorkflowMapScheduled"
+    ]);
+    expect(scheduleCommit.scheduleChildWorkflowMaps).toHaveLength(1);
+    expect(trace).toEqual(["before-child-map"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
+    );
+
+    for (const value of ["a", "b"]) {
+      const childClaim = await backend.claimWorkflowTask(`worker-child-${value}`, {
+        namespace: namespace(),
+        taskQueue: taskQueue("workflows"),
+        registeredWorkflowTypes: [childEchoWorkflow.workflowType],
+        leaseDurationMs: 30_000
+      });
+      if (!childClaim) {
+        throw new Error(`expected child workflow claim for ${value}`);
+      }
+      const childCommit = await prepareWorkflowTaskCommit(
+        childEchoWorkflow,
+        { value },
+        childClaim,
+        { payloadCodec: "Json" }
+      );
+      expect(childCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+        "WorkflowCompleted"
+      ]);
+      await backend.commitWorkflowTask(childClaim.claim, childCommit);
+    }
+
+    const completedClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [mappedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!completedClaim) {
+      throw new Error("expected child-map-complete claim");
+    }
+    const completionCommit = await hot.advance(completedClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual([
+      "before-child-map",
+      "after-child-map:a/child,b/child"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(completedClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+
+    const history = await backend.streamHistory({
+      runId: firstClaim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(20),
+      maxEvents: 20,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map((event) => event.eventType)).toEqual([
+      "WorkflowStarted",
+      "ChildWorkflowMapScheduled",
+      "ChildWorkflowMapCompleted",
+      "WorkflowCompleted"
+    ]);
+  });
+
   it("replays a failed activity as a catchable workflow error", async () => {
     const failingWorkflow = workflow({
       name: "orders.activity-failure",
@@ -582,6 +1097,63 @@ describe("minimal workflow runtime", () => {
     expect(decodePayload(secondCompleted.result)).toEqual({ count: 1 });
   });
 
+  it("fails workflow code that continues as new with a non-object input", async () => {
+    const invalidInputs = [
+      "bad",
+      null,
+      ["bad"],
+      () => ({ ok: false })
+    ];
+
+    for (const [index, invalidInput] of invalidInputs.entries()) {
+      const invalid = workflow({
+        name: `tests.continue-as-new-invalid-input-${index}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<void> =>
+          continueAsNew(invalidInput as unknown as TestNoInput)
+      });
+
+      const commit = await prepareWorkflowTaskCommit(invalid, {}, fakeClaimed, {
+        payloadCodec: "Json"
+      });
+
+      expect(commit.appendEvents?.map((event) => event.data.kind)).toEqual(["WorkflowFailed"]);
+      const failed = commit.appendEvents?.[0]?.data;
+      if (failed?.kind !== "WorkflowFailed") {
+        throw new Error("expected WorkflowFailed");
+      }
+      expect(failed.failure.message).toBe("continueAsNew input must be a durable input object");
+    }
+  });
+
+  it("fails workflow code that publishes a non-object query projection", async () => {
+    const invalidProjections = [
+      "bad",
+      null,
+      [],
+      () => ({ status: "bad" })
+    ];
+
+    for (const [index, invalidProjection] of invalidProjections.entries()) {
+      const invalidWorkflow = workflow({
+        name: `tests.publish-invalid-root-${index}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<void> => {
+          publish(invalidProjection as unknown as Record<string, unknown>);
+        }
+      });
+      const commit = await prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json"
+      });
+      expect(commit.appendEvents?.map((event) => event.data.kind)).toEqual(["WorkflowFailed"]);
+      const failed = commit.appendEvents?.[0]?.data;
+      if (failed?.kind !== "WorkflowFailed") {
+        throw new Error("expected WorkflowFailed");
+      }
+      expect(failed.failure.message).toBe("query projection must be a durable input object");
+    }
+  });
+
   it("prepares a deterministic timer wait when sleepUntil is awaited", async () => {
     const reminder = workflow({
       name: "orders.reminder",
@@ -734,6 +1306,65 @@ describe("minimal workflow runtime", () => {
     ]);
   });
 
+  it("keeps a hot async workflow frame alive across timer firing", async () => {
+    const trace: string[] = [];
+    const reminder = workflow({
+      name: "orders.hot-reminder",
+      version: 1,
+      handler: async (input: { readonly deadlineMs: number }): Promise<{ readonly done: true }> => {
+        trace.push("before-timer");
+        await sleepUntil(input.deadlineMs);
+        trace.push("after-timer");
+        return { done: true };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-timer"),
+      workflowType: reminder.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ deadlineMs: 1_000 }, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [reminder.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(reminder, { deadlineMs: 1_000 }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const timerCommit = await hot.nextCommit();
+    expect(timerCommit.appendEvents?.map((event) => event.data.kind)).toEqual(["TimerStarted"]);
+    expect(trace).toEqual(["before-timer"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, timerCommit)));
+
+    await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [reminder.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual(["before-timer", "after-timer"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
   it("registers a signal wait when no signal is available", async () => {
     const approvalWorkflow = workflow({
       name: "orders.approval",
@@ -861,6 +1492,187 @@ describe("minimal workflow runtime", () => {
     ]);
   });
 
+  it("uses signal schema adapters for client encoding and workflow decoding", async () => {
+    const approvalSchema: SchemaAdapter<ApprovalSignal> = {
+      fingerprint: "sha256:approval-signal",
+      rootKind: "object",
+      encode: (value) => ({ approval_id: value.approvalId }),
+      decode: (value) => ({
+        approvalId: (value as { readonly approval_id: string }).approval_id
+      })
+    };
+    const approved = signal<ApprovalSignal>("schema-approved", { schema: approvalSchema });
+    const approvalWorkflow = workflow({
+      name: "orders.schema-approval",
+      version: 1,
+      handler: async (_input: {}): Promise<ApprovalSignal> => {
+        return await approved;
+      }
+    });
+    const backend = new MemoryBackend();
+    const client = new Client(backend, {
+      payloadCodec: "Json",
+      signalIdFactory: () => "schema-sig-1"
+    });
+
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/schema-signal"),
+      workflowType: approvalWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [approvalWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const waitCommit = await prepareWorkflowTaskCommit(approvalWorkflow, {}, firstClaim, {
+      payloadCodec: "Json"
+    });
+    await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
+
+    await client.sendSignal({
+      workflowId: workflowId("wf/schema-signal"),
+      signal: approved,
+      payload: { approvalId: "a-schema" }
+    });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [approvalWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const liveSignal = await backend.readSignalInbox({
+      runId: secondClaim.runId,
+      signalName: "schema-approved"
+    });
+    expect(liveSignal).not.toBeNull();
+    if (!liveSignal) {
+      throw new Error("expected live signal");
+    }
+    expect(liveSignal.payload.schemaFingerprint).toBe("sha256:approval-signal");
+    expect(decodePayload<{ readonly approval_id: string }>(liveSignal.payload)).toEqual({
+      approval_id: "a-schema"
+    });
+
+    const consumeCommit = await prepareWorkflowTaskCommit(approvalWorkflow, {}, secondClaim, {
+      payloadCodec: "Json",
+      liveSignals: [liveSignal]
+    });
+    await backend.commitWorkflowTask(secondClaim.claim, consumeCommit);
+
+    const history = await backend.streamHistory({
+      runId: secondClaim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    const completed = history.events.find((event) => event.data.kind === "WorkflowCompleted");
+    expect(completed?.data.kind).toBe("WorkflowCompleted");
+    if (completed?.data.kind !== "WorkflowCompleted") {
+      throw new Error("expected completed event");
+    }
+    expect(decodePayload<ApprovalSignal>(completed.data.result)).toEqual({
+      approvalId: "a-schema"
+    });
+  });
+
+  it("keeps a hot async workflow frame alive across signal delivery", async () => {
+    const trace: string[] = [];
+    const approvalWorkflow = workflow({
+      name: "orders.hot-approval",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly approvalId: string }> => {
+        trace.push("waiting");
+        const approval = await signal<ApprovalSignal>("approved");
+        trace.push(`approved:${approval.approvalId}`);
+        return { approvalId: approval.approvalId };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-signal"),
+      workflowType: approvalWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [approvalWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(approvalWorkflow, {}, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.appendEvents).toEqual([]);
+    expect(waitCommit.upsertWaits).toEqual([
+      {
+        waitId: "run-1:signal:1",
+        runId: firstClaim.runId,
+        commandId: { runId: firstClaim.runId, seq: 1 },
+        kind: "Signal",
+        key: "approved",
+        readyAt: null
+      }
+    ]);
+    expect(trace).toEqual(["waiting"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    await backend.signalWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-signal"),
+      signalId: signalId("sig-hot"),
+      signalName: "approved",
+      payload: encodePayload<ApprovalSignal>({ approvalId: "a-hot" }, { codec: "Json" })
+    });
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [approvalWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const liveSignal = await backend.readSignalInbox({
+      runId: secondClaim.runId,
+      signalName: "approved"
+    });
+    if (!liveSignal) {
+      throw new Error("expected live signal");
+    }
+    const completionCommit = await hot.advance(secondClaim, { liveSignals: [liveSignal] });
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "SignalConsumed",
+      "WorkflowCompleted"
+    ]);
+    expect(completionCommit.consumeSignals).toEqual(["sig-hot"]);
+    expect(completionCommit.deleteWaits).toEqual(["run-1:signal:1"]);
+    expect(trace).toEqual(["waiting", "approved:a-hot"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
   it("registers join branches in deterministic object order", async () => {
     const joinedWorkflow = workflow({
       name: "orders.join",
@@ -986,6 +1798,84 @@ describe("minimal workflow runtime", () => {
     expect(decodePayload(completed.result)).toEqual({ cents: 4321 });
   });
 
+  it("keeps a hot async workflow frame alive across join branches", async () => {
+    const trace: string[] = [];
+    const joinedWorkflow = workflow({
+      name: "orders.hot-join",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        trace.push("before-join");
+        const result = await join({
+          quote: callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          delay: sleepUntil(1_000)
+        });
+        trace.push(`after-join:${result.quote.cents}`);
+        return { cents: result.quote.cents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-join"),
+      workflowType: joinedWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [joinedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(joinedWorkflow, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "TimerStarted"
+    ]);
+    expect(trace).toEqual(["before-join"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 8765 }, { codec: "Json" })
+    });
+    await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [joinedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual(["before-join", "after-join:8765"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
+  });
+
   it("registers joinAll branches in array order", async () => {
     const joinedWorkflow = workflow({
       name: "orders.join-all",
@@ -1014,6 +1904,85 @@ describe("minimal workflow runtime", () => {
     }
     expect(activity.scheduled.commandId).toEqual({ runId: runId("run-1"), seq: 1 });
     expect(timer.started.commandId).toEqual({ runId: runId("run-1"), seq: 2 });
+  });
+
+  it("keeps a hot async workflow frame alive across joinAll branches", async () => {
+    const trace: string[] = [];
+    const joinedWorkflow = workflow({
+      name: "orders.hot-join-all",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        trace.push("before-join-all");
+        const result = await joinAll([
+          callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          sleepUntil(1_000)
+        ] as const);
+        const quote = result[0] as QuoteOutput;
+        trace.push(`after-join-all:${quote.cents}`);
+        return { cents: quote.cents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-join-all"),
+      workflowType: joinedWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [joinedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(joinedWorkflow, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "TimerStarted"
+    ]);
+    expect(trace).toEqual(["before-join-all"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 9753 }, { codec: "Json" })
+    });
+    await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [joinedWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    expect(trace).toEqual(["before-join-all", "after-join-all:9753"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
   });
 
   it("records selectAll winner metadata in array order", async () => {
@@ -1098,6 +2067,93 @@ describe("minimal workflow runtime", () => {
       throw new Error("expected WorkflowCompleted");
     }
     expect(decodePayload(completed.result)).toEqual({ index: 0 });
+  });
+
+  it("keeps a hot async workflow frame alive across selectAll winner resolution", async () => {
+    const trace: string[] = [];
+    const racingWorkflow = workflow({
+      name: "orders.hot-select-all",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly index: number; readonly cents: number }> => {
+        trace.push("before-select-all");
+        const winner = await selectAll([
+          callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          sleepUntil(1_000)
+        ] as const);
+        trace.push(`after-select-all:${winner.index}`);
+        return {
+          index: winner.index,
+          cents: (winner.value as QuoteOutput).cents
+        };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-select-all"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "TimerStarted"
+    ]);
+    expect(trace).toEqual(["before-select-all"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 8642 }, { codec: "Json" })
+    });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "SelectWinner",
+      "WorkflowCompleted"
+    ]);
+    const winner = completionCommit.appendEvents?.[0]?.data;
+    if (winner?.kind !== "SelectWinner") {
+      throw new Error("expected SelectWinner");
+    }
+    expect(winner.winner.branchOrdinal).toBe(0);
+    expect(trace).toEqual(["before-select-all", "after-select-all:0"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
   });
 
   it("records a version marker and takes the patched branch for new histories", async () => {
@@ -1542,6 +2598,163 @@ describe("minimal workflow runtime", () => {
     expect(() => Math.random()).not.toThrow();
   });
 
+  it("rejects process.env reads inside workflow code", async () => {
+    const invalidWorkflow = workflow({
+      name: "tests.nondeterministic-process-env",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string | undefined> =>
+        process.env.DURUST_TEST_ENV
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.env is not allowed inside workflow code");
+    expect(() => process.env.PATH).not.toThrow();
+  });
+
+  it("rejects captured process.env proxy aliases inside workflow code", async () => {
+    const installer = workflow({
+      name: "tests.install-process-env-guard",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => "installed"
+    });
+    await prepareWorkflowTaskCommit(installer, {}, fakeClaimed, { payloadCodec: "Json" });
+    const capturedEnv = process.env;
+    const invalidWorkflow = workflow({
+      name: "tests.nondeterministic-process-env-alias",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string | undefined> =>
+        capturedEnv.DURUST_TEST_ENV
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.env is not allowed inside workflow code");
+  });
+
+  it("rejects captured process.env proxy mutations inside workflow code", async () => {
+    const installer = workflow({
+      name: "tests.install-process-env-mutation-guard",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => "installed"
+    });
+    await prepareWorkflowTaskCommit(installer, {}, fakeClaimed, { payloadCodec: "Json" });
+    const capturedEnv = process.env;
+    const invalidWorkflow = workflow({
+      name: "tests.nondeterministic-process-env-mutation",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<void> => {
+        capturedEnv.DURUST_TEST_ENV = "bad";
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.env mutation is not allowed inside workflow code");
+  });
+
+  it("rejects process working-directory APIs inside workflow code", async () => {
+    const currentDirectory = process.cwd();
+    const cwdWorkflow = workflow({
+      name: "tests.nondeterministic-process-cwd",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => process.cwd()
+    });
+    const chdirWorkflow = workflow({
+      name: "tests.nondeterministic-process-chdir",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<void> => {
+        process.chdir(currentDirectory);
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(cwdWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.cwd() is not allowed inside workflow code");
+    await expect(
+      prepareWorkflowTaskCommit(chdirWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.chdir() is not allowed inside workflow code");
+    expect(() => process.cwd()).not.toThrow();
+  });
+
+  it.each([
+    {
+      apiName: "Date()",
+      run: (): unknown => Date()
+    },
+    {
+      apiName: "new Date()",
+      run: (): unknown => new Date()
+    },
+    {
+      apiName: "performance.now()",
+      run: (): unknown => performance.now()
+    },
+    {
+      apiName: "crypto.randomUUID()",
+      run: (): unknown => crypto.randomUUID()
+    },
+    {
+      apiName: "crypto.getRandomValues()",
+      run: (): unknown => crypto.getRandomValues(new Uint8Array(1))
+    },
+    {
+      apiName: "process.hrtime()",
+      run: (): unknown => process.hrtime()
+    },
+    {
+      apiName: "process.hrtime.bigint()",
+      run: (): unknown => process.hrtime.bigint()
+    },
+    {
+      apiName: "process.cpuUsage()",
+      run: (): unknown => process.cpuUsage()
+    },
+    {
+      apiName: "process.memoryUsage()",
+      run: (): unknown => process.memoryUsage()
+    },
+    {
+      apiName: "process.memoryUsage.rss()",
+      run: (): unknown => process.memoryUsage.rss()
+    },
+    {
+      apiName: "process.resourceUsage()",
+      run: (): unknown => process.resourceUsage()
+    },
+    {
+      apiName: "process.uptime()",
+      run: (): unknown => process.uptime()
+    }
+  ])("rejects nondeterministic value API $apiName inside workflow code", async ({ apiName, run }) => {
+    const invalidWorkflow = workflow({
+      name: `tests.nondeterministic-${apiName}`,
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<unknown> => run()
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
+  });
+
+  it("allows deterministic Date construction inside workflow code", async () => {
+    const deterministicDateWorkflow = workflow({
+      name: "tests.deterministic-date-construction",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => new Date(0).toISOString()
+    });
+
+    const commit = await prepareWorkflowTaskCommit(deterministicDateWorkflow, {}, fakeClaimed, {
+      payloadCodec: "Json"
+    });
+    const completed = commit.appendEvents?.[0]?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload(completed.result)).toBe("1970-01-01T00:00:00.000Z");
+  });
+
   it("allows Math.random inside sideEffect and replays the recorded value", async () => {
     let replayClosureRuns = 0;
     const randomWorkflow = workflow({
@@ -1602,6 +2815,123 @@ describe("minimal workflow runtime", () => {
     expect(decodePayload(completed.result)).toBe(recorded);
   });
 
+  it("allows value-producing nondeterministic globals inside sideEffect", async () => {
+    const previousEnvValue = process.env.DURUST_TEST_ENV;
+    process.env.DURUST_TEST_ENV = "recorded-env";
+    let commit;
+    try {
+      const recordedWorkflow = workflow({
+        name: "tests.side-effect-native-values",
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<{
+          readonly dateNow: number;
+          readonly dateStringLength: number;
+          readonly constructedDateLength: number;
+          readonly performanceNow: number;
+          readonly uuidLength: number;
+          readonly randomByte: number;
+          readonly hrtimeLength: number;
+          readonly hrtimeBigintNonNegative: boolean;
+          readonly cwdLength: number;
+          readonly cpuUsageUser: number;
+          readonly memoryUsageRss: number;
+          readonly memoryUsageRssDirect: number;
+          readonly resourceUsageUserCpu: number;
+          readonly uptimeNonNegative: boolean;
+          readonly envValue: string | undefined;
+        }> =>
+          await sideEffect("record-native-values", () => ({
+            dateNow: Date.now(),
+            dateStringLength: Date().length,
+            constructedDateLength: new Date().toISOString().length,
+            performanceNow: performance.now(),
+            uuidLength: crypto.randomUUID().length,
+            randomByte: crypto.getRandomValues(new Uint8Array(1))[0] ?? -1,
+            hrtimeLength: process.hrtime().length,
+            hrtimeBigintNonNegative: process.hrtime.bigint() >= 0n,
+            cwdLength: process.cwd().length,
+            cpuUsageUser: process.cpuUsage().user,
+            memoryUsageRss: process.memoryUsage().rss,
+            memoryUsageRssDirect: process.memoryUsage.rss(),
+            resourceUsageUserCpu: process.resourceUsage().userCPUTime,
+            uptimeNonNegative: process.uptime() >= 0,
+            envValue: process.env.DURUST_TEST_ENV
+          }))
+      });
+
+      commit = await prepareWorkflowTaskCommit(recordedWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json"
+      });
+    } finally {
+      if (previousEnvValue === undefined) {
+        delete process.env.DURUST_TEST_ENV;
+      } else {
+        process.env.DURUST_TEST_ENV = previousEnvValue;
+      }
+    }
+    const marker = commit.appendEvents?.[0]?.data;
+    if (marker?.kind !== "SideEffectMarker") {
+      throw new Error("expected SideEffectMarker");
+    }
+    const recorded = decodePayload<{
+      readonly dateNow: number;
+      readonly dateStringLength: number;
+      readonly constructedDateLength: number;
+      readonly performanceNow: number;
+      readonly uuidLength: number;
+      readonly randomByte: number;
+      readonly hrtimeLength: number;
+      readonly hrtimeBigintNonNegative: boolean;
+      readonly cwdLength: number;
+      readonly cpuUsageUser: number;
+      readonly memoryUsageRss: number;
+      readonly memoryUsageRssDirect: number;
+      readonly resourceUsageUserCpu: number;
+      readonly uptimeNonNegative: boolean;
+      readonly envValue: string | undefined;
+    }>(marker.marker.value);
+    expect(recorded.dateNow).toBeGreaterThan(0);
+    expect(recorded.dateStringLength).toBeGreaterThan(0);
+    expect(recorded.constructedDateLength).toBe("1970-01-01T00:00:00.000Z".length);
+    expect(recorded.performanceNow).toBeGreaterThanOrEqual(0);
+    expect(recorded.uuidLength).toBe(36);
+    expect(recorded.randomByte).toBeGreaterThanOrEqual(0);
+    expect(recorded.hrtimeLength).toBe(2);
+    expect(recorded.hrtimeBigintNonNegative).toBe(true);
+    expect(recorded.cwdLength).toBeGreaterThan(0);
+    expect(recorded.cpuUsageUser).toBeGreaterThanOrEqual(0);
+    expect(recorded.memoryUsageRss).toBeGreaterThan(0);
+    expect(recorded.memoryUsageRssDirect).toBeGreaterThan(0);
+    expect(recorded.resourceUsageUserCpu).toBeGreaterThanOrEqual(0);
+    expect(recorded.uptimeNonNegative).toBe(true);
+    expect(recorded.envValue).toBe("recorded-env");
+  });
+
+  it.each([
+    {
+      apiName: "fetch()",
+      run: async (): Promise<unknown> => await fetch("data:text/plain,workflow")
+    },
+    ...(typeof WebSocket === "function"
+      ? [
+          {
+            apiName: "new WebSocket()",
+            run: (): unknown => new WebSocket("wss://example.com")
+          }
+        ]
+      : [])
+  ])("rejects network API $apiName inside workflow code", async ({ apiName, run }) => {
+    const invalidWorkflow = workflow({
+      name: `tests.nondeterministic-network-${apiName}`,
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<unknown> => await run()
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
+  });
+
   it.each([
     {
       apiName: "setTimeout()",
@@ -1615,6 +2945,20 @@ describe("minimal workflow runtime", () => {
       replacement: "durust sleep() or recurring workflow timers",
       run: (): void => {
         setInterval(() => undefined, 1);
+      }
+    },
+    {
+      apiName: "setImmediate()",
+      replacement: "durust durable operations",
+      run: (): void => {
+        setImmediate(() => undefined);
+      }
+    },
+    {
+      apiName: "process.nextTick()",
+      replacement: "durust durable operations",
+      run: (): void => {
+        process.nextTick(() => undefined);
       }
     },
     {
@@ -1887,6 +3231,98 @@ describe("minimal workflow runtime", () => {
       throw new Error("expected WorkflowCompleted");
     }
     expect(decodePayload(completed.result)).toEqual({ branch: "quote", cents: 2468 });
+  });
+
+  it("keeps a hot async workflow frame alive across select winner resolution", async () => {
+    const trace: string[] = [];
+    const racingWorkflow = workflow({
+      name: "orders.hot-select",
+      version: 1,
+      handler: async (
+        input: CheckoutInput
+      ): Promise<
+        | { readonly branch: "quote"; readonly cents: number }
+        | { readonly branch: "delay" }
+      > => {
+        trace.push("before-select");
+        const winner = await select({
+          quote: callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          delay: sleepUntil(1_000)
+        });
+        trace.push(`after-select:${winner.branch}`);
+        if (winner.branch === "quote") {
+          return { branch: "quote", cents: winner.value.cents };
+        }
+        return { branch: "delay" };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-select"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "TimerStarted"
+    ]);
+    expect(trace).toEqual(["before-select"]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 1357 }, { codec: "Json" })
+    });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "SelectWinner",
+      "WorkflowCompleted"
+    ]);
+    const winner = completionCommit.appendEvents?.[0]?.data;
+    if (winner?.kind !== "SelectWinner") {
+      throw new Error("expected SelectWinner");
+    }
+    expect(winner.winner.branchOrdinal).toBe(0);
+    expect(trace).toEqual(["before-select", "after-select:quote"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+    expect(hot.closed).toBe(true);
   });
 
   it("rejects replay when the recorded select winner changes", async () => {

@@ -92,7 +92,7 @@ export function eventId(value: number): EventId {
   return value as EventId;
 }
 
-export function commandSeq(value: number): CommandSeq {
+function commandSeq(value: number): CommandSeq {
   return value as CommandSeq;
 }
 

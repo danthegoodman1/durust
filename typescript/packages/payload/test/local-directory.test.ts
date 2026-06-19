@@ -4,8 +4,11 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  Client,
   MemoryBackend,
+  Registry,
   RetryPolicy,
+  Worker,
   activityFingerprint,
   activityMapFingerprint,
   activityMapManifest,
@@ -17,12 +20,14 @@ import {
   namespace,
   payloadDigest,
   taskQueue,
+  workflow,
   workflowId,
   workflowType
 } from "@durust/core";
 import {
   LocalDirectoryBlobStore,
   PayloadBackend,
+  type PayloadBlobStore,
   collectPayloadGarbage,
   collectPayloadRefs,
   collectPayloadRefsDeep,
@@ -158,6 +163,105 @@ describe("local-directory payload storage", () => {
     expect(started.input.kind).toBe("Inline");
     expect(decodePayload(started.input)).toEqual({ body: "x".repeat(128) });
     expect(await store.list()).toHaveLength(1);
+  });
+
+  it("recovers workflow progress after a blob-store hydration outage and lease expiry", async () => {
+    let now = 1_000;
+    const inner = new MemoryBackend({ nowMs: () => now });
+    const store = new ToggleableBlobStore(
+      new LocalDirectoryBlobStore({
+        root: await mkdtemp(join(tmpdir(), "durust-payload-outage-"))
+      })
+    );
+    const backend = new PayloadBackend({
+      backend: inner,
+      blobStore: store,
+      inlineThresholdBytes: 8
+    });
+    const echo = workflow({
+      name: "payload.outage.echo",
+      version: 1,
+      handler: async (input: { readonly body: string }): Promise<{ readonly body: string }> =>
+        input
+    });
+    const registry = new Registry().registerWorkflow(echo);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const handle = await client.startWorkflow(
+      echo,
+      workflowId("wf/payload-outage"),
+      "workflows",
+      { body: "recoverable".repeat(32) }
+    );
+
+    store.failGets = true;
+    const firstWorker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "payload-outage-worker-a",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 10,
+      payloadCodec: "Json"
+    });
+    await expect(firstWorker.runWorkflowTaskOnce()).rejects.toThrow("blob store unavailable");
+
+    const rawAfterOutage = await inner.streamHistory({
+      runId: handle.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(rawAfterOutage.events.map((event) => event.eventType)).toEqual(["WorkflowStarted"]);
+
+    const tooEarlyWorker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "payload-outage-worker-b",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 10,
+      payloadCodec: "Json"
+    });
+    store.failGets = false;
+    await expect(tooEarlyWorker.runWorkflowTaskOnce()).resolves.toEqual({ kind: "NoTask" });
+
+    now = 1_011;
+    const recoveryWorker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "payload-outage-worker-c",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 10,
+      payloadCodec: "Json"
+    });
+    await expect(recoveryWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    await expect(handle.result()).resolves.toEqual({ body: "recoverable".repeat(32) });
+
+    const rawCompleted = await inner.streamHistory({
+      runId: handle.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(rawCompleted.events.map((event) => event.eventType)).toEqual([
+      "WorkflowStarted",
+      "WorkflowCompleted"
+    ]);
+    expect(rawCompleted.events.every((event) => {
+      if (event.data.kind === "WorkflowStarted") {
+        return event.data.input.kind === "Blob";
+      }
+      if (event.data.kind === "WorkflowCompleted") {
+        return event.data.result.kind === "Blob";
+      }
+      return false;
+    })).toBe(true);
   });
 
   it("offloads activity inputs and completion results across backend calls", async () => {
@@ -601,3 +705,32 @@ describe("PayloadBackend provider conformance", () => {
     });
   }
 });
+
+class ToggleableBlobStore implements PayloadBlobStore {
+  failGets = false;
+
+  constructor(readonly inner: PayloadBlobStore) {}
+
+  async put(bytes: Uint8Array, digest: string): Promise<string> {
+    return await this.inner.put(bytes, digest);
+  }
+
+  async get(uri: string): Promise<Uint8Array> {
+    if (this.failGets) {
+      throw new Error("blob store unavailable");
+    }
+    return await this.inner.get(uri);
+  }
+
+  async delete(uri: string): Promise<void> {
+    await this.inner.delete(uri);
+  }
+
+  async list(): Promise<readonly string[]> {
+    return await this.inner.list();
+  }
+
+  owns(uri: string): boolean {
+    return this.inner.owns(uri);
+  }
+}

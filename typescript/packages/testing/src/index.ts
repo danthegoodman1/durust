@@ -26,6 +26,8 @@ import {
 } from "@durust/core";
 import type { PayloadRef } from "@durust/core";
 import type {
+  ActivityMapInputManifest,
+  ActivityMapInputPage,
   ActivityMapResultManifest,
   ActivityMapResultPage,
   ChildWorkflowMapResultManifest,
@@ -107,6 +109,65 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(claimed !== null, "matching queue and workflow type should claim task");
         assert(claimed.reason === "WorkflowStarted", "first claim reason should be WorkflowStarted");
+      }
+    },
+    {
+      name: "expired workflow task leases are reclaimable and fence old commits",
+      async run(factory) {
+        const backend = factory();
+        await backend.startWorkflow({
+          namespace: namespace(),
+          workflowId: workflowId("wf/expired-workflow-lease"),
+          workflowType: workflowType("conformance.workflow", 1),
+          taskQueue: taskQueue("workflows"),
+          input: encodePayload({ value: 1 }, { codec: "Json" })
+        });
+
+        const expired = await backend.claimWorkflowTask("expired-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 0
+        });
+        assert(expired !== null, "initial workflow claim should be granted");
+
+        const reclaimed = await backend.claimWorkflowTask("replacement-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(reclaimed !== null, "expired workflow claim should be reclaimable");
+        assert(
+          reclaimed.reason === "WorkflowStarted",
+          "reclaimed workflow task should preserve original wake reason"
+        );
+        assert(
+          reclaimed.claim.token !== expired.claim.token,
+          "reclaimed workflow task should receive a fresh claim token"
+        );
+
+        await assertRejects(
+          () =>
+            backend.commitWorkflowTask(expired.claim, {
+              expectedTailEventId: eventId(1),
+              appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
+            }),
+          "stale workflow task lease"
+        );
+
+        const committed = await backend.commitWorkflowTask(reclaimed.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ ok: true }, { codec: "Json" })
+              }
+            }
+          ]
+        });
+        assert(committed.kind === "Committed", "replacement claim should be able to commit");
       }
     },
     {
@@ -254,6 +315,70 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(
           workflowWake.reason === "ActivityCompleted",
           "activity completion wake should preserve reason"
+        );
+      }
+    },
+    {
+      name: "expired activity task leases are reclaimable and fence old completions",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.echo",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.echo",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const expired = await backend.claimActivityTask("expired-activity-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.echo"],
+          leaseDurationMs: 0
+        });
+        assert(expired !== null, "initial activity claim should be granted");
+
+        const reclaimed = await backend.claimActivityTask("replacement-activity-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.echo"],
+          leaseDurationMs: 30_000
+        });
+        assert(reclaimed !== null, "expired activity claim should be reclaimable");
+        assert(
+          reclaimed.claim.token !== expired.claim.token,
+          "reclaimed activity task should receive a fresh claim token"
+        );
+
+        await assertRejects(
+          () =>
+            backend.completeActivity({
+              claim: expired.claim,
+              result: encodePayload({ value: 2 }, { codec: "Json" })
+            }),
+          "stale activity task lease"
+        );
+
+        const completed = await backend.completeActivity({
+          claim: reclaimed.claim,
+          result: encodePayload({ value: 2 }, { codec: "Json" })
+        });
+        assert(
+          completed.kind === "Completed" && completed.eventId === eventId(3),
+          "replacement activity claim should complete with the next workflow event"
         );
       }
     },
@@ -460,6 +585,474 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
+      name: "retryable activity failure reschedules attempts before terminal failure",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.retry",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.exponential({
+            initialIntervalMs: 0,
+            maxIntervalMs: 0,
+            maxAttempts: 2
+          }),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.retry",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const firstAttempt = await backend.claimActivityTask("activity-worker-1", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(firstAttempt !== null, "first retryable activity attempt should be claimable");
+        assert(firstAttempt.task.attempt === 1, "first retryable attempt should be attempt 1");
+
+        const retry = await backend.failActivity({
+          claim: firstAttempt.claim,
+          failure: {
+            errorType: "test.retryable",
+            message: "retryable failure",
+            nonRetryable: false
+          }
+        });
+        assert(retry.kind === "RetryScheduled", "first retryable failure should schedule retry");
+        assert(retry.attempt === 2, "retry should schedule attempt 2");
+
+        const noWorkflowWake = await backend.claimWorkflowTask("worker-before-terminal-failure", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(noWorkflowWake === null, "retry scheduling should not wake workflow as failed");
+
+        const secondAttempt = await backend.claimActivityTask("activity-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(secondAttempt !== null, "second retryable activity attempt should be claimable");
+        assert(secondAttempt.task.attempt === 2, "second retryable attempt should be attempt 2");
+
+        const terminal = await backend.failActivity({
+          claim: secondAttempt.claim,
+          failure: {
+            errorType: "test.retryable",
+            message: "terminal retry failure",
+            nonRetryable: false
+          }
+        });
+        assert(
+          terminal.kind === "Failed" && terminal.eventId === eventId(3),
+          "exhausted retry should append terminal ActivityFailed"
+        );
+
+        const workflowWake = await backend.claimWorkflowTask("worker-after-terminal-failure", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityFailed", "terminal retry failure should wake workflow");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityScheduled,ActivityFailed",
+          "retry attempts should not append intermediate failure events"
+        );
+      }
+    },
+    {
+      name: "activity start-to-close timeout appends terminal timeout and fences completion",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.timeout",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: 0,
+          heartbeatTimeoutMs: null,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.timeout",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const activity = await backend.claimActivityTask("timeout-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.timeout"],
+          leaseDurationMs: 30_000
+        });
+        assert(activity !== null, "timeout activity should be claimable before timeout maintenance");
+
+        const early = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: 0,
+          limit: 8
+        });
+        assert(early.timedOut === 0, "activity should not time out before its start timestamp");
+
+        const due = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Number.MAX_SAFE_INTEGER,
+          limit: 8
+        });
+        assert(due.timedOut === 1, "due start-to-close timeout should append one terminal event");
+
+        const duplicate = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Number.MAX_SAFE_INTEGER,
+          limit: 8
+        });
+        assert(duplicate.timedOut === 0, "timeout maintenance should be idempotent");
+
+        const late = await backend.completeActivity({
+          claim: activity.claim,
+          result: encodePayload({ ok: true }, { codec: "Json" })
+        });
+        assert(late.kind === "AlreadyCompleted", "late completion should be fenced after timeout");
+
+        const workflowWake = await backend.claimWorkflowTask("worker-after-timeout", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityTimedOut", "timeout should wake workflow");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
+          "timeout should append compact terminal activity history"
+        );
+        const timedOut = history.events.at(-1);
+        assert(timedOut?.data.kind === "ActivityTimedOut", "history should end in ActivityTimedOut");
+        assert(
+          timedOut.data.timedOut.message.includes("start-to-close timed out"),
+          "timeout event should include a useful message"
+        );
+      }
+    },
+    {
+      name: "activity start-to-close timeout retries before terminal workflow wake",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.timeout-retry",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.exponential({
+            initialIntervalMs: 0,
+            maxIntervalMs: 0,
+            maxAttempts: 2,
+            backoffCoefficient: 1
+          }),
+          startToCloseTimeoutMs: 0,
+          heartbeatTimeoutMs: null,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.timeout-retry",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const first = await backend.claimActivityTask("timeout-retry-worker-1", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.timeout-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(first !== null, "first timeout retry attempt should be claimable");
+        assert(first.task.attempt === 1, "first attempt should be attempt 1");
+
+        const firstTimeout = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(firstTimeout.timedOut === 1, "first start-to-close timeout should be processed");
+
+        const prematureWake = await backend.claimWorkflowTask("timeout-retry-premature", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(prematureWake === null, "retryable start-to-close timeout should not wake workflow early");
+
+        const second = await backend.claimActivityTask("timeout-retry-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.timeout-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(second !== null, "second timeout retry attempt should be claimable");
+        assert(second.task.attempt === 2, "second attempt should increment attempt");
+
+        const secondTimeout = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(secondTimeout.timedOut === 1, "exhausted start-to-close timeout should be terminal");
+
+        const workflowWake = await backend.claimWorkflowTask("timeout-retry-ready", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityTimedOut", "exhausted timeout should wake workflow");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
+          "retryable start-to-close timeout should append only terminal activity history"
+        );
+        const timedOut = history.events.at(-1);
+        assert(timedOut?.data.kind === "ActivityTimedOut", "history should end in timeout");
+        assert(
+          timedOut.data.timedOut.message.includes("start-to-close timed out"),
+          "terminal start-to-close timeout should report timeout kind"
+        );
+      }
+    },
+    {
+      name: "activity heartbeat records liveness and terminal missed heartbeat",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.heartbeat",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: 0,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.heartbeat",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const activity = await backend.claimActivityTask("heartbeat-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.heartbeat"],
+          leaseDurationMs: 30_000
+        });
+        assert(activity !== null, "heartbeat activity should be claimable");
+
+        const recorded = await backend.heartbeatActivity({ claim: activity.claim });
+        assert(recorded.kind === "Recorded", "heartbeat should record for current claim");
+        await assertRejects(
+          () =>
+            backend.heartbeatActivity({
+              claim: { ...activity.claim, token: activity.claim.token + 1 }
+            }),
+          "stale activity task lease"
+        );
+
+        const due = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(due.timedOut === 1, "missed heartbeat should time out the activity");
+
+        const duplicate = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(duplicate.timedOut === 0, "heartbeat timeout should be idempotent");
+
+        const lateHeartbeat = await backend.heartbeatActivity({ claim: activity.claim });
+        assert(lateHeartbeat.kind === "AlreadyCompleted", "late heartbeat should be terminal");
+
+        const workflowWake = await backend.claimWorkflowTask("worker-after-heartbeat-timeout", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityTimedOut", "heartbeat timeout should wake workflow");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        const timedOut = history.events.at(-1);
+        assert(timedOut?.data.kind === "ActivityTimedOut", "history should end in ActivityTimedOut");
+        assert(
+          timedOut.data.timedOut.message.includes("missed heartbeat"),
+          "heartbeat timeout event should include a useful message"
+        );
+      }
+    },
+    {
+      name: "activity heartbeat timeout retries before terminal workflow wake",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const input = encodePayload({ value: 1 }, { codec: "Json" });
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.heartbeat-retry",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.exponential({
+            initialIntervalMs: 0,
+            maxIntervalMs: 0,
+            maxAttempts: 2,
+            backoffCoefficient: 1
+          }),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: 0,
+          input,
+          fingerprint: activityFingerprint(
+            "conformance.heartbeat-retry",
+            payloadDigest(input),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)]
+        });
+
+        const first = await backend.claimActivityTask("heartbeat-retry-worker-1", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.heartbeat-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(first !== null, "first heartbeat retry attempt should be claimable");
+        assert(first.task.attempt === 1, "first attempt should be attempt 1");
+
+        const firstTimeout = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(firstTimeout.timedOut === 1, "first missed heartbeat should be processed");
+
+        const prematureWake = await backend.claimWorkflowTask("heartbeat-retry-premature", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(prematureWake === null, "retryable timeout should not wake workflow early");
+
+        const second = await backend.claimActivityTask("heartbeat-retry-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.heartbeat-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(second !== null, "second heartbeat retry attempt should be claimable");
+        assert(second.task.attempt === 2, "second attempt should increment attempt");
+
+        const secondTimeout = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Date.now(),
+          limit: 8
+        });
+        assert(secondTimeout.timedOut === 1, "exhausted missed heartbeat should be terminal");
+
+        const workflowWake = await backend.claimWorkflowTask("heartbeat-retry-ready", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityTimedOut", "exhausted timeout should wake workflow");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
+          "retryable heartbeat timeout should append only terminal activity history"
+        );
+        const timedOut = history.events.at(-1);
+        assert(timedOut?.data.kind === "ActivityTimedOut", "history should end in timeout");
+        assert(
+          timedOut.data.timedOut.message.includes("attempt 2"),
+          "terminal heartbeat timeout should report exhausted attempt"
+        );
+      }
+    },
+    {
       name: "activity map materializes bounded items and writes ordered result manifest",
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
@@ -590,6 +1183,128 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           }
         }
         assert(values.join(",") === "10,20,30", "result manifest should preserve ordinal order");
+      }
+    },
+    {
+      name: "activity-map retryable item failure retries before terminal map failure",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.map-retry",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.exponential({
+            initialIntervalMs: 0,
+            maxIntervalMs: 0,
+            maxAttempts: 2
+          }),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "map-retry",
+          maxInFlight: 1,
+          fingerprint: activityMapFingerprint(
+            "conformance.map-retry",
+            payloadDigest(inputManifest),
+            "map-retry",
+            1,
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+
+        const firstAttempt = await backend.claimActivityTask("map-retry-worker-1", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(firstAttempt !== null, "first map retry attempt should be claimable");
+        assert(firstAttempt.task.mapItem?.itemOrdinal === 0, "first map retry ordinal should be 0");
+        assert(firstAttempt.task.attempt === 1, "first map retry attempt should be attempt 1");
+
+        const retry = await backend.failActivity({
+          claim: firstAttempt.claim,
+          failure: {
+            errorType: "test.map.retryable",
+            message: "retryable map failure",
+            nonRetryable: false
+          }
+        });
+        assert(retry.kind === "RetryScheduled", "retryable map item should schedule retry");
+        assert(retry.attempt === 2, "map retry should schedule attempt 2");
+
+        const noWorkflowWake = await backend.claimWorkflowTask("worker-before-map-terminal-failure", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(noWorkflowWake === null, "map item retry should not wake parent as failed");
+
+        const secondAttempt = await backend.claimActivityTask("map-retry-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-retry"],
+          leaseDurationMs: 30_000
+        });
+        assert(secondAttempt !== null, "second map retry attempt should be claimable");
+        assert(
+          secondAttempt.task.mapItem?.itemOrdinal === 0,
+          "retry should keep the same map item ordinal in flight"
+        );
+        assert(secondAttempt.task.attempt === 2, "second map retry attempt should be attempt 2");
+
+        const terminal = await backend.failActivity({
+          claim: secondAttempt.claim,
+          failure: {
+            errorType: "test.map.retryable",
+            message: "terminal map failure",
+            nonRetryable: false
+          }
+        });
+        assert(
+          terminal.kind === "Failed" && terminal.eventId === eventId(3),
+          "exhausted map item retry should append ActivityMapFailed"
+        );
+
+        const workflowWake = await backend.claimWorkflowTask("worker-after-map-terminal-failure", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(workflowWake?.reason === "ActivityMapFailed", "terminal map failure should wake parent");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
+          "map retries should not append intermediate parent failure events"
+        );
       }
     },
     {
@@ -823,6 +1538,161 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             "payload roots should include committed durable payload refs"
           );
         }
+      }
+    },
+    {
+      name: "payload roots include provider-owned activity-map item refs",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest(
+          [{ value: 1 }, { value: 2 }],
+          2
+        );
+        const inputRefs = activityMapManifestItemRefs(inputManifest);
+        assert(inputRefs.length === 2, "activity-map input manifest should expose two item refs");
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.roots.activity-map",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "activity-rooted",
+          maxInFlight: 1,
+          fingerprint: activityMapFingerprint(
+            "conformance.roots.activity-map",
+            payloadDigest(inputManifest),
+            "activity-rooted",
+            1,
+            "sha256:test-options"
+          )
+        };
+
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+
+        const rootsBeforeCompletion = new Set(
+          collectRootPayloadRefs(await backend.payloadRoots()).map(rootPayloadDigest)
+        );
+        assert(
+          rootsBeforeCompletion.has(rootPayloadDigest(inputRefs[1] as PayloadRef)),
+          "payload roots should include unmaterialized activity-map item inputs"
+        );
+
+        const firstItem = await backend.claimActivityTask("activity-map-root-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.roots.activity-map"],
+          leaseDurationMs: 30_000
+        });
+        assert(firstItem !== null, "first activity-map item should be claimable");
+        const result = encodePayload({ value: 10 }, { codec: "Json" });
+        await backend.completeActivity({ claim: firstItem.claim, result });
+
+        const rootsAfterCompletion = new Set(
+          collectRootPayloadRefs(await backend.payloadRoots()).map(rootPayloadDigest)
+        );
+        assert(
+          rootsAfterCompletion.has(rootPayloadDigest(result)),
+          "payload roots should include in-progress activity-map item results"
+        );
+      }
+    },
+    {
+      name: "payload roots include provider-owned child-workflow-map item refs",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest(
+          [{ value: 1 }, { value: 2 }],
+          2
+        );
+        const inputRefs = activityMapManifestItemRefs(inputManifest);
+        assert(inputRefs.length === 2, "child-workflow-map input manifest should expose two item refs");
+        const childType = workflowType("conformance.roots.child-map-child", 1);
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "child-rooted",
+          workflowIdPrefix: "wf/child-map-roots",
+          maxInFlight: 1,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "CollectAll" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "child-rooted",
+            "wf/child-map-roots",
+            1,
+            "child-workflows",
+            "Cancel",
+            "CollectAll"
+          )
+        };
+
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              workflowType: scheduled.workflowType,
+              taskQueue: scheduled.taskQueue,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              workflowIdPrefix: scheduled.workflowIdPrefix,
+              maxInFlight: scheduled.maxInFlight,
+              parentClosePolicy: scheduled.parentClosePolicy,
+              failureMode: scheduled.failureMode
+            }
+          ]
+        });
+
+        const roots = new Set(
+          collectRootPayloadRefs(await backend.payloadRoots()).map(rootPayloadDigest)
+        );
+        assert(
+          roots.has(rootPayloadDigest(inputRefs[1] as PayloadRef)),
+          "payload roots should include unmaterialized child-workflow-map item inputs"
+        );
+
+        const firstChild = await backend.claimWorkflowTask("child-map-root-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("child-workflows"),
+          registeredWorkflowTypes: [childType],
+          leaseDurationMs: 30_000
+        });
+        assert(firstChild !== null, "first child-workflow-map item should be claimable");
+        const result = encodePayload({ value: 10 }, { codec: "Json" });
+        await backend.commitWorkflowTask(firstChild.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "WorkflowCompleted", result } }]
+        });
+
+        const rootsAfterCompletion = new Set(
+          collectRootPayloadRefs(await backend.payloadRoots()).map(rootPayloadDigest)
+        );
+        assert(
+          rootsAfterCompletion.has(rootPayloadDigest(result)),
+          "payload roots should include in-progress child-workflow-map item results"
+        );
       }
     },
     {
@@ -1310,6 +2180,18 @@ function assert(condition: boolean, message: string): asserts condition {
   }
 }
 
+async function assertRejects(fn: () => Promise<unknown>, message: string): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    if (String(error).includes(message)) {
+      return;
+    }
+    throw new Error(`expected rejection containing ${message}, got ${String(error)}`);
+  }
+  throw new Error(`expected rejection containing ${message}`);
+}
+
 function collectRootPayloadRefs(value: unknown, seen = new WeakSet<object>()): readonly PayloadRef[] {
   if (isPayloadRef(value)) {
     return [value];
@@ -1329,6 +2211,21 @@ function collectRootPayloadRefs(value: unknown, seen = new WeakSet<object>()): r
 
 function rootPayloadDigest(payload: PayloadRef): string {
   return payload.kind === "Blob" ? payload.digest : digestBytes(payload.bytes);
+}
+
+function activityMapManifestItemRefs<Input extends object>(
+  manifestRef: PayloadRef<ActivityMapInputManifest<Input>>
+): readonly PayloadRef<Input>[] {
+  const manifest = decodePayload<ActivityMapInputManifest<Input>>(manifestRef);
+  const refs: PayloadRef<Input>[] = [];
+  for (const pageRef of manifest.pages) {
+    refs.push(
+      ...decodePayload<ActivityMapInputPage<Input>>(
+        pageRef as PayloadRef<ActivityMapInputPage<Input>>
+      ).items
+    );
+  }
+  return refs;
 }
 
 function isPayloadRef(value: unknown): value is PayloadRef {

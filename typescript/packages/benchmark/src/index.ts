@@ -19,10 +19,13 @@ import {
   decodeChildWorkflowMapSuccesses,
   decodePayload,
   eventId,
+  heartbeat,
   signal,
   sleep,
   timestampMs,
   workflow,
+  type ActivityHeartbeatOutcome,
+  type ActivityHeartbeatRequest,
   type ClaimedActivityTask,
   type ClaimedWorkflowTask,
   type CommitOutcome,
@@ -46,6 +49,8 @@ import {
   type StartWorkflowOutcome,
   type StartWorkflowRequest,
   type StreamHistoryRequest,
+  type TimeoutDueActivitiesOutcome,
+  type TimeoutDueActivitiesRequest,
   type PayloadRef,
   type WorkflowHandle,
   type WorkflowTaskClaim,
@@ -54,7 +59,11 @@ import {
   type ClaimWorkflowTaskOptions
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend } from "@durust/payload";
-import { PostgresBackend } from "@durust/postgres";
+import {
+  PostgresBackend,
+  type PostgresBackendStatsSnapshot,
+  type PostgresStatementStatsSnapshot
+} from "@durust/postgres";
 import { SqliteBackend } from "@durust/sqlite";
 
 const WORKFLOW_QUEUE = "workflows";
@@ -68,13 +77,15 @@ export type BenchmarkBackendName = "memory" | "sqlite" | "postgres";
 export type BenchmarkMode =
   | "mixed"
   | "activity"
+  | "activity-heartbeat"
   | "signal"
   | "timer"
   | "child"
   | "activity-map"
   | "child-map"
   | "recovery"
-  | "payload";
+  | "payload"
+  | "write-ceiling";
 
 export interface BenchmarkOptions {
   readonly backend: BenchmarkBackendName;
@@ -104,6 +115,7 @@ export interface BenchmarkCounters {
   readonly child_completions: number;
   readonly timer_handlers: number;
   readonly boot_activities: number;
+  readonly activity_heartbeats: number;
   readonly child_activities: number;
   readonly finish_activities: number;
   readonly workflow_tasks: number;
@@ -116,6 +128,14 @@ export interface BenchmarkCounters {
 export interface WorkerStatsReport {
   readonly workflowTasks: number;
   readonly activityTasks: number;
+  readonly workflowHistoryCacheHits: number;
+  readonly workflowHistoryCacheMisses: number;
+  readonly workflowHistoryCacheEvictions: number;
+  readonly workflowExecutionCacheHits: number;
+  readonly workflowExecutionCacheMisses: number;
+  readonly workflowExecutionCacheEvictions: number;
+  readonly historyStreamChunks: number;
+  readonly historyStreamEvents: number;
   readonly timersFired: number;
   readonly activitiesTimedOut: number;
   readonly childWorkflowStartsDispatched: number;
@@ -144,6 +164,56 @@ export interface BackendMetricsReport {
   readonly operations: Record<string, BackendOperationReport>;
 }
 
+export interface PostgresStatsReport {
+  readonly walBytes: number;
+  readonly walBytesPerSecond: number;
+  readonly walRecords: number;
+  readonly walRecordsPerSecond: number;
+  readonly walFpi: number;
+  readonly walBuffersFull: number;
+  readonly walWrite: number;
+  readonly walSync: number;
+  readonly walWriteTimeMs: number;
+  readonly walSyncTimeMs: number;
+  readonly xactCommit: number;
+  readonly xactRollback: number;
+  readonly transactionsPerSecond: number;
+  readonly transactionsPerMixedAction: number;
+  readonly transactionsPerWorkflow: number;
+  readonly rowsReturned: number;
+  readonly rowsFetched: number;
+  readonly rowsInserted: number;
+  readonly rowsUpdated: number;
+  readonly rowsDeleted: number;
+  readonly blocksRead: number;
+  readonly blocksHit: number;
+  readonly blockCacheHitRatio: number;
+  readonly tempFiles: number;
+  readonly tempBytes: number;
+  readonly deadlocks: number;
+  readonly blockReadTimeMs: number;
+  readonly blockWriteTimeMs: number;
+  readonly activeTimeMs: number;
+  readonly sessionTimeMs: number;
+  readonly activeConnectionsAfter: number;
+  readonly statementStats: PostgresStatementStatsReport | null;
+}
+
+export interface PostgresStatementStatsReport {
+  readonly calls: number;
+  readonly callsPerMixedAction: number;
+  readonly callsPerWorkflow: number;
+  readonly totalExecTimeMs: number;
+  readonly topStatements: readonly PostgresTopStatementReport[];
+}
+
+export interface PostgresTopStatementReport {
+  readonly queryId: string;
+  readonly calls: number;
+  readonly totalExecTimeMs: number;
+  readonly query: string;
+}
+
 export interface BenchmarkResult {
   readonly backend: BenchmarkBackendName;
   readonly mode: BenchmarkMode;
@@ -166,7 +236,7 @@ export interface BenchmarkResult {
   readonly counters: BenchmarkCounters;
   readonly worker_stats: WorkerStatsReport;
   readonly backend_metrics: BackendMetricsReport;
-  readonly postgres_stats: null;
+  readonly postgres_stats: PostgresStatsReport | null;
   readonly resource_samples: null;
   readonly postgres_schema: string | null;
   readonly db_path: string | null;
@@ -176,9 +246,19 @@ export interface BenchmarkResult {
 export interface BenchmarkBaseline {
   readonly name: string;
   readonly kind: "smoke" | "accepted";
+  readonly metadata?: BenchmarkBaselineMetadata;
   readonly profile: Partial<BenchmarkOptions>;
   readonly result: BenchmarkBaselineResult;
   readonly thresholds: BenchmarkThresholds;
+}
+
+export interface BenchmarkBaselineMetadata {
+  readonly measured_at?: string;
+  readonly commit?: string;
+  readonly os?: string;
+  readonly node?: string;
+  readonly postgres?: string;
+  readonly notes?: string;
 }
 
 export interface BenchmarkBaselineResult {
@@ -188,12 +268,21 @@ export interface BenchmarkBaselineResult {
   readonly processing_mixed_actions_per_second: number;
   readonly processing_workflows_per_second: number;
   readonly workflow_task_commit_p95_ms: number;
+  readonly worker_stats?: Partial<WorkerStatsReport>;
   readonly operations: Record<string, BenchmarkBaselineOperation>;
+  readonly postgres_stats?: BenchmarkBaselinePostgresStats;
 }
 
 export interface BenchmarkBaselineOperation {
   readonly calls: number;
   readonly errors: number;
+}
+
+export interface BenchmarkBaselinePostgresStats {
+  readonly transactionsPerMixedAction?: number;
+  readonly statementStats?: {
+    readonly callsPerMixedAction?: number;
+  };
 }
 
 export interface BenchmarkThresholds {
@@ -202,12 +291,21 @@ export interface BenchmarkThresholds {
   readonly require_exact_completed_workflows?: boolean;
   readonly require_exact_mixed_actions?: boolean;
   readonly require_exact_counters?: readonly (keyof BenchmarkCounters)[];
+  readonly require_exact_worker_stats?: readonly (keyof WorkerStatsReport)[];
   readonly required_operation_names?: readonly string[];
+  readonly forbidden_operation_names?: readonly string[];
   readonly allow_operation_errors?: boolean;
   readonly min_processing_mixed_actions_per_second_ratio?: number;
   readonly min_processing_workflows_per_second_ratio?: number;
   readonly max_workflow_task_commit_p95_ratio?: number;
   readonly max_workflow_task_commit_p95_ms?: number;
+  readonly require_postgres_schema?: string;
+  readonly require_postgres_stats?: boolean;
+  readonly require_postgres_statement_stats?: boolean;
+  readonly max_postgres_transactions_per_mixed_action?: number;
+  readonly max_postgres_transactions_per_mixed_action_ratio?: number;
+  readonly max_postgres_statement_calls_per_mixed_action?: number;
+  readonly max_postgres_statement_calls_per_mixed_action_ratio?: number;
 }
 
 export interface BenchmarkThresholdFailure {
@@ -299,6 +397,14 @@ interface StartOutcome {
 interface WorkerRunStats {
   workflowTasks: number;
   activityTasks: number;
+  workflowHistoryCacheHits: number;
+  workflowHistoryCacheMisses: number;
+  workflowHistoryCacheEvictions: number;
+  workflowExecutionCacheHits: number;
+  workflowExecutionCacheMisses: number;
+  workflowExecutionCacheEvictions: number;
+  historyStreamChunks: number;
+  historyStreamEvents: number;
   timersFired: number;
   activitiesTimedOut: number;
   childWorkflowStartsDispatched: number;
@@ -308,6 +414,7 @@ interface BackendHandle {
   readonly backend: DurableBackend;
   readonly dbPath: string | null;
   readonly postgresSchema: string | null;
+  readonly postgresStatsSnapshot: (() => Promise<PostgresBackendStatsSnapshot>) | null;
   readonly cleanup: () => Promise<void>;
 }
 
@@ -421,8 +528,20 @@ class MeasuredBackend implements DurableBackend {
     return this.#measure("failActivity", 1, () => this.inner.failActivity(req));
   }
 
+  async heartbeatActivity(req: ActivityHeartbeatRequest): Promise<ActivityHeartbeatOutcome> {
+    return this.#measure("heartbeatActivity", 1, () => this.inner.heartbeatActivity(req));
+  }
+
   async fireDueTimers(req: FireDueTimersRequest): Promise<FireDueTimersOutcome> {
     return this.#measure("fireDueTimers", req.limit, () => this.inner.fireDueTimers(req));
+  }
+
+  async timeoutDueActivities(
+    req: TimeoutDueActivitiesRequest
+  ): Promise<TimeoutDueActivitiesOutcome> {
+    return this.#measure("timeoutDueActivities", req.limit, () =>
+      this.inner.timeoutDueActivities(req)
+    );
   }
 
   async signalWorkflow(req: SignalWorkflowRequest): Promise<SignalWorkflowOutcome> {
@@ -457,6 +576,17 @@ class MeasuredBackend implements DurableBackend {
 const benchmarkActivity = activity({
   name: "bench.workload.activity",
   handler: async (input: { readonly value: number; readonly delayMs: number }): Promise<number> => {
+    if (input.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, input.delayMs));
+    }
+    return input.value;
+  }
+});
+
+const benchmarkHeartbeatActivity = activity({
+  name: "bench.workload.heartbeat-activity",
+  handler: async (input: { readonly value: number; readonly delayMs: number }): Promise<number> => {
+    await heartbeat();
     if (input.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, input.delayMs));
     }
@@ -502,6 +632,30 @@ const benchmarkActivityParent = workflow({
       { taskQueue: ACTIVITY_QUEUE }
     );
     return { index: input.index, value };
+  }
+});
+
+const benchmarkActivityHeartbeatParent = workflow({
+  name: "bench.workload.activity-heartbeat-parent",
+  version: 1,
+  handler: async (input: WorkflowInput): Promise<ValueOutput> => {
+    const value = await callActivity(
+      benchmarkHeartbeatActivity,
+      { value: input.index, delayMs: input.activityDelayMs },
+      {
+        taskQueue: ACTIVITY_QUEUE,
+        heartbeatTimeoutMs: 60_000
+      }
+    );
+    return { index: input.index, value };
+  }
+});
+
+const benchmarkWriteCeilingParent = workflow({
+  name: "bench.workload.write-ceiling-parent",
+  version: 1,
+  handler: async (input: WorkflowInput): Promise<ValueOutput> => {
+    return { index: input.index, value: input.index };
   }
 });
 
@@ -774,6 +928,7 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
   const metrics = new BackendMetrics();
   const backend = new MeasuredBackend(backendHandle.backend, metrics);
   try {
+    const postgresStatsBefore = await backendHandle.postgresStatsSnapshot?.();
     const setupStarted = performance.now();
     const registry = benchmarkRegistry();
     const startOutcome = await startWorkflows(backend, options);
@@ -787,7 +942,7 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
         workerId: `durust-benchmark-worker-${index}`,
         workflowTaskQueue: WORKFLOW_QUEUE,
         activityTaskQueue: ACTIVITY_QUEUE,
-        registeredSignalNames: ["finish"],
+        registeredSignalNames: options.mode === "write-ceiling" ? [] : ["finish"],
         activityCompletionBatchSize: options.activity_completion_batch,
         payloadCodec: "Json"
       })
@@ -835,6 +990,7 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
     const processingSeconds = Math.max(processingMs / 1000, Number.EPSILON);
     const activations = counters.workflow_tasks;
     const mixedActions = mixedActionCount(counters);
+    const postgresStatsAfter = await backendHandle.postgresStatsSnapshot?.();
     return {
       backend: options.backend,
       mode: options.mode,
@@ -857,7 +1013,14 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
       counters,
       worker_stats: workerStatsReport(stats),
       backend_metrics: metrics.report(),
-      postgres_stats: null,
+      postgres_stats:
+        postgresStatsBefore !== undefined && postgresStatsAfter !== undefined
+          ? postgresStatsReportFromSnapshots(postgresStatsBefore, postgresStatsAfter, {
+              elapsedMs,
+              mixedActions,
+              workflows: completedWorkflows
+            })
+          : null,
       resource_samples: null,
       postgres_schema: backendHandle.postgresSchema,
       db_path: options.keep_db ? backendHandle.dbPath : null,
@@ -903,6 +1066,14 @@ export function compareBenchmarkToBaseline(
       result.counters[key]
     );
   }
+  for (const key of thresholds.require_exact_worker_stats ?? []) {
+    pushEqual(
+      failures,
+      `worker_stats.${key}`,
+      baseline.result.worker_stats?.[key],
+      result.worker_stats[key]
+    );
+  }
   for (const name of thresholds.required_operation_names ?? []) {
     const operation = result.backend_metrics.operations[name];
     if (operation === undefined) {
@@ -922,6 +1093,18 @@ export function compareBenchmarkToBaseline(
         message: `backend operation ${name} recorded errors`
       });
     }
+  }
+  for (const name of thresholds.forbidden_operation_names ?? []) {
+    const operation = result.backend_metrics.operations[name];
+    if (operation === undefined) {
+      continue;
+    }
+    failures.push({
+      path: `backend_metrics.operations.${name}`,
+      expected: "absent",
+      actual: operation.calls,
+      message: `forbidden backend operation ${name} was recorded`
+    });
   }
 
   const minMixedRatio = thresholds.min_processing_mixed_actions_per_second_ratio;
@@ -960,11 +1143,211 @@ export function compareBenchmarkToBaseline(
       result.backend_metrics.workflowTaskCommitLatency.p95Ms
     );
   }
+  if (thresholds.require_postgres_schema !== undefined) {
+    pushEqual(
+      failures,
+      "postgres_schema",
+      thresholds.require_postgres_schema,
+      result.postgres_schema
+    );
+  }
+  if ((thresholds.require_postgres_stats ?? false) && result.postgres_stats === null) {
+    failures.push({
+      path: "postgres_stats",
+      expected: "present",
+      actual: null,
+      message: "Postgres stats were required but not reported"
+    });
+  }
+  if (
+    (thresholds.require_postgres_statement_stats ?? false) &&
+    result.postgres_stats?.statementStats == null
+  ) {
+    failures.push({
+      path: "postgres_stats.statementStats",
+      expected: "present",
+      actual: result.postgres_stats?.statementStats ?? null,
+      message: "Postgres statement stats were required but not reported"
+    });
+  }
+
+  compareOptionalPostgresAtMost(
+    failures,
+    baseline,
+    result,
+    "postgres_stats.transactionsPerMixedAction",
+    thresholds.max_postgres_transactions_per_mixed_action,
+    thresholds.max_postgres_transactions_per_mixed_action_ratio,
+    baseline.result.postgres_stats?.transactionsPerMixedAction,
+    result.postgres_stats?.transactionsPerMixedAction
+  );
+  compareOptionalPostgresAtMost(
+    failures,
+    baseline,
+    result,
+    "postgres_stats.statementStats.callsPerMixedAction",
+    thresholds.max_postgres_statement_calls_per_mixed_action,
+    thresholds.max_postgres_statement_calls_per_mixed_action_ratio,
+    baseline.result.postgres_stats?.statementStats?.callsPerMixedAction,
+    result.postgres_stats?.statementStats?.callsPerMixedAction
+  );
 
   return {
     passed: failures.length === 0,
     baseline: baseline.name,
     failures
+  };
+}
+
+function compareOptionalPostgresAtMost(
+  failures: BenchmarkThresholdFailure[],
+  baseline: BenchmarkBaseline,
+  result: BenchmarkResult,
+  path: string,
+  absoluteMax: number | undefined,
+  baselineRatio: number | undefined,
+  baselineValue: number | undefined,
+  actual: number | undefined
+): void {
+  if (absoluteMax === undefined && baselineRatio === undefined) {
+    return;
+  }
+  if (actual === undefined) {
+    failures.push({
+      path,
+      expected: "present",
+      actual: result.postgres_stats === null ? null : undefined,
+      message: `${path} was required by ${baseline.name} but not reported`
+    });
+    return;
+  }
+  if (absoluteMax !== undefined) {
+    pushAtMost(failures, path, absoluteMax, actual);
+  }
+  if (baselineRatio === undefined) {
+    return;
+  }
+  if (baselineValue === undefined) {
+    failures.push({
+      path: `baseline.result.${path}`,
+      expected: "present",
+      actual: undefined,
+      message: `${baseline.name} is missing ${path} for ratio comparison`
+    });
+    return;
+  }
+  pushAtMost(failures, path, baselineValue * baselineRatio, actual);
+}
+
+export function postgresStatsReportFromSnapshots(
+  before: PostgresBackendStatsSnapshot,
+  after: PostgresBackendStatsSnapshot,
+  context: {
+    readonly elapsedMs: number;
+    readonly mixedActions: number;
+    readonly workflows: number;
+  }
+): PostgresStatsReport {
+  const elapsedSeconds = Math.max(context.elapsedMs / 1000, Number.EPSILON);
+  const mixedActions = Math.max(context.mixedActions, 0);
+  const workflows = Math.max(context.workflows, 0);
+  const walBytes = postgresStatsDelta(before, after, "walBytes");
+  const walRecords = postgresStatsDelta(before, after, "walRecords");
+  const xactCommit = postgresStatsDelta(before, after, "xactCommit");
+  const xactRollback = postgresStatsDelta(before, after, "xactRollback");
+  const transactions = xactCommit + xactRollback;
+  const blocksRead = postgresStatsDelta(before, after, "blocksRead");
+  const blocksHit = postgresStatsDelta(before, after, "blocksHit");
+  const blockAccesses = blocksRead + blocksHit;
+  return {
+    walBytes,
+    walBytesPerSecond: round(walBytes / elapsedSeconds),
+    walRecords,
+    walRecordsPerSecond: round(walRecords / elapsedSeconds),
+    walFpi: postgresStatsDelta(before, after, "walFpi"),
+    walBuffersFull: postgresStatsDelta(before, after, "walBuffersFull"),
+    walWrite: postgresStatsDelta(before, after, "walWrite"),
+    walSync: postgresStatsDelta(before, after, "walSync"),
+    walWriteTimeMs: round(postgresStatsDelta(before, after, "walWriteTimeMs")),
+    walSyncTimeMs: round(postgresStatsDelta(before, after, "walSyncTimeMs")),
+    xactCommit,
+    xactRollback,
+    transactionsPerSecond: round(transactions / elapsedSeconds),
+    transactionsPerMixedAction: mixedActions === 0 ? 0 : round(transactions / mixedActions),
+    transactionsPerWorkflow: workflows === 0 ? 0 : round(transactions / workflows),
+    rowsReturned: postgresStatsDelta(before, after, "rowsReturned"),
+    rowsFetched: postgresStatsDelta(before, after, "rowsFetched"),
+    rowsInserted: postgresStatsDelta(before, after, "rowsInserted"),
+    rowsUpdated: postgresStatsDelta(before, after, "rowsUpdated"),
+    rowsDeleted: postgresStatsDelta(before, after, "rowsDeleted"),
+    blocksRead,
+    blocksHit,
+    blockCacheHitRatio: blockAccesses === 0 ? 1 : round(blocksHit / blockAccesses),
+    tempFiles: postgresStatsDelta(before, after, "tempFiles"),
+    tempBytes: postgresStatsDelta(before, after, "tempBytes"),
+    deadlocks: postgresStatsDelta(before, after, "deadlocks"),
+    blockReadTimeMs: round(postgresStatsDelta(before, after, "blockReadTimeMs")),
+    blockWriteTimeMs: round(postgresStatsDelta(before, after, "blockWriteTimeMs")),
+    activeTimeMs: 0,
+    sessionTimeMs: 0,
+    activeConnectionsAfter: after.activeConnections,
+    statementStats: postgresStatementStatsReportFromSnapshots(before, after, {
+      mixedActions,
+      workflows
+    })
+  };
+}
+
+function postgresStatementStatsReportFromSnapshots(
+  before: PostgresBackendStatsSnapshot,
+  after: PostgresBackendStatsSnapshot,
+  context: {
+    readonly mixedActions: number;
+    readonly workflows: number;
+  }
+): PostgresStatementStatsReport | null {
+  if (before.statements.length === 0 && after.statements.length === 0) {
+    return null;
+  }
+  const beforeById = new Map(before.statements.map((statement) => [statement.queryId, statement]));
+  const deltas = after.statements
+    .map((statement) => postgresStatementDelta(beforeById.get(statement.queryId), statement))
+    .filter((statement) => statement.calls > 0 || statement.totalExecTimeMs > 0)
+    .sort((left, right) =>
+      right.calls === left.calls
+        ? right.totalExecTimeMs - left.totalExecTimeMs
+        : right.calls - left.calls
+    );
+  const calls = deltas.reduce((sum, statement) => sum + statement.calls, 0);
+  const totalExecTimeMs = deltas.reduce(
+    (sum, statement) => sum + statement.totalExecTimeMs,
+    0
+  );
+  return {
+    calls,
+    callsPerMixedAction:
+      context.mixedActions === 0 ? 0 : round(calls / Math.max(1, context.mixedActions)),
+    callsPerWorkflow:
+      context.workflows === 0 ? 0 : round(calls / Math.max(1, context.workflows)),
+    totalExecTimeMs: round(totalExecTimeMs),
+    topStatements: deltas.slice(0, 10).map((statement) => ({
+      queryId: statement.queryId,
+      calls: statement.calls,
+      totalExecTimeMs: round(statement.totalExecTimeMs),
+      query: statement.query
+    }))
+  };
+}
+
+function postgresStatementDelta(
+  before: PostgresStatementStatsSnapshot | undefined,
+  after: PostgresStatementStatsSnapshot
+): PostgresTopStatementReport {
+  return {
+    queryId: after.queryId,
+    calls: Math.max(0, after.calls - (before?.calls ?? 0)),
+    totalExecTimeMs: Math.max(0, after.totalExecTimeMs - (before?.totalExecTimeMs ?? 0)),
+    query: after.query
   };
 }
 
@@ -983,6 +1366,7 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
       }),
       dbPath: handle.dbPath,
       postgresSchema: handle.postgresSchema,
+      postgresStatsSnapshot: handle.postgresStatsSnapshot,
       cleanup: async () => {
         try {
           await handle.cleanup();
@@ -998,6 +1382,7 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
       backend: new MemoryBackend(),
       dbPath: null,
       postgresSchema: null,
+      postgresStatsSnapshot: null,
       cleanup: async () => undefined
     });
   }
@@ -1009,6 +1394,7 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
       backend,
       dbPath,
       postgresSchema: null,
+      postgresStatsSnapshot: null,
       cleanup: async () => {
         backend.close();
         if (!options.keep_db) {
@@ -1030,7 +1416,8 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
   return wrapPayloadBackend({
     backend,
     dbPath: null,
-    postgresSchema: "state-row",
+    postgresSchema: "normalized",
+    postgresStatsSnapshot: () => backend.statsSnapshot(),
     cleanup: async () => {
       if (options.keep_db) {
         await backend.close();
@@ -1044,6 +1431,7 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
 function benchmarkRegistry(): Registry {
   return new Registry()
     .registerWorkflow(benchmarkActivityParent)
+    .registerWorkflow(benchmarkActivityHeartbeatParent)
     .registerWorkflow(benchmarkSignalParent)
     .registerWorkflow(benchmarkTimerParent)
     .registerWorkflow(benchmarkChildParent)
@@ -1053,7 +1441,9 @@ function benchmarkRegistry(): Registry {
     .registerWorkflow(benchmarkChildMapParent)
     .registerWorkflow(benchmarkRecoveryParent)
     .registerWorkflow(benchmarkPayloadParent)
+    .registerWorkflow(benchmarkWriteCeilingParent)
     .registerActivity(benchmarkPayloadActivity)
+    .registerActivity(benchmarkHeartbeatActivity)
     .registerActivity(benchmarkActivity);
 }
 
@@ -1086,6 +1476,14 @@ async function startWorkflows(
       case "activity":
         handle = await client.startWorkflow(
           benchmarkActivityParent,
+          workflowId,
+          WORKFLOW_QUEUE,
+          workflowInput
+        );
+        break;
+      case "activity-heartbeat":
+        handle = await client.startWorkflow(
+          benchmarkActivityHeartbeatParent,
           workflowId,
           WORKFLOW_QUEUE,
           workflowInput
@@ -1152,6 +1550,14 @@ async function startWorkflows(
           body: payloadBody(index)
         });
         break;
+      case "write-ceiling":
+        handle = await client.startWorkflow(
+          benchmarkWriteCeilingParent,
+          workflowId,
+          WORKFLOW_QUEUE,
+          workflowInput
+        );
+        break;
     }
     runs.push({ runId: handle.runId, index });
   }
@@ -1169,29 +1575,47 @@ async function drainWorkerRound(
 ): Promise<WorkerRunStats> {
   let stats = emptyWorkerStats();
   for (const worker of workers) {
+    const beforeMetrics = worker.metrics();
     for (let index = 0; index < options.batch; index += 1) {
       const workflowTask = await worker.runWorkflowTaskOnce();
       if (workflowTask.kind !== "NoTask") {
         stats.workflowTasks += 1;
       }
 
-      const timers = await backend.fireDueTimers({
-        namespace: "default",
-        now: timestampMs(Date.now() + 60_000),
-        limit: options.batch
-      });
-      if (timers.fired > 0) {
-        stats.timersFired += timers.fired;
-      }
+      if (options.mode !== "write-ceiling") {
+        const timers = await backend.fireDueTimers({
+          namespace: "default",
+          now: timestampMs(Date.now() + 60_000),
+          limit: options.batch
+        });
+        if (timers.fired > 0) {
+          stats.timersFired += timers.fired;
+        }
 
-      const activityTasks =
-        options.activity_completion_batch > 1
-          ? await worker.runActivityTaskBatchOnce(options.activity_completion_batch)
-          : await worker.runActivityTaskOnce();
-      if (activityTasks.kind !== "NoTask") {
-        stats.activityTasks += activityTasks.kind === "Processed" ? activityTasks.tasks : 1;
+        const activityTasks =
+          options.activity_completion_batch > 1
+            ? await worker.runActivityTaskBatchOnce(options.activity_completion_batch)
+            : await worker.runActivityTaskOnce();
+        if (activityTasks.kind !== "NoTask") {
+          stats.activityTasks += activityTasks.kind === "Processed" ? activityTasks.tasks : 1;
+        }
       }
     }
+    const afterMetrics = worker.metrics();
+    stats.workflowHistoryCacheHits +=
+      afterMetrics.workflowHistoryCacheHits - beforeMetrics.workflowHistoryCacheHits;
+    stats.workflowHistoryCacheMisses +=
+      afterMetrics.workflowHistoryCacheMisses - beforeMetrics.workflowHistoryCacheMisses;
+    stats.workflowHistoryCacheEvictions +=
+      afterMetrics.workflowHistoryCacheEvictions - beforeMetrics.workflowHistoryCacheEvictions;
+    stats.workflowExecutionCacheHits +=
+      afterMetrics.workflowExecutionCacheHits - beforeMetrics.workflowExecutionCacheHits;
+    stats.workflowExecutionCacheMisses +=
+      afterMetrics.workflowExecutionCacheMisses - beforeMetrics.workflowExecutionCacheMisses;
+    stats.workflowExecutionCacheEvictions +=
+      afterMetrics.workflowExecutionCacheEvictions - beforeMetrics.workflowExecutionCacheEvictions;
+    stats.historyStreamChunks += afterMetrics.historyStreamChunks - beforeMetrics.historyStreamChunks;
+    stats.historyStreamEvents += afterMetrics.historyStreamEvents - beforeMetrics.historyStreamEvents;
   }
   return stats;
 }
@@ -1255,6 +1679,7 @@ function assertExpectedOutput(
       } satisfies ParentOutput;
       break;
     case "activity":
+    case "activity-heartbeat":
       actual = decodePayload<ValueOutput>(payload as PayloadRef<ValueOutput>);
       expected = { index, value: index } satisfies ValueOutput;
       break;
@@ -1304,6 +1729,10 @@ function assertExpectedOutput(
       } satisfies PayloadWorkflowOutput;
       break;
     }
+    case "write-ceiling":
+      actual = decodePayload<ValueOutput>(payload as PayloadRef<ValueOutput>);
+      expected = { index, value: index } satisfies ValueOutput;
+      break;
   }
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
@@ -1354,6 +1783,7 @@ function countersFromStats(
     child_completions: 0,
     timer_handlers: 0,
     boot_activities: 0,
+    activity_heartbeats: 0,
     child_activities: 0,
     finish_activities: 0,
     workflow_tasks: stats.workflowTasks,
@@ -1375,6 +1805,8 @@ function countersFromStats(
       };
     case "activity":
       return { ...base, boot_activities: completed };
+    case "activity-heartbeat":
+      return { ...base, boot_activities: completed, activity_heartbeats: completed };
     case "signal":
       return base;
     case "timer":
@@ -1405,6 +1837,8 @@ function countersFromStats(
       };
     case "payload":
       return { ...base, boot_activities: completed };
+    case "write-ceiling":
+      return base;
   }
 }
 
@@ -1416,6 +1850,7 @@ function mixedActionCount(counters: BenchmarkCounters): number {
     counters.child_completions +
     counters.timer_handlers +
     counters.boot_activities +
+    counters.activity_heartbeats +
     counters.child_activities +
     counters.finish_activities
   );
@@ -1449,6 +1884,14 @@ function workerStatsReport(stats: WorkerRunStats): WorkerStatsReport {
   return {
     workflowTasks: stats.workflowTasks,
     activityTasks: stats.activityTasks,
+    workflowHistoryCacheHits: stats.workflowHistoryCacheHits,
+    workflowHistoryCacheMisses: stats.workflowHistoryCacheMisses,
+    workflowHistoryCacheEvictions: stats.workflowHistoryCacheEvictions,
+    workflowExecutionCacheHits: stats.workflowExecutionCacheHits,
+    workflowExecutionCacheMisses: stats.workflowExecutionCacheMisses,
+    workflowExecutionCacheEvictions: stats.workflowExecutionCacheEvictions,
+    historyStreamChunks: stats.historyStreamChunks,
+    historyStreamEvents: stats.historyStreamEvents,
     timersFired: stats.timersFired,
     activitiesTimedOut: stats.activitiesTimedOut,
     childWorkflowStartsDispatched: stats.childWorkflowStartsDispatched
@@ -1459,6 +1902,14 @@ function emptyWorkerStats(): WorkerRunStats {
   return {
     workflowTasks: 0,
     activityTasks: 0,
+    workflowHistoryCacheHits: 0,
+    workflowHistoryCacheMisses: 0,
+    workflowHistoryCacheEvictions: 0,
+    workflowExecutionCacheHits: 0,
+    workflowExecutionCacheMisses: 0,
+    workflowExecutionCacheEvictions: 0,
+    historyStreamChunks: 0,
+    historyStreamEvents: 0,
     timersFired: 0,
     activitiesTimedOut: 0,
     childWorkflowStartsDispatched: 0
@@ -1469,6 +1920,20 @@ function addWorkerStats(left: WorkerRunStats, right: WorkerRunStats): WorkerRunS
   return {
     workflowTasks: left.workflowTasks + right.workflowTasks,
     activityTasks: left.activityTasks + right.activityTasks,
+    workflowHistoryCacheHits:
+      left.workflowHistoryCacheHits + right.workflowHistoryCacheHits,
+    workflowHistoryCacheMisses:
+      left.workflowHistoryCacheMisses + right.workflowHistoryCacheMisses,
+    workflowHistoryCacheEvictions:
+      left.workflowHistoryCacheEvictions + right.workflowHistoryCacheEvictions,
+    workflowExecutionCacheHits:
+      left.workflowExecutionCacheHits + right.workflowExecutionCacheHits,
+    workflowExecutionCacheMisses:
+      left.workflowExecutionCacheMisses + right.workflowExecutionCacheMisses,
+    workflowExecutionCacheEvictions:
+      left.workflowExecutionCacheEvictions + right.workflowExecutionCacheEvictions,
+    historyStreamChunks: left.historyStreamChunks + right.historyStreamChunks,
+    historyStreamEvents: left.historyStreamEvents + right.historyStreamEvents,
     timersFired: left.timersFired + right.timersFired,
     activitiesTimedOut: left.activitiesTimedOut + right.activitiesTimedOut,
     childWorkflowStartsDispatched:
@@ -1480,6 +1945,14 @@ function madeProgress(stats: WorkerRunStats): boolean {
   return (
     stats.workflowTasks > 0 ||
     stats.activityTasks > 0 ||
+    stats.workflowHistoryCacheHits > 0 ||
+    stats.workflowHistoryCacheMisses > 0 ||
+    stats.workflowHistoryCacheEvictions > 0 ||
+    stats.workflowExecutionCacheHits > 0 ||
+    stats.workflowExecutionCacheMisses > 0 ||
+    stats.workflowExecutionCacheEvictions > 0 ||
+    stats.historyStreamChunks > 0 ||
+    stats.historyStreamEvents > 0 ||
     stats.timersFired > 0 ||
     stats.activitiesTimedOut > 0 ||
     stats.childWorkflowStartsDispatched > 0
@@ -1556,6 +2029,14 @@ function pushAtMost(
   });
 }
 
+function postgresStatsDelta(
+  before: PostgresBackendStatsSnapshot,
+  after: PostgresBackendStatsSnapshot,
+  key: Exclude<keyof PostgresBackendStatsSnapshot, "statements">
+): number {
+  return Math.max(0, after[key] - before[key]);
+}
+
 function dbBytes(path: string): number | null {
   try {
     return statSync(path).size;
@@ -1575,18 +2056,20 @@ function parseMode(value: string): BenchmarkMode {
   if (
     value === "mixed" ||
     value === "activity" ||
+    value === "activity-heartbeat" ||
     value === "signal" ||
     value === "timer" ||
     value === "child" ||
     value === "activity-map" ||
     value === "child-map" ||
     value === "recovery" ||
-    value === "payload"
+    value === "payload" ||
+    value === "write-ceiling"
   ) {
     return value;
   }
   throw new Error(
-    `unsupported mode ${value}; expected mixed, activity, signal, timer, child, activity-map, child-map, recovery, or payload`
+    `unsupported mode ${value}; expected mixed, activity, activity-heartbeat, signal, timer, child, activity-map, child-map, recovery, payload, or write-ceiling`
   );
 }
 
@@ -1613,7 +2096,7 @@ function round(value: number): number {
 function usage(): string {
   return [
     "usage: durust-benchmark-workload [--backend memory|sqlite|postgres]",
-    "  [--mode mixed|activity|signal|timer|child|activity-map|child-map|recovery|payload]",
+    "  [--mode mixed|activity|activity-heartbeat|signal|timer|child|activity-map|child-map|recovery|payload|write-ceiling]",
     "  [--workflows N] [--workers N] [--batch N]",
     "  [--child-map-items N] [--child-map-max-in-flight N] [--json]"
   ].join("\n");

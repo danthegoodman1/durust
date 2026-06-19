@@ -42,32 +42,13 @@ export interface BlobPayloadRef<T = unknown> {
   readonly __payloadType?: T;
 }
 
-export interface PayloadStorageConfig {
-  readonly codec: CodecId;
-  readonly inlineThresholdBytes: number;
-  readonly blobStore?: BlobStoreConfig;
-}
-
-export type BlobStoreConfig = {
-  readonly kind: "LocalDirectory";
-  readonly root: string;
-  readonly prefix: string;
-};
-
-export const DEFAULT_INLINE_THRESHOLD_BYTES = 8 * 1024;
-
-export const defaultPayloadStorageConfig: PayloadStorageConfig = {
-  codec: "MessagePack",
-  inlineThresholdBytes: DEFAULT_INLINE_THRESHOLD_BYTES
-};
-
 export function digestBytes(bytes: Uint8Array | string): string {
   const hasher = createHash("sha256");
   hasher.update(typeof bytes === "string" ? Buffer.from(bytes) : Buffer.from(bytes));
   return `sha256:${hasher.digest("hex")}`;
 }
 
-export function typeNameFingerprint(typeName: string): string {
+function typeNameFingerprint(typeName: string): string {
   return digestBytes(Buffer.from(typeName, "utf8"));
 }
 

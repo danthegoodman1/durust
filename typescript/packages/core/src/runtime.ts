@@ -49,19 +49,41 @@ import {
 import type { HistoryEvent } from "./history.js";
 import { RetryPolicy, type ActivityCallOptions, type ChildWorkflowOptions } from "./options.js";
 import { decodePayload, digestBytes, encodePayload, payloadDigest, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
-import { commandId, eventId, timestampMs, waitId, type CommandId, type EventId, type RunId, type WaitId, type WorkflowId } from "./types.js";
+import { commandId, eventId, timestampMs, waitId, type CommandId, type DurableInput, type EventId, type RunId, type WaitId, type WorkflowId } from "./types.js";
 
 const runtimeStorage = new AsyncLocalStorage<WorkflowRuntimeContext>();
 let nondeterminismGuardsInstalled = false;
+let originalDateConstructor: DateConstructor | undefined;
 let originalDateNow: (() => number) | undefined;
 let originalMathRandom: (() => number) | undefined;
+let originalPerformanceNow: (() => number) | undefined;
+let originalCryptoRandomUUID: (() => `${string}-${string}-${string}-${string}-${string}`) | undefined;
+let originalCryptoGetRandomValues: Crypto["getRandomValues"] | undefined;
+let originalProcessHrtime: typeof process.hrtime | undefined;
+let originalProcessHrtimeBigint: (() => bigint) | undefined;
+let originalProcessEnv: NodeJS.ProcessEnv | undefined;
+let originalProcessCwd: typeof process.cwd | undefined;
+let originalProcessChdir: typeof process.chdir | undefined;
+let originalProcessCpuUsage: typeof process.cpuUsage | undefined;
+let originalProcessMemoryUsage: typeof process.memoryUsage | undefined;
+let originalProcessNextTick: typeof process.nextTick | undefined;
+let originalProcessResourceUsage: typeof process.resourceUsage | undefined;
+let originalProcessUptime: typeof process.uptime | undefined;
 let originalSetTimeout: typeof globalThis.setTimeout | undefined;
 let originalSetInterval: typeof globalThis.setInterval | undefined;
+let originalSetImmediate: typeof globalThis.setImmediate | undefined;
 let originalQueueMicrotask: typeof globalThis.queueMicrotask | undefined;
+let originalRequestAnimationFrame: typeof globalThis.requestAnimationFrame | undefined;
+let originalRequestIdleCallback: typeof globalThis.requestIdleCallback | undefined;
 let originalPromiseAll: PromiseConstructor["all"] | undefined;
 let originalPromiseRace: PromiseConstructor["race"] | undefined;
 let originalPromiseAllSettled: PromiseConstructor["allSettled"] | undefined;
 let originalPromiseAny: PromiseConstructor["any"] | undefined;
+let originalFetch: typeof globalThis.fetch | undefined;
+let originalWebSocket: typeof globalThis.WebSocket | undefined;
+let originalEventSource: typeof globalThis.EventSource | undefined;
+let originalXMLHttpRequest: typeof globalThis.XMLHttpRequest | undefined;
+let guardedProcessEnv: NodeJS.ProcessEnv | undefined;
 
 export interface PrepareWorkflowTaskOptions {
   readonly defaultActivityTaskQueue?: string;
@@ -71,7 +93,26 @@ export interface PrepareWorkflowTaskOptions {
   readonly liveSignals?: readonly SignalInboxRecord[];
 }
 
-export class WorkflowSuspended extends Error {
+type HotWorkflowTaskOptions = PrepareWorkflowTaskOptions;
+
+type HotSuspendResolution<T> =
+  | { readonly kind: "Pending" }
+  | { readonly kind: "Resolved"; readonly value: T }
+  | { readonly kind: "Rejected"; readonly error: unknown };
+
+interface HotWaiter {
+  readonly key: string;
+  tryResolve(): boolean;
+  reject(error: unknown): void;
+}
+
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+class WorkflowSuspended extends Error {
   constructor() {
     super("workflow task suspended on durable operation");
     this.name = "WorkflowSuspended";
@@ -158,7 +199,7 @@ export class ChildWorkflowMapFailureError extends Error {
   }
 }
 
-export class ContinueAsNewRequested extends Error {
+class ContinueAsNewRequested extends Error {
   constructor() {
     super("workflow requested continue-as-new");
     this.name = "ContinueAsNewRequested";
@@ -185,11 +226,11 @@ export function sideEffect<T>(key: string, effect: () => T): PromiseLike<T> {
   return new SideEffectDurablePromise(key, effect);
 }
 
-export function publish<QueryState extends object>(view: QueryState): void {
+export function publish<QueryState extends object>(view: DurableInput<QueryState>): void {
   currentWorkflowRuntimeContext().publish(view);
 }
 
-export function continueAsNew<Input extends object>(input: Input): never {
+export function continueAsNew<Input extends object>(input: DurableInput<Input>): never {
   return currentWorkflowRuntimeContext().continueAsNew(input);
 }
 
@@ -202,7 +243,12 @@ export async function prepareWorkflowTaskCommit<
   options: PrepareWorkflowTaskOptions = {}
 ): Promise<WorkflowTaskCommit> {
   installNondeterminismGuards();
-  const context = new WorkflowRuntimeContext(claimed, options, workflowDefinition.inputSchema);
+  const context = new WorkflowRuntimeContext(
+    claimed,
+    options,
+    workflowDefinition.inputSchema,
+    workflowDefinition.queryStateSchema
+  );
   try {
     const output = await runtimeStorage.run(context, () => workflowDefinition.handler(input));
     context.completeWorkflow(output as WorkflowOutput<W>, workflowDefinition);
@@ -221,7 +267,94 @@ export async function prepareWorkflowTaskCommit<
   return context.toCommit();
 }
 
-export function currentWorkflowRuntimeContext(): WorkflowRuntimeContext {
+export class HotWorkflowExecution {
+  readonly #context: WorkflowRuntimeContext;
+  #observedProgressVersion: number;
+  #fatalError: unknown = null;
+  #terminalCommitPending = false;
+  #closed = false;
+
+  constructor(
+    workflowDefinition: WorkflowDefinition<any, any, any, string>,
+    input: object,
+    claimed: ClaimedWorkflowTask,
+    options: PrepareWorkflowTaskOptions = {}
+  ) {
+    installNondeterminismGuards();
+    this.#context = new WorkflowRuntimeContext(
+      claimed,
+      options,
+      workflowDefinition.inputSchema,
+      workflowDefinition.queryStateSchema,
+      "hot"
+    );
+    this.#observedProgressVersion = this.#context.hotProgressVersion();
+    void runtimeStorage.run(this.#context, () => workflowDefinition.handler(input))
+      .then((output: unknown) => {
+        this.#context.completeWorkflow(output, workflowDefinition);
+        this.#terminalCommitPending = true;
+      })
+      .catch((error: unknown) => {
+        if (error instanceof ContinueAsNewRequested) {
+          this.#terminalCommitPending = true;
+          return;
+        }
+        if (error instanceof WorkflowSuspended) {
+          this.#fatalError = new Error(
+            "hot workflow execution encountered an unsupported durable suspension"
+          );
+          this.#context.notifyHotProgress();
+          return;
+        }
+        if (isWorkflowTaskFatalError(error)) {
+          this.#fatalError = error;
+          this.#context.notifyHotProgress();
+          return;
+        }
+        this.#context.failWorkflow(durableFailureFromUnknown(error));
+        this.#terminalCommitPending = true;
+      });
+  }
+
+  get closed(): boolean {
+    return this.#closed;
+  }
+
+  async nextCommit(): Promise<WorkflowTaskCommit> {
+    if (this.#closed) {
+      throw new Error("hot workflow execution is closed");
+    }
+    await this.#context.waitForHotProgressAfter(this.#observedProgressVersion);
+    this.#observedProgressVersion = this.#context.hotProgressVersion();
+    if (this.#fatalError !== null) {
+      throw this.#fatalError;
+    }
+    return this.#context.toCommit();
+  }
+
+  async advance(
+    claimed: ClaimedWorkflowTask,
+    options: HotWorkflowTaskOptions = {}
+  ): Promise<WorkflowTaskCommit> {
+    if (this.#closed) {
+      throw new Error("hot workflow execution is closed");
+    }
+    this.#context.advanceHotClaim(claimed, options);
+    return this.nextCommit();
+  }
+
+  markCommitted(newTailEventId: EventId): void {
+    if (this.#closed) {
+      throw new Error("hot workflow execution is closed");
+    }
+    this.#context.markHotCommitAccepted(newTailEventId);
+    if (this.#terminalCommitPending) {
+      this.#closed = true;
+    }
+  }
+}
+
+function currentWorkflowRuntimeContext(): WorkflowRuntimeContext {
   const context = runtimeStorage.getStore();
   if (!context) {
     throw new Error("durust durable APIs must be awaited inside a workflow task");
@@ -250,16 +383,63 @@ function installNondeterminismGuards(): void {
     return;
   }
   nondeterminismGuardsInstalled = true;
-  originalDateNow = Date.now.bind(Date);
+  originalDateConstructor = Date;
+  originalDateNow = originalDateConstructor.now.bind(originalDateConstructor);
   originalMathRandom = Math.random.bind(Math);
+  originalPerformanceNow = globalThis.performance?.now.bind(globalThis.performance);
+  originalCryptoRandomUUID = globalThis.crypto?.randomUUID?.bind(globalThis.crypto);
+  originalCryptoGetRandomValues = globalThis.crypto?.getRandomValues.bind(globalThis.crypto);
+  originalProcessHrtime = process.hrtime.bind(process) as typeof process.hrtime;
+  originalProcessHrtimeBigint = process.hrtime.bigint.bind(process.hrtime);
+  originalProcessEnv = process.env;
+  originalProcessCwd = process.cwd.bind(process);
+  originalProcessChdir = process.chdir.bind(process);
+  originalProcessCpuUsage = process.cpuUsage.bind(process);
+  originalProcessMemoryUsage = process.memoryUsage.bind(process);
+  originalProcessNextTick = process.nextTick.bind(process) as typeof process.nextTick;
+  originalProcessResourceUsage =
+    typeof process.resourceUsage === "function"
+      ? process.resourceUsage.bind(process)
+      : undefined;
+  originalProcessUptime = process.uptime.bind(process);
   originalSetTimeout = globalThis.setTimeout.bind(globalThis);
   originalSetInterval = globalThis.setInterval.bind(globalThis);
+  originalSetImmediate = globalThis.setImmediate?.bind(globalThis);
   originalQueueMicrotask = globalThis.queueMicrotask.bind(globalThis);
+  originalRequestAnimationFrame = globalThis.requestAnimationFrame?.bind(globalThis);
+  originalRequestIdleCallback = globalThis.requestIdleCallback?.bind(globalThis);
   originalPromiseAll = Promise.all.bind(Promise) as PromiseConstructor["all"];
   originalPromiseRace = Promise.race.bind(Promise) as PromiseConstructor["race"];
   originalPromiseAllSettled = Promise.allSettled.bind(Promise) as PromiseConstructor["allSettled"];
   originalPromiseAny = Promise.any.bind(Promise) as PromiseConstructor["any"];
-  Object.defineProperty(Date, "now", {
+  originalFetch = globalThis.fetch?.bind(globalThis);
+  originalWebSocket = globalThis.WebSocket;
+  originalEventSource = globalThis.EventSource;
+  originalXMLHttpRequest = globalThis.XMLHttpRequest;
+  const guardedDate = new Proxy(originalDateConstructor, {
+    apply(target, thisArg, args) {
+      if (args.length === 0) {
+        assertNotInWorkflowRuntime("Date()", "workflow time APIs such as sleepUntil()", {
+          allowInSideEffect: true
+        });
+      }
+      return Reflect.apply(target, thisArg, args);
+    },
+    construct(target, args, newTarget) {
+      if (args.length === 0) {
+        assertNotInWorkflowRuntime("new Date()", "workflow time APIs such as sleepUntil()", {
+          allowInSideEffect: true
+        });
+      }
+      return Reflect.construct(target, args, newTarget);
+    }
+  });
+  Object.defineProperty(globalThis, "Date", {
+    configurable: true,
+    writable: true,
+    value: guardedDate
+  });
+  Object.defineProperty(guardedDate, "now", {
     configurable: true,
     writable: true,
     value: () => {
@@ -281,6 +461,171 @@ function installNondeterminismGuards(): void {
       return originalMathRandom?.() ?? 0;
     }
   });
+  if (globalThis.performance !== undefined) {
+    Object.defineProperty(globalThis.performance, "now", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        assertNotInWorkflowRuntime("performance.now()", "workflow time APIs such as sleepUntil()", {
+          allowInSideEffect: true
+        });
+        return originalPerformanceNow?.() ?? 0;
+      }
+    });
+  }
+  if (globalThis.crypto !== undefined) {
+    if (typeof globalThis.crypto.randomUUID === "function") {
+      Object.defineProperty(globalThis.crypto, "randomUUID", {
+        configurable: true,
+        writable: true,
+        value: () => {
+          assertNotInWorkflowRuntime(
+            "crypto.randomUUID()",
+            "sideEffect() for recorded nondeterministic values",
+            { allowInSideEffect: true }
+          );
+          return originalCryptoRandomUUID?.() ?? "00000000-0000-4000-8000-000000000000";
+        }
+      });
+    }
+    Object.defineProperty(globalThis.crypto, "getRandomValues", {
+      configurable: true,
+      writable: true,
+      value: (<T extends Parameters<Crypto["getRandomValues"]>[0]>(array: T): T => {
+        assertNotInWorkflowRuntime(
+          "crypto.getRandomValues()",
+          "sideEffect() for recorded nondeterministic values",
+          { allowInSideEffect: true }
+        );
+        if (originalCryptoGetRandomValues === undefined) {
+          return array;
+        }
+        return originalCryptoGetRandomValues(array) as T;
+      }) as Crypto["getRandomValues"]
+    });
+  }
+  const guardedHrtime = ((time?: [number, number]) => {
+    assertNotInWorkflowRuntime("process.hrtime()", "workflow time APIs such as sleepUntil()", {
+      allowInSideEffect: true
+    });
+    if (time === undefined) {
+      return originalProcessHrtime?.() ?? [0, 0];
+    }
+    return originalProcessHrtime?.(time) ?? [0, 0];
+  }) as typeof process.hrtime;
+  guardedHrtime.bigint = (() => {
+    assertNotInWorkflowRuntime(
+      "process.hrtime.bigint()",
+      "workflow time APIs such as sleepUntil()",
+      { allowInSideEffect: true }
+    );
+    return originalProcessHrtimeBigint?.() ?? 0n;
+  }) as typeof process.hrtime.bigint;
+  Object.defineProperty(process, "hrtime", {
+    configurable: true,
+    writable: true,
+    value: guardedHrtime
+  });
+  guardedProcessEnv = createGuardedProcessEnv(originalProcessEnv);
+  Object.defineProperty(process, "env", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      assertNotInWorkflowRuntime(
+        "process.env",
+        "workflow input or sideEffect() for recorded environment values",
+        { allowInSideEffect: true }
+      );
+      return guardedProcessEnv;
+    },
+    set(value: NodeJS.ProcessEnv) {
+      assertNotInWorkflowRuntime(
+        "process.env assignment",
+        "process configuration outside workflow code"
+      );
+      originalProcessEnv = value;
+      guardedProcessEnv = createGuardedProcessEnv(value);
+    }
+  });
+  Object.defineProperty(process, "cwd", {
+    configurable: true,
+    writable: true,
+    value: (() => {
+      assertNotInWorkflowRuntime(
+        "process.cwd()",
+        "workflow input or sideEffect() for recorded working directory",
+        { allowInSideEffect: true }
+      );
+      return originalProcessCwd?.() ?? "";
+    }) as typeof process.cwd
+  });
+  Object.defineProperty(process, "chdir", {
+    configurable: true,
+    writable: true,
+    value: ((directory: string) => {
+      assertNotInWorkflowRuntime(
+        "process.chdir()",
+        "process configuration outside workflow code"
+      );
+      return originalProcessChdir?.(directory);
+    }) as typeof process.chdir
+  });
+  Object.defineProperty(process, "cpuUsage", {
+    configurable: true,
+    writable: true,
+    value: ((previousValue?: NodeJS.CpuUsage) => {
+      assertProcessRuntimeStateRead("process.cpuUsage()");
+      if (previousValue === undefined) {
+        return originalProcessCpuUsage?.() ?? { user: 0, system: 0 };
+      }
+      return originalProcessCpuUsage?.(previousValue) ?? { user: 0, system: 0 };
+    }) as typeof process.cpuUsage
+  });
+  const guardedMemoryUsage = (() => {
+    assertProcessRuntimeStateRead("process.memoryUsage()");
+    return originalProcessMemoryUsage?.() ?? {
+      rss: 0,
+      heapTotal: 0,
+      heapUsed: 0,
+      external: 0,
+      arrayBuffers: 0
+    };
+  }) as typeof process.memoryUsage;
+  guardedMemoryUsage.rss = (() => {
+    assertProcessRuntimeStateRead("process.memoryUsage.rss()");
+    return originalProcessMemoryUsage?.rss?.() ?? originalProcessMemoryUsage?.().rss ?? 0;
+  }) as typeof process.memoryUsage.rss;
+  Object.defineProperty(process, "memoryUsage", {
+    configurable: true,
+    writable: true,
+    value: guardedMemoryUsage
+  });
+  Object.defineProperty(process, "nextTick", {
+    configurable: true,
+    writable: true,
+    value: ((callback: (...args: any[]) => void, ...args: any[]) => {
+      assertNotInWorkflowRuntime("process.nextTick()", "durust durable operations");
+      return originalProcessNextTick?.(callback, ...args);
+    }) as typeof process.nextTick
+  });
+  if (originalProcessResourceUsage !== undefined) {
+    Object.defineProperty(process, "resourceUsage", {
+      configurable: true,
+      writable: true,
+      value: (() => {
+        assertProcessRuntimeStateRead("process.resourceUsage()");
+        return originalProcessResourceUsage?.();
+      }) as typeof process.resourceUsage
+    });
+  }
+  Object.defineProperty(process, "uptime", {
+    configurable: true,
+    writable: true,
+    value: (() => {
+      assertProcessRuntimeStateRead("process.uptime()");
+      return originalProcessUptime?.() ?? 0;
+    }) as typeof process.uptime
+  });
   Object.defineProperty(globalThis, "setTimeout", {
     configurable: true,
     writable: true,
@@ -297,6 +642,16 @@ function installNondeterminismGuards(): void {
       return originalSetInterval?.(...args);
     }) as typeof globalThis.setInterval
   });
+  if (originalSetImmediate !== undefined) {
+    Object.defineProperty(globalThis, "setImmediate", {
+      configurable: true,
+      writable: true,
+      value: ((...args: Parameters<typeof globalThis.setImmediate>) => {
+        assertNotInWorkflowRuntime("setImmediate()", "durust durable operations");
+        return originalSetImmediate?.(...args);
+      }) as typeof globalThis.setImmediate
+    });
+  }
   Object.defineProperty(globalThis, "queueMicrotask", {
     configurable: true,
     writable: true,
@@ -305,6 +660,43 @@ function installNondeterminismGuards(): void {
       return originalQueueMicrotask?.(callback);
     }) as typeof globalThis.queueMicrotask
   });
+  if (originalRequestAnimationFrame !== undefined) {
+    Object.defineProperty(globalThis, "requestAnimationFrame", {
+      configurable: true,
+      writable: true,
+      value: ((callback: FrameRequestCallback) => {
+        assertNotInWorkflowRuntime("requestAnimationFrame()", "durust sleep() or sleepUntil()");
+        return originalRequestAnimationFrame?.(callback) ?? 0;
+      }) as typeof globalThis.requestAnimationFrame
+    });
+  }
+  if (originalRequestIdleCallback !== undefined) {
+    Object.defineProperty(globalThis, "requestIdleCallback", {
+      configurable: true,
+      writable: true,
+      value: ((...args: Parameters<typeof globalThis.requestIdleCallback>) => {
+        assertNotInWorkflowRuntime("requestIdleCallback()", "durust durable operations");
+        return originalRequestIdleCallback?.(...args) ?? 0;
+      }) as typeof globalThis.requestIdleCallback
+    });
+  }
+  if (originalFetch !== undefined) {
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      writable: true,
+      value: ((...args: Parameters<typeof globalThis.fetch>) => {
+        assertNotInWorkflowRuntime("fetch()", "callActivity() for external I/O");
+        return originalFetch?.(...args) ?? Promise.reject(new Error("fetch is unavailable"));
+      }) as typeof globalThis.fetch
+    });
+  }
+  installNetworkConstructorGuard("WebSocket", originalWebSocket, "callActivity() for network I/O");
+  installNetworkConstructorGuard("EventSource", originalEventSource, "callActivity() for network I/O");
+  installNetworkConstructorGuard(
+    "XMLHttpRequest",
+    originalXMLHttpRequest,
+    "callActivity() for network I/O"
+  );
   Object.defineProperty(Promise, "all", {
     configurable: true,
     writable: true,
@@ -339,6 +731,101 @@ function installNondeterminismGuards(): void {
   });
 }
 
+function installNetworkConstructorGuard<
+  Constructor extends (new (...args: any[]) => any) | undefined
+>(
+  globalName: "WebSocket" | "EventSource" | "XMLHttpRequest",
+  originalConstructor: Constructor,
+  replacement: string
+): void {
+  if (originalConstructor === undefined) {
+    return;
+  }
+  const guarded = new Proxy(originalConstructor, {
+    apply(target, thisArg, args) {
+      assertNotInWorkflowRuntime(`${globalName}()`, replacement);
+      return Reflect.apply(target, thisArg, args);
+    },
+    construct(target, args, newTarget) {
+      assertNotInWorkflowRuntime(`new ${globalName}()`, replacement);
+      return Reflect.construct(target, args, newTarget);
+    }
+  });
+  Object.defineProperty(globalThis, globalName, {
+    configurable: true,
+    writable: true,
+    value: guarded
+  });
+}
+
+function createGuardedProcessEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return new Proxy(env, {
+    get(target, property, receiver) {
+      if (typeof property === "string") {
+        assertProcessEnvRead();
+      }
+      return Reflect.get(target, property, receiver) as string | undefined;
+    },
+    has(target, property) {
+      if (typeof property === "string") {
+        assertProcessEnvRead();
+      }
+      return Reflect.has(target, property);
+    },
+    ownKeys(target) {
+      assertProcessEnvRead();
+      return Reflect.ownKeys(target);
+    },
+    getOwnPropertyDescriptor(target, property) {
+      if (typeof property === "string") {
+        assertProcessEnvRead();
+      }
+      return Reflect.getOwnPropertyDescriptor(target, property);
+    },
+    set(target, property, value, receiver) {
+      if (typeof property === "string") {
+        assertProcessEnvMutation();
+      }
+      return Reflect.set(target, property, value, receiver);
+    },
+    deleteProperty(target, property) {
+      if (typeof property === "string") {
+        assertProcessEnvMutation();
+      }
+      return Reflect.deleteProperty(target, property);
+    },
+    defineProperty(target, property, descriptor) {
+      if (typeof property === "string") {
+        assertProcessEnvMutation();
+      }
+      return Reflect.defineProperty(target, property, descriptor);
+    }
+  });
+}
+
+function assertProcessEnvRead(): void {
+  assertNotInWorkflowRuntime(
+    "process.env",
+    "workflow input or sideEffect() for recorded environment values",
+    { allowInSideEffect: true }
+  );
+}
+
+function assertProcessEnvMutation(): void {
+  assertNotInWorkflowRuntime(
+    "process.env mutation",
+    "process configuration outside workflow code"
+  );
+}
+
+function assertProcessRuntimeStateRead(apiName: string): void {
+  assertNotInWorkflowRuntime(
+    apiName,
+    "workflow input or sideEffect() for recorded process runtime state",
+    { allowInSideEffect: true }
+  );
+}
+
 export function createActivityDurablePromise<A extends ActivityDefinition<any, any, string>>(
   activityDefinition: A,
   input: ActivityInput<A>,
@@ -369,7 +856,7 @@ export function createChildWorkflowStart<W extends WorkflowDefinition<any, any, 
   return new ChildWorkflowStartDurable(workflowDefinition, input, options);
 }
 
-export interface RuntimeTimerSpec {
+interface RuntimeTimerSpec {
   readonly kind: "sleep" | "sleep_until";
   readonly durationMs?: number;
   readonly fireAt?: number;
@@ -407,18 +894,19 @@ export function createSelectAllDurablePromise(
 export function createSignalDurablePromise<
   Payload extends object,
   const Name extends string = string
->(name: Name): SignalDefinition<Payload, Name> {
-  return new SignalDurablePromise<Payload, Name>(name);
+>(name: Name, payloadSchema?: SchemaAdapter<Payload>): SignalDefinition<Payload, Name> {
+  return new SignalDurablePromise<Payload, Name>(name, payloadSchema);
 }
 
-export class WorkflowRuntimeContext {
-  readonly #claimed: ClaimedWorkflowTask;
+class WorkflowRuntimeContext {
+  #claimed: ClaimedWorkflowTask;
   readonly #defaultActivityTaskQueue: string;
   readonly #defaultWorkflowTaskQueue: string;
   readonly #payloadCodec: CodecId;
   readonly #workflowInputSchema: SchemaAdapter<unknown> | undefined;
-  readonly #nowMs: number;
-  readonly #liveSignals: SignalInboxRecord[];
+  readonly #queryStateSchema: SchemaAdapter<unknown> | undefined;
+  #nowMs: number;
+  #liveSignals: SignalInboxRecord[];
   readonly #replayEvents: readonly HistoryEvent[];
   readonly #activityCompletions = new Map<string, HistoryEvent>();
   readonly #activityFailures = new Map<string, HistoryEvent>();
@@ -443,19 +931,27 @@ export class WorkflowRuntimeContext {
   readonly #scheduleChildWorkflowMaps: ChildWorkflowMapTask[] = [];
   #queryProjection: PayloadRef | null = null;
   #allowNondeterministicGlobalsDepth = 0;
+  readonly #mode: "replay" | "hot";
+  readonly #hotWaiters = new Map<string, HotWaiter>();
+  #hotProgressVersion = 0;
+  #hotProgressWaiters: Deferred<void>[] = [];
 
   constructor(
     claimed: ClaimedWorkflowTask,
     options: PrepareWorkflowTaskOptions,
-    workflowInputSchema?: SchemaAdapter<unknown>
+    workflowInputSchema?: SchemaAdapter<unknown>,
+    queryStateSchema?: SchemaAdapter<unknown>,
+    mode: "replay" | "hot" = "replay"
   ) {
     this.#claimed = claimed;
     this.#defaultActivityTaskQueue = options.defaultActivityTaskQueue ?? "default";
     this.#defaultWorkflowTaskQueue = options.defaultWorkflowTaskQueue ?? "default";
     this.#payloadCodec = options.payloadCodec ?? "MessagePack";
     this.#workflowInputSchema = workflowInputSchema;
+    this.#queryStateSchema = queryStateSchema;
     this.#nowMs = options.nowMs ?? 0;
     this.#liveSignals = [...(options.liveSignals ?? [])];
+    this.#mode = mode;
     this.#replayEvents = claimed.prefetchedHistory.filter(
       (event) =>
         event.eventType !== "WorkflowStarted" &&
@@ -472,12 +968,19 @@ export class WorkflowRuntimeContext {
         event.eventType !== "ChildWorkflowCancelled" &&
         event.eventType !== "TimerFired"
     );
-    for (const event of claimed.prefetchedHistory) {
+    this.#ingestHistory(claimed.prefetchedHistory);
+  }
+
+  #ingestHistory(events: readonly HistoryEvent[]): void {
+    for (const event of events) {
       if (event.data.kind === "ActivityCompleted") {
         this.#activityCompletions.set(commandKey(event.data.completed.commandId), event);
       }
       if (event.data.kind === "ActivityFailed") {
         this.#activityFailures.set(commandKey(event.data.failed.commandId), event);
+      }
+      if (event.data.kind === "ActivityTimedOut") {
+        this.#activityFailures.set(commandKey(event.data.timedOut.commandId), event);
       }
       if (event.data.kind === "ActivityMapCompleted") {
         this.#activityMapCompletions.set(commandKey(event.data.completed.commandId), event);
@@ -509,11 +1012,137 @@ export class WorkflowRuntimeContext {
     }
   }
 
+  isHot(): boolean {
+    return this.#mode === "hot";
+  }
+
+  hotProgressVersion(): number {
+    return this.#hotProgressVersion;
+  }
+
+  notifyHotProgress(): void {
+    if (!this.isHot()) {
+      return;
+    }
+    this.#hotProgressVersion += 1;
+    const waiters = this.#hotProgressWaiters;
+    this.#hotProgressWaiters = [];
+    for (const waiter of waiters) {
+      waiter.resolve(undefined);
+    }
+  }
+
+  async waitForHotProgressAfter(version: number): Promise<void> {
+    if (!this.isHot()) {
+      throw new Error("hot progress can only be awaited for hot workflow execution");
+    }
+    if (this.#hotProgressVersion > version) {
+      return;
+    }
+    const deferred = createDeferred<void>();
+    this.#hotProgressWaiters.push(deferred);
+    return deferred.promise;
+  }
+
+  hotSuspend<T>(
+    id: CommandId,
+    resolve: () => HotSuspendResolution<T>
+  ): Promise<T> {
+    return this.hotSuspendByKey(commandKey(id), resolve);
+  }
+
+  hotSuspendByKey<T>(
+    key: string,
+    resolve: () => HotSuspendResolution<T>
+  ): Promise<T> {
+    if (!this.isHot()) {
+      throw new WorkflowSuspended();
+    }
+    const immediate = resolve();
+    if (immediate.kind === "Resolved") {
+      return Promise.resolve(immediate.value);
+    }
+    if (immediate.kind === "Rejected") {
+      return Promise.reject(immediate.error);
+    }
+
+    const deferred = createDeferred<T>();
+    const waiter: HotWaiter = {
+      key,
+      tryResolve: () => {
+        const resolution = resolve();
+        if (resolution.kind === "Pending") {
+          return false;
+        }
+        this.#hotWaiters.delete(key);
+        if (resolution.kind === "Rejected") {
+          deferred.reject(resolution.error);
+        } else {
+          deferred.resolve(resolution.value);
+        }
+        return true;
+      },
+      reject: (error) => {
+        this.#hotWaiters.delete(key);
+        deferred.reject(error);
+      }
+    };
+    this.#hotWaiters.set(key, waiter);
+    this.notifyHotProgress();
+    return deferred.promise;
+  }
+
+  advanceHotClaim(
+    claimed: ClaimedWorkflowTask,
+    options: HotWorkflowTaskOptions
+  ): void {
+    if (!this.isHot()) {
+      throw new Error("advanceHotClaim requires hot workflow execution");
+    }
+    this.#claimed = claimed;
+    this.#nowMs = options.nowMs ?? this.#nowMs;
+    this.#liveSignals = [...(options.liveSignals ?? [])];
+    this.#ingestHistory(claimed.prefetchedHistory);
+    this.#tryResolveHotWaiters();
+  }
+
+  markHotCommitAccepted(newTailEventId: EventId): void {
+    if (!this.isHot()) {
+      throw new Error("markHotCommitAccepted requires hot workflow execution");
+    }
+    this.#claimed = {
+      ...this.#claimed,
+      replayTargetEventId: newTailEventId
+    };
+    this.#appendEvents.length = 0;
+    this.#upsertWaits.length = 0;
+    this.#deleteWaits.length = 0;
+    this.#consumeSignals.length = 0;
+    this.#scheduleActivities.length = 0;
+    this.#scheduleActivityMaps.length = 0;
+    this.#startChildWorkflows.length = 0;
+    this.#scheduleChildWorkflowMaps.length = 0;
+    this.#queryProjection = null;
+  }
+
+  #tryResolveHotWaiters(): void {
+    for (const waiter of [...this.#hotWaiters.values()]) {
+      try {
+        waiter.tryResolve();
+      } catch (error) {
+        waiter.reject(error);
+      }
+    }
+  }
+
   allowsNondeterministicGlobals(): boolean {
     return this.#allowNondeterministicGlobalsDepth > 0;
   }
 
-  resolveSignal<Payload extends object>(name: string): SignalResolution<Payload> {
+  resolveSignal<Payload extends object>(
+    name: string,
+    payloadSchema?: SchemaAdapter<Payload>
+  ): SignalResolution<Payload> {
     const id = commandId(this.#claimed.runId, this.#nextCommandSeq++);
     const fingerprint = signalFingerprint(name);
     const replayEvent = this.#peekReplayEvent();
@@ -530,7 +1159,7 @@ export class WorkflowRuntimeContext {
       this.#advanceReplay();
       return {
         kind: "Consumed",
-        value: decodePayload<Payload>(consumed.payload as PayloadRef<Payload>),
+        value: decodePayload<Payload>(consumed.payload as PayloadRef<Payload>, payloadSchema),
         eventId: replayEvent.eventId
       };
     }
@@ -554,7 +1183,7 @@ export class WorkflowRuntimeContext {
       this.#deleteWaits.push(signalWaitId(id));
       return {
         kind: "Consumed",
-        value: decodePayload<Payload>(live.payload as PayloadRef<Payload>),
+        value: decodePayload<Payload>(live.payload as PayloadRef<Payload>, payloadSchema),
         eventId: consumedEventId
       };
     }
@@ -647,11 +1276,12 @@ export class WorkflowRuntimeContext {
         };
       }
       const failed = this.#activityFailures.get(commandKey(scheduled.commandId));
-      if (failed?.data.kind === "ActivityFailed") {
+      const failure = failed === undefined ? null : activityTerminalFailure(failed);
+      if (failed !== undefined && failure !== null) {
         return {
           kind: "Failed",
           commandId: scheduled.commandId,
-          failure: failed.data.failed.failure,
+          failure,
           eventId: failed.eventId
         };
       }
@@ -683,15 +1313,183 @@ export class WorkflowRuntimeContext {
       };
     }
     const failed = this.#activityFailures.get(commandKey(id));
-    if (failed?.data.kind === "ActivityFailed") {
+    const failure = failed === undefined ? null : activityTerminalFailure(failed);
+    if (failed !== undefined && failure !== null) {
       return {
         kind: "Failed",
         commandId: id,
-        failure: failed.data.failed.failure,
+        failure,
         eventId: failed.eventId
       };
     }
     return { kind: "Pending", commandId: id };
+  }
+
+  resolveHotActivity<A extends ActivityDefinition<any, any, string>>(
+    activityDefinition: A,
+    id: CommandId
+  ): HotSuspendResolution<ActivityOutput<A>> {
+    const resolution = this.resolveHotActivityBranch(activityDefinition, id);
+    if (resolution.kind === "Resolved") {
+      return { kind: "Resolved", value: resolution.value.value };
+    }
+    return resolution;
+  }
+
+  resolveHotActivityBranch<A extends ActivityDefinition<any, any, string>>(
+    activityDefinition: A,
+    id: CommandId
+  ): HotSuspendResolution<ReadyJoinBranch<ActivityOutput<A>>> {
+    const resolution = this.resolveActivityHandleResult(activityDefinition, id);
+    if (resolution.kind === "Completed") {
+      return {
+        kind: "Resolved",
+        value: { kind: "Ready", value: resolution.value, eventId: resolution.eventId }
+      };
+    }
+    if (resolution.kind === "Failed") {
+      return { kind: "Rejected", error: new ActivityFailureError(resolution.failure) };
+    }
+    return { kind: "Pending" };
+  }
+
+  resolveHotTimer(id: CommandId): HotSuspendResolution<void> {
+    const resolution = this.resolveHotTimerBranch(id);
+    if (resolution.kind === "Resolved") {
+      return { kind: "Resolved", value: undefined };
+    }
+    return resolution;
+  }
+
+  resolveHotTimerBranch(id: CommandId): HotSuspendResolution<ReadyJoinBranch<void>> {
+    const terminal = this.#timerFires.get(commandKey(id));
+    if (terminal?.data.kind === "TimerFired") {
+      return {
+        kind: "Resolved",
+        value: { kind: "Ready", value: undefined, eventId: terminal.eventId }
+      };
+    }
+    return { kind: "Pending" };
+  }
+
+  resolveHotSignal<Payload extends object>(
+    name: string,
+    id: CommandId,
+    payloadSchema?: SchemaAdapter<Payload>
+  ): HotSuspendResolution<Payload> {
+    const resolution = this.resolveHotSignalBranch<Payload>(name, id, payloadSchema);
+    if (resolution.kind === "Resolved") {
+      return { kind: "Resolved", value: resolution.value.value };
+    }
+    return resolution;
+  }
+
+  resolveHotSignalBranch<Payload extends object>(
+    name: string,
+    id: CommandId,
+    payloadSchema?: SchemaAdapter<Payload>
+  ): HotSuspendResolution<ReadyJoinBranch<Payload>> {
+    const live = this.#takeLiveSignal(name);
+    if (live === undefined) {
+      return { kind: "Pending" };
+    }
+    const consumedEventId = this.#nextAppendEventId();
+    this.#appendEvents.push({
+      data: {
+        kind: "SignalConsumed",
+        consumed: {
+          commandId: id,
+          signalId: live.signalId,
+          signalName: live.signalName,
+          payload: live.payload,
+          fingerprint: signalFingerprint(name)
+        }
+      }
+    });
+    this.#consumeSignals.push(String(live.signalId));
+    this.#deleteWaits.push(signalWaitId(id));
+    return {
+      kind: "Resolved",
+      value: {
+        kind: "Ready",
+        value: decodePayload<Payload>(live.payload as PayloadRef<Payload>, payloadSchema),
+        eventId: consumedEventId
+      }
+    };
+  }
+
+  resolveHotActivityMapResult<A extends ActivityDefinition<any, any, string>>(
+    id: CommandId
+  ): HotSuspendResolution<PayloadRef<ActivityMapResultManifest<ActivityOutput<A>>>> {
+    const completed = this.#activityMapCompletions.get(commandKey(id));
+    if (completed?.data.kind === "ActivityMapCompleted") {
+      return {
+        kind: "Resolved",
+        value: completed.data.completed.resultManifest as PayloadRef<ActivityMapResultManifest<ActivityOutput<A>>>
+      };
+    }
+    const failed = this.#activityMapFailures.get(commandKey(id));
+    if (failed?.data.kind === "ActivityMapFailed") {
+      return { kind: "Rejected", error: new ActivityFailureError(failed.data.failed.failure) };
+    }
+    return { kind: "Pending" };
+  }
+
+  resolveHotChildWorkflowMapResult<W extends WorkflowDefinition<any, any, any, string>>(
+    id: CommandId
+  ): HotSuspendResolution<PayloadRef<ChildWorkflowMapResultManifest<WorkflowOutput<W>>>> {
+    const completed = this.#childMapCompletions.get(commandKey(id));
+    if (completed?.data.kind === "ChildWorkflowMapCompleted") {
+      return {
+        kind: "Resolved",
+        value: completed.data.completed.resultManifest as PayloadRef<ChildWorkflowMapResultManifest<WorkflowOutput<W>>>
+      };
+    }
+    const failed = this.#childMapFailures.get(commandKey(id));
+    if (failed?.data.kind === "ChildWorkflowMapFailed") {
+      return { kind: "Rejected", error: new ChildWorkflowMapFailureError(failed.data.failed.failure) };
+    }
+    return { kind: "Pending" };
+  }
+
+  resolveHotChildWorkflowStart<W extends WorkflowDefinition<any, any, any, string>>(
+    workflowDefinition: W,
+    id: CommandId
+  ): HotSuspendResolution<ChildWorkflowHandle<WorkflowOutput<W>>> {
+    const started = this.#childStarts.get(commandKey(id));
+    if (started?.data.kind === "ChildWorkflowStarted") {
+      return {
+        kind: "Resolved",
+        value: new RuntimeChildWorkflowHandle(
+          workflowDefinition,
+          id,
+          started.data.started.workflowId,
+          started.data.started.runId
+        )
+      };
+    }
+    const failed = this.#childFailures.get(commandKey(id));
+    if (failed?.data.kind === "ChildWorkflowFailed") {
+      return { kind: "Rejected", error: new ChildWorkflowFailureError(failed.data.failed.failure) };
+    }
+    return { kind: "Pending" };
+  }
+
+  resolveHotChildWorkflowResult<W extends WorkflowDefinition<any, any, any, string>>(
+    workflowDefinition: W,
+    id: CommandId
+  ): HotSuspendResolution<WorkflowOutput<W>> {
+    const resolution = this.resolveChildWorkflowResult(workflowDefinition, id);
+    if (resolution.kind === "Completed") {
+      return { kind: "Resolved", value: resolution.value };
+    }
+    if (resolution.kind === "Failed") {
+      return { kind: "Rejected", error: new ChildWorkflowFailureError(resolution.failure) };
+    }
+    if (resolution.kind === "Cancelled") {
+      return { kind: "Rejected", error: new ChildWorkflowCancelledError(resolution.reason) };
+    }
+    return { kind: "Pending" };
   }
 
   resolveActivityMap<A extends ActivityDefinition<any, any, string>>(
@@ -1088,6 +1886,7 @@ export class WorkflowRuntimeContext {
     this.#appendEvents.push({
       data: { kind: "WorkflowCompleted", result }
     });
+    this.notifyHotProgress();
   }
 
   failWorkflow(failure: DurableFailure): void {
@@ -1097,13 +1896,21 @@ export class WorkflowRuntimeContext {
         failure
       }
     });
+    this.notifyHotProgress();
   }
 
   publish<QueryState extends object>(view: QueryState): void {
-    this.#queryProjection = encodePayload(view, { codec: this.#payloadCodec });
+    assertDurableInputValue(view, "query projection");
+    this.#queryProjection = encodePayload(view, {
+      codec: this.#payloadCodec,
+      ...(this.#queryStateSchema === undefined
+        ? {}
+        : { schema: this.#queryStateSchema as SchemaAdapter<QueryState> })
+    });
   }
 
   continueAsNew<Input extends object>(input: Input): never {
+    assertDurableInputValue(input, "continueAsNew input");
     const payload = encodePayload(input, {
       codec: this.#payloadCodec,
       ...(this.#workflowInputSchema === undefined
@@ -1116,6 +1923,7 @@ export class WorkflowRuntimeContext {
         input: payload
       }
     });
+    this.notifyHotProgress();
     throw new ContinueAsNewRequested();
   }
 
@@ -1420,7 +2228,8 @@ class ActivityDurablePromise<A extends ActivityDefinition<any, any, string>>
     onfulfilled?: ((value: ActivityOutput<A>) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveActivity(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveActivity(
       this.#activityDefinition,
       this.#input,
       this.#options
@@ -1434,6 +2243,12 @@ class ActivityDurablePromise<A extends ActivityDefinition<any, any, string>>
     }
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotActivity(this.#activityDefinition, resolution.commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1450,7 +2265,11 @@ class ActivityDurablePromise<A extends ActivityDefinition<any, any, string>>
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
     }
-    return { kind: "Pending" };
+    return {
+      kind: "Pending",
+      key: commandKey(resolution.commandId),
+      resolve: () => context.resolveHotActivityBranch(this.#activityDefinition, resolution.commandId)
+    };
   }
 
   spawn(): PromiseLike<ActivityHandle<ActivityOutput<A>>> {
@@ -1503,7 +2322,8 @@ class ActivityHandleResultDurablePromise<A extends ActivityDefinition<any, any, 
     onfulfilled?: ((value: ActivityOutput<A>) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveActivityHandleResult(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveActivityHandleResult(
       this.#activityDefinition,
       this.#commandId
     );
@@ -1516,6 +2336,12 @@ class ActivityHandleResultDurablePromise<A extends ActivityDefinition<any, any, 
     }
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        this.#commandId,
+        () => context.resolveHotActivity(this.#activityDefinition, this.#commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1555,7 +2381,8 @@ class ActivityMapResultDurablePromise<A extends ActivityDefinition<any, any, str
       | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveActivityMap(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveActivityMap(
       this.#activityDefinition,
       this.#options
     );
@@ -1568,6 +2395,12 @@ class ActivityMapResultDurablePromise<A extends ActivityDefinition<any, any, str
     }
     if (resolution.kind === "Failed") {
       throw new ActivityFailureError(resolution.failure);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotActivityMapResult<A>(resolution.commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1607,7 +2440,8 @@ class ChildWorkflowMapResultDurablePromise<W extends WorkflowDefinition<any, any
       | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveChildWorkflowMap(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveChildWorkflowMap(
       this.#workflowDefinition,
       this.#options
     );
@@ -1620,6 +2454,12 @@ class ChildWorkflowMapResultDurablePromise<W extends WorkflowDefinition<any, any
     }
     if (resolution.kind === "Failed") {
       throw new ChildWorkflowMapFailureError(resolution.failure);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotChildWorkflowMapResult<W>(resolution.commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1665,7 +2505,8 @@ class ChildWorkflowSpawnDurablePromise<W extends WorkflowDefinition<any, any, an
     onfulfilled?: ((value: ChildWorkflowHandle<WorkflowOutput<W>>) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveChildWorkflowStart(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveChildWorkflowStart(
       this.#workflowDefinition,
       this.#input,
       this.#options
@@ -1681,6 +2522,15 @@ class ChildWorkflowSpawnDurablePromise<W extends WorkflowDefinition<any, any, an
     }
     if (resolution.kind === "Failed") {
       throw new ChildWorkflowFailureError(resolution.failure);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotChildWorkflowStart(
+          this.#workflowDefinition,
+          resolution.commandId
+        )
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1727,7 +2577,8 @@ class ChildWorkflowResultDurablePromise<W extends WorkflowDefinition<any, any, a
     onfulfilled?: ((value: WorkflowOutput<W>) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveChildWorkflowResult(
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveChildWorkflowResult(
       this.#workflowDefinition,
       this.#commandId
     );
@@ -1741,6 +2592,12 @@ class ChildWorkflowResultDurablePromise<W extends WorkflowDefinition<any, any, a
     }
     if (resolution.kind === "Cancelled") {
       throw new ChildWorkflowCancelledError(resolution.reason);
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        this.#commandId,
+        () => context.resolveHotChildWorkflowResult(this.#workflowDefinition, this.#commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1758,9 +2615,16 @@ class TimerDurablePromise implements DurableBranch<void> {
     onfulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveTimer(this.#spec);
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveTimer(this.#spec);
     if (resolution.kind === "Fired") {
       return Promise.resolve(onfulfilled ? onfulfilled(undefined) : (undefined as TResult1));
+    }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotTimer(resolution.commandId)
+      ).then(onfulfilled, _onrejected);
     }
     throw new WorkflowSuspended();
   }
@@ -1769,7 +2633,11 @@ class TimerDurablePromise implements DurableBranch<void> {
     const resolution = context.resolveTimer(this.#spec);
     return resolution.kind === "Fired"
       ? { kind: "Ready", value: undefined, eventId: resolution.eventId }
-      : { kind: "Pending" };
+      : {
+          kind: "Pending",
+          key: commandKey(resolution.commandId),
+          resolve: () => context.resolveHotTimerBranch(resolution.commandId)
+        };
   }
 }
 
@@ -1779,29 +2647,52 @@ class SignalDurablePromise<Payload extends object, const Name extends string = s
   readonly durableBranchKind = "signal" as const;
   readonly kind = "signal" as const;
   readonly name: Name;
+  readonly payloadSchema?: SchemaAdapter<Payload>;
 
-  constructor(name: Name) {
+  constructor(name: Name, payloadSchema?: SchemaAdapter<Payload>) {
     this.name = name;
+    if (payloadSchema !== undefined) {
+      this.payloadSchema = payloadSchema;
+    }
   }
 
   then<TResult1 = Payload, TResult2 = never>(
     onfulfilled?: ((value: Payload) => TResult1 | PromiseLike<TResult1>) | null,
     _onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
   ): PromiseLike<TResult1 | TResult2> {
-    const resolution = currentWorkflowRuntimeContext().resolveSignal<Payload>(this.name);
+    const context = currentWorkflowRuntimeContext();
+    const resolution = context.resolveSignal<Payload>(this.name, this.payloadSchema);
     if (resolution.kind === "Consumed") {
       return Promise.resolve(
         onfulfilled ? onfulfilled(resolution.value) : (resolution.value as unknown as TResult1)
       );
     }
+    if (context.isHot()) {
+      return context.hotSuspend(
+        resolution.commandId,
+        () => context.resolveHotSignal<Payload>(
+          this.name,
+          resolution.commandId,
+          this.payloadSchema
+        )
+      ).then(onfulfilled, _onrejected);
+    }
     throw new WorkflowSuspended();
   }
 
   __durustRegisterJoinBranch(context: WorkflowRuntimeContext): JoinBranchResolution<Payload> {
-    const resolution = context.resolveSignal<Payload>(this.name);
+    const resolution = context.resolveSignal<Payload>(this.name, this.payloadSchema);
     return resolution.kind === "Consumed"
       ? { kind: "Ready", value: resolution.value, eventId: resolution.eventId }
-      : { kind: "Pending" };
+      : {
+          kind: "Pending",
+          key: commandKey(resolution.commandId),
+          resolve: () => context.resolveHotSignalBranch<Payload>(
+            this.name,
+            resolution.commandId,
+            this.payloadSchema
+          )
+        };
   }
 }
 
@@ -1818,18 +2709,39 @@ class JoinDurablePromise implements PromiseLike<Record<string, unknown>> {
   ): PromiseLike<TResult1 | TResult2> {
     const context = currentWorkflowRuntimeContext();
     const values: Record<string, unknown> = {};
-    let pending = false;
+    const pending: PendingJoinBranch<unknown>[] = [];
     for (const key of Object.keys(this.#branches)) {
       const branch = this.#branches[key];
       const durableBranch = asDurableJoinBranch(branch);
       const result = durableBranch.__durustRegisterJoinBranch(context);
       if (result.kind === "Pending") {
-        pending = true;
+        pending.push({
+          ...result,
+          resolve: () => {
+            const resolved = result.resolve();
+            if (resolved.kind === "Resolved") {
+              return {
+                kind: "Resolved",
+                value: {
+                  ...resolved.value,
+                  value: { key, value: resolved.value.value }
+                }
+              };
+            }
+            return resolved as HotSuspendResolution<ReadyJoinBranch<unknown>>;
+          }
+        });
       } else {
         values[key] = result.value;
       }
     }
-    if (pending) {
+    if (pending.length > 0) {
+      if (context.isHot()) {
+        return context.hotSuspendByKey(
+          hotCompositeWaitKey("join", pending),
+          () => resolveHotJoin(values, pending)
+        ).then(onfulfilled, _onrejected);
+      }
       throw new WorkflowSuspended();
     }
     return Promise.resolve(onfulfilled ? onfulfilled(values) : (values as TResult1));
@@ -1849,17 +2761,38 @@ class JoinAllDurablePromise implements PromiseLike<readonly unknown[]> {
   ): PromiseLike<TResult1 | TResult2> {
     const context = currentWorkflowRuntimeContext();
     const values: unknown[] = [];
-    let pending = false;
+    const pending: PendingJoinBranch<unknown>[] = [];
     this.#branches.forEach((branch, index) => {
       const durableBranch = asDurableJoinBranch(branch);
       const result = durableBranch.__durustRegisterJoinBranch(context);
       if (result.kind === "Pending") {
-        pending = true;
+        pending.push({
+          ...result,
+          resolve: () => {
+            const resolved = result.resolve();
+            if (resolved.kind === "Resolved") {
+              return {
+                kind: "Resolved",
+                value: {
+                  ...resolved.value,
+                  value: { index, value: resolved.value.value }
+                }
+              };
+            }
+            return resolved as HotSuspendResolution<ReadyJoinBranch<unknown>>;
+          }
+        });
       } else {
         values[index] = result.value;
       }
     });
-    if (pending) {
+    if (pending.length > 0) {
+      if (context.isHot()) {
+        return context.hotSuspendByKey(
+          hotCompositeWaitKey("joinAll", pending),
+          () => resolveHotJoinAll(values, pending)
+        ).then(onfulfilled, _onrejected);
+      }
       throw new WorkflowSuspended();
     }
     return Promise.resolve(onfulfilled ? onfulfilled(values) : (values as TResult1));
@@ -1880,6 +2813,7 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
     const context = currentWorkflowRuntimeContext();
     const keys = Object.keys(this.#branches);
     const ready: SelectReadyBranch[] = [];
+    const pending: PendingJoinBranch<unknown>[] = [];
     keys.forEach((key, ordinal) => {
       const branch = this.#branches[key];
       const durableBranch = asDurableJoinBranch(branch);
@@ -1891,10 +2825,38 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
           value: result.value,
           eventId: result.eventId
         });
+      } else {
+        pending.push({
+          ...result,
+          resolve: () => {
+            const resolved = result.resolve();
+            if (resolved.kind === "Resolved") {
+              return {
+                kind: "Resolved",
+                value: {
+                  ...resolved.value,
+                  value: {
+                    ordinal,
+                    key,
+                    value: resolved.value.value,
+                    eventId: resolved.value.eventId
+                  }
+                }
+              };
+            }
+            return resolved as HotSuspendResolution<ReadyJoinBranch<unknown>>;
+          }
+        });
       }
     });
 
     if (ready.length === 0) {
+      if (context.isHot()) {
+        return context.hotSuspendByKey(
+          hotCompositeWaitKey("select", pending),
+          () => resolveHotSelect(context, keys, ready, pending)
+        ).then(onfulfilled, _onrejected);
+      }
       throw new WorkflowSuspended();
     }
 
@@ -1917,6 +2879,7 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
   ): PromiseLike<TResult1 | TResult2> {
     const context = currentWorkflowRuntimeContext();
     const ready: SelectReadyBranch[] = [];
+    const pending: PendingJoinBranch<unknown>[] = [];
     this.#branches.forEach((branch, ordinal) => {
       const durableBranch = asDurableJoinBranch(branch);
       const result = durableBranch.__durustRegisterJoinBranch(context);
@@ -1927,10 +2890,39 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
           value: result.value,
           eventId: result.eventId
         });
+      } else {
+        pending.push({
+          ...result,
+          resolve: () => {
+            const resolved = result.resolve();
+            if (resolved.kind === "Resolved") {
+              return {
+                kind: "Resolved",
+                value: {
+                  ...resolved.value,
+                  value: {
+                    ordinal,
+                    key: String(ordinal),
+                    value: resolved.value.value,
+                    eventId: resolved.value.eventId
+                  }
+                }
+              };
+            }
+            return resolved as HotSuspendResolution<ReadyJoinBranch<unknown>>;
+          }
+        });
       }
     });
 
     if (ready.length === 0) {
+      if (context.isHot()) {
+        const keys = this.#branches.map((_, index) => String(index));
+        return context.hotSuspendByKey(
+          hotCompositeWaitKey("selectAll", pending),
+          () => resolveHotSelectAll(context, keys, ready, pending)
+        ).then(onfulfilled, _onrejected);
+      }
       throw new WorkflowSuspended();
     }
 
@@ -1970,8 +2962,20 @@ class SideEffectDurablePromise<T> implements PromiseLike<T> {
 }
 
 type JoinBranchResolution<T> =
-  | { readonly kind: "Pending" }
-  | { readonly kind: "Ready"; readonly value: T; readonly eventId: EventId };
+  | PendingJoinBranch<T>
+  | ReadyJoinBranch<T>;
+
+interface PendingJoinBranch<T> {
+  readonly kind: "Pending";
+  readonly key: string;
+  resolve(): HotSuspendResolution<ReadyJoinBranch<T>>;
+}
+
+interface ReadyJoinBranch<T> {
+  readonly kind: "Ready";
+  readonly value: T;
+  readonly eventId: EventId;
+}
 
 interface DurableJoinBranch<T> {
   __durustRegisterJoinBranch(context: WorkflowRuntimeContext): JoinBranchResolution<T>;
@@ -1988,6 +2992,94 @@ function asDurableJoinBranch(branch: unknown): DurableJoinBranch<unknown> {
     return branch as DurableJoinBranch<unknown>;
   }
   throw new Error("durust.join accepts only durable branches");
+}
+
+function hotCompositeWaitKey(
+  kind: "join" | "joinAll" | "select" | "selectAll",
+  pending: readonly PendingJoinBranch<unknown>[]
+): string {
+  return `${kind}:${pending.map((branch) => branch.key).join("|")}`;
+}
+
+function resolveHotJoin(
+  initialValues: Record<string, unknown>,
+  pending: readonly PendingJoinBranch<unknown>[]
+): HotSuspendResolution<Record<string, unknown>> {
+  const values = { ...initialValues };
+  for (const branch of pending) {
+    const resolution = branch.resolve();
+    if (resolution.kind !== "Resolved") {
+      return resolution as HotSuspendResolution<Record<string, unknown>>;
+    }
+    const joined = resolution.value.value as { readonly key: string; readonly value: unknown };
+    values[joined.key] = joined.value;
+  }
+  return { kind: "Resolved", value: values };
+}
+
+function resolveHotJoinAll(
+  initialValues: readonly unknown[],
+  pending: readonly PendingJoinBranch<unknown>[]
+): HotSuspendResolution<readonly unknown[]> {
+  const values = [...initialValues];
+  for (const branch of pending) {
+    const resolution = branch.resolve();
+    if (resolution.kind !== "Resolved") {
+      return resolution as HotSuspendResolution<readonly unknown[]>;
+    }
+    const joined = resolution.value.value as { readonly index: number; readonly value: unknown };
+    values[joined.index] = joined.value;
+  }
+  return { kind: "Resolved", value: values };
+}
+
+function resolveHotSelect(
+  context: WorkflowRuntimeContext,
+  keys: readonly string[],
+  initialReady: readonly SelectReadyBranch[],
+  pending: readonly PendingJoinBranch<unknown>[]
+): HotSuspendResolution<SelectRuntimeResult> {
+  const ready = [...initialReady];
+  for (const branch of pending) {
+    const resolution = branch.resolve();
+    if (resolution.kind === "Rejected") {
+      return resolution as HotSuspendResolution<SelectRuntimeResult>;
+    }
+    if (resolution.kind === "Resolved") {
+      ready.push(resolution.value.value as SelectReadyBranch);
+    }
+  }
+  if (ready.length === 0) {
+    return { kind: "Pending" };
+  }
+  const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+  return { kind: "Resolved", value: { branch: winner.key, value: winner.value } };
+}
+
+function resolveHotSelectAll(
+  context: WorkflowRuntimeContext,
+  keys: readonly string[],
+  initialReady: readonly SelectReadyBranch[],
+  pending: readonly PendingJoinBranch<unknown>[]
+): HotSuspendResolution<SelectAllRuntimeResult> {
+  const resolution = resolveHotSelect(context, keys, initialReady, pending);
+  if (resolution.kind !== "Resolved") {
+    return resolution as HotSuspendResolution<SelectAllRuntimeResult>;
+  }
+  return {
+    kind: "Resolved",
+    value: { index: Number(resolution.value.branch), value: resolution.value.value }
+  };
+}
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function sameCommandId(left: CommandId, right: CommandId): boolean {
@@ -2053,6 +3145,12 @@ function validateMarkerCommand(changeId: string, expected: CommandId, recorded: 
   }
 }
 
+function assertDurableInputValue(value: unknown, label: string): void {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be a durable input object`);
+  }
+}
+
 function isWorkflowTaskFatalError(error: unknown): boolean {
   if (error instanceof UnsupportedWorkflowVersionError) {
     return true;
@@ -2109,6 +3207,20 @@ function durableFailureFromUnknown(error: unknown): DurableFailure {
     message: String(error),
     nonRetryable: false
   };
+}
+
+function activityTerminalFailure(event: HistoryEvent): DurableFailure | null {
+  if (event.data.kind === "ActivityFailed") {
+    return event.data.failed.failure;
+  }
+  if (event.data.kind === "ActivityTimedOut") {
+    return {
+      errorType: "ActivityTimedOut",
+      message: event.data.timedOut.message,
+      nonRetryable: true
+    };
+  }
+  return null;
 }
 
 function sameFingerprint(

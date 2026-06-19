@@ -6,6 +6,8 @@ import {
   digestBytes,
   encodePayload,
   toBlobRef,
+  type ActivityHeartbeatOutcome,
+  type ActivityHeartbeatRequest,
   type ActivityMapTask,
   type ChildWorkflowMapTask,
   type ClaimActivityOptions,
@@ -37,6 +39,8 @@ import {
   type StartWorkflowOutcome,
   type StartWorkflowRequest,
   type StreamHistoryRequest,
+  type TimeoutDueActivitiesOutcome,
+  type TimeoutDueActivitiesRequest,
   type WorkflowTaskClaim,
   type WorkflowTaskCommit
 } from "@durust/core";
@@ -430,8 +434,18 @@ export class PayloadBackend implements DurableBackend {
     return this.#backend.failActivity(await this.#offload(req));
   }
 
+  async heartbeatActivity(req: ActivityHeartbeatRequest): Promise<ActivityHeartbeatOutcome> {
+    return this.#backend.heartbeatActivity(req);
+  }
+
   async fireDueTimers(req: FireDueTimersRequest): Promise<FireDueTimersOutcome> {
     return this.#backend.fireDueTimers(req);
+  }
+
+  async timeoutDueActivities(
+    req: TimeoutDueActivitiesRequest
+  ): Promise<TimeoutDueActivitiesOutcome> {
+    return this.#backend.timeoutDueActivities(req);
   }
 
   async signalWorkflow(req: SignalWorkflowRequest): Promise<SignalWorkflowOutcome> {

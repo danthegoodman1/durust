@@ -22,6 +22,7 @@ import {
   type ChildWorkflowMapHandle,
   type ChildWorkflowStart,
   type DurablePromise,
+  type SchemaAdapter,
   type WorkflowHandle
 } from "@durust/core";
 
@@ -54,6 +55,11 @@ type NoInput = {};
 interface OrderView {
   readonly status: string;
 }
+
+const approvalSchema: SchemaAdapter<{ readonly approvalId: string }> = {
+  fingerprint: "sha256:approval",
+  rootKind: "object"
+};
 
 const priceQuote = activity({
   name: "payments.price-quote",
@@ -125,7 +131,7 @@ describe("typed public API contract", () => {
   });
 
   it("preserves signal payload types", () => {
-    const approved = signal<{ approvalId: string }>("approved");
+    const approved = signal<{ approvalId: string }>("approved", { schema: approvalSchema });
     const client = new Client();
 
     const sent = client.sendSignal({
@@ -136,6 +142,7 @@ describe("typed public API contract", () => {
     void sent.catch(() => undefined);
 
     expectTypeOf(sent).toEqualTypeOf<Promise<void>>();
+    expect(approved.payloadSchema).toBe(approvalSchema);
   });
 
   it("preserves named join result types", () => {

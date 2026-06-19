@@ -1,5 +1,4 @@
 import {
-  commandId,
   eventId,
   runId,
   type EventId,
@@ -55,7 +54,9 @@ export interface DurableBackend {
   completeActivity(req: CompleteActivityRequest): Promise<CompleteActivityOutcome>;
   completeActivities(req: CompleteActivitiesRequest): Promise<CompleteActivitiesOutcome>;
   failActivity(req: FailActivityRequest): Promise<FailActivityOutcome>;
+  heartbeatActivity(req: ActivityHeartbeatRequest): Promise<ActivityHeartbeatOutcome>;
   fireDueTimers(req: FireDueTimersRequest): Promise<FireDueTimersOutcome>;
+  timeoutDueActivities(req: TimeoutDueActivitiesRequest): Promise<TimeoutDueActivitiesOutcome>;
   signalWorkflow(req: SignalWorkflowRequest): Promise<SignalWorkflowOutcome>;
   readSignalInbox(req: ReadSignalInboxRequest): Promise<SignalInboxRecord | null>;
   queryWorkflow(req: QueryWorkflowRequest): Promise<QueryWorkflowOutcome>;
@@ -196,6 +197,15 @@ export interface FailActivityRequest {
 
 export type FailActivityOutcome =
   | { readonly kind: "Failed"; readonly eventId: EventId }
+  | { readonly kind: "RetryScheduled"; readonly attempt: number; readonly readyAtMs: number }
+  | { readonly kind: "AlreadyCompleted" };
+
+export interface ActivityHeartbeatRequest {
+  readonly claim: ActivityTaskClaim;
+}
+
+export type ActivityHeartbeatOutcome =
+  | { readonly kind: "Recorded" }
   | { readonly kind: "AlreadyCompleted" };
 
 export type WaitKind = "Timer" | "Signal";
@@ -217,6 +227,16 @@ export interface FireDueTimersRequest {
 
 export interface FireDueTimersOutcome {
   readonly fired: number;
+}
+
+export interface TimeoutDueActivitiesRequest {
+  readonly namespace: Namespace | string;
+  readonly now: TimestampMs | number;
+  readonly limit: number;
+}
+
+export interface TimeoutDueActivitiesOutcome {
+  readonly timedOut: number;
 }
 
 export interface SignalWorkflowRequest {
@@ -260,10 +280,16 @@ interface WorkflowState {
   readonly runId: RunId;
   history: HistoryEvent[];
   readyReason: WorkflowTaskReason | null;
-  claim: WorkflowTaskClaim | null;
+  claim: WorkflowLease | null;
   queryProjection: PayloadRef | null;
   terminal: boolean;
   parent: ParentWorkflowLink | null;
+}
+
+interface WorkflowLease {
+  readonly claim: WorkflowTaskClaim;
+  readonly reason: WorkflowTaskReason;
+  readonly expiresAtMs: number;
 }
 
 type ParentWorkflowLink = ChildParentWorkflowLink | ChildWorkflowMapParentLink;
@@ -286,9 +312,17 @@ interface ChildWorkflowMapParentLink {
 interface ActivityState {
   readonly namespace: string;
   readonly workflow: WorkflowState;
-  readonly task: ActivityTask;
-  claim: ActivityTaskClaim | null;
+  task: ActivityTask;
+  claim: ActivityLease | null;
+  availableAtMs: number;
   terminalEventId: EventId | null;
+}
+
+interface ActivityLease {
+  readonly claim: ActivityTaskClaim;
+  readonly startedAtMs: number;
+  readonly heartbeatDeadlineAtMs: number | null;
+  readonly expiresAtMs: number;
 }
 
 interface ActivityMapState {
@@ -321,6 +355,10 @@ interface SignalState {
   consumed: boolean;
 }
 
+export interface MemoryBackendOptions {
+  readonly nowMs?: () => number;
+}
+
 export class MemoryBackend implements DurableBackend {
   readonly #workflowsById = new Map<string, WorkflowState>();
   readonly #workflowsByRun = new Map<string, WorkflowState>();
@@ -329,10 +367,15 @@ export class MemoryBackend implements DurableBackend {
   readonly #childWorkflowMapsByCommand = new Map<string, ChildWorkflowMapState>();
   readonly #waitsById = new Map<string, WaitRecord>();
   readonly #signalsById = new Map<string, SignalState>();
+  readonly #nowMs: () => number;
   #nextRun = 1;
   #nextClaimToken = 1;
   #nextActivityClaimToken = 1;
   #nextSignalSequence = 1;
+
+  constructor(options: MemoryBackendOptions = {}) {
+    this.#nowMs = options.nowMs ?? Date.now;
+  }
 
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
     const key = workflowKey(req.namespace, req.workflowId);
@@ -373,24 +416,32 @@ export class MemoryBackend implements DurableBackend {
       opts.registeredWorkflowTypes.map((workflowType) => workflowTypeKey(workflowType))
     );
     for (const state of this.#workflowsById.values()) {
+      this.#restoreExpiredWorkflowLease(state);
       if (
         state.namespace !== String(opts.namespace) ||
         state.taskQueue !== String(opts.taskQueue) ||
         state.terminal ||
-        state.readyReason === null ||
+        (state.readyReason === null && state.claim === null) ||
         state.claim !== null ||
         !eligibleTypes.has(workflowTypeKey(state.workflowType))
       ) {
         continue;
       }
 
+      const reason = state.readyReason;
+      if (reason === null) {
+        continue;
+      }
       const claim: WorkflowTaskClaim = {
         runId: state.runId,
         workerId,
         token: this.#nextClaimToken++
       };
-      state.claim = claim;
-      const reason = state.readyReason;
+      state.claim = {
+        claim,
+        reason,
+        expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
+      };
       state.readyReason = null;
       return {
         runId: state.runId,
@@ -424,10 +475,10 @@ export class MemoryBackend implements DurableBackend {
     commit: WorkflowTaskCommit
   ): Promise<CommitOutcome> {
     const state = this.#stateForRun(claim.runId);
+    this.#restoreExpiredWorkflowLease(state);
     if (
       state.claim === null ||
-      state.claim.token !== claim.token ||
-      state.claim.workerId !== claim.workerId
+      !workflowLeaseMatches(state.claim, claim)
     ) {
       throw new Error("stale workflow task lease");
     }
@@ -478,6 +529,7 @@ export class MemoryBackend implements DurableBackend {
         workflow: state,
         task,
         claim: null,
+        availableAtMs: 0,
         terminalEventId: null
       };
       this.#activitiesById.set(task.activityId, activityState);
@@ -515,10 +567,12 @@ export class MemoryBackend implements DurableBackend {
   ): Promise<ClaimedActivityTask | null> {
     const eligible = new Set(opts.registeredActivityNames.map(String));
     for (const activity of this.#activitiesById.values()) {
+      this.#restoreExpiredActivityLease(activity);
       if (
         activity.namespace !== String(opts.namespace) ||
         String(activity.task.taskQueue) !== String(opts.taskQueue) ||
         !eligible.has(String(activity.task.activityName)) ||
+        activity.availableAtMs > this.#nowMs() ||
         activity.claim !== null ||
         activity.terminalEventId !== null ||
         this.#activityMapForTask(activity.task)?.terminal === true
@@ -531,7 +585,13 @@ export class MemoryBackend implements DurableBackend {
         workerId,
         token: this.#nextActivityClaimToken++
       };
-      activity.claim = claim;
+      const now = this.#nowMs();
+      activity.claim = {
+        claim,
+        startedAtMs: now,
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, now),
+        expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
+      };
       return { task: activity.task, claim };
     }
     return null;
@@ -559,13 +619,13 @@ export class MemoryBackend implements DurableBackend {
     if (!activity) {
       return { kind: "NotFound" };
     }
+    this.#restoreExpiredActivityLease(activity);
     if (activity.terminalEventId !== null) {
       return { kind: "AlreadyCompleted" };
     }
     if (
       activity.claim === null ||
-      activity.claim.token !== req.claim.token ||
-      activity.claim.workerId !== req.claim.workerId
+      !activityLeaseMatches(activity.claim, req.claim)
     ) {
       return { kind: "StaleLease" };
     }
@@ -594,15 +654,30 @@ export class MemoryBackend implements DurableBackend {
     if (!activity) {
       throw new Error(`activity task not found: ${req.claim.activityId}`);
     }
+    this.#restoreExpiredActivityLease(activity);
     if (activity.terminalEventId !== null) {
       return { kind: "AlreadyCompleted" };
     }
     if (
       activity.claim === null ||
-      activity.claim.token !== req.claim.token ||
-      activity.claim.workerId !== req.claim.workerId
+      !activityLeaseMatches(activity.claim, req.claim)
     ) {
       throw new Error("stale activity task lease");
+    }
+
+    const retry =
+      activity.task.mapItem === null || this.#activityMapForTask(activity.task)?.terminal !== true
+        ? retryActivityAfterFailure(activity, req.failure, this.#nowMs())
+        : null;
+    if (retry !== null) {
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
+      activity.claim = null;
+      return {
+        kind: "RetryScheduled",
+        attempt: retry.task.attempt,
+        readyAtMs: retry.readyAtMs
+      };
     }
 
     if (activity.task.mapItem !== null) {
@@ -622,6 +697,46 @@ export class MemoryBackend implements DurableBackend {
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     return { kind: "Failed", eventId: event.eventId };
+  }
+
+  async heartbeatActivity(req: ActivityHeartbeatRequest): Promise<ActivityHeartbeatOutcome> {
+    const activity = this.#activitiesById.get(req.claim.activityId);
+    if (!activity) {
+      throw new Error(`activity task not found: ${req.claim.activityId}`);
+    }
+    this.#restoreExpiredActivityLease(activity);
+    if (activity.terminalEventId !== null) {
+      return { kind: "AlreadyCompleted" };
+    }
+    if (
+      activity.claim === null ||
+      !activityLeaseMatches(activity.claim, req.claim)
+    ) {
+      throw new Error("stale activity task lease");
+    }
+    const currentClaim = activity.claim;
+    activity.claim = {
+      ...currentClaim,
+      heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+    };
+    return { kind: "Recorded" };
+  }
+
+  #leaseExpiresAt(leaseDurationMs: number): number {
+    return this.#nowMs() + Math.max(0, leaseDurationMs);
+  }
+
+  #restoreExpiredWorkflowLease(state: WorkflowState): void {
+    if (state.claim !== null && state.claim.expiresAtMs <= this.#nowMs()) {
+      state.readyReason ??= state.claim.reason;
+      state.claim = null;
+    }
+  }
+
+  #restoreExpiredActivityLease(activity: ActivityState): void {
+    if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      activity.claim = null;
+    }
   }
 
   async fireDueTimers(req: FireDueTimersRequest): Promise<FireDueTimersOutcome> {
@@ -653,6 +768,55 @@ export class MemoryBackend implements DurableBackend {
       fired += 1;
     }
     return { fired };
+  }
+
+  async timeoutDueActivities(req: TimeoutDueActivitiesRequest): Promise<TimeoutDueActivitiesOutcome> {
+    const due = [...this.#activitiesById.values()]
+      .filter(
+        (activity) =>
+            activity.namespace === String(req.namespace) &&
+            activityTimeoutDeadline(activity).deadline <= Number(req.now)
+        )
+        .sort((left, right) =>
+          activityTimeoutDeadline(left).deadline - activityTimeoutDeadline(right).deadline ||
+          left.task.activityId.localeCompare(right.task.activityId)
+        )
+      .slice(0, Math.max(1, req.limit));
+    let timedOut = 0;
+    for (const activity of due) {
+      if (
+        activity.claim === null ||
+        activity.terminalEventId !== null ||
+          activity.task.mapItem !== null
+        ) {
+          continue;
+        }
+        const timeout = activityTimeoutDeadline(activity);
+        if (timeout.deadline > Number(req.now)) {
+          continue;
+        }
+        const retry = retryActivityAfterTimeout(activity, Number(req.now));
+        if (retry !== null) {
+          activity.task = retry.task;
+          activity.availableAtMs = retry.readyAtMs;
+          activity.claim = null;
+          timedOut += 1;
+          continue;
+        }
+        const event = makeHistoryEvent(eventId(Number(tailEventId(activity.workflow)) + 1), {
+          kind: "ActivityTimedOut",
+          timedOut: {
+            commandId: activity.task.commandId,
+            message: activityTimeoutMessage(activity, timeout.kind)
+          }
+        });
+      activity.workflow.history.push(event);
+      activity.workflow.readyReason = "ActivityTimedOut";
+      activity.terminalEventId = event.eventId;
+      activity.claim = null;
+      timedOut += 1;
+    }
+    return { timedOut };
   }
 
   async signalWorkflow(req: SignalWorkflowRequest): Promise<SignalWorkflowOutcome> {
@@ -792,6 +956,7 @@ export class MemoryBackend implements DurableBackend {
           }
         },
         claim: null,
+        availableAtMs: 0,
         terminalEventId: null
       };
       map.inFlight.add(ordinal);
@@ -1243,6 +1408,100 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
+function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
+  return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
+}
+
+function activityLeaseMatches(lease: ActivityLease, claim: ActivityTaskClaim): boolean {
+  return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
+}
+
+function retryActivityAfterFailure(
+  activity: ActivityState,
+  failure: DurableFailure,
+  nowMs: number
+): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
+  const policy = activity.task.retryPolicy;
+  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
+  if (
+    activity.task.attempt >= maxAttempts ||
+    failure.nonRetryable ||
+    policy.nonRetryableErrorTypes.includes(failure.errorType)
+  ) {
+    return null;
+  }
+  return {
+    task: {
+      ...activity.task,
+      attempt: activity.task.attempt + 1
+    },
+    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+  };
+}
+
+function retryActivityAfterTimeout(
+  activity: ActivityState,
+  nowMs: number
+): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
+  const policy = activity.task.retryPolicy;
+  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
+  if (activity.task.attempt >= maxAttempts) {
+    return null;
+  }
+  return {
+    task: {
+      ...activity.task,
+      attempt: activity.task.attempt + 1
+    },
+    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+  };
+}
+
+function retryDelayMs(
+  completedAttempt: number,
+  policy: ActivityTask["retryPolicy"]
+): number {
+  const initial = Math.max(0, policy.initialIntervalMs);
+  const max = Math.max(initial, policy.maxIntervalMs);
+  const coefficient = Math.max(1, policy.backoffCoefficient);
+  return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
+}
+
+function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
+  return task.heartbeatTimeoutMs === null
+    ? null
+    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+}
+
+function activityTimeoutDeadline(
+  activity: ActivityState
+): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
+  if (
+    activity.claim === null ||
+    activity.terminalEventId !== null ||
+    activity.task.mapItem !== null
+  ) {
+    return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
+  }
+  const startToCloseDeadline =
+    activity.task.startToCloseTimeoutMs === null
+      ? Number.POSITIVE_INFINITY
+      : activity.claim.startedAtMs + Math.max(0, activity.task.startToCloseTimeoutMs);
+  const heartbeatDeadline = activity.claim.heartbeatDeadlineAtMs ?? Number.POSITIVE_INFINITY;
+  return heartbeatDeadline < startToCloseDeadline
+    ? { deadline: heartbeatDeadline, kind: "Heartbeat" }
+    : { deadline: startToCloseDeadline, kind: "StartToClose" };
+}
+
+function activityTimeoutMessage(
+  activity: ActivityState,
+  kind: "StartToClose" | "Heartbeat"
+): string {
+  return kind === "Heartbeat"
+    ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
+    : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
+}
+
 function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
   return {
     eventId: id,
@@ -1250,8 +1509,6 @@ function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
     data
   };
 }
-
-void commandId;
 
 function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {
   const manifest = decodePayload<ActivityMapInputManifest<object>>(

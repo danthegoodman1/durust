@@ -6,9 +6,11 @@ import {
   childWorkflow,
   childWorkflowMap,
   callActivity,
+  continueAsNew,
   encodePayload,
   join,
   joinAll,
+  publish,
   select,
   selectAll,
   signal,
@@ -270,6 +272,17 @@ client.queryWorkflow(checkout, "checkout/o-1").then((view) => {
   void status;
 });
 
+publish({ status: "ready" });
+
+// @ts-expect-error query projections must be object-shaped
+publish("ready");
+
+// @ts-expect-error query projections must not be arrays
+publish(["ready"]);
+
+// @ts-expect-error query projections must not be functions
+publish(() => ({ status: "ready" }));
+
 // @ts-expect-error signal payload must match signal definition
 client.sendSignal({ workflowId: "checkout/o-1", signal: approved, payload: { id: "a-1" } });
 
@@ -287,10 +300,9 @@ client.sendSignal({
 });
 
 // @ts-expect-error query state type is OrderView, not a numeric count view
-const wrongQuery: PromiseLike<{ readonly count: number }> = client.queryWorkflow(
-  checkout,
-  "checkout/o-1"
-);
+client.queryWorkflow(checkout, "checkout/o-1") satisfies PromiseLike<{
+  readonly count: number;
+}>;
 
 const quoteManifest = encodePayload<ActivityMapInputManifest<QuoteInput>>({
   itemCount: 1,
@@ -351,3 +363,20 @@ selectAll([
   // @ts-expect-error selectAll accepts only durable branches, not native promises
   Promise.resolve({ ok: true })
 ]);
+
+void (() => continueAsNew({ orderId: "o-2" }));
+
+void (() => {
+  // @ts-expect-error continue-as-new input must be object-shaped
+  return continueAsNew("o-2");
+});
+
+void (() => {
+  // @ts-expect-error continue-as-new input must not be arrays
+  return continueAsNew(["o-2"]);
+});
+
+void (() => {
+  // @ts-expect-error continue-as-new input must not be functions
+  return continueAsNew(() => ({ orderId: "o-2" }));
+});
