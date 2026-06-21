@@ -119,24 +119,45 @@ Implemented:
   thousands of individual activity claim round trips, and avoidable metadata
   transactions from the sharded workload.
 - Postgres durability-path transaction and statement reductions after the
-  accepted sharded baseline: claimed workflow tasks can carry a bounded,
-  contiguous tail of prefetched history so cache misses avoid a separate history
-  read; batch workflow claim uses one sequence query plus one bulk lease update
-  instead of one token/update pair per claimed task; shard-journal append
-  increments and returns the journal sequence in one head-row upsert; batch
-  workflow commit reuses refreshed shard lease epochs inside the transaction;
-  workflow-task commits bulk insert ordinary appended history events while
-  preserving marker indexes; and Postgres batch activity completion uses a
-  SQL-native normal-activity path with per-item results, falling back to scalar
-  completion for duplicate input ids and activity-map items. A later measured
-  100-shard experiment kept only the SQL-native batch workflow commit fast path
-  for non-terminal, non-child, non-map items after bulk activity scheduling,
-  lease preloading, cached prefetch reuse, and timer batching missed the
-  correctness/performance gate. The accepted 3-run median completed 8,000 mixed
-  actions at 141.72 processing workflows/sec, 1,133.77 processing
-  mixed-actions/sec, 3.65 Postgres transactions/action, and 12.82
-  statements/action. The checked-in high-shard Postgres baseline artifact uses
-  this activity-completion plus workflow-commit batching profile.
+  accepted sharded baseline: claimed workflow tasks carry a bounded, contiguous
+  tail of prefetched history; cached wakes and cold recovery now consume that
+  claim-prefetched history before asking the provider to stream. Batch workflow
+  claim uses one sequence query plus one bulk lease update instead of one
+  token/update pair per claimed task; shard-journal append increments and
+  returns the journal sequence in one head-row upsert; batch workflow commit
+  bulk verifies shard leases once per transaction; workflow-task commits bulk
+  insert appended history events while preserving marker indexes; and Postgres
+  batch activity completion uses a SQL-native normal-activity path with
+  per-item results, falling back to scalar completion for duplicate input ids
+  and activity-map items.
+- The Postgres simple workflow-commit batch path is now the target mixed
+  workload architecture rather than a narrow compatibility fast path. It covers
+  ordinary history-only commits, direct child workflow starts, terminal
+  completed/failed/cancelled events, set-based terminal operational cleanup,
+  direct parent child-terminal notifications, and close-policy cancellation. It
+  excludes only marker/index commits, activity-map/child-map item commits,
+  cancellations, continue-as-new, and terminal commits whose parent/child
+  dependency is in the same batch.
+- The Rust workload runner now reports `processingBackendMetrics` separately
+  from full-run backend metrics and takes Postgres/statement stat snapshots
+  around the processing phase rather than setup and verification. Backend
+  operation reports include call/item density per mixed action, and
+  workflow-task commit shape counters classify how many commits match the
+  current Postgres simple batch fast path versus child-start, terminal,
+  activity-map, child-map, cancel, or other history-event fallback reasons.
+- Local 100-shard mixed comparison on the current target architecture
+  (1,000 workflows, 10 workers, 100 logical shards, 16 physical partitions,
+  activation concurrency 8, prefetch 32, batch 32, activity-completion batch
+  32, pool size 24) measured the current TypeScript runner at 1,666.03
+  processing mixed-actions/sec, 1.002 transactions/action, and 7.409
+  statements/action. Rust measured 1,999.51 processing mixed-actions/sec,
+  0.587 transactions/action, and 5.047 statements/action on the repeated
+  default 12-pass worker cadence, with a best default-equivalent 12-pass run at
+  2,115.79 processing mixed-actions/sec, 0.532 transactions/action, and 4.889
+  statements/action. In these Rust runs every mixed-workload workflow commit was
+  simple-batch eligible; the remaining gap to a stable ceiling is runtime
+  variance and non-workflow scalar paths such as signal send/read and timer
+  maintenance.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 
@@ -146,9 +167,10 @@ Remaining:
   signal, timer, child, activity map, payload refs, recovery, and cached wake
   under recovery load. Child workflow map fanout now has an initial workload
   mode; checked-in thresholds remain pending measured baselines.
-- Extend write-combining beyond workflow-task claim/commit into hot activity,
-  timer, child, and signal progress where the provider can batch without
-  weakening per-run fencing, event ordering, or crash safety.
+- Extend target-architecture write-combining into the remaining hot scalar
+  paths: signal send/read, timer maintenance, activity-map item completion,
+  child-map item completion, and payload-ref materialization where the provider
+  can batch without weakening per-run fencing, event ordering, or crash safety.
 - Finish `0013-postgres-shard-native.md` snapshot/journal-tail rebuild before
   recommending the high-shard Postgres layout as the recovery architecture; the
   checked-in high-shard baseline currently proves scale-out for claim/commit

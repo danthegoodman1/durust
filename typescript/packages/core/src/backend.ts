@@ -43,6 +43,10 @@ export interface DurableBackend {
     workerId: WorkerId | string,
     opts: ClaimWorkflowTaskOptions
   ): Promise<ClaimedWorkflowTask | null>;
+  claimWorkflowTasks?(
+    workerId: WorkerId | string,
+    opts: ClaimWorkflowBatchOptions
+  ): Promise<readonly ClaimedWorkflowTask[]>;
   streamHistory(req: StreamHistoryRequest): Promise<HistoryChunk>;
   commitWorkflowTask(
     claim: WorkflowTaskClaim,
@@ -52,6 +56,10 @@ export interface DurableBackend {
     workerId: WorkerId | string,
     opts: ClaimActivityOptions
   ): Promise<ClaimedActivityTask | null>;
+  claimActivityTasks?(
+    workerId: WorkerId | string,
+    opts: ClaimActivityBatchOptions
+  ): Promise<readonly ClaimedActivityTask[]>;
   completeActivity(req: CompleteActivityRequest): Promise<CompleteActivityOutcome>;
   completeActivities(req: CompleteActivitiesRequest): Promise<CompleteActivitiesOutcome>;
   failActivity(req: FailActivityRequest): Promise<FailActivityOutcome>;
@@ -80,7 +88,12 @@ export interface ClaimWorkflowTaskOptions {
   readonly namespace: Namespace | string;
   readonly taskQueue: TaskQueue | string;
   readonly registeredWorkflowTypes: readonly WorkflowType[];
+  readonly registeredSignalNames?: readonly (SignalName | string)[];
   readonly leaseDurationMs: number;
+}
+
+export interface ClaimWorkflowBatchOptions extends ClaimWorkflowTaskOptions {
+  readonly limit: number;
 }
 
 export type WorkflowTaskReason =
@@ -114,6 +127,7 @@ export interface ClaimedWorkflowTask {
   readonly replayTargetEventId: EventId;
   readonly reason: WorkflowTaskReason;
   readonly prefetchedHistory: readonly HistoryEvent[];
+  readonly liveSignals?: readonly SignalInboxRecord[];
 }
 
 export interface StreamHistoryRequest {
@@ -156,6 +170,10 @@ export interface ClaimActivityOptions {
   readonly taskQueue: TaskQueue | string;
   readonly registeredActivityNames: readonly (ActivityName | string)[];
   readonly leaseDurationMs: number;
+}
+
+export interface ClaimActivityBatchOptions extends ClaimActivityOptions {
+  readonly limit: number;
 }
 
 export interface ActivityTaskClaim {

@@ -2,8 +2,8 @@
   "name": "memory-mixed-local-4-worker",
   "kind": "accepted",
   "metadata": {
-    "measured_at": "2026-06-19",
-    "commit": "f3f2235",
+    "measured_at": "2026-06-21",
+    "commit": "d439cf5",
     "os": "Darwin mac.lan 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:42 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6031 arm64",
     "node": "v24.15.0",
     "notes": "Measured locally from /tmp/durust-ts-final-benchmarks.json. CPU/RAM unavailable from sandboxed sysctl; Postgres ran from tests/fixtures/postgres.compose.yml with pg_stat_statements."
@@ -37,24 +37,24 @@
     },
     "worker_stats": {
       "workflowHistoryCacheHits": 0,
-      "workflowHistoryCacheMisses": 2920,
+      "workflowHistoryCacheMisses": 2000,
       "workflowHistoryCacheEvictions": 0,
-      "workflowExecutionCacheHits": 5080,
-      "workflowExecutionCacheMisses": 2920,
+      "workflowExecutionCacheHits": 6000,
+      "workflowExecutionCacheMisses": 2000,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
       "historyStreamEvents": 0
     },
-    "processing_mixed_actions_per_second": 8859.109,
-    "processing_workflows_per_second": 1107.389,
-    "workflow_task_commit_p95_ms": 0.012,
+    "processing_mixed_actions_per_second": 12651.729,
+    "processing_workflows_per_second": 1581.466,
+    "workflow_task_commit_p95_ms": 0.039,
     "operations": {
       "claimActivityTask": {
-        "calls": 8064,
+        "calls": 3004,
         "errors": 0
       },
       "claimWorkflowTask": {
-        "calls": 8064,
+        "calls": 10972,
         "errors": 0
       },
       "commitWorkflowTask": {
@@ -66,7 +66,7 @@
         "errors": 0
       },
       "fireDueTimers": {
-        "calls": 8064,
+        "calls": 3004,
         "errors": 0
       },
       "readSignalInbox": {
@@ -82,7 +82,7 @@
         "errors": 0
       },
       "streamHistory": {
-        "calls": 64000,
+        "calls": 1000,
         "errors": 0
       }
     }

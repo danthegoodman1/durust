@@ -515,10 +515,7 @@ where
 /// match arms. Returned futures are `Send` so they compose into the providers'
 /// boxed backend futures.
 pub(crate) trait PayloadRewrite {
-    fn payload(
-        &mut self,
-        payload: PayloadRef,
-    ) -> impl Future<Output = Result<PayloadRef>> + Send;
+    fn payload(&mut self, payload: PayloadRef) -> impl Future<Output = Result<PayloadRef>> + Send;
 
     fn activity_map_input_manifest(
         &mut self,
@@ -739,7 +736,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{command_id, ActivityMapCompleted, ChildWorkflowMapCompleted, RunId};
+    use crate::{ActivityMapCompleted, ChildWorkflowMapCompleted, RunId, command_id};
     use futures::executor::block_on;
 
     // Returns a distinct tagged payload from each rewriter method so a test can
@@ -750,7 +747,10 @@ mod tests {
         async fn payload(&mut self, _payload: PayloadRef) -> Result<PayloadRef> {
             crate::encode_payload(&"payload".to_owned())
         }
-        async fn activity_map_input_manifest(&mut self, _manifest: PayloadRef) -> Result<PayloadRef> {
+        async fn activity_map_input_manifest(
+            &mut self,
+            _manifest: PayloadRef,
+        ) -> Result<PayloadRef> {
             crate::encode_payload(&"input-manifest".to_owned())
         }
         async fn activity_map_result_manifest(
@@ -848,6 +848,12 @@ mod tests {
             key: String::new(),
             value: crate::encode_payload(&"v".to_owned()).unwrap(),
         });
-        assert!(block_on(rewrite_history_event_payloads(&mut SentinelRewriter, invalid)).is_err());
+        assert!(
+            block_on(rewrite_history_event_payloads(
+                &mut SentinelRewriter,
+                invalid
+            ))
+            .is_err()
+        );
     }
 }

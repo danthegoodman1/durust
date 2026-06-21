@@ -1,3 +1,4 @@
+use crate::provider_util::{should_retry_activity, timeout_message};
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
     ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
@@ -18,7 +19,6 @@ use crate::{
     encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
-use crate::provider_util::{should_retry_activity, timeout_message};
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};

@@ -1,9 +1,8 @@
 use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
-    ActivityMapResultPage, ActivityTask, CancelWorkflowOutcome,
-    CancelWorkflowRequest, ChildStartOutboxMessage,
-    ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest, ChildWorkflowMapResultPage,
-    ChildWorkflowMapTask, ClaimActivityOptions,
+    ActivityMapResultPage, ActivityTask, CancelWorkflowOutcome, CancelWorkflowRequest,
+    ChildStartOutboxMessage, ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest,
+    ChildWorkflowMapResultPage, ChildWorkflowMapTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome,
     CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
     CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
@@ -12,11 +11,10 @@ use crate::{
     HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
     PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
     PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
-    Result, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
-    digest_bytes,
+    Result, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, WorkerId,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskRelease, digest_bytes,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -466,7 +464,9 @@ struct PayloadBackendNormalizeRewriter<'a, S> {
     config: &'a PayloadStorageConfig,
 }
 
-impl<S: PayloadBlobStore> crate::payload::PayloadRewrite for PayloadBackendNormalizeRewriter<'_, S> {
+impl<S: PayloadBlobStore> crate::payload::PayloadRewrite
+    for PayloadBackendNormalizeRewriter<'_, S>
+{
     async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
         normalize_payload_ref(self.blob_store, self.config, payload).await
     }

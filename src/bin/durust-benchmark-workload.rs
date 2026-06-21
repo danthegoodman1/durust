@@ -21,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const DEFAULT_WORKFLOWS: u64 = 250;
 const DEFAULT_WORKERS: usize = 4;
 const DEFAULT_BATCH: usize = 32;
+const DEFAULT_WORKER_ROUND_PASSES: usize = 12;
 const DEFAULT_MAX_ROUNDS: usize = 10_000;
 const WORKFLOW_QUEUE: &str = "workflows";
 const ACTIVITY_QUEUE: &str = "activities";
@@ -61,6 +62,8 @@ struct BenchmarkOptions {
     activity_delay_ms: u64,
     batch: usize,
     activity_completion_batch: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_round_passes: Option<usize>,
     child_map_items: u64,
     child_map_max_in_flight: usize,
     max_rounds: usize,
@@ -115,6 +118,7 @@ struct LatencyReport {
 struct BackendMetricsReport {
     workflow_task_commit_latency: LatencyReport,
     operations: BTreeMap<String, BackendOperationReport>,
+    workflow_task_commit_shapes: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -126,6 +130,9 @@ struct BackendOperationReport {
     total_ms: f64,
     items_per_call: f64,
     items_per_second: f64,
+    calls_per_mixed_action: f64,
+    items_per_mixed_action: f64,
+    total_ms_per_mixed_action: f64,
     latency: LatencyReport,
 }
 
@@ -276,6 +283,7 @@ struct BenchmarkResult {
     counters: BenchmarkCounters,
     worker_stats: WorkerStatsReport,
     backend_metrics: BackendMetricsReport,
+    processing_backend_metrics: BackendMetricsReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     postgres_stats: Option<PostgresStatsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,6 +298,7 @@ struct BenchmarkResult {
 struct BackendMetrics {
     workflow_task_commit_latencies: Arc<Mutex<Vec<Duration>>>,
     operations: Arc<Mutex<BTreeMap<&'static str, OperationSamples>>>,
+    workflow_task_commit_shapes: Arc<Mutex<BTreeMap<&'static str, u64>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -298,6 +307,13 @@ struct OperationSamples {
     total_duration: Duration,
     items: u64,
     errors: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BackendMetricsSnapshot {
+    workflow_task_commit_latencies: Vec<Duration>,
+    operations: BTreeMap<&'static str, OperationSamples>,
+    workflow_task_commit_shapes: BTreeMap<&'static str, u64>,
 }
 
 impl BackendMetrics {
@@ -322,16 +338,175 @@ impl BackendMetrics {
         }
     }
 
-    fn report(&self) -> BackendMetricsReport {
-        let commit_samples = self
+    fn record_workflow_task_commit_shape(&self, commit: &durust::WorkflowTaskCommit) {
+        let mut shapes = self
+            .workflow_task_commit_shapes
+            .lock()
+            .expect("benchmark metrics mutex poisoned");
+        *shapes.entry("total").or_default() += 1;
+        let mut simple_eligible = true;
+        let has_direct_child_starts = !commit.start_child_workflows.is_empty()
+            && commit
+                .start_child_workflows
+                .iter()
+                .all(|message| message.child_map_item.is_none());
+        if commit
+            .start_child_workflows
+            .iter()
+            .any(|message| message.child_map_item.is_some())
+        {
+            simple_eligible = false;
+            *shapes.entry("ineligibleStartChildWorkflowMap").or_default() += 1;
+        }
+        if !commit.schedule_activity_maps.is_empty() {
+            simple_eligible = false;
+            *shapes.entry("ineligibleActivityMap").or_default() += 1;
+        }
+        if !commit.schedule_child_workflow_maps.is_empty() {
+            simple_eligible = false;
+            *shapes.entry("ineligibleChildWorkflowMap").or_default() += 1;
+        }
+        if !commit.cancel_commands.is_empty() {
+            simple_eligible = false;
+            *shapes.entry("ineligibleCancelCommand").or_default() += 1;
+        }
+        let mut terminal_events = 0_u64;
+        let mut non_simple_history_events = 0_u64;
+        for event in &commit.append_events {
+            match &event.data {
+                HistoryEventData::WorkflowCompleted { .. }
+                | HistoryEventData::WorkflowFailed { .. }
+                | HistoryEventData::WorkflowCancelled { .. } => {
+                    terminal_events += 1;
+                }
+                HistoryEventData::WorkflowContinuedAsNew { .. } => {
+                    simple_eligible = false;
+                    *shapes.entry("ineligibleContinueAsNew").or_default() += 1;
+                }
+                HistoryEventData::VersionMarker(_) | HistoryEventData::DeprecatedPatchMarker(_) => {
+                    non_simple_history_events += 1;
+                    simple_eligible = false;
+                }
+                _ => {
+                    // Non-terminal history-only events can use the Postgres batch fast path.
+                }
+            }
+        }
+        if terminal_events > 0 {
+            *shapes.entry("postgresSimpleTerminalEvent").or_default() += 1;
+            if has_direct_child_starts {
+                simple_eligible = false;
+                *shapes
+                    .entry("ineligibleTerminalWithChildStart")
+                    .or_default() += 1;
+            }
+        }
+        if non_simple_history_events > 0 {
+            *shapes.entry("ineligibleHistoryEvent").or_default() += 1;
+        }
+        if simple_eligible {
+            *shapes.entry("postgresSimpleEligible").or_default() += 1;
+        } else {
+            *shapes.entry("postgresSimpleIneligible").or_default() += 1;
+        }
+    }
+
+    fn snapshot(&self) -> BackendMetricsSnapshot {
+        BackendMetricsSnapshot {
+            workflow_task_commit_latencies: self
+                .workflow_task_commit_latencies
+                .lock()
+                .expect("benchmark metrics mutex poisoned")
+                .clone(),
+            operations: self
+                .operations
+                .lock()
+                .expect("benchmark metrics mutex poisoned")
+                .clone(),
+            workflow_task_commit_shapes: self
+                .workflow_task_commit_shapes
+                .lock()
+                .expect("benchmark metrics mutex poisoned")
+                .clone(),
+        }
+    }
+
+    fn report(&self, mixed_actions: u64) -> BackendMetricsReport {
+        let snapshot = self.snapshot();
+        Self::report_from_parts(
+            snapshot.workflow_task_commit_latencies,
+            snapshot.operations,
+            snapshot.workflow_task_commit_shapes,
+            mixed_actions,
+        )
+    }
+
+    fn report_between(
+        &self,
+        before: &BackendMetricsSnapshot,
+        after: &BackendMetricsSnapshot,
+        mixed_actions: u64,
+    ) -> BackendMetricsReport {
+        let commit_samples = after
             .workflow_task_commit_latencies
-            .lock()
-            .expect("benchmark metrics mutex poisoned")
-            .clone();
-        let operations = self
+            .get(before.workflow_task_commit_latencies.len()..)
+            .unwrap_or(&[])
+            .to_vec();
+        let operations = after
             .operations
-            .lock()
-            .expect("benchmark metrics mutex poisoned")
+            .iter()
+            .map(|(name, samples)| {
+                let before_samples = before.operations.get(name);
+                let start = before_samples.map_or(0, |samples| samples.durations.len());
+                let durations = samples.durations.get(start..).unwrap_or(&[]).to_vec();
+                let total_duration = samples
+                    .total_duration
+                    .checked_sub(
+                        before_samples.map_or(Duration::ZERO, |samples| samples.total_duration),
+                    )
+                    .unwrap_or(Duration::ZERO);
+                let items = samples
+                    .items
+                    .saturating_sub(before_samples.map_or(0, |samples| samples.items));
+                let errors = samples
+                    .errors
+                    .saturating_sub(before_samples.map_or(0, |samples| samples.errors));
+                (
+                    *name,
+                    OperationSamples {
+                        durations,
+                        total_duration,
+                        items,
+                        errors,
+                    },
+                )
+            })
+            .filter(|(_, samples)| !samples.durations.is_empty())
+            .collect::<BTreeMap<_, _>>();
+        let shapes = after
+            .workflow_task_commit_shapes
+            .iter()
+            .filter_map(|(name, value)| {
+                let delta = value.saturating_sub(
+                    before
+                        .workflow_task_commit_shapes
+                        .get(name)
+                        .copied()
+                        .unwrap_or(0),
+                );
+                (delta > 0).then_some((*name, delta))
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self::report_from_parts(commit_samples, operations, shapes, mixed_actions)
+    }
+
+    fn report_from_parts(
+        commit_samples: Vec<Duration>,
+        operation_samples: BTreeMap<&'static str, OperationSamples>,
+        commit_shapes: BTreeMap<&'static str, u64>,
+        mixed_actions: u64,
+    ) -> BackendMetricsReport {
+        let operations = operation_samples
             .iter()
             .map(|(name, samples)| {
                 (
@@ -341,6 +516,7 @@ impl BackendMetrics {
                         samples.total_duration,
                         samples.items,
                         samples.errors,
+                        mixed_actions,
                     ),
                 )
             })
@@ -348,6 +524,10 @@ impl BackendMetrics {
         BackendMetricsReport {
             workflow_task_commit_latency: latency_report(commit_samples),
             operations,
+            workflow_task_commit_shapes: commit_shapes
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value))
+                .collect(),
         }
     }
 }
@@ -559,6 +739,7 @@ where
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
+            metrics.record_workflow_task_commit_shape(&batch);
             let started = Instant::now();
             let result = inner.commit_workflow_task(claim, batch).await;
             let duration = started.elapsed();
@@ -580,6 +761,9 @@ where
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         let input_items = batch.commits.len() as u64;
+        for input in &batch.commits {
+            metrics.record_workflow_task_commit_shape(&input.commit);
+        }
         Box::pin(async move {
             let started = Instant::now();
             let result = inner.commit_workflow_tasks(batch).await;
@@ -1092,6 +1276,7 @@ fn default_options() -> BenchmarkOptions {
         activity_delay_ms: 0,
         batch: DEFAULT_BATCH,
         activity_completion_batch: 1,
+        worker_round_passes: None,
         child_map_items: 32,
         child_map_max_in_flight: 8,
         max_rounds: DEFAULT_MAX_ROUNDS,
@@ -1162,6 +1347,12 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
             "--activity-completion-batch" => {
                 options.activity_completion_batch =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
+            "--worker-round-passes" => {
+                options.worker_round_passes = Some(parse_positive_usize(
+                    next_arg(&mut args, flag, inline_value)?,
+                    flag,
+                )?);
             }
             "--child-map-items" => {
                 options.child_map_items =
@@ -1277,7 +1468,7 @@ fn usage() -> String {
          [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] [--shards 1] \
          [--physical-partitions 1] [--activation-concurrency 1] \
          [--activation-prefetch-limit 1] \
-         [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] \
+         [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] [--worker-round-passes {DEFAULT_WORKER_ROUND_PASSES}] \
          [--child-map-items 32] [--child-map-max-in-flight 8] \
          [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json]"
     )
@@ -1286,7 +1477,7 @@ fn usage() -> String {
 fn run_memory_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult, String> {
     options.sqlite_layout = None;
     let runtime = tokio_runtime()?;
-    run_backend_benchmark(&runtime, MemoryBackend::new(), options, None)
+    run_backend_benchmark(&runtime, MemoryBackend::new(), options, None, None)
 }
 
 fn run_sqlite_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult, String> {
@@ -1300,7 +1491,13 @@ fn run_sqlite_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult
     let dir = tempfile::tempdir().map_err(|err| err.to_string())?;
     let db_path = dir.path().join("durust-benchmark.sqlite3");
     let backend = SqliteBackend::open(&db_path).map_err(|err| err.to_string())?;
-    let result = run_backend_benchmark(&runtime, backend, options.clone(), Some(db_path.clone()))?;
+    let result = run_backend_benchmark(
+        &runtime,
+        backend,
+        options.clone(),
+        Some(db_path.clone()),
+        None,
+    )?;
     if options.keep_db {
         let kept = env::current_dir()
             .map_err(|err| err.to_string())?
@@ -1348,36 +1545,9 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         return run_postgres_write_ceiling_benchmark(runtime, database_url, schema, options);
     }
 
-    let postgres_stats_before = postgres_stats_snapshot(&runtime, &database_url).ok();
-    let statement_stats_before = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
-    let activity_sampler =
-        PostgresActivitySampler::start(database_url.clone(), Duration::from_millis(100));
-    let mut result = run_backend_benchmark(&runtime, backend, options, None);
-    let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
-    let statement_stats_after = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
-    let postgres_stats_after = postgres_stats_snapshot(&runtime, &database_url).ok();
-    if let (Ok(result), Some(before), Some(after)) =
-        (&mut result, postgres_stats_before, postgres_stats_after)
-    {
-        let processing_seconds = (result.processing_ms / 1_000.0).max(f64::EPSILON);
-        result.postgres_stats = Some(postgres_stats_report(
-            before,
-            after,
-            processing_seconds,
-            result.completed_workflows,
-            result.mixed_actions,
-            activity_samples,
-            statement_stats_before
-                .zip(statement_stats_after)
-                .map(|(before, after)| {
-                    postgres_statement_stats_report(
-                        before,
-                        after,
-                        result.completed_workflows,
-                        result.mixed_actions,
-                    )
-                }),
-        ));
+    let mut result =
+        run_backend_benchmark(&runtime, backend, options, None, Some(database_url.clone()));
+    if let Ok(result) = &mut result {
         result.postgres_schema = Some(schema.clone());
     }
     match result {
@@ -1535,6 +1705,7 @@ fn run_postgres_write_ceiling_benchmark(
             ..WorkerStatsReport::default()
         },
         backend_metrics: BackendMetricsReport::default(),
+        processing_backend_metrics: BackendMetricsReport::default(),
         postgres_stats: None,
         resource_samples,
         postgres_schema: Some(schema.clone()),
@@ -1854,6 +2025,7 @@ fn run_backend_benchmark<B>(
     backend: B,
     options: BenchmarkOptions,
     db_path: Option<PathBuf>,
+    postgres_stats_database_url: Option<String>,
 ) -> Result<BenchmarkResult, String>
 where
     B: DurableBackend,
@@ -1867,6 +2039,18 @@ where
     let setup_started = Instant::now();
     let start_outcome = runtime.block_on(start_workflows(&backend, &options))?;
     let setup_finished = Instant::now();
+    let setup_metrics = metrics.snapshot();
+    let postgres_stats_before = postgres_stats_database_url
+        .as_deref()
+        .and_then(|database_url| postgres_stats_snapshot(runtime, database_url).ok());
+    let statement_stats_before = postgres_stats_database_url
+        .as_deref()
+        .and_then(|database_url| postgres_statement_stats_snapshot(runtime, database_url).ok());
+    let activity_sampler = postgres_stats_database_url
+        .clone()
+        .and_then(|database_url| {
+            PostgresActivitySampler::start(database_url, Duration::from_millis(100))
+        });
 
     let shared_worker_runtime = options.backend == BenchmarkBackend::Postgres;
     let mut workers = (0..options.workers)
@@ -1892,8 +2076,14 @@ where
             ));
         }
         rounds += 1;
-        let round_stats =
-            drain_worker_round(runtime, &mut workers, options.batch, shared_worker_runtime)?;
+        let round_stats = drain_worker_round(
+            runtime,
+            &mut workers,
+            options
+                .worker_round_passes
+                .unwrap_or(DEFAULT_WORKER_ROUND_PASSES.min(options.batch).max(1)),
+            shared_worker_runtime,
+        )?;
         let made_progress = round_stats != WorkerRunStats::default();
         stats = add_worker_stats(stats, round_stats);
         if stats.workflow_tasks >= nominal_workflow_tasks {
@@ -1922,6 +2112,14 @@ where
         }
     }
     let processing_finished = Instant::now();
+    let processing_metrics = metrics.snapshot();
+    let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
+    let statement_stats_after = postgres_stats_database_url
+        .as_deref()
+        .and_then(|database_url| postgres_statement_stats_snapshot(runtime, database_url).ok());
+    let postgres_stats_after = postgres_stats_database_url
+        .as_deref()
+        .and_then(|database_url| postgres_stats_snapshot(runtime, database_url).ok());
 
     let verify_started = processing_finished;
     let completed_workflows = runtime.block_on(verify_completed_workflows(
@@ -1952,7 +2150,7 @@ where
         .and_then(|path| sqlite_store_bytes(path).ok())
         .filter(|_| options.keep_db);
     let resource_samples = resource_sampler.and_then(|sampler| sampler.stop().ok());
-    Ok(BenchmarkResult {
+    let mut result = BenchmarkResult {
         backend: options.backend.as_str().to_owned(),
         mode: options.mode.clone(),
         correct: true,
@@ -1974,13 +2172,39 @@ where
         processing_workflows_per_second: completed_workflows as f64 / processing_seconds,
         counters,
         worker_stats: WorkerStatsReport::from(stats),
-        backend_metrics: metrics.report(),
+        backend_metrics: metrics.report(mixed_actions),
+        processing_backend_metrics: metrics.report_between(
+            &setup_metrics,
+            &processing_metrics,
+            mixed_actions,
+        ),
         postgres_stats: None,
         resource_samples,
         postgres_schema: None,
         db_path: None,
         db_bytes,
-    })
+    };
+    if let (Some(before), Some(after)) = (postgres_stats_before, postgres_stats_after) {
+        result.postgres_stats = Some(postgres_stats_report(
+            before,
+            after,
+            processing_seconds,
+            result.completed_workflows,
+            result.mixed_actions,
+            activity_samples,
+            statement_stats_before
+                .zip(statement_stats_after)
+                .map(|(before, after)| {
+                    postgres_statement_stats_report(
+                        before,
+                        after,
+                        result.completed_workflows,
+                        result.mixed_actions,
+                    )
+                }),
+        ));
+    }
+    Ok(result)
 }
 
 fn nominal_workflow_task_target(options: &BenchmarkOptions) -> Result<usize, String> {
@@ -2218,37 +2442,31 @@ where
 {
     let mut stats = WorkerRunStats::default();
     for _ in 0..batch {
-        let mut progressed = false;
-
         let workflow_tasks = worker.run_workflow_batch_once().await?;
-        if workflow_tasks > 0 {
-            stats.workflow_tasks += workflow_tasks;
-            progressed = true;
-        }
-        let maintenance = worker.run_due_maintenance_once().await?;
-        if maintenance.timers_fired > 0 {
-            stats.timers_fired += maintenance.timers_fired;
-            progressed = true;
-        }
-        if maintenance.activities_timed_out > 0 {
-            stats.activities_timed_out += maintenance.activities_timed_out;
-            progressed = true;
-        }
-        let child_starts = worker.run_child_workflow_starts_once().await?;
-        if child_starts > 0 {
-            stats.child_workflow_starts_dispatched += child_starts;
-            progressed = true;
-        }
-        let activity_tasks = worker.run_activity_batch_once().await?;
-        if activity_tasks > 0 {
-            stats.activity_tasks += activity_tasks;
-            progressed = true;
-        }
-
-        if !progressed {
+        if workflow_tasks == 0 {
             break;
         }
+        stats.workflow_tasks += workflow_tasks;
     }
+
+    let maintenance = worker.run_due_maintenance_once().await?;
+    if maintenance.timers_fired > 0 {
+        stats.timers_fired += maintenance.timers_fired;
+    }
+    if maintenance.activities_timed_out > 0 {
+        stats.activities_timed_out += maintenance.activities_timed_out;
+    }
+
+    let child_starts = worker.run_child_workflow_starts_once().await?;
+    if child_starts > 0 {
+        stats.child_workflow_starts_dispatched += child_starts;
+    }
+
+    let activity_tasks = worker.run_activity_batch_once().await?;
+    if activity_tasks > 0 {
+        stats.activity_tasks += activity_tasks;
+    }
+
     Ok(stats)
 }
 
@@ -2449,9 +2667,11 @@ fn operation_report(
     total_duration: Duration,
     items: u64,
     errors: u64,
+    mixed_actions: u64,
 ) -> BackendOperationReport {
     let latency = latency_report(samples);
     let total_seconds = total_duration.as_secs_f64();
+    let mixed_actions = mixed_actions.max(1) as f64;
     BackendOperationReport {
         calls: latency.samples,
         errors,
@@ -2467,6 +2687,9 @@ fn operation_report(
         } else {
             items as f64 / total_seconds
         },
+        calls_per_mixed_action: latency.samples as f64 / mixed_actions,
+        items_per_mixed_action: items as f64 / mixed_actions,
+        total_ms_per_mixed_action: duration_ms(total_duration) / mixed_actions,
         latency,
     }
 }
@@ -2959,28 +3182,14 @@ fn print_text_result(result: &BenchmarkResult) {
         result.backend_metrics.workflow_task_commit_latency.p99_ms,
         result.backend_metrics.workflow_task_commit_latency.max_ms
     );
-    if !result.backend_metrics.operations.is_empty() {
-        let mut operations = result.backend_metrics.operations.iter().collect::<Vec<_>>();
-        operations.sort_by(|(_, left), (_, right)| {
-            right
-                .total_ms
-                .partial_cmp(&left.total_ms)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        println!();
-        println!("Backend operation latency:");
-        for (name, operation) in operations.into_iter().take(8) {
-            println!(
-                "  {name}: calls {}, items {}, total {:.2}ms, p50 {:.3}ms, p95 {:.3}ms, p99 {:.3}ms",
-                operation.calls,
-                operation.items,
-                operation.total_ms,
-                operation.latency.p50_ms,
-                operation.latency.p95_ms,
-                operation.latency.p99_ms
-            );
-        }
-    }
+    print_backend_metrics_summary(
+        "Processing backend operation latency",
+        &result.processing_backend_metrics,
+    );
+    print_backend_metrics_summary(
+        "Full-run backend operation latency",
+        &result.backend_metrics,
+    );
     if let Some(postgres) = &result.postgres_stats {
         println!();
         println!("Postgres stats:");
@@ -3061,6 +3270,38 @@ fn print_text_result(result: &BenchmarkResult) {
     }
 }
 
+fn print_backend_metrics_summary(label: &str, metrics: &BackendMetricsReport) {
+    if !metrics.operations.is_empty() {
+        let mut operations = metrics.operations.iter().collect::<Vec<_>>();
+        operations.sort_by(|(_, left), (_, right)| {
+            right
+                .total_ms
+                .partial_cmp(&left.total_ms)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        println!();
+        println!("{label}:");
+        for (name, operation) in operations.into_iter().take(8) {
+            println!(
+                "  {name}: calls {}, items {}, calls/action {:.3}, items/call {:.2}, total {:.2}ms, p95 {:.3}ms",
+                operation.calls,
+                operation.items,
+                operation.calls_per_mixed_action,
+                operation.items_per_call,
+                operation.total_ms,
+                operation.latency.p95_ms
+            );
+        }
+    }
+    if !metrics.workflow_task_commit_shapes.is_empty() {
+        println!();
+        println!("{label} commit shapes:");
+        for (name, count) in &metrics.workflow_task_commit_shapes {
+            println!("  {name}: {count}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3104,6 +3345,8 @@ mod tests {
             "8".to_owned(),
             "--activity-completion-batch".to_owned(),
             "7".to_owned(),
+            "--worker-round-passes".to_owned(),
+            "1".to_owned(),
         ])
         .unwrap();
         assert_eq!(options.backend, BenchmarkBackend::Postgres);
@@ -3113,6 +3356,7 @@ mod tests {
         assert_eq!(options.activation_concurrency, 4);
         assert_eq!(options.activation_prefetch_limit, 8);
         assert_eq!(options.activity_completion_batch, 7);
+        assert_eq!(options.worker_round_passes, Some(1));
     }
 
     #[test]

@@ -25,6 +25,7 @@ import type {
   ClaimedActivityTask,
   ClaimedWorkflowTask,
   ClaimActivityOptions,
+  ClaimWorkflowBatchOptions,
   ClaimWorkflowTaskOptions,
   CommandId,
   CommitOutcome,
@@ -505,112 +506,250 @@ export class PostgresBackend implements DurableBackend {
     workerId: WorkerId | string,
     opts: ClaimWorkflowTaskOptions
   ): Promise<ClaimedWorkflowTask | null> {
+    const claimed = await this.claimWorkflowTasks(workerId, { ...opts, limit: 1 });
+    return claimed[0] ?? null;
+  }
+
+  async claimWorkflowTasks(
+    workerId: WorkerId | string,
+    opts: ClaimWorkflowBatchOptions
+  ): Promise<readonly ClaimedWorkflowTask[]> {
     if (opts.registeredWorkflowTypes.length === 0) {
-      return null;
+      return [];
     }
+    const limit = Math.max(1, Math.trunc(opts.limit));
     return this.#withSqlTransaction(async (client) => {
-      const registeredTypes = opts.registeredWorkflowTypes.map((workflowType) => ({
-        name: workflowType.name,
-        version: workflowType.version
-      }));
+      const registeredTypes = stringifyJson(
+        opts.registeredWorkflowTypes.map((workflowType) => ({
+          name: workflowType.name,
+          version: workflowType.version
+        }))
+      );
       const now = this.#nowMs();
       const leaseExpiresAt = this.#leaseExpiresAt(opts.leaseDurationMs);
-      const result = await client.query<{
-        readonly run_id: string;
-        readonly workflow_id: string;
-        readonly workflow_type: unknown;
-        readonly tail_event_id: number | string;
-        readonly reason: string;
-        readonly token: number | string;
-      }>(
-        `
-          with selected as (
-            select
-              runs.run_id,
-              runs.workflow_id,
-              runs.workflow_type,
-              runs.tail_event_id,
-              coalesce(runs.ready_reason, runs.claim_reason) as reason
-            from ${this.#workflowRunsTableName} runs
-            join jsonb_to_recordset($3::jsonb) as registered(name text, version integer)
-              on registered.name = runs.workflow_type_name
-             and registered.version = runs.workflow_type_version
-            where runs.namespace = $1
-              and runs.task_queue = $2
-              and runs.terminal = false
-              and (
-                (runs.ready_reason is not null and runs.claim_token is null)
-                or (
-                  runs.claim_token is not null
-                  and runs.claim_reason is not null
-                  and runs.claim_expires_at_ms is not null
-                  and runs.claim_expires_at_ms <= $4::bigint
-                )
-              )
-            order by
-              case
-                when runs.run_id ~ '^run-[0-9]+$' then substring(runs.run_id from 5)::bigint
-                else 9223372036854775807
-              end asc,
-              runs.run_id asc
-            limit 1
-            for update of runs skip locked
-          ),
-          token as (
-            update ${this.#countersTableName}
-            set next_value = next_value + 1
-            where name = 'workflow_claim'
-            returning next_value - 1 as token
-          )
-          update ${this.#workflowRunsTableName} runs
-          set
-            ready_reason = null,
-            claim_worker_id = $5,
-            claim_token = token.token,
-            claim_reason = selected.reason,
-            claim_expires_at_ms = $6::bigint
-          from selected, token
-          where runs.run_id = selected.run_id
-          returning
-            runs.run_id,
-            selected.workflow_id,
-            selected.workflow_type,
-            selected.tail_event_id,
-            selected.reason,
-            token.token
-        `,
-        [
-          String(opts.namespace),
-          String(opts.taskQueue),
-          stringifyJson(registeredTypes),
-          String(now),
-          String(workerId),
-          String(leaseExpiresAt)
-        ]
+      let rows = await this.#claimReadyWorkflowTaskRows(
+        client,
+        workerId,
+        opts,
+        registeredTypes,
+        leaseExpiresAt,
+        limit
       );
-      const row = result.rows[0];
-      if (row === undefined) {
-        return null;
+      if (rows.length === 0) {
+        rows = await this.#claimExpiredWorkflowTaskRows(
+          client,
+          workerId,
+          opts,
+          registeredTypes,
+          now,
+          leaseExpiresAt,
+          limit
+        );
+      }
+      return await this.#hydrateWorkflowClaimRows(
+        client,
+        workerId,
+        rows,
+        opts.registeredSignalNames ?? []
+      );
+    });
+  }
+
+  async #claimReadyWorkflowTaskRows(
+    client: PoolClient,
+    workerId: WorkerId | string,
+    opts: ClaimWorkflowTaskOptions,
+    registeredTypes: string,
+    leaseExpiresAt: number,
+    limit: number
+  ): Promise<readonly WorkflowClaimRow[]> {
+    const result = await client.query<WorkflowClaimRow>(
+      `
+        with selected as (
+          select
+            runs.run_id,
+            runs.workflow_id,
+            runs.workflow_type,
+            runs.tail_event_id,
+            runs.ready_reason as reason
+          from ${this.#workflowRunsTableName} runs
+          join jsonb_to_recordset($3::jsonb) as registered(name text, version integer)
+            on registered.name = runs.workflow_type_name
+           and registered.version = runs.workflow_type_version
+          where runs.namespace = $1
+            and runs.task_queue = $2
+            and runs.terminal = false
+            and runs.ready_reason is not null
+            and runs.claim_token is null
+          order by runs.run_id asc
+          limit $6::bigint
+          for update of runs skip locked
+        ),
+        numbered as (
+          select
+            selected.*,
+            row_number() over (order by selected.run_id asc) - 1 as token_offset
+          from selected
+        ),
+        claimed_count as (
+          select count(*)::bigint as value from numbered
+        ),
+        token as (
+          update ${this.#countersTableName} counters
+          set next_value = next_value + claimed_count.value
+          from claimed_count
+          where counters.name = 'workflow_claim'
+            and claimed_count.value > 0
+          returning counters.next_value - claimed_count.value as first_token
+        )
+        update ${this.#workflowRunsTableName} runs
+        set
+          ready_reason = null,
+          claim_worker_id = $4,
+          claim_token = token.first_token + numbered.token_offset,
+          claim_reason = numbered.reason,
+          claim_expires_at_ms = $5::bigint
+        from numbered, token
+        where runs.run_id = numbered.run_id
+        returning
+          runs.run_id,
+          numbered.workflow_id,
+          numbered.workflow_type,
+          numbered.tail_event_id,
+          numbered.reason,
+          token.first_token + numbered.token_offset as token
+      `,
+      [
+        String(opts.namespace),
+        String(opts.taskQueue),
+        registeredTypes,
+        String(workerId),
+        String(leaseExpiresAt),
+        String(limit)
+      ]
+    );
+    return workflowClaimRowsInDeterministicOrder(result.rows);
+  }
+
+  async #claimExpiredWorkflowTaskRows(
+    client: PoolClient,
+    workerId: WorkerId | string,
+    opts: ClaimWorkflowTaskOptions,
+    registeredTypes: string,
+    now: number,
+    leaseExpiresAt: number,
+    limit: number
+  ): Promise<readonly WorkflowClaimRow[]> {
+    const result = await client.query<WorkflowClaimRow>(
+      `
+        with selected as (
+          select
+            runs.run_id,
+            runs.workflow_id,
+            runs.workflow_type,
+            runs.tail_event_id,
+            runs.claim_reason as reason
+          from ${this.#workflowRunsTableName} runs
+          join jsonb_to_recordset($3::jsonb) as registered(name text, version integer)
+            on registered.name = runs.workflow_type_name
+           and registered.version = runs.workflow_type_version
+          where runs.namespace = $1
+            and runs.task_queue = $2
+            and runs.terminal = false
+            and runs.claim_token is not null
+            and runs.claim_reason is not null
+            and runs.claim_expires_at_ms is not null
+            and runs.claim_expires_at_ms <= $4::bigint
+          order by runs.run_id asc
+          limit $7::bigint
+          for update of runs skip locked
+        ),
+        numbered as (
+          select
+            selected.*,
+            row_number() over (order by selected.run_id asc) - 1 as token_offset
+          from selected
+        ),
+        claimed_count as (
+          select count(*)::bigint as value from numbered
+        ),
+        token as (
+          update ${this.#countersTableName} counters
+          set next_value = next_value + claimed_count.value
+          from claimed_count
+          where counters.name = 'workflow_claim'
+            and claimed_count.value > 0
+          returning counters.next_value - claimed_count.value as first_token
+        )
+        update ${this.#workflowRunsTableName} runs
+        set
+          ready_reason = null,
+          claim_worker_id = $5,
+          claim_token = token.first_token + numbered.token_offset,
+          claim_reason = numbered.reason,
+          claim_expires_at_ms = $6::bigint
+        from numbered, token
+        where runs.run_id = numbered.run_id
+        returning
+          runs.run_id,
+          numbered.workflow_id,
+          numbered.workflow_type,
+          numbered.tail_event_id,
+          numbered.reason,
+          token.first_token + numbered.token_offset as token
+      `,
+      [
+        String(opts.namespace),
+        String(opts.taskQueue),
+        registeredTypes,
+        String(now),
+        String(workerId),
+        String(leaseExpiresAt),
+        String(limit)
+      ]
+    );
+    return workflowClaimRowsInDeterministicOrder(result.rows);
+  }
+
+  async #hydrateWorkflowClaimRows(
+    client: PoolClient,
+    workerId: WorkerId | string,
+    rows: readonly WorkflowClaimRow[],
+    signalNames: readonly (SignalName | string)[]
+  ): Promise<readonly ClaimedWorkflowTask[]> {
+    if (rows.length === 0) {
+      return [];
+    }
+    const orderedRows = workflowClaimRowsInDeterministicOrder(rows);
+    const targets = orderedRows.map((row) => ({
+      runId: runId(row.run_id),
+      replayTargetEventId: eventId(postgresRequiredNumber(row.tail_event_id))
+    }));
+    const histories = await this.#readNormalizedHistoriesForClaims(client, targets);
+    const liveSignals = await this.#readSignalInboxesForClaims(
+      client,
+      targets.map((target) => target.runId),
+      signalNames
+    );
+    return orderedRows.map((row) => {
+      const target = targets.find((item) => String(item.runId) === row.run_id);
+      if (target === undefined) {
+        throw new Error(`missing workflow claim target for ${row.run_id}`);
       }
       const claim: WorkflowTaskClaim = {
-        runId: runId(row.run_id),
+        runId: target.runId,
         workerId,
         token: postgresRequiredNumber(row.token)
       };
-      const replayTargetEventId = eventId(postgresRequiredNumber(row.tail_event_id));
-      const prefetchedHistory = await this.#readNormalizedHistoryForClaim(
-        client,
-        claim.runId,
-        replayTargetEventId
-      );
       return {
         runId: claim.runId,
         workflowId: row.workflow_id,
         workflowType: parsePostgresJson(row.workflow_type) as WorkflowType,
         claim,
-        replayTargetEventId,
+        replayTargetEventId: target.replayTargetEventId,
         reason: row.reason as WorkflowTaskReason,
-        prefetchedHistory
+        prefetchedHistory: histories.get(row.run_id) ?? [],
+        liveSignals: liveSignals.get(row.run_id) ?? []
       };
     });
   }
@@ -1117,6 +1256,119 @@ export class PostgresBackend implements DurableBackend {
         ]
       );
       return { task, claim };
+    });
+  }
+
+  async claimActivityTasks(
+    workerId: WorkerId | string,
+    opts: ClaimActivityOptions & { readonly limit: number }
+  ): Promise<readonly ClaimedActivityTask[]> {
+    if (opts.registeredActivityNames.length === 0) {
+      return [];
+    }
+    const limit = Math.max(1, Math.trunc(opts.limit));
+    return this.#withSqlTransaction(async (client) => {
+      const now = this.#nowMs();
+      const selected = await client.query<NormalizedActivityTaskLoadRow>(
+        `
+          select activities.*
+          from ${this.#activityTasksTableName} activities
+          left join ${this.#activityMapsTableName} maps
+            on maps.command_key = activities.map_command_key
+          where activities.namespace = $1
+            and activities.task_queue = $2
+            and activities.activity_name = any($3::text[])
+            and activities.terminal_event_id is null
+            and activities.available_at_ms <= $4::bigint
+            and (
+              activities.claim_token is null
+              or (
+                activities.claim_expires_at_ms is not null
+                and activities.claim_expires_at_ms <= $4::bigint
+              )
+            )
+            and coalesce(maps.terminal, false) = false
+          order by activities.available_at_ms asc, activities.activity_id asc
+          limit $5::bigint
+          for update of activities skip locked
+        `,
+        [
+          String(opts.namespace),
+          String(opts.taskQueue),
+          opts.registeredActivityNames.map(String),
+          String(now),
+          String(limit)
+        ]
+      );
+      if (selected.rows.length === 0) {
+        return [];
+      }
+
+      const firstToken = await this.#allocateCounterRange(
+        client,
+        "activity_claim",
+        selected.rows.length
+      );
+      const claimExpiresAt = this.#leaseExpiresAt(opts.leaseDurationMs);
+      const claims = selected.rows.map((row, index) => {
+        const task = parsePostgresJson(row.task) as ActivityTask;
+        const token = firstToken + index;
+        const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now);
+        const timeoutDeadline = activityTimeoutDeadlineFromTask(task, now, heartbeatDeadline);
+        return {
+          activityId: row.activity_id,
+          task,
+          claim: {
+            activityId: row.activity_id,
+            workerId,
+            token
+          } satisfies ActivityTaskClaim,
+          heartbeatDeadline,
+          timeoutDeadline,
+          claimExpiresAt
+        };
+      });
+
+      await client.query(
+        `
+          with updates as (
+            select *
+            from jsonb_to_recordset($2::jsonb) as update_row(
+              activity_id text,
+              claim_token bigint,
+              claim_started_at_ms bigint,
+              heartbeat_deadline_at_ms bigint,
+              timeout_deadline_at_ms bigint,
+              claim_expires_at_ms bigint
+            )
+          )
+          update ${this.#activityTasksTableName} activities
+          set
+            claim_worker_id = $1,
+            claim_token = updates.claim_token,
+            claim_started_at_ms = updates.claim_started_at_ms,
+            heartbeat_deadline_at_ms = updates.heartbeat_deadline_at_ms,
+            timeout_deadline_at_ms = updates.timeout_deadline_at_ms,
+            claim_expires_at_ms = updates.claim_expires_at_ms
+          from updates
+          where activities.activity_id = updates.activity_id
+        `,
+        [
+          String(workerId),
+          stringifyJson(
+            claims.map((claim) => ({
+              activity_id: claim.activityId,
+              claim_token: claim.claim.token,
+              claim_started_at_ms: now,
+              heartbeat_deadline_at_ms: claim.heartbeatDeadline,
+              timeout_deadline_at_ms: claim.timeoutDeadline,
+              claim_expires_at_ms: claim.claimExpiresAt
+            }))
+          )
+        ]
+      );
+
+      return claims.map(({ task, claim }) => ({ task, claim }));
     });
   }
 
@@ -1703,6 +1955,57 @@ export class PostgresBackend implements DurableBackend {
       signalName: row.signal_name,
       payload: parseJson<PayloadRef>(JSON.stringify(row.payload))
     };
+  }
+
+  async #readSignalInboxesForClaims(
+    client: PoolClient,
+    runIds: readonly RunId[],
+    signalNames: readonly (SignalName | string)[]
+  ): Promise<ReadonlyMap<string, readonly SignalInboxRecord[]>> {
+    const orderedRunIds = [...new Set(runIds.map(String))];
+    const orderedSignalNames = [...new Set(signalNames.map(String))];
+    const recordsByRun = new Map<string, SignalInboxRecord[]>(
+      orderedRunIds.map((runIdValue) => [runIdValue, []])
+    );
+    if (orderedRunIds.length === 0 || orderedSignalNames.length === 0) {
+      return recordsByRun;
+    }
+    const result = await client.query<NormalizedClaimSignalSelectRow>(
+      `
+        select distinct on (run_id, signal_name)
+          run_id,
+          signal_id,
+          signal_name,
+          payload
+        from ${this.#signalsTableName}
+        where run_id = any($1::text[])
+          and signal_name = any($2::text[])
+          and consumed = false
+        order by run_id asc, signal_name asc, received_sequence asc, signal_id asc
+      `,
+      [orderedRunIds, orderedSignalNames]
+    );
+    const byRunThenSignal = new Map<string, Map<string, SignalInboxRecord>>();
+    for (const row of result.rows) {
+      const bySignal = byRunThenSignal.get(row.run_id) ?? new Map<string, SignalInboxRecord>();
+      bySignal.set(row.signal_name, {
+        signalId: row.signal_id,
+        signalName: row.signal_name,
+        payload: parseJson<PayloadRef>(JSON.stringify(row.payload))
+      });
+      byRunThenSignal.set(row.run_id, bySignal);
+    }
+    for (const runIdValue of orderedRunIds) {
+      const bySignal = byRunThenSignal.get(runIdValue);
+      recordsByRun.set(
+        runIdValue,
+        orderedSignalNames.flatMap((signalName) => {
+          const record = bySignal?.get(signalName);
+          return record === undefined ? [] : [record];
+        })
+      );
+    }
+    return recordsByRun;
   }
 
   async queryWorkflow(req: QueryWorkflowRequest): Promise<QueryWorkflowOutcome> {
@@ -2552,21 +2855,56 @@ export class PostgresBackend implements DurableBackend {
     );
   }
 
-  async #readNormalizedHistoryForClaim(
+  async #readNormalizedHistoriesForClaims(
     client: PoolClient,
-    id: RunId,
-    upToEventId: EventId
-  ): Promise<readonly HistoryEvent[]> {
-    const result = await client.query<NormalizedHistorySelectRow>(
-      `
-        select event_id, event_type, data
-        from ${this.#historyTableName}
-        where run_id = $1 and event_id::bigint > 0 and event_id::bigint <= $2::bigint
-        order by event_id asc
-      `,
-      [String(id), String(Number(upToEventId))]
+    targets: readonly {
+      readonly runId: RunId;
+      readonly replayTargetEventId: EventId;
+    }[]
+  ): Promise<ReadonlyMap<string, readonly HistoryEvent[]>> {
+    const histories = new Map<string, HistoryEvent[]>(
+      targets.map((target) => [String(target.runId), []])
     );
-    return result.rows.map(historyEventFromNormalizedRow);
+    if (targets.length === 0) {
+      return histories;
+    }
+    const result = await client.query<NormalizedClaimHistorySelectRow>(
+      `
+        with targets as (
+          select *
+          from jsonb_to_recordset($1::jsonb) as target(
+            run_id text,
+            replay_target_event_id bigint
+          )
+        )
+        select
+          history.run_id,
+          history.event_id,
+          history.event_type,
+          history.data
+        from ${this.#historyTableName} history
+        join targets
+          on targets.run_id = history.run_id
+         and history.event_id::bigint <= targets.replay_target_event_id
+        where history.event_id::bigint > 0
+        order by history.run_id asc, history.event_id asc
+      `,
+      [
+        stringifyJson(
+          targets.map((target) => ({
+            run_id: String(target.runId),
+            replay_target_event_id: Number(target.replayTargetEventId)
+          }))
+        )
+      ]
+    );
+    for (const row of result.rows) {
+      const history = histories.get(row.run_id);
+      if (history !== undefined) {
+        history.push(historyEventFromNormalizedRow(row));
+      }
+    }
+    return histories;
   }
 
   async #selectCurrentWorkflowRunId(
@@ -4167,6 +4505,19 @@ interface NormalizedHistorySelectRow {
   readonly data: HistoryEventData;
 }
 
+interface NormalizedClaimHistorySelectRow extends NormalizedHistorySelectRow {
+  readonly run_id: string;
+}
+
+interface WorkflowClaimRow {
+  readonly run_id: string;
+  readonly workflow_id: string;
+  readonly workflow_type: unknown;
+  readonly tail_event_id: number | string;
+  readonly reason: string;
+  readonly token: number | string;
+}
+
 interface NormalizedWorkflowRunRow {
   readonly run_id: string;
   readonly namespace: string;
@@ -4221,6 +4572,10 @@ interface NormalizedSignalSelectRow {
   readonly signal_id: string;
   readonly signal_name: string;
   readonly payload: PayloadRef;
+}
+
+interface NormalizedClaimSignalSelectRow extends NormalizedSignalSelectRow {
+  readonly run_id: string;
 }
 
 interface NormalizedActivityTaskRow {
@@ -4679,6 +5034,12 @@ function historyEventFromNormalizedRow(row: NormalizedHistorySelectRow): History
     eventType: row.event_type,
     data
   };
+}
+
+function workflowClaimRowsInDeterministicOrder(
+  rows: readonly WorkflowClaimRow[]
+): readonly WorkflowClaimRow[] {
+  return [...rows].sort((left, right) => left.run_id.localeCompare(right.run_id));
 }
 
 function normalizedWorkflowRunRow(workflow: WorkflowState): NormalizedWorkflowRunRow {

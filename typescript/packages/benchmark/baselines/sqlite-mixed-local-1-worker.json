@@ -2,8 +2,8 @@
   "name": "sqlite-mixed-local-1-worker",
   "kind": "accepted",
   "metadata": {
-    "measured_at": "2026-06-19",
-    "commit": "f3f2235",
+    "measured_at": "2026-06-21",
+    "commit": "d439cf5",
     "os": "Darwin mac.lan 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:42 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6031 arm64",
     "node": "v24.15.0",
     "notes": "Measured locally from /tmp/durust-ts-final-benchmarks.json. CPU/RAM unavailable from sandboxed sysctl; Postgres ran from tests/fixtures/postgres.compose.yml with pg_stat_statements."
@@ -45,16 +45,16 @@
       "historyStreamChunks": 0,
       "historyStreamEvents": 0
     },
-    "processing_mixed_actions_per_second": 719.137,
-    "processing_workflows_per_second": 89.892,
-    "workflow_task_commit_p95_ms": 2.098,
+    "processing_mixed_actions_per_second": 832.243,
+    "processing_workflows_per_second": 104.03,
+    "workflow_task_commit_p95_ms": 2.796,
     "operations": {
       "claimActivityTask": {
-        "calls": 800,
+        "calls": 301,
         "errors": 0
       },
       "claimWorkflowTask": {
-        "calls": 800,
+        "calls": 1098,
         "errors": 0
       },
       "commitWorkflowTask": {
@@ -66,7 +66,7 @@
         "errors": 0
       },
       "fireDueTimers": {
-        "calls": 800,
+        "calls": 301,
         "errors": 0
       },
       "readSignalInbox": {
@@ -82,7 +82,7 @@
         "errors": 0
       },
       "streamHistory": {
-        "calls": 2600,
+        "calls": 100,
         "errors": 0
       }
     }

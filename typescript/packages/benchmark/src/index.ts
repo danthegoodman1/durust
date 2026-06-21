@@ -55,7 +55,9 @@ import {
   type WorkflowHandle,
   type WorkflowTaskClaim,
   type WorkflowTaskCommit,
+  type ClaimActivityBatchOptions,
   type ClaimActivityOptions,
+  type ClaimWorkflowBatchOptions,
   type ClaimWorkflowTaskOptions
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend } from "@durust/payload";
@@ -291,7 +293,9 @@ export interface BenchmarkThresholds {
   readonly require_exact_completed_workflows?: boolean;
   readonly require_exact_mixed_actions?: boolean;
   readonly require_exact_counters?: readonly (keyof BenchmarkCounters)[];
+  readonly require_min_counters?: readonly (keyof BenchmarkCounters)[];
   readonly require_exact_worker_stats?: readonly (keyof WorkerStatsReport)[];
+  readonly require_min_worker_stats?: readonly (keyof WorkerStatsReport)[];
   readonly required_operation_names?: readonly string[];
   readonly forbidden_operation_names?: readonly string[];
   readonly allow_operation_errors?: boolean;
@@ -474,10 +478,59 @@ class OperationSamples {
 }
 
 class MeasuredBackend implements DurableBackend {
+  readonly claimWorkflowTasks?: (
+    workerId: string,
+    opts: ClaimWorkflowBatchOptions
+  ) => Promise<readonly ClaimedWorkflowTask[]>;
+
+  readonly claimActivityTasks?: (
+    workerId: string,
+    opts: ClaimActivityBatchOptions
+  ) => Promise<readonly ClaimedActivityTask[]>;
+
   constructor(
     readonly inner: DurableBackend,
     readonly metrics: BackendMetrics
-  ) {}
+  ) {
+    if (inner.claimWorkflowTasks !== undefined) {
+      this.claimWorkflowTasks = async (workerId, opts) => {
+        const started = performance.now();
+        try {
+          const tasks = await inner.claimWorkflowTasks?.(workerId, opts);
+          const result = tasks ?? [];
+          this.metrics.record(
+            "claimWorkflowTask",
+            performance.now() - started,
+            result.length,
+            true
+          );
+          return result;
+        } catch (error) {
+          this.metrics.record("claimWorkflowTask", performance.now() - started, 0, false);
+          throw error;
+        }
+      };
+    }
+    if (inner.claimActivityTasks !== undefined) {
+      this.claimActivityTasks = async (workerId, opts) => {
+        const started = performance.now();
+        try {
+          const tasks = await inner.claimActivityTasks?.(workerId, opts);
+          const result = tasks ?? [];
+          this.metrics.record(
+            "claimActivityTask",
+            performance.now() - started,
+            result.length,
+            true
+          );
+          return result;
+        } catch (error) {
+          this.metrics.record("claimActivityTask", performance.now() - started, 0, false);
+          throw error;
+        }
+      };
+    }
+  }
 
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
     return this.#measure("startWorkflow", 1, () => this.inner.startWorkflow(req));
@@ -928,11 +981,11 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
   const metrics = new BackendMetrics();
   const backend = new MeasuredBackend(backendHandle.backend, metrics);
   try {
-    const postgresStatsBefore = await backendHandle.postgresStatsSnapshot?.();
     const setupStarted = performance.now();
     const registry = benchmarkRegistry();
     const startOutcome = await startWorkflows(backend, options);
     const setupFinished = performance.now();
+    const postgresStatsBefore = await backendHandle.postgresStatsSnapshot?.();
 
     const workers = Array.from({ length: options.workers }, (_, index) =>
       new Worker({
@@ -952,27 +1005,38 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
     let stats = emptyWorkerStats();
     let rounds = 0;
     let completed = 0;
+    const nominalWorkflowTasks = nominalWorkflowTaskTarget(options);
     while (rounds < options.max_rounds) {
       rounds += 1;
       const roundStats = await drainWorkerRound(backend, workers, options);
       stats = addWorkerStats(stats, roundStats);
-      completed = await verifyCompletedWorkflows(backend, startOutcome.runs, options, false);
-      if (completed === options.workflows) {
-        break;
-      }
-      if (!madeProgress(roundStats)) {
-        throw new Error(
-          `benchmark stalled after ${rounds} rounds: ${completed}/${options.workflows} workflows completed`
-        );
+      if (nominalWorkflowTasks !== null) {
+        if (stats.workflowTasks >= nominalWorkflowTasks) {
+          break;
+        }
+        if (!madeProgress(roundStats)) {
+          break;
+        }
+      } else {
+        completed = await verifyCompletedWorkflows(backend, startOutcome.runs, options, false);
+        if (completed === options.workflows) {
+          break;
+        }
+        if (!madeProgress(roundStats)) {
+          throw new Error(
+            `benchmark stalled after ${rounds} rounds: ${completed}/${options.workflows} workflows completed`
+          );
+        }
       }
     }
-    if (completed !== options.workflows) {
+    if (nominalWorkflowTasks === null && completed !== options.workflows) {
       await verifyCompletedWorkflows(backend, startOutcome.runs, options, true);
       throw new Error(
         `benchmark did not complete after ${options.max_rounds} rounds: ${completed}/${options.workflows}`
       );
     }
     const processingFinished = performance.now();
+    const postgresStatsAfter = await backendHandle.postgresStatsSnapshot?.();
     const verifyStarted = processingFinished;
     const completedWorkflows = await verifyCompletedWorkflows(
       backend,
@@ -990,7 +1054,6 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
     const processingSeconds = Math.max(processingMs / 1000, Number.EPSILON);
     const activations = counters.workflow_tasks;
     const mixedActions = mixedActionCount(counters);
-    const postgresStatsAfter = await backendHandle.postgresStatsSnapshot?.();
     return {
       backend: options.backend,
       mode: options.mode,
@@ -1066,11 +1129,27 @@ export function compareBenchmarkToBaseline(
       result.counters[key]
     );
   }
+  for (const key of thresholds.require_min_counters ?? []) {
+    pushAtLeast(
+      failures,
+      `counters.${key}`,
+      baseline.result.counters[key] ?? 0,
+      result.counters[key]
+    );
+  }
   for (const key of thresholds.require_exact_worker_stats ?? []) {
     pushEqual(
       failures,
       `worker_stats.${key}`,
       baseline.result.worker_stats?.[key],
+      result.worker_stats[key]
+    );
+  }
+  for (const key of thresholds.require_min_worker_stats ?? []) {
+    pushAtLeast(
+      failures,
+      `worker_stats.${key}`,
+      baseline.result.worker_stats?.[key] ?? 0,
       result.worker_stats[key]
     );
   }
@@ -1573,13 +1652,13 @@ async function drainWorkerRound(
   workers: readonly Worker[],
   options: BenchmarkOptions
 ): Promise<WorkerRunStats> {
-  let stats = emptyWorkerStats();
-  for (const worker of workers) {
-    const beforeMetrics = worker.metrics();
-    for (let index = 0; index < options.batch; index += 1) {
-      const workflowTask = await worker.runWorkflowTaskOnce();
-      if (workflowTask.kind !== "NoTask") {
-        stats.workflowTasks += 1;
+  const workerStats = await Promise.all(
+    workers.map(async (worker) => {
+      const beforeMetrics = worker.metrics();
+      const stats = emptyWorkerStats();
+      const workflowTasks = await worker.runWorkflowTaskBatchOnce(options.batch);
+      if (workflowTasks > 0) {
+        stats.workflowTasks += workflowTasks;
       }
 
       if (options.mode !== "write-ceiling") {
@@ -1600,24 +1679,27 @@ async function drainWorkerRound(
           stats.activityTasks += activityTasks.kind === "Processed" ? activityTasks.tasks : 1;
         }
       }
-    }
-    const afterMetrics = worker.metrics();
-    stats.workflowHistoryCacheHits +=
-      afterMetrics.workflowHistoryCacheHits - beforeMetrics.workflowHistoryCacheHits;
-    stats.workflowHistoryCacheMisses +=
-      afterMetrics.workflowHistoryCacheMisses - beforeMetrics.workflowHistoryCacheMisses;
-    stats.workflowHistoryCacheEvictions +=
-      afterMetrics.workflowHistoryCacheEvictions - beforeMetrics.workflowHistoryCacheEvictions;
-    stats.workflowExecutionCacheHits +=
-      afterMetrics.workflowExecutionCacheHits - beforeMetrics.workflowExecutionCacheHits;
-    stats.workflowExecutionCacheMisses +=
-      afterMetrics.workflowExecutionCacheMisses - beforeMetrics.workflowExecutionCacheMisses;
-    stats.workflowExecutionCacheEvictions +=
-      afterMetrics.workflowExecutionCacheEvictions - beforeMetrics.workflowExecutionCacheEvictions;
-    stats.historyStreamChunks += afterMetrics.historyStreamChunks - beforeMetrics.historyStreamChunks;
-    stats.historyStreamEvents += afterMetrics.historyStreamEvents - beforeMetrics.historyStreamEvents;
-  }
-  return stats;
+      const afterMetrics = worker.metrics();
+      stats.workflowHistoryCacheHits +=
+        afterMetrics.workflowHistoryCacheHits - beforeMetrics.workflowHistoryCacheHits;
+      stats.workflowHistoryCacheMisses +=
+        afterMetrics.workflowHistoryCacheMisses - beforeMetrics.workflowHistoryCacheMisses;
+      stats.workflowHistoryCacheEvictions +=
+        afterMetrics.workflowHistoryCacheEvictions - beforeMetrics.workflowHistoryCacheEvictions;
+      stats.workflowExecutionCacheHits +=
+        afterMetrics.workflowExecutionCacheHits - beforeMetrics.workflowExecutionCacheHits;
+      stats.workflowExecutionCacheMisses +=
+        afterMetrics.workflowExecutionCacheMisses - beforeMetrics.workflowExecutionCacheMisses;
+      stats.workflowExecutionCacheEvictions +=
+        afterMetrics.workflowExecutionCacheEvictions - beforeMetrics.workflowExecutionCacheEvictions;
+      stats.historyStreamChunks +=
+        afterMetrics.historyStreamChunks - beforeMetrics.historyStreamChunks;
+      stats.historyStreamEvents +=
+        afterMetrics.historyStreamEvents - beforeMetrics.historyStreamEvents;
+      return stats;
+    })
+  );
+  return workerStats.reduce(addWorkerStats, emptyWorkerStats());
 }
 
 async function verifyCompletedWorkflows(
@@ -1854,6 +1936,17 @@ function mixedActionCount(counters: BenchmarkCounters): number {
     counters.child_activities +
     counters.finish_activities
   );
+}
+
+function nominalWorkflowTaskTarget(options: BenchmarkOptions): number | null {
+  switch (options.mode) {
+    case "mixed":
+      return options.workflows * 8;
+    case "write-ceiling":
+      return options.workflows;
+    default:
+      return null;
+  }
 }
 
 function expectedChildMapSum(index: number, items: number): number {

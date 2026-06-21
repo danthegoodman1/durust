@@ -51,6 +51,17 @@ invariants as the Rust API:
 - deterministic restrictions are enforced by runtime checks, lint rules, and
   replay/simulation tests rather than documentation alone.
 
+The TypeScript `DurableBackend` may expose optional batched workflow and
+activity claim hooks. The existing primitive composition is repeated
+single-claim polling followed by the same replay and commit path. That remains
+correct, but it is insufficient for the Postgres hot path because one worker
+batch otherwise creates one transaction per claimed task and repeats history and
+signal prefetch statements per task. The optional batch hooks protect bounded
+transaction and statement counts per worker batch while preserving lease
+fencing, deterministic claim order, bounded result sets, and provider
+substitutability. They are not user-facing workflow APIs; providers without the
+hook keep using the single-claim contract.
+
 API parity means behavioral parity, not syntactic parity. Rust macro and builder
 APIs do not translate literally to TypeScript, so the TypeScript surface should
 mirror durable semantics rather than Rust spelling. Prefer TypeScript-native

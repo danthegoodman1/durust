@@ -558,7 +558,10 @@ fn rust_benchmark_fixture_matches_shared_output_vocabulary() {
     assert_eq!(ts_result["completed_workflows"], json!(4));
     assert_eq!(ts_result["mixed_actions"], json!(32));
     assert_eq!(ts_result["counters"]["workflow_starts"], json!(4));
-    assert_eq!(ts_result["worker_stats"]["workflowHistoryCacheHits"], json!(0));
+    assert_eq!(
+        ts_result["worker_stats"]["workflowHistoryCacheHits"],
+        json!(0)
+    );
     assert_eq!(
         ts_result["worker_stats"]["workflowHistoryCacheMisses"],
         json!(32)
@@ -567,8 +570,14 @@ fn rust_benchmark_fixture_matches_shared_output_vocabulary() {
         ts_result["worker_stats"]["workflowHistoryCacheEvictions"],
         json!(0)
     );
-    assert_eq!(ts_result["worker_stats"]["workflowExecutionCacheHits"], json!(24));
-    assert_eq!(ts_result["worker_stats"]["workflowExecutionCacheMisses"], json!(8));
+    assert_eq!(
+        ts_result["worker_stats"]["workflowExecutionCacheHits"],
+        json!(24)
+    );
+    assert_eq!(
+        ts_result["worker_stats"]["workflowExecutionCacheMisses"],
+        json!(8)
+    );
     assert_eq!(
         ts_result["worker_stats"]["workflowExecutionCacheEvictions"],
         json!(0)

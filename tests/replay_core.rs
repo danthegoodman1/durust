@@ -1099,15 +1099,17 @@ fn batched_workflow_tasks_commit_multiple_runs_together() {
         // limit collapses to one) could commit at most one per call, so committing 3
         // here proves the batched fork actually ran.
         let scheduled = worker.run_workflow_batch_once().await.unwrap();
-        assert_eq!(scheduled, 3, "all three schedule tasks should commit in one batch");
+        assert_eq!(
+            scheduled, 3,
+            "all three schedule tasks should commit in one batch"
+        );
         let stats = worker.run_until_idle().await.unwrap();
         // The first batch plus the three completion tasks account for every commit.
         assert_eq!(scheduled + stats.workflow_tasks, 6);
 
         for run_id in &run_ids {
             let history = stream_all(&backend, run_id).await;
-            let HistoryEventData::WorkflowCompleted { result } =
-                &history[history.len() - 1].data
+            let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
             else {
                 panic!("batched workflow run did not complete");
             };
@@ -4504,7 +4506,7 @@ fn worker_crash_recovers_by_streaming_history() {
 }
 
 #[test]
-fn recovery_fetches_history_incrementally_in_configured_chunks() {
+fn recovery_replays_prefetched_history_in_configured_chunks() {
     block_on(async {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
@@ -4532,23 +4534,14 @@ fn recovery_fetches_history_incrementally_in_configured_chunks() {
             .build();
         assert!(recovered_worker.run_workflow_once().await.unwrap());
 
-        let requests = backend.stream_requests();
-        assert_eq!(requests.len(), 3);
-        assert!(requests.iter().all(|request| request.max_events == 1));
-        assert_eq!(
-            requests
-                .iter()
-                .map(|request| request.after_event_id)
-                .collect::<Vec<_>>(),
-            vec![EventId::ZERO, EventId(1), EventId(2)]
-        );
+        assert!(backend.stream_requests().is_empty());
         let history = stream_all(&backend, &run_id).await;
         assert_eq!(history.len(), 4);
     });
 }
 
 #[test]
-fn cached_workflow_wake_streams_only_events_after_cached_tail() {
+fn cached_workflow_wake_uses_prefetched_tail() {
     block_on(async {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
@@ -4569,10 +4562,7 @@ fn cached_workflow_wake_streams_only_events_after_cached_tail() {
 
         assert!(worker.run_workflow_once().await.unwrap());
 
-        let requests = backend.stream_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].after_event_id, EventId(2));
-        assert_eq!(requests[0].up_to_event_id, EventId(3));
+        assert!(backend.stream_requests().is_empty());
         let history = stream_all(&backend, &run_id).await;
         assert_eq!(history.len(), 4);
     });
@@ -4606,10 +4596,7 @@ fn cached_workflow_wake_ignores_cold_recovery_saturation() {
 
         assert!(worker.run_workflow_once().await.unwrap());
 
-        let requests = backend.stream_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].after_event_id, EventId(2));
-        assert_eq!(requests[0].up_to_event_id, EventId(3));
+        assert!(backend.stream_requests().is_empty());
         let history = stream_all(&backend, &run_id).await;
         assert_eq!(history.len(), 4);
     });
@@ -4706,10 +4693,7 @@ fn cold_recovery_event_budget_defers_without_appending_failure() {
             .build();
         assert!(recovered_worker.run_workflow_once().await.unwrap());
 
-        let requests = backend.stream_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].max_events, 1);
-        assert_eq!(requests[0].after_event_id, EventId::ZERO);
+        assert!(backend.stream_requests().is_empty());
 
         let history = stream_all(&backend, &run_id).await;
         assert_eq!(history.len(), 3);
@@ -4761,10 +4745,7 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
             .build();
         assert!(recovered_worker.run_workflow_once().await.unwrap());
 
-        let requests = backend.stream_requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].max_bytes, 1);
-        assert_eq!(requests[0].after_event_id, EventId::ZERO);
+        assert!(backend.stream_requests().is_empty());
 
         let history = stream_all(&backend, &run_id).await;
         assert_eq!(history.len(), 3);
@@ -4779,7 +4760,7 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
 #[test]
 fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
     block_on(async {
-        let backend = RecordingBackend::new(MemoryBackend::new());
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", number(9))
@@ -5448,6 +5429,7 @@ struct RecordingBackend {
     stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
+    claim_prefetch_enabled: bool,
 }
 
 impl RecordingBackend {
@@ -5457,7 +5439,13 @@ impl RecordingBackend {
             stream_requests: Arc::new(Mutex::new(Vec::new())),
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
+            claim_prefetch_enabled: true,
         }
+    }
+
+    fn without_claim_prefetch(mut self) -> Self {
+        self.claim_prefetch_enabled = false;
+        self
     }
 
     fn clear_stream_requests(&self) {
@@ -5501,7 +5489,17 @@ impl DurableBackend for RecordingBackend {
         worker_id: WorkerId,
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
-        self.inner.claim_workflow_task(worker_id, opts)
+        let prefetch_enabled = self.claim_prefetch_enabled;
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let mut claimed = inner.claim_workflow_task(worker_id, opts).await?;
+            if !prefetch_enabled {
+                if let Some(claimed) = &mut claimed {
+                    claimed.prefetched_history.clear();
+                }
+            }
+            Ok(claimed)
+        })
     }
 
     fn stream_history(

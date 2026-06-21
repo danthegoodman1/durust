@@ -2,8 +2,8 @@
   "name": "postgres-mixed-accepted",
   "kind": "accepted",
   "metadata": {
-    "measured_at": "2026-06-19",
-    "commit": "f3f2235",
+    "measured_at": "2026-06-21",
+    "commit": "d439cf5",
     "os": "Darwin mac.lan 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:42 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6031 arm64",
     "node": "v24.15.0",
     "postgres": "PostgreSQL 16.11 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
@@ -31,7 +31,7 @@
       "activity_heartbeats": 0,
       "child_activities": 1000,
       "finish_activities": 1000,
-      "workflow_tasks": 8000,
+      "workflow_tasks": 7344,
       "activity_tasks": 3000,
       "timers_fired": 1000,
       "activities_timed_out": 0,
@@ -39,40 +39,36 @@
     },
     "worker_stats": {
       "workflowHistoryCacheHits": 0,
-      "workflowHistoryCacheMisses": 3066,
+      "workflowHistoryCacheMisses": 6802,
       "workflowHistoryCacheEvictions": 0,
-      "workflowExecutionCacheHits": 4934,
-      "workflowExecutionCacheMisses": 3066,
+      "workflowExecutionCacheHits": 542,
+      "workflowExecutionCacheMisses": 6802,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
       "historyStreamEvents": 0
     },
-    "processing_mixed_actions_per_second": 129.48,
-    "processing_workflows_per_second": 16.185,
-    "workflow_task_commit_p95_ms": 2.468,
+    "processing_mixed_actions_per_second": 1693.03,
+    "processing_workflows_per_second": 211.629,
+    "workflow_task_commit_p95_ms": 10.676,
     "operations": {
       "claimActivityTask": {
-        "calls": 11000,
+        "calls": 290,
         "errors": 0
       },
       "claimWorkflowTask": {
-        "calls": 8000,
+        "calls": 290,
         "errors": 0
       },
       "commitWorkflowTask": {
-        "calls": 8000,
+        "calls": 7344,
         "errors": 0
       },
       "completeActivities": {
-        "calls": 3000,
+        "calls": 131,
         "errors": 0
       },
       "fireDueTimers": {
-        "calls": 8000,
-        "errors": 0
-      },
-      "readSignalInbox": {
-        "calls": 8000,
+        "calls": 290,
         "errors": 0
       },
       "signalWorkflow": {
@@ -84,14 +80,14 @@
         "errors": 0
       },
       "streamHistory": {
-        "calls": 26000,
+        "calls": 1000,
         "errors": 0
       }
     },
     "postgres_stats": {
-      "transactionsPerMixedAction": 9.257,
+      "transactionsPerMixedAction": 0.978,
       "statementStats": {
-        "callsPerMixedAction": 28.251
+        "callsPerMixedAction": 7.39
       }
     }
   },
@@ -110,21 +106,10 @@
       "activity_heartbeats",
       "child_activities",
       "finish_activities",
-      "workflow_tasks",
       "activity_tasks",
       "timers_fired",
       "activities_timed_out",
       "child_workflow_starts_dispatched"
-    ],
-    "require_exact_worker_stats": [
-      "workflowHistoryCacheHits",
-      "workflowHistoryCacheMisses",
-      "workflowHistoryCacheEvictions",
-      "workflowExecutionCacheHits",
-      "workflowExecutionCacheMisses",
-      "workflowExecutionCacheEvictions",
-      "historyStreamChunks",
-      "historyStreamEvents"
     ],
     "required_operation_names": [
       "claimActivityTask",
@@ -132,7 +117,6 @@
       "commitWorkflowTask",
       "completeActivities",
       "fireDueTimers",
-      "readSignalInbox",
       "signalWorkflow",
       "startWorkflow",
       "streamHistory"

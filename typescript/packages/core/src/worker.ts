@@ -1,4 +1,5 @@
 import type {
+  ClaimedActivityTask,
   ClaimedWorkflowTask,
   CommitOutcome,
   CompleteActivityItemOutcome,
@@ -338,18 +339,73 @@ export class Worker {
     return await this.#runWorkflowTaskOnce();
   }
 
+  async runWorkflowTaskBatchOnce(limit: number): Promise<number> {
+    const batchLimit = Math.max(1, Math.trunc(limit));
+    if (this.#backend.claimWorkflowTasks !== undefined) {
+      const claimed = await this.#claimWorkflowTaskBatch(batchLimit);
+      for (const task of claimed) {
+        await this.#runClaimedWorkflowTask(task);
+      }
+      return claimed.length;
+    }
+
+    let processed = 0;
+    for (let index = 0; index < batchLimit; index += 1) {
+      const outcome = await this.#runWorkflowTaskOnce();
+      if (outcome.kind === "NoTask") {
+        break;
+      }
+      processed += 1;
+    }
+    return processed;
+  }
+
   async #runWorkflowTaskOnce(signal?: AbortSignal): Promise<RunWorkflowTaskOnceOutcome> {
+    const claimed = await this.#claimWorkflowTask();
+    if (!claimed) {
+      return { kind: "NoTask" };
+    }
+    return await this.#runClaimedWorkflowTask(claimed, signal);
+  }
+
+  async #claimWorkflowTask(): Promise<ClaimedWorkflowTask | null> {
     const claimed = await this.#backend.claimWorkflowTask(this.#workerId, {
       namespace: this.#namespace,
       taskQueue: this.#workflowTaskQueue,
       registeredWorkflowTypes: this.#registeredWorkflowTypes(),
+      registeredSignalNames: this.#registeredSignalNames,
       leaseDurationMs: this.#leaseDurationMs
     });
     if (!claimed) {
       this.#metrics.workflowTaskNoTasks += 1;
-      return { kind: "NoTask" };
+      return null;
     }
     this.#metrics.workflowTaskClaims += 1;
+    return claimed;
+  }
+
+  async #claimWorkflowTaskBatch(limit: number): Promise<readonly ClaimedWorkflowTask[]> {
+    const claimed = await this.#backend.claimWorkflowTasks?.(this.#workerId, {
+      namespace: this.#namespace,
+      taskQueue: this.#workflowTaskQueue,
+      registeredWorkflowTypes: this.#registeredWorkflowTypes(),
+      registeredSignalNames: this.#registeredSignalNames,
+      leaseDurationMs: this.#leaseDurationMs,
+      limit: Math.max(1, Math.trunc(limit))
+    });
+    const tasks = claimed ?? [];
+    if (tasks.length === 0) {
+      this.#metrics.workflowTaskNoTasks += 1;
+    } else {
+      this.#metrics.workflowTaskClaims += tasks.length;
+    }
+    return tasks;
+  }
+
+  async #runClaimedWorkflowTask(
+    claimed: ClaimedWorkflowTask,
+    signal?: AbortSignal
+  ): Promise<RunWorkflowTaskOnceOutcome> {
     await this.#emit({
       kind: "WorkflowTaskClaimed",
       runId: claimed.runId,
@@ -367,7 +423,7 @@ export class Worker {
       );
     }
 
-    const liveSignals = await this.#liveSignalsForClaim(claimed.runId);
+    const liveSignals = claimed.liveSignals ?? await this.#liveSignalsForClaim(claimed.runId);
     const prepared = await this.#prepareWorkflowTaskFromCacheOrReplay(
       definition,
       claimed,
@@ -871,6 +927,77 @@ export class Worker {
     if (this.#activityTaskQueue === null) {
       return 0;
     }
+    if (this.#backend.claimActivityTasks === undefined) {
+      return await this.#runActivityTaskBatchSequential(limit, signal);
+    }
+    const claimedBatch = await this.#claimActivityTaskBatch(limit);
+    if (claimedBatch.length === 0) {
+      return 0;
+    }
+    const completions: CompleteActivityRequest[] = [];
+    let processedTasks = 0;
+    for (const claimed of claimedBatch) {
+      await this.#emit({
+        kind: "ActivityTaskClaimed",
+        activityId: claimed.task.activityId,
+        activityName: String(claimed.task.activityName),
+        attempt: claimed.task.attempt,
+        batched: true
+      });
+
+      const definition = this.#registry.activity(String(claimed.task.activityName));
+      if (!definition) {
+        throw new Error(`activity is not registered: ${claimed.task.activityName}`);
+      }
+
+      const input = decodePayload(
+        claimed.task.input as PayloadRef<unknown>,
+        definition.inputSchema
+      );
+      try {
+        const output = await runWithActivityExecutionContext(
+          {
+            heartbeat: (request) => this.#backend.heartbeatActivity(request),
+            heartbeatRequest: { claim: claimed.claim }
+          },
+          () => Promise.resolve(definition.handler(input))
+        );
+        completions.push({
+          claim: claimed.claim,
+          result: encodePayload(output, {
+            codec: this.#payloadCodec,
+            ...(definition.outputSchema === undefined ? {} : { schema: definition.outputSchema })
+          })
+        });
+      } catch (error) {
+        await this.#flushActivityCompletionBatch(completions);
+        completions.length = 0;
+        const outcome = await this.#backend.failActivity({
+          claim: claimed.claim,
+          failure: durableFailureFromUnknown(error)
+        });
+        this.#metrics.activityTaskFailures += 1;
+        await this.#emit({
+          kind: "ActivityTaskFailed",
+          activityId: claimed.task.activityId,
+          outcome,
+          batched: true
+        });
+      }
+      processedTasks += 1;
+      if (signal?.aborted) {
+        break;
+      }
+    }
+
+    await this.#flushActivityCompletionBatch(completions);
+    return processedTasks;
+  }
+
+  async #runActivityTaskBatchSequential(limit: number, signal?: AbortSignal): Promise<number> {
+    if (this.#activityTaskQueue === null) {
+      return 0;
+    }
     const completions: CompleteActivityRequest[] = [];
     let claimedTasks = 0;
     for (let index = 0; index < limit; index += 1) {
@@ -942,6 +1069,47 @@ export class Worker {
 
     await this.#flushActivityCompletionBatch(completions);
     return claimedTasks;
+  }
+
+  async #claimActivityTaskBatch(limit: number): Promise<readonly ClaimedActivityTask[]> {
+    if (this.#activityTaskQueue === null) {
+      return [];
+    }
+    const batchLimit = Math.max(1, Math.trunc(limit));
+    if (this.#backend.claimActivityTasks !== undefined) {
+      const claimed = await this.#backend.claimActivityTasks(this.#workerId, {
+        namespace: this.#namespace,
+        taskQueue: this.#activityTaskQueue,
+        registeredActivityNames: this.#registeredActivityNames(),
+        leaseDurationMs: this.#leaseDurationMs,
+        limit: batchLimit
+      });
+      if (claimed.length === 0) {
+        this.#metrics.activityTaskNoTasks += 1;
+      } else {
+        this.#metrics.activityTaskClaims += claimed.length;
+      }
+      return claimed;
+    }
+
+    const claimed: ClaimedActivityTask[] = [];
+    for (let index = 0; index < batchLimit; index += 1) {
+      const task = await this.#backend.claimActivityTask(this.#workerId, {
+        namespace: this.#namespace,
+        taskQueue: this.#activityTaskQueue,
+        registeredActivityNames: this.#registeredActivityNames(),
+        leaseDurationMs: this.#leaseDurationMs
+      });
+      if (!task) {
+        if (index === 0) {
+          this.#metrics.activityTaskNoTasks += 1;
+        }
+        break;
+      }
+      claimed.push(task);
+      this.#metrics.activityTaskClaims += 1;
+    }
+    return claimed;
   }
 
   async #flushActivityCompletionBatch(completions: CompleteActivityRequest[]): Promise<void> {

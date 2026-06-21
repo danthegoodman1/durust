@@ -52,7 +52,9 @@ pub(crate) fn encode_encryption_metadata(
         .transpose()
 }
 
-pub(crate) fn decode_encryption_metadata(blob: Option<Vec<u8>>) -> Result<Option<EncryptionMetadata>> {
+pub(crate) fn decode_encryption_metadata(
+    blob: Option<Vec<u8>>,
+) -> Result<Option<EncryptionMetadata>> {
     blob.map(|blob| {
         rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
     })
@@ -103,7 +105,10 @@ pub(crate) fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
     activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
 }
 
-pub(crate) fn activity_timeout_at_ms_from(now: TimestampMs, timeout: Option<Duration>) -> Option<i64> {
+pub(crate) fn activity_timeout_at_ms_from(
+    now: TimestampMs,
+    timeout: Option<Duration>,
+) -> Option<i64> {
     timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
 }
 

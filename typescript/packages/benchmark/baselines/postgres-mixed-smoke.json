@@ -39,16 +39,16 @@
       "historyStreamChunks": 0,
       "historyStreamEvents": 0
     },
-    "processing_mixed_actions_per_second": 83.06,
-    "processing_workflows_per_second": 10.383,
-    "workflow_task_commit_p95_ms": 3.538,
+    "processing_mixed_actions_per_second": 182.633,
+    "processing_workflows_per_second": 22.829,
+    "workflow_task_commit_p95_ms": 2.626,
     "operations": {
       "claimActivityTask": {
-        "calls": 32,
+        "calls": 15,
         "errors": 0
       },
       "claimWorkflowTask": {
-        "calls": 32,
+        "calls": 15,
         "errors": 0
       },
       "commitWorkflowTask": {
@@ -60,11 +60,7 @@
         "errors": 0
       },
       "fireDueTimers": {
-        "calls": 32,
-        "errors": 0
-      },
-      "readSignalInbox": {
-        "calls": 32,
+        "calls": 15,
         "errors": 0
       },
       "signalWorkflow": {
@@ -76,7 +72,7 @@
         "errors": 0
       },
       "streamHistory": {
-        "calls": 20,
+        "calls": 4,
         "errors": 0
       }
     }
@@ -117,7 +113,6 @@
       "commitWorkflowTask",
       "completeActivity",
       "fireDueTimers",
-      "readSignalInbox",
       "signalWorkflow",
       "startWorkflow",
       "streamHistory"

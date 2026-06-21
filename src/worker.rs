@@ -441,7 +441,11 @@ where
         let claim_for_release = prepared.claim.clone();
         let entry = match self.commit_prepared_workflow_task(prepared).await {
             Ok(entry) => entry,
-            Err(err) => return self.release_failed_workflow_task(claim_for_release, err).await,
+            Err(err) => {
+                return self
+                    .release_failed_workflow_task(claim_for_release, err)
+                    .await;
+            }
         };
         if let Some(entry) = entry {
             self.cache.insert(run_id, entry);
@@ -530,11 +534,7 @@ where
         let now = self.backend.current_time().await?;
         let entry_result = if let Some(mut cached) = cached {
             let chunk = self
-                .stream_history_chunk(
-                    claimed.run_id.clone(),
-                    cached.last_event_id,
-                    claimed.replay_target_event_id,
-                )
+                .claim_history_chunk(&claimed, cached.last_event_id)
                 .await;
             match chunk {
                 Ok(chunk) => {
@@ -561,6 +561,7 @@ where
                     let poll = self
                         .poll_until_history_blocked_or_ready(
                             &claimed.run_id,
+                            &claimed,
                             &mut cached.future,
                             &mut context,
                             claimed.replay_target_event_id,
@@ -597,13 +598,8 @@ where
                     is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
                 let first_chunk = match recovery_budget.as_mut() {
                     Some(budget) => {
-                        self.stream_recovery_history_chunk(
-                            claimed.run_id.clone(),
-                            EventId::ZERO,
-                            claimed.replay_target_event_id,
-                            budget,
-                        )
-                        .await
+                        self.claim_recovery_history_chunk(&claimed, EventId::ZERO, budget)
+                            .await
                     }
                     None => self
                         .claim_history_chunk(&claimed, EventId::ZERO)
@@ -643,6 +639,7 @@ where
                                         let poll = self
                                             .poll_until_history_blocked_or_ready(
                                                 &claimed.run_id,
+                                                &claimed,
                                                 &mut future,
                                                 &mut context,
                                                 claimed.replay_target_event_id,
@@ -991,6 +988,39 @@ where
         .await
     }
 
+    async fn claim_recovery_history_chunk(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        after_event_id: EventId,
+        budget: &mut RecoveryReplayBudget,
+    ) -> Result<Option<crate::HistoryChunk>> {
+        if after_event_id >= claimed.replay_target_event_id {
+            return Ok(Some(crate::HistoryChunk {
+                events: Vec::new(),
+                last_event_id: after_event_id,
+                has_more: false,
+            }));
+        }
+        let Some((max_events, max_bytes)) =
+            budget.next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
+        else {
+            return Ok(None);
+        };
+        if let Some(chunk) =
+            prefetched_claim_history_chunk_bounded(claimed, after_event_id, max_events, max_bytes)
+        {
+            budget.record_chunk(&chunk);
+            return Ok(Some(chunk));
+        }
+        self.stream_recovery_history_chunk(
+            claimed.run_id.clone(),
+            after_event_id,
+            claimed.replay_target_event_id,
+            budget,
+        )
+        .await
+    }
+
     async fn stream_recovery_history_chunk(
         &self,
         run_id: RunId,
@@ -1029,6 +1059,7 @@ where
     async fn poll_until_history_blocked_or_ready(
         &self,
         run_id: &RunId,
+        claimed: &crate::ClaimedWorkflowTask,
         future: &mut Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         context: &mut crate::runtime::RuntimeContext,
         replay_target_event_id: EventId,
@@ -1089,12 +1120,7 @@ where
             let chunk = match recovery_budget.as_deref_mut() {
                 Some(budget) => {
                     let Some(chunk) = self
-                        .stream_recovery_history_chunk(
-                            run_id.clone(),
-                            after_event_id,
-                            replay_target_event_id,
-                            budget,
-                        )
+                        .claim_recovery_history_chunk(claimed, after_event_id, budget)
                         .await?
                     else {
                         return Ok(WorkflowPollOutcome::Deferred);
@@ -1352,6 +1378,46 @@ fn prefetched_claim_history_chunk(
         events,
         last_event_id,
         has_more: false,
+    })
+}
+
+fn prefetched_claim_history_chunk_bounded(
+    claimed: &crate::ClaimedWorkflowTask,
+    after_event_id: EventId,
+    max_events: usize,
+    max_bytes: usize,
+) -> Option<crate::HistoryChunk> {
+    if after_event_id >= claimed.replay_target_event_id {
+        return Some(crate::HistoryChunk {
+            events: Vec::new(),
+            last_event_id: after_event_id,
+            has_more: false,
+        });
+    }
+    let max_events = max_events.max(1);
+    let max_bytes = max_bytes.max(1);
+    let mut next_event_id = after_event_id.next();
+    let mut bytes = 0usize;
+    let mut events = Vec::new();
+    for event in claimed.prefetched_history.iter().filter(|event| {
+        event.event_id > after_event_id && event.event_id <= claimed.replay_target_event_id
+    }) {
+        if event.event_id != next_event_id {
+            break;
+        }
+        let event_bytes = crate::runtime::event_payload_len(&event.data).max(1);
+        if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes) {
+            break;
+        }
+        events.push(event.clone());
+        bytes = bytes.saturating_add(event_bytes);
+        next_event_id = event.event_id.next();
+    }
+    let last_event_id = events.last()?.event_id;
+    Some(crate::HistoryChunk {
+        events,
+        last_event_id,
+        has_more: last_event_id < claimed.replay_target_event_id,
     })
 }
 
