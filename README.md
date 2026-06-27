@@ -1,5 +1,7 @@
 # Durust
 
+[Docs.rs](https://docs.rs/durust) | [Crates.io](https://crates.io/crates/durust)
+
 Durust is a durable workflow runtime for Rust services.
 
 Write async Rust workflows that survive crashes, restarts, timers, signals,
