@@ -1,0 +1,137 @@
+{
+  "name": "postgres-mixed-accepted",
+  "kind": "accepted",
+  "metadata": {
+    "measured_at": "2026-06-21",
+    "commit": "d439cf5",
+    "os": "Darwin mac.lan 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:39:42 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6031 arm64",
+    "node": "v24.15.0",
+    "postgres": "PostgreSQL 16.11 on aarch64-unknown-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "notes": "Measured locally from /tmp/durust-ts-final-benchmarks.json. CPU/RAM unavailable from sandboxed sysctl; Postgres ran from tests/fixtures/postgres.compose.yml with pg_stat_statements."
+  },
+  "profile": {
+    "backend": "postgres",
+    "mode": "mixed",
+    "workflows": 1000,
+    "workers": 10,
+    "batch": 32,
+    "activity_completion_batch": 32,
+    "postgres_pool_size": 24
+  },
+  "result": {
+    "completed_workflows": 1000,
+    "mixed_actions": 8000,
+    "counters": {
+      "workflow_starts": 1000,
+      "signals": 1000,
+      "child_starts": 1000,
+      "child_completions": 1000,
+      "timer_handlers": 1000,
+      "boot_activities": 1000,
+      "activity_heartbeats": 0,
+      "child_activities": 1000,
+      "finish_activities": 1000,
+      "workflow_tasks": 7344,
+      "activity_tasks": 3000,
+      "timers_fired": 1000,
+      "activities_timed_out": 0,
+      "child_workflow_starts_dispatched": 0
+    },
+    "worker_stats": {
+      "workflowHistoryCacheHits": 0,
+      "workflowHistoryCacheMisses": 6802,
+      "workflowHistoryCacheEvictions": 0,
+      "workflowExecutionCacheHits": 542,
+      "workflowExecutionCacheMisses": 6802,
+      "workflowExecutionCacheEvictions": 0,
+      "historyStreamChunks": 0,
+      "historyStreamEvents": 0
+    },
+    "processing_mixed_actions_per_second": 1693.03,
+    "processing_workflows_per_second": 211.629,
+    "workflow_task_commit_p95_ms": 10.676,
+    "operations": {
+      "claimActivityTask": {
+        "calls": 290,
+        "errors": 0
+      },
+      "claimWorkflowTask": {
+        "calls": 290,
+        "errors": 0
+      },
+      "commitWorkflowTask": {
+        "calls": 7344,
+        "errors": 0
+      },
+      "completeActivities": {
+        "calls": 131,
+        "errors": 0
+      },
+      "fireDueTimers": {
+        "calls": 290,
+        "errors": 0
+      },
+      "signalWorkflow": {
+        "calls": 1000,
+        "errors": 0
+      },
+      "startWorkflow": {
+        "calls": 1000,
+        "errors": 0
+      },
+      "streamHistory": {
+        "calls": 1000,
+        "errors": 0
+      }
+    },
+    "postgres_stats": {
+      "transactionsPerMixedAction": 0.978,
+      "statementStats": {
+        "callsPerMixedAction": 7.39
+      }
+    }
+  },
+  "thresholds": {
+    "require_correct": true,
+    "require_profile_match": true,
+    "require_exact_completed_workflows": true,
+    "require_exact_mixed_actions": true,
+    "require_exact_counters": [
+      "workflow_starts",
+      "signals",
+      "child_starts",
+      "child_completions",
+      "timer_handlers",
+      "boot_activities",
+      "activity_heartbeats",
+      "child_activities",
+      "finish_activities",
+      "activity_tasks",
+      "timers_fired",
+      "activities_timed_out",
+      "child_workflow_starts_dispatched"
+    ],
+    "required_operation_names": [
+      "claimActivityTask",
+      "claimWorkflowTask",
+      "commitWorkflowTask",
+      "completeActivities",
+      "fireDueTimers",
+      "signalWorkflow",
+      "startWorkflow",
+      "streamHistory"
+    ],
+    "allow_operation_errors": false,
+    "min_processing_mixed_actions_per_second_ratio": 0.1,
+    "min_processing_workflows_per_second_ratio": 0.1,
+    "max_workflow_task_commit_p95_ratio": 25,
+    "max_workflow_task_commit_p95_ms": 100,
+    "require_postgres_schema": "normalized",
+    "require_postgres_stats": true,
+    "require_postgres_statement_stats": true,
+    "max_postgres_transactions_per_mixed_action_ratio": 1.2,
+    "max_postgres_transactions_per_mixed_action": 12,
+    "max_postgres_statement_calls_per_mixed_action_ratio": 1.2,
+    "max_postgres_statement_calls_per_mixed_action": 35
+  }
+}

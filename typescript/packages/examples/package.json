@@ -1,0 +1,22 @@
+{
+  "name": "@durust/examples",
+  "version": "0.0.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/examples/test"
+  },
+  "dependencies": {
+    "@durust/core": "^0.0.0",
+    "@durust/payload": "^0.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/danthegoodman1/durust.git"
+  }
+}

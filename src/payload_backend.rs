@@ -1,9 +1,8 @@
 use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
-    ActivityMapResultPage, ActivityScheduled, ActivityTask, CancelWorkflowOutcome,
-    CancelWorkflowRequest, ChildStartOutboxMessage, ChildWorkflowCompleted, ChildWorkflowFailed,
-    ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest, ChildWorkflowMapResultPage,
-    ChildWorkflowMapTask, ChildWorkflowStartRequested, ClaimActivityOptions,
+    ActivityMapResultPage, ActivityTask, CancelWorkflowOutcome, CancelWorkflowRequest,
+    ChildStartOutboxMessage, ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest,
+    ChildWorkflowMapResultPage, ChildWorkflowMapTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome,
     CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
     CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
@@ -12,11 +11,10 @@ use crate::{
     HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
     PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
     PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
-    Result, SignalConsumed, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
-    digest_bytes,
+    Result, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, WorkerId,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskRelease, digest_bytes,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -459,6 +457,61 @@ where
     })
 }
 
+// Rewriters bind the shared `rewrite_history_event_payloads` visitor to the
+// blob-store decorator's normalize and hydrate leaf operations (memory + SQLite).
+struct PayloadBackendNormalizeRewriter<'a, S> {
+    blob_store: &'a S,
+    config: &'a PayloadStorageConfig,
+}
+
+impl<S: PayloadBlobStore> crate::payload::PayloadRewrite
+    for PayloadBackendNormalizeRewriter<'_, S>
+{
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        normalize_payload_ref(self.blob_store, self.config, payload).await
+    }
+
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        normalize_activity_map_input_manifest(self.blob_store, self.config, manifest).await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        normalize_activity_map_result_manifest(self.blob_store, self.config, manifest).await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        normalize_child_workflow_map_result_manifest(self.blob_store, self.config, manifest).await
+    }
+}
+
+struct PayloadBackendHydrateRewriter<'a, S> {
+    blob_store: &'a S,
+}
+
+impl<S: PayloadBlobStore> crate::payload::PayloadRewrite for PayloadBackendHydrateRewriter<'_, S> {
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        hydrate_payload_ref(self.blob_store, payload).await
+    }
+
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        hydrate_activity_map_input_manifest(self.blob_store, manifest).await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        hydrate_activity_map_result_manifest(self.blob_store, manifest).await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        hydrate_child_workflow_map_result_manifest(self.blob_store, manifest).await
+    }
+}
+
 async fn normalize_history_event<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
@@ -467,96 +520,8 @@ async fn normalize_history_event<S>(
 where
     S: PayloadBlobStore,
 {
-    Ok(match data {
-        HistoryEventData::WorkflowStarted {
-            workflow_type,
-            input,
-        } => HistoryEventData::WorkflowStarted {
-            workflow_type,
-            input: normalize_payload_ref(blob_store, config, input).await?,
-        },
-        HistoryEventData::WorkflowCompleted { result } => HistoryEventData::WorkflowCompleted {
-            result: normalize_payload_ref(blob_store, config, result).await?,
-        },
-        HistoryEventData::WorkflowFailed { failure } => HistoryEventData::WorkflowFailed {
-            failure: normalize_failure(blob_store, config, failure).await?,
-        },
-        HistoryEventData::WorkflowContinuedAsNew { input } => {
-            HistoryEventData::WorkflowContinuedAsNew {
-                input: normalize_payload_ref(blob_store, config, input).await?,
-            }
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => HistoryEventData::ActivityScheduled(
-            normalize_activity_scheduled(blob_store, config, scheduled).await?,
-        ),
-        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                normalize_activity_map_input_manifest(blob_store, config, scheduled.input_manifest)
-                    .await?;
-            HistoryEventData::ActivityMapScheduled(scheduled)
-        }
-        HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest = normalize_activity_map_result_manifest(
-                blob_store,
-                config,
-                completed.result_manifest,
-            )
-            .await?;
-            HistoryEventData::ActivityMapCompleted(completed)
-        }
-        HistoryEventData::ActivityMapFailed(mut failed) => {
-            failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
-            HistoryEventData::ActivityMapFailed(failed)
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                normalize_activity_map_input_manifest(blob_store, config, scheduled.input_manifest)
-                    .await?;
-            HistoryEventData::ChildWorkflowMapScheduled(scheduled)
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            completed.result_manifest = normalize_child_workflow_map_result_manifest(
-                blob_store,
-                config,
-                completed.result_manifest,
-            )
-            .await?;
-            HistoryEventData::ChildWorkflowMapCompleted(completed)
-        }
-        HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-            failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
-            HistoryEventData::ChildWorkflowMapFailed(failed)
-        }
-        HistoryEventData::ActivityCompleted(mut completed) => {
-            completed.result = normalize_payload_ref(blob_store, config, completed.result).await?;
-            HistoryEventData::ActivityCompleted(completed)
-        }
-        HistoryEventData::ActivityFailed(mut failed) => {
-            failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
-            HistoryEventData::ActivityFailed(failed)
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            HistoryEventData::ChildWorkflowStartRequested(
-                normalize_child_start_requested(blob_store, config, requested).await?,
-            )
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            HistoryEventData::ChildWorkflowCompleted(
-                normalize_child_completed(blob_store, config, completed).await?,
-            )
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => HistoryEventData::ChildWorkflowFailed(
-            normalize_child_failed(blob_store, config, failed).await?,
-        ),
-        HistoryEventData::SignalConsumed(signal) => {
-            HistoryEventData::SignalConsumed(normalize_signal(blob_store, config, signal).await?)
-        }
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(&marker)?;
-            HistoryEventData::SideEffectMarker(marker)
-        }
-        data => data,
-    })
+    let mut rewriter = PayloadBackendNormalizeRewriter { blob_store, config };
+    crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
 }
 
 async fn hydrate_history_event<S>(blob_store: &S, event: HistoryEvent) -> Result<HistoryEvent>
@@ -576,110 +541,8 @@ async fn hydrate_history_event_data<S>(
 where
     S: PayloadBlobStore,
 {
-    Ok(match data {
-        HistoryEventData::WorkflowStarted {
-            workflow_type,
-            input,
-        } => HistoryEventData::WorkflowStarted {
-            workflow_type,
-            input: hydrate_payload_ref(blob_store, input).await?,
-        },
-        HistoryEventData::WorkflowCompleted { result } => HistoryEventData::WorkflowCompleted {
-            result: hydrate_payload_ref(blob_store, result).await?,
-        },
-        HistoryEventData::WorkflowFailed { failure } => HistoryEventData::WorkflowFailed {
-            failure: hydrate_failure(blob_store, failure).await?,
-        },
-        HistoryEventData::WorkflowContinuedAsNew { input } => {
-            HistoryEventData::WorkflowContinuedAsNew {
-                input: hydrate_payload_ref(blob_store, input).await?,
-            }
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => HistoryEventData::ActivityScheduled(
-            hydrate_activity_scheduled(blob_store, scheduled).await?,
-        ),
-        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                hydrate_activity_map_input_manifest(blob_store, scheduled.input_manifest).await?;
-            HistoryEventData::ActivityMapScheduled(scheduled)
-        }
-        HistoryEventData::ActivityMapCompleted(mut completed) => {
-            completed.result_manifest =
-                hydrate_activity_map_result_manifest(blob_store, completed.result_manifest).await?;
-            HistoryEventData::ActivityMapCompleted(completed)
-        }
-        HistoryEventData::ActivityMapFailed(mut failed) => {
-            failed.failure = hydrate_failure(blob_store, failed.failure).await?;
-            HistoryEventData::ActivityMapFailed(failed)
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            scheduled.input_manifest =
-                hydrate_activity_map_input_manifest(blob_store, scheduled.input_manifest).await?;
-            HistoryEventData::ChildWorkflowMapScheduled(scheduled)
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            completed.result_manifest =
-                hydrate_child_workflow_map_result_manifest(blob_store, completed.result_manifest)
-                    .await?;
-            HistoryEventData::ChildWorkflowMapCompleted(completed)
-        }
-        HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-            failed.failure = hydrate_failure(blob_store, failed.failure).await?;
-            HistoryEventData::ChildWorkflowMapFailed(failed)
-        }
-        HistoryEventData::ActivityCompleted(mut completed) => {
-            completed.result = hydrate_payload_ref(blob_store, completed.result).await?;
-            HistoryEventData::ActivityCompleted(completed)
-        }
-        HistoryEventData::ActivityFailed(mut failed) => {
-            failed.failure = hydrate_failure(blob_store, failed.failure).await?;
-            HistoryEventData::ActivityFailed(failed)
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            HistoryEventData::ChildWorkflowStartRequested(
-                hydrate_child_start_requested(blob_store, requested).await?,
-            )
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            HistoryEventData::ChildWorkflowCompleted(
-                hydrate_child_completed(blob_store, completed).await?,
-            )
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            HistoryEventData::ChildWorkflowFailed(hydrate_child_failed(blob_store, failed).await?)
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            HistoryEventData::SignalConsumed(hydrate_signal(blob_store, signal).await?)
-        }
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(&marker)?;
-            HistoryEventData::SideEffectMarker(marker)
-        }
-        data => data,
-    })
-}
-
-async fn normalize_activity_scheduled<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    mut scheduled: ActivityScheduled,
-) -> Result<ActivityScheduled>
-where
-    S: PayloadBlobStore,
-{
-    scheduled.input = normalize_payload_ref(blob_store, config, scheduled.input).await?;
-    Ok(scheduled)
-}
-
-async fn hydrate_activity_scheduled<S>(
-    blob_store: &S,
-    mut scheduled: ActivityScheduled,
-) -> Result<ActivityScheduled>
-where
-    S: PayloadBlobStore,
-{
-    scheduled.input = hydrate_payload_ref(blob_store, scheduled.input).await?;
-    Ok(scheduled)
+    let mut rewriter = PayloadBackendHydrateRewriter { blob_store };
+    crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
 }
 
 async fn normalize_activity_task<S>(
@@ -748,95 +611,6 @@ where
     Ok(message)
 }
 
-async fn normalize_child_start_requested<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    mut requested: ChildWorkflowStartRequested,
-) -> Result<ChildWorkflowStartRequested>
-where
-    S: PayloadBlobStore,
-{
-    requested.input = normalize_payload_ref(blob_store, config, requested.input).await?;
-    Ok(requested)
-}
-
-async fn hydrate_child_start_requested<S>(
-    blob_store: &S,
-    mut requested: ChildWorkflowStartRequested,
-) -> Result<ChildWorkflowStartRequested>
-where
-    S: PayloadBlobStore,
-{
-    requested.input = hydrate_payload_ref(blob_store, requested.input).await?;
-    Ok(requested)
-}
-
-async fn normalize_child_completed<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    mut completed: ChildWorkflowCompleted,
-) -> Result<ChildWorkflowCompleted>
-where
-    S: PayloadBlobStore,
-{
-    completed.result = normalize_payload_ref(blob_store, config, completed.result).await?;
-    Ok(completed)
-}
-
-async fn hydrate_child_completed<S>(
-    blob_store: &S,
-    mut completed: ChildWorkflowCompleted,
-) -> Result<ChildWorkflowCompleted>
-where
-    S: PayloadBlobStore,
-{
-    completed.result = hydrate_payload_ref(blob_store, completed.result).await?;
-    Ok(completed)
-}
-
-async fn normalize_child_failed<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    mut failed: ChildWorkflowFailed,
-) -> Result<ChildWorkflowFailed>
-where
-    S: PayloadBlobStore,
-{
-    failed.failure = normalize_failure(blob_store, config, failed.failure).await?;
-    Ok(failed)
-}
-
-async fn hydrate_child_failed<S>(
-    blob_store: &S,
-    mut failed: ChildWorkflowFailed,
-) -> Result<ChildWorkflowFailed>
-where
-    S: PayloadBlobStore,
-{
-    failed.failure = hydrate_failure(blob_store, failed.failure).await?;
-    Ok(failed)
-}
-
-async fn normalize_signal<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    mut signal: SignalConsumed,
-) -> Result<SignalConsumed>
-where
-    S: PayloadBlobStore,
-{
-    signal.payload = normalize_payload_ref(blob_store, config, signal.payload).await?;
-    Ok(signal)
-}
-
-async fn hydrate_signal<S>(blob_store: &S, mut signal: SignalConsumed) -> Result<SignalConsumed>
-where
-    S: PayloadBlobStore,
-{
-    signal.payload = hydrate_payload_ref(blob_store, signal.payload).await?;
-    Ok(signal)
-}
-
 async fn normalize_failure<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
@@ -861,10 +635,16 @@ where
     Ok(failure)
 }
 
-async fn normalize_activity_map_input_manifest<S>(
+// Re-pages an activity-map input manifest, normalizing each item. When
+// `offload_pages` is set the re-encoded pages and root manifest are themselves
+// offloaded to blob storage (history path); otherwise they stay inline for the
+// operations path that re-pages without growing provider rows. The two callers
+// differ only by that final offload toggle.
+async fn rebuild_activity_map_input_manifest<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
     payload: PayloadRef,
+    offload_pages: bool,
 ) -> Result<PayloadRef>
 where
     S: PayloadBlobStore,
@@ -882,22 +662,31 @@ where
             items.push(normalize_payload_ref(blob_store, config, item).await?);
         }
         page.items = items;
-        pages.push(
-            normalize_payload_ref(
-                blob_store,
-                config,
-                crate::encode_payload_with_codec(&page, page_codec)?,
-            )
-            .await?,
-        );
+        let encoded_page = crate::encode_payload_with_codec(&page, page_codec)?;
+        pages.push(if offload_pages {
+            normalize_payload_ref(blob_store, config, encoded_page).await?
+        } else {
+            encoded_page
+        });
     }
     manifest.pages = pages;
-    normalize_payload_ref(
-        blob_store,
-        config,
-        crate::encode_payload_with_codec(&manifest, root_codec)?,
-    )
-    .await
+    let encoded_manifest = crate::encode_payload_with_codec(&manifest, root_codec)?;
+    if offload_pages {
+        normalize_payload_ref(blob_store, config, encoded_manifest).await
+    } else {
+        Ok(encoded_manifest)
+    }
+}
+
+async fn normalize_activity_map_input_manifest<S>(
+    blob_store: &S,
+    config: &PayloadStorageConfig,
+    payload: PayloadRef,
+) -> Result<PayloadRef>
+where
+    S: PayloadBlobStore,
+{
+    rebuild_activity_map_input_manifest(blob_store, config, payload, true).await
 }
 
 async fn normalize_activity_map_input_manifest_for_operations<S>(
@@ -908,23 +697,7 @@ async fn normalize_activity_map_input_manifest_for_operations<S>(
 where
     S: PayloadBlobStore,
 {
-    let root = hydrate_payload_ref(blob_store, payload).await?;
-    let root_codec = root.codec();
-    let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
-    let mut pages = Vec::with_capacity(manifest.pages.len());
-    for page in manifest.pages {
-        let page = hydrate_payload_ref(blob_store, page).await?;
-        let page_codec = page.codec();
-        let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
-        let mut items = Vec::with_capacity(page.items.len());
-        for item in page.items {
-            items.push(normalize_payload_ref(blob_store, config, item).await?);
-        }
-        page.items = items;
-        pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
-    }
-    manifest.pages = pages;
-    crate::encode_payload_with_codec(&manifest, root_codec)
+    rebuild_activity_map_input_manifest(blob_store, config, payload, false).await
 }
 
 async fn hydrate_activity_map_input_manifest<S>(

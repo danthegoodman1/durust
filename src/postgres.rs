@@ -1,3 +1,9 @@
+use crate::provider_util::{
+    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
+    compression_from_str, compression_to_str, decode_encryption_metadata, duration_millis_i64,
+    encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
+    unix_epoch_millis,
+};
 use crate::{
     ActivityFailed, ActivityHeartbeatOutcome, ActivityHeartbeatRequest, ActivityId,
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem, ActivityMapResultManifest,
@@ -31,7 +37,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
 const POSTGRES_SCHEMA_VERSION: i64 = 1;
@@ -104,10 +110,20 @@ struct PreparedSimpleWorkflowCommit {
     lease_epoch: i64,
     append_history: Vec<(EventId, HistoryEventData)>,
     schedule_activities: Vec<ActivityTask>,
+    start_child_workflows: Vec<ChildStartOutboxMessage>,
     upsert_waits: Vec<crate::WaitRecord>,
     consume_signals: Vec<crate::SignalId>,
     delete_waits: Vec<crate::WaitId>,
     query_projection: Option<PayloadRef>,
+    terminal_event: Option<HistoryEventData>,
+    ready_reason: Option<WorkflowTaskReason>,
+}
+
+struct PreparedSimpleChildStart {
+    commit_index: usize,
+    message: ChildStartOutboxMessage,
+    proposed_run_id: RunId,
+    child_shard_id: i32,
 }
 
 struct LockedActivityCompletion {
@@ -788,6 +804,63 @@ impl PostgresBackend {
         }
     }
 
+    async fn verify_shard_leases_tx(
+        &self,
+        tx: &Transaction<'_>,
+        lease_keys: &BTreeSet<(WorkerId, i32)>,
+    ) -> Result<BTreeMap<(WorkerId, i32), i64>> {
+        if lease_keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        if self.logical_shards <= 1 {
+            return Ok(lease_keys
+                .iter()
+                .map(|key| (key.clone(), 0))
+                .collect::<BTreeMap<_, _>>());
+        }
+        let schema = self.schema_sql();
+        let now_ms = unix_epoch_millis();
+        let shard_ids = lease_keys
+            .iter()
+            .map(|(_, shard_id)| *shard_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let rows = tx
+            .query(
+                &format!(
+                    "select shard_id, owner_id, lease_until_ms, lease_epoch
+                     from {schema}.shard_leases
+                     where shard_id = any($1::integer[])"
+                ),
+                &[&shard_ids],
+            )
+            .await
+            .map_err(postgres_error)?;
+        let rows_by_shard = rows
+            .into_iter()
+            .map(|row| {
+                let shard_id: i32 = row.get(0);
+                let owner_id: Option<String> = row.get(1);
+                let lease_until_ms: Option<i64> = row.get(2);
+                let lease_epoch: i64 = row.get(3);
+                (shard_id, (owner_id, lease_until_ms, lease_epoch))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut leases = BTreeMap::new();
+        for key @ (worker_id, shard_id) in lease_keys {
+            let Some((owner_id, lease_until_ms, lease_epoch)) = rows_by_shard.get(shard_id) else {
+                continue;
+            };
+            if owner_id.as_deref() == Some(worker_id.0.as_str())
+                && lease_until_ms.is_some_and(|lease_until_ms| lease_until_ms > now_ms)
+            {
+                leases.insert(key.clone(), *lease_epoch);
+            }
+        }
+        Ok(leases)
+    }
+
     #[cfg(test)]
     async fn force_schema_version_for_tests(&self, version: i64) -> Result<()> {
         let client = self.client().await?;
@@ -1061,7 +1134,7 @@ impl DurableBackend for PostgresBackend {
 }
 
 impl PostgresBackend {
-    async fn retry_transaction<T, F, Fut>(&self, _operation: &'static str, mut body: F) -> Result<T>
+    async fn retry_transaction<T, F, Fut>(&self, mut body: F) -> Result<T>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -1087,7 +1160,7 @@ impl PostgresBackend {
         &self,
         req: StartWorkflowRequest,
     ) -> Result<StartWorkflowOutcome> {
-        self.retry_transaction("start_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.start_workflow_once(req).await }
         })
@@ -1155,7 +1228,7 @@ impl PostgresBackend {
         &self,
         req: CancelWorkflowRequest,
     ) -> Result<CancelWorkflowOutcome> {
-        self.retry_transaction("cancel_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.cancel_workflow_once(req).await }
         })
@@ -1232,7 +1305,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimWorkflowTasksOptions,
     ) -> Result<Vec<ClaimedWorkflowTask>> {
-        self.retry_transaction("claim_workflow_tasks", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_workflow_tasks_once(worker_id, opts).await }
@@ -1450,7 +1523,7 @@ impl PostgresBackend {
         opts: ClaimWorkflowTaskOptions,
         shard_filter: Option<Vec<ShardId>>,
     ) -> Result<Option<ClaimedWorkflowTask>> {
-        self.retry_transaction("claim_workflow_task", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             let shard_filter = shard_filter.clone();
@@ -1752,7 +1825,7 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         release: crate::WorkflowTaskRelease,
     ) -> Result<()> {
-        self.retry_transaction("release_workflow_task", || {
+        self.retry_transaction(|| {
             let claim = claim.clone();
             let release = release.clone();
             async move { self.release_workflow_task_once(claim, release).await }
@@ -1812,7 +1885,7 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> Result<CommitOutcome> {
-        self.retry_transaction("commit_workflow_task", || {
+        self.retry_transaction(|| {
             let claim = claim.clone();
             let batch = batch.clone();
             async move { self.commit_workflow_task_once(claim, batch).await }
@@ -1850,7 +1923,7 @@ impl PostgresBackend {
         &self,
         batch: crate::WorkflowTaskCommitBatch,
     ) -> Result<Vec<crate::WorkflowTaskCommitBatchResult>> {
-        self.retry_transaction("commit_workflow_tasks", || {
+        self.retry_transaction(|| {
             let batch = batch.clone();
             async move { self.commit_workflow_tasks_once(batch).await }
         })
@@ -1877,11 +1950,15 @@ impl PostgresBackend {
             *counts.entry(input.claim.run_id.clone()).or_insert(0usize) += 1;
             counts
         });
+        let terminal_dependency_run_ids = self
+            .workflow_batch_terminal_dependency_run_ids_tx(&tx, &schema, &commits)
+            .await?;
         let simple_indices = commits
             .iter()
             .enumerate()
             .filter_map(|(index, input)| {
                 (run_counts.get(&input.claim.run_id) == Some(&1)
+                    && !terminal_dependency_run_ids.contains(&input.claim.run_id)
                     && postgres_simple_batch_commit_eligible(&input.commit))
                 .then_some(index)
             })
@@ -1966,6 +2043,292 @@ impl PostgresBackend {
         Ok(batch_results)
     }
 
+    async fn workflow_batch_terminal_dependency_run_ids_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        commits: &[crate::WorkflowTaskCommitInput],
+    ) -> Result<BTreeSet<RunId>> {
+        let terminal_run_ids = commits
+            .iter()
+            .filter(|input| postgres_simple_batch_commit_has_terminal_event(&input.commit))
+            .map(|input| input.claim.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        if terminal_run_ids.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        let batch_run_ids = commits
+            .iter()
+            .map(|input| input.claim.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        let batch_run_id_values = batch_run_ids
+            .iter()
+            .map(|run_id| run_id.0.clone())
+            .collect::<Vec<_>>();
+        let rows = tx
+            .query(
+                &format!(
+                    "select run_id, parent_run_id
+                     from {schema}.workflow_instances
+                     where run_id = any($1::text[])"
+                ),
+                &[&batch_run_id_values],
+            )
+            .await
+            .map_err(postgres_error)?;
+        let mut dependency_run_ids = BTreeSet::new();
+        for row in rows {
+            let run_id = RunId::new(row.get::<_, String>(0));
+            let parent_run_id = row.get::<_, Option<String>>(1).map(RunId::new);
+            if terminal_run_ids.contains(&run_id)
+                && parent_run_id
+                    .as_ref()
+                    .is_some_and(|parent_run_id| batch_run_ids.contains(parent_run_id))
+            {
+                dependency_run_ids.insert(run_id.clone());
+            }
+            if parent_run_id
+                .as_ref()
+                .is_some_and(|parent_run_id| terminal_run_ids.contains(parent_run_id))
+            {
+                dependency_run_ids.extend(parent_run_id);
+            }
+        }
+        Ok(dependency_run_ids)
+    }
+
+    async fn apply_child_starts_for_simple_commits_tx(
+        &self,
+        tx: &Transaction<'_>,
+        schema: &str,
+        commits: &mut [PreparedSimpleWorkflowCommit],
+    ) -> Result<()> {
+        let child_start_count = commits
+            .iter()
+            .map(|commit| commit.start_child_workflows.len())
+            .sum::<usize>();
+        if child_start_count == 0 {
+            return Ok(());
+        }
+        let proposed_run_ids = next_run_ids(tx, schema, child_start_count).await?;
+        let mut proposed_run_ids = proposed_run_ids.into_iter();
+        let mut starts = Vec::with_capacity(child_start_count);
+        for (commit_index, commit) in commits.iter().enumerate() {
+            for message in &commit.start_child_workflows {
+                let child_shard_id = i32::try_from(
+                    self.shard_for_workflow(
+                        &Namespace::new(commit.namespace.clone()),
+                        &message.workflow_id,
+                    )
+                    .0,
+                )
+                .unwrap_or(i32::MAX);
+                let proposed_run_id = proposed_run_ids.next().ok_or_else(|| {
+                    Error::Backend("postgres child start run id allocation underflow".to_owned())
+                })?;
+                starts.push(PreparedSimpleChildStart {
+                    commit_index,
+                    message: message.clone(),
+                    proposed_run_id,
+                    child_shard_id,
+                });
+            }
+        }
+
+        let parent_run_id_values = starts
+            .iter()
+            .map(|start| start.message.command_id.run_id.0.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let existing_child_events =
+            existing_child_command_ids_tx(tx, schema, &parent_run_id_values).await?;
+
+        let insertable = starts
+            .iter()
+            .filter(|start| !existing_child_events.contains(&start.message.command_id))
+            .collect::<Vec<_>>();
+        let mut inserted_children = BTreeMap::<(String, String), RunId>::new();
+        if !insertable.is_empty() {
+            let namespaces = insertable
+                .iter()
+                .map(|start| commits[start.commit_index].namespace.clone())
+                .collect::<Vec<_>>();
+            let workflow_ids = insertable
+                .iter()
+                .map(|start| start.message.workflow_id.0.clone())
+                .collect::<Vec<_>>();
+            let run_ids = insertable
+                .iter()
+                .map(|start| start.proposed_run_id.0.clone())
+                .collect::<Vec<_>>();
+            let shard_ids = insertable
+                .iter()
+                .map(|start| start.child_shard_id)
+                .collect::<Vec<_>>();
+            let workflow_names = insertable
+                .iter()
+                .map(|start| start.message.workflow_type.name.clone())
+                .collect::<Vec<_>>();
+            let workflow_versions = insertable
+                .iter()
+                .map(|start| i32::try_from(start.message.workflow_type.version).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>();
+            let task_queues = insertable
+                .iter()
+                .map(|start| start.message.task_queue.0.clone())
+                .collect::<Vec<_>>();
+            let parent_run_ids = insertable
+                .iter()
+                .map(|start| start.message.command_id.run_id.0.clone())
+                .collect::<Vec<_>>();
+            let parent_command_seqs = insertable
+                .iter()
+                .map(|start| i64::try_from(start.message.command_id.seq.0).unwrap_or(i64::MAX))
+                .collect::<Vec<_>>();
+            let parent_close_policies = insertable
+                .iter()
+                .map(|start| {
+                    parent_close_policy_to_str(start.message.parent_close_policy).to_owned()
+                })
+                .collect::<Vec<_>>();
+            let parent_child_map_ordinals = insertable
+                .iter()
+                .map(|start| {
+                    start
+                        .message
+                        .child_map_item
+                        .as_ref()
+                        .map(|item| i64::try_from(item.item_ordinal).unwrap_or(i64::MAX))
+                })
+                .collect::<Vec<_>>();
+            let rows = tx
+                .query(
+                    &format!(
+                        "insert into {schema}.workflow_instances
+                         (namespace, workflow_id, run_id, shard_id, workflow_name, workflow_version,
+                          task_queue, current_event_id, ready_reason, ready_at_ms,
+                          workflow_claim_token, terminal, parent_run_id, parent_command_seq,
+                          parent_close_policy, parent_child_map_ordinal)
+                         select namespace, workflow_id, run_id, shard_id, workflow_name,
+                                workflow_version, task_queue, 1, $12, 0, null, false,
+                                parent_run_id, parent_command_seq, parent_close_policy,
+                                parent_child_map_ordinal
+                         from unnest($1::text[], $2::text[], $3::text[], $4::integer[],
+                                     $5::text[], $6::integer[], $7::text[], $8::text[],
+                                     $9::bigint[], $10::text[], $11::bigint[])
+                              as child_rows(namespace, workflow_id, run_id, shard_id,
+                                            workflow_name, workflow_version, task_queue,
+                                            parent_run_id, parent_command_seq,
+                                            parent_close_policy, parent_child_map_ordinal)
+                         on conflict(namespace, workflow_id) do nothing
+                         returning namespace, workflow_id, run_id"
+                    ),
+                    &[
+                        &namespaces,
+                        &workflow_ids,
+                        &run_ids,
+                        &shard_ids,
+                        &workflow_names,
+                        &workflow_versions,
+                        &task_queues,
+                        &parent_run_ids,
+                        &parent_command_seqs,
+                        &parent_close_policies,
+                        &parent_child_map_ordinals,
+                        &reason_to_str(&WorkflowTaskReason::WorkflowStarted),
+                    ],
+                )
+                .await
+                .map_err(postgres_error)?;
+            for row in rows {
+                inserted_children.insert(
+                    (row.get::<_, String>(0), row.get::<_, String>(1)),
+                    RunId::new(row.get::<_, String>(2)),
+                );
+            }
+        }
+
+        let conflict_keys = insertable
+            .iter()
+            .filter_map(|start| {
+                let key = (
+                    commits[start.commit_index].namespace.clone(),
+                    start.message.workflow_id.0.clone(),
+                );
+                (!inserted_children.contains_key(&key)).then_some(key)
+            })
+            .collect::<BTreeSet<_>>();
+        let existing_children =
+            existing_child_workflows_for_keys_tx(tx, schema, &conflict_keys).await?;
+
+        let mut child_history = Vec::<(RunId, HistoryEventData)>::new();
+        for start in starts {
+            if existing_child_events.contains(&start.message.command_id) {
+                continue;
+            }
+            let namespace = commits[start.commit_index].namespace.clone();
+            let key = (namespace, start.message.workflow_id.0.clone());
+            let outcome = if let Some(run_id) = inserted_children.get(&key) {
+                child_history.push((
+                    run_id.clone(),
+                    HistoryEventData::WorkflowStarted {
+                        workflow_type: start.message.workflow_type.clone(),
+                        input: start.message.input.clone(),
+                    },
+                ));
+                InlineChildStartOutcome::Started(run_id.clone())
+            } else if let Some(existing) = existing_children.get(&key) {
+                let expected_map_ordinal = start
+                    .message
+                    .child_map_item
+                    .as_ref()
+                    .map(|item| i64::try_from(item.item_ordinal).unwrap_or(i64::MAX));
+                let same_child = existing.parent_run_id.as_deref()
+                    == Some(start.message.command_id.run_id.0.as_str())
+                    && existing
+                        .parent_command_seq
+                        .and_then(|seq| u64::try_from(seq).ok())
+                        == Some(start.message.command_id.seq.0)
+                    && existing.parent_child_map_ordinal == expected_map_ordinal;
+                if same_child {
+                    InlineChildStartOutcome::Started(existing.run_id.clone())
+                } else {
+                    InlineChildStartOutcome::Failed(DurableFailure::non_retryable(
+                        "durust.child_workflow_id_conflict",
+                        format!(
+                            "workflow id `{}` is already started",
+                            start.message.workflow_id
+                        ),
+                    ))
+                }
+            } else {
+                InlineChildStartOutcome::Skipped
+            };
+            let Some((event_data, reason)) =
+                child_start_outcome_event_and_reason(&start.message, outcome)
+            else {
+                continue;
+            };
+            let commit = &mut commits[start.commit_index];
+            commit.next_event_id = commit.next_event_id.next();
+            commit
+                .append_history
+                .push((commit.next_event_id, event_data));
+            commit.ready_reason = Some(reason);
+        }
+
+        let child_history_rows = child_history
+            .iter()
+            .map(|(run_id, data)| HistoryEventInsert {
+                run_id,
+                event_id: EventId(1),
+                data,
+            })
+            .collect::<Vec<_>>();
+        insert_history_event_rows(tx, schema, &child_history_rows).await
+    }
+
     async fn apply_simple_workflow_task_commits_tx(
         &self,
         tx: &Transaction<'_>,
@@ -2009,6 +2372,16 @@ impl PostgresBackend {
         let mut item_results = Vec::with_capacity(indices.len());
         let mut prepared = Vec::<PreparedSimpleWorkflowCommit>::new();
         let mut conflict_updates = Vec::<(RunId, EventId)>::new();
+        let lease_keys = indices
+            .iter()
+            .filter_map(|index| {
+                let input = &commits[*index];
+                let row = locked.get(&input.claim.run_id)?;
+                (row.claim_token == Some(i64::try_from(input.claim.token).unwrap_or(i64::MAX)))
+                    .then(|| (input.claim.worker_id.clone(), row.shard_id))
+            })
+            .collect::<BTreeSet<_>>();
+        let lease_epochs = self.verify_shard_leases_tx(tx, &lease_keys).await?;
         for index in indices {
             let input = &commits[*index];
             let claim = input.claim.clone();
@@ -2020,13 +2393,11 @@ impl PostgresBackend {
                 item_results.push((*index, Err(Error::StaleLease)));
                 continue;
             }
-            let lease_epoch = match self
-                .verify_shard_lease_tx(tx, &claim.worker_id, row.shard_id)
-                .await
-            {
-                Ok(lease_epoch) => lease_epoch,
-                Err(err) => {
-                    item_results.push((*index, Err(err)));
+            let lease_key = (claim.worker_id.clone(), row.shard_id);
+            let lease_epoch = match lease_epochs.get(&lease_key).copied() {
+                Some(lease_epoch) => lease_epoch,
+                None => {
+                    item_results.push((*index, Err(Error::StaleLease)));
                     continue;
                 }
             };
@@ -2063,10 +2434,14 @@ impl PostgresBackend {
 
             let mut next_event_id = row.current_tail;
             let mut append_history = Vec::with_capacity(input.commit.append_events.len());
+            let mut terminal_event = None;
             for event in &input.commit.append_events {
                 let data = self
                     .normalize_history_event_for_storage_tx(tx, event.data.clone())
                     .await?;
+                if postgres_simple_batch_terminal_event_eligible(&data) {
+                    terminal_event = Some(data.clone());
+                }
                 next_event_id = next_event_id.next();
                 append_history.push((next_event_id, data));
             }
@@ -2075,6 +2450,14 @@ impl PostgresBackend {
             for task in &input.commit.schedule_activities {
                 schedule_activities.push(
                     self.normalize_activity_task_for_storage_tx(tx, task.clone())
+                        .await?,
+                );
+            }
+            let mut start_child_workflows =
+                Vec::with_capacity(input.commit.start_child_workflows.len());
+            for message in &input.commit.start_child_workflows {
+                start_child_workflows.push(
+                    self.normalize_child_start_message_for_storage_tx(tx, message.clone())
                         .await?,
                 );
             }
@@ -2097,10 +2480,13 @@ impl PostgresBackend {
                 lease_epoch,
                 append_history,
                 schedule_activities,
+                start_child_workflows,
                 upsert_waits: input.commit.upsert_waits.clone(),
                 consume_signals: input.commit.consume_signals.clone(),
                 delete_waits: input.commit.delete_waits.clone(),
                 query_projection,
+                terminal_event,
+                ready_reason: None,
             });
         }
 
@@ -2123,6 +2509,9 @@ impl PostgresBackend {
             .map_err(postgres_error)?;
         }
 
+        self.apply_child_starts_for_simple_commits_tx(tx, schema, &mut prepared)
+            .await?;
+
         let history_rows = prepared
             .iter()
             .flat_map(|commit| {
@@ -2144,6 +2533,24 @@ impl PostgresBackend {
         delete_wait_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
         upsert_query_projection_rows_for_simple_commits_tx(tx, schema, &prepared).await?;
 
+        let terminal_runs = prepared
+            .iter()
+            .filter_map(|commit| {
+                commit
+                    .terminal_event
+                    .as_ref()
+                    .map(|event| (commit.claim.run_id.clone(), event.clone()))
+            })
+            .collect::<Vec<_>>();
+        if !terminal_runs.is_empty() {
+            let terminal_run_ids = terminal_runs
+                .iter()
+                .map(|(run_id, _)| run_id.clone())
+                .collect::<Vec<_>>();
+            cleanup_runs_operational_state_tx(tx, schema, &terminal_run_ids).await?;
+            handle_terminal_runs_tx(self, tx, schema, &terminal_runs).await?;
+        }
+
         if !prepared.is_empty() {
             let run_ids = prepared
                 .iter()
@@ -2153,19 +2560,32 @@ impl PostgresBackend {
                 .iter()
                 .map(|commit| i64::try_from(commit.next_event_id.0).unwrap_or(i64::MAX))
                 .collect::<Vec<_>>();
+            let terminal_flags = prepared
+                .iter()
+                .map(|commit| commit.terminal_event.is_some())
+                .collect::<Vec<_>>();
+            let ready_reasons = prepared
+                .iter()
+                .map(|commit| {
+                    commit
+                        .ready_reason
+                        .as_ref()
+                        .map(|reason| reason_to_str(reason).to_owned())
+                })
+                .collect::<Vec<_>>();
             tx.execute(
                 &format!(
                     "update {schema}.workflow_instances workflows
                      set current_event_id = updates.current_event_id,
                          workflow_claim_token = null,
-                         terminal = false,
-                         ready_reason = null,
+                         terminal = updates.terminal,
+                         ready_reason = updates.ready_reason,
                          ready_at_ms = 0
-                     from unnest($1::text[], $2::bigint[])
-                          as updates(run_id, current_event_id)
+                     from unnest($1::text[], $2::bigint[], $3::boolean[], $4::text[])
+                          as updates(run_id, current_event_id, terminal, ready_reason)
                      where workflows.run_id = updates.run_id"
                 ),
-                &[&run_ids, &event_ids],
+                &[&run_ids, &event_ids, &terminal_flags, &ready_reasons],
             )
             .await
             .map_err(postgres_error)?;
@@ -2189,8 +2609,11 @@ impl PostgresBackend {
                                 commit.next_event_id.0.saturating_sub(commit.current_tail.0),
                             )
                             .unwrap_or(usize::MAX),
-                            terminal: false,
-                            ready_reason: None,
+                            terminal: commit.terminal_event.is_some(),
+                            ready_reason: commit
+                                .ready_reason
+                                .as_ref()
+                                .map(|reason| reason_to_str(reason).to_owned()),
                         },
                     },
                 }),
@@ -2660,7 +3083,7 @@ impl PostgresBackend {
         &self,
         req: SignalWorkflowRequest,
     ) -> Result<SignalWorkflowOutcome> {
-        self.retry_transaction("signal_workflow", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.signal_workflow_once(req).await }
         })
@@ -2799,7 +3222,7 @@ impl PostgresBackend {
         &self,
         req: FireDueTimersRequest,
     ) -> Result<FireDueTimersOutcome> {
-        self.retry_transaction("fire_due_timers", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.fire_due_timers_once(req).await }
         })
@@ -2822,7 +3245,7 @@ impl PostgresBackend {
         &self,
         req: TimeoutDueActivitiesRequest,
     ) -> Result<TimeoutDueActivitiesOutcome> {
-        self.retry_transaction("timeout_due_activities", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.timeout_due_activities_once(req).await }
         })
@@ -2845,7 +3268,7 @@ impl PostgresBackend {
         &self,
         req: RunDueMaintenanceRequest,
     ) -> Result<RunDueMaintenanceOutcome> {
-        self.retry_transaction("run_due_maintenance", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.run_due_maintenance_once(req).await }
         })
@@ -2892,7 +3315,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimActivityOptions,
     ) -> Result<Option<ClaimedActivityTask>> {
-        self.retry_transaction("claim_activity_task", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_activity_task_once(worker_id, opts).await }
@@ -2980,7 +3403,7 @@ impl PostgresBackend {
         worker_id: WorkerId,
         opts: ClaimActivityTasksOptions,
     ) -> Result<Vec<ClaimedActivityTask>> {
-        self.retry_transaction("claim_activity_tasks", || {
+        self.retry_transaction(|| {
             let worker_id = worker_id.clone();
             let opts = opts.clone();
             async move { self.claim_activity_tasks_once(worker_id, opts).await }
@@ -3117,7 +3540,7 @@ impl PostgresBackend {
         &self,
         req: ActivityHeartbeatRequest,
     ) -> Result<ActivityHeartbeatOutcome> {
-        self.retry_transaction("heartbeat_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.heartbeat_activity_once(req).await }
         })
@@ -3183,7 +3606,7 @@ impl PostgresBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> Result<CompleteActivityOutcome> {
-        self.retry_transaction("complete_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.complete_activity_once(req).await }
         })
@@ -3206,7 +3629,7 @@ impl PostgresBackend {
         &self,
         req: CompleteActivityTasksRequest,
     ) -> Result<Vec<CompleteActivityTaskBatchResult>> {
-        self.retry_transaction("complete_activity_tasks", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.complete_activity_tasks_once(req).await }
         })
@@ -3626,7 +4049,7 @@ impl PostgresBackend {
     }
 
     async fn fail_activity_inner(&self, req: FailActivityRequest) -> Result<FailActivityOutcome> {
-        self.retry_transaction("fail_activity", || {
+        self.retry_transaction(|| {
             let req = req.clone();
             async move { self.fail_activity_once(req).await }
         })
@@ -5039,119 +5462,8 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         data: HistoryEventData,
     ) -> Result<HistoryEventData> {
-        match data {
-            HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input,
-            } => Ok(HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input: self.normalize_payload_for_storage_tx(tx, input).await?,
-            }),
-            HistoryEventData::WorkflowCompleted { result } => {
-                Ok(HistoryEventData::WorkflowCompleted {
-                    result: self.normalize_payload_for_storage_tx(tx, result).await?,
-                })
-            }
-            HistoryEventData::WorkflowFailed { failure } => Ok(HistoryEventData::WorkflowFailed {
-                failure: self.normalize_failure_for_storage_tx(tx, failure).await?,
-            }),
-            HistoryEventData::WorkflowContinuedAsNew { input } => {
-                Ok(HistoryEventData::WorkflowContinuedAsNew {
-                    input: self.normalize_payload_for_storage_tx(tx, input).await?,
-                })
-            }
-            HistoryEventData::ActivityScheduled(mut scheduled) => {
-                scheduled.input = self
-                    .normalize_payload_for_storage_tx(tx, scheduled.input)
-                    .await?;
-                Ok(HistoryEventData::ActivityScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .normalize_activity_map_input_manifest_for_storage_tx(
-                        tx,
-                        scheduled.input_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .normalize_activity_map_result_manifest_for_storage_tx(
-                        tx,
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ActivityMapCompleted(completed))
-            }
-            HistoryEventData::ActivityMapFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .normalize_activity_map_input_manifest_for_storage_tx(
-                        tx,
-                        scheduled.input_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .normalize_child_workflow_map_result_manifest_for_storage_tx(
-                        tx,
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
-            }
-            HistoryEventData::ActivityCompleted(mut completed) => {
-                completed.result = self
-                    .normalize_payload_for_storage_tx(tx, completed.result)
-                    .await?;
-                Ok(HistoryEventData::ActivityCompleted(completed))
-            }
-            HistoryEventData::ActivityFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ActivityFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowStartRequested(mut requested) => {
-                requested.input = self
-                    .normalize_payload_for_storage_tx(tx, requested.input)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowStartRequested(requested))
-            }
-            HistoryEventData::ChildWorkflowCompleted(mut completed) => {
-                completed.result = self
-                    .normalize_payload_for_storage_tx(tx, completed.result)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowFailed(mut failed) => {
-                failed.failure = self
-                    .normalize_failure_for_storage_tx(tx, failed.failure)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowFailed(failed))
-            }
-            HistoryEventData::SignalConsumed(mut signal) => {
-                signal.payload = self
-                    .normalize_payload_for_storage_tx(tx, signal.payload)
-                    .await?;
-                Ok(HistoryEventData::SignalConsumed(signal))
-            }
-            other => Ok(other),
-        }
+        let mut rewriter = PostgresNormalizeRewriter { backend: self, tx };
+        crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
     }
 
     async fn normalize_activity_task_for_storage_tx(
@@ -5222,101 +5534,8 @@ impl PostgresBackend {
         &self,
         data: HistoryEventData,
     ) -> Result<HistoryEventData> {
-        match data {
-            HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input,
-            } => Ok(HistoryEventData::WorkflowStarted {
-                workflow_type,
-                input: self.hydrate_payload_from_storage(input).await?,
-            }),
-            HistoryEventData::WorkflowCompleted { result } => {
-                Ok(HistoryEventData::WorkflowCompleted {
-                    result: self.hydrate_payload_from_storage(result).await?,
-                })
-            }
-            HistoryEventData::WorkflowFailed { failure } => Ok(HistoryEventData::WorkflowFailed {
-                failure: self.hydrate_failure_from_storage(failure).await?,
-            }),
-            HistoryEventData::WorkflowContinuedAsNew { input } => {
-                Ok(HistoryEventData::WorkflowContinuedAsNew {
-                    input: self.hydrate_payload_from_storage(input).await?,
-                })
-            }
-            HistoryEventData::ActivityScheduled(mut scheduled) => {
-                scheduled.input = self.hydrate_payload_from_storage(scheduled.input).await?;
-                Ok(HistoryEventData::ActivityScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .hydrate_activity_map_input_manifest_from_storage(scheduled.input_manifest)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
-            }
-            HistoryEventData::ActivityMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .hydrate_activity_map_result_manifest_from_storage(completed.result_manifest)
-                    .await?;
-                Ok(HistoryEventData::ActivityMapCompleted(completed))
-            }
-            HistoryEventData::ActivityMapFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ActivityMapFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-                scheduled.input_manifest = self
-                    .hydrate_activity_map_input_manifest_from_storage(scheduled.input_manifest)
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-                completed.result_manifest = self
-                    .hydrate_child_workflow_map_result_manifest_from_storage(
-                        completed.result_manifest,
-                    )
-                    .await?;
-                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ChildWorkflowMapFailed(failed))
-            }
-            HistoryEventData::ActivityCompleted(mut completed) => {
-                completed.result = self.hydrate_payload_from_storage(completed.result).await?;
-                Ok(HistoryEventData::ActivityCompleted(completed))
-            }
-            HistoryEventData::ActivityFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ActivityFailed(failed))
-            }
-            HistoryEventData::ChildWorkflowStartRequested(mut requested) => {
-                requested.input = self.hydrate_payload_from_storage(requested.input).await?;
-                Ok(HistoryEventData::ChildWorkflowStartRequested(requested))
-            }
-            HistoryEventData::ChildWorkflowCompleted(mut completed) => {
-                completed.result = self.hydrate_payload_from_storage(completed.result).await?;
-                Ok(HistoryEventData::ChildWorkflowCompleted(completed))
-            }
-            HistoryEventData::ChildWorkflowFailed(mut failed) => {
-                failed.failure = self.hydrate_failure_from_storage(failed.failure).await?;
-                Ok(HistoryEventData::ChildWorkflowFailed(failed))
-            }
-            HistoryEventData::SignalConsumed(mut signal) => {
-                signal.payload = self.hydrate_payload_from_storage(signal.payload).await?;
-                Ok(HistoryEventData::SignalConsumed(signal))
-            }
-            other => Ok(other),
-        }
-    }
-
-    async fn hydrate_failure_from_storage(
-        &self,
-        mut failure: DurableFailure,
-    ) -> Result<DurableFailure> {
-        if let Some(details) = failure.details.take() {
-            failure.details = Some(self.hydrate_payload_from_storage(details).await?);
-        }
-        Ok(failure)
+        let mut rewriter = PostgresHydrateRewriter { backend: self };
+        crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
     }
 
     async fn load_payload_blob_tx(
@@ -5504,46 +5723,6 @@ fn is_retryable_postgres_transaction_abort(err: &Error) -> bool {
     )
 }
 
-fn ready_at_ms_for_delay(delay: Duration) -> i64 {
-    if delay.is_zero() {
-        0
-    } else {
-        unix_epoch_millis().saturating_add(duration_millis_i64(delay))
-    }
-}
-
-fn duration_millis_i64(duration: Duration) -> i64 {
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
-    activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
-}
-
-fn activity_timeout_at_ms_from(now: TimestampMs, timeout: Option<Duration>) -> Option<i64> {
-    timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
-}
-
-fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
-    if heartbeat {
-        format!(
-            "activity `{}` missed heartbeat on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    } else {
-        format!(
-            "activity `{}` timed out on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
-    }
-}
-
-fn should_retry_activity(task: &ActivityTask) -> bool {
-    task.attempt < task.retry_policy.max_attempts.max(1)
-}
-
 fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
     match kind {
         WaitKind::Timer => "timer",
@@ -5575,9 +5754,24 @@ async fn cleanup_run_operational_state_tx(
     schema: &str,
     run_id: &RunId,
 ) -> Result<()> {
+    cleanup_runs_operational_state_tx(tx, schema, std::slice::from_ref(run_id)).await
+}
+
+async fn cleanup_runs_operational_state_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    run_ids: &[RunId],
+) -> Result<()> {
+    if run_ids.is_empty() {
+        return Ok(());
+    }
+    let run_id_values = run_ids
+        .iter()
+        .map(|run_id| run_id.0.clone())
+        .collect::<Vec<_>>();
     tx.execute(
-        &format!("delete from {schema}.active_waits where run_id = $1"),
-        &[&run_id.0],
+        &format!("delete from {schema}.active_waits where run_id = any($1::text[])"),
+        &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
@@ -5587,9 +5781,9 @@ async fn cleanup_run_operational_state_tx(
              set completed = true,
                  claim_token = null,
                  heartbeat_deadline_at_ms = null
-             where run_id = $1"
+             where run_id = any($1::text[])"
         ),
-        &[&run_id.0],
+        &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
@@ -5597,9 +5791,9 @@ async fn cleanup_run_operational_state_tx(
         &format!(
             "update {schema}.activity_maps
              set completed = true, in_flight = 0
-             where run_id = $1"
+             where run_id = any($1::text[])"
         ),
-        &[&run_id.0],
+        &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
@@ -5607,9 +5801,9 @@ async fn cleanup_run_operational_state_tx(
         &format!(
             "update {schema}.child_workflow_maps
              set completed = true, in_flight = 0
-             where run_id = $1"
+             where run_id = any($1::text[])"
         ),
-        &[&run_id.0],
+        &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
@@ -5623,9 +5817,27 @@ async fn handle_terminal_run_tx(
     run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) -> Result<()> {
-    notify_parent_of_child_terminal_tx(backend, tx, schema, run_id, terminal_event).await?;
-    cancel_children_for_parent_tx(tx, schema, run_id).await?;
-    Ok(())
+    handle_terminal_runs_tx(
+        backend,
+        tx,
+        schema,
+        &[(run_id.clone(), terminal_event.clone())],
+    )
+    .await
+}
+
+async fn handle_terminal_runs_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    terminal_runs: &[(RunId, HistoryEventData)],
+) -> Result<()> {
+    notify_parents_of_child_terminals_tx(backend, tx, schema, terminal_runs).await?;
+    let run_ids = terminal_runs
+        .iter()
+        .map(|(run_id, _)| run_id.clone())
+        .collect::<Vec<_>>();
+    cancel_children_for_parents_tx(tx, schema, &run_ids).await
 }
 
 async fn continue_run_as_new_tx(
@@ -5689,132 +5901,220 @@ async fn continue_run_as_new_tx(
     Ok(())
 }
 
-async fn notify_parent_of_child_terminal_tx(
+#[derive(Clone)]
+struct DirectChildTerminalNotification {
+    parent_run_id: RunId,
+    command_id: CommandId,
+    terminal_event: HistoryEventData,
+}
+
+async fn notify_parents_of_child_terminals_tx(
     backend: &PostgresBackend,
     tx: &Transaction<'_>,
     schema: &str,
-    child_run_id: &RunId,
-    terminal_event: &HistoryEventData,
+    terminal_runs: &[(RunId, HistoryEventData)],
 ) -> Result<()> {
-    let Some(row) = tx
-        .query_opt(
+    if terminal_runs.is_empty() {
+        return Ok(());
+    }
+    let terminal_events = terminal_runs
+        .iter()
+        .map(|(run_id, event)| (run_id.clone(), event.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let run_ids = terminal_runs
+        .iter()
+        .map(|(run_id, _)| run_id.0.clone())
+        .collect::<Vec<_>>();
+    let rows = tx
+        .query(
             &format!(
-                "select parent_run_id, parent_command_seq, parent_child_map_ordinal
+                "select run_id, parent_run_id, parent_command_seq, parent_child_map_ordinal
                  from {schema}.workflow_instances
-                 where run_id = $1"
+                 where run_id = any($1::text[])
+                   and parent_run_id is not null"
             ),
-            &[&child_run_id.0],
+            &[&run_ids],
         )
         .await
-        .map_err(postgres_error)?
-    else {
-        return Err(Error::RunNotFound(child_run_id.clone()));
-    };
-    let parent_run_id: Option<String> = row.get(0);
-    let parent_command_seq: Option<i64> = row.get(1);
-    let parent_child_map_ordinal: Option<i64> = row.get(2);
-    let Some((parent_run_id, parent_command_seq, parent_child_map_ordinal)) = parent_run_id
-        .zip(parent_command_seq)
-        .and_then(|(run_id, seq)| {
-            Some((
-                RunId::new(run_id),
-                CommandSeq(u64::try_from(seq).ok()?),
-                parent_child_map_ordinal.and_then(|ordinal| u64::try_from(ordinal).ok()),
-            ))
-        })
-    else {
-        return Ok(());
-    };
-    let command_id = CommandId {
-        run_id: parent_run_id.clone(),
-        seq: parent_command_seq,
-    };
-    if let Some(item_ordinal) = parent_child_map_ordinal {
-        let outcome = match terminal_event {
-            HistoryEventData::WorkflowCompleted { result } => {
-                ChildWorkflowMapItemOutcome::Succeeded {
-                    result: result.clone(),
-                }
-            }
-            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
-                failure: failure.clone(),
-            },
-            HistoryEventData::WorkflowCancelled { reason } => {
-                ChildWorkflowMapItemOutcome::Cancelled {
-                    reason: reason.clone(),
-                }
-            }
-            _ => return Ok(()),
+        .map_err(postgres_error)?;
+    let mut direct_notifications = Vec::new();
+    for row in rows {
+        let child_run_id = RunId::new(row.get::<_, String>(0));
+        let Some(terminal_event) = terminal_events.get(&child_run_id).cloned() else {
+            continue;
         };
-        return complete_child_workflow_map_item_tx(
-            backend,
-            tx,
-            schema,
-            ChildWorkflowMapItem {
-                map_command_id: command_id,
-                item_ordinal,
-            },
-            outcome,
-        )
-        .await;
+        let parent_run_id: Option<String> = row.get(1);
+        let parent_command_seq: Option<i64> = row.get(2);
+        let parent_child_map_ordinal: Option<i64> = row.get(3);
+        let Some((parent_run_id, parent_command_seq)) = parent_run_id
+            .zip(parent_command_seq)
+            .and_then(|(run_id, seq)| {
+                Some((RunId::new(run_id), CommandSeq(u64::try_from(seq).ok()?)))
+            })
+        else {
+            continue;
+        };
+        let command_id = CommandId {
+            run_id: parent_run_id.clone(),
+            seq: parent_command_seq,
+        };
+        if let Some(item_ordinal) =
+            parent_child_map_ordinal.and_then(|ordinal| u64::try_from(ordinal).ok())
+        {
+            let outcome = match &terminal_event {
+                HistoryEventData::WorkflowCompleted { result } => {
+                    ChildWorkflowMapItemOutcome::Succeeded {
+                        result: result.clone(),
+                    }
+                }
+                HistoryEventData::WorkflowFailed { failure } => {
+                    ChildWorkflowMapItemOutcome::Failed {
+                        failure: failure.clone(),
+                    }
+                }
+                HistoryEventData::WorkflowCancelled { reason } => {
+                    ChildWorkflowMapItemOutcome::Cancelled {
+                        reason: reason.clone(),
+                    }
+                }
+                _ => continue,
+            };
+            complete_child_workflow_map_item_tx(
+                backend,
+                tx,
+                schema,
+                ChildWorkflowMapItem {
+                    map_command_id: command_id,
+                    item_ordinal,
+                },
+                outcome,
+            )
+            .await?;
+            continue;
+        }
+        direct_notifications.push(DirectChildTerminalNotification {
+            parent_run_id,
+            command_id,
+            terminal_event,
+        });
     }
-    if child_terminal_event_exists_tx(tx, schema, &command_id).await? {
-        return Ok(());
-    }
-    let Some(row) = tx
-        .query_opt(
-            &format!(
-                "select current_event_id, terminal
-                 from {schema}.workflow_instances
-                 where run_id = $1
-                 for update"
-            ),
-            &[&parent_run_id.0],
-        )
-        .await
-        .map_err(postgres_error)?
-    else {
-        return Ok(());
-    };
-    let parent_tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
-    let parent_terminal: bool = row.get(1);
-    if parent_terminal {
-        return Ok(());
-    }
-    let event_id = parent_tail.next();
-    let (event_data, reason) = match terminal_event {
-        HistoryEventData::WorkflowCompleted { result } => (
-            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
-                command_id,
-                result: result.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCompleted,
-        ),
-        HistoryEventData::WorkflowFailed { failure } => (
-            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
-                command_id,
-                failure: failure.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowFailed,
-        ),
-        HistoryEventData::WorkflowCancelled { reason } => (
-            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
-                command_id,
-                reason: reason.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCancelled,
-        ),
-        _ => return Ok(()),
-    };
-    insert_history_event(tx, schema, &parent_run_id, event_id, event_data).await?;
-    set_workflow_ready_tx(tx, schema, &parent_run_id, event_id, reason).await
+    notify_direct_parents_of_child_terminals_tx(tx, schema, direct_notifications).await
 }
 
-async fn child_terminal_event_exists_tx(
+async fn notify_direct_parents_of_child_terminals_tx(
     tx: &Transaction<'_>,
     schema: &str,
-    command_id: &CommandId,
-) -> Result<bool> {
+    notifications: Vec<DirectChildTerminalNotification>,
+) -> Result<()> {
+    if notifications.is_empty() {
+        return Ok(());
+    }
+    let parent_run_ids = notifications
+        .iter()
+        .map(|notification| notification.parent_run_id.clone())
+        .collect::<BTreeSet<_>>();
+    let parent_run_id_values = parent_run_ids
+        .iter()
+        .map(|run_id| run_id.0.clone())
+        .collect::<Vec<_>>();
+    let existing_command_ids =
+        existing_child_terminal_command_ids_tx(tx, schema, &parent_run_id_values).await?;
+    let rows = tx
+        .query(
+            &format!(
+                "select run_id, current_event_id, terminal
+                 from {schema}.workflow_instances
+                 where run_id = any($1::text[])
+                 for update"
+            ),
+            &[&parent_run_id_values],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let mut parent_tails = rows
+        .into_iter()
+        .map(|row| {
+            (
+                RunId::new(row.get::<_, String>(0)),
+                (
+                    EventId(u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX)),
+                    row.get::<_, bool>(2),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut parent_events = Vec::<(RunId, EventId, HistoryEventData)>::new();
+    let mut parent_updates = BTreeMap::<RunId, (EventId, WorkflowTaskReason)>::new();
+    for notification in notifications {
+        if existing_command_ids.contains(&notification.command_id) {
+            continue;
+        }
+        let Some((tail, terminal)) = parent_tails.get_mut(&notification.parent_run_id) else {
+            continue;
+        };
+        if *terminal {
+            continue;
+        }
+        let Some((event_data, reason)) = child_terminal_event_data_and_reason(
+            notification.command_id,
+            &notification.terminal_event,
+        ) else {
+            continue;
+        };
+        let event_id = tail.next();
+        *tail = event_id;
+        parent_updates.insert(notification.parent_run_id.clone(), (event_id, reason));
+        parent_events.push((notification.parent_run_id, event_id, event_data));
+    }
+    let history_rows = parent_events
+        .iter()
+        .map(|(run_id, event_id, data)| HistoryEventInsert {
+            run_id,
+            event_id: *event_id,
+            data,
+        })
+        .collect::<Vec<_>>();
+    insert_history_event_rows(tx, schema, &history_rows).await?;
+    if parent_updates.is_empty() {
+        return Ok(());
+    }
+    let run_ids = parent_updates
+        .keys()
+        .map(|run_id| run_id.0.clone())
+        .collect::<Vec<_>>();
+    let event_ids = parent_updates
+        .values()
+        .map(|(event_id, _)| i64::try_from(event_id.0).unwrap_or(i64::MAX))
+        .collect::<Vec<_>>();
+    let reasons = parent_updates
+        .values()
+        .map(|(_, reason)| reason_to_str(reason).to_owned())
+        .collect::<Vec<_>>();
+    tx.execute(
+        &format!(
+            "update {schema}.workflow_instances workflows
+             set current_event_id = updates.current_event_id,
+                 ready_reason = updates.ready_reason,
+                 ready_at_ms = 0
+             from unnest($1::text[], $2::bigint[], $3::text[])
+                  as updates(run_id, current_event_id, ready_reason)
+             where workflows.run_id = updates.run_id"
+        ),
+        &[&run_ids, &event_ids, &reasons],
+    )
+    .await
+    .map_err(postgres_error)?;
+    Ok(())
+}
+
+async fn existing_child_terminal_command_ids_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    parent_run_id_values: &[String],
+) -> Result<BTreeSet<CommandId>> {
+    if parent_run_id_values.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let child_event_types = vec![
         event_type_to_str(&HistoryEventType::ChildWorkflowCompleted),
         event_type_to_str(&HistoryEventType::ChildWorkflowFailed),
@@ -5825,52 +6125,89 @@ async fn child_terminal_event_exists_tx(
             &format!(
                 "select data
                  from {schema}.history_events
-                 where run_id = $1
+                 where run_id = any($1::text[])
                    and event_type = any($2::text[])"
             ),
-            &[&command_id.run_id.0, &child_event_types],
+            &[&parent_run_id_values, &child_event_types],
         )
         .await
         .map_err(postgres_error)?;
+    let mut command_ids = BTreeSet::new();
     for row in rows {
         let blob: Vec<u8> = row.get(0);
         let event: HistoryEventData =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
+        match event {
             HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
+                command_ids.insert(completed.command_id);
             }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
+            HistoryEventData::ChildWorkflowFailed(failed) => {
+                command_ids.insert(failed.command_id);
+            }
             HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
+                command_ids.insert(cancelled.command_id);
             }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
+            _ => {}
         }
     }
-    Ok(false)
+    Ok(command_ids)
 }
 
-async fn cancel_children_for_parent_tx(
+fn child_terminal_event_data_and_reason(
+    command_id: CommandId,
+    terminal_event: &HistoryEventData,
+) -> Option<(HistoryEventData, WorkflowTaskReason)> {
+    match terminal_event {
+        HistoryEventData::WorkflowCompleted { result } => Some((
+            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
+                command_id,
+                result: result.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCompleted,
+        )),
+        HistoryEventData::WorkflowFailed { failure } => Some((
+            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+                command_id,
+                failure: failure.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowFailed,
+        )),
+        HistoryEventData::WorkflowCancelled { reason } => Some((
+            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
+                command_id,
+                reason: reason.clone(),
+            }),
+            WorkflowTaskReason::ChildWorkflowCancelled,
+        )),
+        _ => None,
+    }
+}
+
+async fn cancel_children_for_parents_tx(
     tx: &Transaction<'_>,
     schema: &str,
-    parent_run_id: &RunId,
+    parent_run_ids: &[RunId],
 ) -> Result<()> {
+    if parent_run_ids.is_empty() {
+        return Ok(());
+    }
+    let parent_run_id_values = parent_run_ids
+        .iter()
+        .map(|run_id| run_id.0.clone())
+        .collect::<Vec<_>>();
     let rows = tx
         .query(
             &format!(
-                "select run_id, current_event_id
+                "select run_id, current_event_id, parent_run_id
                  from {schema}.workflow_instances
-                 where parent_run_id = $1
+                 where parent_run_id = any($1::text[])
                    and parent_close_policy = $2
                    and terminal = false
                  order by run_id asc
                  for update"
             ),
             &[
-                &parent_run_id.0,
+                &parent_run_id_values,
                 &parent_close_policy_to_str(ParentClosePolicy::Cancel),
             ],
         )
@@ -5882,40 +6219,62 @@ async fn cancel_children_for_parent_tx(
             (
                 RunId::new(row.get::<_, String>(0)),
                 EventId(u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX)),
+                RunId::new(row.get::<_, String>(2)),
             )
         })
         .collect::<Vec<_>>();
-    for (child_run_id, tail) in children {
-        let event_id = tail.next();
-        insert_history_event(
-            tx,
-            schema,
-            &child_run_id,
-            event_id,
-            HistoryEventData::WorkflowCancelled {
-                reason: format!("parent workflow `{parent_run_id}` closed"),
-            },
-        )
-        .await?;
-        cleanup_run_operational_state_tx(tx, schema, &child_run_id).await?;
-        tx.execute(
-            &format!(
-                "update {schema}.workflow_instances
-                 set current_event_id = $1,
-                     workflow_claim_token = null,
-                     terminal = true,
-                     ready_reason = null,
-                     ready_at_ms = 0
-                 where run_id = $2"
-            ),
-            &[
-                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-                &child_run_id.0,
-            ],
-        )
-        .await
-        .map_err(postgres_error)?;
+    if children.is_empty() {
+        return Ok(());
     }
+    let child_events = children
+        .iter()
+        .map(|(child_run_id, tail, parent_run_id)| {
+            (
+                child_run_id.clone(),
+                tail.next(),
+                HistoryEventData::WorkflowCancelled {
+                    reason: format!("parent workflow `{parent_run_id}` closed"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let history_rows = child_events
+        .iter()
+        .map(|(run_id, event_id, data)| HistoryEventInsert {
+            run_id,
+            event_id: *event_id,
+            data,
+        })
+        .collect::<Vec<_>>();
+    insert_history_event_rows(tx, schema, &history_rows).await?;
+    let child_run_ids = children
+        .iter()
+        .map(|(child_run_id, _, _)| child_run_id.clone())
+        .collect::<Vec<_>>();
+    cleanup_runs_operational_state_tx(tx, schema, &child_run_ids).await?;
+    let child_run_id_values = child_events
+        .iter()
+        .map(|(run_id, _, _)| run_id.0.clone())
+        .collect::<Vec<_>>();
+    let event_ids = child_events
+        .iter()
+        .map(|(_, event_id, _)| i64::try_from(event_id.0).unwrap_or(i64::MAX))
+        .collect::<Vec<_>>();
+    tx.execute(
+        &format!(
+            "update {schema}.workflow_instances workflows
+             set current_event_id = updates.current_event_id,
+                 workflow_claim_token = null,
+                 terminal = true,
+                 ready_reason = null,
+                 ready_at_ms = 0
+             from unnest($1::text[], $2::bigint[]) as updates(run_id, current_event_id)
+             where workflows.run_id = updates.run_id"
+        ),
+        &[&child_run_id_values, &event_ids],
+    )
+    .await
+    .map_err(postgres_error)?;
     Ok(())
 }
 
@@ -5985,14 +6344,6 @@ async fn set_workflow_ready_tx(
     Ok(())
 }
 
-fn unix_epoch_millis() -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
-}
-
 async fn next_sequence_value(tx: &Transaction<'_>, schema: &str, sequence: &str) -> Result<u64> {
     let row = tx
         .query_one(
@@ -6014,6 +6365,34 @@ async fn next_run_id(tx: &Transaction<'_>, schema: &str) -> Result<RunId> {
         "run-{}",
         next_sequence_value(tx, schema, "run_id_seq").await?
     )))
+}
+
+async fn next_run_ids(tx: &Transaction<'_>, schema: &str, count: usize) -> Result<Vec<RunId>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = tx
+        .query(
+            &format!(
+                "select nextval('{schema}.run_id_seq'::regclass)
+                 from generate_series(1::bigint, $1::bigint)"
+            ),
+            &[&i64::try_from(count).unwrap_or(i64::MAX)],
+        )
+        .await
+        .map_err(postgres_error)?;
+    rows.into_iter()
+        .map(|row| {
+            let value: i64 = row.get(0);
+            u64::try_from(value)
+                .map(|value| RunId::new(format!("run-{value}")))
+                .map_err(|_| {
+                    Error::Backend(format!(
+                        "postgres run id sequence returned invalid value {value}"
+                    ))
+                })
+        })
+        .collect()
 }
 
 fn has_duplicate_activity_completion_ids(completions: &[CompleteActivityRequest]) -> bool {
@@ -6134,9 +6513,14 @@ async fn insert_history_event_rows(
 }
 
 fn postgres_simple_batch_commit_eligible(commit: &WorkflowTaskCommit) -> bool {
+    let has_terminal_event = postgres_simple_batch_commit_has_terminal_event(commit);
     commit.schedule_activity_maps.is_empty()
         && commit.schedule_child_workflow_maps.is_empty()
-        && commit.start_child_workflows.is_empty()
+        && commit
+            .start_child_workflows
+            .iter()
+            .all(|message| message.child_map_item.is_none())
+        && !(has_terminal_event && !commit.start_child_workflows.is_empty())
         && commit.cancel_commands.is_empty()
         && commit
             .append_events
@@ -6144,14 +6528,28 @@ fn postgres_simple_batch_commit_eligible(commit: &WorkflowTaskCommit) -> bool {
             .all(|event| postgres_simple_batch_history_event_eligible(&event.data))
 }
 
+fn postgres_simple_batch_commit_has_terminal_event(commit: &WorkflowTaskCommit) -> bool {
+    commit
+        .append_events
+        .iter()
+        .any(|event| postgres_simple_batch_terminal_event_eligible(&event.data))
+}
+
 fn postgres_simple_batch_history_event_eligible(data: &HistoryEventData) -> bool {
+    postgres_simple_batch_terminal_event_eligible(data)
+        || (!is_terminal(data)
+            && !matches!(
+                data,
+                HistoryEventData::VersionMarker(_) | HistoryEventData::DeprecatedPatchMarker(_)
+            ))
+}
+
+fn postgres_simple_batch_terminal_event_eligible(data: &HistoryEventData) -> bool {
     matches!(
         data,
-        HistoryEventData::ActivityScheduled(_)
-            | HistoryEventData::TimerStarted(_)
-            | HistoryEventData::SignalConsumed(_)
-            | HistoryEventData::SelectWinner(_)
-            | HistoryEventData::SideEffectMarker(_)
+        HistoryEventData::WorkflowCompleted { .. }
+            | HistoryEventData::WorkflowFailed { .. }
+            | HistoryEventData::WorkflowCancelled { .. }
     )
 }
 
@@ -6365,6 +6763,135 @@ enum InlineChildStartOutcome {
     Started(RunId),
     Failed(DurableFailure),
     Skipped,
+}
+
+struct ExistingChildWorkflowRow {
+    run_id: RunId,
+    parent_run_id: Option<String>,
+    parent_command_seq: Option<i64>,
+    parent_child_map_ordinal: Option<i64>,
+}
+
+fn child_start_outcome_event_and_reason(
+    message: &ChildStartOutboxMessage,
+    outcome: InlineChildStartOutcome,
+) -> Option<(HistoryEventData, WorkflowTaskReason)> {
+    match outcome {
+        InlineChildStartOutcome::Started(child_run_id) => Some((
+            HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
+                command_id: message.command_id.clone(),
+                workflow_id: message.workflow_id.clone(),
+                run_id: child_run_id,
+            }),
+            WorkflowTaskReason::ChildWorkflowStarted,
+        )),
+        InlineChildStartOutcome::Failed(failure) => Some((
+            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
+                command_id: message.command_id.clone(),
+                failure,
+            }),
+            WorkflowTaskReason::ChildWorkflowFailed,
+        )),
+        InlineChildStartOutcome::Skipped => None,
+    }
+}
+
+async fn existing_child_workflows_for_keys_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    keys: &BTreeSet<(String, String)>,
+) -> Result<BTreeMap<(String, String), ExistingChildWorkflowRow>> {
+    if keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let namespaces = keys
+        .iter()
+        .map(|(namespace, _)| namespace.clone())
+        .collect::<Vec<_>>();
+    let workflow_ids = keys
+        .iter()
+        .map(|(_, workflow_id)| workflow_id.clone())
+        .collect::<Vec<_>>();
+    let rows = tx
+        .query(
+            &format!(
+                "select workflows.namespace, workflows.workflow_id, workflows.run_id,
+                        workflows.parent_run_id, workflows.parent_command_seq,
+                        workflows.parent_child_map_ordinal
+                 from {schema}.workflow_instances workflows
+                 join unnest($1::text[], $2::text[]) as keys(namespace, workflow_id)
+                   on keys.namespace = workflows.namespace
+                  and keys.workflow_id = workflows.workflow_id
+                 for update"
+            ),
+            &[&namespaces, &workflow_ids],
+        )
+        .await
+        .map_err(postgres_error)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                (row.get::<_, String>(0), row.get::<_, String>(1)),
+                ExistingChildWorkflowRow {
+                    run_id: RunId::new(row.get::<_, String>(2)),
+                    parent_run_id: row.get(3),
+                    parent_command_seq: row.get(4),
+                    parent_child_map_ordinal: row.get(5),
+                },
+            )
+        })
+        .collect())
+}
+
+async fn existing_child_command_ids_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    parent_run_id_values: &[String],
+) -> Result<BTreeSet<CommandId>> {
+    if parent_run_id_values.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let child_event_types = vec![
+        event_type_to_str(&HistoryEventType::ChildWorkflowStarted),
+        event_type_to_str(&HistoryEventType::ChildWorkflowCompleted),
+        event_type_to_str(&HistoryEventType::ChildWorkflowFailed),
+        event_type_to_str(&HistoryEventType::ChildWorkflowCancelled),
+    ];
+    let rows = tx
+        .query(
+            &format!(
+                "select data
+                 from {schema}.history_events
+                 where run_id = any($1::text[])
+                   and event_type = any($2::text[])"
+            ),
+            &[&parent_run_id_values, &child_event_types],
+        )
+        .await
+        .map_err(postgres_error)?;
+    let mut command_ids = BTreeSet::new();
+    for row in rows {
+        let blob: Vec<u8> = row.get(0);
+        let event: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        match event {
+            HistoryEventData::ChildWorkflowStarted(started) => {
+                command_ids.insert(started.command_id);
+            }
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                command_ids.insert(completed.command_id);
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => {
+                command_ids.insert(failed.command_id);
+            }
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                command_ids.insert(cancelled.command_id);
+            }
+            _ => {}
+        }
+    }
+    Ok(command_ids)
 }
 
 async fn start_child_workflow_inline_tx(
@@ -8011,55 +8538,70 @@ fn decode_payload_blob_row(
     Ok(blob)
 }
 
-fn encode_encryption_metadata(
-    encryption: &Option<crate::EncryptionMetadata>,
-) -> Result<Option<Vec<u8>>> {
-    encryption
-        .as_ref()
-        .map(|metadata| {
-            rmp_serde::to_vec_named(metadata).map_err(|err| Error::PayloadEncode(err.to_string()))
-        })
-        .transpose()
+// Rewriters bind the shared `rewrite_history_event_payloads` visitor to Postgres's
+// in-transaction normalize and connection-scoped hydrate leaf operations.
+struct PostgresNormalizeRewriter<'a, 'tx> {
+    backend: &'a PostgresBackend,
+    tx: &'a Transaction<'tx>,
 }
 
-fn decode_encryption_metadata(blob: Option<Vec<u8>>) -> Result<Option<crate::EncryptionMetadata>> {
-    blob.map(|blob| {
-        rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))
-    })
-    .transpose()
-}
+impl crate::payload::PayloadRewrite for PostgresNormalizeRewriter<'_, '_> {
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_payload_for_storage_tx(self.tx, payload)
+            .await
+    }
 
-fn codec_to_str(codec: crate::CodecId) -> &'static str {
-    match codec {
-        crate::CodecId::MessagePack => "messagepack",
-        crate::CodecId::Json => "json",
-        crate::CodecId::Protobuf => "protobuf",
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_activity_map_input_manifest_for_storage_tx(self.tx, manifest)
+            .await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .normalize_activity_map_result_manifest_for_storage_tx(self.tx, manifest)
+            .await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        self.backend
+            .normalize_child_workflow_map_result_manifest_for_storage_tx(self.tx, manifest)
+            .await
     }
 }
 
-fn codec_from_str(value: &str) -> Result<crate::CodecId> {
-    match value {
-        "messagepack" => Ok(crate::CodecId::MessagePack),
-        "json" => Ok(crate::CodecId::Json),
-        "protobuf" => Ok(crate::CodecId::Protobuf),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload codec `{other}`"
-        ))),
-    }
+struct PostgresHydrateRewriter<'a> {
+    backend: &'a PostgresBackend,
 }
 
-fn compression_to_str(compression: crate::CompressionId) -> &'static str {
-    match compression {
-        crate::CompressionId::None => "none",
+impl crate::payload::PayloadRewrite for PostgresHydrateRewriter<'_> {
+    async fn payload(&mut self, payload: PayloadRef) -> Result<PayloadRef> {
+        self.backend.hydrate_payload_from_storage(payload).await
     }
-}
 
-fn compression_from_str(value: &str) -> Result<crate::CompressionId> {
-    match value {
-        "none" => Ok(crate::CompressionId::None),
-        other => Err(Error::PayloadDecode(format!(
-            "unknown payload compression `{other}`"
-        ))),
+    async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_activity_map_input_manifest_from_storage(manifest)
+            .await
+    }
+
+    async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_activity_map_result_manifest_from_storage(manifest)
+            .await
+    }
+
+    async fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> Result<PayloadRef> {
+        self.backend
+            .hydrate_child_workflow_map_result_manifest_from_storage(manifest)
+            .await
     }
 }
 

@@ -1,0 +1,126 @@
+{
+  "name": "postgres-mixed-smoke",
+  "kind": "smoke",
+  "profile": {
+    "backend": "postgres",
+    "mode": "mixed",
+    "workflows": 4,
+    "workers": 1,
+    "batch": 8,
+    "max_rounds": 200,
+    "activity_completion_batch": 1,
+    "postgres_pool_size": 10
+  },
+  "result": {
+    "completed_workflows": 4,
+    "mixed_actions": 32,
+    "counters": {
+      "workflow_starts": 4,
+      "signals": 4,
+      "child_starts": 4,
+      "child_completions": 4,
+      "timer_handlers": 4,
+      "boot_activities": 4,
+      "child_activities": 4,
+      "finish_activities": 4,
+      "workflow_tasks": 32,
+      "activity_tasks": 12,
+      "timers_fired": 4,
+      "activities_timed_out": 0,
+      "child_workflow_starts_dispatched": 0
+    },
+    "worker_stats": {
+      "workflowHistoryCacheHits": 0,
+      "workflowHistoryCacheMisses": 8,
+      "workflowHistoryCacheEvictions": 0,
+      "workflowExecutionCacheHits": 24,
+      "workflowExecutionCacheMisses": 8,
+      "workflowExecutionCacheEvictions": 0,
+      "historyStreamChunks": 0,
+      "historyStreamEvents": 0
+    },
+    "processing_mixed_actions_per_second": 182.633,
+    "processing_workflows_per_second": 22.829,
+    "workflow_task_commit_p95_ms": 2.626,
+    "operations": {
+      "claimActivityTask": {
+        "calls": 15,
+        "errors": 0
+      },
+      "claimWorkflowTask": {
+        "calls": 15,
+        "errors": 0
+      },
+      "commitWorkflowTask": {
+        "calls": 32,
+        "errors": 0
+      },
+      "completeActivity": {
+        "calls": 12,
+        "errors": 0
+      },
+      "fireDueTimers": {
+        "calls": 15,
+        "errors": 0
+      },
+      "signalWorkflow": {
+        "calls": 4,
+        "errors": 0
+      },
+      "startWorkflow": {
+        "calls": 4,
+        "errors": 0
+      },
+      "streamHistory": {
+        "calls": 4,
+        "errors": 0
+      }
+    }
+  },
+  "thresholds": {
+    "require_correct": true,
+    "require_profile_match": true,
+    "require_exact_completed_workflows": true,
+    "require_exact_mixed_actions": true,
+    "require_exact_counters": [
+      "workflow_starts",
+      "signals",
+      "child_starts",
+      "child_completions",
+      "timer_handlers",
+      "boot_activities",
+      "child_activities",
+      "finish_activities",
+      "workflow_tasks",
+      "activity_tasks",
+      "timers_fired",
+      "activities_timed_out",
+      "child_workflow_starts_dispatched"
+    ],
+    "require_exact_worker_stats": [
+      "workflowHistoryCacheHits",
+      "workflowHistoryCacheMisses",
+      "workflowHistoryCacheEvictions",
+      "workflowExecutionCacheHits",
+      "workflowExecutionCacheMisses",
+      "workflowExecutionCacheEvictions",
+      "historyStreamChunks",
+      "historyStreamEvents"
+    ],
+    "required_operation_names": [
+      "claimActivityTask",
+      "claimWorkflowTask",
+      "commitWorkflowTask",
+      "completeActivity",
+      "fireDueTimers",
+      "signalWorkflow",
+      "startWorkflow",
+      "streamHistory"
+    ],
+    "allow_operation_errors": false,
+    "min_processing_mixed_actions_per_second_ratio": 0.05,
+    "min_processing_workflows_per_second_ratio": 0.05,
+    "max_workflow_task_commit_p95_ratio": 25,
+    "max_workflow_task_commit_p95_ms": 150
+  }
+}

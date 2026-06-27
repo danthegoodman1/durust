@@ -10,6 +10,7 @@ mod options;
 mod payload;
 mod payload_backend;
 mod postgres;
+mod provider_util;
 mod registry;
 mod runtime;
 mod sim;

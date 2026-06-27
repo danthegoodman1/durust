@@ -3611,6 +3611,336 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
 }
 
 #[test]
+fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!(
+                "skipping Postgres batch terminal child fast path test; set DURUST_POSTGRES_URL"
+            );
+            return;
+        };
+        let schema = test_schema("batch_workflow_fast_terminal_child");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let (parent_run_id, command_id, child_run_id, parent_claim_opts, child_claim_opts) =
+            start_inline_child_for_tests(
+                &backend,
+                "postgres-batch-fast-terminal-child",
+                ParentClosePolicy::Cancel,
+            )
+            .await;
+        let standalone_run_id = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-terminal-standalone"),
+                workflow_type: child_claim_opts.registered_workflow_types[0].clone(),
+                task_queue: child_claim_opts.task_queue.clone(),
+                input: crate::encode_payload(&"standalone").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+
+        let first_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-terminal-first"),
+                child_claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("first terminal workflow task");
+        let second_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-terminal-second"),
+                child_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("second terminal workflow task");
+        let (child_claim, standalone_claim) = if first_claim.run_id == child_run_id {
+            (first_claim, second_claim)
+        } else {
+            (second_claim, first_claim)
+        };
+        assert_eq!(child_claim.run_id, child_run_id);
+        assert_eq!(standalone_claim.run_id, standalone_run_id);
+
+        let child_result = "postgres-batch-fast-terminal-child-result".to_owned();
+        let standalone_result = "postgres-batch-fast-terminal-standalone-result".to_owned();
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: vec![
+                    crate::WorkflowTaskCommitInput {
+                        claim: child_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: child_claim.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::WorkflowCompleted {
+                                    result: crate::encode_payload(&child_result).unwrap(),
+                                },
+                            )],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                    crate::WorkflowTaskCommitInput {
+                        claim: standalone_claim.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: standalone_claim.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::WorkflowCompleted {
+                                    result: crate::encode_payload(&standalone_result).unwrap(),
+                                },
+                            )],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(2)
+            }
+        );
+        assert_eq!(
+            results[1].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(2)
+            }
+        );
+
+        let parent = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-terminal-parent"),
+                parent_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("parent woken by batched child completion");
+        assert_eq!(parent.reason, WorkflowTaskReason::ChildWorkflowCompleted);
+        assert_eq!(parent.replay_target_event_id, EventId(4));
+        let parent_history = backend
+            .stream_history(crate::StreamHistoryRequest {
+                run_id: parent_run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(4),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap();
+        let HistoryEventData::ChildWorkflowCompleted(completed) = &parent_history.events[3].data
+        else {
+            panic!("expected child completion event");
+        };
+        assert_eq!(completed.command_id, command_id);
+        assert_eq!(
+            crate::decode_payload::<String>(&completed.result).unwrap(),
+            child_result
+        );
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
+fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!(
+                "skipping Postgres batch child start fast path test; set DURUST_POSTGRES_URL"
+            );
+            return;
+        };
+        let schema = test_schema("batch_workflow_fast_child_start");
+        let backend =
+            PostgresBackend::connect_with_config(PostgresBackendConfig::new(url).schema(schema))
+                .await
+                .unwrap();
+        let parent_type = WorkflowType::new("postgres.batch-fast-parent", 1);
+        let child_type = WorkflowType::new("postgres.batch-fast-child", 1);
+        let parent_queue = crate::TaskQueue::new("postgres-batch-fast-parent-workflows");
+        let child_queue = crate::TaskQueue::new("postgres-batch-fast-child-workflows");
+        let parent_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: parent_queue.clone(),
+            registered_workflow_types: vec![parent_type.clone()],
+            lease_duration: Duration::from_secs(30),
+        };
+        let child_claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: child_queue.clone(),
+            registered_workflow_types: vec![child_type.clone()],
+            lease_duration: Duration::from_secs(30),
+        };
+        let parent_a = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-parent-a"),
+                workflow_type: parent_type.clone(),
+                task_queue: parent_queue.clone(),
+                input: crate::encode_payload(&"parent-a").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let parent_b = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: crate::WorkflowId::new("wf/postgres-batch-fast-parent-b"),
+                workflow_type: parent_type,
+                task_queue: parent_queue,
+                input: crate::encode_payload(&"parent-b").unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let claim_a = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-child-start-a"),
+                parent_claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("parent a workflow task");
+        let claim_b = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-child-start-b"),
+                parent_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("parent b workflow task");
+        let request_for = |run_id: &RunId, label: &str| {
+            let workflow_id =
+                crate::WorkflowId::new(format!("wf/postgres-batch-fast-child-{label}"));
+            let input = crate::encode_payload(&format!("child-{label}")).unwrap();
+            crate::ChildWorkflowStartRequested {
+                command_id: CommandId {
+                    run_id: run_id.clone(),
+                    seq: CommandSeq(1),
+                },
+                workflow_type: child_type.clone(),
+                workflow_id: workflow_id.clone(),
+                task_queue: child_queue.clone(),
+                input: input.clone(),
+                parent_close_policy: ParentClosePolicy::Cancel,
+                fingerprint: crate::child_workflow_fingerprint(
+                    child_type.clone(),
+                    workflow_id,
+                    crate::payload_digest(&input),
+                    child_queue.clone(),
+                    ParentClosePolicy::Cancel,
+                ),
+            }
+        };
+        let request_a = request_for(&parent_a, "a");
+        let request_b = request_for(&parent_b, "b");
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: vec![
+                    crate::WorkflowTaskCommitInput {
+                        claim: claim_a.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: claim_a.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::ChildWorkflowStartRequested(request_a.clone()),
+                            )],
+                            start_child_workflows: vec![
+                                crate::ChildStartOutboxMessage::from_requested(&request_a),
+                            ],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                    crate::WorkflowTaskCommitInput {
+                        claim: claim_b.claim,
+                        commit: WorkflowTaskCommit {
+                            expected_tail_event_id: claim_b.replay_target_event_id,
+                            append_events: vec![crate::NewHistoryEvent::new(
+                                HistoryEventData::ChildWorkflowStartRequested(request_b.clone()),
+                            )],
+                            start_child_workflows: vec![
+                                crate::ChildStartOutboxMessage::from_requested(&request_b),
+                            ],
+                            ..WorkflowTaskCommit::default()
+                        },
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(3)
+            }
+        );
+        assert_eq!(
+            results[1].result.as_ref().unwrap(),
+            &CommitOutcome::Committed {
+                new_tail_event_id: EventId(3)
+            }
+        );
+
+        let mut child_run_ids = BTreeSet::new();
+        for run_id in [&parent_a, &parent_b] {
+            let history = backend
+                .stream_history(crate::StreamHistoryRequest {
+                    run_id: run_id.clone(),
+                    after_event_id: EventId::ZERO,
+                    up_to_event_id: EventId(3),
+                    max_events: 100,
+                    max_bytes: usize::MAX,
+                })
+                .await
+                .unwrap();
+            let child_run_id = history
+                .events
+                .iter()
+                .find_map(|event| match &event.data {
+                    HistoryEventData::ChildWorkflowStarted(started) => Some(started.run_id.clone()),
+                    _ => None,
+                })
+                .expect("child started event");
+            child_run_ids.insert(child_run_id);
+        }
+        let first_child = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-child-start-child-a"),
+                child_claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("first child task");
+        let second_child = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-batch-fast-child-start-child-b"),
+                child_claim_opts,
+            )
+            .await
+            .unwrap()
+            .expect("second child task");
+        assert_eq!(
+            [first_child.run_id, second_child.run_id]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            child_run_ids
+        );
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+#[test]
 fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {

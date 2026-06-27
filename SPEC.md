@@ -2390,14 +2390,6 @@ MessagePack:
 JSON:
   supported for debugging, export, CLI inspection, and explicit provider config.
   not the default durable payload codec.
-
-Protobuf:
-  opt-in codec for users who want explicit generated schemas.
-  not the default because it changes the user type contract.
-
-FlatBuffers:
-  not a default codec.
-  only add if a benchmarked zero-copy use case needs it.
 ```
 
 Default inline threshold:
@@ -2418,8 +2410,6 @@ pub struct PayloadStorageConfig {
 pub enum CodecId {
     MessagePack,
     Json,
-    #[cfg(feature = "protobuf-codec")]
-    Protobuf,
 }
 
 #[non_exhaustive]
@@ -2457,7 +2447,7 @@ pub struct S3BlobStoreConfig {
 }
 ```
 
-Providers must implement `MessagePack` and `Json`. `MessagePack` is the default for durable payloads. `Json` is required for debug/export flows and explicit provider configuration. `Protobuf` is reserved for an opt-in feature that uses explicit generated schemas.
+Providers must implement `MessagePack` and `Json`. `MessagePack` is the default for durable payloads. `Json` is required for debug/export flows and explicit provider configuration.
 
 Payload refs reserve compression metadata, but the current runtime writes
 `CompressionId::None` and does not expose a compression policy. Compression is a

@@ -9,13 +9,13 @@ use crate::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecId {
     MessagePack,
     Json,
-    Protobuf,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,13 +207,6 @@ impl PayloadRef {
         }
     }
 
-    pub fn blob_digest(&self) -> Option<&str> {
-        match self {
-            PayloadRef::Blob { digest, .. } => Some(digest.as_str()),
-            PayloadRef::Inline { .. } => None,
-        }
-    }
-
     pub fn inline_bytes(&self) -> Option<&[u8]> {
         match self {
             PayloadRef::Inline { bytes, .. } => Some(bytes),
@@ -243,9 +236,6 @@ where
     match codec {
         CodecId::MessagePack => PayloadRef::inline_messagepack(value),
         CodecId::Json => PayloadRef::inline_json(value),
-        CodecId::Protobuf => Err(Error::PayloadEncode(
-            "protobuf payload codec is not enabled".to_owned(),
-        )),
     }
 }
 
@@ -256,9 +246,6 @@ where
     match payload.codec() {
         CodecId::MessagePack => payload.decode_messagepack(),
         CodecId::Json => payload.decode_json(),
-        CodecId::Protobuf => Err(Error::PayloadDecode(
-            "protobuf payload codec is not enabled".to_owned(),
-        )),
     }
 }
 
@@ -521,6 +508,135 @@ where
     })
 }
 
+/// Async payload rewrite operations for one storage direction (normalize or
+/// hydrate) of a single provider. Implementations supply the storage-specific
+/// leaf behavior; the [`rewrite_history_event_payloads`] visitor owns the shared
+/// history-event traversal so the providers no longer hand-maintain identical
+/// match arms. Returned futures are `Send` so they compose into the providers'
+/// boxed backend futures.
+pub(crate) trait PayloadRewrite {
+    fn payload(&mut self, payload: PayloadRef) -> impl Future<Output = Result<PayloadRef>> + Send;
+
+    fn activity_map_input_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> impl Future<Output = Result<PayloadRef>> + Send;
+
+    fn activity_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> impl Future<Output = Result<PayloadRef>> + Send;
+
+    fn child_workflow_map_result_manifest(
+        &mut self,
+        manifest: PayloadRef,
+    ) -> impl Future<Output = Result<PayloadRef>> + Send;
+}
+
+async fn rewrite_failure<R: PayloadRewrite>(
+    rewriter: &mut R,
+    mut failure: DurableFailure,
+) -> Result<DurableFailure> {
+    if let Some(details) = failure.details.take() {
+        failure.details = Some(rewriter.payload(details).await?);
+    }
+    Ok(failure)
+}
+
+/// Walks a history event applying the rewriter to each payload-bearing field.
+/// Side-effect markers are validated in place (defense-in-depth against an
+/// oversized inline payload); events without payloads pass through unchanged.
+pub(crate) async fn rewrite_history_event_payloads<R: PayloadRewrite>(
+    rewriter: &mut R,
+    data: HistoryEventData,
+) -> Result<HistoryEventData> {
+    Ok(match data {
+        HistoryEventData::WorkflowStarted {
+            workflow_type,
+            input,
+        } => HistoryEventData::WorkflowStarted {
+            workflow_type,
+            input: rewriter.payload(input).await?,
+        },
+        HistoryEventData::WorkflowCompleted { result } => HistoryEventData::WorkflowCompleted {
+            result: rewriter.payload(result).await?,
+        },
+        HistoryEventData::WorkflowFailed { failure } => HistoryEventData::WorkflowFailed {
+            failure: rewrite_failure(rewriter, failure).await?,
+        },
+        HistoryEventData::WorkflowContinuedAsNew { input } => {
+            HistoryEventData::WorkflowContinuedAsNew {
+                input: rewriter.payload(input).await?,
+            }
+        }
+        HistoryEventData::ActivityScheduled(mut scheduled) => {
+            scheduled.input = rewriter.payload(scheduled.input).await?;
+            HistoryEventData::ActivityScheduled(scheduled)
+        }
+        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
+            scheduled.input_manifest = rewriter
+                .activity_map_input_manifest(scheduled.input_manifest)
+                .await?;
+            HistoryEventData::ActivityMapScheduled(scheduled)
+        }
+        HistoryEventData::ActivityMapCompleted(mut completed) => {
+            completed.result_manifest = rewriter
+                .activity_map_result_manifest(completed.result_manifest)
+                .await?;
+            HistoryEventData::ActivityMapCompleted(completed)
+        }
+        HistoryEventData::ActivityMapFailed(mut failed) => {
+            failed.failure = rewrite_failure(rewriter, failed.failure).await?;
+            HistoryEventData::ActivityMapFailed(failed)
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+            scheduled.input_manifest = rewriter
+                .activity_map_input_manifest(scheduled.input_manifest)
+                .await?;
+            HistoryEventData::ChildWorkflowMapScheduled(scheduled)
+        }
+        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+            completed.result_manifest = rewriter
+                .child_workflow_map_result_manifest(completed.result_manifest)
+                .await?;
+            HistoryEventData::ChildWorkflowMapCompleted(completed)
+        }
+        HistoryEventData::ChildWorkflowMapFailed(mut failed) => {
+            failed.failure = rewrite_failure(rewriter, failed.failure).await?;
+            HistoryEventData::ChildWorkflowMapFailed(failed)
+        }
+        HistoryEventData::ActivityCompleted(mut completed) => {
+            completed.result = rewriter.payload(completed.result).await?;
+            HistoryEventData::ActivityCompleted(completed)
+        }
+        HistoryEventData::ActivityFailed(mut failed) => {
+            failed.failure = rewrite_failure(rewriter, failed.failure).await?;
+            HistoryEventData::ActivityFailed(failed)
+        }
+        HistoryEventData::ChildWorkflowStartRequested(mut requested) => {
+            requested.input = rewriter.payload(requested.input).await?;
+            HistoryEventData::ChildWorkflowStartRequested(requested)
+        }
+        HistoryEventData::ChildWorkflowCompleted(mut completed) => {
+            completed.result = rewriter.payload(completed.result).await?;
+            HistoryEventData::ChildWorkflowCompleted(completed)
+        }
+        HistoryEventData::ChildWorkflowFailed(mut failed) => {
+            failed.failure = rewrite_failure(rewriter, failed.failure).await?;
+            HistoryEventData::ChildWorkflowFailed(failed)
+        }
+        HistoryEventData::SignalConsumed(mut signal) => {
+            signal.payload = rewriter.payload(signal.payload).await?;
+            HistoryEventData::SignalConsumed(signal)
+        }
+        HistoryEventData::SideEffectMarker(marker) => {
+            validate_side_effect_marker(&marker)?;
+            HistoryEventData::SideEffectMarker(marker)
+        }
+        other => other,
+    })
+}
+
 fn map_activity_scheduled_payloads<F>(
     mut scheduled: ActivityScheduled,
     map_payload: &mut F,
@@ -615,4 +731,129 @@ where
 {
     signal.payload = map_payload(signal.payload)?;
     Ok(signal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ActivityMapCompleted, ChildWorkflowMapCompleted, RunId, command_id};
+    use futures::executor::block_on;
+
+    // Returns a distinct tagged payload from each rewriter method so a test can
+    // assert which method a given history-event field was routed through.
+    struct SentinelRewriter;
+
+    impl PayloadRewrite for SentinelRewriter {
+        async fn payload(&mut self, _payload: PayloadRef) -> Result<PayloadRef> {
+            crate::encode_payload(&"payload".to_owned())
+        }
+        async fn activity_map_input_manifest(
+            &mut self,
+            _manifest: PayloadRef,
+        ) -> Result<PayloadRef> {
+            crate::encode_payload(&"input-manifest".to_owned())
+        }
+        async fn activity_map_result_manifest(
+            &mut self,
+            _manifest: PayloadRef,
+        ) -> Result<PayloadRef> {
+            crate::encode_payload(&"activity-result-manifest".to_owned())
+        }
+        async fn child_workflow_map_result_manifest(
+            &mut self,
+            _manifest: PayloadRef,
+        ) -> Result<PayloadRef> {
+            crate::encode_payload(&"child-result-manifest".to_owned())
+        }
+    }
+
+    fn tag(payload: &PayloadRef) -> String {
+        crate::decode_payload::<String>(payload).expect("sentinel payload should decode")
+    }
+
+    // Guards the shared visitor's per-field routing: plain payloads, failure
+    // details, and the two distinct result-manifest kinds must each reach the
+    // matching rewriter method (a transcription slip would land on the wrong one).
+    #[test]
+    fn rewrite_history_event_routes_each_field_to_its_rewriter() {
+        let cid = command_id(&RunId::new("run/test"), 1);
+        let orig = crate::encode_payload(&"orig".to_owned()).unwrap();
+
+        let event = HistoryEventData::WorkflowCompleted {
+            result: orig.clone(),
+        };
+        let HistoryEventData::WorkflowCompleted { result } =
+            block_on(rewrite_history_event_payloads(&mut SentinelRewriter, event)).unwrap()
+        else {
+            panic!("workflow completed variant changed");
+        };
+        assert_eq!(tag(&result), "payload");
+
+        let event = HistoryEventData::WorkflowFailed {
+            failure: DurableFailure::new("e", "m")
+                .with_details(&"orig".to_owned())
+                .unwrap(),
+        };
+        let HistoryEventData::WorkflowFailed { failure } =
+            block_on(rewrite_history_event_payloads(&mut SentinelRewriter, event)).unwrap()
+        else {
+            panic!("workflow failed variant changed");
+        };
+        assert_eq!(tag(&failure.details.unwrap()), "payload");
+
+        let event = HistoryEventData::ActivityMapCompleted(ActivityMapCompleted {
+            command_id: cid.clone(),
+            result_manifest: orig.clone(),
+            item_count: 0,
+            success_count: 0,
+            failure_count: 0,
+        });
+        let HistoryEventData::ActivityMapCompleted(completed) =
+            block_on(rewrite_history_event_payloads(&mut SentinelRewriter, event)).unwrap()
+        else {
+            panic!("activity map completed variant changed");
+        };
+        assert_eq!(tag(&completed.result_manifest), "activity-result-manifest");
+
+        let event = HistoryEventData::ChildWorkflowMapCompleted(ChildWorkflowMapCompleted {
+            command_id: cid,
+            result_manifest: orig,
+            item_count: 0,
+            success_count: 0,
+            failure_count: 0,
+            cancellation_count: 0,
+        });
+        let HistoryEventData::ChildWorkflowMapCompleted(completed) =
+            block_on(rewrite_history_event_payloads(&mut SentinelRewriter, event)).unwrap()
+        else {
+            panic!("child workflow map completed variant changed");
+        };
+        assert_eq!(tag(&completed.result_manifest), "child-result-manifest");
+    }
+
+    // The visitor validates side-effect markers on every storage rewrite (the
+    // behavior memory/SQLite always had and Postgres now shares).
+    #[test]
+    fn rewrite_history_event_validates_side_effect_markers() {
+        let cid = command_id(&RunId::new("run/test"), 1);
+        let valid = HistoryEventData::SideEffectMarker(SideEffectMarker {
+            command_id: cid.clone(),
+            key: "k".to_owned(),
+            value: crate::encode_payload(&"v".to_owned()).unwrap(),
+        });
+        assert!(block_on(rewrite_history_event_payloads(&mut SentinelRewriter, valid)).is_ok());
+
+        let invalid = HistoryEventData::SideEffectMarker(SideEffectMarker {
+            command_id: cid,
+            key: String::new(),
+            value: crate::encode_payload(&"v".to_owned()).unwrap(),
+        });
+        assert!(
+            block_on(rewrite_history_event_payloads(
+                &mut SentinelRewriter,
+                invalid
+            ))
+            .is_err()
+        );
+    }
 }

@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/benchmark" },
+    { "path": "./packages/core" },
+    { "path": "./packages/eslint-plugin" },
+    { "path": "./packages/examples" },
+    { "path": "./packages/payload" },
+    { "path": "./packages/postgres" },
+    { "path": "./packages/sqlite" },
+    { "path": "./packages/testing" }
+  ]
+}

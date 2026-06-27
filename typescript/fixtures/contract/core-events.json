@@ -1,0 +1,675 @@
+{
+  "historyEvents": [
+    {
+      "eventId": 1,
+      "eventType": "WorkflowStarted",
+      "data": {
+        "kind": "WorkflowStarted",
+        "workflowType": {
+          "name": "orders.checkout",
+          "version": 1
+        },
+        "input": {
+          "kind": "Inline",
+          "codec": "Json",
+          "schemaFingerprint": "sha256:checkout-input",
+          "compression": "None",
+          "encryption": null,
+          "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        }
+      }
+    },
+    {
+      "eventId": 2,
+      "eventType": "WorkflowCompleted",
+      "data": {
+        "kind": "WorkflowCompleted",
+        "result": {
+          "kind": "Inline",
+          "codec": "Json",
+          "schemaFingerprint": "sha256:checkout-input",
+          "compression": "None",
+          "encryption": null,
+          "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        }
+      }
+    },
+    {
+      "eventId": 3,
+      "eventType": "WorkflowFailed",
+      "data": {
+        "kind": "WorkflowFailed",
+        "failure": {
+          "errorType": "ApplicationError",
+          "message": "checkout failed",
+          "nonRetryable": false
+        }
+      }
+    },
+    {
+      "eventId": 4,
+      "eventType": "WorkflowCancelled",
+      "data": {
+        "kind": "WorkflowCancelled",
+        "reason": "user requested cancellation"
+      }
+    },
+    {
+      "eventId": 5,
+      "eventType": "WorkflowContinuedAsNew",
+      "data": {
+        "kind": "WorkflowContinuedAsNew",
+        "input": {
+          "kind": "Inline",
+          "codec": "Json",
+          "schemaFingerprint": "sha256:checkout-input",
+          "compression": "None",
+          "encryption": null,
+          "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        }
+      }
+    },
+    {
+      "eventId": 6,
+      "eventType": "WorkflowTaskStarted",
+      "data": {
+        "kind": "WorkflowTaskStarted"
+      }
+    },
+    {
+      "eventId": 7,
+      "eventType": "ActivityScheduled",
+      "data": {
+        "kind": "ActivityScheduled",
+        "scheduled": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 1
+          },
+          "activityName": "payments.price-quote",
+          "taskQueue": "payments",
+          "retryPolicy": {
+            "initialIntervalMs": 1000,
+            "maxIntervalMs": 60000,
+            "maxAttempts": 5,
+            "backoffCoefficient": 2,
+            "nonRetryableErrorTypes": []
+          },
+          "startToCloseTimeoutMs": null,
+          "heartbeatTimeoutMs": null,
+          "input": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:quote-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 115, 107, 117, 34, 58, 34, 115, 107, 117, 45, 49, 34, 125]
+          },
+          "fingerprint": {
+            "kind": "Activity",
+            "name": "payments.price-quote",
+            "inputDigest": "sha256:quote-input-digest",
+            "optionsDigest": "sha256:activity-options"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 8,
+      "eventType": "ActivityMapScheduled",
+      "data": {
+        "kind": "ActivityMapScheduled",
+        "scheduled": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 2
+          },
+          "activityName": "payments.price-quote",
+          "taskQueue": "payments",
+          "retryPolicy": {
+            "initialIntervalMs": 1000,
+            "maxIntervalMs": 60000,
+            "maxAttempts": 5,
+            "backoffCoefficient": 2,
+            "nonRetryableErrorTypes": []
+          },
+          "startToCloseTimeoutMs": null,
+          "heartbeatTimeoutMs": null,
+          "inputManifest": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "resultManifestName": "partials",
+          "maxInFlight": 8,
+          "fingerprint": {
+            "kind": "ActivityMap",
+            "name": "payments.price-quote",
+            "inputDigest": "sha256:manifest",
+            "optionsDigest": "sha256:activity-map-options:result=partials:max=8"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 9,
+      "eventType": "ActivityMapCompleted",
+      "data": {
+        "kind": "ActivityMapCompleted",
+        "completed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 2
+          },
+          "resultManifest": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "itemCount": 2,
+          "successCount": 2,
+          "failureCount": 0
+        }
+      }
+    },
+    {
+      "eventId": 10,
+      "eventType": "ActivityMapFailed",
+      "data": {
+        "kind": "ActivityMapFailed",
+        "failed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 2
+          },
+          "failure": {
+            "errorType": "MapItemFailed",
+            "message": "map item failed",
+            "nonRetryable": true
+          }
+        }
+      }
+    },
+    {
+      "eventId": 11,
+      "eventType": "ActivityCompleted",
+      "data": {
+        "kind": "ActivityCompleted",
+        "completed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 1
+          },
+          "result": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          }
+        }
+      }
+    },
+    {
+      "eventId": 12,
+      "eventType": "ActivityFailed",
+      "data": {
+        "kind": "ActivityFailed",
+        "failed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 1
+          },
+          "failure": {
+            "errorType": "ActivityError",
+            "message": "activity failed",
+            "nonRetryable": false
+          }
+        }
+      }
+    },
+    {
+      "eventId": 13,
+      "eventType": "ActivityTimedOut",
+      "data": {
+        "kind": "ActivityTimedOut",
+        "timedOut": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 1
+          },
+          "message": "activity timed out"
+        }
+      }
+    },
+    {
+      "eventId": 14,
+      "eventType": "ChildWorkflowStartRequested",
+      "data": {
+        "kind": "ChildWorkflowStartRequested",
+        "requested": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 3
+          },
+          "workflowType": {
+            "name": "orders.ship",
+            "version": 1
+          },
+          "workflowId": "ship/o-1",
+          "taskQueue": "workflows",
+          "input": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "parentClosePolicy": "Cancel",
+          "fingerprint": {
+            "kind": "ChildWorkflow",
+            "name": "orders.ship@1",
+            "inputDigest": "sha256:ship-input",
+            "optionsDigest": "workflow_id=ship/o-1:task_queue=workflows:parent_close_policy=Cancel"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 15,
+      "eventType": "ChildWorkflowStarted",
+      "data": {
+        "kind": "ChildWorkflowStarted",
+        "started": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 3
+          },
+          "workflowId": "ship/o-1",
+          "runId": "run-child-1"
+        }
+      }
+    },
+    {
+      "eventId": 16,
+      "eventType": "ChildWorkflowCompleted",
+      "data": {
+        "kind": "ChildWorkflowCompleted",
+        "completed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 3
+          },
+          "result": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          }
+        }
+      }
+    },
+    {
+      "eventId": 17,
+      "eventType": "ChildWorkflowFailed",
+      "data": {
+        "kind": "ChildWorkflowFailed",
+        "failed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 3
+          },
+          "failure": {
+            "errorType": "ChildWorkflowError",
+            "message": "child failed",
+            "nonRetryable": false
+          }
+        }
+      }
+    },
+    {
+      "eventId": 18,
+      "eventType": "ChildWorkflowCancelled",
+      "data": {
+        "kind": "ChildWorkflowCancelled",
+        "cancelled": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 3
+          },
+          "reason": "parent cancelled"
+        }
+      }
+    },
+    {
+      "eventId": 19,
+      "eventType": "ChildWorkflowMapScheduled",
+      "data": {
+        "kind": "ChildWorkflowMapScheduled",
+        "scheduled": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 4
+          },
+          "workflowType": {
+            "name": "orders.ship",
+            "version": 1
+          },
+          "taskQueue": "workflows",
+          "inputManifest": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "resultManifestName": "ship-results",
+          "workflowIdPrefix": "ship-map",
+          "maxInFlight": 4,
+          "parentClosePolicy": "Abandon",
+          "failureMode": "CollectAll",
+          "fingerprint": {
+            "kind": "ChildWorkflowMap",
+            "name": "orders.ship@1",
+            "inputDigest": "sha256:ship-manifest",
+            "optionsDigest": "result=ship-results:prefix=ship-map:max=4:task_queue=workflows:parent_close_policy=Abandon:failure_mode=CollectAll"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 20,
+      "eventType": "ChildWorkflowMapCompleted",
+      "data": {
+        "kind": "ChildWorkflowMapCompleted",
+        "completed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 4
+          },
+          "resultManifest": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "itemCount": 2,
+          "successCount": 1,
+          "failureCount": 1,
+          "cancellationCount": 0
+        }
+      }
+    },
+    {
+      "eventId": 21,
+      "eventType": "ChildWorkflowMapFailed",
+      "data": {
+        "kind": "ChildWorkflowMapFailed",
+        "failed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 4
+          },
+          "failure": {
+            "errorType": "ChildWorkflowMapError",
+            "message": "child workflow map failed",
+            "nonRetryable": true
+          }
+        }
+      }
+    },
+    {
+      "eventId": 22,
+      "eventType": "TimerStarted",
+      "data": {
+        "kind": "TimerStarted",
+        "started": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 5
+          },
+          "fireAt": 1781821484000,
+          "fingerprint": {
+            "kind": "Timer",
+            "name": "sleep_until",
+            "inputDigest": null,
+            "optionsDigest": "timestamp-ms:1781821484000"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 23,
+      "eventType": "TimerFired",
+      "data": {
+        "kind": "TimerFired",
+        "fired": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 5
+          },
+          "firedAt": 1781821484000
+        }
+      }
+    },
+    {
+      "eventId": 24,
+      "eventType": "SignalConsumed",
+      "data": {
+        "kind": "SignalConsumed",
+        "consumed": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 6
+          },
+          "signalId": "signal-1",
+          "signalName": "approved",
+          "payload": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          },
+          "fingerprint": {
+            "kind": "Signal",
+            "name": "approved",
+            "inputDigest": null,
+            "optionsDigest": "sha256:default"
+          }
+        }
+      }
+    },
+    {
+      "eventId": 25,
+      "eventType": "SelectWinner",
+      "data": {
+        "kind": "SelectWinner",
+        "winner": {
+          "selectCommandId": {
+            "runId": "run-1",
+            "seq": 7
+          },
+          "branchOrdinal": 1,
+          "winningEventId": 24,
+          "branchesDigest": "sha256:select-branches"
+        }
+      }
+    },
+    {
+      "eventId": 26,
+      "eventType": "VersionMarker",
+      "data": {
+        "kind": "VersionMarker",
+        "marker": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 8
+          },
+          "changeId": "checkout-v2",
+          "version": 2
+        }
+      }
+    },
+    {
+      "eventId": 27,
+      "eventType": "DeprecatedPatchMarker",
+      "data": {
+        "kind": "DeprecatedPatchMarker",
+        "marker": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 9
+          },
+          "patchId": "checkout-v2"
+        }
+      }
+    },
+    {
+      "eventId": 28,
+      "eventType": "SideEffectMarker",
+      "data": {
+        "kind": "SideEffectMarker",
+        "marker": {
+          "commandId": {
+            "runId": "run-1",
+            "seq": 10
+          },
+          "key": "stable-id",
+          "value": {
+            "kind": "Inline",
+            "codec": "Json",
+            "schemaFingerprint": "sha256:checkout-input",
+            "compression": "None",
+            "encryption": null,
+            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+          }
+        }
+      }
+    }
+  ],
+  "fingerprints": {
+    "activity": {
+      "kind": "Activity",
+      "name": "payments.price-quote",
+      "inputDigest": "sha256:quote-input-digest",
+      "optionsDigest": "sha256:activity-options"
+    },
+    "activityMap": {
+      "kind": "ActivityMap",
+      "name": "payments.price-quote",
+      "inputDigest": "sha256:manifest",
+      "optionsDigest": "sha256:activity-map-options:result=partials:max=8"
+    },
+    "childWorkflow": {
+      "kind": "ChildWorkflow",
+      "name": "orders.ship@1",
+      "inputDigest": "sha256:ship-input",
+      "optionsDigest": "workflow_id=ship/o-1:task_queue=workflows:parent_close_policy=Cancel"
+    },
+    "childWorkflowMap": {
+      "kind": "ChildWorkflowMap",
+      "name": "orders.ship@1",
+      "inputDigest": "sha256:ship-manifest",
+      "optionsDigest": "result=ship-results:prefix=ship-map:max=4:task_queue=workflows:parent_close_policy=Abandon:failure_mode=CollectAll"
+    },
+    "timer": {
+      "kind": "Timer",
+      "name": "sleep_until",
+      "inputDigest": null,
+      "optionsDigest": "timestamp-ms:1781821484000"
+    },
+    "signal": {
+      "kind": "Signal",
+      "name": "approved",
+      "inputDigest": null,
+      "optionsDigest": "sha256:default"
+    },
+    "versionMarker": {
+      "kind": "VersionMarker",
+      "name": "checkout-v2",
+      "inputDigest": null,
+      "optionsDigest": "version:2"
+    }
+  },
+  "payloadRefs": {
+    "inlineJson": {
+      "kind": "Inline",
+      "codec": "Json",
+      "schemaFingerprint": "sha256:checkout-input",
+      "compression": "None",
+      "encryption": null,
+      "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+    },
+    "blobJson": {
+      "kind": "Blob",
+      "codec": "Json",
+      "schemaFingerprint": "sha256:checkout-input",
+      "compression": "None",
+      "encryption": null,
+      "digest": "sha256:80ea8a979b50c50b35a32bbb085f8524a79f780c52d4d5cbe560831a413769cb",
+      "size": 17,
+      "uri": "s3://durust-fixtures/payloads/checkout-input.bin"
+    },
+    "inlineMessagePack": {
+      "kind": "Inline",
+      "codec": "MessagePack",
+      "schemaFingerprint": "sha256:checkout-input",
+      "compression": "None",
+      "encryption": null,
+      "bytes": [129, 167, 111, 114, 100, 101, 114, 73, 100, 163, 111, 45, 49]
+    },
+    "blobMessagePack": {
+      "kind": "Blob",
+      "codec": "MessagePack",
+      "schemaFingerprint": "sha256:checkout-input",
+      "compression": "None",
+      "encryption": null,
+      "digest": "sha256:bab762bc7d1a3e80f19fdeb23818f044cdba95d238a829907b94661e4ac12234",
+      "size": 13,
+      "uri": "s3://durust-fixtures/payloads/checkout-input.msgpack"
+    }
+  },
+  "manifestPayloads": {
+    "activityMapInputPage": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:activity-map-input-page","compression":"None","encryption":null,"bytes":[123,34,105,116,101,109,115,34,58,91,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,99,104,101,99,107,111,117,116,45,105,110,112,117,116,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,49,49,44,49,49,52,44,49,48,48,44,49,48,49,44,49,49,52,44,55,51,44,49,48,48,44,51,52,44,53,56,44,51,52,44,49,49,49,44,52,53,44,52,57,44,51,52,44,49,50,53,93,125,93,125]},
+    "activityMapInputManifest": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:activity-map-input-manifest","compression":"None","encryption":null,"bytes":[123,34,105,116,101,109,67,111,117,110,116,34,58,49,44,34,112,97,103,101,76,101,110,103,116,104,115,34,58,91,49,93,44,34,112,97,103,101,115,34,58,91,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,97,99,116,105,118,105,116,121,45,109,97,112,45,105,110,112,117,116,45,112,97,103,101,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,48,53,44,49,49,54,44,49,48,49,44,49,48,57,44,49,49,53,44,51,52,44,53,56,44,57,49,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,55,51,44,49,49,48,44,49,48,56,44,49,48,53,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,48,44,49,48,49,44,57,57,44,51,52,44,53,56,44,51,52,44,55,52,44,49,49,53,44,49,49,49,44,49,49,48,44,51,52,44,52,52,44,51,52,44,49,49,53,44,57,57,44,49,48,52,44,49,48,49,44,49,48,57,44,57,55,44,55,48,44,49,48,53,44,49,49,48,44,49,48,51,44,49,48,49,44,49,49,52,44,49,49,50,44,49,49,52,44,49,48,53,44,49,49,48,44,49,49,54,44,51,52,44,53,56,44,51,52,44,49,49,53,44,49,48,52,44,57,55,44,53,48,44,53,51,44,53,52,44,53,56,44,57,57,44,49,48,52,44,49,48,49,44,57,57,44,49,48,55,44,49,49,49,44,49,49,55,44,49,49,54,44,52,53,44,49,48,53,44,49,49,48,44,49,49,50,44,49,49,55,44,49,49,54,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,57,44,49,49,50,44,49,49,52,44,49,48,49,44,49,49,53,44,49,49,53,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,51,52,44,55,56,44,49,49,49,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,49,48,49,44,49,49,48,44,57,57,44,49,49,52,44,49,50,49,44,49,49,50,44,49,49,54,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,49,49,48,44,49,49,55,44,49,48,56,44,49,48,56,44,52,52,44,51,52,44,57,56,44,49,50,49,44,49,49,54,44,49,48,49,44,49,49,53,44,51,52,44,53,56,44,57,49,44,52,57,44,53,48,44,53,49,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,52,57,44,52,56,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,53,53,44,53,49,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,53,49,44,53,50,44,52,52,44,53,51,44,53,54,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,53,50,44,53,51,44,52,52,44,53,50,44,53,55,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,53,48,44,53,51,44,57,51,44,49,50,53,44,57,51,44,49,50,53,93,125,93,125]},
+    "activityMapResultPage": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:activity-map-result-page","compression":"None","encryption":null,"bytes":[123,34,114,101,115,117,108,116,115,34,58,91,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,99,104,101,99,107,111,117,116,45,105,110,112,117,116,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,49,49,44,49,49,52,44,49,48,48,44,49,48,49,44,49,49,52,44,55,51,44,49,48,48,44,51,52,44,53,56,44,51,52,44,49,49,49,44,52,53,44,52,57,44,51,52,44,49,50,53,93,125,93,125]},
+    "activityMapResultManifest": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:activity-map-result-manifest","compression":"None","encryption":null,"bytes":[123,34,110,97,109,101,34,58,34,112,97,114,116,105,97,108,115,34,44,34,105,116,101,109,67,111,117,110,116,34,58,49,44,34,112,97,103,101,76,101,110,103,116,104,115,34,58,91,49,93,44,34,112,97,103,101,115,34,58,91,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,97,99,116,105,118,105,116,121,45,109,97,112,45,114,101,115,117,108,116,45,112,97,103,101,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,49,52,44,49,48,49,44,49,49,53,44,49,49,55,44,49,48,56,44,49,49,54,44,49,49,53,44,51,52,44,53,56,44,57,49,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,55,51,44,49,49,48,44,49,48,56,44,49,48,53,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,48,44,49,48,49,44,57,57,44,51,52,44,53,56,44,51,52,44,55,52,44,49,49,53,44,49,49,49,44,49,49,48,44,51,52,44,52,52,44,51,52,44,49,49,53,44,57,57,44,49,48,52,44,49,48,49,44,49,48,57,44,57,55,44,55,48,44,49,48,53,44,49,49,48,44,49,48,51,44,49,48,49,44,49,49,52,44,49,49,50,44,49,49,52,44,49,48,53,44,49,49,48,44,49,49,54,44,51,52,44,53,56,44,51,52,44,49,49,53,44,49,48,52,44,57,55,44,53,48,44,53,51,44,53,52,44,53,56,44,57,57,44,49,48,52,44,49,48,49,44,57,57,44,49,48,55,44,49,49,49,44,49,49,55,44,49,49,54,44,52,53,44,49,48,53,44,49,49,48,44,49,49,50,44,49,49,55,44,49,49,54,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,57,44,49,49,50,44,49,49,52,44,49,48,49,44,49,49,53,44,49,49,53,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,51,52,44,55,56,44,49,49,49,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,49,48,49,44,49,49,48,44,57,57,44,49,49,52,44,49,50,49,44,49,49,50,44,49,49,54,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,49,49,48,44,49,49,55,44,49,48,56,44,49,48,56,44,52,52,44,51,52,44,57,56,44,49,50,49,44,49,49,54,44,49,48,49,44,49,49,53,44,51,52,44,53,56,44,57,49,44,52,57,44,53,48,44,53,49,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,52,57,44,52,56,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,53,53,44,53,49,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,53,49,44,53,50,44,52,52,44,53,51,44,53,54,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,53,50,44,53,51,44,52,52,44,53,50,44,53,55,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,53,48,44,53,51,44,57,51,44,49,50,53,44,57,51,44,49,50,53,93,125,93,125]},
+    "childWorkflowMapResultPage": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:child-workflow-map-result-page","compression":"None","encryption":null,"bytes":[123,34,111,117,116,99,111,109,101,115,34,58,91,123,34,107,105,110,100,34,58,34,83,117,99,99,101,101,100,101,100,34,44,34,114,101,115,117,108,116,34,58,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,99,104,101,99,107,111,117,116,45,105,110,112,117,116,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,49,49,44,49,49,52,44,49,48,48,44,49,48,49,44,49,49,52,44,55,51,44,49,48,48,44,51,52,44,53,56,44,51,52,44,49,49,49,44,52,53,44,52,57,44,51,52,44,49,50,53,93,125,125,44,123,34,107,105,110,100,34,58,34,70,97,105,108,101,100,34,44,34,102,97,105,108,117,114,101,34,58,123,34,101,114,114,111,114,84,121,112,101,34,58,34,65,112,112,108,105,99,97,116,105,111,110,69,114,114,111,114,34,44,34,109,101,115,115,97,103,101,34,58,34,99,104,101,99,107,111,117,116,32,102,97,105,108,101,100,34,44,34,110,111,110,82,101,116,114,121,97,98,108,101,34,58,102,97,108,115,101,125,125,44,123,34,107,105,110,100,34,58,34,67,97,110,99,101,108,108,101,100,34,44,34,114,101,97,115,111,110,34,58,34,112,97,114,101,110,116,32,99,97,110,99,101,108,108,101,100,34,125,93,125]},
+    "childWorkflowMapResultManifest": {"kind":"Inline","codec":"Json","schemaFingerprint":"sha256:child-workflow-map-result-manifest","compression":"None","encryption":null,"bytes":[123,34,110,97,109,101,34,58,34,115,104,105,112,45,114,101,115,117,108,116,115,34,44,34,105,116,101,109,67,111,117,110,116,34,58,51,44,34,112,97,103,101,76,101,110,103,116,104,115,34,58,91,51,93,44,34,112,97,103,101,115,34,58,91,123,34,107,105,110,100,34,58,34,73,110,108,105,110,101,34,44,34,99,111,100,101,99,34,58,34,74,115,111,110,34,44,34,115,99,104,101,109,97,70,105,110,103,101,114,112,114,105,110,116,34,58,34,115,104,97,50,53,54,58,99,104,105,108,100,45,119,111,114,107,102,108,111,119,45,109,97,112,45,114,101,115,117,108,116,45,112,97,103,101,34,44,34,99,111,109,112,114,101,115,115,105,111,110,34,58,34,78,111,110,101,34,44,34,101,110,99,114,121,112,116,105,111,110,34,58,110,117,108,108,44,34,98,121,116,101,115,34,58,91,49,50,51,44,51,52,44,49,49,49,44,49,49,55,44,49,49,54,44,57,57,44,49,49,49,44,49,48,57,44,49,48,49,44,49,49,53,44,51,52,44,53,56,44,57,49,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,56,51,44,49,49,55,44,57,57,44,57,57,44,49,48,49,44,49,48,49,44,49,48,48,44,49,48,49,44,49,48,48,44,51,52,44,52,52,44,51,52,44,49,49,52,44,49,48,49,44,49,49,53,44,49,49,55,44,49,48,56,44,49,49,54,44,51,52,44,53,56,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,55,51,44,49,49,48,44,49,48,56,44,49,48,53,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,48,44,49,48,49,44,57,57,44,51,52,44,53,56,44,51,52,44,55,52,44,49,49,53,44,49,49,49,44,49,49,48,44,51,52,44,52,52,44,51,52,44,49,49,53,44,57,57,44,49,48,52,44,49,48,49,44,49,48,57,44,57,55,44,55,48,44,49,48,53,44,49,49,48,44,49,48,51,44,49,48,49,44,49,49,52,44,49,49,50,44,49,49,52,44,49,48,53,44,49,49,48,44,49,49,54,44,51,52,44,53,56,44,51,52,44,49,49,53,44,49,48,52,44,57,55,44,53,48,44,53,51,44,53,52,44,53,56,44,57,57,44,49,48,52,44,49,48,49,44,57,57,44,49,48,55,44,49,49,49,44,49,49,55,44,49,49,54,44,52,53,44,49,48,53,44,49,49,48,44,49,49,50,44,49,49,55,44,49,49,54,44,51,52,44,52,52,44,51,52,44,57,57,44,49,49,49,44,49,48,57,44,49,49,50,44,49,49,52,44,49,48,49,44,49,49,53,44,49,49,53,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,51,52,44,55,56,44,49,49,49,44,49,49,48,44,49,48,49,44,51,52,44,52,52,44,51,52,44,49,48,49,44,49,49,48,44,57,57,44,49,49,52,44,49,50,49,44,49,49,50,44,49,49,54,44,49,48,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,49,49,48,44,49,49,55,44,49,48,56,44,49,48,56,44,52,52,44,51,52,44,57,56,44,49,50,49,44,49,49,54,44,49,48,49,44,49,49,53,44,51,52,44,53,56,44,57,49,44,52,57,44,53,48,44,53,49,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,52,57,44,52,56,44,52,57,44,52,52,44,52,57,44,52,57,44,53,50,44,52,52,44,53,53,44,53,49,44,52,52,44,52,57,44,52,56,44,52,56,44,52,52,44,53,49,44,53,50,44,52,52,44,53,51,44,53,54,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,52,57,44,52,57,44,52,52,44,53,50,44,53,51,44,52,52,44,53,50,44,53,55,44,52,52,44,53,49,44,53,50,44,52,52,44,52,57,44,53,48,44,53,51,44,57,51,44,49,50,53,44,49,50,53,44,52,52,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,55,48,44,57,55,44,49,48,53,44,49,48,56,44,49,48,49,44,49,48,48,44,51,52,44,52,52,44,51,52,44,49,48,50,44,57,55,44,49,48,53,44,49,48,56,44,49,49,55,44,49,49,52,44,49,48,49,44,51,52,44,53,56,44,49,50,51,44,51,52,44,49,48,49,44,49,49,52,44,49,49,52,44,49,49,49,44,49,49,52,44,56,52,44,49,50,49,44,49,49,50,44,49,48,49,44,51,52,44,53,56,44,51,52,44,54,53,44,49,49,50,44,49,49,50,44,49,48,56,44,49,48,53,44,57,57,44,57,55,44,49,49,54,44,49,48,53,44,49,49,49,44,49,49,48,44,54,57,44,49,49,52,44,49,49,52,44,49,49,49,44,49,49,52,44,51,52,44,52,52,44,51,52,44,49,48,57,44,49,48,49,44,49,49,53,44,49,49,53,44,57,55,44,49,48,51,44,49,48,49,44,51,52,44,53,56,44,51,52,44,57,57,44,49,48,52,44,49,48,49,44,57,57,44,49,48,55,44,49,49,49,44,49,49,55,44,49,49,54,44,51,50,44,49,48,50,44,57,55,44,49,48,53,44,49,48,56,44,49,48,49,44,49,48,48,44,51,52,44,52,52,44,51,52,44,49,49,48,44,49,49,49,44,49,49,48,44,56,50,44,49,48,49,44,49,49,54,44,49,49,52,44,49,50,49,44,57,55,44,57,56,44,49,48,56,44,49,48,49,44,51,52,44,53,56,44,49,48,50,44,57,55,44,49,48,56,44,49,49,53,44,49,48,49,44,49,50,53,44,49,50,53,44,52,52,44,49,50,51,44,51,52,44,49,48,55,44,49,48,53,44,49,49,48,44,49,48,48,44,51,52,44,53,56,44,51,52,44,54,55,44,57,55,44,49,49,48,44,57,57,44,49,48,49,44,49,48,56,44,49,48,56,44,49,48,49,44,49,48,48,44,51,52,44,52,52,44,51,52,44,49,49,52,44,49,48,49,44,57,55,44,49,49,53,44,49,49,49,44,49,49,48,44,51,52,44,53,56,44,51,52,44,49,49,50,44,57,55,44,49,49,52,44,49,48,49,44,49,49,48,44,49,49,54,44,51,50,44,57,57,44,57,55,44,49,49,48,44,57,57,44,49,48,49,44,49,48,56,44,49,48,56,44,49,48,49,44,49,48,48,44,51,52,44,49,50,53,44,57,51,44,49,50,53,93,125,93,125]}
+  },
+  "durableFailures": {
+    "retryable": {
+      "errorType": "ApplicationError",
+      "message": "checkout failed",
+      "nonRetryable": false
+    },
+    "nonRetryableWithDetails": {
+      "errorType": "ValidationError",
+      "message": "invalid checkout request",
+      "nonRetryable": true,
+      "details": {
+        "kind": "Inline",
+        "codec": "Json",
+        "schemaFingerprint": "sha256:checkout-input",
+        "compression": "None",
+        "encryption": null,
+        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+      }
+    }
+  }
+}

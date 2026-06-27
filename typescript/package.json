@@ -1,0 +1,38 @@
+{
+  "name": "durust-typescript-workspace",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@11.12.1",
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "test": "vitest run --config vitest.config.ts",
+    "test:soak": "DURUST_LONG_SOAK=1 vitest run --config vitest.config.ts packages/core/test/simulation.test.ts",
+    "test:benchmark-thresholds": "vitest run --config vitest.config.ts packages/benchmark/test/thresholds.test.ts",
+    "lint:determinism": "npm run build --workspace @durust/eslint-plugin && node scripts/determinism-lint.mjs",
+    "package:dry-run": "node scripts/package-dry-run.mjs",
+    "check:fixtures": "node scripts/check-fixtures.mjs",
+    "check:postgres": "node scripts/check-postgres.mjs",
+    "check:release": "node scripts/check-release.mjs",
+    "test:types": "tsc -p tsconfig.type-tests.json --noEmit",
+    "check": "npm run build && npm run test && npm run test:types && npm run lint && npm run package:dry-run",
+    "lint": "npm run lint:determinism"
+  },
+  "durust": {
+    "workflowSources": [
+      "test-d/determinism/valid/**/*.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "tinyglobby": "^0.2.17",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}

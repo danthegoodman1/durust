@@ -401,6 +401,13 @@ impl RuntimeContext {
         self.map_completions
             .extend(collect_map_completions(&events));
         self.map_failures.extend(collect_map_failures(&events));
+        // Child-workflow-map terminal events must be indexed on appended chunks too,
+        // mirroring `new()`, so a completion/failure arriving in a later recovery
+        // chunk is still found by the indexed lookup path during multi-chunk replay.
+        self.child_map_completions
+            .extend(collect_child_map_completions(&events));
+        self.child_map_failures
+            .extend(collect_child_map_failures(&events));
         self.child_starts.extend(collect_child_starts(&events));
         self.child_completions
             .extend(collect_child_completions(&events));
@@ -2098,16 +2105,6 @@ pub fn activity_map_manifest<T>(items: impl IntoIterator<Item = T>) -> Result<Pa
 where
     T: serde::Serialize,
 {
-    activity_map_manifest_with_page_size(items, crate::ACTIVITY_MAP_MANIFEST_PAGE_SIZE)
-}
-
-pub fn activity_map_manifest_with_page_size<T>(
-    items: impl IntoIterator<Item = T>,
-    page_size: usize,
-) -> Result<PayloadRef>
-where
-    T: serde::Serialize,
-{
     with_context(|runtime| {
         let items = items
             .into_iter()
@@ -2115,7 +2112,7 @@ where
             .collect::<Result<Vec<_>>>()?;
         crate::encode_activity_map_input_manifest_with_codec(
             items,
-            page_size,
+            crate::ACTIVITY_MAP_MANIFEST_PAGE_SIZE,
             runtime.payload_codec,
         )
     })
@@ -2383,16 +2380,6 @@ pub fn child_workflow_map_manifest<T>(items: impl IntoIterator<Item = T>) -> Res
 where
     T: serde::Serialize,
 {
-    child_workflow_map_manifest_with_page_size(items, crate::CHILD_WORKFLOW_MAP_MANIFEST_PAGE_SIZE)
-}
-
-pub fn child_workflow_map_manifest_with_page_size<T>(
-    items: impl IntoIterator<Item = T>,
-    page_size: usize,
-) -> Result<PayloadRef>
-where
-    T: serde::Serialize,
-{
     with_context(|runtime| {
         let items = items
             .into_iter()
@@ -2400,7 +2387,7 @@ where
             .collect::<Result<Vec<_>>>()?;
         crate::encode_activity_map_input_manifest_with_codec(
             items,
-            page_size,
+            crate::CHILD_WORKFLOW_MAP_MANIFEST_PAGE_SIZE,
             runtime.payload_codec,
         )
     })
@@ -3587,7 +3574,8 @@ mod tests {
     use crate::{
         ActivityCompleted, ActivityFailed, ActivityMapCompleted, ActivityMapFailed,
         ActivityTimedOut, ChildWorkflowCancelled, ChildWorkflowCompleted, ChildWorkflowFailed,
-        ChildWorkflowStarted, CodecId, DurableFailure, EventId, HistoryEventType, TimerStarted,
+        ChildWorkflowMapFailed, ChildWorkflowStarted, CodecId, DurableFailure, EventId,
+        HistoryEventType, TimerStarted,
     };
 
     #[test]
@@ -3709,6 +3697,101 @@ mod tests {
             },
             |runtime, command_id| runtime.take_consumed_signal(command_id).is_some(),
         );
+    }
+
+    #[test]
+    fn appended_child_workflow_map_terminals_are_indexed_for_out_of_order_replay() {
+        // A child-workflow-map terminal that streams in a later recovery chunk must be
+        // indexed by `append_replay_events`, not only by `new()`. Otherwise the indexed
+        // lookup path misses a completion/failure that arrives out of order relative to
+        // the blocked command. These cases fail if append-time child-map indexing regresses.
+        assert_appended_indexed_event_skips(
+            "child_workflow_map_completed",
+            |command_id| {
+                HistoryEventData::ChildWorkflowMapCompleted(ChildWorkflowMapCompleted {
+                    command_id,
+                    result_manifest: payload(&"child-map-result"),
+                    item_count: 2,
+                    success_count: 2,
+                    failure_count: 0,
+                    cancellation_count: 0,
+                })
+            },
+            |runtime, command_id| runtime.take_child_map_completion(command_id).is_some(),
+        );
+        assert_appended_indexed_event_skips(
+            "child_workflow_map_failed",
+            |command_id| {
+                HistoryEventData::ChildWorkflowMapFailed(ChildWorkflowMapFailed {
+                    command_id,
+                    failure: failure("child map failed"),
+                })
+            },
+            |runtime, command_id| runtime.take_child_map_failure(command_id).is_some(),
+        );
+    }
+
+    // Mirrors `assert_indexed_ready_event_skips` but introduces the indexed terminal via
+    // a second appended chunk rather than the initial `new()` history, exercising the
+    // append-time indexing path specifically.
+    fn assert_appended_indexed_event_skips(
+        case_name: &str,
+        indexed_event: impl FnOnce(CommandId) -> HistoryEventData,
+        consume_indexed: impl FnOnce(&mut RuntimeContext, &CommandId) -> bool,
+    ) {
+        let run_id = RunId::new(format!("run/append-{case_name}"));
+        let first_command_id = command_id(&run_id, 1);
+        let indexed_command_id = command_id(&run_id, 2);
+        let after_skipped_command_id = command_id(&run_id, 3);
+        let first_event = HistoryEventData::ActivityCompleted(ActivityCompleted {
+            command_id: first_command_id.clone(),
+            result: payload(&11_u64),
+        });
+        let after_skipped = HistoryEventData::TimerStarted(TimerStarted {
+            command_id: after_skipped_command_id,
+            fire_at: TimestampMs(10),
+            fingerprint: timer_fingerprint("sleep", TimestampMs(10)),
+        });
+        // First chunk only holds the in-cursor event; the child-map terminal and the
+        // following command stream in via a later chunk.
+        let mut runtime = RuntimeContext::new(
+            run_id,
+            TaskQueue::new("workflows"),
+            TaskQueue::new("activities"),
+            CodecId::MessagePack,
+            TimestampMs(0),
+            vec![event(1, first_event)],
+            ActivityOptions::default(),
+            0,
+            EventId(1),
+            EventId(3),
+            Vec::new(),
+        );
+        runtime.append_replay_events(
+            vec![
+                event(2, indexed_event(indexed_command_id.clone())),
+                event(3, after_skipped),
+            ],
+            EventId(3),
+        );
+
+        assert!(
+            consume_indexed(&mut runtime, &indexed_command_id),
+            "{case_name} appended terminal should be consumable via the index before the cursor reaches it"
+        );
+        assert!(
+            runtime.take_completion(&first_command_id).is_some(),
+            "{case_name} should still consume the in-cursor event"
+        );
+        let next = runtime
+            .peek_replay_event()
+            .unwrap_or_else(|| panic!("{case_name} should skip the consumed indexed event"));
+        assert!(
+            matches!(next.data, HistoryEventData::TimerStarted(_)),
+            "{case_name} should continue at the next unconsumed event, found {:?}",
+            next.event_type
+        );
+        assert_eq!(next.event_id, EventId(3));
     }
 
     fn assert_indexed_ready_event_skips(
