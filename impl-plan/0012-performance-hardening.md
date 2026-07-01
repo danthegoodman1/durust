@@ -158,6 +158,19 @@ Implemented:
   simple-batch eligible; the remaining gap to a stable ceiling is runtime
   variance and non-workflow scalar paths such as signal send/read and timer
   maintenance.
+- The 2026-07-01 Rust Postgres performance loop baseline reran the accepted
+  100-shard mixed profile against the checked-in `postgres:16-alpine` compose
+  fixture on `127.0.0.1:55432` with `pg_stat_statements` preloaded. The
+  same-run median mixed artifact was
+  `target/loop-phase1-std-mixed-run-3.json` at 245.57 processing workflows/sec,
+  1,964.59 processing mixed-actions/sec, p50/p95/p99 workflow-task commit
+  latency 13.44/20.63/60.80ms, 0.808 transactions/action, and 5.04
+  statements/action. The same-run median raw write-ceiling artifact was
+  `target/loop-phase1-std-write-ceiling-run-1.json` at 1,562.66 operations/sec,
+  1.016 transactions/action, and 10.01 statements/action. Future local
+  optimization experiments should compare against these standard-fixture
+  artifacts, carry the observed write-ceiling variance forward, and rerun the
+  raw ceiling when mixed throughput changes are close to the keep gate.
 - `tests/fixtures/postgres.compose.yml`, a local Postgres fixture for env-gated
   benchmark smoke runs and future checked-in Postgres workload baselines.
 
