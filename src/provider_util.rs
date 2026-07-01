@@ -112,6 +112,29 @@ pub(crate) fn activity_timeout_at_ms_from(
     timeout.map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
 }
 
+/// Expiry timestamp for a claim lease taken at `now`. A claim whose lease
+/// expiry is `<= now` is reclaimable; the reclaim issues a fresh fencing token
+/// so the previous holder's commit/release/complete is rejected as stale.
+pub(crate) fn claim_lease_until_ms(now: TimestampMs, lease_duration: Duration) -> i64 {
+    now.0.saturating_add(duration_millis_i64(lease_duration))
+}
+
+/// Claim-time reclaim deadline for an activity with neither a start-to-close
+/// timeout nor a heartbeat timeout. Such a task has no other crash-recovery
+/// signal, so the claim lease feeds the same `timeout_at_ms` slot the timeout
+/// scanner already reads; the retry path then resets the deadline to the
+/// (absent) explicit timeout, leaving the task claimable again. When either
+/// explicit deadline exists it stays authoritative and this returns `None`.
+pub(crate) fn activity_claim_lease_timeout_at_ms(
+    now: TimestampMs,
+    start_to_close_timeout: Option<Duration>,
+    heartbeat_timeout: Option<Duration>,
+    lease_duration: Duration,
+) -> Option<i64> {
+    (start_to_close_timeout.is_none() && heartbeat_timeout.is_none())
+        .then(|| claim_lease_until_ms(now, lease_duration))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +156,39 @@ mod tests {
 
         assert_eq!(encode_encryption_metadata(&None).unwrap(), None);
         assert_eq!(decode_encryption_metadata(None).unwrap(), None);
+    }
+
+    #[test]
+    fn claim_lease_until_saturates_and_offsets_from_the_given_now() {
+        assert_eq!(
+            claim_lease_until_ms(TimestampMs(1_000), Duration::from_secs(30)),
+            31_000
+        );
+        // Saturation instead of overflow keeps an absurd lease from wrapping into the past.
+        assert_eq!(
+            claim_lease_until_ms(TimestampMs(i64::MAX), Duration::from_secs(1)),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn activity_claim_lease_applies_only_without_explicit_deadlines() {
+        let now = TimestampMs(500);
+        let lease = Duration::from_secs(30);
+        // No explicit timeout or heartbeat: the lease is the reclaim deadline.
+        assert_eq!(
+            activity_claim_lease_timeout_at_ms(now, None, None, lease),
+            Some(30_500)
+        );
+        // Any explicit deadline stays authoritative; the lease must not double-drive.
+        assert_eq!(
+            activity_claim_lease_timeout_at_ms(now, Some(Duration::from_secs(1)), None, lease),
+            None
+        );
+        assert_eq!(
+            activity_claim_lease_timeout_at_ms(now, None, Some(Duration::from_secs(1)), lease),
+            None
+        );
     }
 
     #[test]

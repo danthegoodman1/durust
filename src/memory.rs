@@ -1,4 +1,7 @@
-use crate::provider_util::{should_retry_activity, timeout_message};
+use crate::provider_util::{
+    activity_claim_lease_timeout_at_ms, claim_lease_until_ms, should_retry_activity,
+    timeout_message,
+};
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
     ActivityMapResultManifest, ActivityMapResultPage, ActivityMapTask, ActivityTask,
@@ -94,9 +97,26 @@ struct RunRecord {
     history: Vec<HistoryEvent>,
     ready: Option<WorkflowTaskReason>,
     ready_at: Option<Instant>,
-    workflow_claim: Option<u64>,
+    workflow_claim: Option<WorkflowClaim>,
     terminal: bool,
     parent: Option<ChildParentLink>,
+}
+
+// Lease expiry is compared against the virtual clock (`state.now`) so
+// deterministic simulations can expire claims with `advance_time`.
+struct WorkflowClaim {
+    token: u64,
+    lease_until: TimestampMs,
+}
+
+impl WorkflowClaim {
+    fn holds(claim: &Option<WorkflowClaim>, token: u64) -> bool {
+        claim.as_ref().is_some_and(|claim| claim.token == token)
+    }
+
+    fn reclaimable(claim: &Option<WorkflowClaim>, now: TimestampMs) -> bool {
+        claim.as_ref().is_none_or(|claim| claim.lease_until <= now)
+    }
 }
 
 #[derive(Clone)]
@@ -273,12 +293,13 @@ impl DurableBackend for MemoryBackend {
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = Instant::now();
+        let virtual_now = state.now;
         let Some(run_id) = state.runs.iter().find_map(|(run_id, run)| {
             let matches = run.namespace == opts.namespace
                 && run.task_queue == opts.task_queue
                 && run.ready.is_some()
                 && run.ready_at.is_none_or(|ready_at| ready_at <= now)
-                && run.workflow_claim.is_none()
+                && WorkflowClaim::reclaimable(&run.workflow_claim, virtual_now)
                 && !run.terminal
                 && opts
                     .registered_workflow_types
@@ -295,13 +316,17 @@ impl DurableBackend for MemoryBackend {
             .runs
             .get_mut(&run_id)
             .expect("run id selected from runs map");
-        run.workflow_claim = Some(token);
+        // The ready reason stays on the run while claimed so a reclaim after
+        // lease expiry hands out the same task a fresh claim would; commit,
+        // conflict, and release overwrite it.
+        run.workflow_claim = Some(WorkflowClaim {
+            token,
+            lease_until: TimestampMs(claim_lease_until_ms(virtual_now, opts.lease_duration)),
+        });
         let reason = run
             .ready
             .clone()
             .expect("ready reason selected from ready run");
-        run.ready = None;
-        run.ready_at = None;
         let replay_target_event_id = run
             .history
             .last()
@@ -451,7 +476,7 @@ impl DurableBackend for MemoryBackend {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
             };
-            if run.workflow_claim != Some(claim.token) {
+            if !WorkflowClaim::holds(&run.workflow_claim, claim.token) {
                 return Box::pin(ready(Err(Error::StaleLease)));
             }
             let current_tail = run
@@ -583,10 +608,14 @@ impl DurableBackend for MemoryBackend {
             }
 
             run.workflow_claim = None;
+            // Commit consumes the claimed task's readiness (the reason stays
+            // on the run while claimed so lease-expiry reclaims see it); the
+            // signal recheck below re-marks the run if consumable signals
+            // remain, mirroring the SQL providers' commit update.
+            run.ready = None;
+            run.ready_at = None;
             if terminal {
                 run.terminal = true;
-                run.ready = None;
-                run.ready_at = None;
             }
             if let Some(payload) = query_projection {
                 projection_update = Some((
@@ -728,7 +757,7 @@ impl DurableBackend for MemoryBackend {
         let Some(run) = state.runs.get_mut(&claim.run_id) else {
             return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
         };
-        if run.workflow_claim != Some(claim.token) {
+        if !WorkflowClaim::holds(&run.workflow_claim, claim.token) {
             return Box::pin(ready(Err(Error::StaleLease)));
         }
         run.workflow_claim = None;
@@ -948,6 +977,14 @@ impl DurableBackend for MemoryBackend {
                 .expect("activity id selected from activities map");
             record.claim = Some(token);
             record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
+            if let Some(lease_timeout) = activity_claim_lease_timeout_at_ms(
+                now,
+                record.task.start_to_close_timeout,
+                record.task.heartbeat_timeout,
+                opts.lease_duration,
+            ) {
+                record.timeout_at = Some(TimestampMs(lease_timeout));
+            }
             record.task.clone()
         };
         let task = match hydrate_activity_task_from_storage(&state, task) {

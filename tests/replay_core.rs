@@ -5643,6 +5643,325 @@ fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
     });
 }
 
+// Builds a two-slot batch worker so run_workflow_batch_once takes the batched
+// claim/prepare/commit path instead of delegating to run_workflow_once.
+fn batch_error_worker(backend: RecordingBackend) -> Worker<RecordingBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .max_concurrent_workflow_tasks(2)
+        .workflow_task_prefetch_limit(2)
+        .workflow_task_commit_batch_size(2)
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build()
+}
+
+#[test]
+fn claim_is_released_when_current_time_fails_before_prepare() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/current-time-error", "workflows", number(9))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+
+        backend.fail_next_current_time();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        // The failed prepare released its claim immediately: the task is
+        // claimable again without waiting for lease expiry.
+        let reclaimed = backend
+            .claim_workflow_task(
+                WorkerId::new("after-current-time-error"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap()
+            .expect("claim released by failed prepare");
+        backend
+            .release_workflow_task(
+                reclaimed.claim,
+                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+            )
+            .await
+            .unwrap();
+
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+    });
+}
+
+// Drives a workflow through its first task and activity with one worker, then
+// injects `inject` before a fresh worker's cold recovery and asserts the error
+// surfaced without stranding the claim or the single recovery slot: the same
+// worker must afterwards recover and complete the run unaided.
+async fn cold_recovery_error_releases_claim_and_recovery_slot(
+    inject: impl FnOnce(&RecordingBackend),
+    chunk_events: usize,
+) {
+    let backend = RecordingBackend::new(MemoryBackend::new());
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<double_plus_one>("wf/cold-recovery-error", "workflows", number(9))
+        .await
+        .unwrap();
+    let mut first_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build();
+    assert!(first_worker.run_workflow_once().await.unwrap());
+    assert!(first_worker.run_activity_once().await.unwrap());
+    drop(first_worker);
+
+    let mut recovered_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .history_chunk_events(chunk_events)
+        .max_concurrent_recoveries(1)
+        .recovery_defer_delay(Duration::from_millis(1))
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build();
+
+    inject(&backend);
+    let err = recovered_worker.run_workflow_once().await.unwrap_err();
+    assert!(matches!(err, durust::Error::Backend(_)));
+
+    // A leaked claim would keep the run unclaimable (its lease never expires
+    // under virtual time) and a leaked recovery slot would defer every future
+    // cold recovery, so completing here proves both were released.
+    recovered_worker.run_until_idle().await.unwrap();
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history.last().unwrap().data,
+        HistoryEventData::WorkflowCompleted { .. }
+    ));
+}
+
+#[test]
+fn cold_recovery_change_versions_error_releases_claim_and_recovery_slot() {
+    block_on(async {
+        // A one-event chunk keeps `has_more` true so the prepare pipeline
+        // queries the change-version index, which is where the fault fires.
+        cold_recovery_error_releases_claim_and_recovery_slot(
+            |backend| backend.fail_next_change_versions(),
+            1,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn cold_recovery_hydrate_error_releases_claim_and_recovery_slot() {
+    block_on(async {
+        cold_recovery_error_releases_claim_and_recovery_slot(
+            |backend| backend.fail_hydrate_payload_calls(1),
+            128,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn batch_prepare_error_releases_failed_claim_and_still_commits_neighbors() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-prepare-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-prepare-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        // The first claimed task (run a, lowest run id) fails its input
+        // hydration during prepare; its batch neighbor must still commit.
+        backend.fail_hydrate_payload_calls(1);
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        let history_a = stream_all(&backend, &run_a).await;
+        assert_eq!(history_a.len(), 1);
+        let history_b = stream_all(&backend, &run_b).await;
+        assert_eq!(history_b.len(), 2);
+        assert!(matches!(
+            history_b[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+
+        // The failed task's claim was released, so the worker finishes both
+        // workflows without any lease expiry.
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
+#[test]
+fn batch_commit_rpc_error_releases_every_claim_in_the_batch() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-rpc-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-rpc-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        backend.fail_next_commit_batch();
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        // Nothing committed, and both claims were released.
+        for run_id in [&run_a, &run_b] {
+            assert_eq!(stream_all(&backend, run_id).await.len(), 1);
+        }
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
+#[test]
+fn activity_lease_duration_knob_bounds_default_option_activity_runtime() {
+    block_on(async {
+        // An activity with default options (no timeout, no heartbeat, no
+        // retries) whose virtual runtime exceeds the worker's configured
+        // activity lease is reclaimed mid-flight: the maintenance scan turns
+        // it into a permanent ActivityTimedOut, the late completion is
+        // idempotently rejected, and the workflow observes the timeout.
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/lease-too-short", "workflows", number(4))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .activity_task_lease_duration(Duration::from_secs(1))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_and_scan_before_activity_completion(Duration::from_secs(2));
+        assert!(worker.run_activity_once().await.unwrap());
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityTimedOut(_)))
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+        );
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowFailed { .. }
+        ));
+
+        // The same activity under a lease longer than its runtime completes
+        // normally and the workflow finishes.
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/lease-long-enough", "workflows", number(4))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .activity_task_lease_duration(Duration::from_secs(60))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_and_scan_before_activity_completion(Duration::from_secs(2));
+        assert!(worker.run_activity_once().await.unwrap());
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityTimedOut(_)))
+        );
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+    });
+}
+
+#[test]
+fn batch_per_item_conflict_does_not_abort_the_rest_of_the_chunk() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-conflict-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-conflict-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        backend.conflict_batch_commit_for_run(run_a.clone());
+        let committed = worker.run_workflow_batch_once().await.unwrap();
+        assert_eq!(committed, 1);
+
+        let history_a = stream_all(&backend, &run_a).await;
+        assert_eq!(history_a.len(), 1);
+        let history_b = stream_all(&backend, &run_b).await;
+        assert_eq!(history_b.len(), 2);
+
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
 #[test]
 fn replay_detects_changed_activity_input_without_appending_failure() {
     block_on(async {
@@ -6258,6 +6577,12 @@ struct RecordingBackend {
     signal_batch_requests: Arc<Mutex<Vec<durust::ReadSignalInboxesRequest>>>,
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
+    fail_next_current_time: Arc<Mutex<bool>>,
+    fail_next_change_versions: Arc<Mutex<bool>>,
+    hydrate_failures_remaining: Arc<Mutex<u32>>,
+    fail_next_commit_batch: Arc<Mutex<bool>>,
+    conflict_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
+    advance_before_activity_completion: Arc<Mutex<Option<Duration>>>,
     claim_prefetch_enabled: bool,
 }
 
@@ -6269,6 +6594,12 @@ impl RecordingBackend {
             signal_batch_requests: Arc::new(Mutex::new(Vec::new())),
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
+            fail_next_current_time: Arc::new(Mutex::new(false)),
+            fail_next_change_versions: Arc::new(Mutex::new(false)),
+            hydrate_failures_remaining: Arc::new(Mutex::new(0)),
+            fail_next_commit_batch: Arc::new(Mutex::new(false)),
+            conflict_batch_commit_run: Arc::new(Mutex::new(None)),
+            advance_before_activity_completion: Arc::new(Mutex::new(None)),
             claim_prefetch_enabled: true,
         }
     }
@@ -6297,6 +6628,38 @@ impl RecordingBackend {
     fn backpressure_next_replay_stream(&self, retry_after: Duration) {
         *self.backpressure_next_replay_stream.lock().unwrap() = Some(retry_after);
     }
+
+    fn fail_next_current_time(&self) {
+        *self.fail_next_current_time.lock().unwrap() = true;
+    }
+
+    fn fail_next_change_versions(&self) {
+        *self.fail_next_change_versions.lock().unwrap() = true;
+    }
+
+    fn fail_hydrate_payload_calls(&self, count: u32) {
+        *self.hydrate_failures_remaining.lock().unwrap() = count;
+    }
+
+    fn fail_next_commit_batch(&self) {
+        *self.fail_next_commit_batch.lock().unwrap() = true;
+    }
+
+    fn conflict_batch_commit_for_run(&self, run_id: durust::RunId) {
+        *self.conflict_batch_commit_run.lock().unwrap() = Some(run_id);
+    }
+
+    // Simulates an activity whose execution outlives `advance` of virtual time
+    // while the maintenance scanner keeps running elsewhere: before the next
+    // completion is applied, the clock moves and due activities are timed out.
+    fn advance_and_scan_before_activity_completion(&self, advance: Duration) {
+        *self.advance_before_activity_completion.lock().unwrap() = Some(advance);
+    }
+
+    fn take_flag(flag: &Arc<Mutex<bool>>) -> bool {
+        let mut flag = flag.lock().unwrap();
+        std::mem::take(&mut *flag)
+    }
 }
 
 impl DurableBackend for RecordingBackend {
@@ -6315,6 +6678,13 @@ impl DurableBackend for RecordingBackend {
     }
 
     fn current_time(&self) -> BoxFuture<'static, durust::Result<durust::TimestampMs>> {
+        if Self::take_flag(&self.fail_next_current_time) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected current_time failure".to_owned(),
+                ))
+            });
+        }
         self.inner.current_time()
     }
 
@@ -6342,6 +6712,24 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
         self.inner.stream_history(req)
+    }
+
+    fn hydrate_payload(
+        &self,
+        payload: durust::PayloadRef,
+    ) -> BoxFuture<'static, durust::Result<durust::PayloadRef>> {
+        {
+            let mut remaining = self.hydrate_failures_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Box::pin(async {
+                    Err(durust::Error::Backend(
+                        "injected hydrate failure".to_owned(),
+                    ))
+                });
+            }
+        }
+        self.inner.hydrate_payload(payload)
     }
 
     fn stream_history_for_replay(
@@ -6387,6 +6775,53 @@ impl DurableBackend for RecordingBackend {
             });
         }
         self.inner.commit_workflow_task(claim, batch)
+    }
+
+    // Overridden (instead of relying on the default per-item loop) so tests
+    // can fail the whole batch RPC or fabricate a per-item conflict while the
+    // other items commit for real.
+    fn commit_workflow_tasks(
+        &self,
+        batch: durust::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
+        if Self::take_flag(&self.fail_next_commit_batch) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected batch commit failure".to_owned(),
+                ))
+            });
+        }
+        let conflict_run = self.conflict_batch_commit_run.lock().unwrap().take();
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(batch.commits.len());
+            for input in batch.commits {
+                let claim = input.claim;
+                if conflict_run.as_ref() == Some(&claim.run_id) {
+                    // Mirror a real conflict: the provider releases the claim
+                    // as part of reporting it.
+                    backend
+                        .inner
+                        .release_workflow_task(
+                            claim.clone(),
+                            durust::WorkflowTaskRelease::immediate(
+                                durust::WorkflowTaskReason::CacheEvicted,
+                            ),
+                        )
+                        .await?;
+                    results.push(durust::WorkflowTaskCommitBatchResult {
+                        claim,
+                        result: Ok(durust::CommitOutcome::Conflict),
+                    });
+                    continue;
+                }
+                let result = backend
+                    .commit_workflow_task(claim.clone(), input.commit)
+                    .await;
+                results.push(durust::WorkflowTaskCommitBatchResult { claim, result });
+            }
+            Ok(results)
+        })
     }
 
     fn release_workflow_task(
@@ -6452,7 +6887,22 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
-        self.inner.complete_activity(req)
+        let advance = self.advance_before_activity_completion.lock().unwrap().take();
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            if let Some(advance) = advance {
+                inner.advance_time(advance);
+                let now = inner.current_time().await?;
+                inner
+                    .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                        namespace: Namespace::default(),
+                        now,
+                        limit: 16,
+                    })
+                    .await?;
+            }
+            inner.complete_activity(req).await
+        })
     }
 
     fn fail_activity(
@@ -6480,6 +6930,13 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: durust::WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
+        if Self::take_flag(&self.fail_next_change_versions) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected change versions failure".to_owned(),
+                ))
+            });
+        }
         self.inner.workflow_change_versions(req)
     }
 

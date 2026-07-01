@@ -177,6 +177,72 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
 }
 
 #[test]
+fn memory_workflow_lease_expiry_reclaims_and_fences_stale_holder() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/memory-lease-expiry",
+            "memory-lease-expiry-workflows",
+            Duration::from_secs(30),
+            |backend| async move { backend },
+            move || async move {
+                advance_backend.advance_time(Duration::from_secs(31));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_workflow_lease_expiry_reclaims_and_fences_stale_holder_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-expiry.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/sqlite-lease-expiry",
+            "sqlite-lease-expiry-workflows",
+            Duration::from_millis(50),
+            move |backend| async move {
+                drop(backend);
+                SqliteBackend::open(&path).unwrap()
+            },
+            || async { std::thread::sleep(Duration::from_millis(120)) },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres lease expiry conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("lease_expiry");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/postgres-lease-expiry",
+            "postgres-lease-expiry-workflows",
+            Duration::from_millis(50),
+            |backend| async move { backend },
+            || async { tokio::time::sleep(Duration::from_millis(120)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[test]
 fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -1035,7 +1101,11 @@ where
     stale_workflow_task_commit_conflicts(backend.clone()).await;
     batch_workflow_task_claim_and_commit_results_are_ordered(backend.clone()).await;
     batch_activity_completion_reports_ordered_duplicate_and_stale_results(backend.clone()).await;
-    activity_claim_filters_and_stale_completion_is_rejected(backend).await;
+    activity_claim_filters_and_stale_completion_is_rejected(backend.clone()).await;
+    unexpired_workflow_claim_lease_is_not_reclaimable(backend.clone()).await;
+    // Runs last: its timeout scan uses a far-future `now` that must not
+    // disturb other cases' pending activities.
+    timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder(backend).await;
 }
 
 async fn start_large_payload_workflow<B>(
@@ -4115,6 +4185,329 @@ where
         lease_duration: Duration::from_secs(30),
     };
     (run_id, claim_opts, activity_opts)
+}
+
+async fn unexpired_workflow_claim_lease_is_not_reclaimable<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/lease-unexpired", "lease-unexpired-workflows", input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("lease-unexpired-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-holder"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+
+    // The holder's lease is nowhere near expiry, so the task must not be
+    // handed out to another worker.
+    let blocked = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-thief"), claim_opts.clone())
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // Releasing the claim restores normal claimability.
+    backend
+        .release_workflow_task(
+            claimed.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+        )
+        .await
+        .unwrap();
+    let reclaimed = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-after-release"), claim_opts)
+        .await
+        .unwrap();
+    assert!(reclaimed.is_some());
+}
+
+// Claims a workflow task, "crashes" the holder (drops it without commit or
+// release), advances time past the lease, and verifies the task is reclaimed
+// with the identical state a fresh claim would produce while every operation
+// from the dead holder is fenced as stale. `crash` lets SQLite close and
+// reopen the database between claim and reclaim; `advance_past_lease` is
+// virtual time for the memory provider and a real sleep for SQL providers,
+// whose claim scans read their own wall clock.
+async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<B, Crash, CrashFut, Advance, AdvanceFut>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    lease_duration: Duration,
+    crash: Crash,
+    advance_past_lease: Advance,
+) where
+    B: DurableBackend,
+    Crash: FnOnce(B) -> CrashFut,
+    CrashFut: Future<Output = B>,
+    Advance: FnOnce() -> AdvanceFut,
+    AdvanceFut: Future<Output = ()>,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration,
+    };
+    let original = backend
+        .claim_workflow_task(WorkerId::new("lease-crash-holder"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+
+    let backend = crash(backend).await;
+    advance_past_lease().await;
+
+    let reclaimed = backend
+        .claim_workflow_task(WorkerId::new("lease-crash-reclaimer"), claim_opts)
+        .await
+        .unwrap()
+        .expect("expired lease should be reclaimable");
+    // The reclaim must look exactly like a fresh claim of the same task,
+    // under a new fencing token.
+    assert_eq!(reclaimed.run_id, run_id);
+    assert_eq!(reclaimed.reason, original.reason);
+    assert_eq!(
+        reclaimed.replay_target_event_id,
+        original.replay_target_event_id
+    );
+    assert_eq!(
+        reclaimed
+            .prefetched_history
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        original
+            .prefetched_history
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+    );
+    assert_ne!(reclaimed.claim.token, original.claim.token);
+
+    // The dead holder is fenced: its commit and release are rejected as stale
+    // and leave the new claim untouched.
+    let stale_commit = backend
+        .commit_workflow_task(
+            original.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: original.replay_target_event_id,
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_commit, Error::StaleLease));
+    let stale_release = backend
+        .release_workflow_task(
+            original.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_release, Error::StaleLease));
+
+    let outcome = backend
+        .commit_workflow_task(
+            reclaimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: reclaimed.replay_target_event_id,
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&5_u64).unwrap(),
+                })],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+}
+
+async fn schedule_timeoutless_activity<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+) -> (
+    durust::RunId,
+    ClaimWorkflowTaskOptions,
+    ClaimActivityOptions,
+)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(activity_queue),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-timeoutless-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(activity_queue),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    (run_id, claim_opts, activity_opts)
+}
+
+// An activity with neither a start-to-close timeout nor a heartbeat timeout
+// (the `ActivityOptions` defaults) must be reclaimable after its claim lease
+// expires, through the same timeout/retry path explicit deadlines use.
+async fn timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-activity-lease",
+        "timeoutless-lease-workflows",
+        "timeoutless-lease-activities",
+    )
+    .await;
+
+    let first = backend
+        .claim_activity_task(WorkerId::new("timeoutless-worker-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+    let claimed_at = backend.current_time().await.unwrap();
+
+    // While the lease is unexpired the timeout scan leaves the claim alone and
+    // the task is not claimable by anyone else.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(claimed_at.0.saturating_add(100)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-worker-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // Past the 30s claim lease the timeout scan reclaims the task through the
+    // existing retry machinery, making it claimable as attempt 2.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(claimed_at.0.saturating_add(31_000)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let second = backend
+        .claim_activity_task(WorkerId::new("timeoutless-worker-2"), activity_opts)
+        .await
+        .unwrap()
+        .expect("lease-expired activity should be reclaimable");
+    assert_eq!(second.task.attempt, 2);
+
+    // Every operation from the crashed holder is fenced as stale.
+    let stale_heartbeat = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_heartbeat, Error::StaleLease));
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim.clone(),
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+    let stale_failure = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: durust::DurableFailure::new("conformance.crashed", "stale holder"),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_failure, Error::StaleLease));
+
+    // The new holder completes normally and the workflow wakes up.
+    let completed = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        durust::CompleteActivityOutcome::Completed { .. }
+    ));
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(ready.run_id, run_id);
 }
 
 async fn cancel_commands_clear_activity_tasks<B>(backend: B)

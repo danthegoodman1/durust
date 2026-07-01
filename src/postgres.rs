@@ -1,5 +1,6 @@
 use crate::provider_util::{
-    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
+    activity_claim_lease_timeout_at_ms, activity_timeout_at_ms, activity_timeout_at_ms_from,
+    claim_lease_until_ms, codec_from_str, codec_to_str,
     compression_from_str, compression_to_str, decode_encryption_metadata, duration_millis_i64,
     encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
     unix_epoch_millis,
@@ -40,7 +41,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 1;
+const POSTGRES_SCHEMA_VERSION: i64 = 2;
 const DEFAULT_SCHEMA: &str = "durust";
 const DEFAULT_MAX_POOL_SIZE: usize = 16;
 const DEFAULT_LOGICAL_SHARDS: u32 = 1;
@@ -372,6 +373,7 @@ impl PostgresBackend {
                     ready_reason text,
                     ready_at_ms bigint not null default 0,
                     workflow_claim_token bigint,
+                    claim_lease_until_ms bigint,
                     terminal boolean not null,
                     parent_run_id text,
                     parent_command_seq bigint,
@@ -385,6 +387,9 @@ impl PostgresBackend {
 
                 alter table {schema}.workflow_instances
                     add column if not exists parent_child_map_ordinal bigint;
+
+                alter table {schema}.workflow_instances
+                    add column if not exists claim_lease_until_ms bigint;
 
                 create table if not exists {schema}.history_events (
                     run_id text not null,
@@ -504,13 +509,11 @@ impl PostgresBackend {
                 create index if not exists idx_workflow_instances_ready
                     on {schema}.workflow_instances(namespace, task_queue, ready_at_ms, run_id)
                     where ready_reason is not null
-                      and workflow_claim_token is null
                       and terminal = false;
 
                 create index if not exists idx_workflow_instances_ready_shard
                     on {schema}.workflow_instances(namespace, shard_id, task_queue, ready_at_ms, run_id)
                     where ready_reason is not null
-                      and workflow_claim_token is null
                       and terminal = false;
 
                 create table if not exists {schema}.signals (
@@ -1361,6 +1364,8 @@ impl PostgresBackend {
             None => None,
         };
 
+        // A held claim blocks reclaiming only while its lease is unexpired; a
+        // null lease keeps the row unclaimable, which fails safe.
         let rows = tx
             .query(
                 &format!(
@@ -1370,7 +1375,7 @@ impl PostgresBackend {
                        and task_queue = $2
                        and ready_reason is not null
                        and ready_at_ms <= $3
-                       and workflow_claim_token is null
+                       and (workflow_claim_token is null or claim_lease_until_ms <= $3)
                        and terminal = false
                        and ($6::integer[] is null or shard_id = any($6::integer[]))
                        and (workflow_name, workflow_version) in (
@@ -1484,16 +1489,22 @@ impl PostgresBackend {
             .iter()
             .map(|token| i64::try_from(*token).unwrap_or(i64::MAX))
             .collect::<Vec<_>>();
+        // The ready reason and visibility stay on the rows while claimed so a
+        // reclaim after lease expiry hands out the same task a fresh claim
+        // would; commit, conflict, and release overwrite them.
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances workflows
                  set workflow_claim_token = claimed.claim_token,
-                     ready_reason = null,
-                     ready_at_ms = 0
+                     claim_lease_until_ms = $3
                  from unnest($1::text[], $2::bigint[]) as claimed(run_id, claim_token)
                  where workflows.run_id = claimed.run_id"
             ),
-            &[&run_ids, &token_values],
+            &[
+                &run_ids,
+                &token_values,
+                &claim_lease_until_ms(TimestampMs(now_ms), opts.claim.lease_duration),
+            ],
         )
         .await
         .map_err(postgres_error)?;
@@ -1590,7 +1601,7 @@ impl PostgresBackend {
                        and task_queue = $2
                        and ready_reason is not null
                        and ready_at_ms <= $3
-                       and workflow_claim_token is null
+                       and (workflow_claim_token is null or claim_lease_until_ms <= $3)
                        and terminal = false
                        and ($6::integer[] is null or shard_id = any($6::integer[]))
                        and (workflow_name, workflow_version) in (
@@ -1656,10 +1667,14 @@ impl PostgresBackend {
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances
-                 set workflow_claim_token = $1, ready_reason = null, ready_at_ms = 0
-                 where run_id = $2"
+                 set workflow_claim_token = $1, claim_lease_until_ms = $2
+                 where run_id = $3"
             ),
-            &[&i64::try_from(token).unwrap_or(i64::MAX), &run_id.0],
+            &[
+                &i64::try_from(token).unwrap_or(i64::MAX),
+                &claim_lease_until_ms(TimestampMs(now_ms), opts.lease_duration),
+                &run_id.0,
+            ],
         )
         .await
         .map_err(postgres_error)?;
@@ -3463,15 +3478,26 @@ impl PostgresBackend {
             .hydrate_activity_task_from_storage_tx(&tx, task)
             .await?;
         let token = next_claim_token(&tx, &schema).await?;
+        // The lease-derived deadline is only produced for tasks without
+        // explicit timeouts, whose stored timeout_at_ms is null; coalesce
+        // keeps explicit deadlines authoritative.
         tx.execute(
             &format!(
                 "update {schema}.activity_tasks
-                 set claim_token = $1, heartbeat_deadline_at_ms = $2
-                 where activity_id = $3"
+                 set claim_token = $1,
+                     heartbeat_deadline_at_ms = $2,
+                     timeout_at_ms = coalesce($3, timeout_at_ms)
+                 where activity_id = $4"
             ),
             &[
                 &i64::try_from(token).unwrap_or(i64::MAX),
                 &activity_timeout_at_ms(task.heartbeat_timeout),
+                &activity_claim_lease_timeout_at_ms(
+                    TimestampMs(now),
+                    task.start_to_close_timeout,
+                    task.heartbeat_timeout,
+                    opts.lease_duration,
+                ),
                 &activity_id.0,
             ],
         )
@@ -3597,16 +3623,37 @@ impl PostgresBackend {
             .iter()
             .map(|(_, task)| activity_timeout_at_ms(task.heartbeat_timeout).unwrap_or(-1))
             .collect::<Vec<_>>();
+        // The lease-derived deadline is only produced for tasks without
+        // explicit timeouts, whose stored timeout_at_ms is null; coalesce
+        // keeps explicit deadlines authoritative (-1 marks "no lease value").
+        let lease_timeouts = tasks
+            .iter()
+            .map(|(_, task)| {
+                activity_claim_lease_timeout_at_ms(
+                    TimestampMs(now),
+                    task.start_to_close_timeout,
+                    task.heartbeat_timeout,
+                    opts.claim.lease_duration,
+                )
+                .unwrap_or(-1)
+            })
+            .collect::<Vec<_>>();
         tx.execute(
             &format!(
                 "update {schema}.activity_tasks tasks
                  set claim_token = claimed.claim_token,
-                     heartbeat_deadline_at_ms = nullif(claimed.heartbeat_deadline_at_ms, -1)
-                 from unnest($1::text[], $2::bigint[], $3::bigint[])
-                      as claimed(activity_id, claim_token, heartbeat_deadline_at_ms)
+                     heartbeat_deadline_at_ms = nullif(claimed.heartbeat_deadline_at_ms, -1),
+                     timeout_at_ms = coalesce(nullif(claimed.lease_timeout_at_ms, -1), tasks.timeout_at_ms)
+                 from unnest($1::text[], $2::bigint[], $3::bigint[], $4::bigint[])
+                      as claimed(activity_id, claim_token, heartbeat_deadline_at_ms, lease_timeout_at_ms)
                  where tasks.activity_id = claimed.activity_id"
             ),
-            &[&activity_ids, &token_values, &heartbeat_deadlines],
+            &[
+                &activity_ids,
+                &token_values,
+                &heartbeat_deadlines,
+                &lease_timeouts,
+            ],
         )
         .await
         .map_err(postgres_error)?;

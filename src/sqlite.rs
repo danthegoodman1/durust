@@ -1,8 +1,8 @@
 use crate::provider_util::{
-    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
-    compression_from_str, compression_to_str, decode_encryption_metadata,
-    encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
-    unix_epoch_millis,
+    activity_claim_lease_timeout_at_ms, activity_timeout_at_ms, activity_timeout_at_ms_from,
+    claim_lease_until_ms, codec_from_str, codec_to_str, compression_from_str, compression_to_str,
+    decode_encryption_metadata, encode_encryption_metadata, ready_at_ms_for_delay,
+    should_retry_activity, timeout_message, unix_epoch_millis,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -239,6 +239,9 @@ impl DurableBackend for SqliteBackend {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
             let now_ms = unix_epoch_millis();
+            // A held claim blocks reclaiming only while its lease is unexpired.
+            // A held claim with a null lease (only possible for rows claimed
+            // before the lease column existed) stays unclaimable, failing safe.
             let mut stmt = tx
                 .prepare(
                     "select run_id, workflow_id, workflow_name, workflow_version, current_event_id, ready_reason
@@ -247,7 +250,7 @@ impl DurableBackend for SqliteBackend {
                        and task_queue = ?2
                        and ready_reason is not null
                        and ready_at_ms <= ?3
-                       and workflow_claim_token is null
+                       and (workflow_claim_token is null or claim_lease_until_ms <= ?3)
                        and terminal = 0
                      order by rowid asc",
                 )
@@ -294,12 +297,19 @@ impl DurableBackend for SqliteBackend {
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(None);
             };
+            // The ready reason and visibility stay on the row while claimed so
+            // a reclaim after lease expiry hands out the same task a fresh
+            // claim would; commit, conflict, and release overwrite them.
             let token = next_counter(&tx, "claim")?;
             tx.execute(
                 "update workflow_instances
-                 set workflow_claim_token = ?1, ready_reason = null, ready_at_ms = 0
-                 where run_id = ?2",
-                params![token, run_id.0],
+                 set workflow_claim_token = ?1, claim_lease_until_ms = ?2
+                 where run_id = ?3",
+                params![
+                    token,
+                    claim_lease_until_ms(TimestampMs(now_ms), opts.lease_duration),
+                    run_id.0
+                ],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
@@ -1136,13 +1146,24 @@ impl DurableBackend for SqliteBackend {
                 return Ok(None);
             };
             let token = next_counter(&tx, "claim")?;
+            // The lease-derived deadline is only produced for tasks without
+            // explicit timeouts, whose stored timeout_at_ms is null; coalesce
+            // keeps explicit deadlines authoritative.
             tx.execute(
                 "update activity_tasks
-                 set claim_token = ?1, heartbeat_deadline_at_ms = ?2
-                 where activity_id = ?3",
+                 set claim_token = ?1,
+                     heartbeat_deadline_at_ms = ?2,
+                     timeout_at_ms = coalesce(?3, timeout_at_ms)
+                 where activity_id = ?4",
                 params![
                     token,
                     activity_timeout_at_ms_from(now, task.heartbeat_timeout),
+                    activity_claim_lease_timeout_at_ms(
+                        now,
+                        task.start_to_close_timeout,
+                        task.heartbeat_timeout,
+                        opts.lease_duration,
+                    ),
                     activity_id.0
                 ],
             )
@@ -3176,6 +3197,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ready_reason text,
             ready_at_ms integer not null default 0,
             workflow_claim_token integer,
+            claim_lease_until_ms integer,
             terminal integer not null,
             parent_run_id text,
             parent_command_seq integer,
@@ -3307,12 +3329,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
         create index if not exists idx_workflow_change_versions_workflow
             on workflow_change_versions(namespace, workflow_id, change_id);
 
-        create index if not exists idx_workflow_instances_ready
-            on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
-            where ready_reason is not null
-              and workflow_claim_token is null
-              and terminal = 0;
-
         create index if not exists idx_active_waits_timer_due
             on active_waits(kind, ready_at_ms, wait_id);
 
@@ -3366,13 +3382,55 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "parent_close_policy",
         "text not null default 'cancel'",
     )?;
+    ensure_column(
+        conn,
+        "workflow_instances",
+        "claim_lease_until_ms",
+        "integer",
+    )?;
     ensure_column(conn, "activity_tasks", "timeout_at_ms", "integer")?;
     ensure_column(
         conn,
         "activity_tasks",
         "heartbeat_deadline_at_ms",
         "integer",
+    )?;
+    ensure_index(
+        conn,
+        "idx_workflow_instances_ready",
+        WORKFLOW_INSTANCES_READY_INDEX_SQL,
     )
+}
+
+// The ready-scan index must not filter on workflow_claim_token: lease-expiry
+// reclaims match rows whose token is still set, so a claim-token predicate
+// would exclude them from the index. Databases created before lease-based
+// reclaim carry that narrower predicate, and `create index if not exists`
+// never updates an existing index, so init_schema recreates the index from
+// this definition whenever the stored one differs.
+const WORKFLOW_INSTANCES_READY_INDEX_SQL: &str = "create index idx_workflow_instances_ready
+    on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
+    where ready_reason is not null
+      and terminal = 0";
+
+fn ensure_index(conn: &Connection, index: &str, create_sql: &str) -> Result<()> {
+    // sqlite_master stores the create statement verbatim, so a stale
+    // definition (or a missing index) shows up as a text mismatch.
+    let existing = conn
+        .query_row(
+            "select sql from sqlite_master where type = 'index' and name = ?1",
+            params![index],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if existing.as_deref() == Some(create_sql) {
+        return Ok(());
+    }
+    conn.execute(&format!("drop index if exists {index}"), [])
+        .map_err(sqlite_error)?;
+    conn.execute(create_sql, []).map_err(sqlite_error)?;
+    Ok(())
 }
 
 fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -5177,6 +5235,69 @@ mod tests {
                 .is_some();
             assert!(exists, "missing SQLite index `{index_name}`");
         }
+    }
+
+    #[test]
+    fn sqlite_reopen_recreates_legacy_ready_index_and_claims_ready_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-ready-index.sqlite3");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            futures::executor::block_on(backend.start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: WorkflowId::new("wf/legacy-index"),
+                workflow_type: WorkflowType::new("tests.legacy-index", 1),
+                task_queue: crate::TaskQueue::new("legacy-index-workflows"),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            }))
+            .unwrap();
+        }
+        // Simulate a database migrated from before lease-based reclaim: its
+        // ready index still filters on the claim token, which the lease-aware
+        // claim query no longer implies.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "drop index if exists idx_workflow_instances_ready;
+                 create index idx_workflow_instances_ready
+                     on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
+                     where ready_reason is not null
+                       and workflow_claim_token is null
+                       and terminal = 0;",
+            )
+            .unwrap();
+        }
+
+        let reopened = SqliteBackend::open(&path).unwrap();
+        {
+            let conn = reopened.connection().unwrap();
+            let sql = conn
+                .query_row(
+                    "select sql from sqlite_master
+                     where type = 'index' and name = 'idx_workflow_instances_ready'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert!(
+                !sql.contains("workflow_claim_token"),
+                "legacy ready-index predicate survived reopen: {sql}"
+            );
+        }
+        let claimed = futures::executor::block_on(reopened.claim_workflow_task(
+            WorkerId::new("legacy-index-worker"),
+            ClaimWorkflowTaskOptions {
+                namespace: crate::Namespace::default(),
+                task_queue: crate::TaskQueue::new("legacy-index-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("tests.legacy-index", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        ))
+        .unwrap();
+        assert!(
+            claimed.is_some(),
+            "migrated database should still claim ready workflows"
+        );
     }
 }
 
