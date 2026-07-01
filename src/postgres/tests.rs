@@ -855,6 +855,14 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             .await
             .unwrap();
         assert_eq!(claimed.len(), 2);
+        let leases = shard_leases_for_tests(&backend, &schema, &[target_shard]).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1.as_deref(), Some("batch-journal-worker"));
+        let acquired_lease_epoch = leases[0].2;
+        let expected_run_ids = claimed
+            .iter()
+            .map(|claimed| claimed.run_id.clone())
+            .collect::<BTreeSet<_>>();
 
         let results = backend
             .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
@@ -894,7 +902,10 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
         let rows = client
             .query(
                 &format!(
-                    "select operation from {}.shard_journal_{suffix} where shard_id = $1 order by journal_seq asc",
+                    "select journal_seq, lease_epoch, operation
+                     from {}.shard_journal_{suffix}
+                     where shard_id = $1
+                     order by journal_seq asc",
                     quote_ident(&schema)
                 ),
                 &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
@@ -902,21 +913,47 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        let operation_blob: Vec<u8> = rows[0].get(0);
+        let journal_seq: i64 = rows[0].get(0);
+        let journal_lease_epoch: i64 = rows[0].get(1);
+        assert_eq!(journal_seq, 1);
+        assert_eq!(journal_lease_epoch, acquired_lease_epoch);
+        let head_seq: i64 = client
+            .query_one(
+                &format!(
+                    "select journal_seq from {}.shard_heads_{suffix} where shard_id = $1",
+                    quote_ident(&schema)
+                ),
+                &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(head_seq, 1);
+        let operation_blob: Vec<u8> = rows[0].get(2);
         let operation: ShardJournalOperation = rmp_serde::from_slice(&operation_blob).unwrap();
         assert!(matches!(
             operation.kind,
             ShardJournalOperationKind::WorkflowTaskBatch
         ));
         assert_eq!(operation.entries.len(), 2);
-        assert!(operation.entries.iter().all(|entry| matches!(
-            entry.result,
-            ShardJournalCommitResult::Committed {
-                appended_events: 1,
-                terminal: true,
-                ready_reason: None,
-            }
-        )));
+        let actual_run_ids = operation
+            .entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.expected_tail_event_id, EventId(1));
+                assert_eq!(entry.new_tail_event_id, EventId(2));
+                assert!(matches!(
+                    entry.result,
+                    ShardJournalCommitResult::Committed {
+                        appended_events: 1,
+                        terminal: true,
+                        ready_reason: None,
+                    }
+                ));
+                entry.run_id.clone()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_run_ids, expected_run_ids);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }

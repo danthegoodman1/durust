@@ -2652,36 +2652,29 @@ impl PostgresBackend {
         let row = tx
             .query_one(
                 &format!(
-                    "insert into {schema}.shard_heads_{suffix}
-                     (shard_id, journal_seq, snapshot_seq, updated_at_ms)
-                     values ($1, 1, 0, $2)
-                     on conflict(shard_id) do update set
-                        journal_seq = shard_heads_{suffix}.journal_seq + 1,
-                        updated_at_ms = excluded.updated_at_ms
-                     returning journal_seq"
+                    "with next_head as (
+                         insert into {schema}.shard_heads_{suffix}
+                         (shard_id, journal_seq, snapshot_seq, updated_at_ms)
+                         values ($1, 1, 0, $2)
+                         on conflict(shard_id) do update set
+                            journal_seq = shard_heads_{suffix}.journal_seq + 1,
+                            updated_at_ms = excluded.updated_at_ms
+                         returning journal_seq
+                     ),
+                     inserted_journal as (
+                         insert into {schema}.shard_journal_{suffix}
+                         (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
+                         select $1, journal_seq, $3, $4, $2
+                         from next_head
+                         returning journal_seq
+                     )
+                     select journal_seq from inserted_journal"
                 ),
-                &[&shard_id, &now_ms],
+                &[&shard_id, &now_ms, &lease_epoch, &operation_blob],
             )
             .await
             .map_err(postgres_error)?;
         let next_seq = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
-        let next_seq_i64 = i64::try_from(next_seq).unwrap_or(i64::MAX);
-        tx.execute(
-            &format!(
-                "insert into {schema}.shard_journal_{suffix}
-                 (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
-                 values ($1, $2, $3, $4, $5)"
-            ),
-            &[
-                &shard_id,
-                &next_seq_i64,
-                &lease_epoch,
-                &operation_blob,
-                &now_ms,
-            ],
-        )
-        .await
-        .map_err(postgres_error)?;
         Ok(next_seq)
     }
 
