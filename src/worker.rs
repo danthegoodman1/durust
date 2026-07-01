@@ -275,6 +275,7 @@ struct PreparedWorkflowTask {
     default_activity_options: crate::ActivityOptions,
     change_versions: Vec<WorkflowChangeVersionRecord>,
     appended_change_marker: bool,
+    unconsumed_ready_events: bool,
     terminal: bool,
 }
 
@@ -396,8 +397,11 @@ where
                     continue;
                 };
                 committed += 1;
+                // Mirrors `commit_prepared_workflow_task`: unconsumed ready
+                // events force a cold replay on the next task.
                 if task.terminal
                     || task.appended_change_marker
+                    || task.unconsumed_ready_events
                     || last_event_id > task.runtime_appended_tail
                 {
                     continue;
@@ -465,6 +469,7 @@ where
         let runtime_appended_tail = prepared.runtime_appended_tail;
         let terminal = prepared.terminal;
         let appended_change_marker = prepared.appended_change_marker;
+        let unconsumed_ready_events = prepared.unconsumed_ready_events;
         let next_command_seq = prepared.next_command_seq;
         let default_activity_options = prepared.default_activity_options.clone();
         let change_versions = prepared.change_versions.clone();
@@ -480,7 +485,15 @@ where
             return Ok(None);
         };
 
-        if terminal || appended_change_marker || last_event_id > runtime_appended_tail {
+        // A task that leaves loaded ready events unconsumed cannot stay
+        // cached: the next task's context is rebuilt from only the new chunk,
+        // so those events would become unreachable. Cold replay rebuilds the
+        // indexes from the full history instead.
+        if terminal
+            || appended_change_marker
+            || unconsumed_ready_events
+            || last_event_id > runtime_appended_tail
+        {
             return Ok(None);
         }
 
@@ -1090,6 +1103,10 @@ where
                         signal_requests.len()
                     )));
                 }
+                // Only an accepted record counts as progress: the runtime
+                // rejects duplicate deliveries of one inbox record within a
+                // task, and re-polling on a rejected record would re-request
+                // and re-read the same record forever.
                 let mut fulfilled = false;
                 for (request, signal) in signal_requests.into_iter().zip(signals) {
                     let signal = signal.map(|signal| crate::runtime::SignalInboxRecordForRuntime {
@@ -1097,8 +1114,7 @@ where
                         signal_name: signal.signal_name,
                         payload: signal.payload,
                     });
-                    fulfilled |= signal.is_some();
-                    context.fulfill_signal_request(request.command_id, signal);
+                    fulfilled |= context.fulfill_signal_request(request.command_id, signal);
                 }
                 if fulfilled {
                     continue;
@@ -1248,6 +1264,7 @@ where
         change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Result<PreparedWorkflowTask> {
         let next_command_seq = context.next_command_seq();
+        let unconsumed_ready_events = context.has_unconsumed_ready_events();
         let parts = context.into_commit_parts();
         let default_activity_options = parts.default_activity_options.clone();
         let mut append_events = parts.append_events;
@@ -1315,6 +1332,7 @@ where
             default_activity_options,
             change_versions,
             appended_change_marker,
+            unconsumed_ready_events,
             terminal,
         })
     }

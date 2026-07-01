@@ -72,12 +72,12 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 1A: take_*/collect_* consolidation | Missing: shared helper replacing duplicated bodies. |
-| Incomplete | Work | 1B: command-peek helper wired into all nine sites | Missing: `peek_replay_command_event` and call-site migration. |
-| Incomplete | Work | 1C: live signal dedup (runtime + worker) | Missing: dedup logic and tests. |
-| Incomplete | Test | Repro regression test (spawn/sleep/sleep) | Missing: test in `tests/replay_core.rs`. |
-| Incomplete | Test | Per-command-type out-of-order ordering tests | Missing: cached, cold, and multi-chunk variants. |
-| Incomplete | Gate | Full suite green with new tests | Missing: `cargo test` evidence. |
+| Complete | Work | 1A: take_*/collect_* consolidation | `take_indexed`/`collect_indexed` in `src/runtime.rs`; the eleven `take_*` and twelve `collect_*` bodies are one-line wrappers, and the index maps are the single ready-event consumption path. |
+| Complete | Work | 1B: command-peek helper wired into all nine sites | `peek_replay_command_event` skips index-consumable ready events without consuming them; wired into activity, activity map, child map, child, timer, and signal `poll_init`, side effect, `get_version`/`deprecate_patch`, and `record_select_winner`. Worker drops the cache entry when a task leaves loaded ready events unconsumed so the next task cold-replays with full indexes. |
+| Complete | Work | 1C: live signal dedup (runtime + worker) | `fulfill_signal_request` rejects records already in `consume_signals` or handed to another waiter and returns acceptance; the worker fulfillment loop counts only accepted records as progress; select-loser cancellation releases pending live records. |
+| Complete | Test | Repro regression test (spawn/sleep/sleep) | `spawn_sleep_sleep_schedules_second_timer_past_out_of_order_completion_{cached,cold,multi_chunk}` in `tests/replay_core.rs`. |
+| Complete | Test | Per-command-type out-of-order ordering tests | Cached + cold multi-chunk cases for new activity, side effect, version marker, and child spawn commands; preconsume cold-replay case; two-signal select second-branch-winner cold replay (default and single-event chunks); same-name signal sequential and join dedup tests. |
+| Complete | Gate | Full suite green with new tests | `cargo test` 2026-07-01: 60 lib, 99 replay_core, 25 provider_conformance, all other suites 0 failures (Postgres cases skip without `DURUST_POSTGRES_URL`). |
 
 ## Phase 2: Crash-safe claims and worker release discipline
 
@@ -265,6 +265,15 @@ Scope:
 - Runtime hot path: match-on-reference before cloning in the consolidated
   `take_*` helper; single-pass replay index build (depends on Phase 1
   consolidation).
+- Carry unconsumed ready-event indexes in `CachedWorkflow` so a workflow
+  holding an unawaited handle across tasks (spawn early / await late) does not
+  cold-replay full history every task; Phase 1's cache drop on
+  `has_unconsumed_ready_events` is correct but pays cold replay per task for
+  the held-handle pattern. Benchmark the held-handle profile.
+- Detection hardening: error when a workflow reaches a terminal state while
+  un-replayed command events remain in loaded history (leftover command events
+  at terminal are always divergence; `peek_replay_command_event` makes the
+  check nearly free).
 
 Completion gate:
 Criterion baselines for replay throughput, activity claim/complete, child
@@ -286,6 +295,8 @@ Status ledger:
 | Incomplete | Decision | 6D: remove write-only shard journal + dead tables | Missing: removal or explicit deferral rationale. |
 | Incomplete | Work | 6E: operational-row cleanup for terminal runs | Missing: cleanup implementation + conformance. |
 | Incomplete | Work | 6F: runtime match-before-clone + single-pass index build | Missing: hot-path refactor. |
+| Incomplete | Work | 6G: cached unconsumed-index carryover (held-handle cold-replay cost) | Missing: `CachedWorkflow` index carryover + held-handle benchmark. |
+| Incomplete | Work | 6H: terminal-with-leftover-command-events divergence check | Missing: check + regression test. |
 | Incomplete | Gate | Benchmarks show no regression, improvement on targets | Missing: Criterion evidence with baselines. |
 
 ## Phase 7: Production worker shape
