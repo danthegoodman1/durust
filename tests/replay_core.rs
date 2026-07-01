@@ -630,6 +630,19 @@ async fn select_fourth_signal(_: UnitInput) -> durust::Result<String> {
     Ok(outcome)
 }
 
+#[durust::workflow(name = "tests.select-two-signals", version = 1)]
+async fn select_two_signals(_: UnitInput) -> durust::Result<String> {
+    let outcome = durust::select! {
+        left = durust::signal::<String>("left") => {
+            format!("left:{}", left?)
+        }
+        right = durust::signal::<String>("right") => {
+            format!("right:{}", right?)
+        }
+    };
+    Ok(outcome)
+}
+
 #[durust::workflow(name = "tests.select-reorder", version = 1)]
 async fn select_then_wait(input: NumberInput) -> durust::Result<String> {
     let input = input.value;
@@ -2745,6 +2758,63 @@ fn select_signal_winner_cancels_losing_timer_wait() {
         assert_eq!(
             durust::decode_payload::<String>(result).unwrap(),
             "signal:go"
+        );
+    });
+}
+
+#[test]
+fn worker_batches_multiple_live_signal_requests_from_one_poll() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_two_signals>("wf/select-two-signals", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_two_signals)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow(
+                "wf/select-two-signals",
+                "right",
+                "signal/select/right",
+                "go",
+            )
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let batch_requests = backend.signal_batch_requests();
+        assert!(
+            batch_requests
+                .iter()
+                .any(|request| request.requests.len() == 2),
+            "expected one batched signal inbox read with two requests, got {batch_requests:?}"
+        );
+
+        let history = stream_all(&backend.inner, &run_id).await;
+        assert_eq!(history.len(), 4);
+        let HistoryEventData::SignalConsumed(consumed) = &history[1].data else {
+            panic!("expected SignalConsumed");
+        };
+        assert_eq!(
+            consumed.signal_id,
+            durust::SignalId::new("signal/select/right")
+        );
+        let HistoryEventData::SelectWinner(winner) = &history[2].data else {
+            panic!("expected SelectWinner");
+        };
+        assert_eq!(winner.branch_ordinal, 1);
+        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
+            panic!("select workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "right:go"
         );
     });
 }
@@ -5427,6 +5497,7 @@ fn double_plus_one_claim_options() -> ClaimWorkflowTaskOptions {
 struct RecordingBackend {
     inner: MemoryBackend,
     stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
+    signal_batch_requests: Arc<Mutex<Vec<durust::ReadSignalInboxesRequest>>>,
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
     claim_prefetch_enabled: bool,
@@ -5437,6 +5508,7 @@ impl RecordingBackend {
         Self {
             inner,
             stream_requests: Arc::new(Mutex::new(Vec::new())),
+            signal_batch_requests: Arc::new(Mutex::new(Vec::new())),
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
             claim_prefetch_enabled: true,
@@ -5454,6 +5526,10 @@ impl RecordingBackend {
 
     fn stream_requests(&self) -> Vec<durust::StreamHistoryRequest> {
         self.stream_requests.lock().unwrap().clone()
+    }
+
+    fn signal_batch_requests(&self) -> Vec<durust::ReadSignalInboxesRequest> {
+        self.signal_batch_requests.lock().unwrap().clone()
     }
 
     fn conflict_next_commit(&self) {
@@ -5575,6 +5651,14 @@ impl DurableBackend for RecordingBackend {
         req: durust::ReadSignalInboxRequest,
     ) -> BoxFuture<'static, durust::Result<Option<durust::SignalInboxRecord>>> {
         self.inner.read_signal_inbox(req)
+    }
+
+    fn read_signal_inboxes(
+        &self,
+        req: durust::ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::SignalInboxRecord>>>> {
+        self.signal_batch_requests.lock().unwrap().push(req.clone());
+        self.inner.read_signal_inboxes(req)
     }
 
     fn fire_due_timers(

@@ -1386,6 +1386,32 @@ where
         signal_payload
     );
     assert!(matches!(signal.payload, durust::PayloadRef::Inline { .. }));
+    let signal_batch = backend
+        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+            requests: vec![
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("missing"),
+                },
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("payload"),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(signal_batch.len(), 2);
+    assert!(signal_batch[0].is_none());
+    let batched_signal = signal_batch[1].as_ref().expect("batched signal payload");
+    assert_eq!(
+        durust::decode_payload::<String>(&batched_signal.payload).unwrap(),
+        signal_payload
+    );
+    assert!(matches!(
+        batched_signal.payload,
+        durust::PayloadRef::Inline { .. }
+    ));
 
     let history = backend
         .stream_history(durust::StreamHistoryRequest {
@@ -3144,6 +3170,59 @@ where
         .await
         .unwrap();
     assert_eq!(second, durust::SignalWorkflowOutcome::Accepted);
+    let other = client
+        .signal_workflow("wf/signal-inbox", "other", "signal/inbox/other", "other")
+        .await
+        .unwrap();
+    assert_eq!(other, durust::SignalWorkflowOutcome::Accepted);
+
+    let batch = backend
+        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+            requests: vec![
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("ready"),
+                },
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("missing"),
+                },
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("other"),
+                },
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("ready"),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(batch.len(), 4);
+    let first_batch = batch[0].as_ref().expect("first ready signal");
+    assert_eq!(
+        first_batch.signal_id,
+        durust::SignalId::new("signal/inbox/1")
+    );
+    assert_eq!(
+        durust::decode_payload::<String>(&first_batch.payload).unwrap(),
+        "first"
+    );
+    assert!(batch[1].is_none());
+    let other_batch = batch[2].as_ref().expect("other signal");
+    assert_eq!(
+        other_batch.signal_id,
+        durust::SignalId::new("signal/inbox/other")
+    );
+    assert_eq!(
+        durust::decode_payload::<String>(&other_batch.payload).unwrap(),
+        "other"
+    );
+    assert_eq!(
+        batch[3].as_ref().expect("repeated ready request").signal_id,
+        durust::SignalId::new("signal/inbox/1")
+    );
 
     let first_inbox = backend
         .read_signal_inbox(durust::ReadSignalInboxRequest {
@@ -3203,7 +3282,7 @@ where
 
     let second_inbox = backend
         .read_signal_inbox(durust::ReadSignalInboxRequest {
-            run_id,
+            run_id: run_id.clone(),
             signal_name: durust::SignalName::new("ready"),
         })
         .await
@@ -3212,6 +3291,36 @@ where
     assert_eq!(
         second_inbox.signal_id,
         durust::SignalId::new("signal/inbox/2")
+    );
+
+    let post_consume_batch = backend
+        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+            requests: vec![
+                durust::ReadSignalInboxRequest {
+                    run_id: run_id.clone(),
+                    signal_name: durust::SignalName::new("ready"),
+                },
+                durust::ReadSignalInboxRequest {
+                    run_id,
+                    signal_name: durust::SignalName::new("other"),
+                },
+            ],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        post_consume_batch[0]
+            .as_ref()
+            .expect("second ready signal")
+            .signal_id,
+        durust::SignalId::new("signal/inbox/2")
+    );
+    assert_eq!(
+        post_consume_batch[1]
+            .as_ref()
+            .expect("other signal remains unconsumed")
+            .signal_id,
+        durust::SignalId::new("signal/inbox/other")
     );
 }
 

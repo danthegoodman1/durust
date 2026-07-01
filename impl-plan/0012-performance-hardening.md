@@ -36,6 +36,32 @@ size are recorded with the measured result.
 - Provider startup/rebuild throughput.
 - Regression thresholds and documented benchmark invocation.
 
+## Signal Batch Read API Budget
+
+Existing primitive composition is repeated scalar `read_signal_inbox` calls for
+each live signal request produced by one workflow poll. That preserves
+correctness, but a `select!`, `join!`, or `join_all` over multiple signal names
+can create avoidable provider round trips before the workflow task can commit.
+
+`DurableBackend::read_signal_inboxes` is an optional provider method with a
+scalar default implementation. It is not an application API. It earns backend
+surface only as a hot-path provider optimization that preserves these
+invariants:
+
+- each input request maps to exactly one output slot in request order;
+- each output is the lowest unconsumed provider-sequence signal for that
+  request's `(run_id, signal_name)`;
+- the read is non-consuming, with consumption remaining atomic in
+  `commit_workflow_task.consume_signals`;
+- missing signals are represented as `None` without changing request order;
+- providers can implement the method generically without exposing storage
+  tables or coupling workflow-task claims to signal names.
+
+Coverage belongs in shared provider conformance for duplicate signal ids,
+multiple signal names, missing signals, ordering, and non-consuming reads, plus
+worker/replay coverage that multiple live signal requests from one poll use the
+batch path.
+
 ## Current State
 
 Implemented:
@@ -68,6 +94,12 @@ Implemented:
   `--child-map-max-in-flight`. It exercises compact parent history, provider
   map descriptors, child start materialization, result manifest writes, and
   ordered child-map completion accounting across memory, SQLite, and Postgres.
+- `durust-benchmark-workload --mode signal-batch`, a focused signal-read
+  workload with configurable `--signal-batch-width`. It starts workflows after
+  pre-buffering multiple named signals so one workflow poll produces multiple
+  live signal requests. A benchmark-only `--force-scalar-signal-reads` option
+  forces the old scalar read shape for same-binary Postgres comparisons without
+  changing runtime behavior.
 - `durust-benchmark-workload --mode postgres-write-ceiling`, a Postgres-only
   diagnostic that exercises a comparable transactional write shape without the
   Durust runtime. It records the same Postgres stats envelope as the mixed
@@ -177,9 +209,10 @@ Implemented:
 Remaining:
 
 - Add comparable benchmark support for additional modes: bare, activity,
-  signal, timer, child, activity map, payload refs, recovery, and cached wake
-  under recovery load. Child workflow map fanout now has an initial workload
-  mode; checked-in thresholds remain pending measured baselines.
+  broader signal-heavy profiles, timer, child, activity map, payload refs,
+  recovery, and cached wake under recovery load. Child workflow map fanout and
+  focused signal batching now have initial workload modes; checked-in
+  thresholds remain pending measured baselines.
 - Extend target-architecture write-combining into the remaining hot scalar
   paths: signal send/read, timer maintenance, activity-map item completion,
   child-map item completion, and payload-ref materialization where the provider

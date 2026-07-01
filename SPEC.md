@@ -1392,6 +1392,11 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: ReadSignalInboxRequest,
     ) -> durust::Result<Option<SignalInboxRecord>>;
 
+    async fn read_signal_inboxes(
+        &self,
+        req: ReadSignalInboxesRequest,
+    ) -> durust::Result<Vec<Option<SignalInboxRecord>>>;
+
     async fn fire_due_timers(
         &self,
         req: FireDueTimersRequest,
@@ -1440,7 +1445,7 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
 }
 ```
 
-`read_signal_inbox` is a live-tail read for workflow code that reaches `signal(...)` after replay has caught up. It must return a bounded result, usually one record, and it must not mark the signal consumed. Consumption happens only through `commit_workflow_task.consume_signals` in the same atomic commit that appends the corresponding `SignalConsumed` replay fact.
+`read_signal_inbox` is a live-tail read for workflow code that reaches `signal(...)` after replay has caught up. It must return a bounded result, usually one record, and it must not mark the signal consumed. `read_signal_inboxes` is the provider-neutral batch form for multiple live signal requests produced by one workflow poll; it returns one optional record per request in request order and has the same non-consuming semantics. Consumption happens only through `commit_workflow_task.consume_signals` in the same atomic commit that appends the corresponding `SignalConsumed` replay fact.
 
 Claim options carry local worker capabilities so providers do not hand out tasks that the worker cannot execute:
 

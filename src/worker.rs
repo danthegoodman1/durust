@@ -2,11 +2,12 @@ use crate::{
     ActivityHeartbeatRequest, ClaimActivityOptions, ClaimActivityTasksOptions,
     ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, CompleteActivityRequest, DurableBackend,
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
-    Namespace, NewHistoryEvent, ReadSignalInboxRequest, Registry, Result, RunDueMaintenanceRequest,
-    RunId, ShardId, StartWorkflowRequest, TaskQueue, TimeoutDueActivitiesRequest, TimestampMs,
-    WorkerId, Workflow, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
-    WorkflowChangeVersionStatus, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
+    Namespace, NewHistoryEvent, ReadSignalInboxRequest, ReadSignalInboxesRequest, Registry, Result,
+    RunDueMaintenanceRequest, RunId, ShardId, StartWorkflowRequest, TaskQueue,
+    TimeoutDueActivitiesRequest, TimestampMs, WorkerId, Workflow, WorkflowChangeMarkerKind,
+    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease,
+    poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
 use serde::Serialize;
@@ -1069,15 +1070,28 @@ where
             let poll = poll_cached(future, context);
             let signal_requests = context.take_signal_requests();
             if !signal_requests.is_empty() {
+                let inbox_requests = signal_requests
+                    .iter()
+                    .map(|request| ReadSignalInboxRequest {
+                        run_id: run_id.clone(),
+                        signal_name: request.signal_name.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let signals = self
+                    .backend
+                    .read_signal_inboxes(ReadSignalInboxesRequest {
+                        requests: inbox_requests,
+                    })
+                    .await?;
+                if signals.len() != signal_requests.len() {
+                    return Err(Error::Backend(format!(
+                        "backend returned {} signal inbox records for {} requests",
+                        signals.len(),
+                        signal_requests.len()
+                    )));
+                }
                 let mut fulfilled = false;
-                for request in signal_requests {
-                    let signal = self
-                        .backend
-                        .read_signal_inbox(ReadSignalInboxRequest {
-                            run_id: run_id.clone(),
-                            signal_name: request.signal_name,
-                        })
-                        .await?;
+                for (request, signal) in signal_requests.into_iter().zip(signals) {
                     let signal = signal.map(|signal| crate::runtime::SignalInboxRecordForRuntime {
                         signal_id: signal.signal_id,
                         signal_name: signal.signal_name,

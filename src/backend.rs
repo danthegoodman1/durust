@@ -125,6 +125,20 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         req: ReadSignalInboxRequest,
     ) -> BoxFuture<'static, Result<Option<SignalInboxRecord>>>;
 
+    fn read_signal_inboxes(
+        &self,
+        req: ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, Result<Vec<Option<SignalInboxRecord>>>> {
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut records = Vec::with_capacity(req.requests.len());
+            for request in req.requests {
+                records.push(backend.read_signal_inbox(request).await?);
+            }
+            Ok(records)
+        })
+    }
+
     fn fire_due_timers(
         &self,
         req: FireDueTimersRequest,
@@ -477,6 +491,11 @@ pub enum SignalWorkflowOutcome {
 pub struct ReadSignalInboxRequest {
     pub run_id: RunId,
     pub signal_name: SignalName,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReadSignalInboxesRequest {
+    pub requests: Vec<ReadSignalInboxRequest>,
 }
 
 #[derive(Clone, Debug)]

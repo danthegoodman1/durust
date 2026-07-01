@@ -19,13 +19,13 @@ use crate::{
     HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, Namespace, ParentClosePolicy,
     PayloadBlob, PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef,
     PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome,
-    QueryProjectionRequest, ReadSignalInboxRequest, Result, RunDueMaintenanceOutcome,
-    RunDueMaintenanceRequest, RunId, ShardId, SignalInboxRecord, SignalWorkflowOutcome,
-    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
+    QueryProjectionRequest, ReadSignalInboxRequest, ReadSignalInboxesRequest, Result,
+    RunDueMaintenanceOutcome, RunDueMaintenanceRequest, RunId, ShardId, SignalInboxRecord,
+    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
+    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
     encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
@@ -1018,6 +1018,14 @@ impl DurableBackend for PostgresBackend {
     ) -> BoxFuture<'static, Result<Option<SignalInboxRecord>>> {
         let backend = self.clone();
         Box::pin(async move { backend.read_signal_inbox_inner(req).await })
+    }
+
+    fn read_signal_inboxes(
+        &self,
+        req: ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, Result<Vec<Option<SignalInboxRecord>>>> {
+        let backend = self.clone();
+        Box::pin(async move { backend.read_signal_inboxes_inner(req).await })
     }
 
     fn fire_due_timers(
@@ -3216,6 +3224,95 @@ impl PostgresBackend {
             signal_name: crate::SignalName::new(signal_name),
             payload,
         }))
+    }
+
+    async fn read_signal_inboxes_inner(
+        &self,
+        req: ReadSignalInboxesRequest,
+    ) -> Result<Vec<Option<SignalInboxRecord>>> {
+        if req.requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let run_ids = req
+            .requests
+            .iter()
+            .map(|request| request.run_id.0.clone())
+            .collect::<Vec<_>>();
+        let signal_names = req
+            .requests
+            .iter()
+            .map(|request| request.signal_name.0.clone())
+            .collect::<Vec<_>>();
+        let schema = self.schema_sql();
+        let rows = {
+            let client = self.client().await?;
+            client
+                .query(
+                    &format!(
+                        "with requests as (
+                             select request_index, run_id, signal_name
+                             from unnest($1::text[], $2::text[])
+                                  with ordinality as request_rows(run_id, signal_name, request_index)
+                         )
+                         select requests.request_index,
+                                signal_rows.signal_id,
+                                signal_rows.signal_name,
+                                signal_rows.payload
+                         from requests
+                         left join lateral (
+                             select signal_id, signal_name, payload
+                             from {schema}.signals
+                             where run_id = requests.run_id
+                               and signal_name = requests.signal_name
+                               and consumed = false
+                             order by received_sequence asc
+                             limit 1
+                         ) signal_rows on true
+                         order by requests.request_index asc"
+                    ),
+                    &[&run_ids, &signal_names],
+                )
+                .await
+                .map_err(postgres_error)?
+        };
+
+        let mut records = vec![None; req.requests.len()];
+        for row in rows {
+            let request_index: i64 = row.get(0);
+            let Some(signal_id) = row.get::<_, Option<String>>(1) else {
+                continue;
+            };
+            let signal_name: String = row
+                .get::<_, Option<String>>(2)
+                .ok_or_else(|| Error::PayloadDecode("signal row missing signal_name".to_owned()))?;
+            let payload: Vec<u8> = row
+                .get::<_, Option<Vec<u8>>>(3)
+                .ok_or_else(|| Error::PayloadDecode("signal row missing payload".to_owned()))?;
+            let payload: PayloadRef = rmp_serde::from_slice(&payload)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let payload = self.hydrate_payload_from_storage(payload).await?;
+            let zero_based = request_index
+                .checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    Error::Backend(format!(
+                        "postgres returned invalid signal request index {request_index}"
+                    ))
+                })?;
+            let slot = records.get_mut(zero_based).ok_or_else(|| {
+                Error::Backend(format!(
+                    "postgres returned out-of-range signal request index {request_index}"
+                ))
+            })?;
+            *slot = Some(SignalInboxRecord {
+                signal_id: crate::SignalId::new(signal_id),
+                signal_name: crate::SignalName::new(signal_name),
+                payload,
+            });
+        }
+
+        Ok(records)
     }
 
     async fn fire_due_timers_inner(

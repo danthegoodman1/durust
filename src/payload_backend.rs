@@ -11,10 +11,11 @@ use crate::{
     HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
     PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
     PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
-    Result, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
-    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, WorkerId,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskRelease, digest_bytes,
+    ReadSignalInboxesRequest, Result, SignalInboxRecord, SignalWorkflowOutcome,
+    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
+    TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
+    WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
+    digest_bytes,
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
@@ -237,6 +238,27 @@ where
             };
             let payload = hydrate_payload_ref(&blob_store, record.payload).await?;
             Ok(Some(SignalInboxRecord { payload, ..record }))
+        })
+    }
+
+    fn read_signal_inboxes(
+        &self,
+        req: ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, Result<Vec<Option<SignalInboxRecord>>>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let records = inner.read_signal_inboxes(req).await?;
+            let mut hydrated = Vec::with_capacity(records.len());
+            for record in records {
+                let Some(record) = record else {
+                    hydrated.push(None);
+                    continue;
+                };
+                let payload = hydrate_payload_ref(&blob_store, record.payload).await?;
+                hydrated.push(Some(SignalInboxRecord { payload, ..record }));
+            }
+            Ok(hydrated)
         })
     }
 

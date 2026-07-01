@@ -66,10 +66,13 @@ struct BenchmarkOptions {
     worker_round_passes: Option<usize>,
     child_map_items: u64,
     child_map_max_in_flight: usize,
+    signal_batch_width: usize,
     max_rounds: usize,
     keep_db: bool,
     #[serde(skip_serializing_if = "is_false")]
     sample_resources: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    force_scalar_signal_reads: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     postgres_pool_size: Option<usize>,
     json: bool,
@@ -539,14 +542,19 @@ where
 {
     inner: B,
     metrics: BackendMetrics,
+    force_scalar_signal_reads: bool,
 }
 
 impl<B> MeasuredBackend<B>
 where
     B: DurableBackend,
 {
-    fn new(inner: B, metrics: BackendMetrics) -> Self {
-        Self { inner, metrics }
+    fn new(inner: B, metrics: BackendMetrics, force_scalar_signal_reads: bool) -> Self {
+        Self {
+            inner,
+            metrics,
+            force_scalar_signal_reads,
+        }
     }
 }
 
@@ -834,6 +842,44 @@ where
                 "read_signal_inbox",
                 started.elapsed(),
                 items,
+                result.is_ok(),
+            );
+            result
+        })
+    }
+
+    fn read_signal_inboxes(
+        &self,
+        req: durust::ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::SignalInboxRecord>>>> {
+        let inner = self.inner.clone();
+        let metrics = self.metrics.clone();
+        let force_scalar_signal_reads = self.force_scalar_signal_reads;
+        Box::pin(async move {
+            if force_scalar_signal_reads {
+                let mut records = Vec::with_capacity(req.requests.len());
+                for request in req.requests {
+                    let started = Instant::now();
+                    let result = inner.read_signal_inbox(request).await;
+                    let duration = started.elapsed();
+                    let items = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|record| record.as_ref())
+                        .map_or(0, |_| 1);
+                    metrics.record_operation("read_signal_inbox", duration, items, result.is_ok());
+                    records.push(result?);
+                }
+                return Ok(records);
+            }
+
+            let requested = req.requests.len() as u64;
+            let started = Instant::now();
+            let result = inner.read_signal_inboxes(req).await;
+            metrics.record_operation(
+                "read_signal_inboxes",
+                started.elapsed(),
+                requested,
                 result.is_ok(),
             );
             result
@@ -1156,6 +1202,18 @@ struct ChildMapOutput {
     items: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SignalBatchInput {
+    index: u64,
+    width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SignalBatchOutput {
+    index: u64,
+    values: Vec<u64>,
+}
+
 #[durust::activity(name = "bench.workload.activity")]
 async fn benchmark_activity(input: ActivityInput) -> durust::Result<u64> {
     if input.delay_ms > 0 {
@@ -1236,6 +1294,18 @@ async fn benchmark_child_map_parent(input: ChildMapInput) -> durust::Result<Chil
     })
 }
 
+#[durust::workflow(name = "bench.workload.signal-batch", version = 1)]
+async fn benchmark_signal_batch(input: SignalBatchInput) -> durust::Result<SignalBatchOutput> {
+    let signals = (0..input.width)
+        .map(|offset| durust::signal::<u64>(format!("signal-{offset}")))
+        .collect::<Vec<_>>();
+    let values = durust::join_all(signals).await?;
+    Ok(SignalBatchOutput {
+        index: input.index,
+        values,
+    })
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -1279,9 +1349,11 @@ fn default_options() -> BenchmarkOptions {
         worker_round_passes: None,
         child_map_items: 32,
         child_map_max_in_flight: 8,
+        signal_batch_width: 8,
         max_rounds: DEFAULT_MAX_ROUNDS,
         keep_db: false,
         sample_resources: false,
+        force_scalar_signal_reads: false,
         postgres_pool_size: None,
         json: false,
     }
@@ -1362,6 +1434,10 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 options.child_map_max_in_flight =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
             }
+            "--signal-batch-width" => {
+                options.signal_batch_width =
+                    parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
+            }
             "--max-rounds" => {
                 options.max_rounds =
                     parse_positive_usize(next_arg(&mut args, flag, inline_value)?, flag)?;
@@ -1374,6 +1450,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
             }
             "--keep-db" => options.keep_db = true,
             "--sample-resources" => options.sample_resources = true,
+            "--force-scalar-signal-reads" => options.force_scalar_signal_reads = true,
             "--json" => options.json = true,
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown argument `{other}`")),
@@ -1398,14 +1475,20 @@ fn validate_supported_dimensions(options: &BenchmarkOptions) -> Result<(), Strin
     if options.backend != BenchmarkBackend::Postgres
         && options.mode != "mixed"
         && options.mode != "child-map"
+        && options.mode != "signal-batch"
     {
         return Err("only --backend postgres supports diagnostic modes".to_owned());
     }
+    if options.force_scalar_signal_reads && options.mode != "signal-batch" {
+        return Err(
+            "--force-scalar-signal-reads is only supported with --mode signal-batch".to_owned(),
+        );
+    }
     match options.mode.as_str() {
-        "mixed" | "child-map" | "postgres-write-ceiling" => {}
+        "mixed" | "child-map" | "signal-batch" | "postgres-write-ceiling" => {}
         other => {
             return Err(format!(
-                "unsupported benchmark mode `{other}`; expected mixed, child-map, or postgres-write-ceiling"
+                "unsupported benchmark mode `{other}`; expected mixed, child-map, signal-batch, or postgres-write-ceiling"
             ));
         }
     }
@@ -1464,12 +1547,13 @@ fn parse_positive_usize(value: String, flag: &str) -> Result<usize, String> {
 
 fn usage() -> String {
     format!(
-        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed|child-map|postgres-write-ceiling] \
+        "usage: durust-benchmark-workload [--backend sqlite|memory|postgres] [--mode mixed|child-map|signal-batch|postgres-write-ceiling] \
          [--workflows {DEFAULT_WORKFLOWS}] [--workers {DEFAULT_WORKERS}] [--shards 1] \
          [--physical-partitions 1] [--activation-concurrency 1] \
          [--activation-prefetch-limit 1] \
          [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] [--worker-round-passes {DEFAULT_WORKER_ROUND_PASSES}] \
-         [--child-map-items 32] [--child-map-max-in-flight 8] \
+         [--child-map-items 32] [--child-map-max-in-flight 8] [--signal-batch-width 8] \
+         [--force-scalar-signal-reads] \
          [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json]"
     )
 }
@@ -2031,7 +2115,7 @@ where
     B: DurableBackend,
 {
     let metrics = BackendMetrics::default();
-    let backend = MeasuredBackend::new(backend, metrics.clone());
+    let backend = MeasuredBackend::new(backend, metrics.clone(), options.force_scalar_signal_reads);
     let resource_sampler = options
         .sample_resources
         .then(|| ResourceSampler::start(Duration::from_millis(100)))
@@ -2212,6 +2296,7 @@ fn nominal_workflow_task_target(options: &BenchmarkOptions) -> Result<usize, Str
         .map_err(|_| format!("workflow count {} does not fit usize", options.workflows))?;
     let per_workflow = match options.mode.as_str() {
         "mixed" => 8,
+        "signal-batch" => 1,
         "child-map" => {
             let items = usize::try_from(options.child_map_items).map_err(|_| {
                 format!(
@@ -2290,6 +2375,29 @@ where
                     .await
                     .map_err(|err| err.to_string())?
             }
+            "signal-batch" => {
+                let input = SignalBatchInput {
+                    index,
+                    width: options.signal_batch_width,
+                };
+                let run_id = client
+                    .start_workflow::<benchmark_signal_batch>(&workflow_id, WORKFLOW_QUEUE, input)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                for offset in 0..options.signal_batch_width {
+                    client
+                        .signal_workflow(
+                            &workflow_id,
+                            format!("signal-{offset}"),
+                            format!("signal-batch-{index}-{offset}"),
+                            signal_batch_value(index, offset),
+                        )
+                        .await
+                        .map_err(|err| err.to_string())?;
+                    signals += 1;
+                }
+                run_id
+            }
             other => return Err(format!("unsupported benchmark mode `{other}`")),
         };
         runs.push(ExpectedRun { run_id, index });
@@ -2335,6 +2443,7 @@ where
         .activity_completion_batch_size(options.activity_completion_batch)
         .register_workflow(benchmark_parent)
         .register_workflow(benchmark_child_map_parent)
+        .register_workflow(benchmark_signal_batch)
         .register_workflow(benchmark_child)
         .register_activity(benchmark_activity);
     if options.backend == BenchmarkBackend::Postgres && options.shards > 1 {
@@ -2527,6 +2636,22 @@ where
                             ));
                         }
                     }
+                    "signal-batch" => {
+                        let output = durust::decode_payload::<SignalBatchOutput>(result)
+                            .map_err(|err| err.to_string())?;
+                        let expected_output = SignalBatchOutput {
+                            index: expected.index,
+                            values: (0..options.signal_batch_width)
+                                .map(|offset| signal_batch_value(expected.index, offset))
+                                .collect(),
+                        };
+                        if output != expected_output {
+                            return Err(format!(
+                                "run {:?} completed with unexpected signal-batch output {output:?}, expected {expected_output:?}",
+                                expected.run_id
+                            ));
+                        }
+                    }
                     other => return Err(format!("unsupported benchmark mode `{other}`")),
                 }
                 completed += 1;
@@ -2555,7 +2680,7 @@ fn assert_workload_stats(stats: &WorkerRunStats, options: &BenchmarkOptions) -> 
             "expected at least one workflow task per workflow, got {stats:?}"
         ));
     }
-    if stats.activity_tasks == 0 {
+    if options.mode != "signal-batch" && stats.activity_tasks == 0 {
         return Err(format!("expected activity work, got {stats:?}"));
     }
     if options.mode == "mixed" && stats.timers_fired == 0 {
@@ -2594,6 +2719,7 @@ fn counters_from_stats(
             counters.child_completions = counters.child_starts;
             counters.child_activities = counters.child_starts;
         }
+        "signal-batch" => {}
         _ => {}
     }
     counters
@@ -2608,6 +2734,11 @@ fn expected_child_map_sum(index: u64, items: u64) -> u64 {
                 .saturating_mul(10),
         )
     })
+}
+
+fn signal_batch_value(index: u64, offset: usize) -> u64 {
+    let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+    index.saturating_mul(1_000_000).saturating_add(offset)
 }
 
 impl From<WorkerRunStats> for WorkerStatsReport {
@@ -3317,6 +3448,8 @@ mod tests {
         assert_eq!(options.activation_concurrency, 1);
         assert_eq!(options.activation_prefetch_limit, 1);
         assert_eq!(options.activity_completion_batch, 1);
+        assert_eq!(options.signal_batch_width, 8);
+        assert!(!options.force_scalar_signal_reads);
     }
 
     #[test]
@@ -3380,6 +3513,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_signal_batch_mode_and_scalar_comparison_flag() {
+        let options = parse_args([
+            "--backend".to_owned(),
+            "postgres".to_owned(),
+            "--mode".to_owned(),
+            "signal-batch".to_owned(),
+            "--signal-batch-width".to_owned(),
+            "4".to_owned(),
+            "--force-scalar-signal-reads".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(options.backend, BenchmarkBackend::Postgres);
+        assert_eq!(options.mode, "signal-batch");
+        assert_eq!(options.signal_batch_width, 4);
+        assert!(options.force_scalar_signal_reads);
+
+        let err = parse_args([
+            "--backend".to_owned(),
+            "postgres".to_owned(),
+            "--mode".to_owned(),
+            "mixed".to_owned(),
+            "--force-scalar-signal-reads".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(err.contains("only supported with --mode signal-batch"));
+    }
+
+    #[test]
     fn rejects_diagnostic_modes_for_non_postgres_backends() {
         let err = parse_args([
             "--backend".to_owned(),
@@ -3397,6 +3558,10 @@ mod tests {
         options.workflows = 4;
         assert_eq!(nominal_workflow_task_target(&options).unwrap(), 32);
 
+        options.mode = "signal-batch".to_owned();
+        assert_eq!(nominal_workflow_task_target(&options).unwrap(), 4);
+
+        options.mode = "mixed".to_owned();
         options.workflows = u64::MAX;
         let err = nominal_workflow_task_target(&options).unwrap_err();
         assert!(err.contains("does not fit usize") || err.contains("overflowed"));
@@ -3457,5 +3622,33 @@ mod tests {
         assert_eq!(result.counters.child_completions, 4);
         assert_eq!(result.mixed_actions, 32);
         assert_eq!(result.worker_stats.workflow_tasks, 32);
+    }
+
+    #[test]
+    fn memory_signal_batch_workload_records_requested_slots() {
+        let mut options = default_options();
+        options.backend = BenchmarkBackend::Memory;
+        options.mode = "signal-batch".to_owned();
+        options.workflows = 4;
+        options.workers = 2;
+        options.batch = 16;
+        options.signal_batch_width = 3;
+        options.max_rounds = 100;
+
+        let result = run_memory_benchmark(options).unwrap();
+        assert!(result.correct);
+        assert_eq!(result.completed_workflows, 4);
+        assert_eq!(result.counters.workflow_starts, 4);
+        assert_eq!(result.counters.signals, 12);
+        assert_eq!(result.mixed_actions, 16);
+        assert_eq!(result.worker_stats.workflow_tasks, 4);
+        let read = result
+            .processing_backend_metrics
+            .operations
+            .get("read_signal_inboxes")
+            .expect("signal batch read metrics");
+        assert_eq!(read.calls, 4);
+        assert_eq!(read.items, 12);
+        assert_eq!(read.items_per_call, 3.0);
     }
 }
