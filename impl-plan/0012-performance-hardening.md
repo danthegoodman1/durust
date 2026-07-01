@@ -217,6 +217,16 @@ Remaining:
   paths: signal send/read, timer maintenance, activity-map item completion,
   child-map item completion, and payload-ref materialization where the provider
   can batch without weakening per-run fencing, event ordering, or crash safety.
+  A Phase 6 child-map indexing diagnostic,
+  `target/loop-phase6-child-map-small-run-1.json`, completed correctly with 40
+  workflows and 1,280 child starts/completions, but recorded 12 Postgres
+  deadlocks and workflow commit p95/p99 72.08/1070.72ms; two higher-concurrency
+  child-map attempts failed before JSON output with SQLSTATE 40P01. The measured
+  hot path is primary-key row-lock contention on
+  `child_workflow_maps where map_command_id = $1 for update`, so the follow-up
+  is child-map completion/materialization lock ordering, batching, or
+  transaction-shape work rather than an index experiment unless a cancellation
+  benchmark later proves `workflow_instances.parent_run_id` scans hot.
 - Finish `0013-postgres-shard-native.md` snapshot/journal-tail rebuild before
   recommending the high-shard Postgres layout as the recovery architecture; the
   checked-in high-shard baseline currently proves scale-out for claim/commit
