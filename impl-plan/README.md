@@ -23,6 +23,7 @@ affected plan file.
 11. [`0012-performance-hardening.md`](0012-performance-hardening.md)
 12. [`0013-postgres-shard-native.md`](0013-postgres-shard-native.md)
 13. [`0014-typescript-parity.md`](0014-typescript-parity.md)
+14. [`0015-review-remediation.md`](0015-review-remediation.md)
 
 ## Shared Gate
 
