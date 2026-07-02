@@ -629,9 +629,28 @@ pub struct WorkflowChangeVersionRecord {
     pub last_seen_at: TimestampMs,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Grace period protecting blobs uploaded by in-flight commits. Blob uploads
+/// happen before the durable commit that makes them reachable, so GC must
+/// never delete a blob younger than the longest plausible upload-to-commit
+/// window plus the GC scan itself. One hour dwarfs both.
+pub const DEFAULT_PAYLOAD_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Debug)]
 pub struct PayloadGarbageCollectionRequest {
     pub dry_run: bool,
+    /// Blobs whose last-modified timestamp is younger than this are never
+    /// deleted, regardless of reachability. `Duration::ZERO` disables the
+    /// grace period (test-only; unsafe with concurrent writers).
+    pub min_age: Duration,
+}
+
+impl Default for PayloadGarbageCollectionRequest {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            min_age: DEFAULT_PAYLOAD_GC_MIN_AGE,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -663,6 +682,9 @@ pub struct PayloadGarbageCollectionOutcome {
     pub scanned_blobs: usize,
     pub retained_blobs: usize,
     pub deleted_blobs: usize,
+    /// Garbage blobs whose deletion failed. The sweep records them and
+    /// continues instead of aborting; they stay candidates for the next run.
+    pub failed_blobs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

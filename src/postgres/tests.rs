@@ -357,7 +357,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .await
         .unwrap();
         assert_eq!(backend.schema(), schema);
-        assert_eq!(backend.schema_version().await.unwrap(), 2);
+        assert_eq!(backend.schema_version().await.unwrap(), 3);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -2459,45 +2459,93 @@ fn postgres_payload_roots_and_gc_when_configured() {
             )
         }));
 
-        let orphan_bytes = b"postgres unreachable payload".to_vec();
-        let orphan_digest = digest_bytes(&orphan_bytes);
-        let client = backend.client().await.unwrap();
-        let orphan_codec = "messagepack".to_owned();
-        let orphan_schema = "test.orphan".to_owned();
-        let orphan_compression = "none".to_owned();
-        client
-            .execute(
-                &format!(
-                    "insert into {}.payload_blobs
-                         (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                         values ($1, $2, $3, $4, null, $5, $6)",
-                    quote_ident(&schema)
-                ),
-                &[
-                    &orphan_digest,
-                    &orphan_codec,
-                    &orphan_schema,
-                    &orphan_compression,
-                    &i64::try_from(orphan_bytes.len()).unwrap_or(i64::MAX),
-                    &orphan_bytes,
-                ],
-            )
-            .await
-            .unwrap();
+        // Two unreachable orphans: one predating the grace period (the column
+        // default 0 is the epoch) and one freshly written, standing in for a
+        // blob an in-flight commit deduplicated against.
+        let insert_orphan = |suffix: &str, created_at_ms: i64| {
+            let bytes = format!("postgres unreachable payload {suffix}").into_bytes();
+            let digest = digest_bytes(&bytes);
+            let schema = quote_ident(&schema);
+            let backend = backend.clone();
+            async move {
+                let client = backend.client().await.unwrap();
+                client
+                    .execute(
+                        &format!(
+                            "insert into {schema}.payload_blobs
+                             (digest, codec, schema_fingerprint, compression, encryption, size,
+                              bytes, created_at_ms)
+                             values ($1, 'messagepack', 'test.orphan', 'none', null, $2, $3, $4)",
+                        ),
+                        &[
+                            &digest,
+                            &i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                            &bytes,
+                            &created_at_ms,
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                digest
+            }
+        };
+        let old_orphan = insert_orphan("old", 0).await;
+        let young_orphan = insert_orphan("young", crate::provider_util::unix_epoch_millis()).await;
 
+        // The default grace period deletes only the old orphan; the young one
+        // could belong to an in-flight commit.
         let dry_run = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: true,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(dry_run.deleted_blobs, 1);
-        assert!(dry_run.retained_blobs >= 1);
+        assert!(dry_run.retained_blobs >= 2);
         let collected = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: false })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
+        assert_eq!(collected.failed_blobs, 0);
+        let remaining = backend
+            .client()
+            .await
+            .unwrap()
+            .query(
+                &format!(
+                    "select digest from {}.payload_blobs order by digest",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(!remaining.contains(&old_orphan));
+        assert!(remaining.contains(&young_orphan));
+
+        // A zero grace period restores unconditional collection of
+        // unreachable blobs, deleting the young orphan too.
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(collected.deleted_blobs, 1);
         let after = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert_eq!(after.deleted_blobs, 0);
@@ -2516,6 +2564,246 @@ fn postgres_payload_roots_and_gc_when_configured() {
             panic!("expected workflow start");
         };
         assert_eq!(crate::decode_payload::<String>(input).unwrap(), input_value);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+// Pins the `on conflict do update set created_at_ms` arm of the payload-blob
+// insert: a commit that deduplicates against an existing row must restart the
+// GC grace period for it, otherwise GC can collect a blob the commit just
+// referenced. The control orphan proves the same sweep still collects
+// backdated rows that were NOT re-put; the final zero-grace sweep proves the
+// retained blob was genuinely unreachable, so only the refreshed timestamp
+// protected it. Reverting the conflict arm to `do nothing` fails this test.
+#[test]
+fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres dedup GC refresh test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("dedup_refresh");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .payload_storage(PayloadStorageConfig::new().inline_threshold_bytes(64)),
+        )
+        .await
+        .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-dedup-refresh");
+        let workflow_type = WorkflowType::new("postgres.dedup-refresh", 1);
+        let queue = crate::TaskQueue::new("postgres-dedup-refresh-workflows");
+        let run_id = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+
+        let reused_value = "postgres-dedup-refresh-projection".repeat(8);
+        let reused_payload = crate::encode_payload(&reused_value).unwrap();
+        let reused_digest = digest_bytes(reused_payload.inline_bytes().unwrap());
+        let signal_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(1),
+        };
+        let signal_wait = crate::WaitRecord {
+            wait_id: crate::WaitId::new(format!("{}:1:signal", run_id.0)),
+            run_id: run_id.clone(),
+            command_id: signal_command_id,
+            kind: WaitKind::Signal,
+            key: "replace".to_owned(),
+            ready_at: None,
+        };
+        let wake_and_claim = |seq: u64| {
+            let backend = backend.clone();
+            let workflow_id = workflow_id.clone();
+            let run_id = run_id.clone();
+            let claim_opts = claim_opts.clone();
+            async move {
+                backend
+                    .signal_workflow(crate::SignalWorkflowRequest {
+                        namespace: crate::Namespace::default(),
+                        workflow_id,
+                        signal_id: crate::SignalId::new(format!("{}/replace/{seq}", run_id.0)),
+                        signal_name: crate::SignalName::new("replace"),
+                        payload: crate::encode_payload(&seq).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                let inbox = backend
+                    .read_signal_inbox(crate::ReadSignalInboxRequest {
+                        run_id,
+                        signal_name: crate::SignalName::new("replace"),
+                    })
+                    .await
+                    .unwrap()
+                    .expect("wake signal");
+                let claimed = backend
+                    .claim_workflow_task(
+                        WorkerId::new(format!("postgres-dedup-refresh-{seq}")),
+                        claim_opts,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("workflow task");
+                (claimed, inbox.signal_id)
+            }
+        };
+
+        // Commit 1 stores the projection blob and arms the signal wait.
+        let first_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-dedup-refresh-0"),
+                claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("first workflow task");
+        backend
+            .commit_workflow_task(
+                first_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    upsert_waits: vec![signal_wait],
+                    query_projection: Some(reused_payload.clone()),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Backdate the blob row past any grace period, standing in for an old
+        // orphan a later commit deduplicates against.
+        let updated = backend
+            .client()
+            .await
+            .unwrap()
+            .execute(
+                &format!(
+                    "update {}.payload_blobs set created_at_ms = 0 where digest = $1",
+                    quote_ident(&schema)
+                ),
+                &[&reused_digest],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "projection blob row should exist to backdate");
+
+        // Commit 2 re-puts the identical payload: the insert hits
+        // `on conflict(digest)` and must refresh `created_at_ms`.
+        let (second_claim, first_signal) = wake_and_claim(1).await;
+        backend
+            .commit_workflow_task(
+                second_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    consume_signals: vec![first_signal],
+                    query_projection: Some(reused_payload),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Commit 3 replaces the projection, making the reused blob
+        // unreachable: from here only its timestamp can protect it.
+        let (third_claim, second_signal) = wake_and_claim(2).await;
+        backend
+            .commit_workflow_task(
+                third_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    consume_signals: vec![second_signal],
+                    query_projection: Some(crate::encode_payload(&"replaced").unwrap()),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Control: a backdated row that is NOT re-put must be collected by the
+        // same sweep that retains the refreshed blob.
+        let control_bytes = b"postgres dedup refresh control orphan".to_vec();
+        let control_digest = digest_bytes(&control_bytes);
+        backend
+            .client()
+            .await
+            .unwrap()
+            .execute(
+                &format!(
+                    "insert into {}.payload_blobs
+                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes,
+                      created_at_ms)
+                     values ($1, 'messagepack', 'test.orphan', 'none', null, $2, $3, 0)",
+                    quote_ident(&schema)
+                ),
+                &[
+                    &control_digest,
+                    &i64::try_from(control_bytes.len()).unwrap_or(i64::MAX),
+                    &control_bytes,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            collected.deleted_blobs, 1,
+            "only the never-re-put control orphan is old garbage"
+        );
+        assert_eq!(collected.failed_blobs, 0);
+        let remaining = backend
+            .client()
+            .await
+            .unwrap()
+            .query(
+                &format!(
+                    "select digest from {}.payload_blobs order by digest",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.contains(&reused_digest),
+            "the re-put must have restarted the reused blob's grace period"
+        );
+        assert!(!remaining.contains(&control_digest));
+
+        // Zero grace collects the reused blob, proving it was unreachable and
+        // only the refreshed timestamp retained it above.
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(collected.deleted_blobs, 1);
 
         backend.drop_schema_for_tests().await.unwrap();
     });

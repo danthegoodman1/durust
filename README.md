@@ -697,11 +697,21 @@ activities or ordinary payload refs for larger values.
 The SQLite local-directory store is content-addressed and keeps large encoded
 bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
 use `PayloadBackend` so the async object-store implementation works across
-durability providers instead of being duplicated inside each provider. Providers
-also expose dry-run-capable payload GC that removes blobs no longer reachable
-from durable history or operational indexes; `PayloadBackend` applies the same
-contract to its external object store by asking the inner provider for generic
-payload roots and deleting only wrapper-owned unreachable objects.
+durability providers instead of being duplicated inside each provider. Blob URI
+ownership is exclusive: each provider resolves only refs carrying its own
+scheme and persists every other scheme opaquely, so custom `PayloadBlobStore`
+implementations work over any inner provider.
+
+Providers also expose dry-run-capable payload GC that removes blobs no longer
+reachable from durable history or operational indexes; `PayloadBackend` applies
+the same contract to its external object store by asking the inner provider for
+generic payload roots and deleting only wrapper-owned unreachable objects.
+Because blobs upload before the commit that makes them reachable, GC never
+deletes a blob younger than `PayloadGarbageCollectionRequest::min_age` (default
+one hour); stores that can cheaply refresh a blob's timestamp on a
+content-addressed re-put do so, while S3 skips the refresh and relies on the
+grace period exceeding the worst upload-to-commit latency plus one GC scan.
+Delete failures are recorded in the outcome and the sweep continues.
 
 To run the local Garage-backed S3 conformance test:
 

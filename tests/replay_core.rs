@@ -7,7 +7,7 @@ use durust::{
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -147,6 +147,11 @@ async fn large_payload_result(_: UnitInput) -> durust::Result<LargePayload> {
     Ok(LargePayload {
         bytes: vec![7; 64 * 1024],
     })
+}
+
+#[durust::activity(name = "tests.map-large-result")]
+async fn map_large_result(input: NumberInput) -> durust::Result<String> {
+    Ok(format!("{}:", input.value).repeat(2048))
 }
 
 #[durust::activity(name = "tests.version-a")]
@@ -876,6 +881,24 @@ async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
     })
 }
 
+#[durust::workflow(name = "tests.activity-map-large-results", version = 1)]
+async fn activity_map_large_results(input: ValuesInput) -> durust::Result<u64> {
+    let input_manifest =
+        durust::activity_map_manifest(input.values.into_iter().map(|value| NumberInput { value }))?;
+    let mapped = durust::activity_map(map_large_result)
+        .task_queue("map-activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("large-results")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    result_refs.iter().try_fold(0_u64, |total, payload| {
+        Ok(total + durust::decode_payload::<String>(payload)?.len() as u64)
+    })
+}
+
 macro_rules! child_workflow_map_sum_body {
     (
         $input:expr,
@@ -1303,6 +1326,220 @@ fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
             panic!("workflow did not complete after timer and activity result");
         };
         assert_eq!(durust::decode_payload::<usize>(result).unwrap(), 64 * 1024);
+    });
+}
+
+// Bug C pin: manifest levels offload independently, so an activity-map result
+// manifest can have an inline root while its item results are blob refs. The
+// pre-fix runtime short-circuited any inline payload past hydration, handing
+// the workflow raw blob refs that fail decode; the manifest hydrator must run
+// even for inline roots.
+#[test]
+fn inline_result_manifest_root_with_blob_item_results_hydrates_for_the_workflow() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        // Item results (~4 KiB) offload; pages and root hold compact refs and
+        // stay inline under the 2 KiB threshold.
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner.clone(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(2048),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_large_results>(
+                "wf/inline-root-blob-items",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("inline-root-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_large_results)
+            .register_activity(map_large_result)
+            .build();
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.activity_tasks, 3);
+
+        // Shape guard: the recorded manifest must actually be the Bug C shape
+        // (inline root and pages, blob item results); otherwise this test
+        // stops pinning the inline short-circuit.
+        let raw_events = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id: run_id.clone(),
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1_000_000),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let completed = raw_events
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ActivityMapCompleted(completed) => Some(completed),
+                _ => None,
+            })
+            .expect("activity map completed event");
+        assert!(
+            matches!(completed.result_manifest, durust::PayloadRef::Inline { .. }),
+            "result manifest root should be inline, got {:?}",
+            completed.result_manifest
+        );
+        let manifest: durust::ActivityMapResultManifest =
+            durust::decode_payload(&completed.result_manifest).unwrap();
+        for page in &manifest.pages {
+            assert!(
+                matches!(page, durust::PayloadRef::Inline { .. }),
+                "manifest page should be inline, got {page:?}"
+            );
+            let page: durust::ActivityMapResultPage = durust::decode_payload(page).unwrap();
+            for result in &page.results {
+                assert!(
+                    matches!(result, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("memory-blob://payload/")),
+                    "item result should be an offloaded blob ref, got {result:?}"
+                );
+            }
+        }
+
+        // The workflow observed every blob-backed item result and summed the
+        // decoded lengths: three single-digit values at "N:" x 2048.
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 3 * 4096);
+    });
+}
+
+// Perf pin: committing a ref that is already offloaded validates it with a
+// cheap existence probe instead of downloading and re-hashing the blob.
+#[test]
+fn commit_validates_already_offloaded_refs_without_downloading() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner,
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+        );
+        let run_id = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/offloaded-ref-commit"),
+                workflow_type: WorkflowType::new("tests.double-plus-one", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&"x".repeat(8 * 1024)).unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let raw_events = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+            panic!("expected workflow start event");
+        };
+        assert!(matches!(input, durust::PayloadRef::Blob { .. }));
+
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("offloaded-ref-committer"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                durust::WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: Vec::new(),
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: Some(input.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            blob_store.get_count(),
+            0,
+            "commit must not download already-offloaded refs"
+        );
+        assert!(
+            blob_store.exists_probe_count() >= 1,
+            "commit should validate the offloaded ref with an existence probe"
+        );
+    });
+}
+
+// Perf pin: the scheduling commit carries each map input manifest twice (the
+// history event and the operational task) but must rebuild and upload each
+// distinct blob at most once.
+#[test]
+fn activity_map_schedule_commit_uploads_each_manifest_blob_once() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner,
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_sum>(
+                "wf/map-put-once",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("map-put-once-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
+        assert_eq!(
+            blob_store.max_puts_for_one_digest(),
+            1,
+            "each manifest item, page, and root must upload at most once"
+        );
+        assert!(blob_store.put_count() >= 5);
     });
 }
 
@@ -6485,11 +6722,31 @@ fn lazy_payload_worker(
 struct CountingBlobStore {
     blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     gets: Arc<Mutex<usize>>,
+    puts_by_digest: Arc<Mutex<BTreeMap<String, usize>>>,
+    exists_probes: Arc<Mutex<usize>>,
 }
 
 impl CountingBlobStore {
     fn get_count(&self) -> usize {
         *self.gets.lock().unwrap()
+    }
+
+    fn exists_probe_count(&self) -> usize {
+        *self.exists_probes.lock().unwrap()
+    }
+
+    fn max_puts_for_one_digest(&self) -> usize {
+        self.puts_by_digest
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn put_count(&self) -> usize {
+        self.puts_by_digest.lock().unwrap().values().sum()
     }
 }
 
@@ -6500,7 +6757,13 @@ impl durust::PayloadBlobStore for CountingBlobStore {
         bytes: Vec<u8>,
     ) -> BoxFuture<'static, durust::Result<String>> {
         let blobs = self.blobs.clone();
+        let puts_by_digest = self.puts_by_digest.clone();
         Box::pin(async move {
+            *puts_by_digest
+                .lock()
+                .unwrap()
+                .entry(digest.clone())
+                .or_insert(0) += 1;
             blobs.lock().unwrap().insert(digest.clone(), bytes);
             Ok(format!("memory-blob://payload/{digest}"))
         })
@@ -6520,9 +6783,28 @@ impl durust::PayloadBlobStore for CountingBlobStore {
         })
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
         let blobs = self.blobs.clone();
-        Box::pin(async move { Ok(blobs.lock().unwrap().keys().cloned().collect()) })
+        let exists_probes = self.exists_probes.clone();
+        Box::pin(async move {
+            *exists_probes.lock().unwrap() += 1;
+            Ok(blobs.lock().unwrap().contains_key(&digest))
+        })
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            let now = durust::TimestampMs(0);
+            Ok(blobs
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|digest| (digest.clone(), now))
+                .collect())
+        })
     }
 
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {

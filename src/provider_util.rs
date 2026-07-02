@@ -225,6 +225,13 @@ pub(crate) fn ready_at_ms_for_delay(delay: Duration) -> i64 {
     }
 }
 
+/// GC grace-period cutoff: a blob last modified at or before this instant is
+/// old enough to delete. With `min_age` zero every existing blob qualifies,
+/// which is the pre-grace-period behavior tests use to force collection.
+pub(crate) fn payload_gc_cutoff_ms(now_ms: i64, min_age: Duration) -> i64 {
+    now_ms.saturating_sub(duration_millis_i64(min_age))
+}
+
 pub(crate) fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
     activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
 }

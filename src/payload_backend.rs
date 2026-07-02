@@ -13,15 +13,24 @@ use crate::{
     PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
     ReadSignalInboxesRequest, Result, SignalInboxRecord, SignalWorkflowOutcome,
     SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, WorkerId, WorkflowChangeVersionsOutcome,
+    TimeoutDueActivitiesRequest, TimestampMs, WorkerId, WorkflowChangeVersionsOutcome,
     WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
     digest_bytes,
+    provider_util::{payload_gc_cutoff_ms, unix_epoch_millis},
 };
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
+    /// Stores a content-addressed blob and returns its URI. A put for a digest
+    /// that already exists may skip the upload; stores that can cheaply refresh
+    /// the blob's last-modified timestamp on such a skip should do so, because
+    /// the GC grace period (`PayloadGarbageCollectionRequest::min_age`) is the
+    /// only thing protecting a deduplicated blob whose commit has not landed
+    /// yet. S3 skips the refresh: the grace period must exceed the maximum
+    /// upload-to-commit latency plus one GC scan, which the one-hour default
+    /// dwarfs.
     fn put_payload_blob(
         &self,
         digest: String,
@@ -30,7 +39,14 @@ pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
 
     fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>>;
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
+    /// Cheap existence probe (S3 HEAD, filesystem metadata). Used on the
+    /// commit path to validate already-offloaded refs without downloading
+    /// them; bytes are digest-validated at put and get time.
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>>;
+
+    /// Lists stored blobs with their last-modified timestamps so GC can apply
+    /// the minimum-age grace period.
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>>;
 
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
 
@@ -399,27 +415,40 @@ where
         let blob_store = self.blob_store.clone();
         Box::pin(async move {
             let roots = inner.payload_roots().await?;
-            let external_blobs = blob_store.list_payload_blob_digests().await?;
+            let external_blobs = blob_store.list_payload_blobs().await?;
             let mut reachable = BTreeSet::new();
             collect_reachable_external_blobs(&blob_store, roots.roots, &mut reachable).await?;
-            reachable.retain(|digest| external_blobs.contains(digest));
+            // Blob uploads precede the commit that makes them reachable, so an
+            // unreachable-but-young blob may belong to an in-flight commit.
+            // Only blobs older than the grace period are garbage.
+            let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
             let garbage = external_blobs
                 .iter()
-                .filter(|digest| !reachable.contains(*digest))
-                .cloned()
+                .filter(|(digest, last_modified)| {
+                    !reachable.contains(*digest) && last_modified.0 <= cutoff
+                })
+                .map(|(digest, _)| digest.clone())
                 .collect::<Vec<_>>();
             let inner_outcome = inner.gc_payload_blobs(req.clone()).await?;
+            let mut deleted_blobs = garbage.len();
+            let mut failed_blobs = 0_usize;
             if !req.dry_run {
+                deleted_blobs = 0;
                 for digest in &garbage {
-                    blob_store.delete_payload_blob(digest.clone()).await?;
+                    match blob_store.delete_payload_blob(digest.clone()).await {
+                        Ok(()) => deleted_blobs += 1,
+                        Err(_) => failed_blobs += 1,
+                    }
                 }
             }
+            let scanned = external_blobs.len();
             Ok(PayloadGarbageCollectionOutcome {
-                scanned_blobs: inner_outcome
-                    .scanned_blobs
-                    .saturating_add(external_blobs.len()),
-                retained_blobs: inner_outcome.retained_blobs.saturating_add(reachable.len()),
-                deleted_blobs: inner_outcome.deleted_blobs.saturating_add(garbage.len()),
+                scanned_blobs: inner_outcome.scanned_blobs.saturating_add(scanned),
+                retained_blobs: inner_outcome
+                    .retained_blobs
+                    .saturating_add(scanned.saturating_sub(deleted_blobs + failed_blobs)),
+                deleted_blobs: inner_outcome.deleted_blobs.saturating_add(deleted_blobs),
+                failed_blobs: inner_outcome.failed_blobs.saturating_add(failed_blobs),
             })
         })
     }
@@ -433,10 +462,21 @@ async fn normalize_workflow_task_commit<S>(
 where
     S: PayloadBlobStore,
 {
+    // One commit carries each map input manifest twice: in the scheduled
+    // history event and in the operational task. The cache makes the expensive
+    // per-item rebuild (hydrate pages, offload large items) run once per
+    // distinct manifest instead of once per appearance.
+    let mut input_manifest_cache = InputManifestCache::new();
+
     let mut append_events = Vec::with_capacity(batch.append_events.len());
     for event in batch.append_events {
+        let mut rewriter = PayloadBackendNormalizeRewriter {
+            blob_store,
+            config,
+            input_manifest_cache: &mut input_manifest_cache,
+        };
         append_events.push(crate::NewHistoryEvent {
-            data: normalize_history_event(blob_store, config, event.data).await?,
+            data: crate::payload::rewrite_history_event_payloads(&mut rewriter, event.data).await?,
         });
     }
 
@@ -447,14 +487,19 @@ where
 
     let mut schedule_activity_maps = Vec::with_capacity(batch.schedule_activity_maps.len());
     for task in batch.schedule_activity_maps {
-        schedule_activity_maps.push(normalize_activity_map_task(blob_store, config, task).await?);
+        schedule_activity_maps.push(
+            normalize_activity_map_task(blob_store, config, &mut input_manifest_cache, task)
+                .await?,
+        );
     }
 
     let mut schedule_child_workflow_maps =
         Vec::with_capacity(batch.schedule_child_workflow_maps.len());
     for task in batch.schedule_child_workflow_maps {
-        schedule_child_workflow_maps
-            .push(normalize_child_workflow_map_task(blob_store, config, task).await?);
+        schedule_child_workflow_maps.push(
+            normalize_child_workflow_map_task(blob_store, config, &mut input_manifest_cache, task)
+                .await?,
+        );
     }
 
     let mut start_child_workflows = Vec::with_capacity(batch.start_child_workflows.len());
@@ -484,6 +529,7 @@ where
 struct PayloadBackendNormalizeRewriter<'a, S> {
     blob_store: &'a S,
     config: &'a PayloadStorageConfig,
+    input_manifest_cache: &'a mut InputManifestCache,
 }
 
 impl<S: PayloadBlobStore> crate::payload::PayloadRewrite
@@ -494,7 +540,13 @@ impl<S: PayloadBlobStore> crate::payload::PayloadRewrite
     }
 
     async fn activity_map_input_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
-        normalize_activity_map_input_manifest(self.blob_store, self.config, manifest).await
+        normalize_activity_map_input_manifest(
+            self.blob_store,
+            self.config,
+            self.input_manifest_cache,
+            manifest,
+        )
+        .await
     }
 
     async fn activity_map_result_manifest(&mut self, manifest: PayloadRef) -> Result<PayloadRef> {
@@ -532,18 +584,6 @@ impl<S: PayloadBlobStore> crate::payload::PayloadRewrite for PayloadBackendHydra
     ) -> Result<PayloadRef> {
         hydrate_child_workflow_map_result_manifest(self.blob_store, manifest).await
     }
-}
-
-async fn normalize_history_event<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    data: HistoryEventData,
-) -> Result<HistoryEventData>
-where
-    S: PayloadBlobStore,
-{
-    let mut rewriter = PayloadBackendNormalizeRewriter { blob_store, config };
-    crate::payload::rewrite_history_event_payloads(&mut rewriter, data).await
 }
 
 async fn hydrate_history_event<S>(blob_store: &S, event: HistoryEvent) -> Result<HistoryEvent>
@@ -590,34 +630,28 @@ where
 async fn normalize_activity_map_task<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
+    cache: &mut InputManifestCache,
     mut task: crate::ActivityMapTask,
 ) -> Result<crate::ActivityMapTask>
 where
     S: PayloadBlobStore,
 {
-    task.input_manifest = normalize_activity_map_input_manifest_for_operations(
-        blob_store,
-        config,
-        task.input_manifest,
-    )
-    .await?;
+    task.input_manifest =
+        rebuild_activity_map_input_manifest(blob_store, config, cache, task.input_manifest).await?;
     Ok(task)
 }
 
 async fn normalize_child_workflow_map_task<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
+    cache: &mut InputManifestCache,
     mut task: ChildWorkflowMapTask,
 ) -> Result<ChildWorkflowMapTask>
 where
     S: PayloadBlobStore,
 {
-    task.input_manifest = normalize_activity_map_input_manifest_for_operations(
-        blob_store,
-        config,
-        task.input_manifest,
-    )
-    .await?;
+    task.input_manifest =
+        rebuild_activity_map_input_manifest(blob_store, config, cache, task.input_manifest).await?;
     Ok(task)
 }
 
@@ -657,20 +691,35 @@ where
     Ok(failure)
 }
 
-// Re-pages an activity-map input manifest, normalizing each item. When
-// `offload_pages` is set the re-encoded pages and root manifest are themselves
-// offloaded to blob storage (history path); otherwise they stay inline for the
-// operations path that re-pages without growing provider rows. The two callers
-// differ only by that final offload toggle.
+/// Operations-form manifests (pages hydrated and re-encoded inline, items
+/// normalized) keyed by the original manifest payload's identity.
+type InputManifestCache = BTreeMap<String, PayloadRef>;
+
+fn payload_identity_key(payload: &PayloadRef) -> String {
+    match payload {
+        PayloadRef::Inline { bytes, .. } => format!("inline:{}", digest_bytes(bytes)),
+        PayloadRef::Blob { digest, uri, .. } => format!("blob:{digest}:{uri}"),
+    }
+}
+
+// Re-pages an activity-map input manifest into its operations form: pages
+// hydrated, every item normalized (large items offloaded), containers kept
+// inline so the provider can materialize bounded map items. The history path
+// wraps this with a container offload; both paths share one rebuild per
+// distinct manifest through the cache.
 async fn rebuild_activity_map_input_manifest<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
+    cache: &mut InputManifestCache,
     payload: PayloadRef,
-    offload_pages: bool,
 ) -> Result<PayloadRef>
 where
     S: PayloadBlobStore,
 {
+    let key = payload_identity_key(&payload);
+    if let Some(rebuilt) = cache.get(&key) {
+        return Ok(rebuilt.clone());
+    }
     let root = hydrate_payload_ref(blob_store, payload).await?;
     let root_codec = root.codec();
     let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
@@ -684,42 +733,39 @@ where
             items.push(normalize_payload_ref(blob_store, config, item).await?);
         }
         page.items = items;
-        let encoded_page = crate::encode_payload_with_codec(&page, page_codec)?;
-        pages.push(if offload_pages {
-            normalize_payload_ref(blob_store, config, encoded_page).await?
-        } else {
-            encoded_page
-        });
+        pages.push(crate::encode_payload_with_codec(&page, page_codec)?);
     }
     manifest.pages = pages;
-    let encoded_manifest = crate::encode_payload_with_codec(&manifest, root_codec)?;
-    if offload_pages {
-        normalize_payload_ref(blob_store, config, encoded_manifest).await
-    } else {
-        Ok(encoded_manifest)
-    }
+    let rebuilt = crate::encode_payload_with_codec(&manifest, root_codec)?;
+    cache.insert(key, rebuilt.clone());
+    Ok(rebuilt)
 }
 
+// History-event form: the rebuilt pages and root are themselves offloaded by
+// size so large manifests do not inflate history rows.
 async fn normalize_activity_map_input_manifest<S>(
     blob_store: &S,
     config: &PayloadStorageConfig,
+    cache: &mut InputManifestCache,
     payload: PayloadRef,
 ) -> Result<PayloadRef>
 where
     S: PayloadBlobStore,
 {
-    rebuild_activity_map_input_manifest(blob_store, config, payload, true).await
-}
-
-async fn normalize_activity_map_input_manifest_for_operations<S>(
-    blob_store: &S,
-    config: &PayloadStorageConfig,
-    payload: PayloadRef,
-) -> Result<PayloadRef>
-where
-    S: PayloadBlobStore,
-{
-    rebuild_activity_map_input_manifest(blob_store, config, payload, false).await
+    let rebuilt = rebuild_activity_map_input_manifest(blob_store, config, cache, payload).await?;
+    let root_codec = rebuilt.codec();
+    let mut manifest: ActivityMapInputManifest = crate::decode_payload(&rebuilt)?;
+    let mut pages = Vec::with_capacity(manifest.pages.len());
+    for page in manifest.pages {
+        pages.push(normalize_payload_ref(blob_store, config, page).await?);
+    }
+    manifest.pages = pages;
+    normalize_payload_ref(
+        blob_store,
+        config,
+        crate::encode_payload_with_codec(&manifest, root_codec)?,
+    )
+    .await
 }
 
 async fn hydrate_activity_map_input_manifest<S>(
@@ -938,7 +984,7 @@ where
     for root in roots {
         match root {
             PayloadRootRef::Payload(payload) => {
-                collect_reachable_external_payload(blob_store, &payload, reachable).await?;
+                collect_reachable_external_payload(blob_store, &payload, reachable);
             }
             PayloadRootRef::ActivityMapInputManifest(payload) => {
                 collect_reachable_external_input_manifest(blob_store, payload, reachable).await?;
@@ -957,23 +1003,24 @@ where
     Ok(())
 }
 
-async fn collect_reachable_external_payload<S>(
+// Leaves are marked reachable from the ref's digest alone. Downloading them
+// here would fetch every live blob per sweep; bytes are digest-validated at
+// put and get time. Containers still load because traversal needs their
+// contents.
+fn collect_reachable_external_payload<S>(
     blob_store: &S,
     payload: &PayloadRef,
     reachable: &mut BTreeSet<String>,
-) -> Result<()>
-where
+) where
     S: PayloadBlobStore,
 {
     let PayloadRef::Blob { digest, uri, .. } = payload else {
-        return Ok(());
+        return;
     };
     if !blob_store.owns_payload_blob_uri(uri) {
-        return Ok(());
+        return;
     }
-    load_payload_blob(blob_store, payload).await?;
     reachable.insert(digest.clone());
-    Ok(())
 }
 
 async fn load_external_container<S>(
@@ -1025,7 +1072,7 @@ where
         .await?;
         let page: ActivityMapInputPage = crate::decode_payload(&page)?;
         for item in page.items {
-            collect_reachable_external_payload(blob_store, &item, reachable).await?;
+            collect_reachable_external_payload(blob_store, &item, reachable);
         }
     }
     Ok(())
@@ -1057,7 +1104,7 @@ where
         .await?;
         let page: ActivityMapResultPage = crate::decode_payload(&page)?;
         for result in page.results {
-            collect_reachable_external_payload(blob_store, &result, reachable).await?;
+            collect_reachable_external_payload(blob_store, &result, reachable);
         }
     }
     Ok(())
@@ -1091,11 +1138,11 @@ where
         for outcome in page.outcomes {
             match outcome {
                 ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                    collect_reachable_external_payload(blob_store, &result, reachable).await?;
+                    collect_reachable_external_payload(blob_store, &result, reachable);
                 }
                 ChildWorkflowMapItemOutcome::Failed { failure } => {
                     if let Some(details) = failure.details {
-                        collect_reachable_external_payload(blob_store, &details, reachable).await?;
+                        collect_reachable_external_payload(blob_store, &details, reachable);
                     }
                 }
                 ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
@@ -1136,7 +1183,20 @@ where
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            load_payload_blob(blob_store, &payload).await?;
+            // Refs owned by this store get a cheap existence probe instead of
+            // a download-and-rehash: bytes were digest-validated at put time
+            // and are re-validated at get time. Refs owned by other layers
+            // pass through opaquely; hydration is where an unowned ref errors.
+            let PayloadRef::Blob { digest, uri, .. } = &payload else {
+                unreachable!();
+            };
+            if blob_store.owns_payload_blob_uri(uri)
+                && !blob_store.payload_blob_exists(digest.clone()).await?
+            {
+                return Err(Error::PayloadDecode(format!(
+                    "missing payload blob `{digest}`"
+                )));
+            }
             Ok(payload)
         }
     }
@@ -1216,9 +1276,15 @@ fn validate_payload_blob_bytes(digest: &str, expected_size: u64, bytes: &[u8]) -
     Ok(())
 }
 
+#[derive(Debug)]
+struct MemoryBlobRecord {
+    bytes: Vec<u8>,
+    last_modified: TimestampMs,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryBlobStore {
-    blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
+    blobs: Arc<Mutex<BTreeMap<String, MemoryBlobRecord>>>,
 }
 
 impl MemoryBlobStore {
@@ -1247,15 +1313,25 @@ impl PayloadBlobStore for MemoryBlobStore {
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 &bytes,
             )?;
+            let now = TimestampMs(unix_epoch_millis());
             let mut blobs = blobs.lock().expect("memory blob store mutex poisoned");
-            if let Some(existing) = blobs.get(&digest) {
+            if let Some(existing) = blobs.get_mut(&digest) {
                 validate_payload_blob_bytes(
                     &digest,
                     u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                    existing,
+                    &existing.bytes,
                 )?;
+                // A dedup skip still restarts the GC grace period: the caller
+                // is about to commit a ref to this blob.
+                existing.last_modified = now;
             } else {
-                blobs.insert(digest.clone(), bytes);
+                blobs.insert(
+                    digest.clone(),
+                    MemoryBlobRecord {
+                        bytes,
+                        last_modified: now,
+                    },
+                );
             }
             Ok(memory_blob_uri(&digest))
         })
@@ -1268,18 +1344,28 @@ impl PayloadBlobStore for MemoryBlobStore {
                 .lock()
                 .expect("memory blob store mutex poisoned")
                 .get(&digest)
-                .cloned()
+                .map(|record| record.bytes.clone())
                 .ok_or_else(|| Error::PayloadDecode(format!("missing payload blob `{digest}`")))
         })
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>> {
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            Ok(blobs
+                .lock()
+                .expect("memory blob store mutex poisoned")
+                .contains_key(&digest))
+        })
+    }
+
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>> {
         let blobs = self.blobs.clone();
         Box::pin(ready(Ok(blobs
             .lock()
             .expect("memory blob store mutex poisoned")
-            .keys()
-            .cloned()
+            .iter()
+            .map(|(digest, record)| (digest.clone(), record.last_modified))
             .collect())))
     }
 
@@ -1364,6 +1450,13 @@ impl PayloadBlobStore for S3BlobStore {
                 u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                 &bytes,
             )?;
+            // Content-addressed keys make re-puts byte-identical, so one HEAD
+            // replaces the upload. The skip does not refresh LastModified
+            // (copy-object-to-itself per put is not worth the round trip); the
+            // GC grace period covers the unrefreshed dedup window instead.
+            if s3_object_exists(&bucket, &key).await? {
+                return Ok(s3_blob_uri(&bucket_name, &key));
+            }
             let response = bucket
                 .put_object(&key, &bytes)
                 .await
@@ -1386,7 +1479,13 @@ impl PayloadBlobStore for S3BlobStore {
         })
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>> {
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>> {
+        let bucket = self.bucket.clone();
+        let key = s3_key(&self.prefix, &digest);
+        Box::pin(async move { s3_object_exists(&bucket, &key).await })
+    }
+
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>> {
         let bucket = self.bucket.clone();
         let prefix = self.prefix.clone();
         Box::pin(async move {
@@ -1394,15 +1493,20 @@ impl PayloadBlobStore for S3BlobStore {
                 .list(prefix.clone(), None)
                 .await
                 .map_err(s3_backend_error)?;
-            let mut digests = BTreeSet::new();
+            let now = unix_epoch_millis();
+            let mut blobs = BTreeMap::new();
             for page in results {
                 for object in page.contents {
                     if let Some(digest) = digest_from_s3_key(&prefix, &object.key) {
-                        digests.insert(digest);
+                        // An unparseable LastModified is treated as brand new
+                        // so GC retains rather than deletes when unsure.
+                        let last_modified =
+                            parse_iso8601_utc_ms(&object.last_modified).unwrap_or(TimestampMs(now));
+                        blobs.insert(digest, last_modified);
                     }
                 }
             }
-            Ok(digests)
+            Ok(blobs)
         })
     }
 
@@ -1423,6 +1527,61 @@ impl PayloadBlobStore for S3BlobStore {
         };
         digest_from_s3_key(&self.prefix, key).is_some()
     }
+}
+
+async fn s3_object_exists(bucket: &s3::Bucket, key: &str) -> Result<bool> {
+    match bucket.head_object(key).await {
+        Ok((_, status)) if (200..300).contains(&status) => Ok(true),
+        Ok((_, 404)) => Ok(false),
+        Ok((_, status)) => Err(Error::Backend(format!(
+            "head payload blob failed with S3 status {status}"
+        ))),
+        Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(false),
+        Err(err) => Err(s3_backend_error(err)),
+    }
+}
+
+/// Parses the ISO 8601 UTC timestamps S3 ListObjectsV2 returns
+/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) into epoch milliseconds.
+fn parse_iso8601_utc_ms(value: &str) -> Option<TimestampMs> {
+    let value = value.strip_suffix('Z')?;
+    let (date, time) = value.split_once('T')?;
+    let mut date_parts = date.splitn(3, '-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut time_parts = time.splitn(3, ':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let seconds_part = time_parts.next()?;
+    let (second, millis): (i64, i64) = match seconds_part.split_once('.') {
+        Some((second, fraction)) => {
+            let mut fraction = fraction.to_owned();
+            fraction.truncate(3);
+            while fraction.len() < 3 {
+                fraction.push('0');
+            }
+            (second.parse().ok()?, fraction.parse::<i64>().ok()?)
+        }
+        None => (seconds_part.parse().ok()?, 0),
+    };
+    if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..=60).contains(&second) {
+        return None;
+    }
+    // Howard Hinnant's days-from-civil algorithm.
+    let year_adjusted = if month <= 2 { year - 1 } else { year };
+    let era = year_adjusted.div_euclid(400);
+    let year_of_era = year_adjusted - era * 400;
+    let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days_from_epoch = era * 146_097 + day_of_era - 719_468;
+    let seconds: i64 = days_from_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(TimestampMs(
+        seconds.checked_mul(1_000)?.checked_add(millis)?,
+    ))
 }
 
 fn normalize_s3_prefix(prefix: &str) -> String {
@@ -1466,4 +1625,107 @@ fn s3_backend_error(err: s3::error::S3Error) -> Error {
 
 fn s3_payload_decode_error(operation: &str, err: s3::error::S3Error) -> Error {
     Error::PayloadDecode(format!("{operation} failed: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemoryBackend;
+    use futures::executor::block_on;
+    use std::time::Duration;
+
+    // Dedup-reuse window pin (Bug A second flavor): content-addressed dedup
+    // makes a put on an existing digest a data no-op, so a concurrent writer
+    // can reuse a blob GC has already sentenced. The put must restart the GC
+    // grace period; without the timestamp refresh the second sweep here
+    // deletes the blob the in-flight commit is about to reference.
+    #[test]
+    fn memory_blob_store_put_restarts_gc_grace_period_for_reused_digest() {
+        let store = MemoryBlobStore::new();
+        let bytes = vec![7_u8; 64];
+        let digest = digest_bytes(&bytes);
+        block_on(store.put_payload_blob(digest.clone(), bytes.clone())).unwrap();
+        store
+            .blobs
+            .lock()
+            .unwrap()
+            .get_mut(&digest)
+            .unwrap()
+            .last_modified = TimestampMs(0);
+
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            store.clone(),
+            PayloadStorageConfig::default(),
+        );
+        // Control: backdated past the grace period, the unreachable blob is
+        // collectable garbage.
+        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            dry_run: true,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+
+        // The reuse (an in-flight commit about to reference this digest)
+        // restarts the grace period, so the sweep retains the blob.
+        block_on(store.put_payload_blob(digest.clone(), bytes)).unwrap();
+        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            dry_run: false,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        block_on(store.get_payload_blob(digest)).expect("reused blob must survive the sweep");
+    }
+
+    // With a zero grace period the same reuse window loses the blob, which is
+    // the pre-fix behavior tests rely on to force collection.
+    #[test]
+    fn memory_blob_store_zero_grace_period_collects_reused_digest() {
+        let store = MemoryBlobStore::new();
+        let bytes = vec![9_u8; 64];
+        let digest = digest_bytes(&bytes);
+        block_on(store.put_payload_blob(digest.clone(), bytes.clone())).unwrap();
+        block_on(store.put_payload_blob(digest.clone(), bytes)).unwrap();
+
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            store.clone(),
+            PayloadStorageConfig::default(),
+        );
+        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            dry_run: false,
+            min_age: Duration::ZERO,
+        }))
+        .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        block_on(store.get_payload_blob(digest))
+            .expect_err("zero grace period deletes the uncommitted reused blob");
+    }
+
+    // Pins the hand-rolled S3 ListObjectsV2 timestamp parser against known
+    // epoch values, including a leap-day and fractional seconds.
+    #[test]
+    fn iso8601_utc_timestamps_parse_to_epoch_milliseconds() {
+        assert_eq!(
+            parse_iso8601_utc_ms("1970-01-01T00:00:00.000Z"),
+            Some(TimestampMs(0))
+        );
+        assert_eq!(
+            parse_iso8601_utc_ms("2023-01-01T00:00:00Z"),
+            Some(TimestampMs(1_672_531_200_000))
+        );
+        assert_eq!(
+            parse_iso8601_utc_ms("2026-07-01T12:34:56.789Z"),
+            Some(TimestampMs(1_782_909_296_789))
+        );
+        assert_eq!(
+            parse_iso8601_utc_ms("2004-02-29T23:59:59.5Z"),
+            Some(TimestampMs(1_078_099_199_500))
+        );
+        assert_eq!(parse_iso8601_utc_ms("not-a-date"), None);
+        assert_eq!(parse_iso8601_utc_ms("2026-13-01T00:00:00Z"), None);
+        assert_eq!(parse_iso8601_utc_ms("2026-07-01T12:34:56"), None);
+    }
 }

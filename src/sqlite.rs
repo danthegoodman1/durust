@@ -5,8 +5,9 @@ use crate::provider_util::{
     codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
     compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
     event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
-    parent_close_policy_to_str, post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str,
-    reason_to_str, timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
+    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
+    ready_at_ms_for_delay, reason_from_str, reason_to_str, timed_out_by_heartbeat, timeout_message,
+    unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -30,7 +31,7 @@ use crate::{
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
@@ -91,7 +92,7 @@ impl SqliteBackend {
                 row.get::<_, usize>(0)
             })
             .map_err(sqlite_error)?;
-        let external_blobs = external_blob_digests(&self.payload_config)?.len();
+        let external_blobs = external_blob_listings(&self.payload_config)?.len();
         Ok(sqlite_blobs + external_blobs)
     }
 
@@ -1650,42 +1651,60 @@ impl DurableBackend for SqliteBackend {
                 .map_err(sqlite_error)?;
             let mut reachable = BTreeSet::new();
             collect_reachable_payload_blobs(&tx, &self.payload_config, &mut reachable)?;
-            let sqlite_digests = {
+            // Directory-store files are written before the transaction that
+            // makes them reachable commits, so an unreachable-but-young blob
+            // may belong to an in-flight commit. Only blobs older than the
+            // grace period are garbage.
+            let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
+            let mut all_blobs: BTreeMap<String, i64> = {
                 let mut stmt = tx
-                    .prepare("select digest from payload_blobs order by digest asc")
+                    .prepare("select digest, created_at_ms from payload_blobs order by digest asc")
                     .map_err(sqlite_error)?;
-                stmt.query_map([], |row| row.get::<_, String>(0))
-                    .map_err(sqlite_error)?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(sqlite_error)?
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+                .map_err(sqlite_error)?
             };
-            let mut all_digests = sqlite_digests.into_iter().collect::<BTreeSet<_>>();
-            all_digests.extend(external_blob_digests(&self.payload_config)?);
-            let scanned_blobs = all_digests.len();
-            let retained_blobs = all_digests
+            for (digest, last_modified) in external_blob_listings(&self.payload_config)? {
+                // A digest present in both stores keeps the younger timestamp
+                // so the grace period stays conservative.
+                let entry = all_blobs.entry(digest).or_insert(last_modified.0);
+                *entry = (*entry).max(last_modified.0);
+            }
+            let scanned_blobs = all_blobs.len();
+            let garbage = all_blobs
                 .iter()
-                .filter(|digest| reachable.contains(*digest))
-                .count();
-            let garbage = all_digests
-                .into_iter()
-                .filter(|digest| !reachable.contains(digest))
+                .filter(|(digest, last_modified)| {
+                    !reachable.contains(*digest) && **last_modified <= cutoff
+                })
+                .map(|(digest, _)| digest.clone())
                 .collect::<Vec<_>>();
-            let deleted_blobs = garbage.len();
+            let mut deleted_blobs = garbage.len();
+            let mut failed_blobs = 0_usize;
             if !req.dry_run {
+                deleted_blobs = 0;
                 for digest in garbage {
                     tx.execute(
                         "delete from payload_blobs where digest = ?1",
                         params![digest.as_str()],
                     )
                     .map_err(sqlite_error)?;
-                    delete_external_blob(&self.payload_config, &digest)?;
+                    // A file that cannot be deleted is recorded and retried on
+                    // the next sweep instead of aborting the rest.
+                    match delete_external_blob(&self.payload_config, &digest) {
+                        Ok(()) => deleted_blobs += 1,
+                        Err(_) => failed_blobs += 1,
+                    }
                 }
             }
             tx.commit().map_err(sqlite_error)?;
             Ok(crate::PayloadGarbageCollectionOutcome {
                 scanned_blobs,
-                retained_blobs,
+                retained_blobs: scanned_blobs - deleted_blobs - failed_blobs,
                 deleted_blobs,
+                failed_blobs,
             })
         })();
         Box::pin(ready(result))
@@ -2347,8 +2366,6 @@ fn collect_payload_blob_ref(
     if let PayloadRef::Blob { digest, uri, .. } = payload {
         if is_sqlite_payload_uri(uri) {
             load_payload_blob(conn, config, payload, false)?;
-        } else if !is_opaque_external_payload_uri(uri) {
-            load_payload_blob(conn, config, payload, false)?;
         }
         reachable.insert(digest.clone());
     }
@@ -2840,10 +2857,14 @@ fn normalize_payload_for_storage(
                 uri
             } else {
                 let encryption_blob = encode_encryption_metadata(&encryption)?;
+                // A content-addressed reuse keeps the first row's blob but
+                // restarts the GC grace period for it.
                 conn.execute(
-                    "insert or ignore into payload_blobs
-                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "insert into payload_blobs
+                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes,
+                      created_at_ms)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     on conflict(digest) do update set created_at_ms = excluded.created_at_ms",
                     params![
                         digest.as_str(),
                         codec_to_str(codec),
@@ -2851,7 +2872,8 @@ fn normalize_payload_for_storage(
                         compression_to_str(compression),
                         encryption_blob,
                         size,
-                        bytes.as_slice()
+                        bytes.as_slice(),
+                        unix_epoch_millis(),
                     ],
                 )
                 .map_err(sqlite_error)?;
@@ -2869,8 +2891,9 @@ fn normalize_payload_for_storage(
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
-            {
+            // Only refs with this provider's schemes are validated against its
+            // stores; every other scheme is opaque and persists unchanged.
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(uri)) {
                 load_payload_blob(conn, config, &payload, true)?;
             }
             Ok(payload)
@@ -2886,8 +2909,7 @@ fn hydrate_payload_from_storage(
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-            {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri)) {
                 return Ok(payload);
             }
             let PayloadRef::Blob {
@@ -3020,7 +3042,31 @@ fn store_external_payload_blob(
             let path = dir.join(digest);
             if path.exists() {
                 let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                load_external_payload_blob(config, digest, &expected_size)?;
+                let metadata = fs::metadata(&path).map_err(|err| {
+                    Error::Backend(format!(
+                        "failed to inspect local payload blob `{}`: {err}",
+                        path.display()
+                    ))
+                })?;
+                if metadata.len() != expected_size {
+                    return Err(Error::PayloadDecode(format!(
+                        "payload blob size mismatch: expected {expected_size}, got {}",
+                        metadata.len()
+                    )));
+                }
+                // Refresh the mtime so the GC grace period keeps protecting a
+                // blob that this in-flight commit is about to reference; the
+                // digest is re-validated on every read.
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+                    .map_err(|err| {
+                        Error::Backend(format!(
+                            "failed to refresh local payload blob `{}`: {err}",
+                            path.display()
+                        ))
+                    })?;
                 return Ok(Some(local_blob_uri(digest)));
             }
             let tmp_path = dir.join(format!("{digest}.tmp-{}", std::process::id()));
@@ -3087,14 +3133,14 @@ fn load_external_payload_blob(
     }
 }
 
-fn external_blob_digests(config: &PayloadStorageConfig) -> Result<BTreeSet<String>> {
+fn external_blob_listings(config: &PayloadStorageConfig) -> Result<BTreeMap<String, TimestampMs>> {
     let Some(blob_store) = &config.blob_store else {
-        return Ok(BTreeSet::new());
+        return Ok(BTreeMap::new());
     };
     match blob_store {
         BlobStoreConfig::LocalDirectory { root, prefix } => {
             let dir = local_blob_dir(root, prefix);
-            let mut digests = BTreeSet::new();
+            let mut blobs = BTreeMap::new();
             match fs::read_dir(&dir) {
                 Ok(entries) => {
                     for entry in entries {
@@ -3104,26 +3150,36 @@ fn external_blob_digests(config: &PayloadStorageConfig) -> Result<BTreeSet<Strin
                                 dir.display()
                             ))
                         })?;
-                        if !entry
-                            .file_type()
-                            .map_err(|err| {
-                                Error::Backend(format!(
-                                    "failed to inspect local payload blob `{}`: {err}",
-                                    entry.path().display()
-                                ))
-                            })?
-                            .is_file()
-                        {
+                        let metadata = entry.metadata().map_err(|err| {
+                            Error::Backend(format!(
+                                "failed to inspect local payload blob `{}`: {err}",
+                                entry.path().display()
+                            ))
+                        })?;
+                        if !metadata.is_file() {
                             continue;
                         }
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        if !name.contains(".tmp-") {
-                            digests.insert(name);
+                        if name.contains(".tmp-") {
+                            continue;
                         }
+                        // A file without a readable mtime counts as brand new
+                        // so GC retains rather than deletes when unsure.
+                        let last_modified = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| {
+                                modified.duration_since(std::time::UNIX_EPOCH).ok()
+                            })
+                            .map(|since_epoch| {
+                                i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+                            })
+                            .unwrap_or_else(unix_epoch_millis);
+                        blobs.insert(name, TimestampMs(last_modified));
                     }
-                    Ok(digests)
+                    Ok(blobs)
                 }
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(digests),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(blobs),
                 Err(err) => Err(Error::Backend(format!(
                     "failed to list local payload blob directory `{}`: {err}",
                     dir.display()
@@ -3172,12 +3228,11 @@ fn is_sqlite_payload_uri(uri: &str) -> bool {
     uri.starts_with("sqlite://payload/") || uri.starts_with("local://payload/")
 }
 
+// Every blob ref this provider did not mint is opaque: it belongs to whatever
+// layer owns its scheme (a `PayloadBackend` blob store), so the provider never
+// hydrates, validates, or garbage-collects it.
 fn is_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-}
-
-fn is_opaque_external_payload_uri(uri: &str) -> bool {
-    uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri))
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -3223,7 +3278,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             compression text not null,
             encryption blob,
             size integer not null,
-            bytes blob
+            bytes blob,
+            created_at_ms integer not null default 0
         );
 
         create table if not exists activity_tasks (
@@ -3396,6 +3452,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "activity_tasks",
         "heartbeat_deadline_at_ms",
         "integer",
+    )?;
+    // Default 0 makes pre-existing blobs immediately past any GC grace period,
+    // which is correct: they are old.
+    ensure_column(
+        conn,
+        "payload_blobs",
+        "created_at_ms",
+        "integer not null default 0",
     )?;
     ensure_index(
         conn,

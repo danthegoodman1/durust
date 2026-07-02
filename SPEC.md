@@ -2432,7 +2432,8 @@ Production object-store target:
 pub trait PayloadBlobStore {
     fn put_payload_blob(&self, digest: String, bytes: Vec<u8>) -> BoxFuture<'static, Result<String>>;
     fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>>;
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>>;
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>>;
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
     fn owns_payload_blob_uri(&self, uri: &str) -> bool;
 }
@@ -2474,9 +2475,15 @@ local deployments. Production object stores should be provider-agnostic: wrap th
 durability provider in `PayloadBackend<B, S>`, where `S` is an async
 `PayloadBlobStore` such as `S3BlobStore`. The wrapper uploads external payloads
 before delegating durable writes to the inner provider and hydrates external
-`PayloadRef::Blob` values after reads. Concrete providers persist unknown blob
-refs opaquely; they must not know S3, Garage, signing, endpoints, or retry
-policy.
+`PayloadRef::Blob` values after reads.
+
+Blob URI ownership is exclusive and total: every blob ref has exactly one owner,
+identified by its URI scheme. A concrete provider validates, hydrates, and
+garbage-collects only refs carrying its own scheme(s) and persists every other
+scheme opaquely; it must not know S3, Garage, signing, endpoints, retry policy,
+or the set of schemes other layers use. A ref whose scheme no layer owns commits
+and persists unchanged and surfaces an error only when hydration is attempted at
+the outermost payload layer.
 
 Tests should use local Garage as the S3-compatible service so
 `PayloadBackend<SqliteBackend, S3BlobStore>` behavior is covered without
@@ -2493,8 +2500,11 @@ payload-observing operation. When the runtime observes such a payload, the
 worker calls `hydrate_payload` or, for paged activity-map result manifests,
 `hydrate_activity_map_result_manifest` or
 `hydrate_child_workflow_map_result_manifest` at an explicit async boundary
-before polling the workflow again. Workflow polling must not perform hidden
-object-store or database I/O.
+before polling the workflow again. Manifest hydration runs even when the root
+manifest is inline: each manifest level offloads independently by size, so an
+inline root can still hold blob-backed pages or item results. Only plain
+payloads short-circuit hydration when inline. Workflow polling must not perform
+hidden object-store or database I/O.
 
 Providers should expose generic payload garbage collection for provider-owned
 blob stores. GC treats workflow history, activity tasks, activity map manifests
@@ -2502,9 +2512,35 @@ and results, child workflow map manifests and results, child outbox entries,
 signal inbox rows, and query projections as roots. A dry-run mode must report
 retained and deleted blob counts without mutating storage. Counts are for blobs
 owned by the GC target: concrete providers count provider-owned blobs, while
-wrapper GC counts wrapper-owned object-store blobs. If a committed reachable
-`PayloadRef::Blob` is missing or fails
-digest/size validation, GC must fail rather than deleting unrelated blobs.
+wrapper GC counts wrapper-owned object-store blobs.
+
+Blob uploads precede the durable commit that makes them reachable, so a
+reachability snapshot alone can sentence a blob an in-flight commit is about to
+reference — either a fresh upload or an existing blob a content-addressed put
+deduplicated against. GC therefore never deletes a blob whose last-modified
+timestamp is younger than `PayloadGarbageCollectionRequest::min_age` (default
+one hour). Blob listings return last-modified timestamps, and stores that can
+cheaply refresh the timestamp on a deduplicated put do so: local directories
+touch the file mtime, the in-memory stores refresh under their lock, and the
+SQL providers refresh through the row-conflict update whose lock the GC
+delete's timestamp predicate re-evaluates under, which closes the
+sentence-then-reuse race transactionally for provider-internal blobs. Decorator
+blob stores narrow that race rather than close it: the sweep does not re-check
+timestamps between its listing and its deletes, so a put or exists-probe that
+reuses an orphan already past `min_age` while a sweep is running can still lose
+the blob to that sweep. S3 additionally skips the timestamp refresh entirely
+because a copy-object round trip per put is not worth it. Operators size
+`min_age` accordingly: above the maximum upload-to-commit latency plus one full
+GC sweep, which the one-hour default dwarfs.
+
+Reachability marks leaf blobs from the ref's digest alone; only manifest
+containers load, because traversal needs their contents. If a committed
+reachable container is missing or fails digest/size validation, GC must fail
+rather than deleting unrelated blobs. Object-store deletes (decorator blob
+stores and the SQLite local directory) continue past individual failures: the
+failure count is reported in the outcome and the blob remains a candidate for
+the next run. SQL-provider row deletes run inside the sweep's transaction and
+abort atomically, so those sweeps report zero failed blobs by construction.
 
 For provider-agnostic object stores, concrete providers also expose durable
 payload roots without object-store policy. Roots are typed so an outer

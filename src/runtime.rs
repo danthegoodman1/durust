@@ -641,7 +641,13 @@ impl RuntimeContext {
     }
 
     fn ready_payload_or_request(&mut self, request: PayloadHydrationRequest) -> Option<PayloadRef> {
-        if matches!(request.payload, PayloadRef::Inline { .. }) {
+        // Only plain payloads are ready when inline. Manifest kinds offload
+        // each level independently, so an inline root can still hold
+        // blob-backed pages or item results; they always go through the
+        // provider's manifest hydrator, which handles inline roots.
+        if request.kind == PayloadHydrationKind::Payload
+            && matches!(request.payload, PayloadRef::Inline { .. })
+        {
             return Some(request.payload);
         }
         let key = request.key();
@@ -3526,7 +3532,10 @@ mod tests {
                     failure_count: 0,
                 })
             },
-            |runtime, command_id| runtime.take_map_completion(command_id).is_some(),
+            |runtime, command_id| {
+                take_after_hydration(runtime, |runtime| runtime.take_map_completion(command_id))
+                    .is_some()
+            },
         );
         assert_indexed_ready_event_skips(
             "activity_map_failed",
@@ -3667,7 +3676,12 @@ mod tests {
                     cancellation_count: 0,
                 })
             },
-            |runtime, command_id| runtime.take_child_map_completion(command_id).is_some(),
+            |runtime, command_id| {
+                take_after_hydration(runtime, |runtime| {
+                    runtime.take_child_map_completion(command_id)
+                })
+                .is_some()
+            },
         );
         assert_appended_indexed_event_skips(
             "child_workflow_map_failed",
@@ -3742,6 +3756,30 @@ mod tests {
             next.event_type
         );
         assert_eq!(next.event_id, EventId(3));
+    }
+
+    // Mirrors the worker's hydration round trip for manifest takes: the first
+    // take registers a hydration request (an inline manifest root may still
+    // hold blob-backed pages), the worker fulfills it, and the retry take
+    // consumes the event.
+    fn take_after_hydration<T>(
+        runtime: &mut RuntimeContext,
+        mut take: impl FnMut(&mut RuntimeContext) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(value) = take(runtime) {
+            return Some(value);
+        }
+        let requests = runtime.take_payload_hydration_requests();
+        if requests.is_empty() {
+            return None;
+        }
+        for request in requests {
+            let payload = request.payload.clone();
+            runtime
+                .fulfill_payload_hydration(request, payload)
+                .expect("inline manifest hydration fulfillment");
+        }
+        take(runtime)
     }
 
     fn assert_indexed_ready_event_skips(

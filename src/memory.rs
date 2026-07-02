@@ -2,7 +2,7 @@ use crate::provider_util::{
     ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
     activity_timeout_decision, child_terminal_event_data_and_reason,
     child_terminal_map_item_outcome, claim_lease_until_ms, commit_has_workflow_visible_mutations,
-    post_commit_ready_reason, timed_out_by_heartbeat, timeout_message,
+    payload_gc_cutoff_ms, post_commit_ready_reason, timed_out_by_heartbeat, timeout_message,
 };
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -88,7 +88,16 @@ struct MemoryState {
     signals: BTreeMap<SignalId, SignalRecord>,
     query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
     workflow_change_versions: BTreeMap<(RunId, String), WorkflowChangeVersionRecord>,
-    payload_blobs: BTreeMap<String, PayloadBlob>,
+    payload_blobs: BTreeMap<String, StoredPayloadBlob>,
+}
+
+// `stored_at` follows the virtual clock and is refreshed whenever a
+// content-addressed store call reuses the blob, so the GC grace period
+// (`PayloadGarbageCollectionRequest::min_age`) protects blobs that an
+// in-flight commit is about to reference.
+struct StoredPayloadBlob {
+    blob: PayloadBlob,
+    stored_at: TimestampMs,
 }
 
 struct RunRecord {
@@ -1326,25 +1335,25 @@ impl DurableBackend for MemoryBackend {
         if let Err(err) = collect_reachable_payload_blobs(&state, &mut reachable) {
             return Box::pin(ready(Err(err)));
         }
-        let retained_blobs = state
-            .payload_blobs
-            .keys()
-            .filter(|digest| reachable.contains(*digest))
-            .count();
+        // Grace period against the virtual clock: an unreachable-but-young
+        // blob may belong to an in-flight commit.
+        let cutoff = payload_gc_cutoff_ms(state.now.0, req.min_age);
         let deleted_blobs = state
             .payload_blobs
-            .keys()
-            .filter(|digest| !reachable.contains(*digest))
+            .iter()
+            .filter(|(digest, record)| !reachable.contains(*digest) && record.stored_at.0 <= cutoff)
             .count();
+        let retained_blobs = scanned_blobs - deleted_blobs;
         if !req.dry_run {
             state
                 .payload_blobs
-                .retain(|digest, _| reachable.contains(digest));
+                .retain(|digest, record| reachable.contains(digest) || record.stored_at.0 > cutoff);
         }
         Box::pin(ready(Ok(crate::PayloadGarbageCollectionOutcome {
             scanned_blobs,
             retained_blobs,
             deleted_blobs,
+            failed_blobs: 0,
         })))
     }
 }
@@ -2725,8 +2734,6 @@ fn collect_payload_blob_ref(
     if let PayloadRef::Blob { digest, uri, .. } = payload {
         if is_memory_payload_uri(uri) {
             verify_payload_blob(state, payload, false)?;
-        } else if !is_opaque_external_payload_uri(uri) {
-            verify_payload_blob(state, payload, false)?;
         }
         reachable.insert(digest.clone());
     }
@@ -3233,15 +3240,22 @@ fn normalize_payload_for_storage(
         } if bytes.len() > config.inline_threshold_bytes => {
             let digest = digest_bytes(&bytes);
             let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let now = state.now;
             state
                 .payload_blobs
                 .entry(digest.clone())
-                .or_insert_with(|| PayloadBlob {
-                    codec,
-                    schema_fingerprint: schema_fingerprint.clone(),
-                    compression,
-                    encryption: encryption.clone(),
-                    bytes: bytes.clone(),
+                // A content-addressed reuse keeps the first blob's metadata
+                // but restarts the GC grace period for it.
+                .and_modify(|record| record.stored_at = now)
+                .or_insert_with(|| StoredPayloadBlob {
+                    blob: PayloadBlob {
+                        codec,
+                        schema_fingerprint: schema_fingerprint.clone(),
+                        compression,
+                        encryption: encryption.clone(),
+                        bytes: bytes.clone(),
+                    },
+                    stored_at: now,
                 });
             Ok(PayloadRef::Blob {
                 codec,
@@ -3255,8 +3269,9 @@ fn normalize_payload_for_storage(
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
-            {
+            // Only refs with this provider's scheme are validated against its
+            // store; every other scheme is opaque and persists unchanged.
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_memory_payload_uri(uri)) {
                 verify_payload_blob(state, &payload, true)?;
             }
             Ok(payload)
@@ -3268,8 +3283,7 @@ fn hydrate_payload_from_storage(state: &MemoryState, payload: PayloadRef) -> Res
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-            {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_memory_payload_uri(uri)) {
                 return Ok(payload);
             }
             let PayloadRef::Blob {
@@ -3298,12 +3312,11 @@ fn is_memory_payload_uri(uri: &str) -> bool {
     uri.starts_with("memory://payload/")
 }
 
+// Every blob ref this provider did not mint is opaque: it belongs to whatever
+// layer owns its scheme (a `PayloadBackend` blob store), so the provider never
+// hydrates, validates, or garbage-collects it.
 fn is_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-}
-
-fn is_opaque_external_payload_uri(uri: &str) -> bool {
-    uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_memory_payload_uri(uri))
 }
 
 fn verify_payload_blob<'a>(
@@ -3325,7 +3338,7 @@ fn verify_payload_blob<'a>(
             "inline payload does not reference blob storage".to_owned(),
         ));
     };
-    let Some(blob) = state.payload_blobs.get(digest) else {
+    let Some(StoredPayloadBlob { blob, .. }) = state.payload_blobs.get(digest) else {
         return Err(Error::PayloadDecode(format!(
             "missing payload blob `{digest}`"
         )));

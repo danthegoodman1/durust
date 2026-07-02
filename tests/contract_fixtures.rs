@@ -463,6 +463,7 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     let gc_request =
         payload_gc_request_from_fixture(&fixture["payloadGarbageCollection"]["request"]);
     assert!(gc_request.dry_run);
+    assert_eq!(gc_request.min_age, durust::DEFAULT_PAYLOAD_GC_MIN_AGE);
     assert_eq!(
         payload_gc_outcome_from_fixture(
             &fixture["payloadGarbageCollection"]["rustProviderOutcome"]
@@ -471,6 +472,7 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
             scanned_blobs: 3,
             retained_blobs: 2,
             deleted_blobs: 0,
+            failed_blobs: 0,
         }
     );
 }
@@ -940,6 +942,7 @@ fn payload_roots_from_fixture(value: &Value) -> durust::PayloadRootsOutcome {
 fn payload_gc_request_from_fixture(value: &Value) -> durust::PayloadGarbageCollectionRequest {
     durust::PayloadGarbageCollectionRequest {
         dry_run: value["dryRun"].as_bool().expect("GC dryRun"),
+        min_age: Duration::from_millis(value["minAgeMs"].as_u64().expect("GC minAgeMs")),
     }
 }
 
@@ -948,6 +951,7 @@ fn payload_gc_outcome_from_fixture(value: &Value) -> durust::PayloadGarbageColle
         scanned_blobs: usize_field(value, "scannedBlobs"),
         retained_blobs: usize_field(value, "retainedBlobs"),
         deleted_blobs: usize_field(value, "deletedBlobs"),
+        failed_blobs: usize_field(value, "failedBlobs"),
     }
 }
 

@@ -4,17 +4,18 @@ use durust::{
     ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CommitOutcome,
     CompleteActivityRequest, CompleteActivityTasksRequest, DurableBackend, Error, EventId,
     FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent,
-    PayloadBackend, PostgresBackend, PostgresBackendConfig, Registry, SqliteBackend, TaskQueue,
-    Worker, WorkerId, WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput,
-    WorkflowType,
+    PayloadBackend, PayloadBlobStore, PostgresBackend, PostgresBackendConfig, Registry,
+    SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowTaskCommit, WorkflowTaskCommitBatch,
+    WorkflowTaskCommitInput, WorkflowType,
 };
 use futures::executor::block_on;
 use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -581,7 +582,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-garage").await;
         let (gc_workflow_id, gc_projection) =
             payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-garage").await;
-        let external_blobs = durust::PayloadBlobStore::list_payload_blob_digests(&blob_store)
+        let external_blobs = durust::PayloadBlobStore::list_payload_blobs(&blob_store)
             .await
             .unwrap();
         assert!(external_blobs.len() >= 8);
@@ -709,7 +710,7 @@ where
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_error = None;
     while Instant::now() < deadline {
-        match blob_store.list_payload_blob_digests().await {
+        match blob_store.list_payload_blobs().await {
             Ok(_) => return,
             Err(err) => {
                 last_error = Some(err);
@@ -778,8 +779,14 @@ impl durust::PayloadBlobStore for FailingBlobStore {
         )))))
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
-        Box::pin(ready(Ok(BTreeSet::new())))
+    fn payload_blob_exists(&self, _digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        Box::pin(ready(Ok(false)))
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        Box::pin(ready(Ok(BTreeMap::new())))
     }
 
     fn delete_payload_blob(&self, _digest: String) -> BoxFuture<'static, durust::Result<()>> {
@@ -789,6 +796,792 @@ impl durust::PayloadBlobStore for FailingBlobStore {
     fn owns_payload_blob_uri(&self, _uri: &str) -> bool {
         false
     }
+}
+
+// A blob store with a scheme none of the built-in providers know about. Inner
+// providers must treat its refs as opaque; only this store hydrates or
+// garbage-collects them.
+#[derive(Clone, Debug, Default)]
+struct TestCustomBlobStore {
+    blobs: Arc<Mutex<BTreeMap<String, (Vec<u8>, durust::TimestampMs)>>>,
+}
+
+impl TestCustomBlobStore {
+    fn blob_count(&self) -> usize {
+        self.blobs.lock().unwrap().len()
+    }
+}
+
+fn wall_clock_ms() -> durust::TimestampMs {
+    durust::TimestampMs(
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX),
+    )
+}
+
+impl durust::PayloadBlobStore for TestCustomBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            let now = wall_clock_ms();
+            let mut blobs = blobs.lock().unwrap();
+            match blobs.get_mut(&digest) {
+                Some(record) => record.1 = now,
+                None => {
+                    blobs.insert(digest.clone(), (bytes, now));
+                }
+            }
+            Ok(format!("test-custom://payload/{digest}"))
+        })
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs
+                .lock()
+                .unwrap()
+                .get(&digest)
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or_else(|| Error::PayloadDecode(format!("missing payload blob `{digest}`")))
+        })
+    }
+
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move { Ok(blobs.lock().unwrap().contains_key(&digest)) })
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            Ok(blobs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(digest, (_, last_modified))| (digest.clone(), *last_modified))
+                .collect())
+        })
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs.lock().unwrap().remove(&digest);
+            Ok(())
+        })
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        uri.starts_with("test-custom://payload/")
+    }
+}
+
+// Bug B pin: a custom-scheme blob store must work over any inner provider.
+// Against the pre-fix scheme allowlist this fails at the first commit because
+// the inner provider tries to resolve `test-custom://` refs from its own
+// store.
+async fn custom_scheme_blob_store_round_trips_and_survives_gc<B>(inner: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let blob_store = TestCustomBlobStore::default();
+    let backend = PayloadBackend::with_payload_storage(
+        inner,
+        blob_store.clone(),
+        durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+    );
+    let run_id = payload_offload_public_api_round_trip(
+        backend.clone(),
+        &format!("wf/{prefix}-custom-scheme"),
+        &format!("{prefix}-custom-scheme-workflows"),
+        &format!("{prefix}-custom-scheme-activities"),
+    )
+    .await;
+    payload_offload_activity_map_round_trip(backend.clone(), &format!("{prefix}-custom")).await;
+    assert!(blob_store.blob_count() >= 4);
+
+    // Raw replay refs carry the custom scheme end to end.
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+        panic!("expected raw workflow start event");
+    };
+    assert!(
+        matches!(input, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("test-custom://payload/")),
+        "raw workflow input should be a custom-scheme blob ref, got {input:?}"
+    );
+
+    // GC with a zero grace period must still leave every reachable
+    // custom-scheme blob alone.
+    let before = blob_store.blob_count();
+    let outcome = backend
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: false,
+            min_age: Duration::ZERO,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.failed_blobs, 0);
+    assert_eq!(blob_store.blob_count(), before - outcome.deleted_blobs);
+
+    // Hydration after GC proves reachable blobs survived.
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+        panic!("expected hydrated workflow start event");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(input).unwrap(),
+        large_payload("workflow-input")
+    );
+}
+
+#[test]
+fn custom_scheme_blob_store_works_over_memory_provider() {
+    block_on(async {
+        custom_scheme_blob_store_round_trips_and_survives_gc(MemoryBackend::new(), "memory").await;
+    });
+}
+
+#[test]
+fn custom_scheme_blob_store_works_over_sqlite_provider() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom-scheme.sqlite3");
+        let blob_store = TestCustomBlobStore::default();
+        let backend = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let run_id = payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/sqlite-custom-scheme",
+            "sqlite-custom-scheme-workflows",
+            "sqlite-custom-scheme-activities",
+        )
+        .await;
+        drop(backend);
+
+        // Reopen: the persisted custom-scheme refs must hydrate through the
+        // custom store and survive GC with a zero grace period.
+        let reopened = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let outcome = reopened
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed_blobs, 0);
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start after reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+    });
+}
+
+#[test]
+fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres custom-scheme conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("custom_scheme");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        custom_scheme_blob_store_round_trips_and_survives_gc(backend, "postgres").await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+// Bug A pin, fresh-upload window: every write path uploads its blob before the
+// commit that makes it reachable, so GC must never delete an
+// unreachable-but-young blob. `min_age: 0` reproduces the pre-fix behavior;
+// the default grace period keeps the in-flight upload alive until its commit
+// lands, after which reachability protects it unconditionally.
+#[test]
+fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
+    block_on(async {
+        let blob_store = durust::MemoryBlobStore::new();
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let value = large_payload("gc-race-input");
+        let payload = durust::encode_payload(&value).unwrap();
+        let durust::PayloadRef::Inline { bytes, .. } = payload.clone() else {
+            panic!("freshly encoded payload should be inline");
+        };
+        let digest = durust::digest_bytes(&bytes);
+
+        // The in-flight window: uploaded, not yet referenced by any commit.
+        blob_store
+            .put_payload_blob(digest.clone(), bytes.clone())
+            .await
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert_eq!(outcome.scanned_blobs, 1);
+        blob_store
+            .get_payload_blob(digest.clone())
+            .await
+            .expect("grace period must protect the in-flight upload");
+
+        // Zero grace period restores the pre-fix delete-anything-unreachable
+        // behavior: the same window now loses the blob.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        blob_store
+            .get_payload_blob(digest.clone())
+            .await
+            .expect_err("zero grace period deletes the uncommitted upload");
+
+        // Upload again and land the commit; reachability now protects the
+        // blob at any grace period.
+        blob_store
+            .put_payload_blob(digest.clone(), bytes)
+            .await
+            .unwrap();
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/gc-race-committed"),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("gc-race-workflows"),
+                input: payload,
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        blob_store
+            .get_payload_blob(digest)
+            .await
+            .expect("committed blob must always survive GC");
+    });
+}
+
+// Drives one projection replacement against the single-event conformance
+// workflow: wakes the run with a signal when `signal_seq > 0`, claims it, and
+// commits a projection holding `value` plus a re-armed signal wait so the next
+// replacement can wake the run again. Replacing a projection is the simplest
+// way to turn an offloaded blob into garbage.
+async fn commit_projection_replacement<B>(
+    backend: &B,
+    workflow_id: &str,
+    queue: &str,
+    signal_seq: u64,
+    value: &str,
+) where
+    B: DurableBackend,
+{
+    // Idempotent re-start resolves the run id; the tiny input stays inline so
+    // it cannot perturb blob-store contents.
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(queue),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let mut consume_signals = Vec::new();
+    if signal_seq > 0 {
+        backend
+            .signal_workflow(durust::SignalWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                signal_id: durust::SignalId::new(format!("{workflow_id}/replace/{signal_seq}")),
+                signal_name: durust::SignalName::new("replace"),
+                payload: durust::encode_payload(&signal_seq).unwrap(),
+            })
+            .await
+            .unwrap();
+        let inbox = backend
+            .read_signal_inbox(durust::ReadSignalInboxRequest {
+                run_id: run_id.clone(),
+                signal_name: durust::SignalName::new("replace"),
+            })
+            .await
+            .unwrap()
+            .expect("replacement signal");
+        consume_signals.push(inbox.signal_id);
+    }
+    let claimed = claim_conformance_workflow(
+        backend,
+        &format!("{workflow_id}-projection-{signal_seq}"),
+        queue,
+    )
+    .await;
+    let command_id = durust::command_id(&run_id, 1);
+    let wait_id = durust::WaitId::new(format!("{}:{}:signal", command_id.run_id, command_id.seq.0));
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                consume_signals,
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id,
+                    run_id,
+                    command_id,
+                    kind: durust::WaitKind::Signal,
+                    key: "replace".to_owned(),
+                    ready_at: None,
+                }],
+                ..projection_only_commit(durust::encode_payload(&value.to_owned()).unwrap())
+            },
+        )
+        .await
+        .unwrap();
+}
+
+// Bug A pin, memory provider: the provider-internal store follows the virtual
+// clock, so deterministic tests control blob age with `advance_time`. Old
+// unreachable blobs are collected, young ones survive the grace period, and
+// `min_age: 0` collects unconditionally.
+#[test]
+fn memory_gc_grace_period_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let workflow_id = "wf/memory-gc-grace";
+        let queue = "memory-gc-grace-workflows";
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new(queue),
+                input: durust::encode_payload(&large_payload("memory-gc-input")).unwrap(),
+            })
+            .await
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 0, "projection-old").await;
+        commit_projection_replacement(&backend, workflow_id, queue, 1, "projection-mid").await;
+
+        // The replaced projection blob is unreachable but young: the default
+        // grace period retains it because it could belong to an in-flight
+        // commit.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+
+        // Two virtual hours later the same blob is old garbage.
+        backend.advance_time(Duration::from_secs(2 * 60 * 60));
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "projection-old blob aged past the grace period"
+        );
+
+        // A replacement after the clock advance leaves young garbage again:
+        // default grace retains it, zero grace collects it.
+        commit_projection_replacement(&backend, workflow_id, queue, 2, "projection-new").await;
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "projection-mid blob aged past the grace period while projection-new's predecessor stayed protected"
+        );
+        commit_projection_replacement(&backend, workflow_id, queue, 3, "projection-final").await;
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 0,
+            "projection-new blob is young garbage the grace period retains"
+        );
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "zero grace period collects the young garbage"
+        );
+
+        // The live projection and workflow input always survive.
+        let projection = backend
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected live projection");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            "projection-final"
+        );
+    });
+}
+
+// Bug A pin, SQLite local-directory store (close/reopen): directory blobs are
+// written before their transaction commits, so GC ages them by file mtime.
+// Content-addressed re-puts refresh the mtime so a blob a new in-flight commit
+// deduplicated against regains its full grace period.
+#[test]
+fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let object_dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gc-grace.sqlite3");
+        let config = durust::PayloadStorageConfig::new()
+            .inline_threshold_bytes(1)
+            .blob_store(durust::BlobStoreConfig::LocalDirectory {
+                root: object_dir.path().to_path_buf(),
+                prefix: "payloads".to_owned(),
+            });
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let workflow_id = "wf/sqlite-gc-grace";
+        let queue = "sqlite-gc-grace-workflows";
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new(queue),
+                input: durust::encode_payload(&large_payload("sqlite-gc-input")).unwrap(),
+            })
+            .await
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 0, "projection-old").await;
+        commit_projection_replacement(&backend, workflow_id, queue, 1, "projection-live").await;
+
+        let blob_dir = object_dir.path().join("payloads");
+        let garbage_digest = durust::digest_bytes(
+            durust::encode_payload(&"projection-old".to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        );
+        let garbage_path = blob_dir.join(&garbage_digest);
+        assert!(garbage_path.exists());
+
+        // Young unreachable garbage survives the default grace period.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert!(garbage_path.exists());
+
+        // Backdated past the grace period the same file is collected.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        fs::File::options()
+            .write(true)
+            .open(&garbage_path)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert_eq!(outcome.failed_blobs, 0);
+        assert!(!garbage_path.exists());
+
+        // Fresh-upload window: a file written by an in-flight commit (upload
+        // happens before the transaction commits) survives the grace period
+        // and dies only under min_age zero.
+        let in_flight = durust::encode_payload(&large_payload("sqlite-in-flight")).unwrap();
+        let in_flight_bytes = in_flight.inline_bytes().unwrap().to_vec();
+        let in_flight_digest = durust::digest_bytes(&in_flight_bytes);
+        let in_flight_path = blob_dir.join(&in_flight_digest);
+        fs::write(&in_flight_path, &in_flight_bytes).unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert!(in_flight_path.exists());
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert!(!in_flight_path.exists());
+
+        // Dedup window: a commit that reuses an existing old blob must refresh
+        // its mtime, restarting the grace period for the reused content.
+        let reused_value = "projection-reused";
+        let reused_digest = durust::digest_bytes(
+            durust::encode_payload(&reused_value.to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        );
+        let reused_path = blob_dir.join(&reused_digest);
+        fs::write(
+            &reused_path,
+            durust::encode_payload(&reused_value.to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&reused_path)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 2, reused_value).await;
+        let refreshed = fs::metadata(&reused_path).unwrap().modified().unwrap();
+        assert!(
+            refreshed.duration_since(two_hours_ago).unwrap_or_default()
+                > Duration::from_secs(60 * 60),
+            "content-addressed re-put must refresh the blob mtime"
+        );
+        drop(backend);
+
+        // Close/reopen: the refreshed blob is now reachable (live projection)
+        // and hydrates from disk.
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        let outcome = reopened
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed_blobs, 0);
+        assert!(reused_path.exists());
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected reopened projection");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            reused_value
+        );
+    });
+}
+
+// A delete failure on one garbage blob must not abort the sweep: the failure
+// is recorded in the outcome and the remaining garbage is still collected.
+#[derive(Clone, Debug)]
+struct PoisonedDeleteBlobStore {
+    inner: durust::MemoryBlobStore,
+    poisoned_digest: String,
+}
+
+impl durust::PayloadBlobStore for PoisonedDeleteBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        self.inner.put_payload_blob(digest, bytes)
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        self.inner.get_payload_blob(digest)
+    }
+
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        self.inner.payload_blob_exists(digest)
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        self.inner.list_payload_blobs()
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        if digest == self.poisoned_digest {
+            return Box::pin(ready(Err(Error::Backend(
+                "intentional blob delete failure".to_owned(),
+            ))));
+        }
+        self.inner.delete_payload_blob(digest)
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        self.inner.owns_payload_blob_uri(uri)
+    }
+}
+
+#[test]
+fn payload_backend_gc_records_delete_failures_and_continues() {
+    block_on(async {
+        let poisoned_payload = durust::encode_payload(&large_payload("poisoned-garbage")).unwrap();
+        let poisoned_bytes = poisoned_payload.inline_bytes().unwrap().to_vec();
+        let poisoned_digest = durust::digest_bytes(&poisoned_bytes);
+        let deletable_payload =
+            durust::encode_payload(&large_payload("deletable-garbage")).unwrap();
+        let deletable_bytes = deletable_payload.inline_bytes().unwrap().to_vec();
+        let deletable_digest = durust::digest_bytes(&deletable_bytes);
+
+        let blob_store = PoisonedDeleteBlobStore {
+            inner: durust::MemoryBlobStore::new(),
+            poisoned_digest: poisoned_digest.clone(),
+        };
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        blob_store
+            .put_payload_blob(poisoned_digest.clone(), poisoned_bytes)
+            .await
+            .unwrap();
+        blob_store
+            .put_payload_blob(deletable_digest.clone(), deletable_bytes)
+            .await
+            .unwrap();
+
+        // Dry run reports both as would-delete without attempting deletes.
+        let dry_run = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(dry_run.deleted_blobs, 2);
+        assert_eq!(dry_run.failed_blobs, 0);
+
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert_eq!(outcome.failed_blobs, 1);
+        blob_store
+            .get_payload_blob(deletable_digest)
+            .await
+            .expect_err("healthy garbage must still be deleted");
+        blob_store
+            .get_payload_blob(poisoned_digest)
+            .await
+            .expect("failed delete leaves the blob for the next sweep");
+    });
 }
 
 #[test]
@@ -819,12 +1612,18 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
 
         fs::write(object_dir.path().join("payloads").join("orphan"), b"orphan").unwrap();
         let dry_run = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert!(dry_run.deleted_blobs >= 1);
         let collected = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
@@ -1651,7 +2450,10 @@ where
         .unwrap();
 
     let dry_run = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: true,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert!(
@@ -1670,13 +2472,19 @@ where
     );
 
     let collected = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: false,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
 
     let after = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: true,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert_eq!(after.deleted_blobs, 0);
@@ -2857,89 +3665,208 @@ where
     );
 }
 
-async fn missing_provider_blob_ref_is_rejected<B>(backend: B)
+// Reads back the provider-minted blob ref for a freshly started large-input
+// workflow so tests can derive the provider's own URI scheme without
+// hardcoding it. The input exceeds the default inline threshold so it offloads
+// under any payload configuration.
+async fn provider_offloaded_input_ref<B>(
+    backend: &B,
+    workflow_id: &str,
+    workflow_queue: &str,
+) -> durust::PayloadRef
 where
     B: DurableBackend,
 {
-    let client = Client::new(backend.clone());
-    client
-        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", input(5))
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(workflow_queue),
+            input: durust::encode_payload(&format!("{workflow_id}:{}", "x".repeat(64 * 1024)))
+                .unwrap(),
+        })
         .await
-        .unwrap();
-    let claimed = backend
+        .unwrap()
+        .run_id()
+        .clone();
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+        panic!("expected workflow start event");
+    };
+    assert!(
+        matches!(input, durust::PayloadRef::Blob { .. }),
+        "large workflow input should be provider-offloaded"
+    );
+    input.clone()
+}
+
+async fn claim_conformance_workflow<B>(
+    backend: &B,
+    worker: &str,
+    queue: &str,
+) -> durust::ClaimedWorkflowTask
+where
+    B: DurableBackend,
+{
+    backend
         .claim_workflow_task(
-            WorkerId::new("missing-blob-worker"),
+            WorkerId::new(worker),
             ClaimWorkflowTaskOptions {
                 namespace: Namespace::default(),
-                task_queue: TaskQueue::new("missing-blob-workflows"),
+                task_queue: TaskQueue::new(queue),
                 registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
                 lease_duration: Duration::from_secs(30),
             },
         )
         .await
         .unwrap()
-        .expect("workflow task");
-    let missing = durust::PayloadRef::Blob {
-        codec: durust::CodecId::MessagePack,
-        schema_fingerprint: durust::SchemaFingerprint("sha256:test".to_owned()),
-        compression: durust::CompressionId::None,
-        encryption: None,
-        digest: "sha256:missing".to_owned(),
-        size: 9,
-        uri: "durust://missing".to_owned(),
+        .expect("workflow task")
+}
+
+fn projection_only_commit(payload: durust::PayloadRef) -> WorkflowTaskCommit {
+    WorkflowTaskCommit {
+        expected_tail_event_id: EventId(1),
+        append_events: Vec::new(),
+        upsert_waits: Vec::new(),
+        schedule_activities: Vec::new(),
+        schedule_activity_maps: Vec::new(),
+        schedule_child_workflow_maps: Vec::new(),
+        start_child_workflows: Vec::new(),
+        consume_signals: Vec::new(),
+        delete_waits: Vec::new(),
+        cancel_commands: Vec::new(),
+        query_projection: Some(payload),
+    }
+}
+
+async fn missing_provider_blob_ref_is_rejected<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    // A ref carrying the provider's own scheme must be validated at commit
+    // time: a digest missing from the provider's store rejects the commit.
+    let source_ref = provider_offloaded_input_ref(
+        &backend,
+        "wf/missing-blob-source",
+        "missing-blob-source-workflows",
+    )
+    .await;
+    let durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
+        digest,
+        size,
+        uri,
+    } = source_ref
+    else {
+        unreachable!();
     };
+    let missing = durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint: schema_fingerprint.clone(),
+        compression,
+        encryption: encryption.clone(),
+        digest: "sha256:missing".to_owned(),
+        size,
+        uri: uri.replace(digest.as_str(), "sha256:missing"),
+    };
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", input(5))
+        .await
+        .unwrap();
+    let claimed =
+        claim_conformance_workflow(&backend, "missing-blob-worker", "missing-blob-workflows").await;
     let err = backend
-        .commit_workflow_task(
-            claimed.claim,
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: Some(missing),
-            },
-        )
+        .commit_workflow_task(claimed.claim, projection_only_commit(missing))
         .await
         .unwrap_err();
     assert!(
         matches!(err, Error::PayloadDecode(message) if message.contains("missing payload blob"))
     );
+
+    // A scheme the provider does not own is opaque: the commit persists the
+    // ref unchanged and provider hydration returns it as-is. Only a decorating
+    // payload layer that owns the scheme may resolve it.
+    let foreign = durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
+        digest: "sha256:foreign".to_owned(),
+        size,
+        uri: "test-unknown://payload/sha256:foreign".to_owned(),
+    };
+    client
+        .start_workflow::<workflow>(
+            "wf/foreign-scheme-blob",
+            "foreign-scheme-blob-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = claim_conformance_workflow(
+        &backend,
+        "foreign-scheme-blob-worker",
+        "foreign-scheme-blob-workflows",
+    )
+    .await;
+    backend
+        .commit_workflow_task(claimed.claim, projection_only_commit(foreign.clone()))
+        .await
+        .unwrap();
+    let projection = backend
+        .query_projection(durust::QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new("wf/foreign-scheme-blob"),
+        })
+        .await
+        .unwrap();
+    let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        panic!("expected opaque foreign-scheme projection");
+    };
+    assert_eq!(payload, foreign);
+    let hydrated = backend.hydrate_payload(payload).await.unwrap();
+    assert_eq!(hydrated, foreign);
 }
 
 async fn provider_blob_ref_metadata_mismatch_is_rejected<B>(backend: B)
 where
     B: DurableBackend,
 {
-    let large_value = "x".repeat(16 * 1024);
-    let source_payload = durust::encode_payload(&large_value).unwrap();
-    let durust::PayloadRef::Inline {
+    // Metadata validation applies to refs carrying the provider's own scheme;
+    // the source ref supplies that scheme with its real digest.
+    let source_ref = provider_offloaded_input_ref(
+        &backend,
+        "wf/blob-metadata-source",
+        "blob-metadata-source-workflows",
+    )
+    .await;
+    let durust::PayloadRef::Blob {
         codec,
         schema_fingerprint,
         compression,
         encryption,
-        bytes,
-    } = source_payload.clone()
+        digest,
+        size,
+        uri,
+    } = source_ref
     else {
-        panic!("freshly encoded payload should be inline before provider storage");
+        unreachable!();
     };
-    let digest = durust::digest_bytes(&bytes);
-    let size = u64::try_from(bytes.len()).unwrap();
-    backend
-        .start_workflow(durust::StartWorkflowRequest {
-            namespace: Namespace::default(),
-            workflow_id: durust::WorkflowId::new("wf/blob-metadata-source"),
-            workflow_type: WorkflowType::new("conformance.workflow", 1),
-            task_queue: TaskQueue::new("blob-metadata-source-workflows"),
-            input: source_payload,
-        })
-        .await
-        .unwrap();
 
     let cases = [
         (
@@ -2951,7 +3878,7 @@ where
                 encryption: encryption.clone(),
                 digest: digest.clone(),
                 size,
-                uri: format!("durust://payload/{digest}"),
+                uri: uri.clone(),
             },
         ),
         (
@@ -2963,7 +3890,7 @@ where
                 encryption: encryption.clone(),
                 digest: digest.clone(),
                 size,
-                uri: format!("durust://payload/{digest}"),
+                uri: uri.clone(),
             },
         ),
     ];

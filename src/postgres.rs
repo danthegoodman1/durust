@@ -5,7 +5,7 @@ use crate::provider_util::{
     codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
     compression_to_str, decode_encryption_metadata, duration_millis_i64,
     encode_encryption_metadata, event_type_from_str, event_type_to_str, marker_kind_from_str,
-    marker_kind_to_str, parent_close_policy_to_str, post_commit_ready_reason,
+    marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
     ready_at_ms_for_delay, reason_from_str, reason_to_str, timed_out_by_heartbeat, timeout_message,
     unix_epoch_millis, wait_kind_to_str,
 };
@@ -45,7 +45,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 2;
+const POSTGRES_SCHEMA_VERSION: i64 = 3;
 const DEFAULT_SCHEMA: &str = "durust";
 const DEFAULT_MAX_POOL_SIZE: usize = 16;
 const DEFAULT_LOGICAL_SHARDS: u32 = 1;
@@ -410,7 +410,8 @@ impl PostgresBackend {
                     compression text not null,
                     encryption bytea,
                     size bigint not null,
-                    bytes bytea
+                    bytes bytea,
+                    created_at_ms bigint not null default 0
                 );
 
                 create table if not exists {schema}.activity_tasks (
@@ -4465,42 +4466,57 @@ impl PostgresBackend {
         let mut reachable = BTreeSet::new();
         self.collect_reachable_payload_blobs_tx(&tx, &schema, &mut reachable)
             .await?;
+        // A commit racing this sweep may reuse an existing unreachable blob
+        // (content-addressed dedup) without inserting a row. Two mechanisms
+        // close that window: the grace period skips young rows, and the
+        // delete's timestamp predicate re-evaluates under the row lock the
+        // reusing commit's `on conflict do update` touch takes, so a blob
+        // touched between the scan and the delete survives.
+        let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
         let rows = tx
             .query(
-                &format!("select digest from {schema}.payload_blobs order by digest asc"),
+                &format!(
+                    "select digest, created_at_ms from {schema}.payload_blobs
+                     order by digest asc"
+                ),
                 &[],
             )
             .await
             .map_err(postgres_error)?;
-        let all_digests = rows
+        let all_blobs = rows
             .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<BTreeSet<_>>();
-        let scanned_blobs = all_digests.len();
-        let retained_blobs = all_digests
-            .iter()
-            .filter(|digest| reachable.contains(*digest))
-            .count();
-        let garbage = all_digests
+            .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+            .collect::<BTreeMap<_, _>>();
+        let scanned_blobs = all_blobs.len();
+        let garbage = all_blobs
             .into_iter()
-            .filter(|digest| !reachable.contains(digest))
+            .filter(|(digest, created_at_ms)| {
+                !reachable.contains(digest) && *created_at_ms <= cutoff
+            })
+            .map(|(digest, _)| digest)
             .collect::<Vec<_>>();
-        let deleted_blobs = garbage.len();
+        let mut deleted_blobs = garbage.len();
         if !req.dry_run {
+            deleted_blobs = 0;
             for digest in garbage {
-                tx.execute(
-                    &format!("delete from {schema}.payload_blobs where digest = $1"),
-                    &[&digest],
-                )
-                .await
-                .map_err(postgres_error)?;
+                deleted_blobs += tx
+                    .execute(
+                        &format!(
+                            "delete from {schema}.payload_blobs
+                             where digest = $1 and created_at_ms <= $2"
+                        ),
+                        &[&digest, &cutoff],
+                    )
+                    .await
+                    .map_err(postgres_error)? as usize;
             }
         }
         tx.commit().await.map_err(postgres_error)?;
         Ok(PayloadGarbageCollectionOutcome {
             scanned_blobs,
-            retained_blobs,
+            retained_blobs: scanned_blobs - deleted_blobs,
             deleted_blobs,
+            failed_blobs: 0,
         })
     }
 
@@ -5009,9 +5025,7 @@ impl PostgresBackend {
         let PayloadRef::Blob { digest, uri, .. } = payload else {
             return Ok(());
         };
-        if uri.starts_with("postgres://payload/") {
-            self.load_payload_blob_tx(tx, payload, false).await?;
-        } else if !is_opaque_external_payload_ref(payload) {
+        if is_postgres_payload_uri(uri) {
             self.load_payload_blob_tx(tx, payload, false).await?;
         }
         reachable.insert(digest.clone());
@@ -5023,7 +5037,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         self.hydrate_activity_map_input_manifest_from_storage_tx(tx, payload)
@@ -5035,7 +5049,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         self.hydrate_activity_map_result_manifest_from_storage_tx(tx, payload)
@@ -5047,7 +5061,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         self.hydrate_child_workflow_map_result_manifest_from_storage_tx(tx, payload)
@@ -5062,7 +5076,7 @@ impl PostgresBackend {
     ) -> Result<()> {
         self.collect_payload_blob_ref_tx(tx, payload, reachable)
             .await?;
-        if is_opaque_external_payload_ref(payload) {
+        if is_external_payload_ref(payload) {
             return Ok(());
         }
         let manifest_payload = self
@@ -5072,7 +5086,7 @@ impl PostgresBackend {
         for page in manifest.pages {
             self.collect_payload_blob_ref_tx(tx, &page, reachable)
                 .await?;
-            if is_opaque_external_payload_ref(&page) {
+            if is_external_payload_ref(&page) {
                 continue;
             }
             let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
@@ -5093,7 +5107,7 @@ impl PostgresBackend {
     ) -> Result<()> {
         self.collect_payload_blob_ref_tx(tx, payload, reachable)
             .await?;
-        if is_opaque_external_payload_ref(payload) {
+        if is_external_payload_ref(payload) {
             return Ok(());
         }
         let manifest_payload = self
@@ -5103,7 +5117,7 @@ impl PostgresBackend {
         for page in manifest.pages {
             self.collect_payload_blob_ref_tx(tx, &page, reachable)
                 .await?;
-            if is_opaque_external_payload_ref(&page) {
+            if is_external_payload_ref(&page) {
                 continue;
             }
             let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
@@ -5124,7 +5138,7 @@ impl PostgresBackend {
     ) -> Result<()> {
         self.collect_payload_blob_ref_tx(tx, payload, reachable)
             .await?;
-        if is_opaque_external_payload_ref(payload) {
+        if is_external_payload_ref(payload) {
             return Ok(());
         }
         let manifest_payload = self
@@ -5135,7 +5149,7 @@ impl PostgresBackend {
         for page in manifest.pages {
             self.collect_payload_blob_ref_tx(tx, &page, reachable)
                 .await?;
-            if is_opaque_external_payload_ref(&page) {
+            if is_external_payload_ref(&page) {
                 continue;
             }
             let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
@@ -5194,12 +5208,19 @@ impl PostgresBackend {
                 let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 let encryption_blob = encode_encryption_metadata(&encryption)?;
                 let schema = self.schema_sql();
+                // The conflict arm is `do update` rather than `do nothing` on
+                // purpose: refreshing `created_at_ms` restarts the GC grace
+                // period for a reused blob AND takes a row lock, so a
+                // concurrent GC delete serializes against this commit and
+                // re-evaluates its timestamp predicate under the refreshed
+                // value instead of deleting a row this commit references.
                 tx.execute(
                     &format!(
                         "insert into {schema}.payload_blobs
-                         (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                         values ($1, $2, $3, $4, $5, $6, $7)
-                         on conflict(digest) do nothing"
+                         (digest, codec, schema_fingerprint, compression, encryption, size, bytes,
+                          created_at_ms)
+                         values ($1, $2, $3, $4, $5, $6, $7, $8)
+                         on conflict(digest) do update set created_at_ms = excluded.created_at_ms"
                     ),
                     &[
                         &digest,
@@ -5209,6 +5230,7 @@ impl PostgresBackend {
                         &encryption_blob,
                         &i64::try_from(size).unwrap_or(i64::MAX),
                         &bytes,
+                        &unix_epoch_millis(),
                     ],
                 )
                 .await
@@ -5225,7 +5247,11 @@ impl PostgresBackend {
             }
             payload @ PayloadRef::Inline { .. } => Ok(payload),
             payload @ PayloadRef::Blob { .. } => {
-                if !is_opaque_external_payload_ref(&payload) {
+                // Only refs with this provider's scheme are validated against
+                // its store; every other scheme is opaque and persists
+                // unchanged.
+                if matches!(&payload, PayloadRef::Blob { uri, .. } if is_postgres_payload_uri(uri))
+                {
                     self.load_payload_blob_tx(tx, &payload, true).await?;
                 }
                 Ok(payload)
@@ -5236,9 +5262,7 @@ impl PostgresBackend {
     async fn hydrate_payload_from_storage(&self, payload: PayloadRef) -> Result<PayloadRef> {
         match payload {
             payload @ PayloadRef::Inline { .. } => Ok(payload),
-            payload @ PayloadRef::Blob { .. } if is_opaque_external_payload_ref(&payload) => {
-                Ok(payload)
-            }
+            payload @ PayloadRef::Blob { .. } if is_external_payload_ref(&payload) => Ok(payload),
             payload @ PayloadRef::Blob { .. } => {
                 let PayloadRef::Blob {
                     codec,
@@ -5269,9 +5293,7 @@ impl PostgresBackend {
     ) -> Result<PayloadRef> {
         match payload {
             payload @ PayloadRef::Inline { .. } => Ok(payload),
-            payload @ PayloadRef::Blob { .. } if is_opaque_external_payload_ref(&payload) => {
-                Ok(payload)
-            }
+            payload @ PayloadRef::Blob { .. } if is_external_payload_ref(&payload) => Ok(payload),
             payload @ PayloadRef::Blob { .. } => {
                 let PayloadRef::Blob {
                     codec,
@@ -5300,7 +5322,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -5327,7 +5349,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -5354,7 +5376,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -5405,7 +5427,7 @@ impl PostgresBackend {
         &self,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage(payload).await?;
@@ -5431,7 +5453,7 @@ impl PostgresBackend {
         &self,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage(payload).await?;
@@ -5457,7 +5479,7 @@ impl PostgresBackend {
         &self,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage(payload).await?;
@@ -5509,7 +5531,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -5536,7 +5558,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -5563,7 +5585,7 @@ impl PostgresBackend {
         tx: &Transaction<'_>,
         payload: PayloadRef,
     ) -> Result<PayloadRef> {
-        if is_opaque_external_payload_ref(&payload) {
+        if is_external_payload_ref(&payload) {
             return Ok(payload);
         }
         let root = self.hydrate_payload_from_storage_tx(tx, payload).await?;
@@ -8614,8 +8636,15 @@ async fn index_workflow_change_marker_record(
     Ok(())
 }
 
-fn is_opaque_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://"))
+fn is_postgres_payload_uri(uri: &str) -> bool {
+    uri.starts_with("postgres://payload/")
+}
+
+// Every blob ref this provider did not mint is opaque: it belongs to whatever
+// layer owns its scheme (a `PayloadBackend` blob store), so the provider never
+// hydrates, validates, or garbage-collects it.
+fn is_external_payload_ref(payload: &PayloadRef) -> bool {
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_postgres_payload_uri(uri))
 }
 
 fn collect_failure_payload_roots(failure: &DurableFailure, roots: &mut Vec<PayloadRootRef>) {

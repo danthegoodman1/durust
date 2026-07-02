@@ -1295,7 +1295,7 @@ fn payload_garage_object_store(c: &mut Criterion) {
         .unwrap();
     let store = durust::S3BlobStore::garage(config).unwrap();
     runtime
-        .block_on(store.list_payload_blob_digests())
+        .block_on(store.list_payload_blobs())
         .expect("Garage S3 benchmark store must be reachable");
 
     let bytes = encoded_payload_bytes(&large_payload());
