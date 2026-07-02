@@ -126,12 +126,12 @@ describePostgres("PostgresBackend payload roots and GC", () => {
       input
     });
 
-    await expect(backend.planGarbageCollection()).resolves.toMatchObject({
+    await expect(backend.planGarbageCollection({ minAgeMs: 0 })).resolves.toMatchObject({
       unreachableUris: [orphan.uri],
       retainedCount: 1,
       unreachableCount: 1
     });
-    await expect(backend.collectGarbage({ dryRun: false })).resolves.toMatchObject({
+    await expect(backend.collectGarbage({ dryRun: false, minAgeMs: 0 })).resolves.toMatchObject({
       deletedUris: [orphan.uri],
       deletedCount: 1
     });

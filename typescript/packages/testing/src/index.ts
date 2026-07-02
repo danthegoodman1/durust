@@ -979,6 +979,202 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
+      name: "timeout-less activity heartbeat extends lease and expired reclaim bumps attempt",
+      async run(factory) {
+        const originalDateNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
+        try {
+          const { backend, claim } = await startedAndClaimed(factory);
+          const input = encodePayload({ value: 1 }, { codec: "Json" });
+          const scheduled = {
+            commandId: commandId(claim.runId, 1),
+            activityName: "conformance.implicit-heartbeat",
+            taskQueue: "activities",
+            retryPolicy: RetryPolicy.exponential({
+              initialIntervalMs: 0,
+              maxIntervalMs: 0,
+              maxAttempts: 2,
+              backoffCoefficient: 1
+            }),
+            startToCloseTimeoutMs: null,
+            heartbeatTimeoutMs: null,
+            input,
+            fingerprint: activityFingerprint(
+              "conformance.implicit-heartbeat",
+              payloadDigest(input),
+              "sha256:test-options"
+            )
+          };
+          await backend.commitWorkflowTask(claim, {
+            expectedTailEventId: eventId(1),
+            appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+            scheduleActivities: [activityTaskFromScheduled(scheduled)]
+          });
+
+          const first = await backend.claimActivityTask("implicit-heartbeat-worker-1", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(first !== null, "first timeout-less activity attempt should be claimable");
+          assert(first.task.attempt === 1, "first implicit heartbeat attempt should be attempt 1");
+
+          now = 1_009;
+          assert(
+            (await backend.heartbeatActivity({ claim: first.claim })).kind === "Recorded",
+            "heartbeat before the original lease expires should be accepted"
+          );
+          now = 1_018;
+          assert(
+            (await backend.heartbeatActivity({ claim: first.claim })).kind === "Recorded",
+            "second heartbeat should extend the lease past two original periods"
+          );
+          now = 1_027;
+          const competingClaim = await backend.claimActivityTask("implicit-heartbeat-competitor", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(competingClaim === null, "heartbeating holder should not be reclaimed early");
+          const stillLive = await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+          assert(stillLive.timedOut === 0, "heartbeating holder should survive multiple leases");
+
+          now = 1_028;
+          const expired = await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+          assert(expired.timedOut === 1, "stopped heartbeats should reclaim one lease later");
+
+          const noWorkflowWake = await backend.claimWorkflowTask("implicit-heartbeat-premature", {
+            namespace: namespace(),
+            taskQueue: taskQueue("workflows"),
+            registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+            leaseDurationMs: 30_000
+          });
+          assert(noWorkflowWake === null, "retryable lease expiry should not wake workflow early");
+
+          const second = await backend.claimActivityTask("implicit-heartbeat-worker-2", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(second !== null, "expired timeout-less activity should be retried");
+          assert(second.task.attempt === 2, "expired lease reclaim should bump attempt");
+
+          await assertRejects(
+            () =>
+              backend.completeActivity({
+                claim: first.claim,
+                result: encodePayload({ value: 2 }, { codec: "Json" })
+              }),
+            "stale activity task lease"
+          );
+          await assertRejects(
+            () => backend.heartbeatActivity({ claim: first.claim }),
+            "stale activity task lease"
+          );
+        } finally {
+          Date.now = originalDateNow;
+        }
+      }
+    },
+    {
+      name: "expired timeout-less activity lease honors nonzero retry backoff before reclaim",
+      async run(factory) {
+        const originalDateNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
+        try {
+          const { backend, claim } = await startedAndClaimed(factory);
+          const input = encodePayload({ value: 1 }, { codec: "Json" });
+          const scheduled = {
+            commandId: commandId(claim.runId, 1),
+            activityName: "conformance.backoff-reclaim",
+            taskQueue: "activities",
+            retryPolicy: RetryPolicy.exponential({
+              initialIntervalMs: 5_000,
+              maxIntervalMs: 5_000,
+              maxAttempts: 3,
+              backoffCoefficient: 1
+            }),
+            startToCloseTimeoutMs: null,
+            heartbeatTimeoutMs: null,
+            input,
+            fingerprint: activityFingerprint(
+              "conformance.backoff-reclaim",
+              payloadDigest(input),
+              "sha256:test-options"
+            )
+          };
+          await backend.commitWorkflowTask(claim, {
+            expectedTailEventId: eventId(1),
+            appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+            scheduleActivities: [activityTaskFromScheduled(scheduled)]
+          });
+
+          const first = await backend.claimActivityTask("backoff-reclaim-worker-1", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(first !== null, "first backoff activity attempt should be claimable");
+          assert(first.task.attempt === 1, "first backoff attempt should be attempt 1");
+
+          // The lease expired at 1_010 with no heartbeat; the next attempt's
+          // 5s retry backoff starts at reclaim time, so a claim right after
+          // expiry must be refused rather than handed out mid-backoff.
+          now = 1_011;
+          const duringBackoff = await backend.claimActivityTask("backoff-reclaim-worker-2", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(duringBackoff === null, "expired lease must not be reclaimed during retry backoff");
+
+          // Timeout maintenance persists the retry with the paced visibility
+          // so the backoff window is durable rather than recomputed per poll.
+          await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+
+          now = 6_010;
+          const stillBackedOff = await backend.claimActivityTask("backoff-reclaim-worker-3", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(stillBackedOff === null, "retry must stay invisible until the backoff elapses");
+
+          now = 6_011;
+          const second = await backend.claimActivityTask("backoff-reclaim-worker-4", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(second !== null, "retry should be claimable after the backoff elapses");
+          assert(second.task.attempt === 2, "backoff reclaim should be the next attempt");
+        } finally {
+          Date.now = originalDateNow;
+        }
+      }
+    },
+    {
       name: "activity heartbeat timeout retries before terminal workflow wake",
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);

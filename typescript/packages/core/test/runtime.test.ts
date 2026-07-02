@@ -39,6 +39,7 @@ import {
   workflowId,
   workflowType,
   type ClaimedWorkflowTask,
+  type RunId,
   type SchemaAdapter
 } from "@durust/core";
 import { HotWorkflowExecution } from "../src/runtime.js";
@@ -98,7 +99,17 @@ const fakeClaimed: ClaimedWorkflowTask = {
   },
   replayTargetEventId: eventId(1),
   reason: "WorkflowStarted",
-  prefetchedHistory: []
+  prefetchedHistory: [
+    {
+      eventId: eventId(1),
+      eventType: "WorkflowStarted",
+      data: {
+        kind: "WorkflowStarted",
+        workflowType: workflowType("orders.checkout", 1),
+        input: encodePayload({}, { codec: "Json" })
+      }
+    }
+  ]
 };
 
 function committedTail(outcome: { readonly kind: string; readonly newTailEventId?: unknown }) {
@@ -1304,6 +1315,140 @@ describe("minimal workflow runtime", () => {
       "TimerFired",
       "WorkflowCompleted"
     ]);
+  });
+
+  // Records a two-timer history under the given durable name and returns a
+  // replay claim plus the backend, so divergence tests can replay shortened
+  // workflow versions against it.
+  async function recordTwoTimerHistory(durableName: string): Promise<{
+    readonly backend: MemoryBackend;
+    readonly replayClaim: ClaimedWorkflowTask;
+  }> {
+    const twoTimer = workflow({
+      name: durableName,
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly done: true }> => {
+        await sleepUntil(1_000);
+        await sleepUntil(2_000);
+        return { done: true };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId(`wf/${durableName}`),
+      workflowType: twoTimer.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+
+    for (const [worker, timerNow] of [["worker-a", 1_000], ["worker-b", 2_000]] as const) {
+      const claim = await backend.claimWorkflowTask(worker, {
+        namespace: namespace(),
+        taskQueue: taskQueue("workflows"),
+        registeredWorkflowTypes: [twoTimer.workflowType],
+        leaseDurationMs: 30_000
+      });
+      if (!claim) {
+        throw new Error(`expected claim for ${worker}`);
+      }
+      await backend.commitWorkflowTask(
+        claim.claim,
+        await prepareWorkflowTaskCommit(twoTimer, {}, claim, { payloadCodec: "Json" })
+      );
+      await backend.fireDueTimers({ namespace: namespace(), now: timerNow, limit: 16 });
+    }
+
+    const replayClaim = await backend.claimWorkflowTask("worker-replay", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [twoTimer.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!replayClaim) {
+      throw new Error("expected replay claim");
+    }
+    return { backend, replayClaim };
+  }
+
+  async function assertHistoryHasNoTerminalEvent(
+    backend: MemoryBackend,
+    runId: RunId
+  ): Promise<void> {
+    const history = await backend.streamHistory({
+      runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map((event) => event.eventType)).toEqual([
+      "WorkflowStarted",
+      "TimerStarted",
+      "TimerFired",
+      "TimerStarted",
+      "TimerFired"
+    ]);
+  }
+
+  it("rejects terminal completion with leftover recorded timer commands", async () => {
+    const { backend, replayClaim } = await recordTwoTimerHistory("tests.timer-shortening");
+    const oneTimer = workflow({
+      name: "tests.timer-shortening",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly done: true }> => {
+        await sleepUntil(1_000);
+        return { done: true };
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(oneTimer, {}, replayClaim, { payloadCodec: "Json" })
+    ).rejects.toThrow(
+      "nondeterminism: WorkflowCompleted reached with unconsumed recorded command TimerStarted"
+    );
+    await assertHistoryHasNoTerminalEvent(backend, replayClaim.runId);
+  });
+
+  it("rejects terminal app failure with leftover recorded timer commands without hanging", async () => {
+    const { backend, replayClaim } = await recordTwoTimerHistory("tests.timer-shortening-fail");
+    const oneTimerThenThrow = workflow({
+      name: "tests.timer-shortening-fail",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly done: true }> => {
+        await sleepUntil(1_000);
+        throw new Error("app failure after shortened replay");
+      }
+    });
+
+    // The divergence error is raised while recording WorkflowFailed inside the
+    // handler's rejection path; it must surface as a fatal prepare error, not
+    // an unhandled rejection that leaves the task hanging.
+    await expect(
+      prepareWorkflowTaskCommit(oneTimerThenThrow, {}, replayClaim, { payloadCodec: "Json" })
+    ).rejects.toThrow(
+      "nondeterminism: WorkflowFailed reached with unconsumed recorded command TimerStarted"
+    );
+    await assertHistoryHasNoTerminalEvent(backend, replayClaim.runId);
+  });
+
+  it("rejects continue-as-new with leftover recorded timer commands", async () => {
+    const { backend, replayClaim } = await recordTwoTimerHistory("tests.timer-shortening-can");
+    const oneTimerThenContinue = workflow({
+      name: "tests.timer-shortening-can",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<void> => {
+        await sleepUntil(1_000);
+        continueAsNew<TestNoInput>({});
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(oneTimerThenContinue, {}, replayClaim, { payloadCodec: "Json" })
+    ).rejects.toThrow(
+      "nondeterminism: WorkflowContinuedAsNew reached with unconsumed recorded command TimerStarted"
+    );
+    await assertHistoryHasNoTerminalEvent(backend, replayClaim.runId);
   });
 
   it("keeps a hot async workflow frame alive across timer firing", async () => {

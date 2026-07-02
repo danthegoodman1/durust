@@ -117,6 +117,7 @@ interface ActivityLease {
   readonly startedAtMs: number;
   readonly heartbeatDeadlineAtMs: number | null;
   readonly expiresAtMs: number;
+  readonly leaseDurationMs: number;
 }
 
 interface ActivityMapState {
@@ -190,6 +191,7 @@ interface ActivityRow {
   readonly claim_started_at_ms: number | null;
   readonly heartbeat_deadline_at_ms: number | null;
   readonly claim_expires_at_ms: number | null;
+  readonly claim_lease_duration_ms: number | null;
   readonly available_at_ms: number | null;
   readonly terminal_event_id: number | null;
 }
@@ -533,6 +535,13 @@ export class SqliteBackend implements DurableBackend {
       for (const row of rows) {
         const activity = activityStateFromRow(row);
         this.#restoreExpiredActivityLease(activity);
+        // Restoring an expired lease may reschedule the next attempt with
+        // retry backoff; the SQL filter above used the stale available_at_ms,
+        // so persist the restored row and skip it until the backoff elapses.
+        if (activity.availableAtMs > this.#nowMs()) {
+          this.#insertActivity(activity);
+          continue;
+        }
         if (
           this.#activityMapForTask(activity.task)?.terminal === true
         ) {
@@ -547,8 +556,13 @@ export class SqliteBackend implements DurableBackend {
         activity.claim = {
           claim,
           startedAtMs: now,
-          heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, now),
-          expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
+          heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+            activity.task,
+            now,
+            opts.leaseDurationMs
+          ),
+          expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs),
+          leaseDurationMs: Math.max(0, opts.leaseDurationMs)
         };
         this.#insertActivity(activity);
         return { task: activity.task, claim };
@@ -678,9 +692,15 @@ export class SqliteBackend implements DurableBackend {
       if (currentClaim === null) {
         throw new Error("stale activity task lease");
       }
+      const now = this.#nowMs();
       activity.claim = {
         ...currentClaim,
-        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+          activity.task,
+          now,
+          currentClaim.leaseDurationMs
+        ),
+        expiresAtMs: now + currentClaim.leaseDurationMs
       };
       this.#insertActivity(activity);
       return { kind: "Recorded" };
@@ -949,6 +969,7 @@ export class SqliteBackend implements DurableBackend {
         claim_started_at_ms integer,
         heartbeat_deadline_at_ms integer,
         claim_expires_at_ms integer,
+        claim_lease_duration_ms integer,
         available_at_ms integer,
         terminal_event_id integer
       );
@@ -1057,6 +1078,15 @@ export class SqliteBackend implements DurableBackend {
       create index if not exists idx_signals_namespace_inbox
         on signals(namespace, run_id, signal_name, consumed, received_sequence);
     `);
+    try {
+      this.#db.exec(`
+        alter table activities add column claim_lease_duration_ms integer;
+      `);
+    } catch (error) {
+      if (!isSqliteDuplicateColumnError(error)) {
+        throw error;
+      }
+    }
     this.#db.exec(`
       create index if not exists idx_activities_ready_projection
         on activities(namespace, task_queue, activity_name, available_at_ms, activity_id)
@@ -1280,9 +1310,9 @@ export class SqliteBackend implements DurableBackend {
       insert or replace into activities(
         activity_id, namespace, run_id, command_key, activity_name, task_queue,
         map_command_key, map_item_ordinal, task, input, claim_worker, claim_token, claim_started_at_ms,
-        heartbeat_deadline_at_ms, claim_expires_at_ms,
+        heartbeat_deadline_at_ms, claim_expires_at_ms, claim_lease_duration_ms,
         available_at_ms, terminal_event_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       activity.task.activityId,
       activity.namespace,
@@ -1299,6 +1329,7 @@ export class SqliteBackend implements DurableBackend {
       activity.claim?.startedAtMs ?? null,
       activity.claim?.heartbeatDeadlineAtMs ?? null,
       activity.claim?.expiresAtMs ?? null,
+      activity.claim?.leaseDurationMs ?? null,
       activity.availableAtMs,
       activity.terminalEventId === null ? null : Number(activity.terminalEventId)
     );
@@ -1343,6 +1374,13 @@ export class SqliteBackend implements DurableBackend {
 
   #restoreExpiredActivityLease(activity: ActivityState): void {
     if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      const retry = retryActivityAfterTimeout(activity, this.#nowMs());
+      if (retry === null) {
+        activity.claim = null;
+        return;
+      }
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
       activity.claim = null;
     }
   }
@@ -2022,11 +2060,14 @@ function activityStateFromRow(row: ActivityRow): ActivityState {
               activityId: row.activity_id,
               workerId: row.claim_worker,
               token: row.claim_token
+            },
+            startedAtMs: row.claim_started_at_ms ?? 0,
+            heartbeatDeadlineAtMs: row.heartbeat_deadline_at_ms,
+            expiresAtMs: row.claim_expires_at_ms ?? 0,
+            leaseDurationMs:
+              row.claim_lease_duration_ms ??
+              Math.max(0, (row.claim_expires_at_ms ?? 0) - (row.claim_started_at_ms ?? 0))
           },
-          startedAtMs: row.claim_started_at_ms ?? 0,
-          heartbeatDeadlineAtMs: row.heartbeat_deadline_at_ms,
-          expiresAtMs: row.claim_expires_at_ms ?? 0
-        },
     terminalEventId: row.terminal_event_id === null ? null : eventId(row.terminal_event_id)
   };
 }
@@ -2258,10 +2299,15 @@ function retryDelayMs(
   return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
-function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
-  return task.heartbeatTimeoutMs === null
-    ? null
-    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+function activityHeartbeatDeadlineAt(
+  task: ActivityTask,
+  nowMs: number,
+  leaseDurationMs: number
+): number | null {
+  if (task.heartbeatTimeoutMs !== null) {
+    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
+  }
+  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
 function activityTimeoutMessage(
@@ -2301,6 +2347,13 @@ function parseJson<T>(value: string): T {
     }
     return nested;
   }) as T;
+}
+
+function isSqliteDuplicateColumnError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("duplicate column name: claim_lease_duration_ms")
+  );
 }
 
 function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {

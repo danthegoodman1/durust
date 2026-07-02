@@ -342,6 +342,7 @@ interface ActivityLease {
   readonly startedAtMs: number;
   readonly heartbeatDeadlineAtMs: number | null;
   readonly expiresAtMs: number;
+  readonly leaseDurationMs: number;
 }
 
 interface ActivityMapState {
@@ -608,8 +609,13 @@ export class MemoryBackend implements DurableBackend {
       activity.claim = {
         claim,
         startedAtMs: now,
-        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, now),
-        expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+          activity.task,
+          now,
+          opts.leaseDurationMs
+        ),
+        expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs),
+        leaseDurationMs: Math.max(0, opts.leaseDurationMs)
       };
       return { task: activity.task, claim };
     }
@@ -734,9 +740,15 @@ export class MemoryBackend implements DurableBackend {
       throw new Error("stale activity task lease");
     }
     const currentClaim = activity.claim;
+    const now = this.#nowMs();
     activity.claim = {
       ...currentClaim,
-      heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+      heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+        activity.task,
+        now,
+        currentClaim.leaseDurationMs
+      ),
+      expiresAtMs: now + currentClaim.leaseDurationMs
     };
     return { kind: "Recorded" };
   }
@@ -754,6 +766,13 @@ export class MemoryBackend implements DurableBackend {
 
   #restoreExpiredActivityLease(activity: ActivityState): void {
     if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      const retry = retryActivityAfterTimeout(activity, this.#nowMs());
+      if (retry === null) {
+        activity.claim = null;
+        return;
+      }
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
       activity.claim = null;
     }
   }
@@ -1479,10 +1498,15 @@ function retryDelayMs(
   return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
-function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
-  return task.heartbeatTimeoutMs === null
-    ? null
-    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+function activityHeartbeatDeadlineAt(
+  task: ActivityTask,
+  nowMs: number,
+  leaseDurationMs: number
+): number | null {
+  if (task.heartbeatTimeoutMs !== null) {
+    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
+  }
+  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
 function activityTimeoutDeadline(

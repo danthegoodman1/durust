@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ import {
   workflowType
 } from "@durust/core";
 import {
+  DEFAULT_PAYLOAD_GC_MIN_AGE_MS,
   LocalDirectoryBlobStore,
   PayloadBackend,
   type PayloadBlobStore,
@@ -484,10 +485,15 @@ describe("local-directory payload storage", () => {
     }
 
     await expect(
-      planPayloadGarbageCollection({ blobStore: store, roots: [{ payload: reachable }] })
+      planPayloadGarbageCollection({
+        blobStore: store,
+        roots: [{ payload: reachable }],
+        minAgeMs: 0
+      })
     ).resolves.toEqual({
       reachableUris: [reachable.uri],
       unreachableUris: [orphan.uri],
+      retainedYoungUris: [],
       retainedCount: 1,
       unreachableCount: 1
     });
@@ -496,6 +502,7 @@ describe("local-directory payload storage", () => {
       collectPayloadGarbage({
         blobStore: store,
         roots: [{ payload: reachable }],
+        minAgeMs: 0,
         dryRun: true
       })
     ).resolves.toMatchObject({
@@ -509,6 +516,7 @@ describe("local-directory payload storage", () => {
       collectPayloadGarbage({
         blobStore: store,
         roots: [{ payload: reachable }],
+        minAgeMs: 0,
         dryRun: false
       })
     ).resolves.toMatchObject({
@@ -516,6 +524,152 @@ describe("local-directory payload storage", () => {
       deletedCount: 1
     });
     expect(await store.list()).toEqual([reachable.uri]);
+  });
+
+  it("retains in-flight uploads under the default GC grace period", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-gc-inflight-"))
+    });
+    const inFlight = await encodePayloadWithStorage(
+      { body: "uploaded-before-commit".repeat(16) },
+      {
+        inlineThresholdBytes: 8,
+        blobStore: store
+      }
+    );
+    if (inFlight.kind !== "Blob") {
+      throw new Error("expected in-flight blob");
+    }
+    const uploadedAtMs = await store.lastModifiedMs(inFlight.uri);
+    if (uploadedAtMs === null) {
+      throw new Error("expected local blob mtime");
+    }
+
+    await expect(
+      collectPayloadGarbage({
+        blobStore: store,
+        roots: [],
+        dryRun: false,
+        nowMs: uploadedAtMs + DEFAULT_PAYLOAD_GC_MIN_AGE_MS - 1
+      })
+    ).resolves.toMatchObject({
+      deletedUris: [],
+      deletedCount: 0,
+      retainedYoungUris: [inFlight.uri],
+      unreachableUris: []
+    });
+    expect(await store.list()).toEqual([inFlight.uri]);
+  });
+
+  it("allows minAgeMs zero to collect an otherwise in-flight upload", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-gc-zero-age-"))
+    });
+    const inFlight = await encodePayloadWithStorage(
+      { body: "delete-with-zero-age".repeat(16) },
+      {
+        inlineThresholdBytes: 8,
+        blobStore: store
+      }
+    );
+    if (inFlight.kind !== "Blob") {
+      throw new Error("expected in-flight blob");
+    }
+
+    await expect(
+      collectPayloadGarbage({
+        blobStore: store,
+        roots: [],
+        dryRun: false,
+        minAgeMs: 0
+      })
+    ).resolves.toMatchObject({
+      deletedUris: [inFlight.uri],
+      deletedCount: 1
+    });
+    expect(await store.list()).toEqual([]);
+  });
+
+  it("keeps committed blobs regardless of age", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-gc-committed-"))
+    });
+    const committed = await encodePayloadWithStorage(
+      { body: "committed".repeat(32) },
+      {
+        inlineThresholdBytes: 8,
+        blobStore: store
+      }
+    );
+    if (committed.kind !== "Blob") {
+      throw new Error("expected committed blob");
+    }
+
+    await expect(
+      collectPayloadGarbage({
+        blobStore: store,
+        roots: [{ payload: committed }],
+        dryRun: false,
+        minAgeMs: 0
+      })
+    ).resolves.toMatchObject({
+      deletedUris: [],
+      deletedCount: 0,
+      reachableUris: [committed.uri]
+    });
+    expect(await store.list()).toEqual([committed.uri]);
+  });
+
+  it("refreshes content-addressed local blob age on deduplicated re-put", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-gc-reput-"))
+    });
+    const value = { body: "same-content".repeat(32) };
+    const first = await encodePayloadWithStorage(value, {
+      inlineThresholdBytes: 8,
+      blobStore: store
+    });
+    if (first.kind !== "Blob") {
+      throw new Error("expected first blob");
+    }
+    await utimes(fileURLToPath(first.uri), new Date(0), new Date(0));
+
+    await expect(
+      planPayloadGarbageCollection({
+        blobStore: store,
+        roots: [],
+        minAgeMs: 1_000,
+        nowMs: 2_000
+      })
+    ).resolves.toMatchObject({
+      unreachableUris: [first.uri],
+      retainedYoungUris: []
+    });
+
+    const second = await encodePayloadWithStorage(value, {
+      inlineThresholdBytes: 8,
+      blobStore: store
+    });
+    expect(second).toEqual(first);
+    const refreshedAtMs = await store.lastModifiedMs(first.uri);
+    if (refreshedAtMs === null) {
+      throw new Error("expected refreshed local blob mtime");
+    }
+
+    await expect(
+      collectPayloadGarbage({
+        blobStore: store,
+        roots: [],
+        dryRun: false,
+        minAgeMs: 1_000,
+        nowMs: refreshedAtMs + 999
+      })
+    ).resolves.toMatchObject({
+      deletedUris: [],
+      deletedCount: 0,
+      retainedYoungUris: [first.uri]
+    });
+    expect(await store.list()).toEqual([first.uri]);
   });
 
   it("recursively retains blob refs nested inside manifest payloads", async () => {
@@ -592,6 +746,7 @@ describe("local-directory payload storage", () => {
       collectPayloadGarbage({
         blobStore: store,
         roots: [reachable],
+        minAgeMs: 0,
         dryRun: false
       })
     ).rejects.toThrow("blob payload size mismatch");
@@ -625,6 +780,7 @@ describe("local-directory payload storage", () => {
       collectPayloadGarbage({
         blobStore: store,
         roots: [reachable],
+        minAgeMs: 0,
         dryRun: false
       })
     ).rejects.toThrow();
@@ -661,12 +817,12 @@ describe("local-directory payload storage", () => {
       input
     });
 
-    await expect(backend.planGarbageCollection()).resolves.toMatchObject({
+    await expect(backend.planGarbageCollection({ minAgeMs: 0 })).resolves.toMatchObject({
       unreachableUris: [orphan.uri],
       retainedCount: 1,
       unreachableCount: 1
     });
-    await expect(backend.collectGarbage({ dryRun: false })).resolves.toMatchObject({
+    await expect(backend.collectGarbage({ dryRun: false, minAgeMs: 0 })).resolves.toMatchObject({
       deletedUris: [orphan.uri],
       deletedCount: 1
     });
@@ -728,6 +884,10 @@ class ToggleableBlobStore implements PayloadBlobStore {
 
   async list(): Promise<readonly string[]> {
     return await this.inner.list();
+  }
+
+  async lastModifiedMs(uri: string): Promise<number | null> {
+    return (await this.inner.lastModifiedMs?.(uri)) ?? null;
   }
 
   owns(uri: string): boolean {

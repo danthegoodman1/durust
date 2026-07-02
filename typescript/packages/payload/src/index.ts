@@ -1,5 +1,5 @@
 import { createHash, createHmac } from "node:crypto";
-import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import {
   decodePayload,
@@ -50,8 +50,11 @@ export interface PayloadBlobStore {
   get(uri: string): Promise<Uint8Array>;
   delete(uri: string): Promise<void>;
   list(): Promise<readonly string[]>;
+  lastModifiedMs?(uri: string): Promise<number | null>;
   owns(uri: string): boolean;
 }
+
+export const DEFAULT_PAYLOAD_GC_MIN_AGE_MS = 60 * 60 * 1000;
 
 export interface LocalDirectoryBlobStoreOptions {
   readonly root: string;
@@ -95,6 +98,18 @@ export class LocalDirectoryBlobStore implements PayloadBlobStore {
     } catch (error) {
       if (isNodeError(error, "ENOENT")) {
         return [];
+      }
+      throw error;
+    }
+  }
+
+  async lastModifiedMs(uri: string): Promise<number | null> {
+    this.#assertOwned(uri);
+    try {
+      return (await stat(fileUriToPath(uri))).mtimeMs;
+    } catch (error) {
+      if (isNodeError(error, "ENOENT")) {
+        return null;
       }
       throw error;
     }
@@ -189,6 +204,27 @@ export class S3CompatibleBlobStore implements PayloadBlobStore {
     } while (continuationToken !== undefined);
 
     return keys.map((key) => this.#uriForKey(key)).sort();
+  }
+
+  async lastModifiedMs(uri: string): Promise<number | null> {
+    // A blob deleted between list() and this probe answers 404; report unknown
+    // age (retained this sweep) instead of aborting the whole GC run.
+    const request = this.#buildSignedRequest("HEAD", this.#keyFromUri(uri), []);
+    const response = await fetch(request.url, { method: "HEAD", headers: request.headers });
+    if (response.status === 404) {
+      return null;
+    }
+    if (!response.ok) {
+      throw new Error(
+        `S3 HEAD ${request.url.pathname} failed: ${response.status} ${response.statusText}`
+      );
+    }
+    const lastModified = response.headers.get("last-modified");
+    if (lastModified === null) {
+      return null;
+    }
+    const timestamp = Date.parse(lastModified);
+    return Number.isFinite(timestamp) ? timestamp : null;
   }
 
   owns(uri: string): boolean {
@@ -478,20 +514,26 @@ export class PayloadBackend implements DurableBackend {
     return this.#backend.payloadRoots();
   }
 
-  async planGarbageCollection(): Promise<PayloadGarbageCollectionPlan> {
+  async planGarbageCollection(
+    options: { readonly minAgeMs?: number; readonly nowMs?: number } = {}
+  ): Promise<PayloadGarbageCollectionPlan> {
     return planPayloadGarbageCollection({
       blobStore: this.#blobStore,
-      roots: await this.#backend.payloadRoots()
+      roots: await this.#backend.payloadRoots(),
+      ...(options.minAgeMs === undefined ? {} : { minAgeMs: options.minAgeMs }),
+      ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs })
     });
   }
 
   async collectGarbage(
-    options: { readonly dryRun?: boolean } = {}
+    options: { readonly dryRun?: boolean; readonly minAgeMs?: number; readonly nowMs?: number } = {}
   ): Promise<CollectPayloadGarbageOutcome> {
     return collectPayloadGarbage({
       blobStore: this.#blobStore,
       roots: await this.#backend.payloadRoots(),
-      ...(options.dryRun === undefined ? {} : { dryRun: options.dryRun })
+      ...(options.dryRun === undefined ? {} : { dryRun: options.dryRun }),
+      ...(options.minAgeMs === undefined ? {} : { minAgeMs: options.minAgeMs }),
+      ...(options.nowMs === undefined ? {} : { nowMs: options.nowMs })
     });
   }
 
@@ -573,11 +615,14 @@ export function collectPayloadRefs(value: unknown): readonly PayloadRef[] {
 export interface PayloadGarbageCollectionOptions {
   readonly blobStore: PayloadBlobStore;
   readonly roots: readonly unknown[];
+  readonly minAgeMs?: number;
+  readonly nowMs?: number;
 }
 
 export interface PayloadGarbageCollectionPlan {
   readonly reachableUris: readonly string[];
   readonly unreachableUris: readonly string[];
+  readonly retainedYoungUris: readonly string[];
   readonly retainedCount: number;
   readonly unreachableCount: number;
 }
@@ -612,11 +657,23 @@ export async function planPayloadGarbageCollection(
   );
   const reachable = new Set(reachableUris);
   const storedUris = (await options.blobStore.list()).filter((uri) => options.blobStore.owns(uri));
-  const unreachableUris = uniqueSorted(storedUris.filter((uri) => !reachable.has(uri)));
+  const unreachableCandidates = uniqueSorted(storedUris.filter((uri) => !reachable.has(uri)));
+  const nowMs = options.nowMs ?? Date.now();
+  const minAgeMs = normalizeMinAgeMs(options.minAgeMs);
+  const unreachableUris: string[] = [];
+  const retainedYoungUris: string[] = [];
+  for (const uri of unreachableCandidates) {
+    if (await blobIsOldEnoughForCollection(options.blobStore, uri, nowMs, minAgeMs)) {
+      unreachableUris.push(uri);
+    } else {
+      retainedYoungUris.push(uri);
+    }
+  }
   return {
     reachableUris,
-    unreachableUris,
-    retainedCount: reachableUris.length,
+    unreachableUris: uniqueSorted(unreachableUris),
+    retainedYoungUris: uniqueSorted(retainedYoungUris),
+    retainedCount: reachableUris.length + retainedYoungUris.length,
     unreachableCount: unreachableUris.length
   };
 }
@@ -632,13 +689,20 @@ export async function collectPayloadGarbage(
       deletedCount: 0
     };
   }
+  const nowMs = options.nowMs ?? Date.now();
+  const minAgeMs = normalizeMinAgeMs(options.minAgeMs);
+  const deletedUris: string[] = [];
   for (const uri of plan.unreachableUris) {
+    if (!(await blobIsOldEnoughForCollection(options.blobStore, uri, nowMs, minAgeMs))) {
+      continue;
+    }
     await options.blobStore.delete(uri);
+    deletedUris.push(uri);
   }
   return {
     ...plan,
-    deletedUris: plan.unreachableUris,
-    deletedCount: plan.unreachableUris.length
+    deletedUris,
+    deletedCount: deletedUris.length
   };
 }
 
@@ -815,7 +879,8 @@ async function collectPayloadRefsIntoDeep(
   blobStore: PayloadBlobStore,
   refs: PayloadRef[],
   seenObjects: WeakSet<object>,
-  seenPayloads: Set<string>
+  seenPayloads: Set<string>,
+  containerKey?: string
 ): Promise<void> {
   if (isPayloadRef(value)) {
     refs.push(value);
@@ -826,6 +891,9 @@ async function collectPayloadRefsIntoDeep(
     seenPayloads.add(key);
 
     if (value.kind === "Blob" && !blobStore.owns(value.uri)) {
+      return;
+    }
+    if (value.kind === "Blob" && !shouldTraversePayloadRef(containerKey)) {
       return;
     }
     const hydrated = value.kind === "Inline" ? value : await hydratePayloadRef(value, blobStore);
@@ -842,13 +910,22 @@ async function collectPayloadRefsIntoDeep(
   seenObjects.add(value);
   if (Array.isArray(value)) {
     for (const item of value) {
-      await collectPayloadRefsIntoDeep(item, blobStore, refs, seenObjects, seenPayloads);
+      await collectPayloadRefsIntoDeep(item, blobStore, refs, seenObjects, seenPayloads, containerKey);
     }
     return;
   }
-  for (const nested of Object.values(value)) {
-    await collectPayloadRefsIntoDeep(nested, blobStore, refs, seenObjects, seenPayloads);
+  for (const [key, nested] of Object.entries(value)) {
+    await collectPayloadRefsIntoDeep(nested, blobStore, refs, seenObjects, seenPayloads, key);
   }
+}
+
+function shouldTraversePayloadRef(containerKey: string | undefined): boolean {
+  return (
+    containerKey === undefined ||
+    containerKey === "inputManifest" ||
+    containerKey === "resultManifest" ||
+    containerKey === "pages"
+  );
 }
 
 function isPayloadRef(value: unknown): value is PayloadRef {
@@ -900,4 +977,30 @@ function payloadDigestForIdentity(payload: InlinePayloadRef): string {
 
 function uniqueSorted(values: readonly string[]): readonly string[] {
   return [...new Set(values)].sort();
+}
+
+function normalizeMinAgeMs(minAgeMs: number | undefined): number {
+  if (minAgeMs === undefined) {
+    return DEFAULT_PAYLOAD_GC_MIN_AGE_MS;
+  }
+  if (!Number.isFinite(minAgeMs) || minAgeMs < 0) {
+    throw new Error("payload GC minAgeMs must be a non-negative finite number");
+  }
+  return minAgeMs;
+}
+
+async function blobIsOldEnoughForCollection(
+  blobStore: PayloadBlobStore,
+  uri: string,
+  nowMs: number,
+  minAgeMs: number
+): Promise<boolean> {
+  if (minAgeMs === 0) {
+    return true;
+  }
+  const lastModifiedMs = await blobStore.lastModifiedMs?.(uri);
+  if (lastModifiedMs === undefined || lastModifiedMs === null) {
+    return false;
+  }
+  return nowMs - lastModifiedMs >= minAgeMs;
 }

@@ -120,6 +120,7 @@ interface ActivityLease {
   readonly startedAtMs: number;
   readonly heartbeatDeadlineAtMs: number | null;
   readonly expiresAtMs: number;
+  readonly leaseDurationMs: number;
 }
 
 interface ActivityMapState {
@@ -1224,9 +1225,17 @@ export class PostgresBackend implements DurableBackend {
       if (row === undefined) {
         return null;
       }
-      const task = parsePostgresJson(row.task) as ActivityTask;
+      let task = parsePostgresJson(row.task) as ActivityTask;
+      if (postgresOptionalNumber(row.claim_token) !== null) {
+        const retry = retryActivityTaskAfterTimeout(task, now);
+        if (retry !== null && retry.readyAtMs > now) {
+          return null;
+        }
+        task = retry?.task ?? task;
+      }
       const token = await this.#allocateCounterRange(client, "activity_claim", 1);
-      const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now);
+      const leaseDurationMs = Math.max(0, opts.leaseDurationMs);
+      const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now, leaseDurationMs);
       const timeoutDeadline = activityTimeoutDeadlineFromTask(task, now, heartbeatDeadline);
       const claim: ActivityTaskClaim = {
         activityId: row.activity_id,
@@ -1242,7 +1251,10 @@ export class PostgresBackend implements DurableBackend {
             claim_started_at_ms = $4::bigint,
             heartbeat_deadline_at_ms = $5::bigint,
             timeout_deadline_at_ms = $6::bigint,
-            claim_expires_at_ms = $7::bigint
+            claim_expires_at_ms = $7::bigint,
+            claim_lease_duration_ms = $8::bigint,
+            task = $9::jsonb,
+            available_at_ms = $4::bigint
           where activity_id = $1
         `,
         [
@@ -1252,7 +1264,9 @@ export class PostgresBackend implements DurableBackend {
           String(now),
           heartbeatDeadline === null ? null : String(heartbeatDeadline),
           timeoutDeadline === null ? null : String(timeoutDeadline),
-          String(this.#leaseExpiresAt(opts.leaseDurationMs))
+          String(this.#leaseExpiresAt(opts.leaseDurationMs)),
+          String(leaseDurationMs),
+          stringifyJson(task)
         ]
       );
       return { task, claim };
@@ -1309,13 +1323,21 @@ export class PostgresBackend implements DurableBackend {
         "activity_claim",
         selected.rows.length
       );
+      const leaseDurationMs = Math.max(0, opts.leaseDurationMs);
       const claimExpiresAt = this.#leaseExpiresAt(opts.leaseDurationMs);
-      const claims = selected.rows.map((row, index) => {
-        const task = parsePostgresJson(row.task) as ActivityTask;
+      const claims = selected.rows.flatMap((row, index) => {
+        let task = parsePostgresJson(row.task) as ActivityTask;
+        if (postgresOptionalNumber(row.claim_token) !== null) {
+          const retry = retryActivityTaskAfterTimeout(task, now);
+          if (retry !== null && retry.readyAtMs > now) {
+            return [];
+          }
+          task = retry?.task ?? task;
+        }
         const token = firstToken + index;
-        const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now);
+        const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now, leaseDurationMs);
         const timeoutDeadline = activityTimeoutDeadlineFromTask(task, now, heartbeatDeadline);
-        return {
+        return [{
           activityId: row.activity_id,
           task,
           claim: {
@@ -1325,9 +1347,13 @@ export class PostgresBackend implements DurableBackend {
           } satisfies ActivityTaskClaim,
           heartbeatDeadline,
           timeoutDeadline,
-          claimExpiresAt
-        };
+          claimExpiresAt,
+          leaseDurationMs
+        }];
       });
+      if (claims.length === 0) {
+        return [];
+      }
 
       await client.query(
         `
@@ -1339,7 +1365,9 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms bigint,
               heartbeat_deadline_at_ms bigint,
               timeout_deadline_at_ms bigint,
-              claim_expires_at_ms bigint
+              claim_expires_at_ms bigint,
+              claim_lease_duration_ms bigint,
+              task jsonb
             )
           )
           update ${this.#activityTasksTableName} activities
@@ -1349,7 +1377,10 @@ export class PostgresBackend implements DurableBackend {
             claim_started_at_ms = updates.claim_started_at_ms,
             heartbeat_deadline_at_ms = updates.heartbeat_deadline_at_ms,
             timeout_deadline_at_ms = updates.timeout_deadline_at_ms,
-            claim_expires_at_ms = updates.claim_expires_at_ms
+            claim_expires_at_ms = updates.claim_expires_at_ms,
+            claim_lease_duration_ms = updates.claim_lease_duration_ms,
+            task = updates.task,
+            available_at_ms = updates.claim_started_at_ms
           from updates
           where activities.activity_id = updates.activity_id
         `,
@@ -1362,7 +1393,9 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms: now,
               heartbeat_deadline_at_ms: claim.heartbeatDeadline,
               timeout_deadline_at_ms: claim.timeoutDeadline,
-              claim_expires_at_ms: claim.claimExpiresAt
+              claim_expires_at_ms: claim.claimExpiresAt,
+              claim_lease_duration_ms: claim.leaseDurationMs,
+              task: claim.task
             }))
           )
         ]
@@ -1445,6 +1478,7 @@ export class PostgresBackend implements DurableBackend {
             heartbeat_deadline_at_ms,
             timeout_deadline_at_ms,
             claim_expires_at_ms,
+            claim_lease_duration_ms,
             terminal_event_id,
             map_command_key,
             map_item_ordinal
@@ -1558,7 +1592,8 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms = null,
               heartbeat_deadline_at_ms = null,
               timeout_deadline_at_ms = null,
-              claim_expires_at_ms = null
+              claim_expires_at_ms = null,
+              claim_lease_duration_ms = null
             from jsonb_to_recordset($1::jsonb) as updates(
               activity_id text,
               terminal_event_id integer
@@ -1724,9 +1759,15 @@ export class PostgresBackend implements DurableBackend {
         throw new Error("stale activity task lease");
       }
       const currentClaim = activity.claim;
+      const now = this.#nowMs();
       activity.claim = {
         ...currentClaim,
-        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+          activity.task,
+          now,
+          currentClaim.leaseDurationMs
+        ),
+        expiresAtMs: now + currentClaim.leaseDurationMs
       };
       await this.#upsertNormalizedActivityTaskRow(client, activity);
       return { kind: "Recorded" };
@@ -1746,6 +1787,13 @@ export class PostgresBackend implements DurableBackend {
 
   #restoreExpiredActivityLease(activity: ActivityState): void {
     if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      const retry = retryActivityAfterTimeout(activity, this.#nowMs());
+      if (retry === null) {
+        activity.claim = null;
+        return;
+      }
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
       activity.claim = null;
     }
   }
@@ -2269,10 +2317,15 @@ export class PostgresBackend implements DurableBackend {
         heartbeat_deadline_at_ms bigint,
         timeout_deadline_at_ms bigint,
         claim_expires_at_ms bigint,
+        claim_lease_duration_ms bigint,
         terminal_event_id integer,
         map_command_key text,
         map_item_ordinal integer
       )
+    `);
+    await this.#pool.query(`
+      alter table ${this.#activityTasksTableName}
+      add column if not exists claim_lease_duration_ms bigint
     `);
     await this.#pool.query(`
       create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "activity_tasks_claim_idx")}
@@ -2690,6 +2743,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -2717,7 +2771,14 @@ export class PostgresBackend implements DurableBackend {
                 },
                 startedAtMs: postgresRequiredNumber(row.claim_started_at_ms),
                 heartbeatDeadlineAtMs: postgresOptionalNumber(row.heartbeat_deadline_at_ms),
-                expiresAtMs: postgresRequiredNumber(row.claim_expires_at_ms)
+                expiresAtMs: postgresRequiredNumber(row.claim_expires_at_ms),
+                leaseDurationMs:
+                  postgresOptionalNumber(row.claim_lease_duration_ms) ??
+                  Math.max(
+                    0,
+                    postgresRequiredNumber(row.claim_expires_at_ms) -
+                      postgresRequiredNumber(row.claim_started_at_ms)
+                  )
               },
         availableAtMs: postgresRequiredNumber(row.available_at_ms),
         terminalEventId:
@@ -3549,6 +3610,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3568,6 +3630,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3586,6 +3649,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3617,6 +3681,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3636,6 +3701,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3654,6 +3720,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3673,6 +3740,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms = excluded.heartbeat_deadline_at_ms,
           timeout_deadline_at_ms = excluded.timeout_deadline_at_ms,
           claim_expires_at_ms = excluded.claim_expires_at_ms,
+          claim_lease_duration_ms = excluded.claim_lease_duration_ms,
           terminal_event_id = excluded.terminal_event_id,
           map_command_key = excluded.map_command_key,
           map_item_ordinal = excluded.map_item_ordinal
@@ -3705,6 +3773,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3724,6 +3793,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3742,6 +3812,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3761,6 +3832,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms = excluded.heartbeat_deadline_at_ms,
           timeout_deadline_at_ms = excluded.timeout_deadline_at_ms,
           claim_expires_at_ms = excluded.claim_expires_at_ms,
+          claim_lease_duration_ms = excluded.claim_lease_duration_ms,
           terminal_event_id = excluded.terminal_event_id,
           map_command_key = excluded.map_command_key,
           map_item_ordinal = excluded.map_item_ordinal
@@ -4593,6 +4665,7 @@ interface NormalizedActivityTaskRow {
   readonly heartbeat_deadline_at_ms: number | null;
   readonly timeout_deadline_at_ms: number | null;
   readonly claim_expires_at_ms: number | null;
+  readonly claim_lease_duration_ms: number | null;
   readonly terminal_event_id: number | null;
   readonly map_command_key: string | null;
   readonly map_item_ordinal: number | null;
@@ -4613,6 +4686,7 @@ interface NormalizedActivityTaskLoadRow {
   readonly heartbeat_deadline_at_ms: number | string | null;
   readonly timeout_deadline_at_ms: number | string | null;
   readonly claim_expires_at_ms: number | string | null;
+  readonly claim_lease_duration_ms: number | string | null;
   readonly terminal_event_id: number | string | null;
   readonly map_command_key: string | null;
   readonly map_item_ordinal: number | string | null;
@@ -4951,17 +5025,24 @@ function retryActivityAfterTimeout(
   activity: ActivityState,
   nowMs: number
 ): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
+  return retryActivityTaskAfterTimeout(activity.task, nowMs);
+}
+
+function retryActivityTaskAfterTimeout(
+  task: ActivityTask,
+  nowMs: number
+): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
+  const policy = task.retryPolicy;
   const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (activity.task.attempt >= maxAttempts) {
+  if (task.attempt >= maxAttempts) {
     return null;
   }
   return {
     task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
+      ...task,
+      attempt: task.attempt + 1
     },
-    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+    readyAtMs: nowMs + retryDelayMs(task.attempt, policy)
   };
 }
 
@@ -4975,10 +5056,15 @@ function retryDelayMs(
   return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
-function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
-  return task.heartbeatTimeoutMs === null
-    ? null
-    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+function activityHeartbeatDeadlineAt(
+  task: ActivityTask,
+  nowMs: number,
+  leaseDurationMs: number
+): number | null {
+  if (task.heartbeatTimeoutMs !== null) {
+    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
+  }
+  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
 function activityTimeoutDeadlineFromTask(
@@ -5119,6 +5205,7 @@ function normalizedActivityTaskRow(activity: ActivityState): NormalizedActivityT
     heartbeat_deadline_at_ms: activity.claim?.heartbeatDeadlineAtMs ?? null,
     timeout_deadline_at_ms: Number.isFinite(timeoutDeadline) ? timeoutDeadline : null,
     claim_expires_at_ms: activity.claim?.expiresAtMs ?? null,
+    claim_lease_duration_ms: activity.claim?.leaseDurationMs ?? null,
     terminal_event_id: activity.terminalEventId === null ? null : Number(activity.terminalEventId),
     map_command_key:
       activity.task.mapItem === null ? null : commandKey(activity.task.mapItem.mapCommandId),
@@ -5145,6 +5232,7 @@ function normalizedActivityTaskRowFromTask(
     heartbeat_deadline_at_ms: null,
     timeout_deadline_at_ms: null,
     claim_expires_at_ms: null,
+    claim_lease_duration_ms: null,
     terminal_event_id: null,
     map_command_key: task.mapItem === null ? null : commandKey(task.mapItem.mapCommandId),
     map_item_ordinal: task.mapItem?.itemOrdinal ?? null
