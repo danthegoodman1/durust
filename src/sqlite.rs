@@ -1,8 +1,12 @@
 use crate::provider_util::{
-    activity_claim_lease_timeout_at_ms, activity_timeout_at_ms, activity_timeout_at_ms_from,
-    claim_lease_until_ms, codec_from_str, codec_to_str, compression_from_str, compression_to_str,
-    decode_encryption_metadata, encode_encryption_metadata, ready_at_ms_for_delay,
-    should_retry_activity, timeout_message, unix_epoch_millis,
+    ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
+    activity_timeout_at_ms, activity_timeout_at_ms_from, activity_timeout_decision,
+    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
+    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
+    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
+    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
+    parent_close_policy_to_str, post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str,
+    reason_to_str, timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -14,15 +18,14 @@ use crate::{
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob,
-    PayloadRef, PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest,
-    Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec,
+    HistoryChunk, HistoryEvent, HistoryEventData, ParentClosePolicy, PayloadBlob, PayloadRef,
+    PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result,
+    RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
+    WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, WorkflowType,
+    activity_map_input_at, digest_bytes, encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
@@ -566,10 +569,7 @@ impl DurableBackend for SqliteBackend {
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(CommitOutcome::Conflict);
             }
-            if terminal
-                && (!batch.append_events.is_empty()
-                    || !batch.schedule_child_workflow_maps.is_empty())
-            {
+            if terminal && commit_has_workflow_visible_mutations(&batch) {
                 return Err(Error::TerminalWorkflow);
             }
 
@@ -717,11 +717,13 @@ impl DurableBackend for SqliteBackend {
                     handle_terminal_run(&tx, &config, &claim.run_id, &event)?;
                 }
             }
-            let ready_reason = if !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)? {
-                Some(reason_to_str(&WorkflowTaskReason::SignalReceived))
-            } else {
-                None
-            };
+            // SQLite applies child starts through the outbox, so no
+            // same-commit child reason exists; only the signal recheck can
+            // re-mark the run.
+            let signal_ready = !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)?;
+            let ready_reason = post_commit_ready_reason(terminal_after_commit, None, signal_ready)
+                .as_ref()
+                .map(reason_to_str);
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
@@ -1376,9 +1378,11 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            if should_retry_activity(&task) && !req.failure.non_retryable {
+            if let ActivityFailureDecision::Retry { next_attempt } =
+                activity_failure_decision(&task, req.failure.non_retryable)
+            {
                 let mut retry_task = task.clone();
-                retry_task.attempt = retry_task.attempt.saturating_add(1);
+                retry_task.attempt = next_attempt;
                 let retry_blob = rmp_serde::to_vec_named(&retry_task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
                 tx.execute(
@@ -1396,9 +1400,7 @@ impl DurableBackend for SqliteBackend {
                 )
                 .map_err(sqlite_error)?;
                 tx.commit().map_err(sqlite_error)?;
-                return Ok(FailActivityOutcome::RetryScheduled {
-                    next_attempt: retry_task.attempt,
-                });
+                return Ok(FailActivityOutcome::RetryScheduled { next_attempt });
             }
             let failure = normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?;
             if let Some(map_item) = task.map_item.clone() {
@@ -3596,21 +3598,8 @@ fn notify_parent_of_child_terminal(
         seq: parent_command_seq,
     };
     if let Some(item_ordinal) = parent_child_map_ordinal {
-        let outcome = match terminal_event {
-            HistoryEventData::WorkflowCompleted { result } => {
-                ChildWorkflowMapItemOutcome::Succeeded {
-                    result: result.clone(),
-                }
-            }
-            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
-                failure: failure.clone(),
-            },
-            HistoryEventData::WorkflowCancelled { reason } => {
-                ChildWorkflowMapItemOutcome::Cancelled {
-                    reason: reason.clone(),
-                }
-            }
-            _ => return Ok(()),
+        let Some(outcome) = child_terminal_map_item_outcome(terminal_event) else {
+            return Ok(());
         };
         return complete_child_workflow_map_item(
             tx,
@@ -3632,29 +3621,9 @@ fn notify_parent_of_child_terminal(
         return Ok(());
     }
     let event_id = EventId(tail).next();
-    let (data, reason) = match terminal_event {
-        HistoryEventData::WorkflowCompleted { result } => (
-            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
-                command_id,
-                result: result.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCompleted,
-        ),
-        HistoryEventData::WorkflowFailed { failure } => (
-            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
-                command_id,
-                failure: failure.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowFailed,
-        ),
-        HistoryEventData::WorkflowCancelled { reason } => (
-            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
-                command_id,
-                reason: reason.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCancelled,
-        ),
-        _ => return Ok(()),
+    let Some((data, reason)) = child_terminal_event_data_and_reason(command_id, terminal_event)
+    else {
+        return Ok(());
     };
     insert_history_event(tx, &parent_run_id, event_id, data)?;
     set_workflow_ready(tx, &parent_run_id, event_id, reason)
@@ -3807,13 +3776,6 @@ fn child_outbox_id(message: &ChildStartOutboxMessage) -> String {
 
 fn child_outbox_id_for_command(command_id: &CommandId) -> String {
     format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
-}
-
-fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static str {
-    match policy {
-        ParentClosePolicy::Cancel => "cancel",
-        ParentClosePolicy::Abandon => "abandon",
-    }
 }
 
 fn insert_activity_map(
@@ -4912,13 +4874,13 @@ fn timeout_activity(
     if completed || !(start_timeout_due || heartbeat_timeout_due) {
         return Ok(false);
     }
-    let timed_out_by_heartbeat = heartbeat_timeout_due && !start_timeout_due;
+    let timed_out_by_heartbeat = timed_out_by_heartbeat(heartbeat_timeout_due, start_timeout_due);
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    if should_retry_activity(&task) {
+    if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
         let mut retry_task = task.clone();
-        retry_task.attempt = retry_task.attempt.saturating_add(1);
+        retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
             .map_err(|err| Error::PayloadEncode(err.to_string()))?;
         tx.execute(
@@ -5238,6 +5200,84 @@ mod tests {
     }
 
     #[test]
+    fn terminal_run_with_live_claim_rejects_every_mutating_commit_kind() {
+        use crate::provider_util::commit_test_support;
+        use futures::executor::block_on;
+
+        block_on(async {
+            // Every terminal transition clears the workflow claim, so the
+            // guard is defense-in-depth: forge the terminal flag while a valid
+            // claim and matching tail survive, then require each mutation kind
+            // to be rejected (SPEC: "terminal workflow rejects new
+            // workflow-visible commands").
+            let dir = tempfile::tempdir().unwrap();
+            let backend = SqliteBackend::open(dir.path().join("terminal-guard.sqlite3")).unwrap();
+            let workflow_type = WorkflowType::new("tests.sqlite-terminal-guard", 1);
+            backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: crate::Namespace::default(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-guard"),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: crate::TaskQueue::new("sqlite-terminal-guard"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("sqlite-terminal-guard"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: crate::Namespace::default(),
+                        task_queue: crate::TaskQueue::new("sqlite-terminal-guard"),
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("claimable workflow task");
+            backend
+                .connection()
+                .unwrap()
+                .execute(
+                    "update workflow_instances set terminal = 1 where run_id = ?1",
+                    params![claimed.run_id.0],
+                )
+                .unwrap();
+
+            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+            {
+                let err = backend
+                    .commit_workflow_task(claimed.claim.clone(), commit)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::TerminalWorkflow),
+                    "commit kind `{kind}` should be rejected as TerminalWorkflow, got {err:?}"
+                );
+            }
+            // The rejection must not consume the claim, and a fully empty
+            // commit stays an accepted no-op against the terminal run.
+            let outcome = backend
+                .commit_workflow_task(
+                    claimed.claim.clone(),
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                CommitOutcome::Committed {
+                    new_tail_event_id: EventId(1)
+                }
+            );
+        });
+    }
+
+    #[test]
     fn sqlite_reopen_recreates_legacy_ready_index_and_claims_ready_workflows() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy-ready-index.sqlite3");
@@ -5298,139 +5338,5 @@ mod tests {
             claimed.is_some(),
             "migrated database should still claim ready workflows"
         );
-    }
-}
-
-fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
-    match reason {
-        WorkflowTaskReason::WorkflowStarted => "workflow_started",
-        WorkflowTaskReason::ActivityCompleted => "activity_completed",
-        WorkflowTaskReason::ActivityFailed => "activity_failed",
-        WorkflowTaskReason::ActivityTimedOut => "activity_timed_out",
-        WorkflowTaskReason::ActivityMapCompleted => "activity_map_completed",
-        WorkflowTaskReason::ActivityMapFailed => "activity_map_failed",
-        WorkflowTaskReason::ChildWorkflowStarted => "child_workflow_started",
-        WorkflowTaskReason::ChildWorkflowCompleted => "child_workflow_completed",
-        WorkflowTaskReason::ChildWorkflowFailed => "child_workflow_failed",
-        WorkflowTaskReason::ChildWorkflowCancelled => "child_workflow_cancelled",
-        WorkflowTaskReason::ChildWorkflowMapCompleted => "child_workflow_map_completed",
-        WorkflowTaskReason::ChildWorkflowMapFailed => "child_workflow_map_failed",
-        WorkflowTaskReason::TimerFired => "timer_fired",
-        WorkflowTaskReason::SignalReceived => "signal_received",
-        WorkflowTaskReason::CacheEvicted => "cache_evicted",
-    }
-}
-
-fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
-    match value {
-        "workflow_started" => Ok(WorkflowTaskReason::WorkflowStarted),
-        "activity_completed" => Ok(WorkflowTaskReason::ActivityCompleted),
-        "activity_failed" => Ok(WorkflowTaskReason::ActivityFailed),
-        "activity_timed_out" => Ok(WorkflowTaskReason::ActivityTimedOut),
-        "activity_map_completed" => Ok(WorkflowTaskReason::ActivityMapCompleted),
-        "activity_map_failed" => Ok(WorkflowTaskReason::ActivityMapFailed),
-        "child_workflow_started" => Ok(WorkflowTaskReason::ChildWorkflowStarted),
-        "child_workflow_completed" => Ok(WorkflowTaskReason::ChildWorkflowCompleted),
-        "child_workflow_failed" => Ok(WorkflowTaskReason::ChildWorkflowFailed),
-        "child_workflow_cancelled" => Ok(WorkflowTaskReason::ChildWorkflowCancelled),
-        "child_workflow_map_completed" => Ok(WorkflowTaskReason::ChildWorkflowMapCompleted),
-        "child_workflow_map_failed" => Ok(WorkflowTaskReason::ChildWorkflowMapFailed),
-        "timer_fired" => Ok(WorkflowTaskReason::TimerFired),
-        "signal_received" => Ok(WorkflowTaskReason::SignalReceived),
-        "cache_evicted" => Ok(WorkflowTaskReason::CacheEvicted),
-        other => Err(Error::Backend(format!(
-            "unknown workflow task reason `{other}`"
-        ))),
-    }
-}
-
-fn marker_kind_to_str(kind: WorkflowChangeMarkerKind) -> &'static str {
-    match kind {
-        WorkflowChangeMarkerKind::Version => "version",
-        WorkflowChangeMarkerKind::DeprecatedPatch => "deprecated_patch",
-    }
-}
-
-fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKind> {
-    match value {
-        "version" => Ok(WorkflowChangeMarkerKind::Version),
-        "deprecated_patch" => Ok(WorkflowChangeMarkerKind::DeprecatedPatch),
-        other => Err(Error::Backend(format!(
-            "unknown workflow change marker kind `{other}`"
-        ))),
-    }
-}
-
-fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
-    match event_type {
-        HistoryEventType::WorkflowStarted => "workflow_started",
-        HistoryEventType::WorkflowCompleted => "workflow_completed",
-        HistoryEventType::WorkflowFailed => "workflow_failed",
-        HistoryEventType::WorkflowCancelled => "workflow_cancelled",
-        HistoryEventType::WorkflowContinuedAsNew => "workflow_continued_as_new",
-        HistoryEventType::WorkflowTaskStarted => "workflow_task_started",
-        HistoryEventType::ActivityScheduled => "activity_scheduled",
-        HistoryEventType::ActivityMapScheduled => "activity_map_scheduled",
-        HistoryEventType::ActivityMapCompleted => "activity_map_completed",
-        HistoryEventType::ActivityMapFailed => "activity_map_failed",
-        HistoryEventType::ActivityCompleted => "activity_completed",
-        HistoryEventType::ActivityFailed => "activity_failed",
-        HistoryEventType::ActivityTimedOut => "activity_timed_out",
-        HistoryEventType::ChildWorkflowStartRequested => "child_workflow_start_requested",
-        HistoryEventType::ChildWorkflowStarted => "child_workflow_started",
-        HistoryEventType::ChildWorkflowCompleted => "child_workflow_completed",
-        HistoryEventType::ChildWorkflowFailed => "child_workflow_failed",
-        HistoryEventType::ChildWorkflowCancelled => "child_workflow_cancelled",
-        HistoryEventType::ChildWorkflowMapScheduled => "child_workflow_map_scheduled",
-        HistoryEventType::ChildWorkflowMapCompleted => "child_workflow_map_completed",
-        HistoryEventType::ChildWorkflowMapFailed => "child_workflow_map_failed",
-        HistoryEventType::TimerStarted => "timer_started",
-        HistoryEventType::TimerFired => "timer_fired",
-        HistoryEventType::SignalConsumed => "signal_consumed",
-        HistoryEventType::SelectWinner => "select_winner",
-        HistoryEventType::VersionMarker => "version_marker",
-        HistoryEventType::DeprecatedPatchMarker => "deprecated_patch_marker",
-        HistoryEventType::SideEffectMarker => "side_effect_marker",
-    }
-}
-
-fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
-    match value {
-        "workflow_started" => Ok(HistoryEventType::WorkflowStarted),
-        "workflow_completed" => Ok(HistoryEventType::WorkflowCompleted),
-        "workflow_failed" => Ok(HistoryEventType::WorkflowFailed),
-        "workflow_cancelled" => Ok(HistoryEventType::WorkflowCancelled),
-        "workflow_continued_as_new" => Ok(HistoryEventType::WorkflowContinuedAsNew),
-        "workflow_task_started" => Ok(HistoryEventType::WorkflowTaskStarted),
-        "activity_scheduled" => Ok(HistoryEventType::ActivityScheduled),
-        "activity_map_scheduled" => Ok(HistoryEventType::ActivityMapScheduled),
-        "activity_map_completed" => Ok(HistoryEventType::ActivityMapCompleted),
-        "activity_map_failed" => Ok(HistoryEventType::ActivityMapFailed),
-        "activity_completed" => Ok(HistoryEventType::ActivityCompleted),
-        "activity_failed" => Ok(HistoryEventType::ActivityFailed),
-        "activity_timed_out" => Ok(HistoryEventType::ActivityTimedOut),
-        "child_workflow_start_requested" => Ok(HistoryEventType::ChildWorkflowStartRequested),
-        "child_workflow_started" => Ok(HistoryEventType::ChildWorkflowStarted),
-        "child_workflow_completed" => Ok(HistoryEventType::ChildWorkflowCompleted),
-        "child_workflow_failed" => Ok(HistoryEventType::ChildWorkflowFailed),
-        "child_workflow_cancelled" => Ok(HistoryEventType::ChildWorkflowCancelled),
-        "child_workflow_map_scheduled" => Ok(HistoryEventType::ChildWorkflowMapScheduled),
-        "child_workflow_map_completed" => Ok(HistoryEventType::ChildWorkflowMapCompleted),
-        "child_workflow_map_failed" => Ok(HistoryEventType::ChildWorkflowMapFailed),
-        "timer_started" => Ok(HistoryEventType::TimerStarted),
-        "timer_fired" => Ok(HistoryEventType::TimerFired),
-        "signal_consumed" => Ok(HistoryEventType::SignalConsumed),
-        "select_winner" => Ok(HistoryEventType::SelectWinner),
-        "version_marker" => Ok(HistoryEventType::VersionMarker),
-        "deprecated_patch_marker" => Ok(HistoryEventType::DeprecatedPatchMarker),
-        "side_effect_marker" => Ok(HistoryEventType::SideEffectMarker),
-        other => Err(Error::Backend(format!("unknown event type `{other}`"))),
-    }
-}
-
-fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
-    match kind {
-        WaitKind::Timer => "timer",
-        WaitKind::Signal => "signal",
     }
 }

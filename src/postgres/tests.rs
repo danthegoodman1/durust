@@ -188,6 +188,161 @@ async fn start_inline_child_for_tests(
     )
 }
 
+async fn start_and_claim_for_terminal_guard(
+    backend: &PostgresBackend,
+    workflow_id: &str,
+    queue: &str,
+) -> crate::ClaimedWorkflowTask {
+    let workflow_type = WorkflowType::new("tests.postgres-terminal-guard", 1);
+    backend
+        .start_workflow(crate::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: crate::WorkflowId::new(workflow_id),
+            workflow_type: workflow_type.clone(),
+            task_queue: crate::TaskQueue::new(queue),
+            input: crate::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    backend
+        .claim_workflow_task(
+            WorkerId::new("postgres-terminal-guard"),
+            crate::ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: crate::TaskQueue::new(queue),
+                registered_workflow_types: vec![workflow_type],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("claimable workflow task")
+}
+
+async fn force_terminal_for_tests(backend: &PostgresBackend, schema: &str, run_id: &RunId) {
+    let client = backend.client().await.unwrap();
+    client
+        .execute(
+            &format!(
+                "update {}.workflow_instances set terminal = true where run_id = $1",
+                quote_ident(schema)
+            ),
+            &[&run_id.0],
+        )
+        .await
+        .unwrap();
+}
+
+#[test]
+fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres terminal guard test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        // Every terminal transition clears the workflow claim, so the guard is
+        // defense-in-depth: forge the terminal flag while a valid claim and
+        // matching tail survive, then require each mutation kind to be
+        // rejected on the scalar commit path and the set-based batch path
+        // (SPEC: "terminal workflow rejects new workflow-visible commands").
+        let schema = test_schema("terminal_guard");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+
+        let claimed = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard",
+            "postgres-terminal-guard",
+        )
+        .await;
+        force_terminal_for_tests(&backend, &schema, &claimed.run_id).await;
+        for (kind, commit) in
+            crate::provider_util::commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+        {
+            let err = backend
+                .commit_workflow_task(claimed.claim.clone(), commit)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::TerminalWorkflow),
+                "commit kind `{kind}` should be rejected as TerminalWorkflow, got {err:?}"
+            );
+        }
+        // The rejection must not consume the claim, and a fully empty commit
+        // stays an accepted no-op against the terminal run.
+        let outcome = backend
+            .commit_workflow_task(
+                claimed.claim.clone(),
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(1)
+            }
+        );
+
+        // Batch path: two simple-eligible mutating commits on two forged
+        // terminal runs route through the set-based batch apply and must both
+        // be rejected per item.
+        let first = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard-batch-1",
+            "postgres-terminal-guard-batch",
+        )
+        .await;
+        let second = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard-batch-2",
+            "postgres-terminal-guard-batch",
+        )
+        .await;
+        force_terminal_for_tests(&backend, &schema, &first.run_id).await;
+        force_terminal_for_tests(&backend, &schema, &second.run_id).await;
+        let batch_commits = [&first, &second]
+            .iter()
+            .map(|claimed| {
+                let (kind, commit) = crate::provider_util::commit_test_support::mutating_commits(
+                    &claimed.run_id,
+                    EventId(1),
+                )
+                .into_iter()
+                .find(|(kind, _)| *kind == "upsert_waits")
+                .expect("upsert_waits catalog entry");
+                assert!(postgres_simple_batch_commit_eligible(&commit), "{kind}");
+                crate::WorkflowTaskCommitInput {
+                    claim: claimed.claim.clone(),
+                    commit,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: batch_commits,
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(
+                matches!(result.result, Err(Error::TerminalWorkflow)),
+                "batch item should be rejected as TerminalWorkflow, got {:?}",
+                result.result
+            );
+        }
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
 #[test]
 fn postgres_schema_migration_runs_when_configured() {
     block_on_tokio(async {

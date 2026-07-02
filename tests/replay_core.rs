@@ -6887,7 +6887,11 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
-        let advance = self.advance_before_activity_completion.lock().unwrap().take();
+        let advance = self
+            .advance_before_activity_completion
+            .lock()
+            .unwrap()
+            .take();
         let inner = self.inner.clone();
         Box::pin(async move {
             if let Some(advance) = advance {

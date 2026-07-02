@@ -1,6 +1,8 @@
 use crate::provider_util::{
-    activity_claim_lease_timeout_at_ms, claim_lease_until_ms, should_retry_activity,
-    timeout_message,
+    ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
+    activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, commit_has_workflow_visible_mutations,
+    post_commit_ready_reason, timed_out_by_heartbeat, timeout_message,
 };
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -490,7 +492,7 @@ impl DurableBackend for MemoryBackend {
                 run.ready_at = None;
                 return Box::pin(ready(Ok(CommitOutcome::Conflict)));
             }
-            if run.terminal && !batch.append_events.is_empty() {
+            if run.terminal && commit_has_workflow_visible_mutations(&batch) {
                 return Box::pin(ready(Err(Error::TerminalWorkflow)));
             }
         }
@@ -724,12 +726,15 @@ impl DurableBackend for MemoryBackend {
                         && !signal.consumed
                 })
         });
-        if signal_wait_ready {
+        let terminal_after_commit = state.runs.get(&claim.run_id).is_none_or(|run| run.terminal);
+        // Memory applies child starts through the outbox, so no same-commit
+        // child reason exists; only the signal recheck can re-mark the run.
+        if let Some(reason) =
+            post_commit_ready_reason(terminal_after_commit, None, signal_wait_ready)
+        {
             if let Some(run) = state.runs.get_mut(&claim.run_id) {
-                if !run.terminal {
-                    run.ready = Some(WorkflowTaskReason::SignalReceived);
-                    run.ready_at = None;
-                }
+                run.ready = Some(reason);
+                run.ready_at = None;
             }
         }
         if let Some((namespace, workflow_id, projection)) = projection_update {
@@ -1045,6 +1050,31 @@ impl DurableBackend for MemoryBackend {
             record.task.clone()
         };
         let config = self.payload_config.clone();
+        if let Some(map_item) = task.map_item.clone() {
+            let result = match normalize_payload_for_storage(&mut state, &config, req.result) {
+                Ok(result) => result,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            let outcome = match complete_map_item(&mut state, &config, task, map_item, result) {
+                Ok(outcome) => outcome,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
+                record.completed = true;
+            }
+            return Box::pin(ready(Ok(outcome)));
+        }
+        // Validate the run before touching the record or payload store so a
+        // rejected completion leaves the record retryable and every retry
+        // returns the same error, matching the SQL providers' transactional
+        // rollback.
+        if let Some(run) = state.runs.get(&task.run_id) {
+            if run.terminal {
+                return Box::pin(ready(Err(Error::TerminalWorkflow)));
+            }
+        } else {
+            return Box::pin(ready(Err(Error::RunNotFound(task.run_id))));
+        }
         let result = match normalize_payload_for_storage(&mut state, &config, req.result) {
             Ok(result) => result,
             Err(err) => return Box::pin(ready(Err(err))),
@@ -1052,17 +1082,9 @@ impl DurableBackend for MemoryBackend {
         if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
             record.completed = true;
         }
-        if let Some(map_item) = task.map_item.clone() {
-            return Box::pin(ready(complete_map_item(
-                &mut state, &config, task, map_item, result,
-            )));
-        }
         let Some(run) = state.runs.get_mut(&task.run_id) else {
             return Box::pin(ready(Err(Error::RunNotFound(task.run_id))));
         };
-        if run.terminal {
-            return Box::pin(ready(Err(Error::TerminalWorkflow)));
-        }
         let event_id = run
             .history
             .last()
@@ -1103,23 +1125,49 @@ impl DurableBackend for MemoryBackend {
             }
             record.task.clone()
         };
-        if should_retry_activity(&task) && !req.failure.non_retryable {
+        if let ActivityFailureDecision::Retry { next_attempt } =
+            activity_failure_decision(&task, req.failure.non_retryable)
+        {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
                 return Box::pin(ready(Err(Error::Backend(format!(
                     "activity `{}` not found",
                     req.claim.activity_id.0
                 )))));
             };
-            record.task.attempt = record.task.attempt.saturating_add(1);
+            record.task.attempt = next_attempt;
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
-                next_attempt: record.task.attempt,
+                next_attempt,
             })));
         }
 
         let config = self.payload_config.clone();
+        if let Some(map_item) = task.map_item.clone() {
+            let failure = match normalize_failure_for_storage(&mut state, &config, req.failure) {
+                Ok(failure) => failure,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            let outcome = match fail_map_item(&mut state, task, map_item, failure) {
+                Ok(outcome) => outcome,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
+                record.completed = true;
+            }
+            return Box::pin(ready(Ok(outcome)));
+        }
+        // Validate the run before touching the record or payload store so a
+        // rejected failure leaves the record retryable and every retry returns
+        // the same error, matching the SQL providers' transactional rollback.
+        if let Some(run) = state.runs.get(&task.run_id) {
+            if run.terminal {
+                return Box::pin(ready(Err(Error::TerminalWorkflow)));
+            }
+        } else {
+            return Box::pin(ready(Err(Error::RunNotFound(task.run_id))));
+        }
         let failure = match normalize_failure_for_storage(&mut state, &config, req.failure) {
             Ok(failure) => failure,
             Err(err) => return Box::pin(ready(Err(err))),
@@ -1127,15 +1175,9 @@ impl DurableBackend for MemoryBackend {
         if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
             record.completed = true;
         }
-        if let Some(map_item) = task.map_item.clone() {
-            return Box::pin(ready(fail_map_item(&mut state, task, map_item, failure)));
-        }
         let Some(run) = state.runs.get_mut(&task.run_id) else {
             return Box::pin(ready(Err(Error::RunNotFound(task.run_id))));
         };
-        if run.terminal {
-            return Box::pin(ready(Err(Error::TerminalWorkflow)));
-        }
         let event_id = run
             .history
             .last()
@@ -1708,21 +1750,8 @@ fn notify_parent_of_child_terminal(
         return;
     };
     if let Some(map_item) = parent.child_map_item.clone() {
-        let outcome = match terminal_event {
-            HistoryEventData::WorkflowCompleted { result } => {
-                ChildWorkflowMapItemOutcome::Succeeded {
-                    result: result.clone(),
-                }
-            }
-            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
-                failure: failure.clone(),
-            },
-            HistoryEventData::WorkflowCancelled { reason } => {
-                ChildWorkflowMapItemOutcome::Cancelled {
-                    reason: reason.clone(),
-                }
-            }
-            _ => return,
+        let Some(outcome) = child_terminal_map_item_outcome(terminal_event) else {
+            return;
         };
         let _ = complete_child_workflow_map_item(state, config, map_item, outcome);
         return;
@@ -1741,36 +1770,14 @@ fn notify_parent_of_child_terminal(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    let (event_type, data, reason) = match terminal_event {
-        HistoryEventData::WorkflowCompleted { result } => (
-            crate::HistoryEventType::ChildWorkflowCompleted,
-            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
-                command_id: parent.command_id,
-                result: result.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCompleted,
-        ),
-        HistoryEventData::WorkflowFailed { failure } => (
-            crate::HistoryEventType::ChildWorkflowFailed,
-            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
-                command_id: parent.command_id,
-                failure: failure.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowFailed,
-        ),
-        HistoryEventData::WorkflowCancelled { reason } => (
-            crate::HistoryEventType::ChildWorkflowCancelled,
-            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
-                command_id: parent.command_id,
-                reason: reason.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCancelled,
-        ),
-        _ => return,
+    let Some((data, reason)) =
+        child_terminal_event_data_and_reason(parent.command_id, terminal_event)
+    else {
+        return;
     };
     parent_run.history.push(HistoryEvent {
         event_id,
-        event_type,
+        event_type: data.event_type(),
         data,
     });
     parent_run.ready = Some(reason);
@@ -2337,16 +2344,17 @@ fn timeout_activity(
         if record.completed || !activity_due_at(record).is_some_and(|due_at| due_at <= now) {
             return Ok(false);
         }
-        let timed_out_by_heartbeat = record
+        let heartbeat_due = record
             .heartbeat_deadline_at
-            .is_some_and(|deadline| deadline <= now)
-            && !record
-                .timeout_at
-                .is_some_and(|timeout_at| timeout_at <= now);
+            .is_some_and(|deadline| deadline <= now);
+        let start_to_close_due = record
+            .timeout_at
+            .is_some_and(|timeout_at| timeout_at <= now);
+        let timed_out_by_heartbeat = timed_out_by_heartbeat(heartbeat_due, start_to_close_due);
 
         let task = record.task.clone();
-        if should_retry_activity(&task) {
-            record.task.attempt = record.task.attempt.saturating_add(1);
+        if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
+            record.task.attempt = next_attempt;
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
@@ -3358,7 +3366,167 @@ fn ready_at_for_delay(delay: Duration) -> Option<Instant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_util::commit_test_support;
     use crate::{CodecId, CompressionId, SchemaFingerprint};
+    use futures::executor::block_on;
+
+    async fn start_and_claim(
+        backend: &MemoryBackend,
+        workflow_id: &str,
+        queue: &str,
+    ) -> ClaimedWorkflowTask {
+        let workflow_type = crate::WorkflowType::new("tests.memory-terminal-guard", 1);
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: WorkflowId::new(workflow_id),
+                workflow_type: workflow_type.clone(),
+                task_queue: crate::TaskQueue::new(queue),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        backend
+            .claim_workflow_task(
+                crate::WorkerId::new("memory-terminal-guard"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: crate::TaskQueue::new(queue),
+                    registered_workflow_types: vec![workflow_type],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("claimable workflow task")
+    }
+
+    fn force_terminal(backend: &MemoryBackend, run_id: &RunId) {
+        let mut state = backend.state.lock().unwrap();
+        state.runs.get_mut(run_id).unwrap().terminal = true;
+    }
+
+    #[test]
+    fn terminal_run_with_live_claim_rejects_every_mutating_commit_kind() {
+        block_on(async {
+            // Every terminal transition clears the workflow claim, so the
+            // guard is defense-in-depth: forge the terminal flag while a valid
+            // claim and matching tail survive, then require each mutation kind
+            // to be rejected (SPEC: "terminal workflow rejects new
+            // workflow-visible commands").
+            let backend = MemoryBackend::new();
+            let claimed = start_and_claim(&backend, "wf/memory-terminal-guard", "guard-q").await;
+            force_terminal(&backend, &claimed.run_id);
+
+            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+            {
+                let err = backend
+                    .commit_workflow_task(claimed.claim.clone(), commit)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::TerminalWorkflow),
+                    "commit kind `{kind}` should be rejected as TerminalWorkflow, got {err:?}"
+                );
+            }
+            // The rejection must not consume the claim, and a fully empty
+            // commit stays an accepted no-op against the terminal run.
+            let outcome = backend
+                .commit_workflow_task(
+                    claimed.claim.clone(),
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                CommitOutcome::Committed {
+                    new_tail_event_id: EventId(1)
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn activity_completion_against_terminal_run_fails_identically_on_every_retry() {
+        block_on(async {
+            // Regression: complete/fail used to mark the record completed
+            // before validating the run, so the first call returned
+            // TerminalWorkflow but a retry returned AlreadyCompleted. The SQL
+            // providers roll the whole transaction back; memory must validate
+            // first so every retry sees the same error.
+            let backend = MemoryBackend::new();
+            let claimed =
+                start_and_claim(&backend, "wf/memory-terminal-activity", "guard-aq").await;
+            let command_id = crate::CommandId {
+                run_id: claimed.run_id.clone(),
+                seq: crate::CommandSeq(1),
+            };
+            let mut task = commit_test_support::activity_task(&claimed.run_id, &command_id);
+            task.task_queue = crate::TaskQueue::new("guard-aq-activities");
+            task.retry_policy.max_attempts = 1;
+            backend
+                .commit_workflow_task(
+                    claimed.claim.clone(),
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        schedule_activities: vec![task],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let activity = backend
+                .claim_activity_task(
+                    crate::WorkerId::new("memory-terminal-activity"),
+                    ClaimActivityOptions {
+                        namespace: Namespace::default(),
+                        task_queue: crate::TaskQueue::new("guard-aq-activities"),
+                        registered_activity_names: vec![crate::ActivityName::new(
+                            "tests.guard-activity",
+                        )],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("claimable activity task");
+            // Forge the racing state directly: run terminal while the
+            // activity record is still claimed and uncompleted (cleanup on
+            // real terminal transitions completes the record atomically).
+            force_terminal(&backend, &claimed.run_id);
+
+            for attempt in 0..2 {
+                let err = backend
+                    .complete_activity(CompleteActivityRequest {
+                        claim: activity.claim.clone(),
+                        result: crate::encode_payload(&1_u64).unwrap(),
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::TerminalWorkflow),
+                    "complete retry {attempt} should stay TerminalWorkflow, got {err:?}"
+                );
+            }
+            for attempt in 0..2 {
+                let err = backend
+                    .fail_activity(FailActivityRequest {
+                        claim: activity.claim.clone(),
+                        failure: crate::DurableFailure::new("tests.boom", "boom"),
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::TerminalWorkflow),
+                    "fail retry {attempt} should stay TerminalWorkflow, got {err:?}"
+                );
+            }
+        });
+    }
 
     #[test]
     fn content_addressed_payload_blobs_allow_distinct_schema_fingerprints() {

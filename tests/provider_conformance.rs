@@ -69,6 +69,11 @@ async fn workflow(input: Input) -> durust::Result<u64> {
     durust::call_activity!(echo(Input { value: input.value })).await
 }
 
+#[durust::workflow(name = "conformance.signal-race", version = 1)]
+async fn signal_race_workflow(_: Input) -> durust::Result<String> {
+    durust::signal::<String>("go").await
+}
+
 mod default_name_handlers {
     #[durust::activity]
     pub async fn default_activity(_: DefaultInput) -> durust::Result<()> {
@@ -1078,6 +1083,11 @@ where
     workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
     continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
+    signal_between_claim_and_commit_wakes_workflow(backend.clone()).await;
+    signal_during_claim_window_survives_empty_commit(backend.clone()).await;
+    signal_between_claim_and_commit_wakes_workflows_in_batch_commit(backend.clone()).await;
+    terminal_run_fences_stale_mutating_commits_identically(backend.clone()).await;
+    late_activity_completion_after_cancel_is_idempotent_across_retries(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
     non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
@@ -3394,6 +3404,689 @@ where
     );
 }
 
+fn signal_race_claim_opts(queue: &str) -> ClaimWorkflowTaskOptions {
+    ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.signal-race", 1)],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+/// The commit the signal-race workflow's first task produces: no appends, one
+/// signal wait registered for command seq 1 on signal name `go`.
+fn signal_wait_commit(run_id: &durust::RunId, expected_tail: EventId) -> WorkflowTaskCommit {
+    let command_id = durust::command_id(run_id, 1);
+    WorkflowTaskCommit {
+        expected_tail_event_id: expected_tail,
+        upsert_waits: vec![durust::WaitRecord {
+            wait_id: durust::WaitId::new(format!(
+                "{}:{}:signal",
+                command_id.run_id, command_id.seq.0
+            )),
+            run_id: run_id.clone(),
+            command_id,
+            kind: durust::WaitKind::Signal,
+            key: "go".to_owned(),
+            ready_at: None,
+        }],
+        ..WorkflowTaskCommit::default()
+    }
+}
+
+/// Runs a real worker until idle and asserts the signal-race run finished by
+/// consuming a signal and completing with the expected payload.
+async fn assert_signal_race_run_completes<B>(
+    backend: &B,
+    queue: &str,
+    run_id: durust::RunId,
+    expected_result: &str,
+) where
+    B: DurableBackend,
+{
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue(queue)
+        .activity_task_queue(queue)
+        .register_workflow(signal_race_workflow)
+        .build();
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_history(backend, run_id).await;
+    assert_eq!(
+        history.len(),
+        3,
+        "expected WorkflowStarted, SignalConsumed, WorkflowCompleted; got {history:?}"
+    );
+    assert!(matches!(
+        history[1].data,
+        HistoryEventData::SignalConsumed(_)
+    ));
+    let HistoryEventData::WorkflowCompleted { result } = &history[2].data else {
+        panic!("expected WorkflowCompleted, got {:?}", history[2].data);
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(result).unwrap(),
+        expected_result
+    );
+}
+
+/// A signal delivered after a task is claimed but before its commit registers
+/// the signal wait must leave the run immediately claimable with
+/// `SignalReceived`; the commit's ready-reason recomputation is what prevents
+/// the delivery from being lost until an unrelated event pokes the run.
+async fn signal_between_claim_and_commit_wakes_workflow<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/signal-race-new-wait",
+            "signal-race-new-wait",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-race-claimer"),
+            signal_race_claim_opts("signal-race-new-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    assert_eq!(claimed.reason, durust::WorkflowTaskReason::WorkflowStarted);
+
+    // The race: the signal lands while the task is claimed and the wait it
+    // matches is only created by the claimed task's commit below.
+    let accepted = client
+        .signal_workflow(
+            "wf/signal-race-new-wait",
+            "go",
+            "signal/race-new-wait/1",
+            "raced-hello",
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+
+    let outcome = backend
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        }
+    );
+
+    let woken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-race-waker"),
+            signal_race_claim_opts("signal-race-new-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("run should be immediately claimable after the racing signal");
+    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+    backend
+        .release_workflow_task(
+            woken.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+        )
+        .await
+        .unwrap();
+
+    // The real workflow consumes the raced signal on its next task.
+    assert_signal_race_run_completes(
+        &backend,
+        "signal-race-new-wait",
+        run_id.clone(),
+        "raced-hello",
+    )
+    .await;
+    let inbox = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id,
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap();
+    assert!(inbox.is_none(), "raced signal should be consumed");
+}
+
+/// A signal delivered during the claim window for a wait that already existed
+/// before the claim must survive a commit that carries no mutations: the
+/// commit's unconditional ready-reason write would otherwise erase the wakeup
+/// the delivery recorded.
+async fn signal_during_claim_window_survives_empty_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/signal-race-existing-wait",
+            "signal-race-existing-wait",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-scheduler"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    backend
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .await
+        .unwrap();
+    // Blocked on the signal: not claimable until a delivery arrives.
+    assert!(
+        backend
+            .claim_workflow_task(
+                WorkerId::new("signal-existing-early"),
+                signal_race_claim_opts("signal-race-existing-wait"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let first = client
+        .signal_workflow(
+            "wf/signal-race-existing-wait",
+            "go",
+            "signal/race-existing/1",
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, durust::SignalWorkflowOutcome::Accepted);
+    let woken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-claimer"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("signal delivery should wake the run");
+    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+
+    // Second delivery lands while the task is claimed, matching the
+    // pre-existing wait; the claimed task then commits nothing (a spurious
+    // wake), which must not erase the pending delivery's readiness.
+    let second = client
+        .signal_workflow(
+            "wf/signal-race-existing-wait",
+            "go",
+            "signal/race-existing/2",
+            "second",
+        )
+        .await
+        .unwrap();
+    assert_eq!(second, durust::SignalWorkflowOutcome::Accepted);
+    let outcome = backend
+        .commit_workflow_task(
+            woken.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        }
+    );
+
+    let rewoken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-rewake"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("pending signals must keep the run claimable after an empty commit");
+    assert_eq!(rewoken.reason, durust::WorkflowTaskReason::SignalReceived);
+    backend
+        .release_workflow_task(
+            rewoken.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+        )
+        .await
+        .unwrap();
+
+    // The real workflow consumes the oldest delivery; the second stays in the
+    // inbox for the (now terminal) run.
+    assert_signal_race_run_completes(
+        &backend,
+        "signal-race-existing-wait",
+        run_id.clone(),
+        "first",
+    )
+    .await;
+    let remaining = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id,
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap()
+        .expect("second delivery stays unconsumed");
+    assert_eq!(
+        remaining.signal_id,
+        durust::SignalId::new("signal/race-existing/2")
+    );
+}
+
+/// The claim-window signal race applied to a multi-run `commit_workflow_tasks`
+/// batch: every committed run with a pending consumable signal must come out
+/// claimable, exercising the set-based batch commit path on providers that
+/// have one.
+async fn signal_between_claim_and_commit_wakes_workflows_in_batch_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let queue = "signal-race-batch";
+    let mut claims = Vec::new();
+    for index in 0..2 {
+        let workflow_id = format!("wf/signal-race-batch/{index}");
+        let run_id = client
+            .start_workflow::<signal_race_workflow>(&workflow_id, queue, input(index))
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("signal-batch-claimer-{index}")),
+                signal_race_claim_opts(queue),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        assert_eq!(claimed.run_id, run_id);
+        let accepted = client
+            .signal_workflow(
+                &workflow_id,
+                "go",
+                format!("signal/race-batch/{index}"),
+                format!("batch-{index}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+        claims.push(claimed);
+    }
+
+    let results = backend
+        .commit_workflow_tasks(WorkflowTaskCommitBatch {
+            commits: claims
+                .iter()
+                .map(|claimed| WorkflowTaskCommitInput {
+                    claim: claimed.claim.clone(),
+                    commit: signal_wait_commit(&claimed.run_id, EventId(1)),
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    for result in &results {
+        assert_eq!(
+            *result.result.as_ref().unwrap(),
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(1)
+            }
+        );
+    }
+
+    let mut woken = Vec::new();
+    for index in 0..2 {
+        let task = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("signal-batch-waker-{index}")),
+                signal_race_claim_opts(queue),
+            )
+            .await
+            .unwrap()
+            .expect("both committed runs should be claimable after racing signals");
+        assert_eq!(task.reason, durust::WorkflowTaskReason::SignalReceived);
+        woken.push(task);
+    }
+    let woken_run_ids = woken
+        .iter()
+        .map(|task| task.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(woken_run_ids.len(), 2, "each run wakes exactly once");
+    for task in woken {
+        backend
+            .release_workflow_task(
+                task.claim,
+                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (index, claimed) in claims.into_iter().enumerate() {
+        assert_signal_race_run_completes(
+            &backend,
+            queue,
+            claimed.run_id,
+            &format!("batch-{index}"),
+        )
+        .await;
+    }
+}
+
+/// Once a run is terminal every mutation kind in a stale holder's commit is
+/// rejected identically across providers. Terminal transitions clear the
+/// claim, so the fencing check fires first and the rejection is `StaleLease`
+/// for every kind; the deeper `TerminalWorkflow` guard is pinned per provider
+/// with forged state in the provider unit suites.
+async fn terminal_run_fences_stale_mutating_commits_identically<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/terminal-fence",
+            "terminal-fence-workflows",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("terminal-fence-claimer"),
+            signal_race_claim_opts("terminal-fence-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let cancelled = client
+        .cancel_workflow("wf/terminal-fence", "fence test")
+        .await
+        .unwrap();
+    let durust::CancelWorkflowOutcome::Cancelled { event_id, .. } = cancelled else {
+        panic!("expected cancellation, got {cancelled:?}");
+    };
+
+    for (kind, commit) in terminal_fence_commits(&run_id, event_id) {
+        let err = backend
+            .commit_workflow_task(claimed.claim.clone(), commit)
+            .await
+            .expect_err(kind);
+        assert!(
+            matches!(err, Error::StaleLease),
+            "stale `{kind}` commit against the cancelled run should fence as StaleLease, got {err:?}"
+        );
+    }
+}
+
+/// One commit per workflow-visible mutation kind, aimed at the post-cancel
+/// tail so only claim fencing (not a tail conflict) decides the outcome.
+fn terminal_fence_commits(
+    run_id: &durust::RunId,
+    expected_tail: EventId,
+) -> Vec<(&'static str, WorkflowTaskCommit)> {
+    let command_id = durust::command_id(run_id, 900);
+    let base = WorkflowTaskCommit {
+        expected_tail_event_id: expected_tail,
+        ..WorkflowTaskCommit::default()
+    };
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("terminal-fence-activities"),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(1),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    vec![
+        (
+            "append_events",
+            WorkflowTaskCommit {
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&0_u64).unwrap(),
+                })],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_activities",
+            WorkflowTaskCommit {
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..base.clone()
+            },
+        ),
+        (
+            "upsert_waits",
+            WorkflowTaskCommit {
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: durust::WaitId::new(format!("{run_id}:900:signal")),
+                    run_id: run_id.clone(),
+                    command_id: command_id.clone(),
+                    kind: durust::WaitKind::Signal,
+                    key: "go".to_owned(),
+                    ready_at: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "consume_signals",
+            WorkflowTaskCommit {
+                consume_signals: vec![durust::SignalId::new("terminal-fence-signal")],
+                ..base.clone()
+            },
+        ),
+        (
+            "delete_waits",
+            WorkflowTaskCommit {
+                delete_waits: vec![durust::WaitId::new(format!("{run_id}:900:signal"))],
+                ..base.clone()
+            },
+        ),
+        (
+            "start_child_workflows",
+            WorkflowTaskCommit {
+                start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                    command_id: command_id.clone(),
+                    workflow_id: durust::WorkflowId::new(format!("{run_id}/fence-child")),
+                    workflow_type: WorkflowType::new("conformance.signal-race", 1),
+                    task_queue: TaskQueue::new("terminal-fence-workflows"),
+                    input: durust::encode_payload(&Input { value: 0 }).unwrap(),
+                    parent_close_policy: durust::ParentClosePolicy::Cancel,
+                    child_map_item: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_activity_maps",
+            WorkflowTaskCommit {
+                schedule_activity_maps: vec![durust::ActivityMapTask {
+                    map_command_id: command_id.clone(),
+                    activity_name: ActivityName::new("conformance.echo"),
+                    task_queue: TaskQueue::new("terminal-fence-activities"),
+                    input_manifest: durust::encode_payload(&0_u64).unwrap(),
+                    result_manifest_name: "results".to_owned(),
+                    max_in_flight: 1,
+                    retry_policy: durust::RetryPolicy::exponential().max_attempts(1),
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_child_workflow_maps",
+            WorkflowTaskCommit {
+                schedule_child_workflow_maps: vec![ChildWorkflowMapTask {
+                    map_command_id: command_id.clone(),
+                    workflow_type: WorkflowType::new("conformance.signal-race", 1),
+                    task_queue: TaskQueue::new("terminal-fence-workflows"),
+                    input_manifest: durust::encode_payload(&0_u64).unwrap(),
+                    result_manifest_name: "results".to_owned(),
+                    workflow_id_prefix: format!("{run_id}/fence-child-map"),
+                    max_in_flight: 1,
+                    parent_close_policy: durust::ParentClosePolicy::Cancel,
+                    failure_mode: durust::ChildWorkflowMapFailureMode::FailFast,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "cancel_commands",
+            WorkflowTaskCommit {
+                cancel_commands: vec![command_id],
+                ..base.clone()
+            },
+        ),
+        (
+            "query_projection",
+            WorkflowTaskCommit {
+                query_projection: Some(durust::encode_payload(&0_u64).unwrap()),
+                ..base
+            },
+        ),
+    ]
+}
+
+/// Late completion and failure of an activity whose run was cancelled must be
+/// idempotently absorbed, and repeated retries must keep returning the same
+/// outcome on every provider (cancellation completes the run's activity rows
+/// atomically with the terminal transition).
+async fn late_activity_completion_after_cancel_is_idempotent_across_retries<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(
+            "wf/late-completion-cancel",
+            "late-completion-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("late-completion-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("late-completion-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_payload = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("late-completion-activities"),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input_payload.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input_payload),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled.clone(),
+                ))],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity = backend
+        .claim_activity_task(
+            WorkerId::new("late-completion-worker"),
+            ClaimActivityOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("late-completion-activities"),
+                registered_activity_names: vec![ActivityName::new("conformance.echo")],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+
+    client
+        .cancel_workflow("wf/late-completion-cancel", "late completion test")
+        .await
+        .unwrap();
+
+    // Retried completions and failures after cancellation must return the
+    // same idempotent outcome every time; a provider that mutates before
+    // validating would flip between error kinds across retries.
+    for attempt in 0..2 {
+        let completed = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim.clone(),
+                result: durust::encode_payload(&9_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            completed,
+            durust::CompleteActivityOutcome::AlreadyCompleted,
+            "complete retry {attempt}"
+        );
+        let failed = backend
+            .fail_activity(FailActivityRequest {
+                claim: activity.claim.clone(),
+                failure: durust::DurableFailure::new("test.late", "late failure"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            durust::FailActivityOutcome::AlreadyCompleted,
+            "fail retry {attempt}"
+        );
+    }
+
+    // The cancelled run's history is untouched by the late attempts.
+    let history = stream_history(&backend, run_id).await;
+    assert!(matches!(
+        history.last().map(|event| &event.data),
+        Some(HistoryEventData::WorkflowCancelled { .. })
+    ));
+}
+
 async fn timer_waits_fire_only_when_due_and_make_workflow_claimable<B>(backend: B)
 where
     B: DurableBackend,
@@ -4238,7 +4931,13 @@ where
 // reopen the database between claim and reclaim; `advance_past_lease` is
 // virtual time for the memory provider and a real sleep for SQL providers,
 // whose claim scans read their own wall clock.
-async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<B, Crash, CrashFut, Advance, AdvanceFut>(
+async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
+    B,
+    Crash,
+    CrashFut,
+    Advance,
+    AdvanceFut,
+>(
     backend: B,
     workflow_id: &str,
     workflow_queue: &str,
