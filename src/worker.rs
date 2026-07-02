@@ -4,17 +4,18 @@ use crate::{
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
     Namespace, NewHistoryEvent, ReadSignalInboxRequest, ReadSignalInboxesRequest, Registry, Result,
     RunDueMaintenanceRequest, RunId, ShardId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, TimestampMs, WorkerId, Workflow, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsRequest,
-    WorkflowId, WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease,
-    poll_with_activity_context, poll_with_runtime_context,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitForReadyRequest, WorkerId, Workflow,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
+    WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -22,6 +23,44 @@ const DEFAULT_TASK_LEASE_DURATION: Duration = Duration::from_secs(30);
 // A lease shorter than this cannot reliably outlive a single claim-to-commit
 // round trip, so claims would be reclaimed while their holder is still alive.
 const MIN_TASK_LEASE_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_IDLE_WAIT: Duration = Duration::from_millis(100);
+// Below this an idle worker degenerates into a busy poll against providers
+// without push notifications.
+const MIN_IDLE_WAIT: Duration = Duration::from_millis(5);
+const DEFAULT_MAX_CACHED_WORKFLOWS: usize = 10_000;
+// `Worker::run` tolerates this many consecutive failing passes before
+// surfacing the error, so one transient backend hiccup does not kill an
+// unattended worker while a dead backend still fails loudly.
+const MAX_CONSECUTIVE_RUN_PASS_FAILURES: usize = 16;
+
+/// Requests a graceful stop of `Worker::run`. Cheap to clone and safe to
+/// trigger from any task or thread; `run` returns `Ok(())` at the next loop
+/// iteration after `shutdown` is called.
+#[derive(Clone)]
+pub struct WorkerShutdown {
+    inner: Arc<(AtomicBool, tokio::sync::Notify)>,
+}
+
+impl WorkerShutdown {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((AtomicBool::new(false), tokio::sync::Notify::new())),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.0.store(true, Ordering::SeqCst);
+        self.inner.1.notify_waiters();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.inner.0.load(Ordering::SeqCst)
+    }
+
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.1.notified()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkerRunOptions {
@@ -173,9 +212,14 @@ where
     workflow_task_lease_duration: Duration,
     activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
+    max_concurrent_activities: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
+    max_cached_workflows: usize,
+    cache_access_seq: u64,
+    idle_wait: Duration,
+    shutdown: WorkerShutdown,
 }
 
 struct CachedWorkflow {
@@ -189,6 +233,10 @@ struct CachedWorkflow {
     // next task's context so the run stays cached; the next chunk starts
     // after `last_event_id`, so carried entries cannot be collected twice.
     unconsumed_indexes: crate::runtime::ReadyEventIndexes,
+    // Monotonic worker counter stamped on insert; the bounded cache evicts
+    // the minimum, giving LRU behavior because cached runs re-enter the
+    // cache through insert after every task.
+    last_accessed_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -341,8 +389,64 @@ where
             workflow_task_lease_duration: DEFAULT_TASK_LEASE_DURATION,
             activity_task_lease_duration: DEFAULT_TASK_LEASE_DURATION,
             activity_task_batch_size: 1,
+            max_concurrent_activities: 1,
             activity_completion_batch_size: 1,
             max_local_activities_per_workflow_task: 0,
+            max_cached_workflows: DEFAULT_MAX_CACHED_WORKFLOWS,
+            idle_wait: DEFAULT_IDLE_WAIT,
+        }
+    }
+
+    /// Handle for requesting a graceful stop of [`Worker::run`].
+    pub fn shutdown_handle(&self) -> WorkerShutdown {
+        self.shutdown.clone()
+    }
+
+    /// Runs the worker until [`WorkerShutdown::shutdown`] is requested,
+    /// looping full work passes (workflow tasks, local activities, due
+    /// maintenance, child dispatch, activity tasks) and parking in the
+    /// backend's `wait_for_ready` while idle.
+    ///
+    /// A failing pass does not kill the loop: transient backend errors are
+    /// retried after the idle wait, and only [`MAX_CONSECUTIVE_RUN_PASS_FAILURES`]
+    /// consecutive failing passes surface the last error, so a dead backend
+    /// still fails loudly. Any successful pass resets the failure count.
+    pub async fn run(&mut self) -> Result<()> {
+        let shutdown = self.shutdown_handle();
+        let mut consecutive_failures = 0usize;
+        loop {
+            if shutdown.is_requested() {
+                return Ok(());
+            }
+            let mut stats = WorkerRunStats::default();
+            match self.run_pass_once(&mut stats).await {
+                Ok(true) => {
+                    consecutive_failures = 0;
+                    continue;
+                }
+                Ok(false) => {
+                    consecutive_failures = 0;
+                }
+                Err(err) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_RUN_PASS_FAILURES {
+                        return Err(err);
+                    }
+                }
+            }
+            if shutdown.is_requested() {
+                return Ok(());
+            }
+            let wait = self.backend.wait_for_ready(WaitForReadyRequest {
+                namespace: self.namespace.clone(),
+                workflow_task_queue: self.workflow_task_queue.clone(),
+                activity_task_queue: self.activity_task_queue.clone(),
+                max_wait: self.idle_wait,
+            });
+            let notified = std::pin::pin!(shutdown.notified());
+            // A wait_for_ready error is ignored: the wait is bounded either
+            // way, and a genuinely dead backend trips the failure cap above.
+            let _ = futures::future::select(notified, wait).await;
         }
     }
 
@@ -478,17 +582,17 @@ where
                         "committed workflow future was already moved".to_owned(),
                     )))),
                 );
-                self.cache.insert(
-                    task.run_id.clone(),
-                    CachedWorkflow {
-                        future,
-                        last_event_id,
-                        next_command_seq: task.next_command_seq,
-                        default_activity_options: task.default_activity_options.clone(),
-                        change_versions: task.change_versions.clone(),
-                        unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
-                    },
-                );
+                let run_id = task.run_id.clone();
+                let entry = CachedWorkflow {
+                    future,
+                    last_event_id,
+                    next_command_seq: task.next_command_seq,
+                    default_activity_options: task.default_activity_options.clone(),
+                    change_versions: task.change_versions.clone(),
+                    unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
+                    last_accessed_seq: 0,
+                };
+                self.insert_cached_workflow(run_id, entry);
             }
             start = end;
         }
@@ -524,7 +628,7 @@ where
             }
         };
         if let Some(entry) = entry {
-            self.cache.insert(run_id, entry);
+            self.insert_cached_workflow(run_id, entry);
         }
         self.run_local_activities_after_workflow_tasks(1).await?;
         Ok(())
@@ -570,6 +674,7 @@ where
             default_activity_options,
             change_versions,
             unconsumed_indexes,
+            last_accessed_seq: 0,
         }))
     }
 
@@ -783,56 +888,89 @@ where
     }
 
     pub async fn run_activity_batch_once(&mut self) -> Result<usize> {
-        let limit = self.activity_task_batch_size.max(1);
-        if limit == 1 {
+        let max_in_flight = self.max_concurrent_activities.max(1);
+        let claim_batch = self.activity_task_batch_size.max(1);
+        if max_in_flight == 1 && claim_batch == 1 {
             return self.run_activity_once().await.map(usize::from);
         }
 
-        let claimed = self
-            .backend
-            .claim_activity_tasks(
-                self.worker_id.clone(),
-                ClaimActivityTasksOptions {
-                    claim: ClaimActivityOptions {
-                        namespace: self.namespace.clone(),
-                        task_queue: self.activity_task_queue.clone(),
-                        registered_activity_names: self.registry.activity_names(),
-                        lease_duration: self.activity_task_lease_duration,
+        // Claim up to the concurrency bound, `claim_batch` tasks per claim
+        // RPC; a short claim means the queue is drained for now.
+        let mut claimed = Vec::new();
+        while claimed.len() < max_in_flight {
+            let want = claim_batch.min(max_in_flight - claimed.len());
+            let batch = self
+                .backend
+                .claim_activity_tasks(
+                    self.worker_id.clone(),
+                    ClaimActivityTasksOptions {
+                        claim: ClaimActivityOptions {
+                            namespace: self.namespace.clone(),
+                            task_queue: self.activity_task_queue.clone(),
+                            registered_activity_names: self.registry.activity_names(),
+                            lease_duration: self.activity_task_lease_duration,
+                        },
+                        limit: want,
                     },
-                    limit,
-                },
-            )
-            .await?;
+                )
+                .await?;
+            let got = batch.len();
+            claimed.extend(batch);
+            if got < want {
+                break;
+            }
+        }
         if claimed.is_empty() {
             return Ok(0);
         }
+        self.execute_claimed_activities(claimed).await
+    }
 
+    async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
+        let finish = self.start_claimed_activity(claimed)?.await;
+        self.finish_activity(finish).await
+    }
+
+    // Executes claimed activities concurrently on the worker task and
+    // reports each completion as it finishes. Trade-off: genuinely async
+    // activities interleave here, but this drains every claimed execution
+    // before returning, so any long-running activity — even a well-behaved
+    // heartbeating one — holds the whole pass (and the whole `run` loop,
+    // workflow tasks included) until it finishes; a CPU-bound activity that
+    // never yields additionally starves its concurrent neighbors.
+    async fn execute_claimed_activities(
+        &self,
+        claimed: Vec<crate::ClaimedActivityTask>,
+    ) -> Result<usize> {
+        let mut executions = FuturesUnordered::new();
+        for task in claimed {
+            executions.push(self.start_claimed_activity(task)?);
+        }
+        let flush_size = self.activity_completion_batch_size.max(1);
         let mut completed = 0usize;
-        if self.activity_completion_batch_size <= 1 {
-            for task in claimed {
-                self.run_claimed_activity(task).await?;
-                completed += 1;
+        let mut finishes = Vec::new();
+        while let Some(finish) = executions.next().await {
+            finishes.push(finish);
+            completed += 1;
+            // Flush as soon as a completion batch fills so fast activities
+            // reach the backend while slower ones are still running.
+            if finishes.len() >= flush_size {
+                self.finish_activities(std::mem::take(&mut finishes))
+                    .await?;
             }
-        } else {
-            let mut finishes = Vec::with_capacity(claimed.len());
-            for task in claimed {
-                finishes.push(self.prepare_activity_finish(task).await?);
-                completed += 1;
-            }
+        }
+        if !finishes.is_empty() {
             self.finish_activities(finishes).await?;
         }
         Ok(completed)
     }
 
-    async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
-        let finish = self.prepare_activity_finish(claimed).await?;
-        self.finish_activity(finish).await
-    }
-
-    async fn prepare_activity_finish(
-        &mut self,
+    // Builds the self-contained execution future for one claimed activity;
+    // the future owns its heartbeat context so many can run concurrently.
+    fn start_claimed_activity(
+        &self,
         claimed: crate::ClaimedActivityTask,
-    ) -> Result<ActivityFinish> {
+    ) -> Result<impl Future<Output = ActivityFinish> + Send + 'static> {
         let registration = self
             .registry
             .activity(&claimed.task.activity_name)
@@ -849,20 +987,19 @@ where
             })
         });
         let mut future = registration.run(claimed.task.input, self.payload_codec);
-        let result = std::future::poll_fn(|cx| {
-            poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
-        })
-        .await;
-
-        Ok(match result {
-            Ok(result) => ActivityFinish::Complete(CompleteActivityRequest {
-                claim: claimed.claim,
-                result,
-            }),
-            Err(err) => ActivityFinish::Fail(FailActivityRequest {
-                claim: claimed.claim,
-                failure: err.durable_failure(),
-            }),
+        let claim = claimed.claim;
+        Ok(async move {
+            let result = std::future::poll_fn(|cx| {
+                poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
+            })
+            .await;
+            match result {
+                Ok(result) => ActivityFinish::Complete(CompleteActivityRequest { claim, result }),
+                Err(err) => ActivityFinish::Fail(FailActivityRequest {
+                    claim,
+                    failure: err.durable_failure(),
+                }),
+            }
         })
     }
 
@@ -964,39 +1101,7 @@ where
     pub async fn run_until_idle_with(&mut self, opts: WorkerRunOptions) -> Result<WorkerRunStats> {
         let mut stats = WorkerRunStats::default();
         for _ in 0..opts.max_iterations {
-            let mut progressed = false;
-
-            let workflow_tasks = self.run_workflow_batch_once().await?;
-            if workflow_tasks > 0 {
-                stats.workflow_tasks += workflow_tasks;
-                progressed = true;
-            }
-            let local_activity_tasks = self.take_completed_local_activity_tasks();
-            if local_activity_tasks > 0 {
-                stats.activity_tasks += local_activity_tasks;
-                progressed = true;
-            }
-            let maintenance = self.run_due_maintenance_once().await?;
-            if maintenance.timers_fired > 0 {
-                stats.timers_fired += maintenance.timers_fired;
-                progressed = true;
-            }
-            if maintenance.activities_timed_out > 0 {
-                stats.activities_timed_out += maintenance.activities_timed_out;
-                progressed = true;
-            }
-            let child_starts = self.run_child_workflow_starts_once().await?;
-            if child_starts > 0 {
-                stats.child_workflow_starts_dispatched += child_starts;
-                progressed = true;
-            }
-            let activity_tasks = self.run_activity_batch_once().await?;
-            if activity_tasks > 0 {
-                stats.activity_tasks += activity_tasks;
-                progressed = true;
-            }
-
-            if !progressed {
+            if !self.run_pass_once(&mut stats).await? {
                 return Ok(stats);
             }
         }
@@ -1005,6 +1110,44 @@ where
             "worker did not become idle within {} iterations",
             opts.max_iterations
         )))
+    }
+
+    // One full work pass, shared by `run_until_idle` and the production
+    // `run` loop. Returns whether any work was performed.
+    async fn run_pass_once(&mut self, stats: &mut WorkerRunStats) -> Result<bool> {
+        let mut progressed = false;
+
+        let workflow_tasks = self.run_workflow_batch_once().await?;
+        if workflow_tasks > 0 {
+            stats.workflow_tasks += workflow_tasks;
+            progressed = true;
+        }
+        let local_activity_tasks = self.take_completed_local_activity_tasks();
+        if local_activity_tasks > 0 {
+            stats.activity_tasks += local_activity_tasks;
+            progressed = true;
+        }
+        let maintenance = self.run_due_maintenance_once().await?;
+        if maintenance.timers_fired > 0 {
+            stats.timers_fired += maintenance.timers_fired;
+            progressed = true;
+        }
+        if maintenance.activities_timed_out > 0 {
+            stats.activities_timed_out += maintenance.activities_timed_out;
+            progressed = true;
+        }
+        let child_starts = self.run_child_workflow_starts_once().await?;
+        if child_starts > 0 {
+            stats.child_workflow_starts_dispatched += child_starts;
+            progressed = true;
+        }
+        let activity_tasks = self.run_activity_batch_once().await?;
+        if activity_tasks > 0 {
+            stats.activity_tasks += activity_tasks;
+            progressed = true;
+        }
+
+        Ok(progressed)
     }
 
     async fn stream_history_chunk(
@@ -1468,6 +1611,36 @@ where
         self.completed_local_activity_tasks = 0;
         completed
     }
+
+    // Single insertion point for the workflow cache: stamps the access
+    // sequence and enforces `max_cached_workflows` by dropping the
+    // least-recently-inserted entry. Eviction is a plain drop; the next task
+    // for an evicted run cold-replays from history. The O(n) min scan is
+    // fine because the map is bounded and eviction only runs at the bound;
+    // no extra index or dependency is warranted.
+    fn insert_cached_workflow(&mut self, run_id: RunId, mut entry: CachedWorkflow) {
+        self.cache_access_seq += 1;
+        entry.last_accessed_seq = self.cache_access_seq;
+        self.cache.insert(run_id, entry);
+        while self.cache.len() > self.max_cached_workflows {
+            let Some(evict) = self
+                .cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed_seq)
+                .map(|(run_id, _)| run_id.clone())
+            else {
+                break;
+            };
+            self.cache.remove(&evict);
+        }
+    }
+
+    // Test-only visibility into the cache bound; hidden because integration
+    // tests need it but it is not part of the supported API.
+    #[doc(hidden)]
+    pub fn cached_workflow_count(&self) -> usize {
+        self.cache.len()
+    }
 }
 
 fn poll_cached(
@@ -1631,8 +1804,11 @@ where
     workflow_task_lease_duration: Duration,
     activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
+    max_concurrent_activities: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
+    max_cached_workflows: usize,
+    idle_wait: Duration,
 }
 
 impl<B> WorkerBuilder<B>
@@ -1711,13 +1887,21 @@ where
         self
     }
 
+    // How many activity tasks one claim RPC requests; purely a round-trip
+    // batching knob, not a concurrency bound. One activity pass claims up to
+    // `max_concurrent_activities` tasks in total, `min` of the two knobs per
+    // RPC — so setting only this knob still claims one task per pass
+    // (max_concurrent_activities defaults to 1), and high concurrency with
+    // this knob unset issues single-task claim RPCs.
     pub fn activity_task_batch_size(mut self, limit: usize) -> Self {
         self.activity_task_batch_size = limit.max(1);
         self
     }
 
+    // How many claimed activities execute concurrently within one activity
+    // pass.
     pub fn max_concurrent_activities(mut self, limit: usize) -> Self {
-        self.activity_task_batch_size = limit.max(1);
+        self.max_concurrent_activities = limit.max(1);
         self
     }
 
@@ -1753,6 +1937,20 @@ where
 
     pub fn max_local_activities_per_workflow_task(mut self, limit: usize) -> Self {
         self.max_local_activities_per_workflow_task = limit;
+        self
+    }
+
+    // Upper bound on cached workflow futures; the least recently used run is
+    // dropped at the bound and cold-replays on its next task.
+    pub fn max_cached_workflows(mut self, limit: usize) -> Self {
+        self.max_cached_workflows = limit.max(1);
+        self
+    }
+
+    // How long an idle `Worker::run` pass waits in the backend's
+    // `wait_for_ready` before re-polling.
+    pub fn idle_wait(mut self, wait: Duration) -> Self {
+        self.idle_wait = wait.max(MIN_IDLE_WAIT);
         self
     }
 
@@ -1812,10 +2010,22 @@ where
             workflow_task_lease_duration: self.workflow_task_lease_duration,
             activity_task_lease_duration: self.activity_task_lease_duration,
             activity_task_batch_size: self.activity_task_batch_size,
+            max_concurrent_activities: self.max_concurrent_activities,
             activity_completion_batch_size: self.activity_completion_batch_size,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,
+            max_cached_workflows: self.max_cached_workflows,
+            cache_access_seq: 0,
+            idle_wait: self.idle_wait,
+            shutdown: WorkerShutdown::new(),
         }
+    }
+
+    /// Builds the worker and runs it until shutdown or a persistent backend
+    /// failure; a convenience for workers that never need the [`Worker`]
+    /// value itself (for example activity-only workers).
+    pub async fn run(self) -> Result<()> {
+        self.build().run().await
     }
 }
 

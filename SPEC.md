@@ -573,7 +573,7 @@ Workers are local processes that register code they can execute and poll durable
 Registration is local capability registration, not durable schema mutation:
 
 ```rust
-let worker = durust::Worker::builder(backend.clone())
+let mut worker = durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("orders-a")
     .workflow_task_queue("orders")
@@ -586,9 +586,16 @@ let worker = durust::Worker::builder(backend.clone())
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
     .activity_completion_batch_size(32)
-    .run()
-    .await?;
+    .build();
+
+let shutdown = worker.shutdown_handle();
+worker.run().await?;
 ```
+
+`Worker::run` loops full work passes and parks in the provider's
+`wait_for_ready` while idle; `shutdown.shutdown()` stops it gracefully.
+`WorkerBuilder::run` builds and runs in one step for workers that never need
+the `Worker` value itself.
 
 Workflow-only worker:
 

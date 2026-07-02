@@ -171,7 +171,7 @@ Workflow workers and activity workers can run in the same process or on
 different machines.
 
 ```rust
-let worker = durust::Worker::builder(backend.clone())
+let mut worker = durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("orders-a")
     .workflow_task_queue("orders")
@@ -184,12 +184,29 @@ let worker = durust::Worker::builder(backend.clone())
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
     .activity_completion_batch_size(32)
-    .run()
-    .await?;
+    .build();
+
+let shutdown = worker.shutdown_handle();
+worker.run().await?;
 ```
 
+`Worker::run` loops work passes until `shutdown.shutdown()` is called from
+another task, parking in the provider's `wait_for_ready` while idle. The
+throughput knobs:
+
+- `max_cached_workflows` bounds the in-memory workflow future cache (LRU);
+  evicted runs cold-replay from history on their next task.
+- `max_concurrent_workflow_tasks` bounds how many workflow tasks one pass
+  claims and pipelines through commit.
+- `max_concurrent_activities` bounds how many claimed activities execute
+  concurrently within one activity pass.
+- `activity_task_batch_size` sets how many tasks one claim RPC requests (the
+  per-RPC size is the min of both activity knobs); raise it under high
+  concurrency to issue fewer, larger claim RPCs instead of single-task ones.
+- `activity_completion_batch_size` batches activity completion RPCs.
+
 Activity-only workers are just workers that register activities and poll an
-activity queue:
+activity queue (`WorkerBuilder::run` builds and runs in one step):
 
 ```rust
 durust::Worker::builder(backend.clone())

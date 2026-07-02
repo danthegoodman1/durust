@@ -33,14 +33,15 @@ use std::time::Duration;
 pub struct MemoryBackend {
     state: Arc<Mutex<MemoryState>>,
     payload_config: PayloadStorageConfig,
+    // Signaled by every mutation that can create worker-visible work so
+    // `wait_for_ready` waiters wake immediately instead of sleeping out
+    // their `max_wait`.
+    work_notify: Arc<tokio::sync::Notify>,
 }
 
 impl Default for MemoryBackend {
     fn default() -> Self {
-        Self {
-            state: Arc::new(Mutex::new(MemoryState::default())),
-            payload_config: PayloadStorageConfig::default(),
-        }
+        Self::with_payload_storage(PayloadStorageConfig::default())
     }
 }
 
@@ -53,7 +54,12 @@ impl MemoryBackend {
         Self {
             state: Arc::new(Mutex::new(MemoryState::default())),
             payload_config,
+            work_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    fn notify_work(&self) {
+        self.work_notify.notify_waiters();
     }
 
     pub fn payload_blob_count(&self) -> usize {
@@ -62,13 +68,17 @@ impl MemoryBackend {
     }
 
     pub fn advance_time(&self, duration: std::time::Duration) {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
-        state.now = TimestampMs(
-            state
-                .now
-                .0
-                .saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
-        );
+        {
+            let mut state = self.state.lock().expect("memory backend mutex poisoned");
+            state.now = TimestampMs(
+                state
+                    .now
+                    .0
+                    .saturating_add(i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
+            );
+        }
+        // Delayed releases and due timers may have become visible.
+        self.notify_work();
     }
 }
 
@@ -273,6 +283,8 @@ impl DurableBackend for MemoryBackend {
             },
         );
 
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(StartWorkflowOutcome::Started { run_id })))
     }
 
@@ -322,6 +334,8 @@ impl DurableBackend for MemoryBackend {
         let config = self.payload_config.clone();
         handle_terminal_run(&mut state, &config, &run_id, &terminal_event);
 
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(CancelWorkflowOutcome::Cancelled {
             run_id,
             event_id,
@@ -534,6 +548,8 @@ impl DurableBackend for MemoryBackend {
                 run.workflow_claim = None;
                 run.ready = Some(WorkflowTaskReason::CacheEvicted);
                 run.ready_at = None;
+                drop(state);
+                self.notify_work();
                 return Box::pin(ready(Ok(CommitOutcome::Conflict)));
             }
             if run.terminal && commit_has_workflow_visible_mutations(&batch) {
@@ -796,6 +812,8 @@ impl DurableBackend for MemoryBackend {
                 .insert((record.run_id.clone(), record.change_id.clone()), record);
         }
 
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(CommitOutcome::Committed {
             new_tail_event_id: next_event_id.0,
         })))
@@ -815,11 +833,16 @@ impl DurableBackend for MemoryBackend {
             return Box::pin(ready(Err(Error::StaleLease)));
         }
         run.workflow_claim = None;
-        if !run.terminal {
+        let became_ready = !run.terminal;
+        if became_ready {
             run.ready = Some(release.reason);
             run.ready_at = ready_at_for_delay(now, release.delay);
         } else {
             run.ready_at = None;
+        }
+        drop(state);
+        if became_ready {
+            self.notify_work();
         }
         Box::pin(ready(Ok(())))
     }
@@ -873,6 +896,8 @@ impl DurableBackend for MemoryBackend {
                 }
             }
         }
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(SignalWorkflowOutcome::Accepted)))
     }
 
@@ -947,6 +972,12 @@ impl DurableBackend for MemoryBackend {
             state.waits.remove(&wait_id);
             fired += 1;
         }
+        drop(state);
+        // Guarded so idle maintenance passes do not wake other waiters and
+        // spin them against each other.
+        if fired > 0 {
+            self.notify_work();
+        }
         Box::pin(ready(Ok(FireDueTimersOutcome { fired })))
     }
 
@@ -979,7 +1010,24 @@ impl DurableBackend for MemoryBackend {
             }
         }
 
+        drop(state);
+        if timed_out > 0 {
+            self.notify_work();
+        }
         Box::pin(ready(Ok(TimeoutDueActivitiesOutcome { timed_out })))
+    }
+
+    fn wait_for_ready(&self, req: crate::WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
+        let notify = Arc::clone(&self.work_notify);
+        Box::pin(async move {
+            // Race the notification against the bounded sleep: a mutation
+            // that lands between the caller's last claim check and this
+            // registration is missed, so the sleep caps the staleness.
+            let notified = std::pin::pin!(notify.notified());
+            let sleep = std::pin::pin!(tokio::time::sleep(req.max_wait));
+            futures::future::select(notified, sleep).await;
+            Ok(())
+        })
     }
 
     fn claim_activity_task(
@@ -1108,6 +1156,8 @@ impl DurableBackend for MemoryBackend {
             if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
                 record.completed = true;
             }
+            drop(state);
+            self.notify_work();
             return Box::pin(ready(Ok(outcome)));
         }
         // Validate the run before touching the record or payload store so a
@@ -1147,6 +1197,8 @@ impl DurableBackend for MemoryBackend {
         run.ready = Some(WorkflowTaskReason::ActivityCompleted);
         run.ready_at = None;
 
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(CompleteActivityOutcome::Completed { event_id })))
     }
 
@@ -1182,6 +1234,8 @@ impl DurableBackend for MemoryBackend {
             record.claim = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
+            drop(state);
+            self.notify_work();
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
                 next_attempt,
             })));
@@ -1200,6 +1254,8 @@ impl DurableBackend for MemoryBackend {
             if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
                 record.completed = true;
             }
+            drop(state);
+            self.notify_work();
             return Box::pin(ready(Ok(outcome)));
         }
         // Validate the run before touching the record or payload store so a
@@ -1238,6 +1294,8 @@ impl DurableBackend for MemoryBackend {
         run.ready = Some(WorkflowTaskReason::ActivityFailed);
         run.ready_at = None;
 
+        drop(state);
+        self.notify_work();
         Box::pin(ready(Ok(FailActivityOutcome::Failed { event_id })))
     }
 
@@ -1266,6 +1324,9 @@ impl DurableBackend for MemoryBackend {
             }
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
         })();
+        if matches!(&result, Ok(outcome) if outcome.dispatched > 0) {
+            self.notify_work();
+        }
         Box::pin(ready(result))
     }
 

@@ -4152,6 +4152,95 @@ fn held_handle_across_sleeps_recovers_with_one_cold_replay_after_crash() {
     });
 }
 
+// Drives three interleaved two-timer workflows (initial task plus one task
+// per timer fire) under a given cache bound and reports how many replay
+// streams started from the beginning of history plus the largest cache size
+// observed at pass boundaries. Claim prefetch is disabled so every cold
+// replay is visible as a from-zero stream request.
+async fn run_interleaved_two_timer_workflows_with_cache_bound(
+    max_cached_workflows: usize,
+) -> (usize, usize) {
+    let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+    let client = Client::new(backend.clone());
+    let mut run_ids = Vec::new();
+    for i in 0..3 {
+        run_ids.push(
+            client
+                .start_workflow::<two_timers_workflow>(
+                    format!("wf/cache-bound-{i}"),
+                    "workflows",
+                    unit(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .max_cached_workflows(max_cached_workflows)
+        .register_workflow(two_timers_workflow)
+        .build();
+
+    let mut max_cache_len = 0usize;
+    for _ in 0..3 {
+        worker.run_until_idle().await.unwrap();
+        max_cache_len = max_cache_len.max(worker.cached_workflow_count());
+        backend.inner.advance_time(Duration::from_millis(1));
+    }
+    worker.run_until_idle().await.unwrap();
+
+    for run_id in &run_ids {
+        let history = stream_all(&backend.inner, run_id).await;
+        assert!(
+            matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ),
+            "workflow {run_id:?} did not complete under cache bound {max_cached_workflows}"
+        );
+    }
+    let from_zero = backend
+        .stream_requests()
+        .iter()
+        .filter(|req| req.after_event_id == EventId::ZERO)
+        .count();
+    (from_zero, max_cache_len)
+}
+
+// With room for one cached run, three interleaved runs evict each other on
+// almost every task: eight of the nine workflow tasks (three per run)
+// cold-replay from the beginning of history. The single warm task is the
+// last run's terminal task: earlier tasks in that round are terminal and do
+// not re-enter the cache, so its round-two entry survives until claimed.
+#[test]
+fn cache_bound_of_one_forces_cold_replays_for_interleaved_runs() {
+    block_on(async {
+        let (from_zero, max_cache_len) =
+            run_interleaved_two_timer_workflows_with_cache_bound(1).await;
+        assert_eq!(
+            from_zero, 8,
+            "all but the sole cache-resident task must cold-replay under a bound of one"
+        );
+        assert!(max_cache_len <= 1, "cache exceeded its bound of 1");
+    });
+}
+
+// With a bound above the run count the same scenario replays from zero only
+// for each run's initial task; timer tasks resume the cached futures.
+#[test]
+fn cache_bound_above_run_count_keeps_interleaved_runs_cached() {
+    block_on(async {
+        let (from_zero, max_cache_len) =
+            run_interleaved_two_timer_workflows_with_cache_bound(1_000).await;
+        assert_eq!(
+            from_zero, 3,
+            "only the initial task per run may replay from the beginning"
+        );
+        // All three non-terminal runs were cached simultaneously.
+        assert_eq!(max_cache_len, 3);
+    });
+}
+
 // Records two timers, then replays against a version with one timer that
 // completes: the leftover TimerStarted command event is divergence, so the
 // task must fail with Nondeterminism and append no terminal event.

@@ -176,6 +176,19 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         })
     }
 
+    /// Blocks until work may be claimable for the given queues or `max_wait`
+    /// elapses. The default is a plain bounded sleep, so polling drivers work
+    /// against every provider; providers with a push channel (in-memory
+    /// notify, Postgres LISTEN/NOTIFY) override this to wake waiters as soon
+    /// as work is created. Spurious wakeups are allowed; callers must
+    /// re-check for work after every return.
+    fn wait_for_ready(&self, req: WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            tokio::time::sleep(req.max_wait).await;
+            Ok(())
+        })
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -291,6 +304,17 @@ pub struct CancelWorkflowRequest {
 pub enum CancelWorkflowOutcome {
     Cancelled { run_id: RunId, event_id: EventId },
     AlreadyTerminal { run_id: RunId },
+}
+
+#[derive(Clone, Debug)]
+pub struct WaitForReadyRequest {
+    pub namespace: Namespace,
+    pub workflow_task_queue: TaskQueue,
+    pub activity_task_queue: TaskQueue,
+    /// Upper bound on the wait; providers without push notifications sleep
+    /// this long, providers with them use it as the staleness bound for
+    /// notifications that raced past the waiter's registration.
+    pub max_wait: Duration,
 }
 
 #[derive(Clone, Debug)]

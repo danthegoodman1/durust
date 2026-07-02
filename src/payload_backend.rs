@@ -142,6 +142,10 @@ where
         self.inner.claim_workflow_task(worker_id, opts)
     }
 
+    fn wait_for_ready(&self, req: crate::WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
+        self.inner.wait_for_ready(req)
+    }
+
     fn stream_history(
         &self,
         req: crate::StreamHistoryRequest,

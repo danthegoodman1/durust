@@ -2374,6 +2374,7 @@ where
             },
         )?)
         .workflow_task_commit_batch_size(options.batch)
+        .activity_task_batch_size(options.batch)
         .max_concurrent_activities(options.batch)
         .activity_completion_batch_size(options.activity_completion_batch)
         .register_workflow(benchmark_parent)
