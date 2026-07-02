@@ -178,6 +178,47 @@ async fn select_all_mixed(input: BenchInput) -> durust::Result<String> {
     Ok(format!("{}:{}", winner.branch_index, winner.value))
 }
 
+const LARGE_HISTORY_TIMERS: u64 = 64;
+const HELD_HANDLE_SLEEPS: u64 = 16;
+const CHILD_FANOUT_CHILDREN: u64 = 8;
+
+#[durust::workflow(name = "bench.timer-loop-then-signal", version = 1)]
+async fn timer_loop_then_signal(input: BenchInput) -> durust::Result<String> {
+    let _input = input.value;
+    for _ in 0..LARGE_HISTORY_TIMERS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    durust::signal::<String>("after").await
+}
+
+#[durust::workflow(name = "bench.held-handle", version = 1)]
+async fn held_handle_activity_then_sleeps(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
+    let handle = durust::call_activity!(double(BenchInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    for _ in 0..HELD_HANDLE_SLEEPS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    handle.result().await
+}
+
+#[durust::workflow(name = "bench.child-fanout", version = 1)]
+async fn child_fanout(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
+    let mut results = Vec::new();
+    for offset in 0..CHILD_FANOUT_CHILDREN {
+        let child = durust::child!(child_double(bench_input(input + offset)))
+            .workflow_id(format!("bench/fanout-child/{offset}"))
+            .spawn()
+            .await?;
+        results.push(child.result());
+    }
+    let results = durust::join_all(results).await?;
+    Ok(results.into_iter().sum())
+}
+
 #[durust::workflow(name = "bench.select-then-wait", version = 1)]
 async fn select_then_wait(input: BenchInput) -> durust::Result<String> {
     let input = input.value;
@@ -308,6 +349,72 @@ fn crash_replay(c: &mut Criterion) {
                 block_on(async {
                     let mut recovered = worker(backend);
                     recovered.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("workflow_replay_large_history_memory", |b| {
+        b.iter_batched(
+            setup_large_history_replay,
+            |backend| {
+                block_on(async {
+                    let mut recovered = large_history_worker(backend);
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn held_handle_wake(c: &mut Criterion) {
+    c.bench_function("held_handle_spawn_then_sleeps_memory", |b| {
+        b.iter_batched(
+            setup_held_handle_workflow,
+            |backend| {
+                block_on(async {
+                    let mut worker = held_handle_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(stats.activity_tasks, 1);
+                    assert_eq!(stats.timers_fired, HELD_HANDLE_SLEEPS as usize);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn child_fanout_completion(c: &mut Criterion) {
+    c.bench_function("child_fanout_completion_memory", |b| {
+        b.iter_batched(
+            setup_child_fanout_memory,
+            |backend| {
+                block_on(async {
+                    let mut worker = child_fanout_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(
+                        stats.child_workflow_starts_dispatched,
+                        CHILD_FANOUT_CHILDREN as usize
+                    );
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("child_fanout_completion_sqlite", |b| {
+        b.iter_batched(
+            setup_child_fanout_sqlite,
+            |(_dir, backend)| {
+                block_on(async {
+                    let mut worker = child_fanout_sqlite_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(
+                        stats.child_workflow_starts_dispatched,
+                        CHILD_FANOUT_CHILDREN as usize
+                    );
                 });
             },
             BatchSize::SmallInput,
@@ -702,6 +809,50 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .unwrap();
                             assert_eq!(chunk.events.len(), 32);
                             assert!(chunk.has_more);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("history_stream_chunked_replay_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "history_chunked",
+                iters,
+                setup_postgres_large_history_stream,
+                |fixture, run_ids| {
+                    fixture.runtime.block_on(async {
+                        for run_id in run_ids {
+                            let mut after = EventId::ZERO;
+                            let mut total = 0usize;
+                            loop {
+                                let chunk = fixture
+                                    .backend
+                                    .stream_history_for_replay(durust::StreamHistoryRequest {
+                                        run_id: run_id.clone(),
+                                        after_event_id: after,
+                                        up_to_event_id: EventId(
+                                            POSTGRES_CHUNKED_HISTORY_EVENTS + 1,
+                                        ),
+                                        max_events: 128,
+                                        max_bytes: usize::MAX,
+                                    })
+                                    .await
+                                    .unwrap();
+                                total += chunk.events.len();
+                                after = chunk.last_event_id;
+                                if !chunk.has_more {
+                                    break;
+                                }
+                            }
+                            assert_eq!(
+                                total,
+                                usize::try_from(POSTGRES_CHUNKED_HISTORY_EVENTS).unwrap() + 1
+                            );
                         }
                     });
                 },
@@ -1515,6 +1666,107 @@ fn setup_select_replay() -> MemoryBackend {
             .unwrap();
         backend
     })
+}
+
+fn setup_large_history_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<timer_loop_then_signal>(
+                "bench/large-history",
+                "workflows",
+                bench_input(1),
+            )
+            .await
+            .unwrap();
+        let mut worker = large_history_worker(backend.clone());
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.timers_fired, LARGE_HISTORY_TIMERS as usize);
+        drop(worker);
+        client
+            .signal_workflow(
+                "bench/large-history",
+                "after",
+                "bench/large-history/after",
+                "done",
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn large_history_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(timer_loop_then_signal)
+        .build()
+}
+
+fn setup_held_handle_workflow() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<held_handle_activity_then_sleeps>(
+                "bench/held-handle",
+                "workflows",
+                bench_input(21),
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn held_handle_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(held_handle_activity_then_sleeps)
+        .register_activity(double)
+        .build()
+}
+
+fn setup_child_fanout_memory() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<child_fanout>("bench/child-fanout", "workflows", bench_input(5))
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn child_fanout_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(child_fanout)
+        .register_workflow(child_double)
+        .build()
+}
+
+fn setup_child_fanout_sqlite() -> (tempfile::TempDir, SqliteBackend) {
+    block_on(async {
+        let (dir, backend) = sqlite_backend();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<child_fanout>("bench/child-fanout", "workflows", bench_input(5))
+            .await
+            .unwrap();
+        (dir, backend)
+    })
+}
+
+fn child_fanout_sqlite_worker(backend: SqliteBackend) -> Worker<SqliteBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(child_fanout)
+        .register_workflow(child_double)
+        .build()
 }
 
 fn setup_child_start_outbox() -> MemoryBackend {
@@ -2881,6 +3133,39 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
     claimed.run_id
 }
 
+const POSTGRES_CHUNKED_HISTORY_EVENTS: u64 = 1024;
+
+fn setup_postgres_large_history_stream(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> durust::RunId {
+    start_postgres_workflow(fixture, "history_chunked", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-history-chunked-worker");
+    let events = (0..POSTGRES_CHUNKED_HISTORY_EVENTS)
+        .map(|_| NewHistoryEvent::new(HistoryEventData::WorkflowTaskStarted))
+        .collect::<Vec<_>>();
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: events,
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+    claimed.run_id
+}
+
 fn setup_postgres_child_start(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3061,6 +3346,8 @@ criterion_group!(
     workflow_task_append_commit,
     cached_wake_poll,
     crash_replay,
+    held_handle_wake,
+    child_fanout_completion,
     recovery_flow_control,
     select_registration,
     select_replay,

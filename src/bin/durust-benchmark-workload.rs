@@ -1913,7 +1913,6 @@ async fn run_postgres_write_ceiling_operations(
             worker_index,
             workers,
             operations,
-            options.physical_partitions,
         )
     });
     let results = futures::future::join_all(futures).await;
@@ -1929,7 +1928,6 @@ async fn run_postgres_write_ceiling_worker(
     worker_index: usize,
     workers: usize,
     operations: usize,
-    physical_partitions: u64,
 ) -> Result<(), String> {
     let (mut client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
         .await
@@ -1940,9 +1938,6 @@ async fn run_postgres_write_ceiling_worker(
         }
     });
     let schema = quote_benchmark_ident(&schema);
-    let physical_partitions_u32 = u32::try_from(physical_partitions)
-        .unwrap_or(u32::MAX)
-        .max(1);
     let payload_a = vec![1_u8; 64];
     let payload_b = vec![2_u8; 64];
     for operation in (worker_index..operations).step_by(workers) {
@@ -2000,53 +1995,6 @@ async fn run_postgres_write_ceiling_worker(
         )
         .await
         .map_err(|err| err.to_string())?;
-        let partition = u32::try_from(shard_id.max(0)).unwrap_or(0) % physical_partitions_u32;
-        let suffix = benchmark_partition_suffix(partition, physical_partitions_u32);
-        let now_ms = unix_epoch_millis_benchmark();
-        tx.execute(
-            &format!(
-                "insert into {schema}.shard_heads_{suffix}
-                 (shard_id, journal_seq, snapshot_seq, updated_at_ms)
-                 values ($1, 0, 0, $2)
-                 on conflict(shard_id) do nothing"
-            ),
-            &[&shard_id, &now_ms],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        let row = tx
-            .query_one(
-                &format!(
-                    "select journal_seq
-                     from {schema}.shard_heads_{suffix}
-                     where shard_id = $1
-                     for update"
-                ),
-                &[&shard_id],
-            )
-            .await
-            .map_err(|err| err.to_string())?;
-        let next_journal_seq = row.get::<_, i64>(0).saturating_add(1);
-        tx.execute(
-            &format!(
-                "insert into {schema}.shard_journal_{suffix}
-                 (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
-                 values ($1, $2, 1, $3, $4)"
-            ),
-            &[&shard_id, &next_journal_seq, &payload_a, &now_ms],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
-        tx.execute(
-            &format!(
-                "update {schema}.shard_heads_{suffix}
-                 set journal_seq = $1, updated_at_ms = $2
-                 where shard_id = $3"
-            ),
-            &[&next_journal_seq, &now_ms, &shard_id],
-        )
-        .await
-        .map_err(|err| err.to_string())?;
         tx.commit().await.map_err(|err| err.to_string())?;
     }
     Ok(())
@@ -2089,19 +2037,6 @@ async fn verify_postgres_write_ceiling(
 
 fn quote_benchmark_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn benchmark_partition_suffix(partition: u32, physical_partitions: u32) -> String {
-    let width = physical_partitions.saturating_sub(1).max(1).ilog10() as usize + 1;
-    format!("p{partition:0width$}")
-}
-
-fn unix_epoch_millis_benchmark() -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 fn run_backend_benchmark<B>(

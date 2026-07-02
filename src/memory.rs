@@ -1,6 +1,6 @@
 use crate::provider_util::{
-    ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
-    activity_timeout_decision, child_terminal_event_data_and_reason,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
+    activity_failure_decision, activity_timeout_decision, child_terminal_event_data_and_reason,
     child_terminal_map_item_outcome, claim_lease_until_ms, commit_has_workflow_visible_mutations,
     payload_gc_cutoff_ms, post_commit_ready_reason, timed_out_by_heartbeat, timeout_message,
 };
@@ -106,6 +106,12 @@ struct RunRecord {
     workflow_type: crate::WorkflowType,
     task_queue: crate::TaskQueue,
     history: Vec<HistoryEvent>,
+    // Command seqs with a child lifecycle event (started/terminal) in this
+    // run's history, and the terminal-only subset. Kept so child start and
+    // terminal notification dedup are lookups instead of history scans;
+    // rebuildable from history.
+    child_event_seqs: BTreeSet<u64>,
+    child_terminal_seqs: BTreeSet<u64>,
     ready: Option<WorkflowTaskReason>,
     // Virtual-clock visibility deadline for delayed releases; `advance_time`
     // controls when a deferred task becomes claimable again.
@@ -113,6 +119,32 @@ struct RunRecord {
     workflow_claim: Option<WorkflowClaim>,
     terminal: bool,
     parent: Option<ChildParentLink>,
+}
+
+impl RunRecord {
+    // The single append point for run history so the child dedup indexes
+    // cannot drift from the events actually stored.
+    fn push_history(&mut self, event: HistoryEvent) {
+        match &event.data {
+            HistoryEventData::ChildWorkflowStarted(started) => {
+                self.child_event_seqs.insert(started.command_id.seq.0);
+            }
+            HistoryEventData::ChildWorkflowCompleted(completed) => {
+                self.child_event_seqs.insert(completed.command_id.seq.0);
+                self.child_terminal_seqs.insert(completed.command_id.seq.0);
+            }
+            HistoryEventData::ChildWorkflowFailed(failed) => {
+                self.child_event_seqs.insert(failed.command_id.seq.0);
+                self.child_terminal_seqs.insert(failed.command_id.seq.0);
+            }
+            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                self.child_event_seqs.insert(cancelled.command_id.seq.0);
+                self.child_terminal_seqs.insert(cancelled.command_id.seq.0);
+            }
+            _ => {}
+        }
+        self.history.push(event);
+    }
 }
 
 // Lease expiry is compared against the virtual clock (`state.now`) so
@@ -231,6 +263,8 @@ impl DurableBackend for MemoryBackend {
                 workflow_type: req.workflow_type,
                 task_queue: req.task_queue,
                 history: vec![start],
+                child_event_seqs: BTreeSet::new(),
+                child_terminal_seqs: BTreeSet::new(),
                 ready: Some(WorkflowTaskReason::WorkflowStarted),
                 ready_at: None,
                 workflow_claim: None,
@@ -273,7 +307,7 @@ impl DurableBackend for MemoryBackend {
                 .last()
                 .map(|event| event.event_id.next())
                 .unwrap_or(EventId(1));
-            run.history.push(HistoryEvent {
+            run.push_history(HistoryEvent {
                 event_id,
                 event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: terminal_event.clone(),
@@ -284,7 +318,7 @@ impl DurableBackend for MemoryBackend {
             run.workflow_claim = None;
             event_id
         };
-        cleanup_run_operational_state(&mut state, &run_id);
+        cleanup_run_operational_state(&mut state, &run_id, TerminalCleanup::Closed);
         let config = self.payload_config.clone();
         handle_terminal_run(&mut state, &config, &run_id, &terminal_event);
 
@@ -612,7 +646,7 @@ impl DurableBackend for MemoryBackend {
                 {
                     change_version_updates.push(record);
                 }
-                run.history.push(HistoryEvent {
+                run.push_history(HistoryEvent {
                     event_id: next_event_id,
                     event_type: data.event_type(),
                     data,
@@ -718,7 +752,11 @@ impl DurableBackend for MemoryBackend {
             cancel_command_operational_state(&mut state, &command_id);
         }
         if next_event_id.1 {
-            cleanup_run_operational_state(&mut state, &claim.run_id);
+            let cleanup = terminal_event
+                .as_ref()
+                .map(TerminalCleanup::for_terminal_event)
+                .unwrap_or(TerminalCleanup::Closed);
+            cleanup_run_operational_state(&mut state, &claim.run_id, cleanup);
             if let Some(event) = terminal_event {
                 if matches!(event, HistoryEventData::WorkflowContinuedAsNew { .. }) {
                     continue_run_as_new(&mut state, &claim.run_id, event);
@@ -896,7 +934,7 @@ impl DurableBackend for MemoryBackend {
                 .last()
                 .map(|event| event.event_id.next())
                 .unwrap_or(EventId(1));
-            run.history.push(HistoryEvent {
+            run.push_history(HistoryEvent {
                 event_id,
                 event_type: crate::HistoryEventType::TimerFired,
                 data: HistoryEventData::TimerFired(crate::TimerFired {
@@ -1024,10 +1062,9 @@ impl DurableBackend for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
         let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )))));
+            // Activity records exist until their run's terminal cleanup
+            // deletes them, so a missing record is a completed activity.
+            return Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted)));
         };
         if record.completed {
             return Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted)));
@@ -1047,10 +1084,8 @@ impl DurableBackend for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-                return Box::pin(ready(Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )))));
+                // Missing record means the run's terminal cleanup deleted it.
+                return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
             };
             if record.completed {
                 return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
@@ -1101,7 +1136,7 @@ impl DurableBackend for MemoryBackend {
             .last()
             .map(|event| event.event_id.next())
             .unwrap_or(EventId(1));
-        run.history.push(HistoryEvent {
+        run.push_history(HistoryEvent {
             event_id,
             event_type: crate::HistoryEventType::ActivityCompleted,
             data: HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
@@ -1123,10 +1158,8 @@ impl DurableBackend for MemoryBackend {
         let now = state.now;
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-                return Box::pin(ready(Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )))));
+                // Missing record means the run's terminal cleanup deleted it.
+                return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
             };
             if record.completed {
                 return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
@@ -1194,7 +1227,7 @@ impl DurableBackend for MemoryBackend {
             .last()
             .map(|event| event.event_id.next())
             .unwrap_or(EventId(1));
-        run.history.push(HistoryEvent {
+        run.push_history(HistoryEvent {
             event_id,
             event_type: crate::HistoryEventType::ActivityFailed,
             data: HistoryEventData::ActivityFailed(crate::ActivityFailed {
@@ -1464,26 +1497,35 @@ fn change_version_record_for_run(
     })
 }
 
-fn cleanup_run_operational_state(state: &mut MemoryState, run_id: &RunId) {
+// Deletes the terminal run's operational records; see `TerminalCleanup` for
+// the contract (history stays authoritative, missing activity records answer
+// late calls as `AlreadyCompleted`, signal records survive continue-as-new).
+// Undispatched child outbox records stay: an abandoned child may still start
+// after its parent closes.
+fn cleanup_run_operational_state(
+    state: &mut MemoryState,
+    run_id: &RunId,
+    cleanup: TerminalCleanup,
+) {
     state.waits.retain(|_, wait| &wait.run_id != run_id);
-    for record in state.activities.values_mut() {
-        if &record.task.run_id == run_id {
-            record.completed = true;
-            record.claim = None;
-            record.heartbeat_deadline_at = None;
-        }
-    }
-    for map in state.activity_maps.values_mut() {
-        if &map.task.map_command_id.run_id == run_id {
-            map.completed = true;
-            map.in_flight = 0;
-        }
-    }
-    for map in state.child_workflow_maps.values_mut() {
-        if &map.task.map_command_id.run_id == run_id {
-            map.completed = true;
-            map.in_flight = 0;
-        }
+    state
+        .activities
+        .retain(|_, record| &record.task.run_id != run_id);
+    state
+        .activity_maps
+        .retain(|_, map| &map.task.map_command_id.run_id != run_id);
+    state
+        .child_workflow_maps
+        .retain(|_, map| &map.task.map_command_id.run_id != run_id);
+    state
+        .child_outbox
+        .retain(|_, record| !(record.dispatched && &record.message.command_id.run_id == run_id));
+    if cleanup.deletes_consumed_signals() {
+        // Unconsumed deliveries stay readable through the inbox after the run
+        // closes; only the consumed dedup records go.
+        state
+            .signals
+            .retain(|_, signal| !(signal.consumed && &signal.run_id == run_id));
     }
 }
 
@@ -1596,6 +1638,8 @@ fn start_child_run(state: &mut MemoryState, message: &ChildStartOutboxMessage) -
             workflow_type: message.workflow_type.clone(),
             task_queue: message.task_queue.clone(),
             history: vec![start],
+            child_event_seqs: BTreeSet::new(),
+            child_terminal_seqs: BTreeSet::new(),
             ready: Some(WorkflowTaskReason::WorkflowStarted),
             ready_at: None,
             workflow_claim: None,
@@ -1633,7 +1677,7 @@ fn append_child_started(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    parent.history.push(HistoryEvent {
+    parent.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ChildWorkflowStarted,
         data: HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
@@ -1666,7 +1710,7 @@ fn append_child_start_failed(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    parent.history.push(HistoryEvent {
+    parent.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ChildWorkflowFailed,
         data: HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
@@ -1680,19 +1724,10 @@ fn append_child_start_failed(
 }
 
 fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> bool {
-    state.runs.get(&command_id.run_id).is_some_and(|run| {
-        run.history.iter().any(|event| match &event.data {
-            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        })
-    })
+    state
+        .runs
+        .get(&command_id.run_id)
+        .is_some_and(|run| run.child_event_seqs.contains(&command_id.seq.0))
 }
 
 fn handle_terminal_run(
@@ -1738,6 +1773,8 @@ fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: Histo
             workflow_type,
             task_queue,
             history: vec![start],
+            child_event_seqs: BTreeSet::new(),
+            child_terminal_seqs: BTreeSet::new(),
             ready: Some(WorkflowTaskReason::WorkflowStarted),
             ready_at: None,
             workflow_claim: None,
@@ -1786,7 +1823,7 @@ fn notify_parent_of_child_terminal(
     else {
         return;
     };
-    parent_run.history.push(HistoryEvent {
+    parent_run.push_history(HistoryEvent {
         event_id,
         event_type: data.event_type(),
         data,
@@ -1796,18 +1833,10 @@ fn notify_parent_of_child_terminal(
 }
 
 fn child_terminal_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> bool {
-    state.runs.get(&command_id.run_id).is_some_and(|run| {
-        run.history.iter().any(|event| match &event.data {
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        })
-    })
+    state
+        .runs
+        .get(&command_id.run_id)
+        .is_some_and(|run| run.child_terminal_seqs.contains(&command_id.seq.0))
 }
 
 fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
@@ -1844,7 +1873,7 @@ fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
                 .last()
                 .map(|event| event.event_id.next())
                 .unwrap_or(EventId(1));
-            child.history.push(HistoryEvent {
+            child.push_history(HistoryEvent {
                 event_id,
                 event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: terminal_event.clone(),
@@ -1854,7 +1883,7 @@ fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
             child.ready_at = None;
             child.workflow_claim = None;
         }
-        cleanup_run_operational_state(state, &child_run_id);
+        cleanup_run_operational_state(state, &child_run_id, TerminalCleanup::Closed);
     }
 }
 
@@ -2116,7 +2145,7 @@ fn append_child_workflow_map_completed(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    parent.history.push(HistoryEvent {
+    parent.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ChildWorkflowMapCompleted,
         data: HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
@@ -2151,7 +2180,7 @@ fn append_child_workflow_map_failed(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    parent.history.push(HistoryEvent {
+    parent.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ChildWorkflowMapFailed,
         data: HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
@@ -2196,7 +2225,7 @@ fn cancel_child_workflow_map_children(state: &mut MemoryState, map_command_id: &
                 .last()
                 .map(|event| event.event_id.next())
                 .unwrap_or(EventId(1));
-            child.history.push(HistoryEvent {
+            child.push_history(HistoryEvent {
                 event_id,
                 event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: HistoryEventData::WorkflowCancelled {
@@ -2208,7 +2237,7 @@ fn cancel_child_workflow_map_children(state: &mut MemoryState, map_command_id: &
             child.ready_at = None;
             child.workflow_claim = None;
         }
-        cleanup_run_operational_state(state, &child_run_id);
+        cleanup_run_operational_state(state, &child_run_id, TerminalCleanup::Closed);
     }
 }
 
@@ -2281,7 +2310,7 @@ fn complete_map_item(
             .last()
             .map(|event| event.event_id.next())
             .unwrap_or(EventId(1));
-        run.history.push(HistoryEvent {
+        run.push_history(HistoryEvent {
             event_id,
             event_type: crate::HistoryEventType::ActivityMapCompleted,
             data: HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
@@ -2330,7 +2359,7 @@ fn fail_map_item(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    run.history.push(HistoryEvent {
+    run.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ActivityMapFailed,
         data: HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
@@ -2401,7 +2430,7 @@ fn timeout_activity(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    run.history.push(HistoryEvent {
+    run.push_history(HistoryEvent {
         event_id,
         event_type: crate::HistoryEventType::ActivityTimedOut,
         data: HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {

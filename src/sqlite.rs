@@ -1,13 +1,13 @@
 use crate::provider_util::{
-    ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
-    activity_timeout_at_ms, activity_timeout_at_ms_from, activity_timeout_decision,
-    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
-    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
-    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
-    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
-    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, timed_out_by_heartbeat, timeout_message,
-    unix_epoch_millis, wait_kind_to_str,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
+    activity_failure_decision, activity_timeout_at_ms, activity_timeout_at_ms_from,
+    activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
+    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
+    decode_encryption_metadata, encode_encryption_metadata, event_type_from_str, event_type_to_str,
+    marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
+    post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
+    timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -209,7 +209,7 @@ impl DurableBackend for SqliteBackend {
             let event_id = EventId(tail).next();
             let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
             insert_history_event(&tx, &run_id, event_id, terminal_event.clone())?;
-            cleanup_run_operational_state(&tx, &run_id)?;
+            cleanup_run_operational_state(&tx, &run_id, TerminalCleanup::Closed)?;
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
@@ -704,7 +704,11 @@ impl DurableBackend for SqliteBackend {
             }
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
-                cleanup_run_operational_state(&tx, &claim.run_id)?;
+                let cleanup = terminal_event
+                    .as_ref()
+                    .map(TerminalCleanup::for_terminal_event)
+                    .unwrap_or(TerminalCleanup::Closed);
+                cleanup_run_operational_state(&tx, &claim.run_id, cleanup)?;
                 if let Some(event @ HistoryEventData::WorkflowContinuedAsNew { .. }) =
                     terminal_event.clone()
                 {
@@ -1210,10 +1214,10 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Activity rows exist until their run's terminal cleanup
+                // deletes them, so a missing row is a completed activity.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -1265,10 +1269,9 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Missing row means the run's terminal cleanup deleted it.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(CompleteActivityOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -1365,10 +1368,9 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Missing row means the run's terminal cleanup deleted it.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(FailActivityOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -3267,6 +3269,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             run_id text not null,
             event_id integer not null,
             event_type text not null,
+            command_seq integer,
             data blob not null,
             primary key(run_id, event_id)
         );
@@ -3461,11 +3464,73 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "created_at_ms",
         "integer not null default 0",
     )?;
+    // One transaction for the whole command_seq migration: the backfill runs
+    // only on the open that adds the column, so a crash between the ALTER and
+    // the backfill must roll the column back too — otherwise the next open
+    // would skip the backfill and child-terminal dedup would miss legacy
+    // rows. The index is created after the column exists.
+    let command_seq_migration = conn.unchecked_transaction().map_err(sqlite_error)?;
+    if ensure_column(
+        &command_seq_migration,
+        "history_events",
+        "command_seq",
+        "integer",
+    )? {
+        backfill_history_event_command_seqs(&command_seq_migration)?;
+    }
+    command_seq_migration
+        .execute(
+            "create index if not exists idx_history_events_command_seq
+             on history_events(run_id, command_seq)
+             where command_seq is not null",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    command_seq_migration.commit().map_err(sqlite_error)?;
     ensure_index(
         conn,
         "idx_workflow_instances_ready",
         WORKFLOW_INSTANCES_READY_INDEX_SQL,
     )
+}
+
+// Databases created before the `command_seq` column carry null for existing
+// rows; child-terminal dedup reads the column, so a one-time decode of the
+// legacy child lifecycle events keeps dedup correct across the migration.
+fn backfill_history_event_command_seqs(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "select rowid, data from history_events
+             where command_seq is null
+               and event_type in (
+                 'child_workflow_started',
+                 'child_workflow_completed',
+                 'child_workflow_failed',
+                 'child_workflow_cancelled'
+               )",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    drop(stmt);
+    for (rowid, blob) in rows {
+        let data: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        let Some(command_seq) = data.command_seq() else {
+            continue;
+        };
+        conn.execute(
+            "update history_events set command_seq = ?1 where rowid = ?2",
+            params![command_seq.0, rowid],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
 }
 
 // The ready-scan index must not filter on workflow_claim_token: lease-expiry
@@ -3499,7 +3564,8 @@ fn ensure_index(conn: &Connection, index: &str, create_sql: &str) -> Result<()> 
     Ok(())
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+// Returns whether the column was added by this call.
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<bool> {
     let mut stmt = conn
         .prepare(&format!("pragma table_info({table})"))
         .map_err(sqlite_error)?;
@@ -3508,7 +3574,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         .map_err(sqlite_error)?;
     for existing in columns {
         if existing.map_err(sqlite_error)? == column {
-            return Ok(());
+            return Ok(false);
         }
     }
     conn.execute(
@@ -3516,7 +3582,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         [],
     )
     .map_err(sqlite_error)?;
-    Ok(())
+    Ok(true)
 }
 
 fn signal_wait_ready(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
@@ -3537,35 +3603,62 @@ fn signal_wait_ready(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
         .is_some())
 }
 
-fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result<()> {
+// Deletes the terminal run's operational rows; see `TerminalCleanup` for the
+// contract (history stays authoritative, missing activity rows answer late
+// calls as `AlreadyCompleted`, signal rows survive continue-as-new). Undis-
+// patched child outbox rows stay: an abandoned child may still start after
+// its parent closes.
+fn cleanup_run_operational_state(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    cleanup: TerminalCleanup,
+) -> Result<()> {
     tx.execute(
         "delete from active_waits where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update activity_tasks
-         set completed = 1,
-             claim_token = null,
-             heartbeat_deadline_at_ms = null
-         where run_id = ?1",
+        "delete from activity_tasks where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update activity_maps
-         set completed = 1, in_flight = 0
-         where run_id = ?1",
+        "delete from activity_map_results
+         where map_command_id in (select map_command_id from activity_maps where run_id = ?1)",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update child_workflow_maps
-         set completed = 1, in_flight = 0
-         where run_id = ?1",
+        "delete from activity_maps where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_workflow_map_results
+         where map_command_id in (select map_command_id from child_workflow_maps where run_id = ?1)",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_workflow_maps where run_id = ?1",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_outbox where parent_run_id = ?1 and dispatched = 1",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    if cleanup.deletes_consumed_signals() {
+        // Unconsumed deliveries stay readable through the inbox after the run
+        // closes; only the consumed dedup rows go.
+        tx.execute(
+            "delete from signals where run_id = ?1 and consumed = 1",
+            params![run_id.0],
+        )
+        .map_err(sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -3694,39 +3787,26 @@ fn notify_parent_of_child_terminal(
 }
 
 fn child_terminal_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
-    let mut stmt = tx
-        .prepare(
-            "select data from history_events
+    // Indexed lookup on (run_id, command_seq); the event-type filter
+    // distinguishes a terminal notification from the started event that
+    // shares the child command's sequence.
+    Ok(tx
+        .query_row(
+            "select 1 from history_events
              where run_id = ?1
+               and command_seq = ?2
                and event_type in (
                  'child_workflow_completed',
                  'child_workflow_failed',
                  'child_workflow_cancelled'
-               )",
+               )
+             limit 1",
+            params![command_id.run_id.0, command_id.seq.0],
+            |_| Ok(()),
         )
-        .map_err(sqlite_error)?;
-    let rows = stmt
-        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(sqlite_error)?;
-    for row in rows {
-        let blob = row.map_err(sqlite_error)?;
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .optional()
+        .map_err(sqlite_error)?
+        .is_some())
 }
 
 fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Result<()> {
@@ -3771,7 +3851,7 @@ fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Re
         };
         let event_id = EventId(tail).next();
         insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
-        cleanup_run_operational_state(tx, &child_run_id)?;
+        cleanup_run_operational_state(tx, &child_run_id, TerminalCleanup::Closed)?;
         tx.execute(
             "update workflow_instances
              set current_event_id = ?1,
@@ -4179,41 +4259,24 @@ fn set_workflow_ready(
 }
 
 fn child_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
-    let mut stmt = tx
-        .prepare(
-            "select data from history_events
+    Ok(tx
+        .query_row(
+            "select 1 from history_events
              where run_id = ?1
+               and command_seq = ?2
                and event_type in (
                  'child_workflow_started',
                  'child_workflow_completed',
                  'child_workflow_failed',
                  'child_workflow_cancelled'
-               )",
+               )
+             limit 1",
+            params![command_id.run_id.0, command_id.seq.0],
+            |_| Ok(()),
         )
-        .map_err(sqlite_error)?;
-    let rows = stmt
-        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(sqlite_error)?;
-    for row in rows {
-        let blob = row.map_err(sqlite_error)?;
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
-            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .optional()
+        .map_err(sqlite_error)?
+        .is_some())
 }
 
 fn materialize_activity_map_items(
@@ -4640,7 +4703,7 @@ fn cancel_child_workflow_map_children(
         };
         let event_id = EventId(tail).next();
         insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
-        cleanup_run_operational_state(tx, &child_run_id)?;
+        cleanup_run_operational_state(tx, &child_run_id, TerminalCleanup::Closed)?;
         tx.execute(
             "update workflow_instances
              set current_event_id = ?1,
@@ -5087,12 +5150,13 @@ fn insert_history_event(
     data: HistoryEventData,
 ) -> Result<()> {
     let event_type = event_type_to_str(&data.event_type());
+    let command_seq = data.command_seq().map(|seq| seq.0);
     let blob =
         rmp_serde::to_vec_named(&data).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
-        "insert into history_events(run_id, event_id, event_type, data)
-         values (?1, ?2, ?3, ?4)",
-        params![run_id.0, event_id.0, event_type, blob],
+        "insert into history_events(run_id, event_id, event_type, command_seq, data)
+         values (?1, ?2, ?3, ?4, ?5)",
+        params![run_id.0, event_id.0, event_type, command_seq, blob],
     )
     .map_err(sqlite_error)?;
     index_workflow_change_marker(tx, run_id, event_id, &data)?;
@@ -5261,6 +5325,426 @@ mod tests {
                 .is_some();
             assert!(exists, "missing SQLite index `{index_name}`");
         }
+    }
+
+    // Databases created before `history_events.command_seq` must have their
+    // child lifecycle rows backfilled on the open that adds the column, and
+    // the backfilled values must feed child-terminal dedup; otherwise a
+    // re-delivered terminal notification would append a duplicate child event
+    // to the parent (silent replay corruption). Follows the Phase 2G legacy
+    // reopen pattern: build the history, strip the column with a raw
+    // connection, and reopen through `SqliteBackend::open`.
+    #[test]
+    fn sqlite_reopen_backfills_command_seq_and_preserves_child_terminal_dedup() {
+        use futures::executor::block_on;
+
+        block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("command-seq-backfill.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let namespace = crate::Namespace::default();
+            let parent_type = WorkflowType::new("tests.backfill-parent", 1);
+            let child_type = WorkflowType::new("tests.backfill-child", 1);
+            let parent_outcome = backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/backfill-parent"),
+                    workflow_type: parent_type.clone(),
+                    task_queue: crate::TaskQueue::new("backfill-workflows"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let parent_run_id = parent_outcome.run_id().clone();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("backfill-parent-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("backfill-workflows"),
+                        registered_workflow_types: vec![parent_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("parent workflow task");
+            let command_id = crate::command_id(&parent_run_id, 1);
+            let input = crate::encode_payload(&7_u64).unwrap();
+            let requested = crate::ChildWorkflowStartRequested {
+                command_id: command_id.clone(),
+                workflow_type: child_type.clone(),
+                workflow_id: WorkflowId::new("wf/backfill-child"),
+                task_queue: crate::TaskQueue::new("backfill-children"),
+                input: input.clone(),
+                parent_close_policy: ParentClosePolicy::Abandon,
+                fingerprint: crate::child_workflow_fingerprint(
+                    child_type.clone(),
+                    WorkflowId::new("wf/backfill-child"),
+                    crate::payload_digest(&input),
+                    crate::TaskQueue::new("backfill-children"),
+                    ParentClosePolicy::Abandon,
+                ),
+            };
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![crate::NewHistoryEvent::new(
+                            HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+                        )],
+                        start_child_workflows: vec![ChildStartOutboxMessage::from_requested(
+                            &requested,
+                        )],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let dispatched = backend
+                .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
+                    namespace: namespace.clone(),
+                    limit: 16,
+                })
+                .await
+                .unwrap();
+            assert_eq!(dispatched.dispatched, 1);
+            let child_claim = backend
+                .claim_workflow_task(
+                    WorkerId::new("backfill-child-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("backfill-children"),
+                        registered_workflow_types: vec![child_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("child workflow task");
+            let child_run_id = child_claim.run_id.clone();
+            // The child completes, appending ChildWorkflowCompleted to the
+            // parent through the terminal notification path.
+            backend
+                .commit_workflow_task(
+                    child_claim.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![crate::NewHistoryEvent::new(
+                            HistoryEventData::WorkflowCompleted {
+                                result: crate::encode_payload(&14_u64).unwrap(),
+                            },
+                        )],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            drop(backend);
+
+            // Simulate the pre-command_seq schema: drop the index that
+            // references the column, then the column itself.
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "drop index if exists idx_history_events_command_seq;
+                 alter table history_events drop column command_seq;",
+            )
+            .unwrap();
+            drop(raw);
+
+            // Reopen: the migration adds the column and backfills the legacy
+            // child lifecycle rows in the same transaction.
+            let reopened = SqliteBackend::open(&path).unwrap();
+            let conn = reopened.connection().unwrap();
+            let unbackfilled: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where command_seq is null
+                       and event_type in (
+                         'child_workflow_started',
+                         'child_workflow_completed',
+                         'child_workflow_failed',
+                         'child_workflow_cancelled'
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                unbackfilled, 0,
+                "legacy child lifecycle rows must be backfilled on reopen"
+            );
+            let backfilled_seqs: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where run_id = ?1 and command_seq = 1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                backfilled_seqs >= 2,
+                "started + completed rows should carry the child command seq"
+            );
+            let parent_tail_before: u64 = conn
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            // Simulate a re-delivered terminal transition: forge the child
+            // live again and cancel it, so notify_parent_of_child_terminal
+            // runs against the backfilled dedup data.
+            conn.execute(
+                "update workflow_instances set terminal = 0 where run_id = ?1",
+                params![child_run_id.0],
+            )
+            .unwrap();
+            drop(conn);
+            reopened
+                .cancel_workflow(crate::CancelWorkflowRequest {
+                    namespace,
+                    workflow_id: WorkflowId::new("wf/backfill-child"),
+                    reason: "duplicate terminal delivery".to_owned(),
+                })
+                .await
+                .unwrap();
+
+            let conn = reopened.connection().unwrap();
+            let parent_terminal_events: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where run_id = ?1
+                       and event_type in (
+                         'child_workflow_completed',
+                         'child_workflow_failed',
+                         'child_workflow_cancelled'
+                       )",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                parent_terminal_events, 1,
+                "backfilled dedup must suppress the duplicate child-terminal notify"
+            );
+            let parent_tail_after: u64 = conn
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent_tail_after, parent_tail_before);
+        });
+    }
+
+    #[test]
+    fn terminal_cleanup_deletes_operational_rows_across_reopen() {
+        use futures::executor::block_on;
+
+        block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("terminal-cleanup.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let workflow_type = WorkflowType::new("tests.sqlite-terminal-cleanup", 1);
+            let namespace = crate::Namespace::default();
+            let outcome = backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: crate::TaskQueue::new("sqlite-cleanup-workflows"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let run_id = outcome.run_id().clone();
+            for (signal_id, name) in [
+                ("signal/cleanup/consumed", "go"),
+                ("signal/cleanup/pending", "go"),
+            ] {
+                backend
+                    .signal_workflow(crate::SignalWorkflowRequest {
+                        namespace: namespace.clone(),
+                        workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                        signal_id: crate::SignalId::new(signal_id),
+                        signal_name: crate::SignalName::new(name),
+                        payload: crate::encode_payload(&"x").unwrap(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("sqlite-cleanup-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("sqlite-cleanup-workflows"),
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("workflow task");
+            let activity_command = crate::command_id(&run_id, 1);
+            let map_command = crate::command_id(&run_id, 2);
+            let signal_command = crate::command_id(&run_id, 3);
+            let input = crate::encode_payload(&1_u64).unwrap();
+            let scheduled = crate::ActivityScheduled {
+                command_id: activity_command.clone(),
+                activity_name: crate::ActivityName::new("tests.echo"),
+                task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                fingerprint: crate::activity_fingerprint(
+                    crate::ActivityName::new("tests.echo"),
+                    crate::payload_digest(&input),
+                    "sha256:test-options".to_owned(),
+                ),
+                input: input.clone(),
+            };
+            let input_manifest =
+                crate::encode_activity_map_input_manifest(vec![input.clone(), input.clone()], 2)
+                    .unwrap();
+            let map_task = ActivityMapTask {
+                map_command_id: map_command.clone(),
+                activity_name: crate::ActivityName::new("tests.echo"),
+                task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                input_manifest: input_manifest.clone(),
+                result_manifest_name: "cleanup-results".to_owned(),
+                max_in_flight: 2,
+            };
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                scheduled.clone(),
+                            )),
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                                crate::ActivityMapScheduled {
+                                    command_id: map_command.clone(),
+                                    activity_name: crate::ActivityName::new("tests.echo"),
+                                    task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                                    retry_policy: crate::RetryPolicy::none(),
+                                    start_to_close_timeout: None,
+                                    heartbeat_timeout: None,
+                                    input_manifest: input_manifest.clone(),
+                                    result_manifest_name: "cleanup-results".to_owned(),
+                                    max_in_flight: 2,
+                                    fingerprint: crate::activity_map_fingerprint(
+                                        crate::ActivityName::new("tests.echo"),
+                                        crate::payload_digest(&input_manifest),
+                                        "cleanup-results".to_owned(),
+                                        2,
+                                        "sha256:test-options".to_owned(),
+                                    ),
+                                },
+                            )),
+                            crate::NewHistoryEvent::new(HistoryEventData::SignalConsumed(
+                                crate::SignalConsumed {
+                                    command_id: signal_command,
+                                    signal_id: crate::SignalId::new("signal/cleanup/consumed"),
+                                    signal_name: crate::SignalName::new("go"),
+                                    payload: crate::encode_payload(&"x").unwrap(),
+                                    fingerprint: crate::signal_fingerprint(crate::SignalName::new(
+                                        "go",
+                                    )),
+                                },
+                            )),
+                        ],
+                        schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
+                        schedule_activity_maps: vec![map_task],
+                        consume_signals: vec![crate::SignalId::new("signal/cleanup/consumed")],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let activity = backend
+                .claim_activity_task(
+                    WorkerId::new("sqlite-cleanup-activity-worker"),
+                    crate::ClaimActivityOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                        registered_activity_names: vec![crate::ActivityName::new("tests.echo")],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("activity task");
+
+            backend
+                .cancel_workflow(crate::CancelWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                    reason: "cleanup test".to_owned(),
+                })
+                .await
+                .unwrap();
+            drop(backend);
+
+            // Reopen: the deletions are durable, history is untouched, and
+            // only the undelivered signal survives as an inbox row.
+            let reopened = SqliteBackend::open(&path).unwrap();
+            let conn = reopened.connection().unwrap();
+            for (table, expected) in [
+                ("activity_tasks", 0_i64),
+                ("activity_maps", 0),
+                ("activity_map_results", 0),
+                ("active_waits", 0),
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("select count(*) from {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, expected, "terminal cleanup should empty `{table}`");
+            }
+            let (signal_count, unconsumed_count): (i64, i64) = conn
+                .query_row(
+                    "select count(*), sum(case when consumed = 0 then 1 else 0 end)
+                     from signals where run_id = ?1",
+                    params![run_id.0],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (signal_count, unconsumed_count),
+                (1, 1),
+                "only the undelivered signal survives cleanup"
+            );
+            let history_count: i64 = conn
+                .query_row(
+                    "select count(*) from history_events where run_id = ?1",
+                    params![run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(history_count, 5, "history stays authoritative");
+            drop(conn);
+
+            // Late calls answer from row absence after the reopen.
+            let late = reopened
+                .complete_activity(crate::CompleteActivityRequest {
+                    claim: activity.claim,
+                    result: crate::encode_payload(&1_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(late, crate::CompleteActivityOutcome::AlreadyCompleted);
+        });
     }
 
     #[test]

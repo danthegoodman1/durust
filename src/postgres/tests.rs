@@ -357,7 +357,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .await
         .unwrap();
         assert_eq!(backend.schema(), schema);
-        assert_eq!(backend.schema_version().await.unwrap(), 3);
+        assert_eq!(backend.schema_version().await.unwrap(), 4);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -378,13 +378,6 @@ fn postgres_shard_key_uses_namespace() {
     let a = shard_for_workflow(&Namespace::new("a"), &workflow_id, 4096);
     let b = shard_for_workflow(&Namespace::new("b"), &workflow_id, 4096);
     assert_ne!(a, b);
-}
-
-#[test]
-fn postgres_partition_suffix_width_tracks_partition_count() {
-    assert_eq!(partition_suffix(0, 1), "p0");
-    assert_eq!(partition_suffix(3, 16), "p03");
-    assert_eq!(partition_suffix(12, 128), "p012");
 }
 
 #[test]
@@ -924,35 +917,21 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
             }
         );
 
-        let suffix = partition_suffix(
-            shard_id.0 % backend.physical_partitions(),
-            backend.physical_partitions(),
-        );
-        let client = backend.client().await.unwrap();
-        let journal_rows: i64 = client
-            .query_one(
-                &format!(
-                    "select count(*) from {}.shard_journal_{suffix} where shard_id = $1",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(shard_id.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(journal_rows, 1);
+        let leases = shard_leases_for_tests(&backend, &schema, &[shard_id]).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1.as_deref(), Some("unfiltered-shard-worker"));
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
 
 #[test]
-fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
+fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch journal test; set DURUST_POSTGRES_URL");
+            eprintln!("skipping Postgres batch shard commit test; set DURUST_POSTGRES_URL");
             return;
         };
-        let schema = test_schema("batch_journal");
+        let schema = test_schema("batch_shard_commit");
         let backend = PostgresBackend::connect_with_config(
             PostgresBackendConfig::new(url)
                 .schema(schema.clone())
@@ -1040,6 +1019,11 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
+        let committed_run_ids = results
+            .iter()
+            .map(|result| result.claim.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(committed_run_ids, expected_run_ids);
         for result in results {
             assert_eq!(
                 result.result.unwrap(),
@@ -1049,66 +1033,12 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             );
         }
 
-        let suffix = partition_suffix(
-            target_shard.0 % backend.physical_partitions(),
-            backend.physical_partitions(),
-        );
-        let client = backend.client().await.unwrap();
-        let rows = client
-            .query(
-                &format!(
-                    "select journal_seq, lease_epoch, operation
-                     from {}.shard_journal_{suffix}
-                     where shard_id = $1
-                     order by journal_seq asc",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let journal_seq: i64 = rows[0].get(0);
-        let journal_lease_epoch: i64 = rows[0].get(1);
-        assert_eq!(journal_seq, 1);
-        assert_eq!(journal_lease_epoch, acquired_lease_epoch);
-        let head_seq: i64 = client
-            .query_one(
-                &format!(
-                    "select journal_seq from {}.shard_heads_{suffix} where shard_id = $1",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(head_seq, 1);
-        let operation_blob: Vec<u8> = rows[0].get(2);
-        let operation: ShardJournalOperation = rmp_serde::from_slice(&operation_blob).unwrap();
-        assert!(matches!(
-            operation.kind,
-            ShardJournalOperationKind::WorkflowTaskBatch
-        ));
-        assert_eq!(operation.entries.len(), 2);
-        let actual_run_ids = operation
-            .entries
-            .iter()
-            .map(|entry| {
-                assert_eq!(entry.expected_tail_event_id, EventId(1));
-                assert_eq!(entry.new_tail_event_id, EventId(2));
-                assert!(matches!(
-                    entry.result,
-                    ShardJournalCommitResult::Committed {
-                        appended_events: 1,
-                        terminal: true,
-                        ready_reason: None,
-                    }
-                ));
-                entry.run_id.clone()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(actual_run_ids, expected_run_ids);
+        // Committing through the acquired lease must not bump its epoch:
+        // fencing only rotates ownership on reclaim.
+        let leases = shard_leases_for_tests(&backend, &schema, &[target_shard]).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1.as_deref(), Some("batch-journal-worker"));
+        assert_eq!(leases[0].2, acquired_lease_epoch);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }

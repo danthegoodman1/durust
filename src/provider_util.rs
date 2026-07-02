@@ -62,6 +62,36 @@ pub(crate) fn decode_encryption_metadata(
     .transpose()
 }
 
+/// How a run reached its terminal transition, deciding which operational rows
+/// its cleanup may delete. Every provider deletes a terminal run's activity
+/// tasks, map descriptors, map results, waits, and dispatched child outbox
+/// rows: history is authoritative, so nothing rebuilds from them, and late
+/// activity calls answer `AlreadyCompleted` from the row's absence. Signal
+/// rows are subtler: unconsumed deliveries always stay readable through the
+/// inbox, and consumed rows are the `signal_id` dedup record. A closed run
+/// (completed/failed/cancelled) rejects every further send with
+/// `TerminalWorkflow` before the dedup lookup can matter, so it may drop its
+/// consumed rows; a run that continues as new keeps accepting sends under the
+/// same workflow id and must keep them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalCleanup {
+    Closed,
+    ContinuedAsNew,
+}
+
+impl TerminalCleanup {
+    pub(crate) fn for_terminal_event(event: &HistoryEventData) -> Self {
+        match event {
+            HistoryEventData::WorkflowContinuedAsNew { .. } => Self::ContinuedAsNew,
+            _ => Self::Closed,
+        }
+    }
+
+    pub(crate) fn deletes_consumed_signals(self) -> bool {
+        self == Self::Closed
+    }
+}
+
 pub(crate) fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
     if heartbeat {
         format!(

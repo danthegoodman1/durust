@@ -113,18 +113,7 @@ pub(crate) struct RuntimeContext {
     needs_more_history: bool,
     last_ready_event_id: Option<crate::EventId>,
     next_command_seq: u64,
-    completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
-    failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
-    map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
-    map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_map_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)>,
-    child_map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_starts: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)>,
-    child_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)>,
-    child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
-    timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
-    consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
+    indexes: ReadyEventIndexes,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
     hydrated_payloads: BTreeMap<String, PayloadRef>,
@@ -141,6 +130,110 @@ pub(crate) struct RuntimeContext {
     delete_waits: Vec<WaitId>,
     cancel_commands: Vec<CommandId>,
     query_projection: Option<PayloadRef>,
+}
+
+/// Per-command-seq indexes over ready events (completions, failures, timer
+/// fires, consumed signals, child lifecycle). They are the single consumption
+/// path for ready events during replay (see `take_indexed`); the replay
+/// cursor only skips over them. Entries a committed task did not consume are
+/// carried into the worker's `CachedWorkflow` and seed the next task's
+/// context, so a run holding an unawaited handle stays cached instead of
+/// cold-replaying: chunks are `after_event_id`-based, so a carried entry can
+/// never be re-collected from a later chunk.
+#[derive(Debug, Default)]
+pub(crate) struct ReadyEventIndexes {
+    completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
+    failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
+    map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
+    map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_map_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)>,
+    child_map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_starts: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)>,
+    child_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)>,
+    child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
+    timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
+    consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
+}
+
+impl ReadyEventIndexes {
+    /// Indexes every ready event in one pass over the chunk. Must run on both
+    /// the initial history and every appended chunk so out-of-order arrivals
+    /// stay claimable through the indexes.
+    fn index_events(&mut self, events: &[HistoryEvent]) {
+        for event in events {
+            let event_id = event.event_id;
+            match &event.data {
+                HistoryEventData::ActivityCompleted(completed) => {
+                    self.completions.insert(
+                        completed.command_id.seq,
+                        (event_id, completed.result.clone()),
+                    );
+                }
+                HistoryEventData::ActivityFailed(failed) => {
+                    self.failures.insert(
+                        failed.command_id.seq,
+                        (
+                            event_id,
+                            ActivityTerminalError::Failed(failed.failure.clone()),
+                        ),
+                    );
+                }
+                HistoryEventData::ActivityTimedOut(timed_out) => {
+                    self.failures.insert(
+                        timed_out.command_id.seq,
+                        (
+                            event_id,
+                            ActivityTerminalError::TimedOut(timed_out.message.clone()),
+                        ),
+                    );
+                }
+                HistoryEventData::ActivityMapCompleted(completed) => {
+                    self.map_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ActivityMapFailed(failed) => {
+                    self.map_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+                    self.child_map_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ChildWorkflowMapFailed(failed) => {
+                    self.child_map_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowStarted(started) => {
+                    self.child_starts
+                        .insert(started.command_id.seq, (event_id, started.clone()));
+                }
+                HistoryEventData::ChildWorkflowCompleted(completed) => {
+                    self.child_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ChildWorkflowFailed(failed) => {
+                    self.child_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                    self.child_cancellations.insert(
+                        cancelled.command_id.seq,
+                        (event_id, cancelled.reason.clone()),
+                    );
+                }
+                HistoryEventData::TimerFired(fired) => {
+                    self.timers
+                        .insert(fired.command_id.seq, (event_id, fired.clone()));
+                }
+                HistoryEventData::SignalConsumed(consumed) => {
+                    self.consumed_signals
+                        .insert(consumed.command_id.seq, (event_id, consumed.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,27 +298,6 @@ pub(crate) struct PayloadHydrationRequest {
 }
 
 impl PayloadHydrationRequest {
-    fn payload(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::Payload,
-            payload,
-        }
-    }
-
-    fn activity_map_result_manifest(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::ActivityMapResultManifest,
-            payload,
-        }
-    }
-
-    fn child_workflow_map_result_manifest(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::ChildWorkflowMapResultManifest,
-            payload,
-        }
-    }
-
     pub(crate) fn key(&self) -> String {
         payload_hydration_key(self.kind, &self.payload)
     }
@@ -274,6 +346,7 @@ impl ActivityTerminalError {
 }
 
 impl RuntimeContext {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         run_id: RunId,
         worker_workflow_task_queue: TaskQueue,
@@ -286,19 +359,13 @@ impl RuntimeContext {
         last_loaded_event_id: crate::EventId,
         replay_target_event_id: crate::EventId,
         change_versions: Vec<WorkflowChangeVersionRecord>,
+        carried_indexes: ReadyEventIndexes,
     ) -> Self {
-        let completions = collect_completions(&replay_events);
-        let failures = collect_failures(&replay_events);
-        let map_completions = collect_map_completions(&replay_events);
-        let map_failures = collect_map_failures(&replay_events);
-        let child_map_completions = collect_child_map_completions(&replay_events);
-        let child_map_failures = collect_child_map_failures(&replay_events);
-        let child_starts = collect_child_starts(&replay_events);
-        let child_completions = collect_child_completions(&replay_events);
-        let child_failures = collect_child_failures(&replay_events);
-        let child_cancellations = collect_child_cancellations(&replay_events);
-        let timers = collect_timers(&replay_events);
-        let consumed_signals = collect_consumed_signals(&replay_events);
+        // Carried entries all precede this task's chunk (their events were
+        // loaded and committed by an earlier task), so indexing the new chunk
+        // on top cannot collide with them.
+        let mut indexes = carried_indexes;
+        indexes.index_events(&replay_events);
         let change_markers = change_versions
             .into_iter()
             .map(RuntimeChangeMarker::from_record)
@@ -320,18 +387,7 @@ impl RuntimeContext {
             needs_more_history: false,
             last_ready_event_id: None,
             next_command_seq,
-            completions,
-            failures,
-            map_completions,
-            map_failures,
-            child_map_completions,
-            child_map_failures,
-            child_starts,
-            child_completions,
-            child_failures,
-            child_cancellations,
-            timers,
-            consumed_signals,
+            indexes,
             live_signals: BTreeMap::new(),
             payload_hydration_requests: BTreeMap::new(),
             hydrated_payloads: BTreeMap::new(),
@@ -371,25 +427,12 @@ impl RuntimeContext {
         self.next_command_seq
     }
 
-    /// True when the loaded history still holds ready events no future has
-    /// consumed (for example a completion for a spawned handle the workflow
-    /// has not awaited yet). Contexts are rebuilt per task from only the new
-    /// chunk, so a cached future would never see these events again; the
-    /// worker must drop the cache entry and cold-replay the full history on
-    /// the next task instead.
-    pub(crate) fn has_unconsumed_ready_events(&self) -> bool {
-        !(self.completions.is_empty()
-            && self.failures.is_empty()
-            && self.map_completions.is_empty()
-            && self.map_failures.is_empty()
-            && self.child_map_completions.is_empty()
-            && self.child_map_failures.is_empty()
-            && self.child_starts.is_empty()
-            && self.child_completions.is_empty()
-            && self.child_failures.is_empty()
-            && self.child_cancellations.is_empty()
-            && self.timers.is_empty()
-            && self.consumed_signals.is_empty())
+    /// Extracts the ready-event entries this task did not consume so the
+    /// worker can carry them into `CachedWorkflow`; the next task's context
+    /// is constructed with them and the run stays cached instead of
+    /// cold-replaying to rebuild the indexes.
+    pub(crate) fn take_unconsumed_ready_event_indexes(&mut self) -> ReadyEventIndexes {
+        std::mem::take(&mut self.indexes)
     }
 
     fn encode_payload<T>(&self, value: &T) -> Result<PayloadRef>
@@ -417,27 +460,7 @@ impl RuntimeContext {
             self.replay_events.drain(..self.replay_cursor);
             self.replay_cursor = 0;
         }
-        self.completions.extend(collect_completions(&events));
-        self.failures.extend(collect_failures(&events));
-        self.map_completions
-            .extend(collect_map_completions(&events));
-        self.map_failures.extend(collect_map_failures(&events));
-        // Child-workflow-map terminal events must be indexed on appended chunks too,
-        // mirroring `new()`, so a completion/failure arriving in a later recovery
-        // chunk is still found by the indexed lookup path during multi-chunk replay.
-        self.child_map_completions
-            .extend(collect_child_map_completions(&events));
-        self.child_map_failures
-            .extend(collect_child_map_failures(&events));
-        self.child_starts.extend(collect_child_starts(&events));
-        self.child_completions
-            .extend(collect_child_completions(&events));
-        self.child_failures.extend(collect_child_failures(&events));
-        self.child_cancellations
-            .extend(collect_child_cancellations(&events));
-        self.timers.extend(collect_timers(&events));
-        self.consumed_signals
-            .extend(collect_consumed_signals(&events));
+        self.indexes.index_events(&events);
         self.replay_events.extend(events);
         self.last_loaded_event_id = last_loaded_event_id;
     }
@@ -603,6 +626,25 @@ impl RuntimeContext {
             && self.last_loaded_event_id >= self.replay_target_event_id
     }
 
+    /// The next un-replayed command event still sitting in loaded history.
+    /// Unconsumed ready events are legal at any point (fire-and-forget), so
+    /// the peek skips them without consuming; a command event left behind
+    /// when the workflow reaches a terminal state is divergence.
+    pub(crate) fn unreplayed_command_event(
+        &mut self,
+    ) -> Option<(crate::EventId, crate::HistoryEventType)> {
+        self.peek_replay_command_event()
+            .map(|event| (event.event_id, event.event_type))
+    }
+
+    /// Where loading must resume when events up to the replay target are not
+    /// loaded yet, so the terminal divergence check can inspect the rest of
+    /// history.
+    pub(crate) fn unloaded_history_after(&self) -> Option<crate::EventId> {
+        (self.last_loaded_event_id < self.replay_target_event_id)
+            .then_some(self.last_loaded_event_id)
+    }
+
     fn request_more_history_if_available(&mut self) -> bool {
         if self.last_loaded_event_id < self.replay_target_event_id {
             self.needs_more_history = true;
@@ -640,73 +682,94 @@ impl RuntimeContext {
         self.peek_replay_command_event().is_none() && self.at_replay_tail()
     }
 
-    fn ready_payload_or_request(&mut self, request: PayloadHydrationRequest) -> Option<PayloadRef> {
-        // Only plain payloads are ready when inline. Manifest kinds offload
-        // each level independently, so an inline root can still hold
-        // blob-backed pages or item results; they always go through the
-        // provider's manifest hydrator, which handles inline roots.
-        if request.kind == PayloadHydrationKind::Payload
-            && matches!(request.payload, PayloadRef::Inline { .. })
-        {
-            return Some(request.payload);
+    /// Resolves a payload for consumption without cloning it: inline plain
+    /// payloads short-circuit, a fulfilled hydration is claimed, and an
+    /// unresolved blob registers a hydration request (cloning only the small
+    /// blob ref) and hands the original back through `Err` so the caller can
+    /// re-file it for the retry poll. Manifest kinds never short-circuit:
+    /// they offload each level independently, so an inline root can still
+    /// hold blob-backed pages and always goes through the provider's manifest
+    /// hydrator.
+    fn ready_payload_or_request(
+        &mut self,
+        kind: PayloadHydrationKind,
+        payload: PayloadRef,
+    ) -> std::result::Result<PayloadRef, PayloadRef> {
+        if kind == PayloadHydrationKind::Payload && matches!(payload, PayloadRef::Inline { .. }) {
+            return Ok(payload);
         }
-        let key = request.key();
+        let key = payload_hydration_key(kind, &payload);
         if let Some(hydrated) = self.hydrated_payloads.remove(&key) {
-            return Some(hydrated);
+            return Ok(hydrated);
         }
         self.payload_hydration_requests
             .entry(key)
-            .or_insert(request);
-        None
+            .or_insert_with(|| PayloadHydrationRequest {
+                kind,
+                payload: payload.clone(),
+            });
+        Err(payload)
     }
 
     /// Consumes an indexed ready event exactly once. Every ready event is
     /// collected into its per-command-seq index map at chunk load, so the
     /// index is the single consumption path; the replay cursor only skips
-    /// ready events and never hands them out. Hydration may leave the entry
-    /// in place so a later poll can retry.
-    fn take_indexed<V: Clone>(
+    /// ready events and never hands them out. The entry is removed before
+    /// hydration and re-filed through `Err` when hydration is still pending,
+    /// so a later poll can retry without ever cloning the value.
+    fn take_indexed<V>(
         &mut self,
         command_id: &CommandId,
-        index: impl Fn(&mut Self) -> &mut BTreeMap<CommandSeq, (crate::EventId, V)>,
-        hydrate: impl FnOnce(&mut Self, V) -> Option<V>,
+        index: impl Fn(&mut ReadyEventIndexes) -> &mut BTreeMap<CommandSeq, (crate::EventId, V)>,
+        hydrate: impl FnOnce(&mut Self, V) -> std::result::Result<V, V>,
     ) -> Option<V> {
-        let (event_id, value) = index(self).get(&command_id.seq).cloned()?;
-        let value = hydrate(self, value)?;
-        index(self).remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(value)
+        let (event_id, value) = index(&mut self.indexes).remove(&command_id.seq)?;
+        match hydrate(self, value) {
+            Ok(value) => {
+                self.record_indexed_ready_event_id(event_id);
+                Some(value)
+            }
+            Err(value) => {
+                index(&mut self.indexes).insert(command_id.seq, (event_id, value));
+                None
+            }
+        }
     }
 
     fn take_completion(&mut self, command_id: &CommandId) -> Option<PayloadRef> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.completions,
+            |indexes| &mut indexes.completions,
             |runtime, result| {
-                runtime.ready_payload_or_request(PayloadHydrationRequest::payload(result))
+                runtime.ready_payload_or_request(PayloadHydrationKind::Payload, result)
             },
         )
     }
 
     fn take_failure(&mut self, command_id: &CommandId) -> Option<ActivityTerminalError> {
-        self.take_indexed(command_id, |runtime| &mut runtime.failures, |_, v| Some(v))
+        self.take_indexed(command_id, |indexes| &mut indexes.failures, |_, v| Ok(v))
     }
 
     fn take_timer(&mut self, command_id: &CommandId) -> Option<TimerFired> {
-        self.take_indexed(command_id, |runtime| &mut runtime.timers, |_, v| Some(v))
+        self.take_indexed(command_id, |indexes| &mut indexes.timers, |_, v| Ok(v))
     }
 
     fn take_map_completion(&mut self, command_id: &CommandId) -> Option<ActivityMapCompleted> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.map_completions,
-            |runtime, mut completed| {
-                completed.result_manifest = runtime.ready_payload_or_request(
-                    PayloadHydrationRequest::activity_map_result_manifest(
-                        completed.result_manifest,
-                    ),
-                )?;
-                Some(completed)
+            |indexes| &mut indexes.map_completions,
+            |runtime, mut completed| match runtime.ready_payload_or_request(
+                PayloadHydrationKind::ActivityMapResultManifest,
+                completed.result_manifest,
+            ) {
+                Ok(manifest) => {
+                    completed.result_manifest = manifest;
+                    Ok(completed)
+                }
+                Err(manifest) => {
+                    completed.result_manifest = manifest;
+                    Err(completed)
+                }
             },
         )
     }
@@ -714,8 +777,8 @@ impl RuntimeContext {
     fn take_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.map_failures,
-            |_, v| Some(v),
+            |indexes| &mut indexes.map_failures,
+            |_, v| Ok(v),
         )
     }
 
@@ -725,14 +788,19 @@ impl RuntimeContext {
     ) -> Option<ChildWorkflowMapCompleted> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_map_completions,
-            |runtime, mut completed| {
-                completed.result_manifest = runtime.ready_payload_or_request(
-                    PayloadHydrationRequest::child_workflow_map_result_manifest(
-                        completed.result_manifest,
-                    ),
-                )?;
-                Some(completed)
+            |indexes| &mut indexes.child_map_completions,
+            |runtime, mut completed| match runtime.ready_payload_or_request(
+                PayloadHydrationKind::ChildWorkflowMapResultManifest,
+                completed.result_manifest,
+            ) {
+                Ok(manifest) => {
+                    completed.result_manifest = manifest;
+                    Ok(completed)
+                }
+                Err(manifest) => {
+                    completed.result_manifest = manifest;
+                    Err(completed)
+                }
             },
         )
     }
@@ -740,27 +808,34 @@ impl RuntimeContext {
     fn take_child_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_map_failures,
-            |_, v| Some(v),
+            |indexes| &mut indexes.child_map_failures,
+            |_, v| Ok(v),
         )
     }
 
     fn take_child_started(&mut self, command_id: &CommandId) -> Option<ChildWorkflowStarted> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_starts,
-            |_, v| Some(v),
+            |indexes| &mut indexes.child_starts,
+            |_, v| Ok(v),
         )
     }
 
     fn take_child_completion(&mut self, command_id: &CommandId) -> Option<ChildWorkflowCompleted> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_completions,
-            |runtime, mut completed| {
-                completed.result = runtime
-                    .ready_payload_or_request(PayloadHydrationRequest::payload(completed.result))?;
-                Some(completed)
+            |indexes| &mut indexes.child_completions,
+            |runtime, mut completed| match runtime
+                .ready_payload_or_request(PayloadHydrationKind::Payload, completed.result)
+            {
+                Ok(result) => {
+                    completed.result = result;
+                    Ok(completed)
+                }
+                Err(result) => {
+                    completed.result = result;
+                    Err(completed)
+                }
             },
         )
     }
@@ -768,16 +843,16 @@ impl RuntimeContext {
     fn take_child_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_failures,
-            |_, v| Some(v),
+            |indexes| &mut indexes.child_failures,
+            |_, v| Ok(v),
         )
     }
 
     fn take_child_cancellation(&mut self, command_id: &CommandId) -> Option<String> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.child_cancellations,
-            |_, v| Some(v),
+            |indexes| &mut indexes.child_cancellations,
+            |_, v| Ok(v),
         )
     }
 
@@ -785,27 +860,41 @@ impl RuntimeContext {
         if !self.replay_drained_for_live_events() {
             return None;
         }
-        let mut signal = self.live_signals.get(&command_id.seq).cloned()?;
-        signal.payload =
-            self.ready_payload_or_request(PayloadHydrationRequest::payload(signal.payload))?;
-        self.live_signals.remove(&command_id.seq);
-        Some(signal)
+        let mut signal = self.live_signals.remove(&command_id.seq)?;
+        match self.ready_payload_or_request(PayloadHydrationKind::Payload, signal.payload) {
+            Ok(payload) => {
+                signal.payload = payload;
+                Some(signal)
+            }
+            Err(payload) => {
+                signal.payload = payload;
+                self.live_signals.insert(command_id.seq, signal);
+                None
+            }
+        }
     }
 
     fn take_consumed_signal(&mut self, command_id: &CommandId) -> Option<SignalConsumed> {
         self.take_indexed(
             command_id,
-            |runtime| &mut runtime.consumed_signals,
-            |runtime, mut consumed| {
-                consumed.payload = runtime
-                    .ready_payload_or_request(PayloadHydrationRequest::payload(consumed.payload))?;
-                Some(consumed)
+            |indexes| &mut indexes.consumed_signals,
+            |runtime, mut consumed| match runtime
+                .ready_payload_or_request(PayloadHydrationKind::Payload, consumed.payload)
+            {
+                Ok(payload) => {
+                    consumed.payload = payload;
+                    Ok(consumed)
+                }
+                Err(payload) => {
+                    consumed.payload = payload;
+                    Err(consumed)
+                }
             },
         )
     }
 
     fn has_recorded_signal_consumption(&self, command_id: &CommandId) -> bool {
-        self.consumed_signals.contains_key(&command_id.seq)
+        self.indexes.consumed_signals.contains_key(&command_id.seq)
     }
 
     fn request_signal(&mut self, command_id: CommandId, signal_name: SignalName) {
@@ -3238,153 +3327,6 @@ where
     crate::decode_payload::<T>(&consumed.payload)
 }
 
-/// Builds a per-command-seq index over one class of ready events. These
-/// indexes are the single consumption path for ready events during replay
-/// (see `take_indexed`), so every collector must run on both the initial
-/// history and every appended chunk.
-fn collect_indexed<V>(
-    events: &[HistoryEvent],
-    extract: impl Fn(&HistoryEventData) -> Option<(CommandSeq, V)>,
-) -> BTreeMap<CommandSeq, (crate::EventId, V)> {
-    events
-        .iter()
-        .filter_map(|event| extract(&event.data).map(|(seq, value)| (seq, (event.event_id, value))))
-        .collect()
-}
-
-fn collect_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, PayloadRef)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ActivityCompleted(completed) => {
-            Some((completed.command_id.seq, completed.result.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ActivityFailed(failed) => Some((
-            failed.command_id.seq,
-            ActivityTerminalError::Failed(failed.failure.clone()),
-        )),
-        HistoryEventData::ActivityTimedOut(timed_out) => Some((
-            timed_out.command_id.seq,
-            ActivityTerminalError::TimedOut(timed_out.message.clone()),
-        )),
-        _ => None,
-    })
-}
-
-fn collect_map_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            Some((completed.command_id.seq, completed.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_map_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ActivityMapFailed(failed) => {
-            Some((failed.command_id.seq, failed.failure.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_map_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            Some((completed.command_id.seq, completed.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_map_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            Some((failed.command_id.seq, failed.failure.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_starts(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowStarted(started) => {
-            Some((started.command_id.seq, started.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            Some((completed.command_id.seq, completed.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            Some((failed.command_id.seq, failed.failure.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_child_cancellations(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, String)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-            Some((cancelled.command_id.seq, cancelled.reason.clone()))
-        }
-        _ => None,
-    })
-}
-
-fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, TimerFired)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::TimerFired(fired) => Some((fired.command_id.seq, fired.clone())),
-        _ => None,
-    })
-}
-
-fn collect_consumed_signals(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)> {
-    collect_indexed(events, |data| match data {
-        HistoryEventData::SignalConsumed(consumed) => {
-            Some((consumed.command_id.seq, consumed.clone()))
-        }
-        _ => None,
-    })
-}
-
 pub(crate) fn is_terminal(data: &HistoryEventData) -> bool {
     matches!(
         data,
@@ -3730,6 +3672,7 @@ mod tests {
             EventId(1),
             EventId(3),
             Vec::new(),
+            ReadyEventIndexes::default(),
         );
         runtime.append_replay_events(
             vec![
@@ -3842,6 +3785,7 @@ mod tests {
             EventId(3),
             EventId(3),
             Vec::new(),
+            ReadyEventIndexes::default(),
         )
     }
 

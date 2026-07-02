@@ -1942,6 +1942,8 @@ where
     signal_between_claim_and_commit_wakes_workflows_in_batch_commit(backend.clone()).await;
     terminal_run_fences_stale_mutating_commits_identically(backend.clone()).await;
     late_activity_completion_after_cancel_is_idempotent_across_retries(backend.clone()).await;
+    terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals(backend.clone()).await;
+    consumed_signal_dedup_survives_continue_as_new(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
     non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
@@ -4961,10 +4963,274 @@ fn terminal_fence_commits(
     ]
 }
 
+/// Terminal cleanup deletes the run's operational rows, so late activity
+/// calls (heartbeat included) must answer `AlreadyCompleted` from row
+/// absence across retries, claim scans must not see the terminal run's
+/// tasks, undelivered signals must stay readable through the inbox, and
+/// their `signal_id` dedup must survive while new sends fail terminally.
+async fn terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(
+            "wf/terminal-cleanup",
+            "terminal-cleanup-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("terminal-cleanup-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("terminal-cleanup-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_payload = durust::encode_payload(&Input { value: 3 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("terminal-cleanup-activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: Some(Duration::from_secs(30)),
+        input: input_payload.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input_payload),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled.clone(),
+                ))],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("terminal-cleanup-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let activity = backend
+        .claim_activity_task(
+            WorkerId::new("terminal-cleanup-worker"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+    // An undelivered signal lands before the run closes.
+    let undelivered = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/undelivered",
+            "pending",
+        )
+        .await
+        .unwrap();
+    assert_eq!(undelivered, durust::SignalWorkflowOutcome::Accepted);
+
+    client
+        .cancel_workflow("wf/terminal-cleanup", "terminal cleanup test")
+        .await
+        .unwrap();
+
+    // Late calls answer idempotently from row absence, on every retry.
+    for attempt in 0..2 {
+        let heartbeat = backend
+            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+                claim: activity.claim.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            heartbeat,
+            durust::ActivityHeartbeatOutcome::AlreadyCompleted,
+            "heartbeat retry {attempt}"
+        );
+        let completed = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim.clone(),
+                result: durust::encode_payload(&3_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            completed,
+            durust::CompleteActivityOutcome::AlreadyCompleted,
+            "complete retry {attempt}"
+        );
+        let failed = backend
+            .fail_activity(FailActivityRequest {
+                claim: activity.claim.clone(),
+                failure: durust::DurableFailure::new("test.late", "late failure"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            durust::FailActivityOutcome::AlreadyCompleted,
+            "fail retry {attempt}"
+        );
+    }
+
+    // Claim scans no longer see the terminal run's tasks.
+    assert!(
+        backend
+            .claim_activity_task(WorkerId::new("terminal-cleanup-leftover"), activity_opts)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The undelivered signal stays readable and its dedup record survives;
+    // a genuinely new send fails terminally.
+    let inboxed = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id: run_id.clone(),
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap()
+        .expect("undelivered signal survives terminal cleanup");
+    assert_eq!(
+        inboxed.signal_id,
+        durust::SignalId::new("signal/terminal-cleanup/undelivered")
+    );
+    let duplicate = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/undelivered",
+            "pending",
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+    let fresh = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/fresh",
+            "rejected",
+        )
+        .await;
+    assert!(matches!(fresh, Err(durust::Error::TerminalWorkflow)));
+}
+
+/// Consumed signal rows are the `signal_id` dedup record, and continue-as-new
+/// keeps accepting sends under the same workflow id, so cleanup after a
+/// continue-as-new transition must retain them: a retried send of an already
+/// consumed id must stay `Duplicate` instead of delivering again to the next
+/// run.
+async fn consumed_signal_dedup_survives_continue_as_new<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>("wf/can-signal-dedup", "can-signal-workflows", input(2))
+        .await
+        .unwrap();
+    let consumed_signal_id = durust::SignalId::new("signal/can-dedup/consumed");
+    let accepted = client
+        .signal_workflow(
+            "wf/can-signal-dedup",
+            "go",
+            consumed_signal_id.0.clone(),
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("can-signal-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("can-signal-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let signal_payload = durust::encode_payload(&"first").unwrap();
+    // One commit consumes the delivery and continues the run as new.
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![
+                    NewHistoryEvent::new(HistoryEventData::SignalConsumed(
+                        durust::SignalConsumed {
+                            command_id: command_id.clone(),
+                            signal_id: consumed_signal_id.clone(),
+                            signal_name: durust::SignalName::new("go"),
+                            payload: signal_payload,
+                            fingerprint: durust::signal_fingerprint(durust::SignalName::new("go")),
+                        },
+                    )),
+                    NewHistoryEvent::new(HistoryEventData::WorkflowContinuedAsNew {
+                        input: durust::encode_payload(&Input { value: 3 }).unwrap(),
+                    }),
+                ],
+                consume_signals: vec![consumed_signal_id.clone()],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The retried send of the consumed id must stay deduplicated instead of
+    // delivering a second time to the next run.
+    let retried = client
+        .signal_workflow(
+            "wf/can-signal-dedup",
+            "go",
+            consumed_signal_id.0.clone(),
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried, durust::SignalWorkflowOutcome::Duplicate);
+
+    // The continued run is live under the same workflow id: fresh sends land.
+    let fresh = client
+        .signal_workflow("wf/can-signal-dedup", "go", "signal/can-dedup/next", "next")
+        .await
+        .unwrap();
+    assert_eq!(fresh, durust::SignalWorkflowOutcome::Accepted);
+}
+
 /// Late completion and failure of an activity whose run was cancelled must be
 /// idempotently absorbed, and repeated retries must keep returning the same
-/// outcome on every provider (cancellation completes the run's activity rows
-/// atomically with the terminal transition).
+/// outcome on every provider (cancellation deletes the run's activity rows
+/// atomically with the terminal transition; absence answers late calls).
 async fn late_activity_completion_after_cancel_is_idempotent_across_retries<B>(backend: B)
 where
     B: DurableBackend,

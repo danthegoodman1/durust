@@ -2707,6 +2707,27 @@ idempotency
   expires_at
 ```
 
+## 19.1 Terminal cleanup
+
+Operational rows exist to drive a live run; append history stays the
+authoritative record. When a run reaches a terminal state, the provider
+deletes the run's waits, activity tasks, map descriptors, map results, and
+dispatched child outbox rows in the same transaction as the terminal
+transition, so operational storage does not grow with closed runs and claim,
+timeout, and dispatch scans never revisit them. Late activity completions,
+failures, and heartbeats for a cleaned-up run answer `AlreadyCompleted` from
+the row's absence, identically on every retry.
+
+Signal rows are the exception. Undelivered signal rows stay readable through
+the inbox after the run closes. Consumed signal rows are the `signal_id`
+dedup record: a closed run (completed, failed, or cancelled) deletes them
+because those rows are then only reachable by retried sends against the
+closed run, which are rejected with `TerminalWorkflow` once the row is gone —
+no delivery can result either way. Continue-as-new keeps them because the
+next run continues to accept sends under the same workflow id. Undispatched
+child outbox rows also survive cleanup so an abandoned child can still start
+after its parent closes.
+
 ---
 
 # 20. Concurrency

@@ -184,6 +184,11 @@ struct CachedWorkflow {
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
     change_versions: Vec<WorkflowChangeVersionRecord>,
+    // Ready events the committed task left unconsumed (for example a spawned
+    // handle's completion the workflow has not awaited yet). They seed the
+    // next task's context so the run stays cached; the next chunk starts
+    // after `last_event_id`, so carried entries cannot be collected twice.
+    unconsumed_indexes: crate::runtime::ReadyEventIndexes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -301,7 +306,7 @@ struct PreparedWorkflowTask {
     default_activity_options: crate::ActivityOptions,
     change_versions: Vec<WorkflowChangeVersionRecord>,
     appended_change_marker: bool,
-    unconsumed_ready_events: bool,
+    unconsumed_indexes: crate::runtime::ReadyEventIndexes,
     terminal: bool,
 }
 
@@ -460,11 +465,9 @@ where
                     }
                 };
                 committed += 1;
-                // Mirrors `commit_prepared_workflow_task`: unconsumed ready
-                // events force a cold replay on the next task.
+                // Mirrors `commit_prepared_workflow_task`'s cache decision.
                 if task.terminal
                     || task.appended_change_marker
-                    || task.unconsumed_ready_events
                     || last_event_id > task.runtime_appended_tail
                 {
                     continue;
@@ -483,6 +486,7 @@ where
                         next_command_seq: task.next_command_seq,
                         default_activity_options: task.default_activity_options.clone(),
                         change_versions: task.change_versions.clone(),
+                        unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
                     },
                 );
             }
@@ -536,7 +540,7 @@ where
         let runtime_appended_tail = prepared.runtime_appended_tail;
         let terminal = prepared.terminal;
         let appended_change_marker = prepared.appended_change_marker;
-        let unconsumed_ready_events = prepared.unconsumed_ready_events;
+        let unconsumed_indexes = prepared.unconsumed_indexes;
         let next_command_seq = prepared.next_command_seq;
         let default_activity_options = prepared.default_activity_options.clone();
         let change_versions = prepared.change_versions.clone();
@@ -552,15 +556,10 @@ where
             return Ok(None);
         };
 
-        // A task that leaves loaded ready events unconsumed cannot stay
-        // cached: the next task's context is rebuilt from only the new chunk,
-        // so those events would become unreachable. Cold replay rebuilds the
-        // indexes from the full history instead.
-        if terminal
-            || appended_change_marker
-            || unconsumed_ready_events
-            || last_event_id > runtime_appended_tail
-        {
+        // Provider-appended events past the runtime's tail (for example
+        // inline child starts) are invisible to the cached future, so the
+        // next task must cold-replay to pick them up.
+        if terminal || appended_change_marker || last_event_id > runtime_appended_tail {
             return Ok(None);
         }
 
@@ -570,6 +569,7 @@ where
             next_command_seq,
             default_activity_options,
             change_versions,
+            unconsumed_indexes,
         }))
     }
 
@@ -656,6 +656,7 @@ where
                 chunk.last_event_id,
                 claimed.replay_target_event_id,
                 change_versions.clone(),
+                cached.unconsumed_indexes,
             );
             let poll = self
                 .poll_until_history_blocked_or_ready(
@@ -734,6 +735,7 @@ where
             last_loaded_event_id,
             claimed.replay_target_event_id,
             change_versions.clone(),
+            crate::runtime::ReadyEventIndexes::default(),
         );
         let poll = self
             .poll_until_history_blocked_or_ready(
@@ -1312,12 +1314,24 @@ where
         &mut self,
         claimed: crate::ClaimedWorkflowTask,
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
-        context: crate::runtime::RuntimeContext,
+        mut context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
         change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Result<PreparedWorkflowTask> {
+        let poll_reached_terminal_state = match &poll {
+            Poll::Pending => false,
+            Poll::Ready(Ok(_)) => true,
+            Poll::Ready(Err(err)) => !matches!(
+                err,
+                Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
+            ),
+        };
+        if poll_reached_terminal_state {
+            self.reject_terminal_with_unreplayed_command_events(&claimed, &mut context)
+                .await?;
+        }
         let next_command_seq = context.next_command_seq();
-        let unconsumed_ready_events = context.has_unconsumed_ready_events();
+        let unconsumed_indexes = context.take_unconsumed_ready_event_indexes();
         let parts = context.into_commit_parts();
         let default_activity_options = parts.default_activity_options.clone();
         let mut append_events = parts.append_events;
@@ -1385,9 +1399,47 @@ where
             default_activity_options,
             change_versions,
             appended_change_marker,
-            unconsumed_ready_events,
+            unconsumed_indexes,
             terminal,
         })
+    }
+
+    // A workflow that reaches a terminal state while un-replayed command
+    // events remain in history diverged from its recording (for example a
+    // removed trailing command); committing the terminal event would
+    // silently corrupt replay, so the task fails with nondeterminism and the
+    // claim is released with backoff. Unconsumed ready events are legal
+    // (fire-and-forget completions), so only command events count; unloaded
+    // chunks are streamed in to check the rest of history.
+    async fn reject_terminal_with_unreplayed_command_events(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        context: &mut crate::runtime::RuntimeContext,
+    ) -> Result<()> {
+        loop {
+            if let Some((event_id, event_type)) = context.unreplayed_command_event() {
+                return Err(Error::Nondeterminism(format!(
+                    "workflow reached a terminal state while command event {event_type:?} at event {event_id} was not replayed"
+                )));
+            }
+            let Some(after_event_id) = context.unloaded_history_after() else {
+                return Ok(());
+            };
+            let chunk = self
+                .stream_history_chunk(
+                    claimed.run_id.clone(),
+                    after_event_id,
+                    claimed.replay_target_event_id,
+                )
+                .await?;
+            if chunk.events.is_empty() {
+                return Err(Error::Backend(format!(
+                    "history stream ended at event {after_event_id} before replay target {}",
+                    claimed.replay_target_event_id
+                )));
+            }
+            context.append_replay_events(chunk.events, chunk.last_event_id);
+        }
     }
 
     async fn run_local_activities_after_workflow_tasks(

@@ -1,11 +1,12 @@
 use crate::provider_util::{
-    ActivityFailureDecision, activity_claim_lease_timeout_at_ms, activity_failure_decision,
-    activity_timeout_at_ms, activity_timeout_at_ms_from, activity_timeout_decision,
-    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
-    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
-    compression_to_str, decode_encryption_metadata, duration_millis_i64,
-    encode_encryption_metadata, event_type_from_str, event_type_to_str, marker_kind_from_str,
-    marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
+    activity_failure_decision, activity_timeout_at_ms, activity_timeout_at_ms_from,
+    activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
+    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
+    decode_encryption_metadata, duration_millis_i64, encode_encryption_metadata,
+    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
+    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
     ready_at_ms_for_delay, reason_from_str, reason_to_str, timed_out_by_heartbeat, timeout_message,
     unix_epoch_millis, wait_kind_to_str,
 };
@@ -38,62 +39,23 @@ use deadpool_postgres::{
     Manager, ManagerConfig, Object as PooledPostgresClient, Pool, RecyclingMethod, Runtime,
 };
 use futures::future::{BoxFuture, ready};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 3;
+const POSTGRES_SCHEMA_VERSION: i64 = 4;
 const DEFAULT_SCHEMA: &str = "durust";
 const DEFAULT_MAX_POOL_SIZE: usize = 16;
 const DEFAULT_LOGICAL_SHARDS: u32 = 1;
 const DEFAULT_PHYSICAL_PARTITIONS: u32 = 1;
-const DEFAULT_SNAPSHOT_INTERVAL: u64 = 10_000;
 const DEFAULT_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const POSTGRES_TRANSACTION_RETRY_ATTEMPTS: usize = 3;
 const POSTGRES_TRANSACTION_RETRY_BASE_DELAY: Duration = Duration::from_millis(2);
 const CLAIM_HISTORY_PREFETCH_EVENTS: usize = 16;
 const CLAIM_HISTORY_PREFETCH_BYTES: usize = 256 * 1024;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardJournalOperation {
-    kind: ShardJournalOperationKind,
-    entries: Vec<ShardJournalEntry>,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-enum ShardJournalOperationKind {
-    WorkflowTaskBatch,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShardJournalEntry {
-    run_id: RunId,
-    expected_tail_event_id: EventId,
-    new_tail_event_id: EventId,
-    result: ShardJournalCommitResult,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-enum ShardJournalCommitResult {
-    Committed {
-        appended_events: usize,
-        terminal: bool,
-        ready_reason: Option<String>,
-    },
-    Conflict,
-}
-
-#[derive(Clone, Debug)]
-struct AppliedWorkflowTaskCommit {
-    outcome: CommitOutcome,
-    shard_id: i32,
-    lease_epoch: i64,
-    journal_entry: ShardJournalEntry,
-}
 
 struct LockedWorkflowCommitRow {
     current_tail: EventId,
@@ -107,12 +69,9 @@ struct LockedWorkflowCommitRow {
 struct PreparedSimpleWorkflowCommit {
     input_index: usize,
     claim: WorkflowTaskClaim,
-    current_tail: EventId,
     next_event_id: EventId,
     namespace: String,
     workflow_id: String,
-    shard_id: i32,
-    lease_epoch: i64,
     append_history: Vec<(EventId, HistoryEventData)>,
     schedule_activities: Vec<ActivityTask>,
     start_child_workflows: Vec<ChildStartOutboxMessage>,
@@ -158,7 +117,6 @@ pub struct PostgresBackendConfig {
     max_pool_size: usize,
     logical_shards: u32,
     physical_partitions: u32,
-    snapshot_interval: u64,
     statement_timeout: Duration,
     lock_timeout: Duration,
 }
@@ -172,7 +130,6 @@ impl PostgresBackendConfig {
             max_pool_size: DEFAULT_MAX_POOL_SIZE,
             logical_shards: DEFAULT_LOGICAL_SHARDS,
             physical_partitions: DEFAULT_PHYSICAL_PARTITIONS,
-            snapshot_interval: DEFAULT_SNAPSHOT_INTERVAL,
             statement_timeout: DEFAULT_STATEMENT_TIMEOUT,
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
         }
@@ -203,11 +160,6 @@ impl PostgresBackendConfig {
         self
     }
 
-    pub fn snapshot_interval(mut self, snapshot_interval: u64) -> Self {
-        self.snapshot_interval = snapshot_interval.max(1);
-        self
-    }
-
     pub fn statement_timeout(mut self, timeout: Duration) -> Self {
         self.statement_timeout = timeout;
         self
@@ -226,7 +178,6 @@ pub struct PostgresBackend {
     payload_config: PayloadStorageConfig,
     logical_shards: u32,
     physical_partitions: u32,
-    snapshot_interval: u64,
     statement_timeout: Duration,
     lock_timeout: Duration,
 }
@@ -277,7 +228,6 @@ impl PostgresBackend {
             payload_config: config.payload_config,
             logical_shards: config.logical_shards.max(1),
             physical_partitions: config.physical_partitions.max(1),
-            snapshot_interval: config.snapshot_interval.max(1),
             statement_timeout: config.statement_timeout,
             lock_timeout: config.lock_timeout,
         };
@@ -399,9 +349,14 @@ impl PostgresBackend {
                     run_id text not null,
                     event_id bigint not null,
                     event_type text not null,
+                    command_seq bigint,
                     data bytea not null,
                     primary key(run_id, event_id)
                 );
+
+                create index if not exists idx_history_events_command_seq
+                    on {schema}.history_events(run_id, command_seq)
+                    where command_seq is not null;
 
                 create table if not exists {schema}.payload_blobs (
                     digest text primary key,
@@ -540,6 +495,11 @@ impl PostgresBackend {
                 create index if not exists idx_activity_tasks_heartbeat_due
                     on {schema}.activity_tasks(namespace, completed, heartbeat_deadline_at_ms, activity_id);
 
+                create index if not exists idx_activity_tasks_claim
+                    on {schema}.activity_tasks(namespace, task_queue, activity_id)
+                    where completed = false
+                      and claim_token is null;
+
                 insert into {schema}.meta(key, value)
                 values ('schema_version', {POSTGRES_SCHEMA_VERSION})
                 on conflict(key) do update set value = excluded.value;
@@ -585,7 +545,7 @@ impl PostgresBackend {
             .map_err(postgres_error)?;
 
         self.validate_or_insert_provider_metadata(&client).await?;
-        self.ensure_shard_native_tables(&client).await
+        self.ensure_shard_leases(&client).await
     }
 
     async fn validate_or_insert_provider_metadata(
@@ -596,10 +556,6 @@ impl PostgresBackend {
         let expected = BTreeMap::from([
             ("logical_shards", i64::from(self.logical_shards)),
             ("physical_partitions", i64::from(self.physical_partitions)),
-            (
-                "snapshot_interval",
-                i64::try_from(self.snapshot_interval).unwrap_or(i64::MAX),
-            ),
             (
                 "statement_timeout_ms",
                 duration_millis_i64(self.statement_timeout),
@@ -640,7 +596,11 @@ impl PostgresBackend {
         Ok(())
     }
 
-    async fn ensure_shard_native_tables(&self, client: &PooledPostgresClient) -> Result<()> {
+    // Shard leases fence claims and commits today. Journal, snapshot, and
+    // partitioned history storage arrive with shard-native recovery
+    // (impl-plan item 0013); until something reads them, no such tables or
+    // writes exist.
+    async fn ensure_shard_leases(&self, client: &PooledPostgresClient) -> Result<()> {
         let schema = self.schema_sql();
         client
             .batch_execute(&format!(
@@ -655,49 +615,6 @@ impl PostgresBackend {
             ))
             .await
             .map_err(postgres_error)?;
-
-        for partition in 0..self.physical_partitions {
-            let suffix = partition_suffix(partition, self.physical_partitions);
-            client
-                .batch_execute(&format!(
-                    "
-                    create table if not exists {schema}.shard_heads_{suffix} (
-                        shard_id integer primary key,
-                        journal_seq bigint not null,
-                        snapshot_seq bigint not null,
-                        updated_at_ms bigint not null
-                    );
-
-                    create table if not exists {schema}.shard_journal_{suffix} (
-                        shard_id integer not null,
-                        journal_seq bigint not null,
-                        lease_epoch bigint not null,
-                        operation bytea not null,
-                        appended_at_ms bigint not null,
-                        primary key(shard_id, journal_seq)
-                    );
-
-                    create table if not exists {schema}.shard_snapshots_{suffix} (
-                        shard_id integer not null,
-                        snapshot_seq bigint not null,
-                        journal_seq bigint not null,
-                        snapshot bytea not null,
-                        created_at_ms bigint not null,
-                        primary key(shard_id, snapshot_seq)
-                    );
-
-                    create table if not exists {schema}.history_events_{suffix} (
-                        run_id text not null,
-                        event_id bigint not null,
-                        event_type text not null,
-                        data bytea not null,
-                        primary key(run_id, event_id)
-                    );
-                    "
-                ))
-                .await
-                .map_err(postgres_error)?;
-        }
 
         for shard_id in 0..self.logical_shards {
             client
@@ -1287,7 +1204,7 @@ impl PostgresBackend {
         let event_id = tail.next();
         let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
         insert_history_event(&tx, &schema, &run_id, event_id, terminal_event.clone()).await?;
-        cleanup_run_operational_state_tx(&tx, &schema, &run_id).await?;
+        cleanup_run_operational_state_tx(&tx, &schema, &run_id, TerminalCleanup::Closed).await?;
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances
@@ -1711,24 +1628,30 @@ impl PostgresBackend {
     ) -> Result<HistoryChunk> {
         let schema = self.schema_sql();
         let client = self.client().await?;
+        let max_events = req.max_events.max(1);
+        let max_bytes = req.max_bytes.max(1);
+        // Fetch one row past the event budget so `has_more` is answered
+        // without materializing the whole remaining history; byte-budget
+        // truncation stays Rust-side because row sizes are not known in SQL.
+        let row_limit = i64::try_from(max_events.saturating_add(1)).unwrap_or(i64::MAX);
         let rows = client
             .query(
                 &format!(
                     "select event_id, event_type, data
                      from {schema}.history_events
                      where run_id = $1 and event_id > $2 and event_id <= $3
-                     order by event_id asc"
+                     order by event_id asc
+                     limit $4"
                 ),
                 &[
                     &req.run_id.0,
                     &i64::try_from(req.after_event_id.0).unwrap_or(i64::MAX),
                     &i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX),
+                    &row_limit,
                 ],
             )
             .await
             .map_err(postgres_error)?;
-        let max_events = req.max_events.max(1);
-        let max_bytes = req.max_bytes.max(1);
         let mut events = Vec::new();
         let mut bytes = 0usize;
         let mut consumed_rows = 0usize;
@@ -1929,20 +1852,9 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let applied = self
+        let outcome = self
             .apply_workflow_task_commit_tx(&tx, &schema, claim, batch, None)
             .await?;
-        self.append_shard_journal_tx(
-            &tx,
-            applied.shard_id,
-            applied.lease_epoch,
-            ShardJournalOperation {
-                kind: ShardJournalOperationKind::WorkflowTaskBatch,
-                entries: vec![applied.journal_entry],
-            },
-        )
-        .await?;
-        let outcome = applied.outcome;
         tx.commit().await.map_err(postgres_error)?;
         Ok(outcome)
     }
@@ -1971,8 +1883,6 @@ impl PostgresBackend {
         let schema = self.schema_sql();
         let commits = batch.commits;
         let mut results = (0..commits.len()).map(|_| None).collect::<Vec<_>>();
-        let mut applied_by_index = BTreeMap::<usize, AppliedWorkflowTaskCommit>::new();
-        let mut journal_by_shard = BTreeMap::<(i32, i64), Vec<ShardJournalEntry>>::new();
         let mut lease_epoch_cache = BTreeMap::<(WorkerId, i32), i64>::new();
         let run_counts = commits.iter().fold(BTreeMap::new(), |mut counts, input| {
             *counts.entry(input.claim.run_id.clone()).or_insert(0usize) += 1;
@@ -1998,9 +1908,8 @@ impl PostgresBackend {
                 .await?
             {
                 match result {
-                    Ok(applied) => {
-                        results[index] = Some(Ok(applied.outcome.clone()));
-                        applied_by_index.insert(index, applied);
+                    Ok(outcome) => {
+                        results[index] = Some(Ok(outcome));
                     }
                     Err(err @ Error::Backend(_)) => return Err(err),
                     Err(err) => {
@@ -2025,9 +1934,8 @@ impl PostgresBackend {
                 )
                 .await
             {
-                Ok(applied) => {
-                    results[index] = Some(Ok(applied.outcome.clone()));
-                    applied_by_index.insert(index, applied);
+                Ok(outcome) => {
+                    results[index] = Some(Ok(outcome));
                 }
                 Err(err @ Error::Backend(_)) => return Err(err),
                 Err(err) => {
@@ -2038,12 +1946,6 @@ impl PostgresBackend {
 
         let mut batch_results = Vec::with_capacity(commits.len());
         for (index, input) in commits.iter().enumerate() {
-            if let Some(applied) = applied_by_index.remove(&index) {
-                journal_by_shard
-                    .entry((applied.shard_id, applied.lease_epoch))
-                    .or_default()
-                    .push(applied.journal_entry);
-            }
             batch_results.push(crate::WorkflowTaskCommitBatchResult {
                 claim: input.claim.clone(),
                 result: results[index].take().unwrap_or_else(|| {
@@ -2052,19 +1954,6 @@ impl PostgresBackend {
                     )))
                 }),
             });
-        }
-
-        for ((shard_id, lease_epoch), entries) in journal_by_shard {
-            self.append_shard_journal_tx(
-                &tx,
-                shard_id,
-                lease_epoch,
-                ShardJournalOperation {
-                    kind: ShardJournalOperationKind::WorkflowTaskBatch,
-                    entries,
-                },
-            )
-            .await?;
         }
 
         tx.commit().await.map_err(postgres_error)?;
@@ -2363,7 +2252,7 @@ impl PostgresBackend {
         schema: &str,
         commits: &[crate::WorkflowTaskCommitInput],
         indices: &[usize],
-    ) -> Result<Vec<(usize, Result<AppliedWorkflowTaskCommit>)>> {
+    ) -> Result<Vec<(usize, Result<CommitOutcome>)>> {
         let run_id_values = indices
             .iter()
             .map(|index| commits[*index].claim.run_id.0.clone())
@@ -2422,30 +2311,14 @@ impl PostgresBackend {
                 continue;
             }
             let lease_key = (claim.worker_id.clone(), row.shard_id);
-            let lease_epoch = match lease_epochs.get(&lease_key).copied() {
-                Some(lease_epoch) => lease_epoch,
-                None => {
-                    item_results.push((*index, Err(Error::StaleLease)));
-                    continue;
-                }
-            };
+            if !lease_epochs.contains_key(&lease_key) {
+                item_results.push((*index, Err(Error::StaleLease)));
+                continue;
+            }
             let expected_tail_event_id = input.commit.expected_tail_event_id;
             if row.current_tail != expected_tail_event_id {
                 conflict_updates.push((claim.run_id.clone(), row.current_tail));
-                item_results.push((
-                    *index,
-                    Ok(AppliedWorkflowTaskCommit {
-                        outcome: CommitOutcome::Conflict,
-                        shard_id: row.shard_id,
-                        lease_epoch,
-                        journal_entry: ShardJournalEntry {
-                            run_id: claim.run_id,
-                            expected_tail_event_id,
-                            new_tail_event_id: row.current_tail,
-                            result: ShardJournalCommitResult::Conflict,
-                        },
-                    }),
-                ));
+                item_results.push((*index, Ok(CommitOutcome::Conflict)));
                 continue;
             }
             if row.terminal && commit_has_workflow_visible_mutations(&input.commit) {
@@ -2493,12 +2366,9 @@ impl PostgresBackend {
             prepared.push(PreparedSimpleWorkflowCommit {
                 input_index: *index,
                 claim,
-                current_tail: row.current_tail,
                 next_event_id,
                 namespace: row.namespace.clone(),
                 workflow_id: row.workflow_id.clone(),
-                shard_id: row.shard_id,
-                lease_epoch,
                 append_history,
                 schedule_activities,
                 start_child_workflows,
@@ -2568,7 +2438,16 @@ impl PostgresBackend {
                 .iter()
                 .map(|(run_id, _)| run_id.clone())
                 .collect::<Vec<_>>();
-            cleanup_runs_operational_state_tx(tx, schema, &terminal_run_ids).await?;
+            // Simple-batch terminal events are only completed/failed/cancelled
+            // (continue-as-new falls back to the scalar path), so this is
+            // always a closed-run cleanup.
+            cleanup_runs_operational_state_tx(
+                tx,
+                schema,
+                &terminal_run_ids,
+                TerminalCleanup::Closed,
+            )
+            .await?;
             handle_terminal_runs_tx(self, tx, schema, &terminal_runs).await?;
         }
 
@@ -2636,80 +2515,12 @@ impl PostgresBackend {
         for commit in prepared {
             item_results.push((
                 commit.input_index,
-                Ok(AppliedWorkflowTaskCommit {
-                    outcome: CommitOutcome::Committed {
-                        new_tail_event_id: commit.next_event_id,
-                    },
-                    shard_id: commit.shard_id,
-                    lease_epoch: commit.lease_epoch,
-                    journal_entry: ShardJournalEntry {
-                        run_id: commit.claim.run_id,
-                        expected_tail_event_id: commit.current_tail,
-                        new_tail_event_id: commit.next_event_id,
-                        result: ShardJournalCommitResult::Committed {
-                            appended_events: usize::try_from(
-                                commit.next_event_id.0.saturating_sub(commit.current_tail.0),
-                            )
-                            .unwrap_or(usize::MAX),
-                            terminal: commit.terminal_event.is_some(),
-                            ready_reason: commit
-                                .ready_reason
-                                .as_ref()
-                                .map(|reason| reason_to_str(reason).to_owned()),
-                        },
-                    },
+                Ok(CommitOutcome::Committed {
+                    new_tail_event_id: commit.next_event_id,
                 }),
             ));
         }
         Ok(item_results)
-    }
-
-    async fn append_shard_journal_tx(
-        &self,
-        tx: &Transaction<'_>,
-        shard_id: i32,
-        lease_epoch: i64,
-        operation: ShardJournalOperation,
-    ) -> Result<u64> {
-        let shard_id_u32 = u32::try_from(shard_id).map_err(|_| {
-            Error::Backend(format!(
-                "invalid postgres shard id {shard_id} for journal append"
-            ))
-        })?;
-        let partition = shard_id_u32 % self.physical_partitions.max(1);
-        let suffix = partition_suffix(partition, self.physical_partitions);
-        let operation_blob = rmp_serde::to_vec_named(&operation)
-            .map_err(|err| Error::PayloadEncode(err.to_string()))?;
-        let schema = self.schema_sql();
-        let now_ms = unix_epoch_millis();
-
-        let row = tx
-            .query_one(
-                &format!(
-                    "with next_head as (
-                         insert into {schema}.shard_heads_{suffix}
-                         (shard_id, journal_seq, snapshot_seq, updated_at_ms)
-                         values ($1, 1, 0, $2)
-                         on conflict(shard_id) do update set
-                            journal_seq = shard_heads_{suffix}.journal_seq + 1,
-                            updated_at_ms = excluded.updated_at_ms
-                         returning journal_seq
-                     ),
-                     inserted_journal as (
-                         insert into {schema}.shard_journal_{suffix}
-                         (shard_id, journal_seq, lease_epoch, operation, appended_at_ms)
-                         select $1, journal_seq, $3, $4, $2
-                         from next_head
-                         returning journal_seq
-                     )
-                     select journal_seq from inserted_journal"
-                ),
-                &[&shard_id, &now_ms, &lease_epoch, &operation_blob],
-            )
-            .await
-            .map_err(postgres_error)?;
-        let next_seq = u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX);
-        Ok(next_seq)
     }
 
     async fn apply_workflow_task_commit_tx(
@@ -2719,7 +2530,7 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
         mut lease_epoch_cache: Option<&mut BTreeMap<(WorkerId, i32), i64>>,
-    ) -> Result<AppliedWorkflowTaskCommit> {
+    ) -> Result<CommitOutcome> {
         let Some(row) = tx
             .query_opt(
                 &format!(
@@ -2747,24 +2558,26 @@ impl PostgresBackend {
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
-        let lease_epoch = match lease_epoch_cache.as_deref_mut() {
+        // Shard-lease fencing: the verification must run even though its
+        // epoch has no consumer; the per-batch cache avoids re-verifying one
+        // (worker, shard) pair per item.
+        match lease_epoch_cache.as_deref_mut() {
             Some(cache) => {
                 let key = (claim.worker_id.clone(), shard_id);
-                if let Some(lease_epoch) = cache.get(&key).copied() {
-                    lease_epoch
-                } else {
+                // The entry API cannot hold a borrow across the verify await.
+                #[allow(clippy::map_entry)]
+                if !cache.contains_key(&key) {
                     let lease_epoch = self
                         .verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
                         .await?;
                     cache.insert(key, lease_epoch);
-                    lease_epoch
                 }
             }
             None => {
                 self.verify_shard_lease_tx(tx, &claim.worker_id, shard_id)
-                    .await?
+                    .await?;
             }
-        };
+        }
         let current_tail = EventId(u64::try_from(current_tail_i64).unwrap_or(u64::MAX));
         let expected_tail_event_id = batch.expected_tail_event_id;
         if current_tail != expected_tail_event_id {
@@ -2781,17 +2594,7 @@ impl PostgresBackend {
             )
             .await
             .map_err(postgres_error)?;
-            return Ok(AppliedWorkflowTaskCommit {
-                outcome: CommitOutcome::Conflict,
-                shard_id,
-                lease_epoch,
-                journal_entry: ShardJournalEntry {
-                    run_id: claim.run_id,
-                    expected_tail_event_id,
-                    new_tail_event_id: current_tail,
-                    result: ShardJournalCommitResult::Conflict,
-                },
-            });
+            return Ok(CommitOutcome::Conflict);
         }
         if terminal && commit_has_workflow_visible_mutations(&batch) {
             return Err(Error::TerminalWorkflow);
@@ -3034,30 +2837,17 @@ impl PostgresBackend {
 
         let terminal_after_commit = terminal || became_terminal;
         if terminal_after_commit {
-            cleanup_run_operational_state_tx(&tx, &schema, &claim.run_id).await?;
+            let cleanup = terminal_event
+                .as_ref()
+                .map(TerminalCleanup::for_terminal_event)
+                .unwrap_or(TerminalCleanup::Closed);
+            cleanup_run_operational_state_tx(&tx, &schema, &claim.run_id, cleanup).await?;
             if let Some(event @ HistoryEventData::WorkflowContinuedAsNew { .. }) =
                 terminal_event.clone()
             {
                 continue_run_as_new_tx(&tx, &schema, &claim.run_id, event).await?;
-                return Ok(AppliedWorkflowTaskCommit {
-                    outcome: CommitOutcome::Committed {
-                        new_tail_event_id: next_event_id,
-                    },
-                    shard_id,
-                    lease_epoch,
-                    journal_entry: ShardJournalEntry {
-                        run_id: claim.run_id,
-                        expected_tail_event_id,
-                        new_tail_event_id: next_event_id,
-                        result: ShardJournalCommitResult::Committed {
-                            appended_events: usize::try_from(
-                                next_event_id.0.saturating_sub(current_tail.0),
-                            )
-                            .unwrap_or(usize::MAX),
-                            terminal: terminal_after_commit,
-                            ready_reason: None,
-                        },
-                    },
+                return Ok(CommitOutcome::Committed {
+                    new_tail_event_id: next_event_id,
                 });
             }
             if let Some(event) = terminal_event {
@@ -3092,25 +2882,8 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
-        Ok(AppliedWorkflowTaskCommit {
-            outcome: CommitOutcome::Committed {
-                new_tail_event_id: next_event_id,
-            },
-            shard_id,
-            lease_epoch,
-            journal_entry: ShardJournalEntry {
-                run_id: claim.run_id,
-                expected_tail_event_id,
-                new_tail_event_id: next_event_id,
-                result: ShardJournalCommitResult::Committed {
-                    appended_events: usize::try_from(
-                        next_event_id.0.saturating_sub(current_tail.0),
-                    )
-                    .unwrap_or(usize::MAX),
-                    terminal: terminal_after_commit,
-                    ready_reason: ready_reason.map(str::to_owned),
-                },
-            },
+        Ok(CommitOutcome::Committed {
+            new_tail_event_id: next_event_id,
         })
     }
 
@@ -3723,10 +3496,10 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            return Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )));
+            // Activity rows exist until their run's terminal cleanup deletes
+            // them, so a missing row is a completed activity.
+            tx.commit().await.map_err(postgres_error)?;
+            return Ok(ActivityHeartbeatOutcome::AlreadyCompleted);
         };
         let task_blob: Vec<u8> = row.get(0);
         let claim_token: Option<i64> = row.get(1);
@@ -3854,10 +3627,8 @@ impl PostgresBackend {
 
         for (index, completion) in req.completions.iter().enumerate() {
             let Some(row) = locked.get(&completion.claim.activity_id.0) else {
-                result_slots[index] = Some(Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    completion.claim.activity_id.0
-                ))));
+                // Missing row means the run's terminal cleanup deleted it.
+                result_slots[index] = Some(Ok(CompleteActivityOutcome::AlreadyCompleted));
                 continue;
             };
             if row.completed {
@@ -4109,10 +3880,8 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            return Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )));
+            // Missing row means the run's terminal cleanup deleted it.
+            return Ok(CompleteActivityOutcome::AlreadyCompleted);
         };
         let task_blob: Vec<u8> = row.get(0);
         let claim_token: Option<i64> = row.get(1);
@@ -4229,10 +3998,9 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            return Err(Error::Backend(format!(
-                "activity `{}` not found",
-                req.claim.activity_id.0
-            )));
+            // Missing row means the run's terminal cleanup deleted it.
+            tx.commit().await.map_err(postgres_error)?;
+            return Ok(FailActivityOutcome::AlreadyCompleted);
         };
         let task_blob: Vec<u8> = row.get(0);
         let claim_token: Option<i64> = row.get(1);
@@ -5864,11 +5632,6 @@ fn shard_for_workflow(
     ShardId((u64::from_be_bytes(prefix) % u64::from(logical_shards.max(1))) as u32)
 }
 
-fn partition_suffix(partition: u32, physical_partitions: u32) -> String {
-    let width = physical_partitions.saturating_sub(1).max(1).ilog10() as usize + 1;
-    format!("p{partition:0width$}")
-}
-
 fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -5953,14 +5716,19 @@ async fn cleanup_run_operational_state_tx(
     tx: &Transaction<'_>,
     schema: &str,
     run_id: &RunId,
+    cleanup: TerminalCleanup,
 ) -> Result<()> {
-    cleanup_runs_operational_state_tx(tx, schema, std::slice::from_ref(run_id)).await
+    cleanup_runs_operational_state_tx(tx, schema, std::slice::from_ref(run_id), cleanup).await
 }
 
+// Deletes the terminal runs' operational rows; see `TerminalCleanup` for the
+// contract (history stays authoritative, missing activity rows answer late
+// calls as `AlreadyCompleted`, signal rows survive continue-as-new).
 async fn cleanup_runs_operational_state_tx(
     tx: &Transaction<'_>,
     schema: &str,
     run_ids: &[RunId],
+    cleanup: TerminalCleanup,
 ) -> Result<()> {
     if run_ids.is_empty() {
         return Ok(());
@@ -5976,37 +5744,60 @@ async fn cleanup_runs_operational_state_tx(
     .await
     .map_err(postgres_error)?;
     tx.execute(
-        &format!(
-            "update {schema}.activity_tasks
-             set completed = true,
-                 claim_token = null,
-                 heartbeat_deadline_at_ms = null
-             where run_id = any($1::text[])"
-        ),
+        &format!("delete from {schema}.activity_tasks where run_id = any($1::text[])"),
         &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
     tx.execute(
         &format!(
-            "update {schema}.activity_maps
-             set completed = true, in_flight = 0
-             where run_id = any($1::text[])"
+            "delete from {schema}.activity_map_results
+             where map_command_id in (
+                 select map_command_id from {schema}.activity_maps
+                 where run_id = any($1::text[])
+             )"
         ),
         &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
     tx.execute(
+        &format!("delete from {schema}.activity_maps where run_id = any($1::text[])"),
+        &[&run_id_values],
+    )
+    .await
+    .map_err(postgres_error)?;
+    tx.execute(
         &format!(
-            "update {schema}.child_workflow_maps
-             set completed = true, in_flight = 0
-             where run_id = any($1::text[])"
+            "delete from {schema}.child_workflow_map_results
+             where map_command_id in (
+                 select map_command_id from {schema}.child_workflow_maps
+                 where run_id = any($1::text[])
+             )"
         ),
         &[&run_id_values],
     )
     .await
     .map_err(postgres_error)?;
+    tx.execute(
+        &format!("delete from {schema}.child_workflow_maps where run_id = any($1::text[])"),
+        &[&run_id_values],
+    )
+    .await
+    .map_err(postgres_error)?;
+    if cleanup.deletes_consumed_signals() {
+        // Unconsumed deliveries stay readable through the inbox after the run
+        // closes; only the consumed dedup rows go.
+        tx.execute(
+            &format!(
+                "delete from {schema}.signals
+                 where run_id = any($1::text[]) and consumed = true"
+            ),
+            &[&run_id_values],
+        )
+        .await
+        .map_err(postgres_error)?;
+    }
     Ok(())
 }
 
@@ -6297,45 +6088,13 @@ async fn existing_child_terminal_command_ids_tx(
     schema: &str,
     parent_run_id_values: &[String],
 ) -> Result<BTreeSet<CommandId>> {
-    if parent_run_id_values.is_empty() {
-        return Ok(BTreeSet::new());
-    }
     let child_event_types = vec![
         event_type_to_str(&HistoryEventType::ChildWorkflowCompleted),
         event_type_to_str(&HistoryEventType::ChildWorkflowFailed),
         event_type_to_str(&HistoryEventType::ChildWorkflowCancelled),
     ];
-    let rows = tx
-        .query(
-            &format!(
-                "select data
-                 from {schema}.history_events
-                 where run_id = any($1::text[])
-                   and event_type = any($2::text[])"
-            ),
-            &[&parent_run_id_values, &child_event_types],
-        )
+    existing_child_command_ids_by_types_tx(tx, schema, parent_run_id_values, child_event_types)
         .await
-        .map_err(postgres_error)?;
-    let mut command_ids = BTreeSet::new();
-    for row in rows {
-        let blob: Vec<u8> = row.get(0);
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        match event {
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                command_ids.insert(completed.command_id);
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => {
-                command_ids.insert(failed.command_id);
-            }
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                command_ids.insert(cancelled.command_id);
-            }
-            _ => {}
-        }
-    }
-    Ok(command_ids)
 }
 
 async fn cancel_children_for_parents_tx(
@@ -6406,7 +6165,7 @@ async fn cancel_children_for_parents_tx(
         .iter()
         .map(|(child_run_id, _, _)| child_run_id.clone())
         .collect::<Vec<_>>();
-    cleanup_runs_operational_state_tx(tx, schema, &child_run_ids).await?;
+    cleanup_runs_operational_state_tx(tx, schema, &child_run_ids, TerminalCleanup::Closed).await?;
     let child_run_id_values = child_events
         .iter()
         .map(|(run_id, _, _)| run_id.0.clone())
@@ -6558,13 +6317,10 @@ fn has_duplicate_activity_completion_ids(completions: &[CompleteActivityRequest]
 }
 
 fn is_activity_completion_item_error(err: &Error) -> bool {
-    match err {
-        Error::StaleLease | Error::RunNotFound(_) | Error::TerminalWorkflow => true,
-        Error::Backend(message) => {
-            message.starts_with("activity `") && message.ends_with(" not found")
-        }
-        _ => false,
-    }
+    matches!(
+        err,
+        Error::StaleLease | Error::RunNotFound(_) | Error::TerminalWorkflow
+    )
 }
 
 async fn next_signal_sequence(tx: &Transaction<'_>, schema: &str) -> Result<u64> {
@@ -6583,17 +6339,21 @@ async fn insert_history_event(
     data: HistoryEventData,
 ) -> Result<()> {
     let event_type = event_type_to_str(&data.event_type());
+    let command_seq = data
+        .command_seq()
+        .map(|seq| i64::try_from(seq.0).unwrap_or(i64::MAX));
     let blob =
         rmp_serde::to_vec_named(&data).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
         &format!(
-            "insert into {schema}.history_events(run_id, event_id, event_type, data)
-             values ($1, $2, $3, $4)"
+            "insert into {schema}.history_events(run_id, event_id, event_type, command_seq, data)
+             values ($1, $2, $3, $4, $5)"
         ),
         &[
             &run_id.0,
             &i64::try_from(event_id.0).unwrap_or(i64::MAX),
             &event_type,
+            &command_seq,
             &blob,
         ],
     )
@@ -6647,6 +6407,15 @@ async fn insert_history_event_rows(
         .iter()
         .map(|event| event_type_to_str(&event.data.event_type()).to_owned())
         .collect::<Vec<_>>();
+    let command_seqs = events
+        .iter()
+        .map(|event| {
+            event
+                .data
+                .command_seq()
+                .map(|seq| i64::try_from(seq.0).unwrap_or(i64::MAX))
+        })
+        .collect::<Vec<_>>();
     let payloads = events
         .iter()
         .map(|event| rmp_serde::to_vec_named(event.data))
@@ -6655,12 +6424,12 @@ async fn insert_history_event_rows(
 
     tx.execute(
         &format!(
-            "insert into {schema}.history_events(run_id, event_id, event_type, data)
-             select run_id, event_id, event_type, data
-             from unnest($1::text[], $2::bigint[], $3::text[], $4::bytea[])
-                  as event_rows(run_id, event_id, event_type, data)"
+            "insert into {schema}.history_events(run_id, event_id, event_type, command_seq, data)
+             select run_id, event_id, event_type, command_seq, data
+             from unnest($1::text[], $2::bigint[], $3::text[], $4::bigint[], $5::bytea[])
+                  as event_rows(run_id, event_id, event_type, command_seq, data)"
         ),
-        &[&run_ids, &event_ids, &event_types, &payloads],
+        &[&run_ids, &event_ids, &event_types, &command_seqs, &payloads],
     )
     .await
     .map_err(postgres_error)?;
@@ -7004,22 +6773,36 @@ async fn existing_child_command_ids_tx(
     schema: &str,
     parent_run_id_values: &[String],
 ) -> Result<BTreeSet<CommandId>> {
-    if parent_run_id_values.is_empty() {
-        return Ok(BTreeSet::new());
-    }
     let child_event_types = vec![
         event_type_to_str(&HistoryEventType::ChildWorkflowStarted),
         event_type_to_str(&HistoryEventType::ChildWorkflowCompleted),
         event_type_to_str(&HistoryEventType::ChildWorkflowFailed),
         event_type_to_str(&HistoryEventType::ChildWorkflowCancelled),
     ];
+    existing_child_command_ids_by_types_tx(tx, schema, parent_run_id_values, child_event_types)
+        .await
+}
+
+// Reads the indexed `command_seq` column instead of decoding event payloads;
+// child lifecycle events within one run identify their command by sequence
+// alone, so (run_id, command_seq) reconstructs the command id.
+async fn existing_child_command_ids_by_types_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    parent_run_id_values: &[String],
+    child_event_types: Vec<&'static str>,
+) -> Result<BTreeSet<CommandId>> {
+    if parent_run_id_values.is_empty() {
+        return Ok(BTreeSet::new());
+    }
     let rows = tx
         .query(
             &format!(
-                "select data
+                "select run_id, command_seq
                  from {schema}.history_events
                  where run_id = any($1::text[])
-                   and event_type = any($2::text[])"
+                   and event_type = any($2::text[])
+                   and command_seq is not null"
             ),
             &[&parent_run_id_values, &child_event_types],
         )
@@ -7027,24 +6810,12 @@ async fn existing_child_command_ids_tx(
         .map_err(postgres_error)?;
     let mut command_ids = BTreeSet::new();
     for row in rows {
-        let blob: Vec<u8> = row.get(0);
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        match event {
-            HistoryEventData::ChildWorkflowStarted(started) => {
-                command_ids.insert(started.command_id);
-            }
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                command_ids.insert(completed.command_id);
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => {
-                command_ids.insert(failed.command_id);
-            }
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                command_ids.insert(cancelled.command_id);
-            }
-            _ => {}
-        }
+        let run_id = RunId::new(row.get::<_, String>(0));
+        let seq = u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX);
+        command_ids.insert(CommandId {
+            run_id,
+            seq: CommandSeq(seq),
+        });
     }
     Ok(command_ids)
 }
@@ -7155,38 +6926,25 @@ async fn child_event_exists_tx(
         event_type_to_str(&HistoryEventType::ChildWorkflowFailed),
         event_type_to_str(&HistoryEventType::ChildWorkflowCancelled),
     ];
-    let rows = tx
-        .query(
+    let row = tx
+        .query_opt(
             &format!(
-                "select data
+                "select 1
                  from {schema}.history_events
                  where run_id = $1
-                   and event_type = any($2::text[])"
+                   and command_seq = $2
+                   and event_type = any($3::text[])
+                 limit 1"
             ),
-            &[&command_id.run_id.0, &child_event_types],
+            &[
+                &command_id.run_id.0,
+                &i64::try_from(command_id.seq.0).unwrap_or(i64::MAX),
+                &child_event_types,
+            ],
         )
         .await
         .map_err(postgres_error)?;
-    for row in rows {
-        let blob: Vec<u8> = row.get(0);
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
-            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(row.is_some())
 }
 
 async fn insert_activity_map_tx(
@@ -7836,7 +7594,8 @@ async fn cancel_child_workflow_map_children_tx(
             },
         )
         .await?;
-        cleanup_run_operational_state_tx(tx, schema, &child_run_id).await?;
+        cleanup_run_operational_state_tx(tx, schema, &child_run_id, TerminalCleanup::Closed)
+            .await?;
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances

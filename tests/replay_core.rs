@@ -326,6 +326,34 @@ async fn activity_spawn_await_later_workflow(input: NumberInput) -> durust::Resu
     first.result().await
 }
 
+const HELD_HANDLE_TEST_SLEEPS: u64 = 3;
+
+#[durust::workflow(name = "tests.held-handle-sleeps", version = 1)]
+async fn held_handle_sleeps_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    for _ in 0..HELD_HANDLE_TEST_SLEEPS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    handle.result().await
+}
+
+#[durust::workflow(name = "tests.timer-count-change", version = 1)]
+async fn two_timers_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(1)).await?;
+    durust::sleep(Duration::from_millis(1)).await?;
+    Ok(2)
+}
+
+#[durust::workflow(name = "tests.timer-count-change", version = 1)]
+async fn one_timer_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(1)).await?;
+    Ok(1)
+}
+
 #[durust::workflow(name = "tests.sleep-before-large-activity-result", version = 1)]
 async fn sleep_before_large_activity_result(_: UnitInput) -> durust::Result<usize> {
     let handle = durust::call_activity!(large_payload_result(UnitInput {}))
@@ -4020,6 +4048,167 @@ fn select_branch_reorder_is_detected_on_replay() {
         let err = changed_worker.run_workflow_once().await.unwrap_err();
         assert!(matches!(err, durust::Error::Nondeterminism(_)));
     });
+}
+
+fn held_handle_worker(backend: RecordingBackend) -> Worker<RecordingBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(held_handle_sleeps_workflow)
+        .register_activity(double)
+        .build()
+}
+
+// A workflow holding an unawaited handle across tasks (spawn early, await
+// late) leaves the activity completion unconsumed in every intermediate
+// task. The unconsumed index entries are carried in the workflow cache, so
+// only the initial task may replay from the beginning of history.
+#[test]
+fn held_handle_across_sleeps_completes_without_cold_replay_when_cached() {
+    block_on(async {
+        // Claim prefetch is disabled so every task must stream history,
+        // making a cold replay visible as a from-zero stream request.
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<held_handle_sleeps_workflow>(
+                "wf/held-handle",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+        let mut worker = held_handle_worker(backend.clone());
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.activity_tasks, 1);
+        assert_eq!(stats.timers_fired, HELD_HANDLE_TEST_SLEEPS as usize);
+
+        let from_zero = backend
+            .stream_requests()
+            .iter()
+            .filter(|req| req.after_event_id == EventId::ZERO)
+            .count();
+        assert_eq!(
+            from_zero,
+            1,
+            "only the initial task may replay from the beginning, got {:?}",
+            backend.stream_requests()
+        );
+
+        let history = stream_all(&backend.inner, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("held-handle workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+    });
+}
+
+// The cold variant: a worker crash mid-pattern forces one full recovery
+// replay, after which the rebuilt unconsumed indexes are carried again and
+// the remaining tasks stay cached.
+#[test]
+fn held_handle_across_sleeps_recovers_with_one_cold_replay_after_crash() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<held_handle_sleeps_workflow>(
+                "wf/held-handle-cold",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+        let mut crashed_worker = held_handle_worker(backend.clone());
+        // Spawn the activity and the first sleep, land the out-of-order
+        // completion, then crash before the next workflow task.
+        assert!(crashed_worker.run_workflow_once().await.unwrap());
+        assert!(crashed_worker.run_activity_once().await.unwrap());
+        drop(crashed_worker);
+        backend.clear_stream_requests();
+
+        let mut recovered_worker = held_handle_worker(backend.clone());
+        let stats = recovered_worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.timers_fired, HELD_HANDLE_TEST_SLEEPS as usize);
+
+        let from_zero = backend
+            .stream_requests()
+            .iter()
+            .filter(|req| req.after_event_id == EventId::ZERO)
+            .count();
+        assert_eq!(
+            from_zero,
+            1,
+            "recovery replays the full history once and then stays cached, got {:?}",
+            backend.stream_requests()
+        );
+
+        let history = stream_all(&backend.inner, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("held-handle workflow did not complete after recovery");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+    });
+}
+
+// Records two timers, then replays against a version with one timer that
+// completes: the leftover TimerStarted command event is divergence, so the
+// task must fail with Nondeterminism and append no terminal event.
+async fn assert_two_timer_recording_rejects_one_timer_completion(history_chunk_events: usize) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<two_timers_workflow>("wf/timer-count-change", "workflows", unit())
+        .await
+        .unwrap();
+    let mut original_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .register_workflow(two_timers_workflow)
+        .build();
+    // Record both timers but crash before the completing task commits, so
+    // the run stays claimable with the second TimerStarted/TimerFired pair
+    // at the history tail.
+    assert!(original_worker.run_workflow_once().await.unwrap());
+    backend.advance_time(Duration::from_millis(1));
+    assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+    assert!(original_worker.run_workflow_once().await.unwrap());
+    backend.advance_time(Duration::from_millis(1));
+    assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+    drop(original_worker);
+
+    let mut changed_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .history_chunk_events(history_chunk_events)
+        .register_workflow(one_timer_workflow)
+        .nondeterminism_retry_backoff(Duration::from_millis(25))
+        .build();
+    let err = changed_worker.run_workflow_once().await.unwrap_err();
+    assert!(
+        matches!(err, durust::Error::Nondeterminism(_)),
+        "expected Nondeterminism, got {err:?}"
+    );
+
+    // No terminal event was committed: history still ends at the recorded
+    // second timer fire.
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history.last().unwrap().data,
+        HistoryEventData::TimerFired(_)
+    ));
+}
+
+#[test]
+fn terminal_with_leftover_command_events_is_nondeterminism() {
+    block_on(assert_two_timer_recording_rejects_one_timer_completion(128));
+}
+
+// Single-event chunks leave the leftover command events unloaded when the
+// workflow returns; the divergence check must stream the rest of history
+// instead of trusting the loaded prefix.
+#[test]
+fn terminal_with_leftover_command_events_in_unloaded_chunks_is_nondeterminism() {
+    block_on(assert_two_timer_recording_rejects_one_timer_completion(1));
 }
 
 #[test]

@@ -90,14 +90,13 @@ Postgres tables, partitions, or shard journals.
 
 ## Storage Shape
 
-- `meta` keys for schema version, shard layout, snapshot interval, and provider
-  timeout settings
+- `meta` keys for schema version, shard layout, and provider timeout settings
 - `workflow_instances.shard_id`
 - `shard_leases`
-- `shard_heads_pNN`
-- `shard_journal_pNN`
-- `shard_snapshots_pNN`
-- `history_events_pNN`
+- `shard_heads_pNN`, `shard_journal_pNN`, `shard_snapshots_pNN`,
+  `history_events_pNN`, and the snapshot-interval knob arrive with the
+  journal-reading slices below; they are created only once something reads
+  them
 - partitioned activity lease/task tables as needed for remote activity workers
 
 Logical shards are the scheduling and fencing unit. Physical partitions are a
@@ -115,8 +114,12 @@ storage layout detail.
    transaction, including unfiltered claim lease acquisition.
 5. **Done:** Implement shard-fenced Postgres batch workflow-task commit in one
    transaction with ordered per-item committed/conflict/stale results.
-6. **Done:** Append one fenced shard-journal operation per shard/lease epoch for
-   each workflow-task commit batch.
+6. **Reverted (0015 Phase 6):** Workflow-task commits appended one fenced
+   shard-journal operation per shard/lease epoch, but nothing read,
+   snapshotted, or pruned the journal, so the write and the
+   `shard_heads`/`shard_journal`/`shard_snapshots`/partitioned history tables
+   were removed until slices 9-11 give them a reader. Shard leases and commit
+   fencing remain. Re-adding the journal write belongs to slice 9.
 7. **Done:** Add provider/unit coverage for shard hashing, metadata mismatch,
    shard-filtered claim, unfiltered shard lease acquisition, stale owner commit
    rejection, ordered batch commit results, and shard-journal batching.
