@@ -2622,6 +2622,273 @@ describe("Worker", () => {
   });
 });
 
+describe("Worker claim release on error paths", () => {
+  it("releases workflow claims when workflow registry lookup fails", async () => {
+    const inner = new MemoryBackend();
+    const backend = forceWorkflowClaimTypes(inner, [echoWorkflow.workflowType]);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(echoWorkflow, workflowId("wf/release-missing-workflow"), "workflows", {
+      value: "ok"
+    });
+    const worker = new Worker({
+      backend,
+      registry: new Registry(),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("workflow is not registered");
+
+    const reclaimed = await inner.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [echoWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("drains a claimed workflow batch when an earlier task fails", async () => {
+    const unregisteredWorkflow = workflow({
+      name: "worker.batch-unregistered",
+      version: 1,
+      handler: async (input: EchoInput): Promise<EchoOutput> => input
+    });
+    const inner = new MemoryBackend();
+    // The wrapper claims both types so the unregistered workflow (started
+    // first, so claimed first) fails registry lookup inside the batch drain
+    // while its echo neighbors remain independently processable.
+    const backend = withSequentialBatchClaims(inner, [
+      unregisteredWorkflow.workflowType,
+      echoWorkflow.workflowType
+    ]);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(
+      unregisteredWorkflow,
+      workflowId("wf/batch-drain-bad"),
+      "workflows",
+      { value: "bad" }
+    );
+    const secondHandle = await client.startWorkflow(
+      echoWorkflow,
+      workflowId("wf/batch-drain-2"),
+      "workflows",
+      { value: "two" }
+    );
+    const thirdHandle = await client.startWorkflow(
+      echoWorkflow,
+      workflowId("wf/batch-drain-3"),
+      "workflows",
+      { value: "three" }
+    );
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(echoWorkflow),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    // The first error still surfaces, but only after the whole batch drains.
+    await expect(worker.runWorkflowTaskBatchOnce(3)).rejects.toThrow(
+      "workflow is not registered: worker.batch-unregistered@1"
+    );
+
+    // Neighbors committed in the same call rather than stranding until lease expiry.
+    await expect(secondHandle.result()).resolves.toEqual({ value: "two" });
+    await expect(thirdHandle.result()).resolves.toEqual({ value: "three" });
+
+    // The failing task's own claim was released with its wake reason preserved.
+    const reclaimed = await inner.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [unregisteredWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("releases workflow claims when live signal reads fail", async () => {
+    const inner = new MemoryBackend();
+    const backend = failBackendCall(inner, "readSignalInbox", new Error("signal read failed"));
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(echoWorkflow, workflowId("wf/release-signal-read"), "workflows", {
+      value: "ok"
+    });
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(echoWorkflow),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      registeredSignalNames: ["approval"],
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("signal read failed");
+
+    const reclaimed = await inner.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [echoWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("releases workflow claims when replay history streaming fails", async () => {
+    const inner = new MemoryBackend();
+    const truncated = truncateWorkflowClaimPrefetch(inner, 0, []);
+    const backend = failBackendCall(truncated, "streamHistory", new Error("stream failed"));
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(echoWorkflow, workflowId("wf/release-stream"), "workflows", {
+      value: "ok"
+    });
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(echoWorkflow),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      workflowExecutionCacheSize: 0,
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("stream failed");
+
+    const reclaimed = await inner.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [echoWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("releases workflow claims when commit fails", async () => {
+    const inner = new MemoryBackend();
+    const backend = failBackendCall(inner, "commitWorkflowTask", new Error("commit failed"));
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(echoWorkflow, workflowId("wf/release-commit"), "workflows", {
+      value: "ok"
+    });
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(echoWorkflow),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("commit failed");
+
+    const reclaimed = await inner.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [echoWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("delays released workflow claims after nondeterminism errors", async () => {
+    let now = 1_000;
+    const backend = new MemoryBackend({ nowMs: () => now });
+    const nondeterministicWorkflow = workflow({
+      name: "worker.nondeterministic-release",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly value: number }> => ({
+        value: Date.now()
+      })
+    });
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(
+      nondeterministicWorkflow,
+      workflowId("wf/release-nondeterminism"),
+      "workflows",
+      {}
+    );
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(nondeterministicWorkflow),
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      leaseDurationMs: 30_000,
+      nondeterminismRetryBackoffMs: 100,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("nondeterminism:");
+    await expect(
+      backend.claimWorkflowTask("worker-too-early", {
+        namespace: namespace(),
+        taskQueue: "workflows",
+        registeredWorkflowTypes: [nondeterministicWorkflow.workflowType],
+        leaseDurationMs: 30_000
+      })
+    ).resolves.toBeNull();
+
+    now += 100;
+    const reclaimed = await backend.claimWorkflowTask("worker-after-backoff", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [nondeterministicWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(reclaimed?.reason).toBe("WorkflowStarted");
+  });
+
+  it("fails unregistered activity claims instead of dropping them until lease expiry", async () => {
+    const inner = new MemoryBackend();
+    const backend = forceActivityClaimNames(inner, [quoteActivity.name]);
+    const registry = new Registry().registerWorkflow(quoteWorkflow);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    await client.startWorkflow(
+      quoteWorkflow,
+      workflowId("wf/release-missing-activity"),
+      "workflows",
+      { sku: "sku-1" }
+    );
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "worker-a",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      leaseDurationMs: 30_000,
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+      kind: "Failed",
+      outcome: { kind: "Failed" }
+    });
+
+    const wake = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: "workflows",
+      registeredWorkflowTypes: [quoteWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    expect(wake?.reason).toBe("ActivityFailed");
+  });
+});
+
 function failFirstWorkflowClaim(inner: DurableBackend): DurableBackend {
   let failed = false;
   return new Proxy(inner, {
@@ -2634,6 +2901,95 @@ function failFirstWorkflowClaim(inner: DurableBackend): DurableBackend {
           }
           return await target.claimWorkflowTask(...args);
         };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+function failBackendCall<K extends keyof DurableBackend>(
+  inner: DurableBackend,
+  method: K,
+  error: Error
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === method) {
+        return async () => {
+          throw error;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+// Adds the optional claimWorkflowTasks batch API to a single-claim backend by
+// looping claimWorkflowTask, forcing the given types past the worker's
+// registry-derived claim filter so unregistered claims can reach the drain.
+function withSequentialBatchClaims(
+  inner: DurableBackend,
+  workflowTypes: Parameters<DurableBackend["claimWorkflowTask"]>[1]["registeredWorkflowTypes"]
+): DurableBackend {
+  const claimWorkflowTasks = async (
+    workerId: Parameters<DurableBackend["claimWorkflowTask"]>[0],
+    opts: Parameters<DurableBackend["claimWorkflowTask"]>[1] & { readonly limit: number }
+  ) => {
+    const claimed = [];
+    for (let index = 0; index < Math.max(1, Math.trunc(opts.limit)); index += 1) {
+      const task = await inner.claimWorkflowTask(workerId, {
+        ...opts,
+        registeredWorkflowTypes: workflowTypes
+      });
+      if (task === null) {
+        break;
+      }
+      claimed.push(task);
+    }
+    return claimed;
+  };
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "claimWorkflowTasks") {
+        return claimWorkflowTasks;
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+function forceWorkflowClaimTypes(
+  inner: DurableBackend,
+  workflowTypes: Parameters<DurableBackend["claimWorkflowTask"]>[1]["registeredWorkflowTypes"]
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "claimWorkflowTask") {
+        return async (
+          workerId: Parameters<DurableBackend["claimWorkflowTask"]>[0],
+          opts: Parameters<DurableBackend["claimWorkflowTask"]>[1]
+        ) => target.claimWorkflowTask(workerId, { ...opts, registeredWorkflowTypes: workflowTypes });
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+function forceActivityClaimNames(
+  inner: DurableBackend,
+  activityNames: Parameters<DurableBackend["claimActivityTask"]>[1]["registeredActivityNames"]
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "claimActivityTask") {
+        return async (
+          workerId: Parameters<DurableBackend["claimActivityTask"]>[0],
+          opts: Parameters<DurableBackend["claimActivityTask"]>[1]
+        ) => target.claimActivityTask(workerId, { ...opts, registeredActivityNames: activityNames });
       }
       const value = Reflect.get(target, property, receiver);
       return typeof value === "function" ? value.bind(target) : value;

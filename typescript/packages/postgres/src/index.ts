@@ -5,7 +5,8 @@ import {
   encodePayload,
   eventId,
   historyEventType,
-  runId
+  runId,
+  workflowTaskCommitHasWorkflowVisibleMutations
 } from "@durust/core";
 import type {
   ActivityMapInputManifest,
@@ -49,6 +50,7 @@ import type {
   QueryWorkflowOutcome,
   QueryWorkflowRequest,
   ReadSignalInboxRequest,
+  ReleaseWorkflowTaskOptions,
   RunId,
   SignalInboxRecord,
   SignalName,
@@ -77,6 +79,7 @@ interface WorkflowState {
   readonly runId: RunId;
   history: HistoryEvent[];
   readyReason: WorkflowTaskReason | null;
+  readyAtMs: number;
   claim: WorkflowLease | null;
   queryProjection: PayloadRef | null;
   terminal: boolean;
@@ -478,6 +481,7 @@ export class PostgresBackend implements DurableBackend {
             task_queue,
             tail_event_id,
             ready_reason,
+            ready_at_ms,
             claim_worker_id,
             claim_token,
             claim_reason,
@@ -486,7 +490,7 @@ export class PostgresBackend implements DurableBackend {
             terminal,
             parent
           )
-          values ($1, $2, $3, $4, $5::integer, $6::jsonb, $7, 1, 'WorkflowStarted',
+          values ($1, $2, $3, $4, $5::integer, $6::jsonb, $7, 1, 'WorkflowStarted', 0,
             null, null, null, null, null, false, null)
         `,
         [
@@ -581,6 +585,7 @@ export class PostgresBackend implements DurableBackend {
             and runs.task_queue = $2
             and runs.terminal = false
             and runs.ready_reason is not null
+            and runs.ready_at_ms <= $7::bigint
             and runs.claim_token is null
           order by runs.run_id asc
           limit $6::bigint
@@ -626,7 +631,8 @@ export class PostgresBackend implements DurableBackend {
         registeredTypes,
         String(workerId),
         String(leaseExpiresAt),
-        String(limit)
+        String(limit),
+        String(this.#nowMs())
       ]
     );
     return workflowClaimRowsInDeterministicOrder(result.rows);
@@ -803,10 +809,14 @@ export class PostgresBackend implements DurableBackend {
     ) {
       throw new Error("stale workflow task lease");
     }
+    if (state.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+      throw new Error("terminal workflow rejects workflow-visible mutations");
+    }
 
     if (commit.expectedTailEventId !== tailEventId(state)) {
       state.claim = null;
       state.readyReason = "CacheEvicted";
+      state.readyAtMs = 0;
       if (targetedProjectionUpdates) {
         await this.#upsertNormalizedWorkflowRow(client, state);
       }
@@ -904,6 +914,36 @@ export class PostgresBackend implements DurableBackend {
     }, targetedProjectionUpdates ? simpleWorkflowCommitRewriteScope : fullNormalizedRewriteScope);
   }
 
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options: ReleaseWorkflowTaskOptions = {}
+  ): Promise<void> {
+    await this.#ensureReady();
+    const readyAtMs = this.#nowMs() + Math.max(0, options.visibilityDelayMs ?? 0);
+    await this.#pool.query(
+      `
+        update ${this.#workflowRunsTableName}
+        set
+          ready_reason = claim_reason,
+          ready_at_ms = $4::bigint,
+          claim_worker_id = null,
+          claim_token = null,
+          claim_reason = null,
+          claim_expires_at_ms = null
+        where run_id = $1
+          and claim_worker_id = $2
+          and claim_token = $3::bigint
+          and claim_reason is not null
+      `,
+      [
+        String(claim.runId),
+        String(claim.workerId),
+        String(claim.token),
+        String(readyAtMs)
+      ]
+    );
+  }
+
   async #commitWorkflowTaskSqlNative(
     claim: WorkflowTaskClaim,
     commit: WorkflowTaskCommit
@@ -921,6 +961,7 @@ export class PostgresBackend implements DurableBackend {
             task_queue,
             tail_event_id,
             ready_reason,
+            ready_at_ms,
             claim_worker_id,
             claim_token,
             claim_reason,
@@ -949,6 +990,9 @@ export class PostgresBackend implements DurableBackend {
       ) {
         throw new Error("stale workflow task lease");
       }
+      if (row.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+        throw new Error("terminal workflow rejects workflow-visible mutations");
+      }
 
       const currentTail = postgresRequiredNumber(row.tail_event_id);
       if (Number(commit.expectedTailEventId) !== currentTail) {
@@ -957,6 +1001,7 @@ export class PostgresBackend implements DurableBackend {
             update ${this.#workflowRunsTableName}
             set
               ready_reason = 'CacheEvicted',
+              ready_at_ms = 0,
               claim_worker_id = null,
               claim_token = null,
               claim_reason = null,
@@ -1040,6 +1085,7 @@ export class PostgresBackend implements DurableBackend {
             runId: childRunId,
             history: [childStarted],
             readyReason: "WorkflowStarted",
+            readyAtMs: 0,
             claim: null,
             queryProjection: null,
             terminal: false,
@@ -1128,6 +1174,7 @@ export class PostgresBackend implements DurableBackend {
           set
             tail_event_id = $2::integer,
             ready_reason = $3,
+            ready_at_ms = 0,
             claim_worker_id = null,
             claim_token = null,
             claim_reason = null,
@@ -1654,7 +1701,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityCompleted";
+    markWorkflowReady(activity.workflow, "ActivityCompleted");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     recordProjectionUpdate?.({ activity, workflow: activity.workflow });
@@ -1735,7 +1782,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityFailed";
+    markWorkflowReady(activity.workflow, "ActivityFailed");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     recordProjectionUpdate?.({ activity, workflow: activity.workflow });
@@ -1781,6 +1828,7 @@ export class PostgresBackend implements DurableBackend {
   #restoreExpiredWorkflowLease(state: WorkflowState): void {
     if (state.claim !== null && state.claim.expiresAtMs <= this.#nowMs()) {
       state.readyReason ??= state.claim.reason;
+      state.readyAtMs = 0;
       state.claim = null;
     }
   }
@@ -1901,7 +1949,7 @@ export class PostgresBackend implements DurableBackend {
           }
         });
         activity.workflow.history.push(event);
-        activity.workflow.readyReason = "ActivityTimedOut";
+        markWorkflowReady(activity.workflow, "ActivityTimedOut");
         activity.terminalEventId = event.eventId;
         activity.claim = null;
         timedOut += 1;
@@ -1969,7 +2017,9 @@ export class PostgresBackend implements DurableBackend {
         await client.query(
           `
             update ${this.#workflowRunsTableName}
-            set ready_reason = 'SignalReceived'
+            set
+              ready_reason = 'SignalReceived',
+              ready_at_ms = 0
             where run_id = $1
               and terminal = false
           `,
@@ -2178,6 +2228,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue text not null,
         tail_event_id integer not null,
         ready_reason text,
+        ready_at_ms bigint not null default 0,
         claim_worker_id text,
         claim_token bigint,
         claim_reason text,
@@ -2187,6 +2238,10 @@ export class PostgresBackend implements DurableBackend {
         parent jsonb
       )
     `);
+    await this.#pool.query(
+      `alter table ${this.#workflowRunsTableName}
+       add column if not exists ready_at_ms bigint not null default 0`
+    );
     await this.#pool.query(`
       create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "workflow_runs_ready_idx")}
       on ${this.#workflowRunsTableName}(
@@ -2194,6 +2249,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue,
         terminal,
         ready_reason,
+        ready_at_ms,
         workflow_type_name,
         workflow_type_version
       )
@@ -2205,6 +2261,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue,
         workflow_type_name,
         workflow_type_version,
+        ready_at_ms,
         run_id
       )
       where terminal = false
@@ -2625,6 +2682,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+            ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -2658,6 +2716,7 @@ export class PostgresBackend implements DurableBackend {
         runId: runId(row.run_id),
         history: historiesByRun.get(row.run_id) ?? [],
         readyReason: row.ready_reason as WorkflowTaskReason | null,
+            readyAtMs: postgresRequiredNumber(row.ready_at_ms),
         claim,
         queryProjection:
           row.query_projection === null
@@ -3065,6 +3124,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3083,6 +3143,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3100,6 +3161,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3132,6 +3194,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3150,6 +3213,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3167,6 +3231,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3198,6 +3263,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3216,6 +3282,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3233,6 +3300,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3251,6 +3319,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue = excluded.task_queue,
           tail_event_id = excluded.tail_event_id,
           ready_reason = excluded.ready_reason,
+          ready_at_ms = excluded.ready_at_ms,
           claim_worker_id = excluded.claim_worker_id,
           claim_token = excluded.claim_token,
           claim_reason = excluded.claim_reason,
@@ -3279,7 +3348,8 @@ export class PostgresBackend implements DurableBackend {
         update ${this.#workflowRunsTableName} runs
         set
           tail_event_id = updates.tail_event_id,
-          ready_reason = updates.ready_reason
+          ready_reason = updates.ready_reason,
+          ready_at_ms = 0
         from jsonb_to_recordset($1::jsonb) as updates(
           run_id text,
           tail_event_id integer,
@@ -4080,7 +4150,7 @@ export class PostgresBackend implements DurableBackend {
         )
     );
     if (ready) {
-      state.readyReason = "SignalReceived";
+      markWorkflowReady(state, "SignalReceived");
     }
   }
 
@@ -4181,7 +4251,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapFailed";
+    markWorkflowReady(map.workflow, "ActivityMapFailed");
     return event.eventId;
   }
 
@@ -4209,7 +4279,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapCompleted";
+    markWorkflowReady(map.workflow, "ActivityMapCompleted");
     return event.eventId;
   }
 
@@ -4276,6 +4346,7 @@ export class PostgresBackend implements DurableBackend {
           })
         ],
         readyReason: "WorkflowStarted",
+        readyAtMs: 0,
         claim: null,
         queryProjection: null,
         terminal: false,
@@ -4374,7 +4445,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapCompleted";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapCompleted");
     return event.eventId;
   }
 
@@ -4392,7 +4463,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapFailed";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapFailed");
     this.#cancelRunningChildWorkflowMapItems(map);
     return event.eventId;
   }
@@ -4413,6 +4484,7 @@ export class PostgresBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -4432,6 +4504,7 @@ export class PostgresBackend implements DurableBackend {
       runId: newRunId,
       history: [started],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -4455,7 +4528,7 @@ export class PostgresBackend implements DurableBackend {
           }
         }
       }));
-      parent.readyReason = "ChildWorkflowFailed";
+      markWorkflowReady(parent, "ChildWorkflowFailed");
       return;
     }
 
@@ -4474,6 +4547,7 @@ export class PostgresBackend implements DurableBackend {
         })
       ],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -4494,7 +4568,7 @@ export class PostgresBackend implements DurableBackend {
         runId: childRunId
       }
     }));
-    parent.readyReason = "ChildWorkflowStarted";
+    markWorkflowReady(parent, "ChildWorkflowStarted");
   }
 
   #notifyParentOfChildTerminal(parentLink: ParentWorkflowLink, terminal: ChildTerminalUpdate): void {
@@ -4531,12 +4605,14 @@ export class PostgresBackend implements DurableBackend {
               }
             };
     parent.history.push(makeHistoryEvent(eventId(Number(tailEventId(parent)) + 1), data));
-    parent.readyReason =
+    markWorkflowReady(
+      parent,
       terminal.kind === "Completed"
         ? "ChildWorkflowCompleted"
         : terminal.kind === "Failed"
           ? "ChildWorkflowFailed"
-          : "ChildWorkflowCancelled";
+          : "ChildWorkflowCancelled"
+    );
   }
 
   #cancelChildrenForClosedParent(parent: WorkflowState): void {
@@ -4554,6 +4630,7 @@ export class PostgresBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -4600,6 +4677,7 @@ interface NormalizedWorkflowRunRow {
   readonly task_queue: string;
   readonly tail_event_id: number;
   readonly ready_reason: WorkflowTaskReason | null;
+  readonly ready_at_ms: number;
   readonly claim_worker_id: string | null;
   readonly claim_token: number | null;
   readonly claim_reason: WorkflowTaskReason | null;
@@ -4702,6 +4780,7 @@ interface NormalizedWorkflowRunLoadRow {
   readonly task_queue: string;
   readonly tail_event_id: number | string;
   readonly ready_reason: string | null;
+  readonly ready_at_ms: number | string;
   readonly claim_worker_id: string | null;
   readonly claim_token: number | string | null;
   readonly claim_reason: string | null;
@@ -4970,6 +5049,11 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
+function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): void {
+  state.readyReason = reason;
+  state.readyAtMs = 0;
+}
+
 function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
   return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
 }
@@ -5139,6 +5223,7 @@ function normalizedWorkflowRunRow(workflow: WorkflowState): NormalizedWorkflowRu
     task_queue: workflow.taskQueue,
     tail_event_id: Number(tailEventId(workflow)),
     ready_reason: workflow.readyReason,
+    ready_at_ms: workflow.readyAtMs,
     claim_worker_id: workflow.claim === null ? null : String(workflow.claim.claim.workerId),
     claim_token: workflow.claim?.claim.token ?? null,
     claim_reason: workflow.claim?.reason ?? null,

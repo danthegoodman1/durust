@@ -384,8 +384,11 @@ async function offloadEncodedPayload<T>(
 export async function hydratePayloadRef<T>(
   payload: PayloadRef<T>,
   blobStore: PayloadBlobStore
-): Promise<InlinePayloadRef<T>> {
+): Promise<PayloadRef<T>> {
   if (payload.kind === "Inline") {
+    return payload;
+  }
+  if (!blobStore.owns(payload.uri)) {
     return payload;
   }
 
@@ -461,6 +464,13 @@ export class PayloadBackend implements DurableBackend {
     commit: WorkflowTaskCommit
   ): Promise<CommitOutcome> {
     return this.#backend.commitWorkflowTask(claim, await this.#offloadWorkflowTaskCommit(commit));
+  }
+
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options?: Parameters<DurableBackend["releaseWorkflowTask"]>[1]
+  ): Promise<void> {
+    await this.#backend.releaseWorkflowTask(claim, options);
   }
 
   async claimActivityTask(
@@ -551,6 +561,9 @@ export class PayloadBackend implements DurableBackend {
 
   async #hydratePayloadRefDeep<T>(payload: PayloadRef<T>): Promise<PayloadRef<T>> {
     const hydrated = await hydratePayloadRef(payload, this.#blobStore);
+    if (hydrated.kind === "Blob") {
+      return hydrated;
+    }
     const decoded = decodePayload<unknown>(hydrated);
     const nestedHydrated = await transformPayloadRefs(decoded, (nested) =>
       this.#hydratePayloadRefDeep(nested)

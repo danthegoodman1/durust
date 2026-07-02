@@ -15,6 +15,7 @@ import {
   activityTaskFromScheduled,
   commandId,
   decodePayload,
+  digestBytes,
   encodePayload,
   eventId,
   namespace,
@@ -22,7 +23,8 @@ import {
   taskQueue,
   workflow,
   workflowId,
-  workflowType
+  workflowType,
+  type PayloadRef
 } from "@durust/core";
 import {
   DEFAULT_PAYLOAD_GC_MIN_AGE_MS,
@@ -108,6 +110,71 @@ describe("local-directory payload storage", () => {
     await expect(hydratePayloadRef(payload, store)).rejects.toThrow(
       "blob payload size mismatch"
     );
+  });
+
+  it("passes foreign-scheme refs through hydration unchanged", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-foreign-hydrate-"))
+    });
+    const foreign = foreignBlobRef({ value: "foreign" });
+
+    await expect(hydratePayloadRef(foreign, store)).resolves.toEqual(foreign);
+    await expect(decodePayloadWithStorage(foreign, store)).rejects.toThrow(
+      "blob payload must be hydrated before decode"
+    );
+  });
+
+  it("round-trips foreign-scheme refs through deep PayloadBackend hydration", async () => {
+    const inner = new MemoryBackend();
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-foreign-backend-"))
+    });
+    const backend = new PayloadBackend({
+      backend: inner,
+      blobStore: store,
+      inlineThresholdBytes: 1024
+    });
+    const foreign = foreignBlobRef({ value: "foreign" });
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/payload-foreign-ref"),
+      workflowType: workflowType("payload.foreign", 1),
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ foreign }, { codec: "Json" })
+    });
+
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [workflowType("payload.foreign", 1)],
+      leaseDurationMs: 30_000
+    });
+    expect(claim).not.toBeNull();
+    const started = claim?.prefetchedHistory[0]?.data;
+    if (started?.kind !== "WorkflowStarted") {
+      throw new Error("expected hydrated WorkflowStarted");
+    }
+    expect(
+      decodePayload<{ readonly foreign: unknown }>(
+        started.input as PayloadRef<{ readonly foreign: unknown }>
+      ).foreign
+    ).toEqual(foreign);
+  });
+
+  it("leaves foreign-scheme refs out of wrapper-owned GC reachability", async () => {
+    const store = new LocalDirectoryBlobStore({
+      root: await mkdtemp(join(tmpdir(), "durust-payload-foreign-gc-"))
+    });
+    const foreign = foreignBlobRef({ value: "foreign" });
+
+    await expect(collectPayloadRefsDeep(foreign, store)).resolves.toEqual([foreign]);
+    await expect(planPayloadGarbageCollection({ blobStore: store, roots: [foreign] })).resolves.toEqual({
+      reachableUris: [],
+      unreachableUris: [],
+      retainedYoungUris: [],
+      retainedCount: 0,
+      unreachableCount: 0
+    });
   });
 
   it("offloads workflow start payloads while hydrated claims stay transparent", async () => {
@@ -893,4 +960,21 @@ class ToggleableBlobStore implements PayloadBlobStore {
   owns(uri: string): boolean {
     return this.inner.owns(uri);
   }
+}
+
+function foreignBlobRef(value: unknown) {
+  const payload = encodePayload(value, { codec: "Json" });
+  if (payload.kind !== "Inline") {
+    throw new Error("expected inline encoded payload");
+  }
+  return {
+    kind: "Blob" as const,
+    codec: payload.codec,
+    schemaFingerprint: payload.schemaFingerprint,
+    compression: payload.compression,
+    encryption: payload.encryption,
+    digest: digestBytes(payload.bytes),
+    size: payload.bytes.byteLength,
+    uri: `test-custom://payloads/${digestBytes(payload.bytes).replace("sha256:", "")}`
+  };
 }

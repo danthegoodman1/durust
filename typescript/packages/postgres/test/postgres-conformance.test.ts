@@ -25,6 +25,7 @@ import {
   eventId,
   namespace,
   payloadDigest,
+  runId,
   signal,
   signalId,
   sleep,
@@ -39,7 +40,8 @@ import {
   type ActivityMapResultPage,
   type ChildWorkflowMapResultManifest,
   type ChildWorkflowMapResultPage,
-  type PayloadRef
+  type PayloadRef,
+  type WorkflowTaskClaim
 } from "@durust/core";
 import {
   LocalDirectoryBlobStore,
@@ -48,7 +50,11 @@ import {
   encodePayloadWithStorage
 } from "@durust/payload";
 import { PostgresBackend } from "@durust/postgres";
-import { basicProviderConformanceCases, prepareWorkflowTaskCommit } from "@durust/testing";
+import {
+  basicProviderConformanceCases,
+  prepareWorkflowTaskCommit,
+  workflowVisibleMutationCommitCases
+} from "@durust/testing";
 
 const postgresUrl = process.env.DURUST_POSTGRES_URL;
 const describePostgres = postgresUrl === undefined ? describe.skip : describe;
@@ -90,6 +96,32 @@ describePostgres("PostgresBackend blob-backed provider conformance", () => {
       });
     });
   }
+});
+
+describePostgres("PostgresBackend terminal commit guard", () => {
+  it("rejects every workflow-visible mutation against a forged terminal claim", async () => {
+    for (const catalogCase of workflowVisibleMutationCommitCases(runId("catalog"), eventId(1))) {
+      const { backend, claim } = await forgedTerminalPostgresClaim(`terminal_${catalogCase.name}`);
+      const testCase = workflowVisibleMutationCommitCases(claim.runId, eventId(1)).find(
+        (candidate) => candidate.name === catalogCase.name
+      );
+      if (testCase === undefined) {
+        throw new Error(`missing terminal guard test case: ${catalogCase.name}`);
+      }
+
+      await expect(backend.commitWorkflowTask(claim, testCase.commit)).rejects.toThrow(
+        "terminal workflow rejects workflow-visible mutations"
+      );
+    }
+  });
+
+  it("accepts an empty no-op commit against a forged terminal claim", async () => {
+    const { backend, claim } = await forgedTerminalPostgresClaim("terminal_empty");
+
+    await expect(
+      backend.commitWorkflowTask(claim, { expectedTailEventId: eventId(1) })
+    ).resolves.toEqual({ kind: "Committed", newTailEventId: eventId(1) });
+  });
 });
 
 describePostgres("PostgresBackend payload roots and GC", () => {
@@ -2658,6 +2690,39 @@ function trackedPostgresBackendWithTable(tableName: string): PostgresBackend {
   });
   managedBackends.push(backend);
   return backend;
+}
+
+async function forgedTerminalPostgresClaim(
+  label: string
+): Promise<{ readonly backend: PostgresBackend; readonly claim: WorkflowTaskClaim }> {
+  const tableName = nextTableName(label);
+  const backend = trackedPostgresBackendWithTable(tableName);
+  await backend.startWorkflow({
+    namespace: namespace(),
+    workflowId: workflowId(`wf/postgres-${label}`),
+    workflowType: workflowType("postgres.terminal-guard", 1),
+    taskQueue: taskQueue("workflows"),
+    input: encodePayload({ value: label }, { codec: "Json" })
+  });
+  const claimed = await backend.claimWorkflowTask("terminal-forger", {
+    namespace: namespace(),
+    taskQueue: taskQueue("workflows"),
+    registeredWorkflowTypes: [workflowType("postgres.terminal-guard", 1)],
+    leaseDurationMs: 30_000
+  });
+  expect(claimed).not.toBeNull();
+  if (claimed === null) {
+    throw new Error("expected forged terminal claim");
+  }
+
+  await withPostgresPool(async (pool) => {
+    await pool.query(
+      `update ${derivedQuoteIdentifier(tableName, "workflow_runs")} set terminal = true where run_id = $1`,
+      [String(claimed.runId)]
+    );
+  });
+
+  return { backend, claim: claimed.claim };
 }
 
 function nextTableName(label: string): string {

@@ -52,6 +52,10 @@ export interface DurableBackend {
     claim: WorkflowTaskClaim,
     commit: WorkflowTaskCommit
   ): Promise<CommitOutcome>;
+  releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options?: ReleaseWorkflowTaskOptions
+  ): Promise<void>;
   claimActivityTask(
     workerId: WorkerId | string,
     opts: ClaimActivityOptions
@@ -164,6 +168,26 @@ export interface WorkflowTaskCommit {
 export type CommitOutcome =
   | { readonly kind: "Committed"; readonly newTailEventId: EventId }
   | { readonly kind: "Conflict" };
+
+export interface ReleaseWorkflowTaskOptions {
+  readonly visibilityDelayMs?: number;
+}
+
+export function workflowTaskCommitHasWorkflowVisibleMutations(
+  commit: WorkflowTaskCommit
+): boolean {
+  return (
+    (commit.appendEvents?.length ?? 0) > 0 ||
+    (commit.upsertWaits?.length ?? 0) > 0 ||
+    (commit.deleteWaits?.length ?? 0) > 0 ||
+    (commit.consumeSignals?.length ?? 0) > 0 ||
+    (commit.scheduleActivities?.length ?? 0) > 0 ||
+    (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
+    (commit.startChildWorkflows?.length ?? 0) > 0 ||
+    (commit.scheduleChildWorkflowMaps?.length ?? 0) > 0 ||
+    commit.queryProjection !== undefined
+  );
+}
 
 export interface ClaimActivityOptions {
   readonly namespace: Namespace | string;
@@ -299,6 +323,7 @@ interface WorkflowState {
   readonly runId: RunId;
   history: HistoryEvent[];
   readyReason: WorkflowTaskReason | null;
+  readyAtMs: number;
   claim: WorkflowLease | null;
   queryProjection: PayloadRef | null;
   terminal: boolean;
@@ -418,6 +443,7 @@ export class MemoryBackend implements DurableBackend {
       runId: newRunId,
       history: [started],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -443,6 +469,7 @@ export class MemoryBackend implements DurableBackend {
         state.terminal ||
         (state.readyReason === null && state.claim === null) ||
         state.claim !== null ||
+        state.readyAtMs > this.#nowMs() ||
         !eligibleTypes.has(workflowTypeKey(state.workflowType))
       ) {
         continue;
@@ -463,6 +490,7 @@ export class MemoryBackend implements DurableBackend {
         expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
       };
       state.readyReason = null;
+      state.readyAtMs = 0;
       return {
         runId: state.runId,
         workflowId: state.workflowId,
@@ -502,10 +530,14 @@ export class MemoryBackend implements DurableBackend {
     ) {
       throw new Error("stale workflow task lease");
     }
+    if (state.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+      throw new Error("terminal workflow rejects workflow-visible mutations");
+    }
 
     if (commit.expectedTailEventId !== tailEventId(state)) {
       state.claim = null;
       state.readyReason = "CacheEvicted";
+      state.readyAtMs = 0;
       return { kind: "Conflict" };
     }
 
@@ -579,6 +611,20 @@ export class MemoryBackend implements DurableBackend {
       this.#cancelChildrenForClosedParent(state);
     }
     return { kind: "Committed", newTailEventId: tailEventId(state) };
+  }
+
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options: ReleaseWorkflowTaskOptions = {}
+  ): Promise<void> {
+    const state = this.#stateForRun(claim.runId);
+    this.#restoreExpiredWorkflowLease(state);
+    if (state.claim === null || !workflowLeaseMatches(state.claim, claim)) {
+      return;
+    }
+    state.readyReason = state.claim.reason;
+    state.readyAtMs = this.#nowMs() + Math.max(0, options.visibilityDelayMs ?? 0);
+    state.claim = null;
   }
 
   async claimActivityTask(
@@ -668,7 +714,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityCompleted";
+    markWorkflowReady(activity.workflow, "ActivityCompleted");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     return { kind: "Completed", eventId: event.eventId };
@@ -718,7 +764,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityFailed";
+    markWorkflowReady(activity.workflow, "ActivityFailed");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     return { kind: "Failed", eventId: event.eventId };
@@ -760,6 +806,7 @@ export class MemoryBackend implements DurableBackend {
   #restoreExpiredWorkflowLease(state: WorkflowState): void {
     if (state.claim !== null && state.claim.expiresAtMs <= this.#nowMs()) {
       state.readyReason ??= state.claim.reason;
+      state.readyAtMs = 0;
       state.claim = null;
     }
   }
@@ -801,7 +848,7 @@ export class MemoryBackend implements DurableBackend {
         }
       });
       state.history.push(event);
-      state.readyReason = "TimerFired";
+      markWorkflowReady(state, "TimerFired");
       this.#waitsById.delete(String(wait.waitId));
       fired += 1;
     }
@@ -849,7 +896,7 @@ export class MemoryBackend implements DurableBackend {
           }
         });
       activity.workflow.history.push(event);
-      activity.workflow.readyReason = "ActivityTimedOut";
+      markWorkflowReady(activity.workflow, "ActivityTimedOut");
       activity.terminalEventId = event.eventId;
       activity.claim = null;
       timedOut += 1;
@@ -942,7 +989,7 @@ export class MemoryBackend implements DurableBackend {
         )
     );
     if (ready) {
-      state.readyReason = "SignalReceived";
+        markWorkflowReady(state, "SignalReceived");
     }
   }
 
@@ -1043,7 +1090,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapFailed";
+    markWorkflowReady(map.workflow, "ActivityMapFailed");
     return event.eventId;
   }
 
@@ -1071,7 +1118,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapCompleted";
+    markWorkflowReady(map.workflow, "ActivityMapCompleted");
     return event.eventId;
   }
 
@@ -1138,6 +1185,7 @@ export class MemoryBackend implements DurableBackend {
           })
         ],
         readyReason: "WorkflowStarted",
+        readyAtMs: 0,
         claim: null,
         queryProjection: null,
         terminal: false,
@@ -1236,7 +1284,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapCompleted";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapCompleted");
     return event.eventId;
   }
 
@@ -1254,7 +1302,7 @@ export class MemoryBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapFailed";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapFailed");
     this.#cancelRunningChildWorkflowMapItems(map);
     return event.eventId;
   }
@@ -1275,6 +1323,7 @@ export class MemoryBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -1294,6 +1343,7 @@ export class MemoryBackend implements DurableBackend {
       runId: newRunId,
       history: [started],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -1317,7 +1367,7 @@ export class MemoryBackend implements DurableBackend {
           }
         }
       }));
-      parent.readyReason = "ChildWorkflowFailed";
+      markWorkflowReady(parent, "ChildWorkflowFailed");
       return;
     }
 
@@ -1336,6 +1386,7 @@ export class MemoryBackend implements DurableBackend {
         })
       ],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -1356,7 +1407,7 @@ export class MemoryBackend implements DurableBackend {
         runId: childRunId
       }
     }));
-    parent.readyReason = "ChildWorkflowStarted";
+    markWorkflowReady(parent, "ChildWorkflowStarted");
   }
 
   #notifyParentOfChildTerminal(parentLink: ParentWorkflowLink, terminal: ChildTerminalUpdate): void {
@@ -1393,12 +1444,14 @@ export class MemoryBackend implements DurableBackend {
               }
             };
     parent.history.push(makeHistoryEvent(eventId(Number(tailEventId(parent)) + 1), data));
-    parent.readyReason =
+    markWorkflowReady(
+      parent,
       terminal.kind === "Completed"
         ? "ChildWorkflowCompleted"
         : terminal.kind === "Failed"
           ? "ChildWorkflowFailed"
-          : "ChildWorkflowCancelled";
+          : "ChildWorkflowCancelled"
+    );
   }
 
   #cancelChildrenForClosedParent(parent: WorkflowState): void {
@@ -1416,6 +1469,7 @@ export class MemoryBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -1437,6 +1491,11 @@ function workflowTypeKey(workflowType: WorkflowType): string {
 
 function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
+}
+
+function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): void {
+  state.readyReason = reason;
+  state.readyAtMs = 0;
 }
 
 function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {

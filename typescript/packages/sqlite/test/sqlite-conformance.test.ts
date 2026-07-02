@@ -22,6 +22,7 @@ import {
   eventId,
   namespace,
   payloadDigest,
+  runId,
   signal,
   signalId,
   sleep,
@@ -35,10 +36,15 @@ import {
   type ActivityMapResultPage,
   type ChildWorkflowMapResultManifest,
   type ChildWorkflowMapResultPage,
-  type PayloadRef
+  type PayloadRef,
+  type WorkflowTaskClaim
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend, collectPayloadRefs } from "@durust/payload";
-import { basicProviderConformanceCases, prepareWorkflowTaskCommit } from "@durust/testing";
+import {
+  basicProviderConformanceCases,
+  prepareWorkflowTaskCommit,
+  workflowVisibleMutationCommitCases
+} from "@durust/testing";
 import { SqliteBackend } from "@durust/sqlite";
 
 const roots: string[] = [];
@@ -62,6 +68,40 @@ function withRawSqlite(path: string, fn: (db: DatabaseSync) => void): void {
   } finally {
     db.close();
   }
+}
+
+async function forgedTerminalSqliteClaim(
+  label: string
+): Promise<{ readonly backend: SqliteBackend; readonly claim: WorkflowTaskClaim }> {
+  const path = tempSqlitePath(label);
+  const first = new SqliteBackend({ path });
+  await first.startWorkflow({
+    namespace: namespace(),
+    workflowId: workflowId(`wf/sqlite-${label}`),
+    workflowType: workflowType("sqlite.terminal-guard", 1),
+    taskQueue: taskQueue("workflows"),
+    input: encodePayload({ value: label }, { codec: "Json" })
+  });
+  const claimed = await first.claimWorkflowTask("terminal-forger", {
+    namespace: namespace(),
+    taskQueue: taskQueue("workflows"),
+    registeredWorkflowTypes: [workflowType("sqlite.terminal-guard", 1)],
+    leaseDurationMs: 30_000
+  });
+  expect(claimed).not.toBeNull();
+  if (claimed === null) {
+    throw new Error("expected forged terminal claim");
+  }
+  first.close();
+
+  withRawSqlite(path, (db) => {
+    db.prepare("update workflows set terminal = 1 where run_id = ?").run(String(claimed.runId));
+  });
+
+  return {
+    backend: new SqliteBackend({ path }),
+    claim: claimed.claim
+  };
 }
 
 afterAll(() => {
@@ -101,6 +141,34 @@ describe("SqliteBackend blob-backed provider conformance", () => {
       });
     });
   }
+});
+
+describe("SqliteBackend terminal commit guard", () => {
+  it("rejects every workflow-visible mutation against a forged terminal claim", async () => {
+    for (const catalogCase of workflowVisibleMutationCommitCases(runId("catalog"), eventId(1))) {
+      const { backend, claim } = await forgedTerminalSqliteClaim(`terminal-${catalogCase.name}`);
+      const testCase = workflowVisibleMutationCommitCases(claim.runId, eventId(1)).find(
+        (candidate) => candidate.name === catalogCase.name
+      );
+      if (testCase === undefined) {
+        throw new Error(`missing terminal guard test case: ${catalogCase.name}`);
+      }
+      await expect(backend.commitWorkflowTask(claim, testCase.commit)).rejects.toThrow(
+        "terminal workflow rejects workflow-visible mutations"
+      );
+      backend.close();
+    }
+  });
+
+  it("accepts an empty no-op commit against a forged terminal claim", async () => {
+    const { backend, claim } = await forgedTerminalSqliteClaim("terminal-empty");
+
+    await expect(
+      backend.commitWorkflowTask(claim, { expectedTailEventId: eventId(1) })
+    ).resolves.toEqual({ kind: "Committed", newTailEventId: eventId(1) });
+
+    backend.close();
+  });
 });
 
 describe("SqliteBackend persistence", () => {

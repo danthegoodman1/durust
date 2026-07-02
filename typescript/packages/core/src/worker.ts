@@ -16,7 +16,11 @@ import type { HistoryEvent } from "./history.js";
 import { historyEventType } from "./history.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef } from "./payload.js";
 import type { Registry } from "./registry.js";
-import { HotWorkflowExecution, durableFailureFromUnknown } from "./runtime.js";
+import {
+  HotWorkflowExecution,
+  UnsupportedWorkflowVersionError,
+  durableFailureFromUnknown
+} from "./runtime.js";
 import {
   eventId,
   type ActivityName,
@@ -45,6 +49,7 @@ export interface WorkerOptions {
   readonly historyFetchMaxBytes?: number;
   readonly workflowHistoryCacheSize?: number;
   readonly workflowExecutionCacheSize?: number;
+  readonly nondeterminismRetryBackoffMs?: number;
   readonly onEvent?: WorkerEventSink;
 }
 
@@ -228,6 +233,7 @@ export class Worker {
   readonly #historyFetchMaxBytes: number;
   readonly #workflowHistoryCacheSize: number;
   readonly #workflowExecutionCacheSize: number;
+  readonly #nondeterminismRetryBackoffMs: number;
   readonly #eventSink: WorkerEventSink | undefined;
   readonly #metrics: MutableWorkerMetrics = emptyWorkerMetrics();
   readonly #workflowHistoryCache = new Map<string, readonly HistoryEvent[]>();
@@ -266,6 +272,10 @@ export class Worker {
     this.#workflowExecutionCacheSize = Math.max(
       0,
       Math.trunc(options.workflowExecutionCacheSize ?? 1024)
+    );
+    this.#nondeterminismRetryBackoffMs = Math.max(
+      0,
+      Math.trunc(options.nondeterminismRetryBackoffMs ?? 60_000)
     );
     this.#eventSink = options.onEvent;
   }
@@ -343,8 +353,21 @@ export class Worker {
     const batchLimit = Math.max(1, Math.trunc(limit));
     if (this.#backend.claimWorkflowTasks !== undefined) {
       const claimed = await this.#claimWorkflowTaskBatch(batchLimit);
+      // One task's failure must not abandon its batch neighbors' claims:
+      // #runClaimedWorkflowTask releases the failing task's own claim (and
+      // swallows release errors), so the drain keeps processing the remaining
+      // independent tasks and propagates only the first error after every
+      // claim in the batch has been committed, conflicted, or released.
+      let firstError: unknown = null;
       for (const task of claimed) {
-        await this.#runClaimedWorkflowTask(task);
+        try {
+          await this.#runClaimedWorkflowTask(task);
+        } catch (error) {
+          firstError ??= error;
+        }
+      }
+      if (firstError !== null) {
+        throw firstError;
       }
       return claimed.length;
     }
@@ -406,37 +429,42 @@ export class Worker {
     claimed: ClaimedWorkflowTask,
     signal?: AbortSignal
   ): Promise<RunWorkflowTaskOnceOutcome> {
-    await this.#emit({
-      kind: "WorkflowTaskClaimed",
-      runId: claimed.runId,
-      workflowType: claimed.workflowType,
-      reason: claimed.reason
-    });
-
-    const definition = this.#registry.workflow(
-      claimed.workflowType.name,
-      claimed.workflowType.version
-    );
-    if (!definition) {
-      throw new Error(
-        `workflow is not registered: ${claimed.workflowType.name}@${claimed.workflowType.version}`
-      );
-    }
-
-    const liveSignals = claimed.liveSignals ?? await this.#liveSignalsForClaim(claimed.runId);
-    const prepared = await this.#prepareWorkflowTaskFromCacheOrReplay(
-      definition,
-      claimed,
-      liveSignals
-    );
-    let outcome: CommitOutcome;
+    let prepared: PreparedWorkflowExecution | null = null;
+    let outcome: CommitOutcome | null = null;
     try {
+      await this.#emit({
+        kind: "WorkflowTaskClaimed",
+        runId: claimed.runId,
+        workflowType: claimed.workflowType,
+        reason: claimed.reason
+      });
+
+      const definition = this.#registry.workflow(
+        claimed.workflowType.name,
+        claimed.workflowType.version
+      );
+      if (!definition) {
+        throw new Error(
+          `workflow is not registered: ${claimed.workflowType.name}@${claimed.workflowType.version}`
+        );
+      }
+
+      const liveSignals = claimed.liveSignals ?? await this.#liveSignalsForClaim(claimed.runId);
+      prepared = await this.#prepareWorkflowTaskFromCacheOrReplay(
+        definition,
+        claimed,
+        liveSignals
+      );
       outcome = await this.#backend.commitWorkflowTask(claimed.claim, prepared.commit);
     } catch (error) {
-      if (prepared.cacheKey !== null) {
+      if (prepared?.cacheKey !== null && prepared?.cacheKey !== undefined) {
         this.#workflowExecutionCache.delete(prepared.cacheKey);
       }
+      await this.#releaseFailedWorkflowTask(claimed.claim, error);
       throw error;
+    }
+    if (prepared === null || outcome === null) {
+      throw new Error("workflow task finished without a prepared commit");
     }
     if (outcome.kind === "Committed") {
       prepared.execution.markCommitted(outcome.newTailEventId);
@@ -471,6 +499,16 @@ export class Worker {
     return { kind: "Committed", runId: claimed.runId, outcome, localActivityTasks };
   }
 
+  async #releaseFailedWorkflowTask(
+    claim: ClaimedWorkflowTask["claim"],
+    error: unknown
+  ): Promise<void> {
+    const visibilityDelayMs = isNondeterminismError(error)
+      ? this.#nondeterminismRetryBackoffMs
+      : 0;
+    await this.#backend.releaseWorkflowTask(claim, { visibilityDelayMs }).catch(() => undefined);
+  }
+
   async runActivityTaskOnce(): Promise<RunActivityTaskOnceOutcome> {
     if (this.#activityTaskQueue === null) {
       throw new Error("Worker.runActivityTaskOnce requires activityTaskQueue");
@@ -496,7 +534,12 @@ export class Worker {
 
     const definition = this.#registry.activity(String(claimed.task.activityName));
     if (!definition) {
-      throw new Error(`activity is not registered: ${claimed.task.activityName}`);
+      const outcome = await this.#failClaimedActivity(
+        claimed,
+        new Error(`activity is not registered: ${claimed.task.activityName}`),
+        false
+      );
+      return { kind: "Failed", activityId: claimed.task.activityId, outcome };
     }
 
     const input = decodePayload(
@@ -541,6 +584,25 @@ export class Worker {
       });
       return { kind: "Failed", activityId: claimed.task.activityId, outcome };
     }
+  }
+
+  async #failClaimedActivity(
+    claimed: ClaimedActivityTask,
+    error: unknown,
+    batched: boolean
+  ): Promise<Awaited<ReturnType<DurableBackend["failActivity"]>>> {
+    const outcome = await this.#backend.failActivity({
+      claim: claimed.claim,
+      failure: durableFailureFromUnknown(error)
+    });
+    this.#metrics.activityTaskFailures += 1;
+    await this.#emit({
+      kind: "ActivityTaskFailed",
+      activityId: claimed.task.activityId,
+      outcome,
+      batched
+    });
+    return outcome;
   }
 
   async runActivityTaskBatchOnce(limit = this.#activityCompletionBatchSize): Promise<RunActivityTaskBatchOnceOutcome> {
@@ -947,7 +1009,18 @@ export class Worker {
 
       const definition = this.#registry.activity(String(claimed.task.activityName));
       if (!definition) {
-        throw new Error(`activity is not registered: ${claimed.task.activityName}`);
+        await this.#flushActivityCompletionBatch(completions);
+        completions.length = 0;
+        await this.#failClaimedActivity(
+          claimed,
+          new Error(`activity is not registered: ${claimed.task.activityName}`),
+          true
+        );
+        processedTasks += 1;
+        if (signal?.aborted) {
+          break;
+        }
+        continue;
       }
 
       const input = decodePayload(
@@ -1025,7 +1098,17 @@ export class Worker {
 
       const definition = this.#registry.activity(String(claimed.task.activityName));
       if (!definition) {
-        throw new Error(`activity is not registered: ${claimed.task.activityName}`);
+        await this.#flushActivityCompletionBatch(completions);
+        completions.length = 0;
+        await this.#failClaimedActivity(
+          claimed,
+          new Error(`activity is not registered: ${claimed.task.activityName}`),
+          true
+        );
+        if (signal?.aborted) {
+          break;
+        }
+        continue;
       }
 
       const input = decodePayload(
@@ -1233,6 +1316,13 @@ function workerErrorInfo(error: unknown): WorkerErrorInfo {
     name: "Error",
     message: String(error)
   };
+}
+
+function isNondeterminismError(error: unknown): boolean {
+  return (
+    error instanceof UnsupportedWorkflowVersionError ||
+    (error instanceof Error && error.message.startsWith("nondeterminism:"))
+  );
 }
 
 function completedBatchItemAccepted(result: CompleteActivityItemOutcome): boolean {
