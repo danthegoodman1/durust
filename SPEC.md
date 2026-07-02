@@ -3018,6 +3018,16 @@ durust::run_many_seeds(
 logging, and invariant failure reporting. `SimFailure` includes the failing seed
 and trace so a CI failure can be replayed locally.
 
+Simulations exercise production code, not models of it: `FaultInjectingBackend`
+wraps a real provider (the in-memory provider, whose clock is fully virtual)
+with seeded per-call fault decisions — transient errors on any backend method,
+duplicated activity completions replayed through the provider's idempotency
+path, scripted crashes that strand a live claim between claim and commit, and
+a post-claim hook for racing appends that force genuine commit conflicts. Real
+`Worker` instances run over the wrapped backend and every invariant is
+asserted from durable state (streamed history), with a same-seed rerun pinning
+byte-identical final histories.
+
 Run profiles:
 
 ```text

@@ -5670,7 +5670,8 @@ fn cached_workflow_wake_ignores_cold_recovery_saturation() {
 #[test]
 fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
     block_on(async {
-        let backend = RecordingBackend::new(MemoryBackend::new());
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner.clone());
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<double_plus_one>("wf/recovery-admission", "workflows", number(7))
@@ -5715,7 +5716,7 @@ fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
                 .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
         );
 
-        std::thread::sleep(Duration::from_millis(40));
+        inner.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-recovery-admission-delay"),
@@ -5825,7 +5826,8 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
 #[test]
 fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
     block_on(async {
-        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner.clone()).without_claim_prefetch();
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", number(9))
@@ -5868,7 +5870,7 @@ fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        inner.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-provider-backpressure-delay"),
@@ -6290,7 +6292,7 @@ fn configured_nondeterminism_backoff_releases_workflow_after_delay() {
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        backend.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-backoff"),

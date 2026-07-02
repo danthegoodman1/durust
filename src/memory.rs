@@ -27,7 +27,7 @@ use crate::{
 use futures::future::{BoxFuture, ready};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub struct MemoryBackend {
@@ -107,7 +107,9 @@ struct RunRecord {
     task_queue: crate::TaskQueue,
     history: Vec<HistoryEvent>,
     ready: Option<WorkflowTaskReason>,
-    ready_at: Option<Instant>,
+    // Virtual-clock visibility deadline for delayed releases; `advance_time`
+    // controls when a deferred task becomes claimable again.
+    ready_at: Option<TimestampMs>,
     workflow_claim: Option<WorkflowClaim>,
     terminal: bool,
     parent: Option<ChildParentLink>,
@@ -303,14 +305,13 @@ impl DurableBackend for MemoryBackend {
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
-        let now = Instant::now();
-        let virtual_now = state.now;
+        let now = state.now;
         let Some(run_id) = state.runs.iter().find_map(|(run_id, run)| {
             let matches = run.namespace == opts.namespace
                 && run.task_queue == opts.task_queue
                 && run.ready.is_some()
                 && run.ready_at.is_none_or(|ready_at| ready_at <= now)
-                && WorkflowClaim::reclaimable(&run.workflow_claim, virtual_now)
+                && WorkflowClaim::reclaimable(&run.workflow_claim, now)
                 && !run.terminal
                 && opts
                     .registered_workflow_types
@@ -332,7 +333,7 @@ impl DurableBackend for MemoryBackend {
         // conflict, and release overwrite it.
         run.workflow_claim = Some(WorkflowClaim {
             token,
-            lease_until: TimestampMs(claim_lease_until_ms(virtual_now, opts.lease_duration)),
+            lease_until: TimestampMs(claim_lease_until_ms(now, opts.lease_duration)),
         });
         let reason = run
             .ready
@@ -768,6 +769,7 @@ impl DurableBackend for MemoryBackend {
         release: crate::WorkflowTaskRelease,
     ) -> BoxFuture<'static, Result<()>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let now = state.now;
         let Some(run) = state.runs.get_mut(&claim.run_id) else {
             return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
         };
@@ -777,7 +779,7 @@ impl DurableBackend for MemoryBackend {
         run.workflow_claim = None;
         if !run.terminal {
             run.ready = Some(release.reason);
-            run.ready_at = ready_at_for_delay(release.delay);
+            run.ready_at = ready_at_for_delay(now, release.delay);
         } else {
             run.ready_at = None;
         }
@@ -3367,12 +3369,12 @@ fn verify_payload_blob<'a>(
     Ok(blob)
 }
 
-fn ready_at_for_delay(delay: Duration) -> Option<Instant> {
+fn ready_at_for_delay(now: TimestampMs, delay: Duration) -> Option<TimestampMs> {
     if delay.is_zero() {
         None
     } else {
-        let now = Instant::now();
-        Some(now.checked_add(delay).unwrap_or(now))
+        let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+        Some(TimestampMs(now.0.saturating_add(delay_ms)))
     }
 }
 

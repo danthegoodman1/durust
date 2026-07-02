@@ -769,7 +769,12 @@ Replay and command fingerprints remain the correctness backstop.
 
 Runtime and provider fault tests use the deterministic simulator primitives
 (`SimRun`, `FaultProfile`, and `run_many_seeds`) so failures report a seed and
-trace that can be replayed locally.
+trace that can be replayed locally. `FaultInjectingBackend` wraps any
+`DurableBackend` with seeded per-call fault decisions (transient errors,
+duplicated activity completions, scripted worker crashes) so simulations drive
+the real `Worker` over the real in-memory provider under fault injection; the
+memory provider's clock is fully virtual (`advance_time`), so leases, timers,
+delayed visibility, and retry backoffs are simulation-controlled.
 
 ## Durability Providers
 

@@ -249,6 +249,62 @@ fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configur
 }
 
 #[test]
+fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/memory-delayed-release",
+            "memory-delayed-release-workflows",
+            move || async move {
+                advance_backend.advance_time(Duration::from_millis(40));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("delayed-release.sqlite3")).unwrap();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/sqlite-delayed-release",
+            "sqlite-delayed-release-workflows",
+            || async { std::thread::sleep(Duration::from_millis(40)) },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres delayed release conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("delayed_release");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/postgres-delayed-release",
+            "postgres-delayed-release-workflows",
+            || async { tokio::time::sleep(Duration::from_millis(40)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[test]
 fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -1875,7 +1931,6 @@ where
     workflow_claim_filters_by_queue_and_registered_type(backend.clone()).await;
     stream_history_honors_bounds(backend.clone()).await;
     released_workflow_task_is_claimable_again(backend.clone()).await;
-    delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
     missing_provider_blob_ref_is_rejected(backend.clone()).await;
     provider_blob_ref_metadata_mismatch_is_rejected(backend.clone()).await;
@@ -3512,18 +3567,27 @@ where
     assert!(reclaimed.is_some());
 }
 
-async fn delayed_released_workflow_task_is_not_claimable_until_visible<B>(backend: B)
-where
+// Parametrized on how time passes because delayed visibility is a clock
+// comparison: memory follows the virtual clock (`advance_time`) while the SQL
+// providers compare against the wall clock and must really sleep.
+async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance, AdvanceFut>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    advance_past_delay: Advance,
+) where
     B: DurableBackend,
+    Advance: FnOnce() -> AdvanceFut,
+    AdvanceFut: Future<Output = ()>,
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/delayed-release", "delayed-release-workflows", input(5))
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
-        task_queue: TaskQueue::new("delayed-release-workflows"),
+        task_queue: TaskQueue::new(workflow_queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
         lease_duration: Duration::from_secs(30),
     };
@@ -3549,7 +3613,7 @@ where
         .unwrap();
     assert!(hidden.is_none());
 
-    std::thread::sleep(Duration::from_millis(40));
+    advance_past_delay().await;
     let visible = backend
         .claim_workflow_task(WorkerId::new("worker-c"), claim_opts)
         .await
