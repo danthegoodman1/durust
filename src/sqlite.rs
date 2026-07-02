@@ -1,14 +1,14 @@
 use crate::provider_util::{
-    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
-    activity_failure_decision, activity_timeout_at_ms, activity_timeout_at_ms_from,
-    activity_timeout_decision, child_terminal_event_data_and_reason,
-    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
-    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
-    decode_encryption_metadata, encode_encryption_metadata, event_type_from_str, event_type_to_str,
-    marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
-    post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
-    retry_visible_at_ms, timed_out_by_heartbeat, timeout_message, unix_epoch_millis,
-    wait_kind_to_str,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
+    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
+    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
+    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
+    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
+    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
+    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
+    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
+    unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -1136,7 +1136,8 @@ impl DurableBackend for SqliteBackend {
                             tx.execute(
                                 "update activity_tasks
                                  set completed = 1,
-                                     heartbeat_deadline_at_ms = null
+                                     heartbeat_deadline_at_ms = null,
+                                     implicit_heartbeat_ms = null
                                  where activity_id = ?1",
                                 params![activity_id],
                             )
@@ -1155,24 +1156,28 @@ impl DurableBackend for SqliteBackend {
                 return Ok(None);
             };
             let token = next_counter(&tx, "claim")?;
-            // The lease-derived deadline is only produced for tasks without
-            // explicit timeouts, whose stored timeout_at_ms is null; coalesce
-            // keeps explicit deadlines authoritative.
+            // Tasks without explicit timeouts get the lease as an implicit
+            // heartbeat interval; explicit deadlines stay authoritative and
+            // the stored timeout_at_ms is untouched by the claim.
+            let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
+                task.start_to_close_timeout,
+                task.heartbeat_timeout,
+                opts.lease_duration,
+            );
             tx.execute(
                 "update activity_tasks
                  set claim_token = ?1,
                      heartbeat_deadline_at_ms = ?2,
-                     timeout_at_ms = coalesce(?3, timeout_at_ms)
+                     implicit_heartbeat_ms = ?3
                  where activity_id = ?4",
                 params![
                     token,
-                    activity_timeout_at_ms_from(now, task.heartbeat_timeout),
-                    activity_claim_lease_timeout_at_ms(
+                    activity_heartbeat_deadline_at_ms(
                         now,
-                        task.start_to_close_timeout,
                         task.heartbeat_timeout,
-                        opts.lease_duration,
+                        implicit_heartbeat_ms
                     ),
+                    implicit_heartbeat_ms,
                     activity_id.0
                 ],
             )
@@ -1199,9 +1204,9 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let Some((task_blob, claim_token, completed)) = tx
+            let Some((task_blob, claim_token, completed, implicit_heartbeat_ms)) = tx
                 .query_row(
-                    "select task, claim_token, completed
+                    "select task, claim_token, completed, implicit_heartbeat_ms
                      from activity_tasks
                      where activity_id = ?1",
                     params![req.claim.activity_id.0],
@@ -1210,6 +1215,7 @@ impl DurableBackend for SqliteBackend {
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Option<u64>>(1)?,
                             row.get::<_, bool>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
                         ))
                     },
                 )
@@ -1236,7 +1242,11 @@ impl DurableBackend for SqliteBackend {
                  set heartbeat_deadline_at_ms = ?1
                  where activity_id = ?2",
                 params![
-                    activity_timeout_at_ms(task.heartbeat_timeout),
+                    activity_heartbeat_deadline_at_ms(
+                        TimestampMs(unix_epoch_millis()),
+                        task.heartbeat_timeout,
+                        implicit_heartbeat_ms
+                    ),
                     req.claim.activity_id.0
                 ],
             )
@@ -1335,7 +1345,8 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
@@ -1402,6 +1413,7 @@ impl DurableBackend for SqliteBackend {
                          claim_token = null,
                          timeout_at_ms = ?2,
                          heartbeat_deadline_at_ms = null,
+                         implicit_heartbeat_ms = null,
                          visible_at_ms = ?3
                      where activity_id = ?4",
                     params![
@@ -1463,7 +1475,8 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
@@ -2661,6 +2674,13 @@ fn normalize_activity_map_input_manifest_for_storage(
         .pages
         .into_iter()
         .map(|page| {
+            // A foreign-scheme page under an inline root is opaque: the
+            // owning layer normalized its items before this commit, so it
+            // passes through untouched (mirroring the reachability
+            // collectors' external-page skip).
+            if is_external_payload_ref(&page) {
+                return Ok(page);
+            }
             let page = hydrate_payload_from_storage(conn, config, page)?;
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page
@@ -3309,6 +3329,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             completed integer not null,
             timeout_at_ms integer,
             heartbeat_deadline_at_ms integer,
+            implicit_heartbeat_ms integer,
             visible_at_ms integer
         );
 
@@ -3471,6 +3492,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "integer",
     )?;
     ensure_column(conn, "activity_tasks", "visible_at_ms", "integer")?;
+    ensure_column(conn, "activity_tasks", "implicit_heartbeat_ms", "integer")?;
     // Default 0 makes pre-existing blobs immediately past any GC grace period,
     // which is correct: they are old.
     ensure_column(
@@ -3889,7 +3911,8 @@ fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId
         "update activity_tasks
          set completed = 1,
              claim_token = null,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1 or activity_id like ?2",
         params![activity_id.0, map_prefix],
     )
@@ -4767,7 +4790,8 @@ fn complete_map_item(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -4921,7 +4945,8 @@ fn fail_map_item(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -4991,9 +5016,15 @@ fn timeout_activity(
     activity_id: ActivityId,
     now: TimestampMs,
 ) -> Result<bool> {
-    let Some((task_blob, completed, timeout_at_ms, heartbeat_deadline_at_ms)) = tx
+    let Some((
+        task_blob,
+        completed,
+        timeout_at_ms,
+        heartbeat_deadline_at_ms,
+        implicit_heartbeat_ms,
+    )) = tx
         .query_row(
-            "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms
+            "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms, implicit_heartbeat_ms
              from activity_tasks
              where activity_id = ?1",
             params![activity_id.0],
@@ -5003,6 +5034,7 @@ fn timeout_activity(
                     row.get::<_, bool>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
@@ -5016,7 +5048,11 @@ fn timeout_activity(
     if completed || !(start_timeout_due || heartbeat_timeout_due) {
         return Ok(false);
     }
-    let timed_out_by_heartbeat = timed_out_by_heartbeat(heartbeat_timeout_due, start_timeout_due);
+    let attribution = activity_timeout_attribution(
+        start_timeout_due,
+        heartbeat_timeout_due,
+        implicit_heartbeat_ms.is_some(),
+    );
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
@@ -5034,6 +5070,7 @@ fn timeout_activity(
                  claim_token = null,
                  timeout_at_ms = ?2,
                  heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null,
                  visible_at_ms = null
              where activity_id = ?3",
             params![
@@ -5049,7 +5086,8 @@ fn timeout_activity(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -5062,7 +5100,7 @@ fn timeout_activity(
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+                timeout_message(&activity_id, task.attempt, attribution),
             ),
             activity_id,
         )?;
@@ -5090,7 +5128,7 @@ fn timeout_activity(
         event_id,
         HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: task.command_id,
-            message: timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+            message: timeout_message(&activity_id, task.attempt, attribution),
         }),
     )?;
     tx.execute(

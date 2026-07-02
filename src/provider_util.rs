@@ -102,19 +102,58 @@ impl TerminalCleanup {
     }
 }
 
-pub(crate) fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat: bool) -> String {
-    if heartbeat {
-        format!(
-            "activity `{}` missed heartbeat on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
+/// Which deadline reclaimed a running activity. The attribution decides the
+/// message persisted in history (`ActivityTimedOut` events and map-item
+/// `DurableFailure`s), so existing variants' text is append-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityTimeoutAttribution {
+    StartToClose,
+    MissedHeartbeat,
+    /// The implicit lease-as-heartbeat deadline of a task with no explicit
+    /// timeouts lapsed: the claim holder stopped heartbeating (or never did).
+    LeaseExpired,
+}
+
+/// An expired start-to-close deadline is the stronger fact and wins the
+/// attribution even when the heartbeat deadline lapsed too. A lapsed
+/// heartbeat deadline is a missed heartbeat only when it came from an
+/// explicit `heartbeat_timeout`; the implicit lease interval produces the
+/// lease-flavored attribution instead.
+pub(crate) fn activity_timeout_attribution(
+    start_to_close_due: bool,
+    heartbeat_due: bool,
+    implicit_heartbeat: bool,
+) -> ActivityTimeoutAttribution {
+    if start_to_close_due || !heartbeat_due {
+        ActivityTimeoutAttribution::StartToClose
+    } else if implicit_heartbeat {
+        ActivityTimeoutAttribution::LeaseExpired
     } else {
-        format!(
-            "activity `{}` timed out on attempt {}",
-            activity_id.0,
-            attempt.max(1)
-        )
+        ActivityTimeoutAttribution::MissedHeartbeat
+    }
+}
+
+pub(crate) fn timeout_message(
+    activity_id: &ActivityId,
+    attempt: u32,
+    attribution: ActivityTimeoutAttribution,
+) -> String {
+    let attempt = attempt.max(1);
+    match attribution {
+        ActivityTimeoutAttribution::StartToClose => {
+            format!(
+                "activity `{}` timed out on attempt {attempt}",
+                activity_id.0
+            )
+        }
+        ActivityTimeoutAttribution::MissedHeartbeat => format!(
+            "activity `{}` missed heartbeat on attempt {attempt}",
+            activity_id.0
+        ),
+        ActivityTimeoutAttribution::LeaseExpired => format!(
+            "activity `{}` claim lease expired without heartbeat on attempt {attempt}",
+            activity_id.0
+        ),
     }
 }
 
@@ -173,13 +212,6 @@ pub(crate) fn activity_failure_decision(
 /// Timeouts are always retryable up to the stored policy's attempt budget.
 pub(crate) fn activity_timeout_decision(task: &ActivityTask) -> ActivityFailureDecision {
     activity_failure_decision(task, false)
-}
-
-/// A missed heartbeat is reported as such only when the start-to-close
-/// deadline has not also lapsed; an expired start-to-close deadline is the
-/// stronger fact and wins the timeout message.
-pub(crate) fn timed_out_by_heartbeat(heartbeat_due: bool, start_to_close_due: bool) -> bool {
-    heartbeat_due && !start_to_close_due
 }
 
 /// True when a commit carries any workflow-visible mutation. A terminal run
@@ -320,20 +352,38 @@ pub(crate) fn claim_lease_until_ms(now: TimestampMs, lease_duration: Duration) -
     now.0.saturating_add(duration_millis_i64(lease_duration))
 }
 
-/// Claim-time reclaim deadline for an activity with neither a start-to-close
-/// timeout nor a heartbeat timeout. Such a task has no other crash-recovery
-/// signal, so the claim lease feeds the same `timeout_at_ms` slot the timeout
-/// scanner already reads; the retry path then resets the deadline to the
-/// (absent) explicit timeout, leaving the task claimable again. When either
-/// explicit deadline exists it stays authoritative and this returns `None`.
-pub(crate) fn activity_claim_lease_timeout_at_ms(
-    now: TimestampMs,
+/// Implicit heartbeat interval for a claim on an activity with neither an
+/// explicit start-to-close timeout nor an explicit heartbeat timeout. Such a
+/// task has no other crash-recovery signal, so the claim lease acts as its
+/// heartbeat interval: the claim stamps `heartbeat_deadline = now + lease`,
+/// every accepted heartbeat re-stamps it (the interval is persisted on the
+/// claimed row so refreshes know it), and the existing heartbeat-deadline
+/// scan reclaims the task one lease after the last heartbeat. A faithfully
+/// heartbeating holder therefore survives indefinitely; one that never
+/// heartbeats is reclaimed one lease after the claim. When either explicit
+/// deadline exists it stays authoritative and this returns `None`.
+pub(crate) fn activity_claim_implicit_heartbeat_ms(
     start_to_close_timeout: Option<Duration>,
     heartbeat_timeout: Option<Duration>,
     lease_duration: Duration,
 ) -> Option<i64> {
     (start_to_close_timeout.is_none() && heartbeat_timeout.is_none())
-        .then(|| claim_lease_until_ms(now, lease_duration))
+        .then(|| duration_millis_i64(lease_duration))
+}
+
+/// Heartbeat deadline to stamp at claim time and on every accepted heartbeat.
+/// An explicit `heartbeat_timeout` is authoritative; otherwise the implicit
+/// lease interval persisted at claim keeps a live holder ahead of the
+/// heartbeat-deadline scan. `None` means no heartbeat deadline (the task has
+/// an explicit start-to-close timeout only).
+pub(crate) fn activity_heartbeat_deadline_at_ms(
+    now: TimestampMs,
+    heartbeat_timeout: Option<Duration>,
+    implicit_heartbeat_ms: Option<i64>,
+) -> Option<i64> {
+    heartbeat_timeout
+        .map(|timeout| now.0.saturating_add(duration_millis_i64(timeout)))
+        .or_else(|| implicit_heartbeat_ms.map(|interval| now.0.saturating_add(interval.max(0))))
 }
 
 // The string codecs below are persisted in provider storage (ready reasons,
@@ -682,22 +732,89 @@ mod tests {
     }
 
     #[test]
-    fn activity_claim_lease_applies_only_without_explicit_deadlines() {
+    fn implicit_heartbeat_claim_stamping_applies_only_without_explicit_deadlines() {
         let now = TimestampMs(500);
         let lease = Duration::from_secs(30);
-        // No explicit timeout or heartbeat: the lease is the reclaim deadline.
+        // Decision table: both timeouts None -> the lease becomes the implicit
+        // heartbeat interval and the claim stamps a heartbeat deadline.
         assert_eq!(
-            activity_claim_lease_timeout_at_ms(now, None, None, lease),
+            activity_claim_implicit_heartbeat_ms(None, None, lease),
+            Some(30_000)
+        );
+        assert_eq!(
+            activity_heartbeat_deadline_at_ms(now, None, Some(30_000)),
             Some(30_500)
         );
         // Any explicit deadline stays authoritative; the lease must not double-drive.
         assert_eq!(
-            activity_claim_lease_timeout_at_ms(now, Some(Duration::from_secs(1)), None, lease),
+            activity_claim_implicit_heartbeat_ms(Some(Duration::from_secs(1)), None, lease),
             None
         );
         assert_eq!(
-            activity_claim_lease_timeout_at_ms(now, None, Some(Duration::from_secs(1)), lease),
+            activity_claim_implicit_heartbeat_ms(None, Some(Duration::from_secs(1)), lease),
             None
+        );
+        // Explicit heartbeat timeout wins the refresh even when an implicit
+        // interval is (incorrectly) present.
+        assert_eq!(
+            activity_heartbeat_deadline_at_ms(now, Some(Duration::from_secs(1)), Some(30_000)),
+            Some(1_500)
+        );
+        // Explicit start-to-close only: no heartbeat deadline at all.
+        assert_eq!(activity_heartbeat_deadline_at_ms(now, None, None), None);
+        // A negative persisted interval clamps to "due now" instead of
+        // stamping a deadline in the past.
+        assert_eq!(
+            activity_heartbeat_deadline_at_ms(now, None, Some(-5)),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn timeout_attribution_orders_start_to_close_heartbeat_and_lease() {
+        // Start-to-close is the stronger fact and wins even when the
+        // heartbeat deadline lapsed too.
+        assert_eq!(
+            activity_timeout_attribution(true, true, false),
+            ActivityTimeoutAttribution::StartToClose
+        );
+        assert_eq!(
+            activity_timeout_attribution(true, false, false),
+            ActivityTimeoutAttribution::StartToClose
+        );
+        // A lapsed explicit heartbeat deadline is a missed heartbeat.
+        assert_eq!(
+            activity_timeout_attribution(false, true, false),
+            ActivityTimeoutAttribution::MissedHeartbeat
+        );
+        // A lapsed implicit (lease-derived) deadline is a lease expiry.
+        assert_eq!(
+            activity_timeout_attribution(false, true, true),
+            ActivityTimeoutAttribution::LeaseExpired
+        );
+    }
+
+    #[test]
+    fn timeout_messages_are_pinned() {
+        // These strings are persisted in history (`ActivityTimedOut` events
+        // and map-item failures); existing text is append-only.
+        let activity_id = ActivityId("act".to_owned());
+        assert_eq!(
+            timeout_message(&activity_id, 2, ActivityTimeoutAttribution::StartToClose),
+            "activity `act` timed out on attempt 2"
+        );
+        assert_eq!(
+            timeout_message(&activity_id, 2, ActivityTimeoutAttribution::MissedHeartbeat),
+            "activity `act` missed heartbeat on attempt 2"
+        );
+        assert_eq!(
+            timeout_message(&activity_id, 2, ActivityTimeoutAttribution::LeaseExpired),
+            "activity `act` claim lease expired without heartbeat on attempt 2"
+        );
+        // Attempt 0 reports as attempt 1 rather than underflowing.
+        assert_eq!(
+            timeout_message(&activity_id, 0, ActivityTimeoutAttribution::StartToClose),
+            "activity `act` timed out on attempt 1"
         );
     }
 
@@ -975,10 +1092,6 @@ mod tests {
             activity_timeout_decision(&exhausted),
             ActivityFailureDecision::Fail
         ));
-        // Heartbeat attribution defers to an expired start-to-close deadline.
-        assert!(timed_out_by_heartbeat(true, false));
-        assert!(!timed_out_by_heartbeat(true, true));
-        assert!(!timed_out_by_heartbeat(false, false));
     }
 
     #[test]

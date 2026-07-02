@@ -357,7 +357,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .await
         .unwrap();
         assert_eq!(backend.schema(), schema);
-        assert_eq!(backend.schema_version().await.unwrap(), 5);
+        assert_eq!(backend.schema_version().await.unwrap(), 6);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }

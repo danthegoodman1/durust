@@ -1,9 +1,9 @@
 use crate::provider_util::{
-    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
-    activity_failure_decision, activity_timeout_decision, child_terminal_event_data_and_reason,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_attribution,
+    activity_timeout_decision, child_terminal_event_data_and_reason,
     child_terminal_map_item_outcome, claim_lease_until_ms, commit_has_workflow_visible_mutations,
-    payload_gc_cutoff_ms, post_commit_ready_reason, retry_visible_at_ms, timed_out_by_heartbeat,
-    timeout_message,
+    payload_gc_cutoff_ms, post_commit_ready_reason, retry_visible_at_ms, timeout_message,
 };
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -195,6 +195,10 @@ struct ActivityRecord {
     completed: bool,
     timeout_at: Option<TimestampMs>,
     heartbeat_deadline_at: Option<TimestampMs>,
+    /// Lease-as-heartbeat interval stamped at claim when the task has no
+    /// explicit timeouts; heartbeat refreshes re-derive the deadline from it.
+    /// Cleared on retry, re-stamped at the next claim.
+    implicit_heartbeat_ms: Option<i64>,
     /// Retry-backoff visibility: the task is not claimable before this
     /// instant. `None` means immediately visible.
     visible_at: Option<TimestampMs>,
@@ -708,6 +712,7 @@ impl DurableBackend for MemoryBackend {
                     completed: false,
                     timeout_at,
                     heartbeat_deadline_at: None,
+                    implicit_heartbeat_ms: None,
                     visible_at: None,
                 },
             );
@@ -1086,15 +1091,17 @@ impl DurableBackend for MemoryBackend {
                 .get_mut(&activity_id)
                 .expect("activity id selected from activities map");
             record.claim = Some(token);
-            record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
-            if let Some(lease_timeout) = activity_claim_lease_timeout_at_ms(
-                now,
+            record.implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
                 record.task.start_to_close_timeout,
                 record.task.heartbeat_timeout,
                 opts.lease_duration,
-            ) {
-                record.timeout_at = Some(TimestampMs(lease_timeout));
-            }
+            );
+            record.heartbeat_deadline_at = activity_heartbeat_deadline_at_ms(
+                now,
+                record.task.heartbeat_timeout,
+                record.implicit_heartbeat_ms,
+            )
+            .map(TimestampMs);
             record.task.clone()
         };
         let task = match hydrate_activity_task_from_storage(&state, task) {
@@ -1129,7 +1136,12 @@ impl DurableBackend for MemoryBackend {
             return Box::pin(ready(Err(Error::StaleLease)));
         }
 
-        record.heartbeat_deadline_at = activity_timeout_at(now, record.task.heartbeat_timeout);
+        record.heartbeat_deadline_at = activity_heartbeat_deadline_at_ms(
+            now,
+            record.task.heartbeat_timeout,
+            record.implicit_heartbeat_ms,
+        )
+        .map(TimestampMs);
         Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::Recorded)))
     }
 
@@ -1249,6 +1261,7 @@ impl DurableBackend for MemoryBackend {
             record.timeout_at =
                 activity_timeout_at(visible_from, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
+            record.implicit_heartbeat_ms = None;
             drop(state);
             self.notify_work();
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
@@ -1526,6 +1539,7 @@ fn materialize_activity_map_items(
                 completed: false,
                 timeout_at,
                 heartbeat_deadline_at: None,
+                implicit_heartbeat_ms: None,
                 visible_at: None,
             },
         );
@@ -1976,6 +1990,7 @@ fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate:
             record.completed = true;
             record.claim = None;
             record.heartbeat_deadline_at = None;
+            record.implicit_heartbeat_ms = None;
         }
     }
     if let Some(map) = state.activity_maps.get_mut(command_id) {
@@ -2467,7 +2482,11 @@ fn timeout_activity(
         let start_to_close_due = record
             .timeout_at
             .is_some_and(|timeout_at| timeout_at <= now);
-        let timed_out_by_heartbeat = timed_out_by_heartbeat(heartbeat_due, start_to_close_due);
+        let attribution = activity_timeout_attribution(
+            start_to_close_due,
+            heartbeat_due,
+            record.implicit_heartbeat_ms.is_some(),
+        );
 
         let task = record.task.clone();
         if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
@@ -2479,14 +2498,15 @@ fn timeout_activity(
             record.visible_at = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
+            record.implicit_heartbeat_ms = None;
             return Ok(true);
         }
 
         record.completed = true;
-        (task, timed_out_by_heartbeat)
+        (task, attribution)
     };
 
-    let (timed_out_task, timed_out_by_heartbeat) = timed_out_task;
+    let (timed_out_task, attribution) = timed_out_task;
     if let Some(map_item) = timed_out_task.map_item.clone() {
         fail_map_item(
             state,
@@ -2494,7 +2514,7 @@ fn timeout_activity(
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(activity_id, timed_out_task.attempt, timed_out_by_heartbeat),
+                timeout_message(activity_id, timed_out_task.attempt, attribution),
             ),
         )?;
         return Ok(true);
@@ -2516,7 +2536,7 @@ fn timeout_activity(
         event_type: crate::HistoryEventType::ActivityTimedOut,
         data: HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: timed_out_task.command_id,
-            message: timeout_message(activity_id, timed_out_task.attempt, timed_out_by_heartbeat),
+            message: timeout_message(activity_id, timed_out_task.attempt, attribution),
         }),
     });
     run.ready = Some(WorkflowTaskReason::ActivityTimedOut);
@@ -3153,6 +3173,13 @@ fn normalize_activity_map_input_manifest_for_storage(
         .pages
         .into_iter()
         .map(|page| {
+            // A foreign-scheme page under an inline root is opaque: the
+            // owning layer normalized its items before this commit, so it
+            // passes through untouched (mirroring the reachability
+            // collectors' external-page skip).
+            if is_external_payload_ref(&page) {
+                return Ok(page);
+            }
             let page = hydrate_payload_from_storage(state, page)?;
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page

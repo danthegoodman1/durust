@@ -1,14 +1,14 @@
 use crate::provider_util::{
-    ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
-    activity_failure_decision, activity_timeout_at_ms, activity_timeout_at_ms_from,
-    activity_timeout_decision, child_terminal_event_data_and_reason,
-    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
-    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
-    decode_encryption_metadata, duration_millis_i64, encode_encryption_metadata,
-    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
-    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms,
-    timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
+    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
+    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
+    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
+    compression_to_str, decode_encryption_metadata, duration_millis_i64,
+    encode_encryption_metadata, event_type_from_str, event_type_to_str, marker_kind_from_str,
+    marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
+    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
+    unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityHeartbeatOutcome, ActivityHeartbeatRequest, ActivityId,
@@ -45,7 +45,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 5;
+const POSTGRES_SCHEMA_VERSION: i64 = 6;
 const DEFAULT_SCHEMA: &str = "durust";
 const DEFAULT_MAX_POOL_SIZE: usize = 16;
 const DEFAULT_LOGICAL_SHARDS: u32 = 1;
@@ -380,6 +380,7 @@ impl PostgresBackend {
                     completed boolean not null,
                     timeout_at_ms bigint,
                     heartbeat_deadline_at_ms bigint,
+                    implicit_heartbeat_ms bigint,
                     visible_at_ms bigint
                 );
 
@@ -3272,26 +3273,30 @@ impl PostgresBackend {
             .hydrate_activity_task_from_storage_tx(&tx, task)
             .await?;
         let token = next_claim_token(&tx, &schema).await?;
-        // The lease-derived deadline is only produced for tasks without
-        // explicit timeouts, whose stored timeout_at_ms is null; coalesce
-        // keeps explicit deadlines authoritative.
+        // Tasks without explicit timeouts get the lease as an implicit
+        // heartbeat interval; explicit deadlines stay authoritative and the
+        // stored timeout_at_ms is untouched by the claim.
+        let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
+            task.start_to_close_timeout,
+            task.heartbeat_timeout,
+            opts.lease_duration,
+        );
         tx.execute(
             &format!(
                 "update {schema}.activity_tasks
                  set claim_token = $1,
                      heartbeat_deadline_at_ms = $2,
-                     timeout_at_ms = coalesce($3, timeout_at_ms)
+                     implicit_heartbeat_ms = $3
                  where activity_id = $4"
             ),
             &[
                 &i64::try_from(token).unwrap_or(i64::MAX),
-                &activity_timeout_at_ms(task.heartbeat_timeout),
-                &activity_claim_lease_timeout_at_ms(
+                &activity_heartbeat_deadline_at_ms(
                     TimestampMs(now),
-                    task.start_to_close_timeout,
                     task.heartbeat_timeout,
-                    opts.lease_duration,
+                    implicit_heartbeat_ms,
                 ),
+                &implicit_heartbeat_ms,
                 &activity_id.0,
             ],
         )
@@ -3414,21 +3419,29 @@ impl PostgresBackend {
             .iter()
             .map(|token| i64::try_from(*token).unwrap_or(i64::MAX))
             .collect::<Vec<_>>();
-        let heartbeat_deadlines = tasks
-            .iter()
-            .map(|(_, task)| activity_timeout_at_ms(task.heartbeat_timeout).unwrap_or(-1))
-            .collect::<Vec<_>>();
-        // The lease-derived deadline is only produced for tasks without
-        // explicit timeouts, whose stored timeout_at_ms is null; coalesce
-        // keeps explicit deadlines authoritative (-1 marks "no lease value").
-        let lease_timeouts = tasks
+        // Tasks without explicit timeouts get the lease as an implicit
+        // heartbeat interval; explicit deadlines stay authoritative and the
+        // stored timeout_at_ms is untouched by the claim (-1 marks "none" in
+        // the unnest arrays).
+        let implicit_heartbeats = tasks
             .iter()
             .map(|(_, task)| {
-                activity_claim_lease_timeout_at_ms(
-                    TimestampMs(now),
+                activity_claim_implicit_heartbeat_ms(
                     task.start_to_close_timeout,
                     task.heartbeat_timeout,
                     opts.claim.lease_duration,
+                )
+                .unwrap_or(-1)
+            })
+            .collect::<Vec<_>>();
+        let heartbeat_deadlines = tasks
+            .iter()
+            .zip(implicit_heartbeats.iter())
+            .map(|((_, task), implicit)| {
+                activity_heartbeat_deadline_at_ms(
+                    TimestampMs(now),
+                    task.heartbeat_timeout,
+                    (*implicit >= 0).then_some(*implicit),
                 )
                 .unwrap_or(-1)
             })
@@ -3438,16 +3451,16 @@ impl PostgresBackend {
                 "update {schema}.activity_tasks tasks
                  set claim_token = claimed.claim_token,
                      heartbeat_deadline_at_ms = nullif(claimed.heartbeat_deadline_at_ms, -1),
-                     timeout_at_ms = coalesce(nullif(claimed.lease_timeout_at_ms, -1), tasks.timeout_at_ms)
+                     implicit_heartbeat_ms = nullif(claimed.implicit_heartbeat_ms, -1)
                  from unnest($1::text[], $2::bigint[], $3::bigint[], $4::bigint[])
-                      as claimed(activity_id, claim_token, heartbeat_deadline_at_ms, lease_timeout_at_ms)
+                      as claimed(activity_id, claim_token, heartbeat_deadline_at_ms, implicit_heartbeat_ms)
                  where tasks.activity_id = claimed.activity_id"
             ),
             &[
                 &activity_ids,
                 &token_values,
                 &heartbeat_deadlines,
-                &lease_timeouts,
+                &implicit_heartbeats,
             ],
         )
         .await
@@ -3489,7 +3502,7 @@ impl PostgresBackend {
         let Some(row) = tx
             .query_opt(
                 &format!(
-                    "select task, claim_token, completed
+                    "select task, claim_token, completed, implicit_heartbeat_ms
                      from {schema}.activity_tasks
                      where activity_id = $1
                      for update"
@@ -3507,6 +3520,7 @@ impl PostgresBackend {
         let task_blob: Vec<u8> = row.get(0);
         let claim_token: Option<i64> = row.get(1);
         let completed: bool = row.get(2);
+        let implicit_heartbeat_ms: Option<i64> = row.get(3);
         if completed {
             tx.commit().await.map_err(postgres_error)?;
             return Ok(ActivityHeartbeatOutcome::AlreadyCompleted);
@@ -3524,7 +3538,11 @@ impl PostgresBackend {
                  where activity_id = $2"
             ),
             &[
-                &activity_timeout_at_ms(task.heartbeat_timeout),
+                &activity_heartbeat_deadline_at_ms(
+                    TimestampMs(unix_epoch_millis()),
+                    task.heartbeat_timeout,
+                    implicit_heartbeat_ms,
+                ),
                 &req.claim.activity_id.0,
             ],
         )
@@ -3791,7 +3809,8 @@ impl PostgresBackend {
                     &format!(
                         "update {schema}.activity_tasks
                          set completed = true,
-                             heartbeat_deadline_at_ms = null
+                             heartbeat_deadline_at_ms = null,
+                             implicit_heartbeat_ms = null
                          where activity_id = any($1::text[])"
                     ),
                     &[&completed_activity_ids],
@@ -3966,7 +3985,8 @@ impl PostgresBackend {
             &format!(
                 "update {schema}.activity_tasks
                  set completed = true,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = $1"
             ),
             &[&req.claim.activity_id.0],
@@ -4037,6 +4057,7 @@ impl PostgresBackend {
                          claim_token = null,
                          timeout_at_ms = $2,
                          heartbeat_deadline_at_ms = null,
+                         implicit_heartbeat_ms = null,
                          visible_at_ms = $3
                      where activity_id = $4"
                 ),
@@ -4119,7 +4140,8 @@ impl PostgresBackend {
             &format!(
                 "update {schema}.activity_tasks
                  set completed = true,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = $1"
             ),
             &[&req.claim.activity_id.0],
@@ -5108,6 +5130,14 @@ impl PostgresBackend {
         let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
         let mut pages = Vec::with_capacity(manifest.pages.len());
         for page in manifest.pages {
+            // A foreign-scheme page under an inline root is opaque: the
+            // owning layer normalized its items before this commit, so it
+            // passes through untouched (mirroring the reachability
+            // collectors' external-page skip).
+            if is_external_payload_ref(&page) {
+                pages.push(page);
+                continue;
+            }
             let page = self.hydrate_payload_from_storage_tx(tx, page).await?;
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             let mut items = Vec::with_capacity(page.items.len());
@@ -5214,6 +5244,12 @@ impl PostgresBackend {
         let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
         let mut pages = Vec::with_capacity(manifest.pages.len());
         for page in manifest.pages {
+            // A foreign-scheme page under an inline root is opaque here; the
+            // owning layer hydrates it.
+            if is_external_payload_ref(&page) {
+                pages.push(page);
+                continue;
+            }
             let page = self.hydrate_payload_from_storage(page).await?;
             let page_codec = page.codec();
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
@@ -5318,6 +5354,12 @@ impl PostgresBackend {
         let mut manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
         let mut pages = Vec::with_capacity(manifest.pages.len());
         for page in manifest.pages {
+            // A foreign-scheme page under an inline root is opaque here; the
+            // owning layer hydrates it.
+            if is_external_payload_ref(&page) {
+                pages.push(page);
+                continue;
+            }
             let page = self.hydrate_payload_from_storage_tx(tx, page).await?;
             let page_codec = page.codec();
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
@@ -6215,7 +6257,8 @@ async fn cancel_command_operational_state_tx(
             "update {schema}.activity_tasks
              set completed = true,
                  claim_token = null,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null
              where activity_id = $1 or activity_id like $2"
         ),
         &[&activity_id.0, &map_prefix],
@@ -7666,7 +7709,8 @@ async fn complete_map_item_tx(
         &format!(
             "update {schema}.activity_tasks
              set completed = true,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null
              where activity_id = $1"
         ),
         &[&activity_id.0],
@@ -7856,7 +7900,8 @@ async fn fail_map_item_tx(
         &format!(
             "update {schema}.activity_tasks
              set completed = true,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null
              where activity_id = $1"
         ),
         &[&activity_id.0],
@@ -7939,7 +7984,8 @@ async fn fail_map_item_tx(
             "update {schema}.activity_tasks
              set completed = true,
                  claim_token = null,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null
              where activity_id like $1"
         ),
         &[&map_prefix],
@@ -8152,7 +8198,8 @@ async fn timeout_activity_tx(
     let Some(row) = tx
         .query_opt(
             &format!(
-                "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms
+                "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms,
+                        implicit_heartbeat_ms
                  from {schema}.activity_tasks
                  where activity_id = $1
                  for update"
@@ -8168,12 +8215,17 @@ async fn timeout_activity_tx(
     let completed: bool = row.get(1);
     let timeout_at_ms: Option<i64> = row.get(2);
     let heartbeat_deadline_at_ms: Option<i64> = row.get(3);
+    let implicit_heartbeat_ms: Option<i64> = row.get(4);
     let start_timeout_due = timeout_at_ms.is_some_and(|timeout_at_ms| timeout_at_ms <= now.0);
     let heartbeat_timeout_due = heartbeat_deadline_at_ms.is_some_and(|deadline| deadline <= now.0);
     if completed || !(start_timeout_due || heartbeat_timeout_due) {
         return Ok(false);
     }
-    let timed_out_by_heartbeat = timed_out_by_heartbeat(heartbeat_timeout_due, start_timeout_due);
+    let attribution = activity_timeout_attribution(
+        start_timeout_due,
+        heartbeat_timeout_due,
+        implicit_heartbeat_ms.is_some(),
+    );
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
@@ -8192,6 +8244,7 @@ async fn timeout_activity_tx(
                      claim_token = null,
                      timeout_at_ms = $2,
                      heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null,
                      visible_at_ms = null
                  where activity_id = $3"
             ),
@@ -8210,7 +8263,8 @@ async fn timeout_activity_tx(
         &format!(
             "update {schema}.activity_tasks
              set completed = true,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null
              where activity_id = $1"
         ),
         &[&activity_id.0],
@@ -8226,7 +8280,7 @@ async fn timeout_activity_tx(
             map_item,
             DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+                timeout_message(&activity_id, task.attempt, attribution),
             ),
             &activity_id,
         )
@@ -8262,7 +8316,7 @@ async fn timeout_activity_tx(
         event_id,
         HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: task.command_id,
-            message: timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+            message: timeout_message(&activity_id, task.attempt, attribution),
         }),
     )
     .await?;

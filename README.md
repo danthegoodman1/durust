@@ -302,6 +302,13 @@ the heartbeat deadline when the activity task is claimed and refreshes it when
 the activity calls `durust::heartbeat_activity().await?`. A missed heartbeat
 uses the same retry policy as other activity timeouts.
 
+Activities with neither a start-to-close timeout nor a heartbeat timeout use
+their claim lease as an implicit heartbeat interval: a timeout-less activity
+that outlives the worker's activity lease (default 30s) must heartbeat, and
+each heartbeat keeps the claim alive for one more lease. One that stops
+heartbeating — a hung or crashed worker — is reclaimed and retried one lease
+after its last heartbeat.
+
 `RetryPolicy::exponential()` paces retries with provider-enforced backoff: a
 failed attempt's retry becomes claimable `1s * 2^(failed_attempt - 1)` after
 the failure, so a fast-failing activity cannot hot-loop. `RetryPolicy::none()`

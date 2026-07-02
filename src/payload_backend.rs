@@ -48,6 +48,21 @@ pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
     /// the minimum-age grace period.
     fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>>;
 
+    /// Fresh last-modified probe for one blob, consulted by the GC sweep
+    /// immediately before each delete so a content-addressed re-put landing
+    /// after the sweep's listing is not deleted out from under its racing
+    /// commit. `Ok(None)` means the store has no fresh information (missing
+    /// blob or no timestamp support); the sweep then trusts its listing
+    /// snapshot. Defaulted so existing third-party stores keep compiling with
+    /// their current behavior.
+    fn payload_blob_last_modified(
+        &self,
+        digest: String,
+    ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
+        let _ = digest;
+        Box::pin(ready(Ok(None)))
+    }
+
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
 
     fn owns_payload_blob_uri(&self, uri: &str) -> bool;
@@ -439,6 +454,20 @@ where
             if !req.dry_run {
                 deleted_blobs = 0;
                 for digest in &garbage {
+                    // Re-probe the timestamp right before the delete: a
+                    // content-addressed re-put racing the sweep refreshes it,
+                    // and deleting anyway would dangle the racing commit's
+                    // ref. A blob skipped here counts as retained; a failed
+                    // probe leaves the blob alone and reports it so the next
+                    // sweep reconsiders it.
+                    match blob_store.payload_blob_last_modified(digest.clone()).await {
+                        Ok(Some(last_modified)) if last_modified.0 > cutoff => continue,
+                        Ok(_) => {}
+                        Err(_) => {
+                            failed_blobs += 1;
+                            continue;
+                        }
+                    }
                     match blob_store.delete_payload_blob(digest.clone()).await {
                         Ok(()) => deleted_blobs += 1,
                         Err(_) => failed_blobs += 1,
@@ -1373,6 +1402,20 @@ impl PayloadBlobStore for MemoryBlobStore {
             .collect())))
     }
 
+    fn payload_blob_last_modified(
+        &self,
+        digest: String,
+    ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            Ok(blobs
+                .lock()
+                .expect("memory blob store mutex poisoned")
+                .get(&digest)
+                .map(|record| record.last_modified))
+        })
+    }
+
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>> {
         let blobs = self.blobs.clone();
         Box::pin(async move {
@@ -1518,6 +1561,35 @@ impl PayloadBlobStore for S3BlobStore {
         })
     }
 
+    fn payload_blob_last_modified(
+        &self,
+        digest: String,
+    ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
+        let bucket = self.bucket.clone();
+        let key = s3_key(&self.prefix, &digest);
+        Box::pin(async move {
+            match bucket.head_object(&key).await {
+                Ok((head, status)) if (200..300).contains(&status) => {
+                    // HEAD reports Last-Modified as an HTTP-date while
+                    // ListObjectsV2 uses ISO 8601; accept either. An
+                    // existing object with an unparseable timestamp reports
+                    // "now" so GC retains rather than deletes when unsure.
+                    Ok(Some(
+                        head.last_modified
+                            .as_deref()
+                            .and_then(parse_s3_last_modified_ms)
+                            .unwrap_or(TimestampMs(unix_epoch_millis())),
+                    ))
+                }
+                Ok((_, 404)) | Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(None),
+                Ok((_, status)) => Err(Error::Backend(format!(
+                    "head payload blob failed with S3 status {status}"
+                ))),
+                Err(err) => Err(s3_backend_error(err)),
+            }
+        })
+    }
+
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>> {
         let bucket = self.bucket.clone();
         let key = s3_key(&self.prefix, &digest);
@@ -1550,6 +1622,13 @@ async fn s3_object_exists(bucket: &s3::Bucket, key: &str) -> Result<bool> {
     }
 }
 
+/// Parses either Last-Modified form S3 produces: ISO 8601 from ListObjectsV2
+/// or an HTTP-date from a HEAD response header.
+#[cfg(feature = "s3")]
+fn parse_s3_last_modified_ms(value: &str) -> Option<TimestampMs> {
+    parse_iso8601_utc_ms(value).or_else(|| parse_http_date_utc_ms(value))
+}
+
 /// Parses the ISO 8601 UTC timestamps S3 ListObjectsV2 returns
 /// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) into epoch milliseconds.
 #[cfg(feature = "s3")]
@@ -1560,9 +1639,6 @@ fn parse_iso8601_utc_ms(value: &str) -> Option<TimestampMs> {
     let year: i64 = date_parts.next()?.parse().ok()?;
     let month: i64 = date_parts.next()?.parse().ok()?;
     let day: i64 = date_parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
     let mut time_parts = time.splitn(3, ':');
     let hour: i64 = time_parts.next()?.parse().ok()?;
     let minute: i64 = time_parts.next()?.parse().ok()?;
@@ -1578,6 +1654,58 @@ fn parse_iso8601_utc_ms(value: &str) -> Option<TimestampMs> {
         }
         None => (seconds_part.parse().ok()?, 0),
     };
+    civil_utc_to_epoch_ms(year, month, day, hour, minute, second, millis)
+}
+
+/// Parses the RFC 7231 IMF-fixdate form HTTP Last-Modified headers use
+/// (`Tue, 01 Jul 2026 12:34:56 GMT`) into epoch milliseconds.
+#[cfg(feature = "s3")]
+fn parse_http_date_utc_ms(value: &str) -> Option<TimestampMs> {
+    let rest = match value.split_once(", ") {
+        Some((_, rest)) => rest,
+        None => value,
+    };
+    let mut parts = rest.split_ascii_whitespace();
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let mut time_parts = parts.next()?.splitn(3, ':');
+    let hour: i64 = time_parts.next()?.parse().ok()?;
+    let minute: i64 = time_parts.next()?.parse().ok()?;
+    let second: i64 = time_parts.next()?.parse().ok()?;
+    if !matches!(parts.next()?, "GMT" | "UTC") {
+        return None;
+    }
+    civil_utc_to_epoch_ms(year, month, day, hour, minute, second, 0)
+}
+
+#[cfg(feature = "s3")]
+fn civil_utc_to_epoch_ms(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+) -> Option<TimestampMs> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
     if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..=60).contains(&second) {
         return None;
     }
@@ -1721,6 +1849,133 @@ mod tests {
             .expect_err("zero grace period deletes the uncommitted reused blob");
     }
 
+    // Blob store wrapper that performs a content-addressed re-put of another
+    // sentenced digest inside the first delete call, deterministically
+    // landing the reuse in the window between the sweep's listing and its
+    // remaining deletes.
+    #[derive(Clone)]
+    struct ReputOnFirstDeleteStore {
+        inner: MemoryBlobStore,
+        reput: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+    }
+
+    impl PayloadBlobStore for ReputOnFirstDeleteStore {
+        fn put_payload_blob(
+            &self,
+            digest: String,
+            bytes: Vec<u8>,
+        ) -> BoxFuture<'static, Result<String>> {
+            self.inner.put_payload_blob(digest, bytes)
+        }
+
+        fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>> {
+            self.inner.get_payload_blob(digest)
+        }
+
+        fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>> {
+            self.inner.payload_blob_exists(digest)
+        }
+
+        fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>> {
+            self.inner.list_payload_blobs()
+        }
+
+        fn payload_blob_last_modified(
+            &self,
+            digest: String,
+        ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
+            self.inner.payload_blob_last_modified(digest)
+        }
+
+        fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>> {
+            let inner = self.inner.clone();
+            let reput = self.reput.clone();
+            Box::pin(async move {
+                let racing_put = reput.lock().unwrap().take();
+                if let Some((reput_digest, bytes)) = racing_put {
+                    inner.put_payload_blob(reput_digest, bytes).await?;
+                }
+                inner.delete_payload_blob(digest).await
+            })
+        }
+
+        fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+            self.inner.owns_payload_blob_uri(uri)
+        }
+    }
+
+    fn backdate_blob(store: &MemoryBlobStore, digest: &str) {
+        store
+            .blobs
+            .lock()
+            .unwrap()
+            .get_mut(digest)
+            .unwrap()
+            .last_modified = TimestampMs(0);
+    }
+
+    // Reuse-window pin for the decorator sweep: a content-addressed re-put of
+    // an already-past-min_age orphan landing between the sweep's listing and
+    // its delete must not be deleted (the racing commit is about to reference
+    // it). The per-delete timestamp re-probe catches the refresh; without it
+    // the just-re-put blob is lost.
+    #[test]
+    fn gc_sweep_reprobe_skips_orphan_reput_between_listing_and_delete() {
+        let inner = MemoryBlobStore::new();
+        let bytes_x = vec![1_u8; 64];
+        let bytes_y = vec![2_u8; 64];
+        let digest_x = digest_bytes(&bytes_x);
+        let digest_y = digest_bytes(&bytes_y);
+        block_on(inner.put_payload_blob(digest_x.clone(), bytes_x.clone())).unwrap();
+        block_on(inner.put_payload_blob(digest_y.clone(), bytes_y.clone())).unwrap();
+        backdate_blob(&inner, &digest_x);
+        backdate_blob(&inner, &digest_y);
+
+        // The sweep deletes garbage in listing (digest-sorted) order, so the
+        // wrapper's first-delete hook fires for the smaller digest and
+        // re-puts the other one — a reuse landing after the listing but
+        // before that blob's delete.
+        let (first_deleted, reused) = if digest_x < digest_y {
+            (digest_x.clone(), digest_y.clone())
+        } else {
+            (digest_y.clone(), digest_x.clone())
+        };
+        let reused_bytes = if reused == digest_x { bytes_x } else { bytes_y };
+        let store = ReputOnFirstDeleteStore {
+            inner: inner.clone(),
+            reput: Arc::new(Mutex::new(Some((reused.clone(), reused_bytes)))),
+        };
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            store,
+            PayloadStorageConfig::default(),
+        );
+
+        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            dry_run: false,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1, "only the un-reused orphan goes");
+        assert_eq!(outcome.retained_blobs, 1, "the re-put blob counts retained");
+        assert_eq!(outcome.failed_blobs, 0);
+        block_on(inner.get_payload_blob(first_deleted))
+            .expect_err("the un-reused orphan is collected");
+        block_on(inner.get_payload_blob(reused.clone()))
+            .expect("the re-put blob must survive the sweep that sentenced it");
+
+        // Once the reuse ages past min_age again (and no commit landed), a
+        // later sweep collects it normally.
+        backdate_blob(&inner, &reused);
+        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            dry_run: false,
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        block_on(inner.get_payload_blob(reused)).expect_err("aged orphan collected on resweep");
+    }
+
     // Pins the hand-rolled S3 ListObjectsV2 timestamp parser against known
     // epoch values, including a leap-day and fractional seconds.
     #[cfg(feature = "s3")]
@@ -1745,5 +2000,30 @@ mod tests {
         assert_eq!(parse_iso8601_utc_ms("not-a-date"), None);
         assert_eq!(parse_iso8601_utc_ms("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_iso8601_utc_ms("2026-07-01T12:34:56"), None);
+    }
+
+    // HEAD responses carry Last-Modified as an HTTP-date; the shared parser
+    // must accept both forms and reject junk.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn http_date_timestamps_parse_to_epoch_milliseconds() {
+        assert_eq!(
+            parse_http_date_utc_ms("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(TimestampMs(0))
+        );
+        assert_eq!(
+            parse_http_date_utc_ms("Wed, 01 Jul 2026 12:34:56 GMT"),
+            Some(TimestampMs(1_782_909_296_000))
+        );
+        assert_eq!(parse_http_date_utc_ms("Wed, 01 Jul 2026 12:34:56"), None);
+        assert_eq!(parse_http_date_utc_ms("not-a-date"), None);
+        assert_eq!(
+            parse_s3_last_modified_ms("2026-07-01T12:34:56.789Z"),
+            Some(TimestampMs(1_782_909_296_789))
+        );
+        assert_eq!(
+            parse_s3_last_modified_ms("Wed, 01 Jul 2026 12:34:56 GMT"),
+            Some(TimestampMs(1_782_909_296_000))
+        );
     }
 }

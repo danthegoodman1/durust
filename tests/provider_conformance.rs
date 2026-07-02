@@ -82,6 +82,39 @@ async fn signal_race_workflow(_: Input) -> durust::Result<String> {
     durust::signal::<String>("go").await
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PageItem {
+    label: String,
+}
+
+#[durust::activity(name = "conformance.page-item-len")]
+async fn page_item_len(input: PageItem) -> durust::Result<u64> {
+    Ok(input.label.len() as u64)
+}
+
+// Items are ~600 bytes each so a page of five overflows a 2 KiB decorator
+// threshold (page offloaded to the custom scheme) while the manifest root —
+// a handful of page refs — stays inline.
+#[durust::workflow(name = "conformance.foreign-page-map", version = 1)]
+async fn foreign_page_map_workflow(input: Input) -> durust::Result<u64> {
+    let items = (0..input.value).map(|ordinal| PageItem {
+        label: format!("{ordinal:0>600}"),
+    });
+    let input_manifest = durust::activity_map_manifest(items)?;
+    let mapped = durust::activity_map(page_item_len)
+        .task_queue("foreign-page-map-activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("page-item-lens")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok(sum + durust::decode_payload::<u64>(payload)?)
+    })
+}
+
 mod default_name_handlers {
     #[durust::activity]
     pub async fn default_activity(_: DefaultInput) -> durust::Result<()> {
@@ -979,7 +1012,6 @@ fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     });
 }
 
-#[cfg(any(feature = "postgres", feature = "s3"))]
 fn block_on_tokio<F>(future: F) -> F::Output
 where
     F: Future,
@@ -1271,6 +1303,122 @@ where
         durust::decode_payload::<String>(input).unwrap(),
         large_payload("workflow-input")
     );
+}
+
+// 4F pin: a decorator-owned (foreign-scheme) blob page under an inline
+// manifest root must commit and run to completion on every inner provider.
+// Against the pre-fix normalize functions the first commit fails with "blob
+// payload must be hydrated by the durability provider before decode" (the
+// inner provider tries to decode the foreign page) and the task poison-loops.
+async fn inline_root_foreign_page_activity_map_completes<B>(inner: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let blob_store = TestCustomBlobStore::default();
+    let backend = PayloadBackend::with_payload_storage(
+        inner,
+        blob_store.clone(),
+        durust::PayloadStorageConfig::new().inline_threshold_bytes(2048),
+    );
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<foreign_page_map_workflow>(
+            &format!("wf/{prefix}-foreign-page-map"),
+            "foreign-page-map-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue("foreign-page-map-workflows")
+        .activity_task_queue("foreign-page-map-activities")
+        .register_workflow(foreign_page_map_workflow)
+        .register_activity(page_item_len)
+        .build();
+    worker.run_until_idle().await.unwrap();
+
+    // Shape guard: the raw recorded manifest must be an inline root holding
+    // at least one foreign-scheme blob page, or this test stops exercising
+    // the guarded path.
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let scheduled = raw_events
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ActivityMapScheduled(scheduled) => Some(scheduled),
+            _ => None,
+        })
+        .expect("activity map scheduled event");
+    assert!(
+        matches!(&scheduled.input_manifest, durust::PayloadRef::Inline { .. }),
+        "manifest root must stay inline, got {:?}",
+        scheduled.input_manifest
+    );
+    let manifest: ActivityMapInputManifest =
+        durust::decode_payload(&scheduled.input_manifest).unwrap();
+    assert!(!manifest.pages.is_empty());
+    for page in &manifest.pages {
+        assert!(
+            matches!(page, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("test-custom://payload/")),
+            "pages must be foreign-scheme blobs, got {page:?}"
+        );
+    }
+
+    // The run completed with the decoded item lengths, proving materialized
+    // map items and result assembly worked over the foreign pages.
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "expected WorkflowCompleted, got {:?}",
+            history.last().unwrap().data
+        );
+    };
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 5 * 600);
+}
+
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_memory_provider() {
+    block_on(async {
+        inline_root_foreign_page_activity_map_completes(MemoryBackend::new(), "memory").await;
+    });
+}
+
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_sqlite_provider() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("foreign-page.sqlite3")).unwrap();
+        inline_root_foreign_page_activity_map_completes(backend, "sqlite").await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_postgres_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres foreign-page conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("foreign_page");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        inline_root_foreign_page_activity_map_completes(backend, "postgres").await;
+        drop_postgres_schema(&url, &schema).await;
+    });
 }
 
 #[test]
@@ -2221,9 +2369,12 @@ where
     batch_activity_completion_reports_ordered_duplicate_and_stale_results(backend.clone()).await;
     activity_claim_filters_and_stale_completion_is_rejected(backend.clone()).await;
     unexpired_workflow_claim_lease_is_not_reclaimable(backend.clone()).await;
-    // Runs last: its timeout scan uses a far-future `now` that must not
+    // Run last: their timeout scans use far-future `now`s that must not
     // disturb other cases' pending activities.
-    timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder(backend).await;
+    timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder(backend.clone()).await;
+    timeoutless_activity_reclaims_one_lease_after_heartbeats_stop(backend.clone()).await;
+    timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat(backend.clone()).await;
+    explicit_heartbeat_timeout_takes_precedence_over_claim_lease(backend).await;
 }
 
 async fn start_large_payload_workflow<B>(
@@ -6719,6 +6870,552 @@ where
         .expect("activity completion workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
     assert_eq!(ready.run_id, run_id);
+}
+
+// A timeout-less activity whose holder heartbeats and then stops must be
+// reclaimed exactly one lease after the last heartbeat: the heartbeat re-arms
+// the implicit lease-as-heartbeat deadline, so the scan leaves the claim
+// alone just short of it and reclaims reliably once it lapses. The terminal
+// miss records the lease-flavored attribution.
+async fn timeoutless_activity_reclaims_one_lease_after_heartbeats_stop<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-heartbeat-stop",
+        "timeoutless-hb-stop-workflows",
+        "timeoutless-hb-stop-activities",
+    )
+    .await;
+    let lease_ms = i64::try_from(activity_opts.lease_duration.as_millis()).unwrap();
+
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-worker-1"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // The refreshed deadline sits at least one lease past the pre-heartbeat
+    // instant, so a scan just short of that must leave the claim alone.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_none(),
+        "claim must hold until one lease past the last heartbeat"
+    );
+
+    // One lease after the last heartbeat the holder counts as crashed and
+    // the scan reclaims the task as attempt 2.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let second = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-worker-2"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("stopped heartbeats must reclaim one lease after the last one");
+    assert_eq!(second.task.attempt, 2);
+
+    // Every operation from the stopped holder is fenced as stale.
+    let stale_heartbeat = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_heartbeat, Error::StaleLease));
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim.clone(),
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+    let stale_failure = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: durust::DurableFailure::new("conformance.crashed", "stale holder"),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_failure, Error::StaleLease));
+
+    // Attempt 2 exhausts the retry budget without heartbeating; the terminal
+    // miss persists the lease-expiry attribution rather than a
+    // missed-heartbeat or start-to-close message.
+    let second_claimed_at = backend.current_time().await.unwrap();
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(second_claimed_at.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-hb-stop-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("terminal timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out
+            .message
+            .contains("claim lease expired without heartbeat on attempt 2"),
+        "implicit deadline misses need the lease attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// The batch claim RPC must stamp the implicit lease-as-heartbeat state
+// exactly like the scalar claim: Postgres routes it through a set-based
+// unnest update with -1 sentinels while memory/SQLite loop the scalar path.
+// A swapped unnest array or a broken sentinel decode either stamps a garbage
+// deadline (reclaimed immediately, tripping the blocked assertion) or none at
+// all (never reclaimed, tripping the reclaim assertion), so the boundary
+// scans pin both sides.
+async fn timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-batch-claim",
+        "timeoutless-batch-claim-workflows",
+        "timeoutless-batch-claim-activities",
+    )
+    .await;
+    let lease_ms = i64::try_from(activity_opts.lease_duration.as_millis()).unwrap();
+
+    let mut claimed = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-worker-1"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let first = claimed.remove(0);
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // Just short of one lease past the last heartbeat the claim holds: the
+    // heartbeat re-armed the batch-stamped implicit deadline.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-blocked"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_empty(),
+        "batch-claimed implicit deadline must hold until one lease past the last heartbeat"
+    );
+
+    // One lease after the last heartbeat the task reclaims as attempt 2,
+    // again through the batch claim RPC; the old holder is fenced.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let before_second_claim = backend.current_time().await.unwrap();
+    let mut reclaimed = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-worker-2"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "batch-claimed timeout-less task must reclaim one lease after the last heartbeat"
+    );
+    let second = reclaimed.remove(0);
+    assert_eq!(second.task.attempt, 2);
+    let after_second_claim = backend.current_time().await.unwrap();
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+
+    // Attempt 2 never heartbeats, so the deadline observed below is exactly
+    // what the batch claim stamped: it must hold just short of one lease and
+    // lapse just past it. A batch claim that stamps no deadline (or a garbage
+    // one) fails one of these two boundaries. The lapse exhausts the retry
+    // budget and records the lease attribution.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_second_claim.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-blocked-2"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts,
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_empty(),
+        "batch claim must stamp the implicit deadline one full lease ahead"
+    );
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_second_claim.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-batch-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("terminal timeout workflow task (batch claim must stamp a deadline)");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out
+            .message
+            .contains("claim lease expired without heartbeat on attempt 2"),
+        "batch-claimed implicit misses need the lease attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// An explicit heartbeat timeout stays authoritative over the claim lease: an
+// activity with a 200ms heartbeat timeout under a 30s lease is reclaimed on
+// the 200ms cadence when heartbeats stop, and the miss is attributed to the
+// heartbeat, not the lease.
+async fn explicit_heartbeat_timeout_takes_precedence_over_claim_lease<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_heartbeat_activity(
+        backend.clone(),
+        "wf/explicit-heartbeat-precedence",
+        "explicit-hb-precedence-workflows",
+        "explicit-hb-precedence-activities",
+        durust::RetryPolicy::exponential().max_attempts(1),
+    )
+    .await;
+    assert_eq!(activity_opts.lease_duration, Duration::from_secs(30));
+
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("explicit-hb-precedence-worker"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("heartbeat activity");
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // Just short of the 200ms explicit cadence the claim holds.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(199)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("explicit-hb-precedence-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // 201ms after the last heartbeat — far inside the 30s lease — the
+    // explicit cadence reclaims the task; the exhausted retry budget makes
+    // the miss terminal with the missed-heartbeat attribution.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(201)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("explicit-hb-precedence-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("heartbeat timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out.message.contains("missed heartbeat on attempt 1"),
+        "explicit heartbeat misses keep the heartbeat attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// A timeout-less activity whose holder heartbeats faithfully must survive
+// past the original claim lease indefinitely: each heartbeat re-arms the
+// implicit lease-as-heartbeat deadline. `pass_partial_lease` moves provider
+// time a large fraction of the lease per cycle (virtual time for memory,
+// wall-clock waiting for the SQL providers), so three cycles put provider
+// time well past the deadline stamped at claim.
+async fn heartbeating_timeoutless_activity_survives_lease_periods<B, F, Fut>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+    lease: Duration,
+    pass_partial_lease: F,
+) where
+    B: DurableBackend,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let (run_id, claim_opts, mut activity_opts) =
+        schedule_timeoutless_activity(backend.clone(), workflow_id, workflow_queue, activity_queue)
+            .await;
+    activity_opts.lease_duration = lease;
+    let lease_ms = i64::try_from(lease.as_millis()).unwrap();
+
+    let claimed = backend
+        .claim_activity_task(WorkerId::new("hb-timeoutless-worker"), activity_opts)
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(claimed.task.attempt, 1);
+    let claimed_at = backend.current_time().await.unwrap();
+
+    for _ in 0..3 {
+        pass_partial_lease().await;
+        // The scan runs before this cycle's heartbeat, so it observes the
+        // deadline as re-armed by the previous heartbeat only.
+        let now = backend.current_time().await.unwrap();
+        backend
+            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                namespace: Namespace::default(),
+                now,
+                limit: 16,
+            })
+            .await
+            .unwrap();
+        let recorded = backend
+            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+                claim: claimed.claim.clone(),
+            })
+            .await
+            .expect("heartbeating holder must never be reclaimed");
+        assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    }
+    let now = backend.current_time().await.unwrap();
+    assert!(
+        now.0 > claimed_at.0.saturating_add(lease_ms),
+        "test must outlive the deadline stamped at claim time"
+    );
+
+    // The original holder completes normally: exactly one attempt ran and no
+    // timeout was recorded.
+    let completed = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: claimed.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        durust::CompleteActivityOutcome::Completed { .. }
+    ));
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("hb-timeoutless-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    assert!(
+        history
+            .iter()
+            .all(|event| !matches!(event.data, HistoryEventData::ActivityTimedOut(_))),
+        "no timeout may fire for a heartbeating holder: {history:?}"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+            .count(),
+        1,
+        "exactly one attempt completes"
+    );
+}
+
+#[test]
+fn memory_heartbeating_timeoutless_activity_survives_lease_periods_on_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/memory-hb-timeoutless",
+            "memory-hb-timeoutless-workflows",
+            "memory-hb-timeoutless-activities",
+            Duration::from_secs(30),
+            move || {
+                let advance_backend = advance_backend.clone();
+                async move {
+                    advance_backend.advance_time(Duration::from_secs(20));
+                }
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_heartbeating_timeoutless_activity_survives_lease_periods() {
+    block_on_tokio(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("hb-timeoutless.sqlite3")).unwrap();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/sqlite-hb-timeoutless",
+            "sqlite-hb-timeoutless-workflows",
+            "sqlite-hb-timeoutless-activities",
+            Duration::from_millis(500),
+            || async { tokio::time::sleep(Duration::from_millis(200)).await },
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_heartbeating_timeoutless_activity_survives_lease_periods_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres heartbeat lease conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("hb_timeoutless");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/postgres-hb-timeoutless",
+            "postgres-hb-timeoutless-workflows",
+            "postgres-hb-timeoutless-activities",
+            Duration::from_millis(500),
+            || async { tokio::time::sleep(Duration::from_millis(200)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
 }
 
 async fn cancel_commands_clear_activity_tasks<B>(backend: B)

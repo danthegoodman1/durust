@@ -1063,14 +1063,24 @@ fingerprint includes that resolved option set, so changing defaults or
 overrides before a recorded activity command is a nondeterministic replay change
 unless it is protected by a version marker.
 
-Heartbeat enforcement is disabled by default. If a scheduled activity has a
-heartbeat timeout, the provider starts an operational heartbeat deadline when
-the activity task is claimed. Activity code may call
-`durust::heartbeat_activity().await?`; providers must accept only the currently
-claimed activity token, reject stale heartbeat claims, and refresh the deadline.
-Missed heartbeats are handled by the generic activity timeout scanner: retry
-attempts are rescheduled according to the stored retry policy, and only the
-terminal miss appends `ActivityTimedOut`.
+Activity liveness has three deadline sources. An explicit start-to-close
+timeout stamps the task's `timeout_at` when it is scheduled (restarting at
+retry visibility). An explicit heartbeat timeout starts an operational
+heartbeat deadline when the activity task is claimed; each accepted heartbeat
+refreshes it by the explicit interval. A task with neither timeout uses its
+claim lease as an implicit heartbeat interval: the claim stamps the heartbeat
+deadline one lease ahead and persists the interval on the claimed row, and
+each accepted heartbeat re-arms it, so a faithfully heartbeating holder
+survives indefinitely while a hung or crashed one is reclaimed one lease after
+its last heartbeat (or one lease after the claim if it never heartbeat).
+Activity code may call `durust::heartbeat_activity().await?`; providers must
+accept only the currently claimed activity token, reject stale heartbeat
+claims, and refresh the deadline, with an explicit heartbeat timeout taking
+precedence over the implicit lease interval. Missed deadlines are handled by
+the generic activity timeout scanner: retry attempts are rescheduled according
+to the stored retry policy, and only the terminal miss appends
+`ActivityTimedOut`, attributed to the start-to-close deadline, the missed
+heartbeat, or the expired claim lease.
 
 Activity and workflow errors must be represented as a serializable Durust
 failure envelope before they are written to history:
@@ -2563,14 +2573,20 @@ cheaply refresh the timestamp on a deduplicated put do so: local directories
 touch the file mtime, the in-memory stores refresh under their lock, and the
 SQL providers refresh through the row-conflict update whose lock the GC
 delete's timestamp predicate re-evaluates under, which closes the
-sentence-then-reuse race transactionally for provider-internal blobs. Decorator
-blob stores narrow that race rather than close it: the sweep does not re-check
-timestamps between its listing and its deletes, so a put or exists-probe that
-reuses an orphan already past `min_age` while a sweep is running can still lose
-the blob to that sweep. S3 additionally skips the timestamp refresh entirely
-because a copy-object round trip per put is not worth it. Operators size
-`min_age` accordingly: above the maximum upload-to-commit latency plus one full
-GC sweep, which the one-hour default dwarfs.
+sentence-then-reuse race transactionally for provider-internal blobs. The
+decorator sweep re-probes each candidate's last-modified timestamp immediately
+before deleting it (`PayloadBlobStore::payload_blob_last_modified`; the
+in-tree memory and S3 stores implement it, S3 via HEAD Last-Modified), so a
+re-put that lands after the sweep's listing but before that blob's pre-delete
+probe is retained; only the sliver between the probe and the delete itself
+stays exposed. The
+residual window shrinks to stores that cannot report a fresh timestamp — the
+defaulted probe returns no information and the sweep trusts its listing
+snapshot — and to S3 deduplicated puts, which skip the timestamp refresh
+because a copy-object round trip per put is not worth it (fresh S3 uploads do
+get a new Last-Modified the re-probe observes). Operators size `min_age`
+accordingly: above the maximum upload-to-commit latency plus one full GC
+sweep, which the one-hour default dwarfs.
 
 Reachability marks leaf blobs from the ref's digest alone; only manifest
 containers load, because traversal needs their contents. If a committed
@@ -2645,7 +2661,7 @@ ready_workflows
   run_id
   latest_event_id
   reason
-  lease_owner
+  claim_token
   lease_until
 
 signals
@@ -2674,8 +2690,11 @@ activities
   failure_ref
   attempt
   retry_policy_ref
-  lease_owner
-  lease_until
+  claim_token
+  timeout_at
+  heartbeat_deadline_at
+  implicit_heartbeat_ms
+  visible_at
   status
 
 activity_maps
@@ -2745,6 +2764,17 @@ idempotency
   result_ref
   expires_at
 ```
+
+Claims carry a fencing `claim_token`, not an owner identity: every claim and
+reclaim mints a fresh token and stale holders are rejected by token
+comparison, which is strictly stronger than matching an owner id. A
+`lease_owner` column is deliberately omitted; an implementation that records
+the claiming worker id keeps it as observability metadata only. Workflow
+claims store `lease_until` for reclaim eligibility. Activity claims need no
+separate lease column: explicit deadlines reclaim through `timeout_at` and
+`heartbeat_deadline_at`, and a timeout-less activity persists its claim lease
+as `implicit_heartbeat_ms`, which drives the same heartbeat deadline (section
+6.3).
 
 ## 19.1 Terminal cleanup
 
