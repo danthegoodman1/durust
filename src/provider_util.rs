@@ -4,12 +4,17 @@
 //! silently diverging.
 
 use crate::{
-    ActivityId, ActivityTask, ChildWorkflowMapItemOutcome, CodecId, CommandId, CompressionId,
-    EncryptionMetadata, Error, HistoryEventData, HistoryEventType, ParentClosePolicy, Result,
-    TimestampMs, WaitKind, WorkflowChangeMarkerKind, WorkflowTaskCommit, WorkflowTaskReason,
+    ActivityId, ActivityTask, ChildWorkflowMapItemOutcome, CommandId, HistoryEventData,
+    TimestampMs, WorkflowTaskCommit, WorkflowTaskReason,
+};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use crate::{
+    CodecId, CompressionId, EncryptionMetadata, Error, HistoryEventType, ParentClosePolicy, Result,
+    WaitKind, WorkflowChangeMarkerKind,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn codec_to_str(codec: CodecId) -> &'static str {
     match codec {
         CodecId::MessagePack => "messagepack",
@@ -17,6 +22,7 @@ pub(crate) fn codec_to_str(codec: CodecId) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn codec_from_str(value: &str) -> Result<CodecId> {
     match value {
         "messagepack" => Ok(CodecId::MessagePack),
@@ -27,12 +33,14 @@ pub(crate) fn codec_from_str(value: &str) -> Result<CodecId> {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn compression_to_str(compression: CompressionId) -> &'static str {
     match compression {
         CompressionId::None => "none",
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn compression_from_str(value: &str) -> Result<CompressionId> {
     match value {
         "none" => Ok(CompressionId::None),
@@ -42,6 +50,7 @@ pub(crate) fn compression_from_str(value: &str) -> Result<CompressionId> {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn encode_encryption_metadata(
     encryption: &Option<EncryptionMetadata>,
 ) -> Result<Option<Vec<u8>>> {
@@ -53,6 +62,7 @@ pub(crate) fn encode_encryption_metadata(
         .transpose()
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn decode_encryption_metadata(
     blob: Option<Vec<u8>>,
 ) -> Result<Option<EncryptionMetadata>> {
@@ -110,6 +120,33 @@ pub(crate) fn timeout_message(activity_id: &ActivityId, attempt: u32, heartbeat:
 
 pub(crate) fn should_retry_activity(task: &ActivityTask) -> bool {
     task.attempt < task.retry_policy.max_attempts.max(1)
+}
+
+/// Base delay before the first exponential retry; every further failed
+/// attempt doubles it.
+pub(crate) const RETRY_BACKOFF_BASE_MS: i64 = 1_000;
+
+/// Visibility deadline for the retry scheduled after `failed_attempt` failed
+/// (attempts are 1-based). `None` means the retry is immediately claimable
+/// (`RetryBackoff::None`); `RetryBackoff::Exponential` yields
+/// `now + base * 2^(failed_attempt - 1)`, saturating instead of overflowing so
+/// absurd attempt counts push visibility to the far future rather than
+/// wrapping into the past. Backoff paces explicit activity failures only;
+/// timeout retries are already paced by the timeout deadline itself.
+pub(crate) fn retry_visible_at_ms(
+    policy: &crate::RetryPolicy,
+    failed_attempt: u32,
+    now: TimestampMs,
+) -> Option<i64> {
+    match policy.backoff {
+        crate::RetryBackoff::None => None,
+        crate::RetryBackoff::Exponential => {
+            let exponent = failed_attempt.saturating_sub(1).min(62);
+            let factor = 1_i64 << exponent;
+            let delay = RETRY_BACKOFF_BASE_MS.saturating_mul(factor);
+            Some(now.0.saturating_add(delay))
+        }
+    }
 }
 
 pub(crate) enum ActivityFailureDecision {
@@ -247,6 +284,7 @@ pub(crate) fn unix_epoch_millis() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn ready_at_ms_for_delay(delay: Duration) -> i64 {
     if delay.is_zero() {
         0
@@ -262,10 +300,12 @@ pub(crate) fn payload_gc_cutoff_ms(now_ms: i64, min_age: Duration) -> i64 {
     now_ms.saturating_sub(duration_millis_i64(min_age))
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
     activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn activity_timeout_at_ms_from(
     now: TimestampMs,
     timeout: Option<Duration>,
@@ -301,6 +341,7 @@ pub(crate) fn activity_claim_lease_timeout_at_ms(
 // policies). Values are part of each provider's on-disk format and must never
 // change; `persisted_codec_strings_are_pinned` pins them.
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
     match reason {
         WorkflowTaskReason::WorkflowStarted => "workflow_started",
@@ -321,6 +362,7 @@ pub(crate) fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
     match value {
         "workflow_started" => Ok(WorkflowTaskReason::WorkflowStarted),
@@ -344,6 +386,7 @@ pub(crate) fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
     match event_type {
         HistoryEventType::WorkflowStarted => "workflow_started",
@@ -377,6 +420,7 @@ pub(crate) fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
     match value {
         "workflow_started" => Ok(HistoryEventType::WorkflowStarted),
@@ -411,6 +455,7 @@ pub(crate) fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
     match kind {
         WaitKind::Timer => "timer",
@@ -418,6 +463,7 @@ pub(crate) fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn marker_kind_to_str(kind: WorkflowChangeMarkerKind) -> &'static str {
     match kind {
         WorkflowChangeMarkerKind::Version => "version",
@@ -425,6 +471,7 @@ pub(crate) fn marker_kind_to_str(kind: WorkflowChangeMarkerKind) -> &'static str
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKind> {
     match value {
         "version" => Ok(WorkflowChangeMarkerKind::Version),
@@ -435,6 +482,7 @@ pub(crate) fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKi
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static str {
     match policy {
         ParentClosePolicy::Cancel => "cancel",
@@ -600,6 +648,7 @@ mod tests {
     use super::commit_test_support;
     use super::*;
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     fn encryption_metadata_round_trips_through_the_provider_codec() {
         // The encryption column is spec'd forward-compatibility metadata. Exercise the
@@ -652,6 +701,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     fn codec_and_compression_strings_round_trip() {
         for codec in [CodecId::MessagePack, CodecId::Json] {
@@ -665,6 +715,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]
     fn persisted_codec_strings_are_pinned() {
         // These strings live in provider storage (ready_reason and event_type
@@ -857,6 +908,45 @@ mod tests {
             Some(WorkflowTaskReason::SignalReceived)
         );
         assert_eq!(post_commit_ready_reason(false, None, false), None);
+    }
+
+    #[test]
+    fn retry_visible_at_doubles_per_failed_attempt_and_saturates() {
+        let now = TimestampMs(10_000);
+        // No backoff: the retry is immediately claimable.
+        assert_eq!(
+            retry_visible_at_ms(&crate::RetryPolicy::none(), 1, now),
+            None
+        );
+        let exponential = crate::RetryPolicy::exponential();
+        // base * 2^(failed_attempt - 1): 1s, 2s, 4s, ...
+        assert_eq!(
+            retry_visible_at_ms(&exponential, 1, now),
+            Some(10_000 + RETRY_BACKOFF_BASE_MS)
+        );
+        assert_eq!(
+            retry_visible_at_ms(&exponential, 2, now),
+            Some(10_000 + 2 * RETRY_BACKOFF_BASE_MS)
+        );
+        assert_eq!(
+            retry_visible_at_ms(&exponential, 3, now),
+            Some(10_000 + 4 * RETRY_BACKOFF_BASE_MS)
+        );
+        // Attempt 0 is treated as attempt 1 rather than underflowing.
+        assert_eq!(
+            retry_visible_at_ms(&exponential, 0, now),
+            Some(10_000 + RETRY_BACKOFF_BASE_MS)
+        );
+        // Huge attempt counts and a now near the epoch ceiling saturate
+        // instead of wrapping into the past.
+        assert_eq!(
+            retry_visible_at_ms(&exponential, u32::MAX, now),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            retry_visible_at_ms(&exponential, 1, TimestampMs(i64::MAX)),
+            Some(i64::MAX)
+        );
     }
 
     #[test]

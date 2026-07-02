@@ -1,11 +1,11 @@
 use proc_macro::TokenStream;
-use quote::{format_ident, quote, ToTokens};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
 use syn::visit::Visit;
 use syn::{
-    parse_macro_input, Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn,
-    Lit, LitStr, Meta, Pat, Path, PathArguments, ReturnType, Token, Type, TypePath,
+    Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitStr, Meta,
+    Pat, Path, PathArguments, ReturnType, Token, Type, TypePath, parse_macro_input,
 };
 
 struct MacroArgs {
@@ -196,8 +196,13 @@ fn expand_handler_inner(
         .query_state
         .clone()
         .unwrap_or_else(|| syn::parse_quote!(()));
-    let rust_path =
-        quote!(concat!(env!("CARGO_PKG_NAME"), "::", module_path!(), "::", stringify!(#ident)));
+    let rust_path = quote!(concat!(
+        env!("CARGO_PKG_NAME"),
+        "::",
+        module_path!(),
+        "::",
+        stringify!(#ident)
+    ));
     let name = match parsed.name {
         Some(name) => quote!(#name),
         None => rust_path.clone(),
@@ -250,13 +255,13 @@ fn expand_handler_inner(
                     output_type: <#ident as ::durust::Workflow>::output_type_name().to_owned(),
                     query_state_type: <#ident as ::durust::Workflow>::query_state_type_name()
                         .map(str::to_owned),
-                    input_schema_hash: ::durust::type_name_fingerprint(
+                    input_type_name_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Workflow>::input_type_name(),
                     ),
-                    output_schema_hash: ::durust::type_name_fingerprint(
+                    output_type_name_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Workflow>::output_type_name(),
                     ),
-                    query_state_schema_hash: <#ident as ::durust::Workflow>::query_state_type_name()
+                    query_state_type_name_hash: <#ident as ::durust::Workflow>::query_state_type_name()
                         .map(::durust::type_name_fingerprint),
                 }
             }
@@ -274,10 +279,10 @@ fn expand_handler_inner(
                     rust_path: <#ident as ::durust::Activity>::RUST_PATH.to_owned(),
                     input_type: <#ident as ::durust::Activity>::input_type_name().to_owned(),
                     output_type: <#ident as ::durust::Activity>::output_type_name().to_owned(),
-                    input_schema_hash: ::durust::type_name_fingerprint(
+                    input_type_name_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Activity>::input_type_name(),
                     ),
-                    output_schema_hash: ::durust::type_name_fingerprint(
+                    output_type_name_hash: ::durust::type_name_fingerprint(
                         <#ident as ::durust::Activity>::output_type_name(),
                     ),
                 }
@@ -495,18 +500,15 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     }
 
-    let branch_digest = branches
-        .iter()
-        .map(|branch| {
-            format!(
-                "{}={}",
-                branch.pattern.to_token_stream(),
-                branch.future.to_token_stream()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|");
-    let branch_digest = LitStr::new(&branch_digest, proc_macro2::Span::call_site());
+    // Structural digest: only the branch count. Reordering and swapping
+    // branches is caught by the recorded winner ordinal plus per-command
+    // fingerprints, so hashing branch source text would only make benign
+    // refactors (renames, reformatting) break replay of old histories.
+    // `select_all` records the matching `select_all:{count}` form.
+    let branch_digest = LitStr::new(
+        &format!("select:{}", branches.len()),
+        proc_macro2::Span::call_site(),
+    );
 
     let futures = branches
         .iter()
@@ -516,7 +518,10 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(|branch| &branch.pattern)
         .collect::<Vec<_>>();
-    let bodies = branches.iter().map(|branch| &branch.body).collect::<Vec<_>>();
+    let bodies = branches
+        .iter()
+        .map(|branch| &branch.body)
+        .collect::<Vec<_>>();
     let future_vars = (0..branches.len())
         .map(|index| format_ident!("__durust_select_future_{index}"))
         .collect::<Vec<_>>();
@@ -524,12 +529,7 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
         .map(|index| format_ident!("__durust_select_output_{index}"))
         .collect::<Vec<_>>();
     let branch_ordinals = (0..branches.len())
-        .map(|index| {
-            syn::LitInt::new(
-                &format!("{index}_u32"),
-                proc_macro2::Span::call_site(),
-            )
-        })
+        .map(|index| syn::LitInt::new(&format!("{index}_u32"), proc_macro2::Span::call_site()))
         .collect::<Vec<_>>();
     let output_messages = (0..branches.len())
         .map(|index| {
@@ -605,19 +605,18 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
                 }
             })
             .collect::<Vec<_>>();
-    let cancel_losers =
-        future_vars
-            .iter()
-            .zip(output_vars.iter())
-            .zip(branch_ordinals.iter())
-            .map(|((future_var, output_var), branch_ordinal)| {
-                quote! {
-                    if __durust_select_branch_ordinal != #branch_ordinal && #output_var.is_none() {
-                        ::durust::DurableSelectBranch::__durust_cancel_branch(&#future_var);
-                    }
+    let cancel_losers = future_vars
+        .iter()
+        .zip(output_vars.iter())
+        .zip(branch_ordinals.iter())
+        .map(|((future_var, output_var), branch_ordinal)| {
+            quote! {
+                if __durust_select_branch_ordinal != #branch_ordinal && #output_var.is_none() {
+                    ::durust::DurableSelectBranch::__durust_cancel_branch(&#future_var);
                 }
-            })
-            .collect::<Vec<_>>();
+            }
+        })
+        .collect::<Vec<_>>();
     let match_arms = branch_ordinals
         .iter()
         .zip(patterns.iter())
@@ -810,7 +809,13 @@ impl ParsedArgs {
         let mut parsed = Self::default();
         for meta in args.items {
             match meta {
-                Meta::Path(path) if path.is_ident("strict") => {}
+                Meta::Path(path) if path.is_ident("strict") => {
+                    return Err(syn::Error::new_spanned(
+                        path,
+                        "strict mode is not implemented yet; remove `strict` or pin the durust \
+                         version that ships it",
+                    ));
+                }
                 Meta::NameValue(name_value) if name_value.path.is_ident("name") => {
                     parsed.name = Some(lit_string(&name_value.value, "name")?);
                 }
@@ -863,9 +868,15 @@ fn lint_workflow_body(item_fn: &ItemFn) -> syn::Result<()> {
     let forbidden = [
         ("tokio :: time :: sleep", "use durust::sleep instead"),
         ("tokio :: select", "use durust::select! instead"),
-        ("tokio :: spawn", "use durust::spawn or durust::join! instead"),
+        (
+            "tokio :: spawn",
+            "use durust::spawn or durust::join! instead",
+        ),
         ("std :: time :: Instant :: now", "use durust::now instead"),
-        ("std :: time :: SystemTime :: now", "use durust::now instead"),
+        (
+            "std :: time :: SystemTime :: now",
+            "use durust::now instead",
+        ),
         (
             "rand :: random",
             "use durust::side_effect(...).await instead",

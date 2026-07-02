@@ -4,10 +4,11 @@ use durust::{
     ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CommitOutcome,
     CompleteActivityRequest, CompleteActivityTasksRequest, DurableBackend, Error, EventId,
     FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent,
-    PayloadBackend, PayloadBlobStore, PostgresBackend, PostgresBackendConfig, Registry,
-    SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowTaskCommit, WorkflowTaskCommitBatch,
-    WorkflowTaskCommitInput, WorkflowType,
+    PayloadBackend, PayloadBlobStore, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
+    WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
 };
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,9 @@ use std::env;
 use std::fs;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "s3")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Input {
@@ -27,10 +30,12 @@ fn input(value: u64) -> Input {
     Input { value }
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_url_from_env() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_test_schema(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -39,6 +44,7 @@ fn postgres_test_schema(prefix: &str) -> String {
     format!("durust_{prefix}_{}_{}", std::process::id(), millis)
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -56,6 +62,7 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -104,6 +111,7 @@ fn sqlite_provider_passes_basic_conformance() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_provider_passes_basic_conformance_when_configured() {
     block_on_tokio(async {
@@ -222,6 +230,7 @@ fn sqlite_workflow_lease_expiry_reclaims_and_fences_stale_holder_across_reopen()
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configured() {
     block_on_tokio(async {
@@ -280,6 +289,7 @@ fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
     block_on_tokio(async {
@@ -356,6 +366,242 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             .unwrap();
         assert!(visible.is_some());
     });
+}
+
+#[test]
+fn memory_activity_retry_backoff_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        exponential_backoff_hides_retry_until_visible(
+            backend.clone(),
+            backend,
+            "memory",
+            move |activity_opts| async move {
+                // Pin the exact visibility boundary: one millisecond before
+                // the 1s first-attempt backoff the retry is still hidden.
+                advance_backend.advance_time(Duration::from_millis(999));
+                let hidden = advance_backend
+                    .claim_activity_task(WorkerId::new("memory-backoff-boundary"), activity_opts)
+                    .await
+                    .unwrap();
+                assert!(hidden.is_none(), "retry visible before its backoff elapsed");
+                advance_backend.advance_time(Duration::from_millis(1));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_activity_retry_backoff_persists_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-backoff.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        // The retry side runs on a reopened provider so the visibility
+        // deadline is proven to live in the database, not in memory.
+        let reopened = SqliteBackend::open(&path).unwrap();
+        exponential_backoff_hides_retry_until_visible(backend, reopened, "sqlite", |_| async {
+            std::thread::sleep(Duration::from_millis(1_000));
+        })
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_activity_retry_backoff_delays_reclaim_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres retry backoff conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("retry_backoff");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        exponential_backoff_hides_retry_until_visible(
+            backend.clone(),
+            backend,
+            "postgres",
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+            },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+// Shared exponential-backoff suite: a failing activity's retry is hidden from
+// claims until `now + base * 2^(attempt - 1)`, claimable afterwards, and the
+// workflow still completes on the retried attempt. `pass_backoff` moves the
+// provider clock past the 1s first-attempt backoff (virtual time for memory,
+// wall-clock waiting for the SQL providers); `retry_backend` performs every
+// post-failure call so SQLite can prove the persisted deadline across a
+// reopen.
+async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
+    backend: B,
+    retry_backend: R,
+    prefix: &str,
+    pass_backoff: F,
+) where
+    B: DurableBackend,
+    R: DurableBackend,
+    F: FnOnce(ClaimActivityOptions) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let client = Client::new(backend.clone());
+    let workflow_queue = format!("{prefix}-backoff-workflows");
+    let activity_queue = format!("{prefix}-backoff-activities");
+    let run_id = client
+        .start_workflow::<workflow>(format!("wf/{prefix}-backoff"), &workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(&workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("backoff-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(&activity_queue),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(&activity_queue),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first = backend
+        .claim_activity_task(WorkerId::new("backoff-worker-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+    assert_eq!(
+        backend
+            .fail_activity(FailActivityRequest {
+                claim: first.claim,
+                failure: durust::DurableFailure::new("test.transient", "transient"),
+            })
+            .await
+            .unwrap(),
+        durust::FailActivityOutcome::RetryScheduled { next_attempt: 2 }
+    );
+
+    // The scheduled retry exists but is hidden until its backoff elapses.
+    let hidden = retry_backend
+        .claim_activity_task(WorkerId::new("backoff-worker-2"), activity_opts.clone())
+        .await
+        .unwrap();
+    assert!(hidden.is_none(), "retry visible before its backoff elapsed");
+
+    pass_backoff(activity_opts.clone()).await;
+
+    // Wall clocks are inexact, so the SQL providers poll for the deadline;
+    // memory succeeds on the first claim because virtual time has passed it.
+    let mut second = None;
+    for _ in 0..200 {
+        if let Some(claimed) = retry_backend
+            .claim_activity_task(WorkerId::new("backoff-worker-3"), activity_opts.clone())
+            .await
+            .unwrap()
+        {
+            second = Some(claimed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let second = second.expect("retry should become claimable after its backoff");
+    assert_eq!(second.task.attempt, 2);
+    retry_backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+
+    // The workflow wakes on the retried completion and still runs to a
+    // terminal state.
+    let ready = retry_backend
+        .claim_workflow_task(WorkerId::new("backoff-finisher"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion should wake workflow");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    retry_backend
+        .commit_workflow_task(
+            ready.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: ready.replay_target_event_id,
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCompleted {
+                        result: durust::encode_payload(&9_u64).unwrap(),
+                    },
+                )],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let history = retry_backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    assert!(matches!(
+        history.last().expect("terminal event").data,
+        HistoryEventData::WorkflowCompleted { .. }
+    ));
+    // The retried attempt left no failure event behind.
+    assert!(!history.iter().any(|event| matches!(
+        event.data,
+        HistoryEventData::ActivityFailed(_) | HistoryEventData::ActivityTimedOut(_)
+    )));
 }
 
 #[test]
@@ -608,6 +854,7 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
     });
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
     block_on_tokio(async {
@@ -683,6 +930,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
     });
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     block_on_tokio(async {
@@ -731,6 +979,7 @@ fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     });
 }
 
+#[cfg(any(feature = "postgres", feature = "s3"))]
 fn block_on_tokio<F>(future: F) -> F::Output
 where
     F: Future,
@@ -742,6 +991,7 @@ where
         .block_on(future)
 }
 
+#[cfg(feature = "s3")]
 fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
     let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
@@ -759,6 +1009,7 @@ fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     })
 }
 
+#[cfg(feature = "s3")]
 async fn wait_for_blob_store<S>(blob_store: &S)
 where
     S: durust::PayloadBlobStore,
@@ -1085,6 +1336,7 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
     block_on_tokio(async {
@@ -1854,7 +2106,7 @@ fn registry_generates_manifest_metadata_from_handlers() {
     );
     assert!(
         manifest.workflows[0]
-            .input_schema_hash
+            .input_type_name_hash
             .starts_with("sha256:")
     );
 
@@ -1867,7 +2119,7 @@ fn registry_generates_manifest_metadata_from_handlers() {
     );
     assert!(
         manifest.activities[0]
-            .output_schema_hash
+            .output_type_name_hash
             .starts_with("sha256:")
     );
 }
@@ -1891,7 +2143,7 @@ fn macros_export_manifest_metadata_for_linked_handlers() {
         <workflow as durust::Workflow>::input_type_name()
     );
     assert_eq!(
-        workflow_export.input_schema_hash,
+        workflow_export.input_type_name_hash,
         durust::type_fingerprint::<<workflow as durust::Workflow>::Input>()
     );
 
@@ -1906,7 +2158,7 @@ fn macros_export_manifest_metadata_for_linked_handlers() {
         <echo as durust::Activity>::output_type_name()
     );
     assert_eq!(
-        activity.output_schema_hash,
+        activity.output_type_name_hash,
         durust::type_fingerprint::<<echo as durust::Activity>::Output>()
     );
 }
@@ -5471,7 +5723,10 @@ where
         .expect("workflow task");
     let command_id = durust::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let retry_policy = durust::RetryPolicy::exponential().max_attempts(2);
+    // No backoff: this suite pins retry bookkeeping (attempt counts, history
+    // silence, terminal failure), not retry pacing, and must stay immediate
+    // for every provider clock. Backoff pacing has its own conformance tests.
+    let retry_policy = durust::RetryPolicy::none().max_attempts(2);
     let scheduled = durust::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
@@ -7457,7 +7712,9 @@ where
     .unwrap();
     let activity_name = ActivityName::new("conformance.echo");
     let task_queue = TaskQueue::new("map-failure-activities");
-    let retry_policy = durust::RetryPolicy::exponential().max_attempts(2);
+    // No backoff: the map-failure suite reclaims the retried item
+    // immediately; backoff pacing has its own conformance tests.
+    let retry_policy = durust::RetryPolicy::none().max_attempts(2);
     let map_task = ActivityMapTask {
         map_command_id: command_id.clone(),
         activity_name: activity_name.clone(),

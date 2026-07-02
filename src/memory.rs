@@ -2,7 +2,8 @@ use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_lease_timeout_at_ms,
     activity_failure_decision, activity_timeout_decision, child_terminal_event_data_and_reason,
     child_terminal_map_item_outcome, claim_lease_until_ms, commit_has_workflow_visible_mutations,
-    payload_gc_cutoff_ms, post_commit_ready_reason, timed_out_by_heartbeat, timeout_message,
+    payload_gc_cutoff_ms, post_commit_ready_reason, retry_visible_at_ms, timed_out_by_heartbeat,
+    timeout_message,
 };
 use crate::{
     ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -194,6 +195,9 @@ struct ActivityRecord {
     completed: bool,
     timeout_at: Option<TimestampMs>,
     heartbeat_deadline_at: Option<TimestampMs>,
+    /// Retry-backoff visibility: the task is not claimable before this
+    /// instant. `None` means immediately visible.
+    visible_at: Option<TimestampMs>,
 }
 
 struct ActivityMapRecord {
@@ -704,6 +708,7 @@ impl DurableBackend for MemoryBackend {
                     completed: false,
                     timeout_at,
                     heartbeat_deadline_at: None,
+                    visible_at: None,
                 },
             );
         }
@@ -1046,6 +1051,9 @@ impl DurableBackend for MemoryBackend {
                     .get(&record.task.run_id)
                     .is_none_or(|run| run.terminal || run.namespace != opts.namespace)
                 || activity_due_at(record).is_some_and(|due_at| due_at <= state.now)
+                || record
+                    .visible_at
+                    .is_some_and(|visible_at| visible_at > state.now)
                 || !opts
                     .registered_activity_names
                     .iter()
@@ -1232,7 +1240,14 @@ impl DurableBackend for MemoryBackend {
             };
             record.task.attempt = next_attempt;
             record.claim = None;
-            record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
+            // The retry backoff delays visibility; the start-to-close clock
+            // restarts at the visibility instant so the timeout scanner
+            // cannot fire on a task that was never claimable.
+            let visible_at = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
+            record.visible_at = visible_at.map(TimestampMs);
+            let visible_from = visible_at.map(TimestampMs).unwrap_or(now);
+            record.timeout_at =
+                activity_timeout_at(visible_from, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
             drop(state);
             self.notify_work();
@@ -1511,6 +1526,7 @@ fn materialize_activity_map_items(
                 completed: false,
                 timeout_at,
                 heartbeat_deadline_at: None,
+                visible_at: None,
             },
         );
     }
@@ -2455,8 +2471,12 @@ fn timeout_activity(
 
         let task = record.task.clone();
         if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
+            // Timeout retries carry no backoff: the expired deadline already
+            // paced this attempt, and delaying crash recovery further would
+            // only add latency.
             record.task.attempt = next_attempt;
             record.claim = None;
+            record.visible_at = None;
             record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.heartbeat_deadline_at = None;
             return Ok(true);

@@ -1,24 +1,30 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, PostgresBackend, PostgresBackendConfig, SqliteBackend, TaskQueue,
-    Worker, WorkerId, WorkflowType,
+    MemoryBackend, Namespace, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
 };
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(feature = "postgres")]
 use std::env;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "postgres")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
 
+#[cfg(feature = "postgres")]
 fn postgres_url_from_env() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_test_schema(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,6 +33,7 @@ fn postgres_test_schema(prefix: &str) -> String {
     format!("durust_{prefix}_{}_{}", std::process::id(), millis)
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -44,10 +51,12 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+#[cfg(feature = "postgres")]
 fn block_on_tokio<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -238,6 +247,7 @@ async fn child_spawn_wait_workflow(input: NumberInput) -> durust::Result<u64> {
     child.result().await
 }
 
+#[cfg(feature = "postgres")]
 #[durust::workflow(name = "tests.postgres-inline-child-signal-timer", version = 1)]
 async fn postgres_inline_child_signal_timer(input: NumberInput) -> durust::Result<String> {
     let input = input.value;
@@ -686,6 +696,52 @@ async fn select_then_wait(input: NumberInput) -> durust::Result<String> {
         timer = durust::sleep(Duration::from_millis(input)) => {
             timer?;
             "timer".to_owned()
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
+// Structurally identical to `select_then_wait` (same branches, same order,
+// same commands) but with renamed bind patterns, a differently-spelled future
+// expression, and different variable names inside the branch bodies. The
+// select digest hashes only the branch count, so replaying a history recorded
+// by `select_then_wait` against this refactor must succeed.
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait_reformatted(input: NumberInput) -> durust::Result<String> {
+    let millis = input.value;
+    let first = durust::select! {
+        sig = durust::signal::<String>("ready") => {
+            let payload = sig?;
+            format!("signal:{payload}")
+        }
+        t = durust::sleep(core::time::Duration::from_millis(millis)) => {
+            t?;
+            String::from("timer")
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
+// Same name and same first two branches as `select_then_wait`, plus a third
+// branch appended after them. The appended branch leaves the select command
+// id and every previously recorded branch command at its original sequence,
+// so the branch-count digest is the only validation that can catch the
+// change.
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait_extra_branch(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let first = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+        extra = durust::signal::<String>("extra") => {
+            format!("extra:{}", extra?)
         }
     };
     let after = durust::signal::<String>("after").await?;
@@ -1752,6 +1808,7 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when_configured() {
     block_on_tokio(async {
@@ -4016,6 +4073,130 @@ fn select_replays_recorded_winner_after_worker_crash() {
     });
 }
 
+// Regression: the select digest must not hash branch source text. A benign
+// refactor (renamed bind patterns, reformatted future expressions, renamed
+// body locals) replays a recorded SelectWinner cleanly because the digest
+// pins only the branch count; the stored form is asserted directly.
+#[test]
+fn select_branch_source_refactor_replays_recorded_winner() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_then_wait>("wf/select-refactor", "workflows", number(10))
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        let history = stream_all(&backend, &run_id).await;
+        let winner = history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::SelectWinner(winner) => Some(winner.clone()),
+                _ => None,
+            })
+            .expect("recorded SelectWinner");
+        assert_eq!(winner.branches_digest, "select:2");
+
+        client
+            .signal_workflow(
+                "wf/select-refactor",
+                "after",
+                "signal/select/refactor-after",
+                "done",
+            )
+            .await
+            .unwrap();
+        // Cold replay (single-event chunks) through the refactored workflow
+        // must accept the recorded winner and complete.
+        let mut refactored_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(select_then_wait_reformatted)
+            .build();
+        assert!(refactored_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("completed event").data
+        else {
+            panic!("refactored select workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "timer:done"
+        );
+    });
+}
+
+// Regression for the count-only select digest: a branch appended after the
+// recorded ones keeps the select command id and all prior command
+// fingerprints valid, so the `select:{count}` digest is the sole check that
+// can detect the change. Replay must fail with the digest's nondeterminism
+// error and must not append a terminal event.
+#[test]
+fn select_branch_count_change_is_detected_on_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_then_wait>("wf/select-count-change", "workflows", number(10))
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        client
+            .signal_workflow(
+                "wf/select-count-change",
+                "after",
+                "signal/select/count-after",
+                "done",
+            )
+            .await
+            .unwrap();
+        let mut changed_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait_extra_branch)
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .build();
+        let err = changed_worker.run_workflow_once().await.unwrap_err();
+        let durust::Error::Nondeterminism(message) = err else {
+            panic!("expected nondeterminism error, got {err:?}");
+        };
+        assert!(
+            message.contains("select branch set changed"),
+            "unexpected nondeterminism message: {message}"
+        );
+
+        // The failed replay left the run open: no terminal event appended.
+        let history = stream_all(&backend, &run_id).await;
+        assert!(!history.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::WorkflowCompleted { .. }
+                | HistoryEventData::WorkflowFailed { .. }
+                | HistoryEventData::WorkflowCancelled { .. }
+        )));
+    });
+}
+
 #[test]
 fn select_branch_reorder_is_detected_on_replay() {
     block_on(async {
@@ -5211,9 +5392,20 @@ fn retryable_activity_failure_does_not_append_failure_history() {
             .register_activity(flaky_activity)
             .build();
 
-        let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.workflow_tasks, 2);
-        assert_eq!(stats.activity_tasks, 2);
+        // The first attempt fails; the exponential backoff hides the retry
+        // until virtual time passes its visibility deadline, so the worker
+        // goes idle after one activity task.
+        let first_pass = worker.run_until_idle().await.unwrap();
+        assert_eq!(first_pass.activity_tasks, 1);
+        assert_eq!(*FLAKY_ATTEMPTS.lock().unwrap(), 1);
+        backend.advance_time(Duration::from_secs(1));
+        let second_pass = worker.run_until_idle().await.unwrap();
+        assert_eq!(
+            first_pass.workflow_tasks + second_pass.workflow_tasks,
+            2,
+            "one scheduling task and one completion task"
+        );
+        assert_eq!(second_pass.activity_tasks, 1);
         assert_eq!(*FLAKY_ATTEMPTS.lock().unwrap(), 2);
 
         let history = stream_all(&backend, &run_id).await;

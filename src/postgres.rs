@@ -7,8 +7,8 @@ use crate::provider_util::{
     decode_encryption_metadata, duration_millis_i64, encode_encryption_metadata,
     event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
     parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, timed_out_by_heartbeat, timeout_message,
-    unix_epoch_millis, wait_kind_to_str,
+    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms,
+    timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityHeartbeatOutcome, ActivityHeartbeatRequest, ActivityId,
@@ -45,7 +45,7 @@ use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
 
-const POSTGRES_SCHEMA_VERSION: i64 = 4;
+const POSTGRES_SCHEMA_VERSION: i64 = 5;
 const DEFAULT_SCHEMA: &str = "durust";
 const DEFAULT_MAX_POOL_SIZE: usize = 16;
 const DEFAULT_LOGICAL_SHARDS: u32 = 1;
@@ -379,7 +379,8 @@ impl PostgresBackend {
                     claim_token bigint,
                     completed boolean not null,
                     timeout_at_ms bigint,
-                    heartbeat_deadline_at_ms bigint
+                    heartbeat_deadline_at_ms bigint,
+                    visible_at_ms bigint
                 );
 
                 create table if not exists {schema}.activity_maps (
@@ -3245,6 +3246,7 @@ impl PostgresBackend {
                        and completed = false
                        and claim_token is null
                        and (timeout_at_ms is null or timeout_at_ms > $4)
+                       and (visible_at_ms is null or visible_at_ms <= $4)
                      order by activity_id asc
                      limit 1
                      for update skip locked"
@@ -3349,6 +3351,7 @@ impl PostgresBackend {
                        and completed = false
                        and claim_token is null
                        and (timeout_at_ms is null or timeout_at_ms > $4)
+                       and (visible_at_ms is null or visible_at_ms <= $4)
                      order by activity_id asc
                      limit $5
                      for update skip locked"
@@ -4021,18 +4024,26 @@ impl PostgresBackend {
             retry_task.attempt = next_attempt;
             let retry_blob = rmp_serde::to_vec_named(&retry_task)
                 .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+            // The retry backoff delays visibility; the start-to-close clock
+            // restarts at the visibility instant so the timeout scanner
+            // cannot fire on a task that was never claimable.
+            let now = TimestampMs(unix_epoch_millis());
+            let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
+            let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
             tx.execute(
                 &format!(
                     "update {schema}.activity_tasks
                      set task = $1,
                          claim_token = null,
                          timeout_at_ms = $2,
-                         heartbeat_deadline_at_ms = null
-                     where activity_id = $3"
+                         heartbeat_deadline_at_ms = null,
+                         visible_at_ms = $3
+                     where activity_id = $4"
                 ),
                 &[
                     &retry_blob,
-                    &activity_timeout_at_ms(retry_task.start_to_close_timeout),
+                    &activity_timeout_at_ms_from(visible_from, retry_task.start_to_close_timeout),
+                    &visible_at_ms,
                     &req.claim.activity_id.0,
                 ],
             )
@@ -8167,6 +8178,9 @@ async fn timeout_activity_tx(
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
     if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
+        // Timeout retries carry no backoff: the expired deadline already
+        // paced this attempt, and delaying crash recovery further would only
+        // add latency.
         let mut retry_task = task.clone();
         retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -8177,7 +8191,8 @@ async fn timeout_activity_tx(
                  set task = $1,
                      claim_token = null,
                      timeout_at_ms = $2,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     visible_at_ms = null
                  where activity_id = $3"
             ),
             &[

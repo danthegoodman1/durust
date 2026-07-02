@@ -357,7 +357,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .await
         .unwrap();
         assert_eq!(backend.schema(), schema);
-        assert_eq!(backend.schema_version().await.unwrap(), 4);
+        assert_eq!(backend.schema_version().await.unwrap(), 5);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -5156,7 +5156,9 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             command_id: retry_command_id.clone(),
             activity_name: crate::ActivityName::new("postgres.retry"),
             task_queue: activity_queue.clone(),
-            retry_policy: crate::RetryPolicy::exponential().max_attempts(2),
+            // No backoff: this test reclaims the retry immediately; backoff
+            // pacing has its own conformance test.
+            retry_policy: crate::RetryPolicy::none().max_attempts(2),
             start_to_close_timeout: Some(Duration::from_secs(30)),
             heartbeat_timeout: None,
             input: crate::encode_payload(&"retry-input").unwrap(),

@@ -1393,6 +1393,7 @@ fn memory_blob_uri(digest: &str) -> String {
     format!("memory-blob://payload/{digest}")
 }
 
+#[cfg(feature = "s3")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct S3BlobStoreConfig {
     pub bucket: String,
@@ -1403,6 +1404,7 @@ pub struct S3BlobStoreConfig {
     pub secret_access_key: String,
 }
 
+#[cfg(feature = "s3")]
 #[derive(Clone)]
 pub struct S3BlobStore {
     bucket: Arc<s3::Bucket>,
@@ -1410,6 +1412,7 @@ pub struct S3BlobStore {
     prefix: String,
 }
 
+#[cfg(feature = "s3")]
 impl S3BlobStore {
     pub fn new(config: S3BlobStoreConfig) -> Result<Self> {
         let credentials = s3::creds::Credentials::new(
@@ -1439,6 +1442,7 @@ impl S3BlobStore {
     }
 }
 
+#[cfg(feature = "s3")]
 impl PayloadBlobStore for S3BlobStore {
     fn put_payload_blob(
         &self,
@@ -1533,6 +1537,7 @@ impl PayloadBlobStore for S3BlobStore {
     }
 }
 
+#[cfg(feature = "s3")]
 async fn s3_object_exists(bucket: &s3::Bucket, key: &str) -> Result<bool> {
     match bucket.head_object(key).await {
         Ok((_, status)) if (200..300).contains(&status) => Ok(true),
@@ -1547,6 +1552,7 @@ async fn s3_object_exists(bucket: &s3::Bucket, key: &str) -> Result<bool> {
 
 /// Parses the ISO 8601 UTC timestamps S3 ListObjectsV2 returns
 /// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`) into epoch milliseconds.
+#[cfg(feature = "s3")]
 fn parse_iso8601_utc_ms(value: &str) -> Option<TimestampMs> {
     let value = value.strip_suffix('Z')?;
     let (date, time) = value.split_once('T')?;
@@ -1588,10 +1594,12 @@ fn parse_iso8601_utc_ms(value: &str) -> Option<TimestampMs> {
     ))
 }
 
+#[cfg(feature = "s3")]
 fn normalize_s3_prefix(prefix: &str) -> String {
     prefix.trim_matches('/').to_owned()
 }
 
+#[cfg(feature = "s3")]
 fn s3_key(prefix: &str, digest: &str) -> String {
     if prefix.is_empty() {
         digest.to_owned()
@@ -1600,6 +1608,7 @@ fn s3_key(prefix: &str, digest: &str) -> String {
     }
 }
 
+#[cfg(feature = "s3")]
 fn digest_from_s3_key(prefix: &str, key: &str) -> Option<String> {
     let digest = if prefix.is_empty() {
         key
@@ -1609,10 +1618,12 @@ fn digest_from_s3_key(prefix: &str, key: &str) -> Option<String> {
     digest.starts_with("sha256:").then(|| digest.to_owned())
 }
 
+#[cfg(feature = "s3")]
 fn s3_blob_uri(bucket: &str, key: &str) -> String {
     format!("s3://{bucket}/{key}")
 }
 
+#[cfg(feature = "s3")]
 fn require_s3_success(operation: &str, status: u16) -> Result<()> {
     if (200..300).contains(&status) {
         Ok(())
@@ -1623,10 +1634,12 @@ fn require_s3_success(operation: &str, status: u16) -> Result<()> {
     }
 }
 
+#[cfg(feature = "s3")]
 fn s3_backend_error(err: s3::error::S3Error) -> Error {
     Error::Backend(format!("S3 payload store error: {err}"))
 }
 
+#[cfg(feature = "s3")]
 fn s3_payload_decode_error(operation: &str, err: s3::error::S3Error) -> Error {
     Error::PayloadDecode(format!("{operation} failed: {err}"))
 }
@@ -1710,6 +1723,7 @@ mod tests {
 
     // Pins the hand-rolled S3 ListObjectsV2 timestamp parser against known
     // epoch values, including a leap-day and fractional seconds.
+    #[cfg(feature = "s3")]
     #[test]
     fn iso8601_utc_timestamps_parse_to_epoch_milliseconds() {
         assert_eq!(

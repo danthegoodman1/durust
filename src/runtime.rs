@@ -1760,8 +1760,8 @@ fn record_select_winner(
                 }
                 if winner.branches_digest != branches_digest {
                     return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "select branch order changed for command {}",
-                        select_command_id.seq.0
+                        "select branch set changed for command {}: recorded digest `{}`, current `{}`",
+                        select_command_id.seq.0, winner.branches_digest, branches_digest
                     ))));
                 }
                 if winner.branch_ordinal != branch_ordinal {

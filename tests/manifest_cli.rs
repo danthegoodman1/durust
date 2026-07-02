@@ -41,10 +41,10 @@ fn manifest_check_exits_nonzero_for_ci_conflicts() {
 }
 
 #[test]
-fn manifest_write_materializes_current_manifest_to_output() {
+fn manifest_normalize_reserializes_current_manifest_to_output() {
     let dir = tempfile::tempdir().unwrap();
     let current = dir.path().join("durable.manifest.current.json");
-    let output_path = dir.path().join("written.manifest.json");
+    let output_path = dir.path().join("normalized.manifest.json");
     let manifest = DurableManifest {
         workflows: vec![workflow("orders.checkout", 1, "hash:input", "hash:output")],
         activities: vec![activity(
@@ -59,7 +59,7 @@ fn manifest_write_materializes_current_manifest_to_output() {
         .args([
             "durable",
             "manifest",
-            "write",
+            "normalize",
             "--current",
             current.to_str().unwrap(),
             "--output",
@@ -276,8 +276,8 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
 fn workflow(
     name: &str,
     version: u32,
-    input_schema_hash: &str,
-    output_schema_hash: &str,
+    input_type_name_hash: &str,
+    output_type_name_hash: &str,
 ) -> ManifestWorkflow {
     ManifestWorkflow {
         name: name.to_owned(),
@@ -286,19 +286,23 @@ fn workflow(
         input_type: "Input".to_owned(),
         output_type: "Output".to_owned(),
         query_state_type: None,
-        input_schema_hash: input_schema_hash.to_owned(),
-        output_schema_hash: output_schema_hash.to_owned(),
-        query_state_schema_hash: None,
+        input_type_name_hash: input_type_name_hash.to_owned(),
+        output_type_name_hash: output_type_name_hash.to_owned(),
+        query_state_type_name_hash: None,
     }
 }
 
-fn activity(name: &str, input_schema_hash: &str, output_schema_hash: &str) -> ManifestActivity {
+fn activity(
+    name: &str,
+    input_type_name_hash: &str,
+    output_type_name_hash: &str,
+) -> ManifestActivity {
     ManifestActivity {
         name: name.to_owned(),
         rust_path: "crate::activity".to_owned(),
         input_type: "Input".to_owned(),
         output_type: "Output".to_owned(),
-        input_schema_hash: input_schema_hash.to_owned(),
-        output_schema_hash: output_schema_hash.to_owned(),
+        input_type_name_hash: input_type_name_hash.to_owned(),
+        output_type_name_hash: output_type_name_hash.to_owned(),
     }
 }

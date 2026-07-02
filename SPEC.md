@@ -247,8 +247,8 @@ The manifest records every workflow and activity exported by the crate:
       "rustPath": "order_service::workflows::checkout::order",
       "inputType": "order_service::types::OrderInput",
       "outputType": "order_service::types::OrderOutput",
-      "inputSchemaHash": "sha256:...",
-      "outputSchemaHash": "sha256:..."
+      "inputTypeNameHash": "sha256:...",
+      "outputTypeNameHash": "sha256:..."
     }
   ],
   "activities": [
@@ -257,12 +257,18 @@ The manifest records every workflow and activity exported by the crate:
       "rustPath": "order_service::activities::payments::charge_card",
       "inputType": "order_service::types::ChargeInput",
       "outputType": "order_service::types::ChargeOutput",
-      "inputSchemaHash": "sha256:...",
-      "outputSchemaHash": "sha256:..."
+      "inputTypeNameHash": "sha256:...",
+      "outputTypeNameHash": "sha256:..."
     }
   ]
 }
 ```
+
+The `*TypeNameHash` fields are SHA-256 fingerprints of the Rust type names.
+They detect type-identity changes (a handler switching to a different
+input/output type), not structural changes: fields added, removed, or retyped
+inside the same-named type do not change the hash. Structural evolution is
+governed by the Serde guidance and version markers, not the manifest.
 
 The `#[workflow]` and `#[activity]` macros submit linked handler metadata into
 Durust's manifest inventory. A binary or test harness that links the handlers can
@@ -274,11 +280,15 @@ the explicit cargo helper.
 CLI:
 
 ```text
-cargo durable manifest write
+cargo durable manifest normalize
 cargo durable manifest check
 cargo durable manifest diff
 cargo durable manifest accept
 ```
+
+`manifest normalize` re-serializes the `--current` manifest to `--output` in
+canonical form; it does not regenerate metadata (that requires a binary that
+links the handlers).
 
 Normal local compilation should not fail just because the manifest changed. If a checked-in manifest exists, the macro/build integration may emit warnings for obvious drift, but the explicit CLI is the source of hard failures.
 
@@ -1079,6 +1089,17 @@ Providers do not classify application errors; they only honor the generic
 `non_retryable` flag on a failed activity request. If `non_retryable` is true,
 the provider records the terminal activity failure immediately even when the
 stored retry policy has remaining attempts.
+
+Retry pacing is provider-enforced through delayed visibility. When a failed
+attempt is rescheduled under `RetryBackoff::Exponential`, the provider stamps
+the task with `visible_at = now + 1s * 2^(failed_attempt - 1)` (saturating)
+and claim queries skip tasks whose `visible_at` is in the future, so a
+fast-failing activity cannot hot-loop. The retry's start-to-close clock starts
+at the visibility instant, which keeps the timeout scanner from firing on a
+task that was never claimable. `RetryBackoff::None` retries are immediately
+visible. Timeout-driven retries carry no extra backoff: the expired deadline
+already paced the attempt, and delaying crash recovery further would only add
+latency.
 
 The durable future behaves like this:
 
@@ -1954,6 +1975,7 @@ SelectWinner {
     select_command_id: CommandId,
     branch_ordinal: u32,
     winning_event_id: EventId,
+    branches_digest: String, // "select:{branch_count}"
 }
 ```
 
@@ -1963,6 +1985,13 @@ Tie-break:
 1. earliest history event id
 2. lexical branch order
 ```
+
+`branches_digest` is structural: it records only the branch count
+(`select:{count}`; `select_all` records `select_all:{count}`), so benign
+refactors of branch source text replay cleanly. Reordering or swapping
+branches is detected through the recorded winner ordinal and the per-command
+fingerprints of the branch commands, and a changed branch count fails digest
+validation as nondeterminism.
 
 ---
 
@@ -2276,13 +2305,16 @@ durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
 
-The macro/lint layer should be fail-closed in strict mode:
+Strict mode is a fail-closed variant of the lint layer:
 
 ```rust
 #[durust::workflow(strict)]
 ```
 
-The `#[workflow]` macro should run a best-effort AST lint pass over the annotated workflow function. Strict mode should reject:
+Strict mode is not implemented yet. Until it ships, the `strict` argument is
+rejected at compile time with an explicit error so a build can never silently
+claim strict guarantees it does not have. When implemented, strict mode should
+reject:
 
 ```text
 unknown .await

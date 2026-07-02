@@ -537,6 +537,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "durust-benchtools"
+version = "0.1.2"
+dependencies = [
+ "durust",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "durust-macros"
 version = "0.1.2"
 dependencies = [

@@ -7,7 +7,8 @@ use crate::provider_util::{
     decode_encryption_metadata, encode_encryption_metadata, event_type_from_str, event_type_to_str,
     marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
     post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
-    timed_out_by_heartbeat, timeout_message, unix_epoch_millis, wait_kind_to_str,
+    retry_visible_at_ms, timed_out_by_heartbeat, timeout_message, unix_epoch_millis,
+    wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -1105,6 +1106,7 @@ impl DurableBackend for SqliteBackend {
                        and a.completed = 0
                        and a.claim_token is null
                        and (a.timeout_at_ms is null or a.timeout_at_ms > ?3)
+                       and (a.visible_at_ms is null or a.visible_at_ms <= ?3)
                        and i.terminal = 0
                      order by a.rowid asc",
                 )
@@ -1388,16 +1390,27 @@ impl DurableBackend for SqliteBackend {
                 retry_task.attempt = next_attempt;
                 let retry_blob = rmp_serde::to_vec_named(&retry_task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                // The retry backoff delays visibility; the start-to-close
+                // clock restarts at the visibility instant so the timeout
+                // scanner cannot fire on a task that was never claimable.
+                let now = TimestampMs(unix_epoch_millis());
+                let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
+                let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
                 tx.execute(
                     "update activity_tasks
                      set task = ?1,
                          claim_token = null,
                          timeout_at_ms = ?2,
-                         heartbeat_deadline_at_ms = null
-                     where activity_id = ?3",
+                         heartbeat_deadline_at_ms = null,
+                         visible_at_ms = ?3
+                     where activity_id = ?4",
                     params![
                         retry_blob,
-                        activity_timeout_at_ms(retry_task.start_to_close_timeout),
+                        activity_timeout_at_ms_from(
+                            visible_from,
+                            retry_task.start_to_close_timeout
+                        ),
+                        visible_at_ms,
                         req.claim.activity_id.0
                     ],
                 )
@@ -3295,7 +3308,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             claim_token integer,
             completed integer not null,
             timeout_at_ms integer,
-            heartbeat_deadline_at_ms integer
+            heartbeat_deadline_at_ms integer,
+            visible_at_ms integer
         );
 
         create table if not exists activity_maps (
@@ -3456,6 +3470,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "heartbeat_deadline_at_ms",
         "integer",
     )?;
+    ensure_column(conn, "activity_tasks", "visible_at_ms", "integer")?;
     // Default 0 makes pre-existing blobs immediately past any GC grace period,
     // which is correct: they are old.
     ensure_column(
@@ -5006,6 +5021,9 @@ fn timeout_activity(
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
     if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
+        // Timeout retries carry no backoff: the expired deadline already
+        // paced this attempt, and delaying crash recovery further would only
+        // add latency.
         let mut retry_task = task.clone();
         retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -5015,7 +5033,8 @@ fn timeout_activity(
              set task = ?1,
                  claim_token = null,
                  timeout_at_ms = ?2,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 visible_at_ms = null
              where activity_id = ?3",
             params![
                 retry_blob,

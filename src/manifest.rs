@@ -13,6 +13,10 @@ pub struct DurableManifest {
     pub activities: Vec<ManifestActivity>,
 }
 
+/// The `*_type_name_hash` fields are SHA-256 fingerprints of the Rust type
+/// NAMES, not of the type structures: they detect a handler switching to a
+/// different input/output type, but cannot detect fields added, removed, or
+/// retyped inside the same-named type.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestWorkflow {
@@ -23,10 +27,10 @@ pub struct ManifestWorkflow {
     pub output_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_state_type: Option<String>,
-    pub input_schema_hash: String,
-    pub output_schema_hash: String,
+    pub input_type_name_hash: String,
+    pub output_type_name_hash: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub query_state_schema_hash: Option<String>,
+    pub query_state_type_name_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,8 +40,8 @@ pub struct ManifestActivity {
     pub rust_path: String,
     pub input_type: String,
     pub output_type: String,
-    pub input_schema_hash: String,
-    pub output_schema_hash: String,
+    pub input_type_name_hash: String,
+    pub output_type_name_hash: String,
 }
 
 #[derive(Clone, Copy)]
@@ -177,9 +181,9 @@ pub fn diff_manifests(baseline: &DurableManifest, current: &DurableManifest) -> 
         match current_workflows.get(key) {
             None => diff.vanished_workflows.push(key.clone()),
             Some(new) => {
-                if old.input_schema_hash != new.input_schema_hash
-                    || old.output_schema_hash != new.output_schema_hash
-                    || old.query_state_schema_hash != new.query_state_schema_hash
+                if old.input_type_name_hash != new.input_type_name_hash
+                    || old.output_type_name_hash != new.output_type_name_hash
+                    || old.query_state_type_name_hash != new.query_state_type_name_hash
                     || old.input_type != new.input_type
                     || old.output_type != new.output_type
                     || old.query_state_type != new.query_state_type
@@ -213,8 +217,8 @@ pub fn diff_manifests(baseline: &DurableManifest, current: &DurableManifest) -> 
         match current_activities.get(key) {
             None => diff.vanished_activities.push(key.clone()),
             Some(new) => {
-                if old.input_schema_hash != new.input_schema_hash
-                    || old.output_schema_hash != new.output_schema_hash
+                if old.input_type_name_hash != new.input_type_name_hash
+                    || old.output_type_name_hash != new.output_type_name_hash
                     || old.input_type != new.input_type
                     || old.output_type != new.output_type
                 {
@@ -338,8 +342,8 @@ mod tests {
     fn workflow(
         name: &str,
         version: u32,
-        input_schema_hash: &str,
-        output_schema_hash: &str,
+        input_type_name_hash: &str,
+        output_type_name_hash: &str,
     ) -> ManifestWorkflow {
         ManifestWorkflow {
             name: name.to_owned(),
@@ -348,20 +352,24 @@ mod tests {
             input_type: "Input".to_owned(),
             output_type: "Output".to_owned(),
             query_state_type: None,
-            input_schema_hash: input_schema_hash.to_owned(),
-            output_schema_hash: output_schema_hash.to_owned(),
-            query_state_schema_hash: None,
+            input_type_name_hash: input_type_name_hash.to_owned(),
+            output_type_name_hash: output_type_name_hash.to_owned(),
+            query_state_type_name_hash: None,
         }
     }
 
-    fn activity(name: &str, input_schema_hash: &str, output_schema_hash: &str) -> ManifestActivity {
+    fn activity(
+        name: &str,
+        input_type_name_hash: &str,
+        output_type_name_hash: &str,
+    ) -> ManifestActivity {
         ManifestActivity {
             name: name.to_owned(),
             rust_path: "crate::activity".to_owned(),
             input_type: "Input".to_owned(),
             output_type: "Output".to_owned(),
-            input_schema_hash: input_schema_hash.to_owned(),
-            output_schema_hash: output_schema_hash.to_owned(),
+            input_type_name_hash: input_type_name_hash.to_owned(),
+            output_type_name_hash: output_type_name_hash.to_owned(),
         }
     }
 }

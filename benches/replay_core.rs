@@ -1,24 +1,33 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(feature = "s3")]
+use durust::PayloadBlobStore;
 use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
-    MemoryBackend, Namespace, NewHistoryEvent, PayloadBlobStore, PayloadStorageConfig,
-    PostgresBackend, PostgresBackendConfig, SignalWorkflowRequest, TaskQueue, TimestampMs,
-    WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
+    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
+    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
+    WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "postgres", feature = "s3"))]
 use std::env;
 use std::hint::black_box;
+#[cfg(feature = "postgres")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "postgres")]
+use std::time::Instant;
 
 const SQLITE_SINGLE_FILE_WORKFLOWS: usize = 1_000;
 const SQLITE_SINGLE_FILE_WORKERS: usize = 4;
 const SQLITE_DRAIN_MAX_ITERATIONS: usize = 50_000;
+#[cfg(feature = "postgres")]
 static POSTGRES_BENCH_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -723,6 +732,7 @@ fn sqlite_single_file_mixed_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_provider_hot_paths(c: &mut Criterion) {
     let Some(database_url) = postgres_benchmark_url() else {
         return;
@@ -1436,6 +1446,7 @@ fn payload_compression(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "s3")]
 fn payload_garage_object_store(c: &mut Criterion) {
     let Some(config) = garage_config_from_env() else {
         return;
@@ -2482,6 +2493,7 @@ fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
         .to_vec()
 }
 
+#[cfg(feature = "s3")]
 fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
     let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
@@ -2737,6 +2749,7 @@ fn sqlite_mixed_worker(backend: SqliteBackend, worker_index: usize) -> Worker<Sq
         .build()
 }
 
+#[cfg(feature = "postgres")]
 struct PostgresBenchFixture {
     runtime: tokio::runtime::Runtime,
     database_url: String,
@@ -2744,15 +2757,18 @@ struct PostgresBenchFixture {
     backend: PostgresBackend,
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_benchmark_url() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_bench_schema(prefix: &str) -> String {
     let counter = POSTGRES_BENCH_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("durust_bench_{prefix}_{}_{}", std::process::id(), counter)
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2760,6 +2776,7 @@ fn postgres_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[cfg(feature = "postgres")]
 fn measure_postgres_bench<T, Setup, Measure>(
     database_url: String,
     prefix: &str,
@@ -2782,6 +2799,7 @@ where
     elapsed
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_backend(database_url: String, prefix: &str) -> PostgresBenchFixture {
     let runtime = postgres_runtime();
     let schema = postgres_bench_schema(prefix);
@@ -2800,6 +2818,7 @@ fn setup_postgres_backend(database_url: String, prefix: &str) -> PostgresBenchFi
     }
 }
 
+#[cfg(feature = "postgres")]
 fn finish_postgres_bench(fixture: PostgresBenchFixture) {
     let PostgresBenchFixture {
         runtime,
@@ -2811,6 +2830,7 @@ fn finish_postgres_bench(fixture: PostgresBenchFixture) {
     runtime.block_on(drop_postgres_schema(&database_url, &schema));
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -2828,14 +2848,17 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_workflow_id(prefix: &str, schema: &str, iteration: u64) -> durust::WorkflowId {
     durust::WorkflowId::new(format!("bench/postgres/{prefix}/{schema}/{iteration}"))
 }
 
+#[cfg(feature = "postgres")]
 fn start_postgres_workflow(
     fixture: &PostgresBenchFixture,
     prefix: &str,
@@ -2859,6 +2882,7 @@ fn start_postgres_workflow(
     (workflow_id, outcome.run_id().clone())
 }
 
+#[cfg(feature = "postgres")]
 fn claim_postgres_workflow_task(
     fixture: &PostgresBenchFixture,
     worker_id: impl Into<String>,
@@ -2874,6 +2898,7 @@ fn claim_postgres_workflow_task(
         .expect("workflow task")
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_workflow_for_commit(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2916,6 +2941,7 @@ fn setup_postgres_claimed_workflow_for_commit(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: u64) {
     let (claimed, batch) = setup_postgres_claimed_workflow_for_commit(fixture, iteration);
     fixture
@@ -2924,6 +2950,7 @@ fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: 
         .unwrap();
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_heartbeat_activity(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2977,6 +3004,7 @@ fn setup_postgres_claimed_heartbeat_activity(
     activity.claim
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
     start_postgres_workflow(fixture, "timer", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-timer-worker");
@@ -3018,6 +3046,7 @@ fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
         .unwrap();
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_signal_wait(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3061,6 +3090,7 @@ fn setup_postgres_signal_wait(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_projection_update(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3073,6 +3103,7 @@ fn setup_postgres_claimed_projection_update(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_projection_read(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3105,6 +3136,7 @@ fn setup_postgres_projection_read(
     }
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64) -> durust::RunId {
     start_postgres_workflow(fixture, "history", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-history-worker");
@@ -3133,8 +3165,10 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
     claimed.run_id
 }
 
+#[cfg(feature = "postgres")]
 const POSTGRES_CHUNKED_HISTORY_EVENTS: u64 = 1024;
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_large_history_stream(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3166,6 +3200,7 @@ fn setup_postgres_large_history_stream(
     claimed.run_id
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_child_start(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3214,6 +3249,7 @@ fn setup_postgres_child_start(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_activity_map_workflow(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3338,6 +3374,12 @@ fn version_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .register_activity(double)
         .build()
 }
+
+#[cfg(not(feature = "postgres"))]
+fn postgres_provider_hot_paths(_: &mut Criterion) {}
+
+#[cfg(not(feature = "s3"))]
+fn payload_garage_object_store(_: &mut Criterion) {}
 
 criterion_group!(
     benches,

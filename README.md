@@ -221,7 +221,11 @@ durust::Worker::builder(backend.clone())
 Handlers annotated with `#[durust::workflow]` and `#[durust::activity]` also
 export manifest metadata for the binary that links them. Use
 `durust::exported_manifest()` with `durust::write_manifest(...)` to materialize a
-current `durable.manifest.json` candidate for review.
+current `durable.manifest.json` candidate for review, and the `cargo durable
+manifest <normalize|check|diff|accept>` CLI to normalize, gate, and accept it.
+The manifest's `*TypeNameHash` fields fingerprint Rust type names: they catch a
+handler switching input/output types, not fields changing inside a same-named
+type.
 
 Workflow and activity handlers take exactly one named input struct. Wrap scalar,
 tuple, collection, and no-input cases in an explicit request type so durable
@@ -297,6 +301,12 @@ The heartbeat timeout is disabled by default. When enabled, the provider starts
 the heartbeat deadline when the activity task is claimed and refreshes it when
 the activity calls `durust::heartbeat_activity().await?`. A missed heartbeat
 uses the same retry policy as other activity timeouts.
+
+`RetryPolicy::exponential()` paces retries with provider-enforced backoff: a
+failed attempt's retry becomes claimable `1s * 2^(failed_attempt - 1)` after
+the failure, so a fast-failing activity cannot hot-loop. `RetryPolicy::none()`
+disables both retries and pacing. Timeout-driven retries are re-claimable
+immediately because the expired deadline already paced the attempt.
 
 Activities return serializable Durust errors. A retry policy is skipped when the
 activity returns a non-retryable application error:
@@ -713,8 +723,9 @@ activities or ordinary payload refs for larger values.
 
 The SQLite local-directory store is content-addressed and keeps large encoded
 bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
-use `PayloadBackend` so the async object-store implementation works across
-durability providers instead of being duplicated inside each provider. Blob URI
+use `PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
+async object-store implementation works across durability providers instead of
+being duplicated inside each provider. Blob URI
 ownership is exclusive: each provider resolves only refs carrying its own
 scheme and persists every other scheme opaquely, so custom `PayloadBlobStore`
 implementations work over any inner provider.
@@ -740,7 +751,7 @@ DURUST_GARAGE_REGION=garage \
 DURUST_GARAGE_PREFIX=local/payloads \
 DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
 DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-cargo test --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+cargo test --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
 docker compose -f tests/fixtures/garage.compose.yml down -v
 ```
 
@@ -817,12 +828,32 @@ provider conformance tests
 Durust includes:
 
 ```text
-memory provider for fast tests
-SQLite provider for local development and conformance
-production-oriented provider examples
+memory provider for fast tests (always available)
+SQLite provider for local development and conformance (`sqlite` feature, default)
+Postgres provider (`postgres` feature)
+S3-compatible payload blob store (`s3` feature)
 ```
 
-SQLite is included for local development, testing, and provider conformance.
+### Cargo Features
+
+```toml
+[dependencies]
+durust = "0.1"                                            # memory + SQLite
+durust = { version = "0.1", features = ["postgres"] }     # + Postgres
+durust = { version = "0.1", features = ["s3"] }           # + S3BlobStore
+durust = { version = "0.1", default-features = false }    # memory only
+```
+
+- `sqlite` (default) gates `SqliteBackend` and the `cargo-durable` CLI binary.
+- `postgres` gates `PostgresBackend` and its `tokio-postgres`/`deadpool-postgres`
+  dependencies.
+- `s3` gates `S3BlobStore`; the `PayloadBackend` decorator and the SQLite
+  local-directory blob store are always available.
+
+The benchmark workload, comparison, and reporting binaries live in the
+unpublished `durust-benchtools` workspace crate
+(`cargo run -p durust-benchtools --bin durust-benchmark-workload`), so library
+consumers never compile them.
 
 ## Examples
 

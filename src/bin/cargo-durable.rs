@@ -42,7 +42,7 @@ fn run_manifest(args: &[String]) -> Result<(), String> {
     let output = value_after(args, "--output").unwrap_or(current);
 
     match action {
-        "write" => {
+        "normalize" => {
             let current = read_manifest(current).map_err(|err| err.to_string())?;
             write_manifest(output, &current).map_err(|err| err.to_string())
         }
@@ -152,5 +152,5 @@ fn value_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
 }
 
 fn usage() -> String {
-    "usage: cargo durable manifest <write|check|diff|accept> [--baseline durable.manifest.json] [--current durable.manifest.current.json] [--output durable.manifest.current.json] [--yes]\n       cargo durable versions <list|check|safe-to-remove> --sqlite <path> [--namespace default] [--workflow-id id] [--run-id id] [--change-id id]".to_owned()
+    "usage: cargo durable manifest <normalize|check|diff|accept> [--baseline durable.manifest.json] [--current durable.manifest.current.json] [--output durable.manifest.current.json] [--yes]\n       cargo durable versions <list|check|safe-to-remove> --sqlite <path> [--namespace default] [--workflow-id id] [--run-id id] [--change-id id]".to_owned()
 }
