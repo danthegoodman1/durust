@@ -45,7 +45,7 @@ function readCurrentVersion() {
 
 function releaseBump(explicitBump, message) {
   if (explicitBump && explicitBump !== "auto") {
-    if (!["patch", "minor", "major"].includes(explicitBump)) {
+    if (!["current", "patch", "minor", "major"].includes(explicitBump)) {
       fail(`unsupported release bump ${explicitBump}`);
     }
     return explicitBump;
@@ -60,6 +60,9 @@ function releaseBump(explicitBump, message) {
 }
 
 function nextVersion(version, bump) {
+  if (bump === "current") {
+    return version;
+  }
   const parts = parseVersion(version);
   if (bump === "major") {
     return `${parts.major + 1}.0.0`;

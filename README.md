@@ -964,6 +964,9 @@ minor or major version when the triggering commit message contains `#minor` or
 `[skip release]`, then publishes `durust-macros`, `durust`, and the public
 `@durust/*` npm packages.
 
+Manual dispatch can publish the `current` checked-in version without creating a
+new version commit. This is only for recovering a partially published release.
+
 The repository must define a `CARGO_REGISTRY_TOKEN` secret, and branch
 protection must allow the GitHub Actions token to push the generated release
 commit. npm packages use trusted publishing, so each public `@durust/*` package
