@@ -3128,6 +3128,29 @@ describe("minimal workflow runtime", () => {
     ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
   });
 
+  it("reapplies the process.nextTick guard if another module replaces it", async () => {
+    const savedNextTick = process.nextTick;
+    Object.defineProperty(process, "nextTick", {
+      configurable: true,
+      writable: true,
+      value: ((callback: (...args: any[]) => void, ...args: any[]) =>
+        savedNextTick(callback, ...args)) as typeof process.nextTick
+    });
+
+    const invalidWorkflow = workflow({
+      name: "tests.nondeterministic-reapplied-next-tick",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => {
+        process.nextTick(() => undefined);
+        return "unreachable";
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow("nondeterminism: process.nextTick() is not allowed inside workflow code");
+  });
+
   it.each([
     {
       apiName: "Promise.all()",

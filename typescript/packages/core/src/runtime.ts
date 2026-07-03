@@ -343,6 +343,7 @@ function assertNotInWorkflowRuntime(
 
 function installNondeterminismGuards(): void {
   if (nondeterminismGuardsInstalled) {
+    installProcessNextTickGuard();
     return;
   }
   nondeterminismGuardsInstalled = true;
@@ -563,14 +564,7 @@ function installNondeterminismGuards(): void {
     writable: true,
     value: guardedMemoryUsage
   });
-  Object.defineProperty(process, "nextTick", {
-    configurable: true,
-    writable: true,
-    value: ((callback: (...args: any[]) => void, ...args: any[]) => {
-      assertNotInWorkflowRuntime("process.nextTick()", "durust durable operations");
-      return originalProcessNextTick?.(callback, ...args);
-    }) as typeof process.nextTick
-  });
+  installProcessNextTickGuard();
   if (originalProcessResourceUsage !== undefined) {
     Object.defineProperty(process, "resourceUsage", {
       configurable: true,
@@ -691,6 +685,17 @@ function installNondeterminismGuards(): void {
       assertNotInWorkflowRuntime("Promise.any()", "durust select() or selectAll()");
       return originalPromiseAny?.(values as Iterable<unknown>);
     }) as PromiseConstructor["any"]
+  });
+}
+
+function installProcessNextTickGuard(): void {
+  Object.defineProperty(process, "nextTick", {
+    configurable: true,
+    writable: true,
+    value: ((callback: (...args: any[]) => void, ...args: any[]) => {
+      assertNotInWorkflowRuntime("process.nextTick()", "durust durable operations");
+      return originalProcessNextTick?.(callback, ...args);
+    }) as typeof process.nextTick
   });
 }
 
