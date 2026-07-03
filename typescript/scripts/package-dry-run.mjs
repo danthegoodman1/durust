@@ -12,7 +12,7 @@ const expectedLicense = "MIT";
 const expectedNodeEngine = ">=24.0.0";
 const expectedRepository = {
   type: "git",
-  url: "git+https://github.com/danthegoodman1/durust.git"
+  url: "https://github.com/danthegoodman1/durust"
 };
 const expectedPublishablePackages = new Map([
   ["@durust/core", "typescript/packages/core"],
