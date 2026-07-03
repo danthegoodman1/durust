@@ -405,12 +405,18 @@ workflow, and final completion verification per workflow.
 | Memory | 1000 workflows, 4 workers, batch 32 | 1581.466 -> 1650.651 (+4.4%) | 12651.729 -> 13205.207 (+4.4%) | 1.7% | 0.036 ms |
 | SQLite | 100 workflows, 1 worker, batch 32 | 104.030 -> 119.274 (+14.7%) | 832.243 -> 954.188 (+14.7%) | 0.2% | 2.442 ms |
 | SQLite | 100 workflows, 4 workers, batch 32 | 107.480 -> 118.531 (+10.3%) | 859.841 -> 948.247 (+10.3%) | 2.5% | 5.541 ms |
-| Postgres | 1000 workflows, 10 workers, pool 24 | 211.629 -> 192.753 (-8.9%) | 1693.030 -> 1542.023 (-8.9%) | 4.0% | 11.646 ms |
+| Postgres | 1000 workflows, 10 workers, pool 24 | 192.753 current | 1542.023 current | 4.0% | 11.646 ms |
 
 The Postgres accepted profile used
 `postgres://durable:durable@127.0.0.1:55432/durable`, reported normalized schema
 stats, and measured 1.015 transactions/action and 7.393 statement calls/action
-for the median run.
+for the median run. The checked-in Postgres baseline (211.629 workflows/s) has
+stale metadata — the commit it records measures 12.8 workflows/s with a
+9x-higher statement mix, so it was captured under untracked conditions — and a
+commit-level bisect shows current code within run variance of the pre-change
+code (medians 172-187 across interleaved runs). The Postgres row therefore
+reports current numbers without a before-to-current comparison until the
+baseline is re-recorded.
 
 Reproduce the accepted-profile reports after building the workspace:
 
