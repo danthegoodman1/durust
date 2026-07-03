@@ -137,6 +137,11 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          npm --version
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "GitHub OIDC request environment is missing" >&2
+            exit 1
+          fi
 
           publish_package() {
             local package="$1"
@@ -144,7 +149,7 @@ jobs:
               echo "${package} ${VERSION} is already published"
               return
             fi
-            npm publish --provenance --prefix typescript --workspace "$package"
+            npm publish --prefix typescript --workspace "$package"
           }
 
           publish_package @durust/core
