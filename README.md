@@ -87,6 +87,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
 - [Benchmarks](#benchmarks)
+- [Release Automation](#release-automation)
 - [Examples](#examples)
 
 ## Why Durust
@@ -953,6 +954,21 @@ DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
   cargo bench --bench replay_core -- --baseline phase6-before \
   '^(workflow_cached_wake_poll_memory|workflow_replay_(small|large)_history_memory|held_handle_spawn_then_sleeps_memory|child_fanout_completion_(memory|sqlite)|child_start_dispatch_memory|activity_claim_complete_(memory|sqlite)|workflow_task_append_commit_(memory|sqlite)|postgres_provider_hot_paths/(workflow_task_append_commit|history_stream|history_stream_chunked_replay|activity_claim_complete|child_workflow_start_parent_wakeup)_postgres)$'
 ```
+
+## Release Automation
+
+Pushes to `main` publish a lockstep release for the Rust crates and TypeScript
+packages. The release workflow bumps the patch version by default, or bumps the
+minor or major version when the triggering commit message contains `#minor` or
+`#major`. It commits the updated manifests and lockfiles back to `main` with
+`[skip release]`, then publishes `durust-macros`, `durust`, and the public
+`@durust/*` npm packages.
+
+The repository must define a `CARGO_REGISTRY_TOKEN` secret, and branch
+protection must allow the GitHub Actions token to push the generated release
+commit. npm packages use trusted publishing, so each public `@durust/*` package
+must trust the `danthegoodman1/durust` repository's `release.yml` workflow on
+the `main` branch.
 
 ## Examples
 

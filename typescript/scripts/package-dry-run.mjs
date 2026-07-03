@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
 const packagesRoot = join(workspaceRoot, "packages");
-const expectedVersion = "0.2.0";
+const expectedVersion = readJson(join(packagesRoot, "core/package.json")).version;
 const expectedLicense = "MIT";
 const expectedNodeEngine = ">=24.0.0";
 const expectedRepository = {

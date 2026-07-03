@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply.
+        required: true
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip release]') && !startsWith(github.event.head_commit.message, 'chore(release):')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Use Rust stable
+        run: rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine release version
+        id: version
+        env:
+          RELEASE_BUMP: ${{ inputs.bump || 'auto' }}
+          RELEASE_MESSAGE: ${{ github.event.head_commit.message || '' }}
+        run: |
+          version="$(node scripts/release-version.mjs next --bump "$RELEASE_BUMP" --message "$RELEASE_MESSAGE")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      - name: Apply lockstep version
+        run: |
+          node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
+          cargo update -w
+          npm install --prefix typescript --package-lock-only --ignore-scripts
+          node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
+
+      - name: Install TypeScript dependencies
+        run: npm ci --prefix typescript
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Check Rust feature matrix
+        run: |
+          cargo check --locked --no-default-features
+          cargo check --locked --features postgres,s3
+
+      - name: Run Rust tests
+        run: cargo test --locked --workspace --all-features
+
+      - name: Run TypeScript checks
+        run: npm run check --prefix typescript
+
+      - name: Commit and push release version
+        run: |
+          git diff --check
+          git add Cargo.toml Cargo.lock durust-macros/Cargo.toml benchtools/Cargo.toml typescript/package-lock.json typescript/packages
+          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip release]"
+          git push origin HEAD:main
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          crate_exists() {
+            local crate="$1"
+            curl -fsSL -H "User-Agent: durust-release-ci" "https://crates.io/api/v1/crates/${crate}/${VERSION}" >/dev/null 2>&1
+          }
+
+          publish_crate() {
+            local crate="$1"
+            if crate_exists "$crate"; then
+              echo "${crate} ${VERSION} is already published"
+              return
+            fi
+            cargo publish --locked -p "$crate" --token "$CARGO_REGISTRY_TOKEN"
+          }
+
+          publish_crate durust-macros
+
+          for attempt in {1..24}; do
+            if crate_exists durust-macros; then
+              break
+            fi
+            if [ "$attempt" -eq 24 ]; then
+              echo "durust-macros ${VERSION} did not become visible on crates.io" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          publish_crate durust
+
+      - name: Publish npm packages
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          publish_package() {
+            local package="$1"
+            if npm view "${package}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${package} ${VERSION} is already published"
+              return
+            fi
+            npm publish --provenance --prefix typescript --workspace "$package"
+          }
+
+          publish_package @durust/core
+          publish_package @durust/payload
+          publish_package @durust/sqlite
+          publish_package @durust/postgres
+          publish_package @durust/testing
+          publish_package @durust/eslint-plugin
