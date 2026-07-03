@@ -392,6 +392,49 @@ The threshold suite includes smoke baselines for memory `mixed`,
 memory/SQLite accepted-profile guards and env-gated Postgres smoke and accepted
 guards when `DURUST_POSTGRES_URL` is set.
 
+### Current Benchmark Medians
+
+These medians come from three runs on a shared Darwin 25.5.0 machine. Treat the
+before-to-current comparison as same-machine evidence; do not use the absolute
+numbers as deployment capacity. The mixed workload matches the Rust benchmark
+shape: one parent workflow, three activities, one signal, one timer, one child
+workflow, and final completion verification per workflow.
+
+| Backend | Config | Processing workflows/s before -> current | Processing actions/s before -> current | Variance | Commit p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Memory | 1000 workflows, 4 workers, batch 32 | 1581.466 -> 1650.651 (+4.4%) | 12651.729 -> 13205.207 (+4.4%) | 1.7% | 0.036 ms |
+| SQLite | 100 workflows, 1 worker, batch 32 | 104.030 -> 119.274 (+14.7%) | 832.243 -> 954.188 (+14.7%) | 0.2% | 2.442 ms |
+| SQLite | 100 workflows, 4 workers, batch 32 | 107.480 -> 118.531 (+10.3%) | 859.841 -> 948.247 (+10.3%) | 2.5% | 5.541 ms |
+| Postgres | 1000 workflows, 10 workers, pool 24 | 211.629 -> 192.753 (-8.9%) | 1693.030 -> 1542.023 (-8.9%) | 4.0% | 11.646 ms |
+
+The Postgres accepted profile used
+`postgres://durable:durable@127.0.0.1:55432/durable`, reported normalized schema
+stats, and measured 1.015 transactions/action and 7.393 statement calls/action
+for the median run.
+
+Reproduce the accepted-profile reports after building the workspace:
+
+```bash
+npm run build --workspace @durust/benchmark
+
+node packages/benchmark/dist/index.js \
+  --backend memory --mode mixed --workflows 1000 --workers 4 \
+  --batch 32 --activity-completion-batch 1 --json
+
+node packages/benchmark/dist/index.js \
+  --backend sqlite --mode mixed --workflows 100 --workers 1 \
+  --batch 32 --activity-completion-batch 1 --json
+
+node packages/benchmark/dist/index.js \
+  --backend sqlite --mode mixed --workflows 100 --workers 4 \
+  --batch 32 --activity-completion-batch 1 --json
+
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  node packages/benchmark/dist/index.js \
+  --backend postgres --mode mixed --workflows 1000 --workers 10 \
+  --batch 32 --activity-completion-batch 32 --postgres-pool-size 24 --json
+```
+
 Run the benchmark CLI directly:
 
 ```bash
@@ -513,14 +556,3 @@ remaining major gaps include:
 Package dry-run validation is already wired into `npm run check`; it verifies
 that publishable packages include only intended built JS, declaration files,
 source maps, JSON assets, package metadata, and allowed root docs.
-
-The current checked-in accepted local benchmark medians were measured on
-June 19, 2026, with Node v24.15.0 on Darwin 25.5.0 arm64. The Postgres accepted
-profile used PostgreSQL 16.11 from `tests/fixtures/postgres.compose.yml` with
-`pg_stat_statements` loaded. Median results:
-
-- memory mixed local 4-worker: 8859.109 mixed actions/sec, commit p95 0.012 ms.
-- SQLite mixed local 1-worker: 719.137 mixed actions/sec, commit p95 2.098 ms.
-- SQLite mixed local 4-worker: 842.354 mixed actions/sec, commit p95 2.104 ms.
-- Postgres mixed accepted: 129.48 mixed actions/sec, commit p95 2.468 ms,
-  9.257 transactions/action, 28.251 statement calls/action.

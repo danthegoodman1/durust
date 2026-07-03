@@ -86,6 +86,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
 - [Recovery Model](#recovery-model)
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
+- [Benchmarks](#benchmarks)
 - [Examples](#examples)
 
 ## Why Durust
@@ -861,6 +862,97 @@ The benchmark workload, comparison, and reporting binaries live in the
 unpublished `durust-benchtools` workspace crate
 (`cargo run -p durust-benchtools --bin durust-benchmark-workload`), so library
 consumers never compile them.
+
+## Benchmarks
+
+These numbers are local medians from three runs on a shared Darwin 25.5.0
+machine. They are useful for close comparisons on the same machine, not as
+portable capacity claims. The mixed workload starts each parent workflow, runs
+three activities, sends one signal, fires one timer, starts and completes one
+child workflow, then verifies completion. The TypeScript implementation has its
+own benchmark section in [`typescript/README.md`](typescript/README.md).
+
+Mixed workload medians:
+
+| Backend | Config | Processing workflows/s before -> current | Processing actions/s before -> current | Variance | Commit p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SQLite | 1000 workflows, 4 workers, batch 32 | 206.10 -> 226.82 (+10.0%) | 1648.83 -> 1814.52 (+10.0%) | 9.6% | 3.769 ms |
+| SQLite | 1000 workflows, 1 worker, batch 32 | 215.63 -> 224.78 (+4.2%) | 1725.01 -> 1798.21 (+4.2%) | 4.2% | 0.402 ms |
+| Postgres | 1000 workflows, 4 workers, pool 8 | 38.46 -> 47.94 (+24.7%) | 307.68 -> 383.52 (+24.7%) | 9.9% | 7.912 ms |
+| Postgres | 1000 workflows, 100 shard leases, 10 workers, pool 24 | 141.72 -> 320.50 (+126.1%) | 1133.77 -> 2563.98 (+126.1%) | 7.3% | 15.838 ms |
+
+The 100-shard Postgres profile still runs, but it now means batched normalized
+Postgres operation under 100 shard leases. The write-only shard journal and
+snapshot tables were removed, so this is not a shard-journal recovery profile.
+
+Criterion headline medians, current versus the saved `phase6-before` baseline:
+
+| Benchmark | Current median | Delta |
+| --- | ---: | ---: |
+| Cached wake poll, memory | 4.0 us | -3.1% |
+| Replay small history, memory | 8.1 us | -4.5% |
+| Replay large history, memory | 45.9 us | -10.3% |
+| Activity claim/complete, memory | 1.5 us | +0.4% |
+| Activity claim/complete, SQLite | 2.1 ms | -43.2% |
+| Activity claim/complete, Postgres | 3.4 ms | -17.8% |
+| Workflow append commit, memory | 1.0 us | -3.9% |
+| Workflow append commit, SQLite | 0.428 ms | -20.1% |
+| Workflow append commit, Postgres | 2.1 ms | -26.7% |
+| Held handle across sleeps, memory | 75.2 us | -62.5% |
+| Child fanout completion, memory | 131.4 us | -2.7% |
+| Child fanout completion, SQLite | 14.7 ms | -0.0% |
+| Child start dispatch, memory | 1.6 us | +8.5% |
+| Child parent wakeup, Postgres | 3.1 ms | -32.2% |
+| History stream, Postgres | 0.339 ms | -22.7% |
+| Chunked history replay stream, Postgres | 4.3 ms | -25.7% |
+
+Reproduce the mixed workload reports with release benchtools:
+
+```bash
+cargo build --release -p durust-benchtools
+
+cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend sqlite --mode mixed --sqlite-layout single-file \
+  --workflows 1000 --workers 4 --shards 1 --physical-partitions 1 \
+  --activation-concurrency 1 --activation-prefetch-limit 1 \
+  --batch 32 --activity-completion-batch 1 --max-rounds 10000 --json
+
+cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend sqlite --mode mixed --sqlite-layout single-file \
+  --workflows 1000 --workers 1 --shards 1 --physical-partitions 1 \
+  --activation-concurrency 1 --activation-prefetch-limit 1 \
+  --batch 32 --activity-completion-batch 1 --max-rounds 10000 --json
+
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend postgres --mode mixed --workflows 1000 --workers 4 \
+  --shards 1 --physical-partitions 1 --activation-concurrency 1 \
+  --activation-prefetch-limit 1 --batch 32 --activity-completion-batch 1 \
+  --postgres-pool-size 8 --max-rounds 10000 --json
+
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend postgres --mode mixed --workflows 1000 --workers 10 \
+  --shards 100 --physical-partitions 16 --activation-concurrency 8 \
+  --activation-prefetch-limit 32 --batch 32 --activity-completion-batch 32 \
+  --postgres-pool-size 24 --max-rounds 10000 --json
+```
+
+Compare a captured mixed workload report with its checked-in baseline:
+
+```bash
+cargo run --release -p durust-benchtools --bin durust-benchmark-compare -- \
+  --durust target/benchmark-runs/rust/durust-mixed-postgres-median.json \
+  --baseline benches/baselines/durust-mixed-postgres.json
+```
+
+Run the scoped Criterion comparison against a saved baseline:
+
+```bash
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo bench --bench replay_core -- --baseline phase6-before \
+  '^(workflow_cached_wake_poll_memory|workflow_replay_(small|large)_history_memory|held_handle_spawn_then_sleeps_memory|child_fanout_completion_(memory|sqlite)|child_start_dispatch_memory|activity_claim_complete_(memory|sqlite)|workflow_task_append_commit_(memory|sqlite)|postgres_provider_hot_paths/(workflow_task_append_commit|history_stream|history_stream_chunked_replay|activity_claim_complete|child_workflow_start_parent_wakeup)_postgres)$'
+```
 
 ## Examples
 
