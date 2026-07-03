@@ -1,6 +1,6 @@
 {
   "name": "@durust/examples",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "private": true,
   "engines": {
@@ -11,8 +11,8 @@
     "test": "vitest run --root ../.. --config vitest.config.ts packages/examples/test"
   },
   "dependencies": {
-    "@durust/core": "^0.2.0",
-    "@durust/payload": "^0.2.0"
+    "@durust/core": "^0.2.1",
+    "@durust/payload": "^0.2.1"
   },
   "license": "MIT",
   "repository": {

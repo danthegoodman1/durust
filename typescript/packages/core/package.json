@@ -1,6 +1,6 @@
 {
   "name": "@durust/core",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Durable workflow runtime core for TypeScript and Node.js.",
   "type": "module",
   "engines": {

@@ -1,13 +1,13 @@
 {
   "name": "@durust/payload",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Payload offload wrapper and blob stores for Durust TypeScript backends.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@durust/core": "^0.2.0"
+    "@durust/core": "^0.2.1"
   },
   "exports": {
     ".": {
@@ -33,7 +33,7 @@
     "test": "vitest run --root ../.. --config vitest.config.ts packages/payload/test"
   },
   "devDependencies": {
-    "@durust/testing": "^0.2.0"
+    "@durust/testing": "^0.2.1"
   },
   "license": "MIT",
   "keywords": [

@@ -1,13 +1,13 @@
 {
   "name": "@durust/postgres",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Postgres durable backend for Durust TypeScript workflows.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@durust/core": "^0.2.0",
+    "@durust/core": "^0.2.1",
     "@types/pg": "^8.20.0",
     "pg": "^8.21.0"
   },
@@ -35,8 +35,8 @@
     "test": "vitest run --root ../.. --config vitest.config.ts packages/postgres/test"
   },
   "devDependencies": {
-    "@durust/payload": "^0.2.0",
-    "@durust/testing": "^0.2.0"
+    "@durust/payload": "^0.2.1",
+    "@durust/testing": "^0.2.1"
   },
   "license": "MIT",
   "keywords": [
