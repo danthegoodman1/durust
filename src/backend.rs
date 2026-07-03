@@ -176,6 +176,19 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         })
     }
 
+    /// Blocks until work may be claimable for the given queues or `max_wait`
+    /// elapses. The default is a plain bounded sleep, so polling drivers work
+    /// against every provider; providers with a push channel (in-memory
+    /// notify, Postgres LISTEN/NOTIFY) override this to wake waiters as soon
+    /// as work is created. Spurious wakeups are allowed; callers must
+    /// re-check for work after every return.
+    fn wait_for_ready(&self, req: WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
+        Box::pin(async move {
+            tokio::time::sleep(req.max_wait).await;
+            Ok(())
+        })
+    }
+
     fn claim_activity_task(
         &self,
         worker_id: WorkerId,
@@ -291,6 +304,17 @@ pub struct CancelWorkflowRequest {
 pub enum CancelWorkflowOutcome {
     Cancelled { run_id: RunId, event_id: EventId },
     AlreadyTerminal { run_id: RunId },
+}
+
+#[derive(Clone, Debug)]
+pub struct WaitForReadyRequest {
+    pub namespace: Namespace,
+    pub workflow_task_queue: TaskQueue,
+    pub activity_task_queue: TaskQueue,
+    /// Upper bound on the wait; providers without push notifications sleep
+    /// this long, providers with them use it as the staleness bound for
+    /// notifications that raced past the waiter's registration.
+    pub max_wait: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -629,9 +653,28 @@ pub struct WorkflowChangeVersionRecord {
     pub last_seen_at: TimestampMs,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Grace period protecting blobs uploaded by in-flight commits. Blob uploads
+/// happen before the durable commit that makes them reachable, so GC must
+/// never delete a blob younger than the longest plausible upload-to-commit
+/// window plus the GC scan itself. One hour dwarfs both.
+pub const DEFAULT_PAYLOAD_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Debug)]
 pub struct PayloadGarbageCollectionRequest {
     pub dry_run: bool,
+    /// Blobs whose last-modified timestamp is younger than this are never
+    /// deleted, regardless of reachability. `Duration::ZERO` disables the
+    /// grace period (test-only; unsafe with concurrent writers).
+    pub min_age: Duration,
+}
+
+impl Default for PayloadGarbageCollectionRequest {
+    fn default() -> Self {
+        Self {
+            dry_run: false,
+            min_age: DEFAULT_PAYLOAD_GC_MIN_AGE,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -663,6 +706,9 @@ pub struct PayloadGarbageCollectionOutcome {
     pub scanned_blobs: usize,
     pub retained_blobs: usize,
     pub deleted_blobs: usize,
+    /// Garbage blobs whose deletion failed. The sweep records them and
+    /// continues instead of aborting; they stay candidates for the next run.
+    pub failed_blobs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

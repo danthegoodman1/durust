@@ -1,24 +1,30 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, PostgresBackend, PostgresBackendConfig, SqliteBackend, TaskQueue,
-    Worker, WorkerId, WorkflowType,
+    MemoryBackend, Namespace, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
 };
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(feature = "postgres")]
 use std::env;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+#[cfg(feature = "postgres")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
 
+#[cfg(feature = "postgres")]
 fn postgres_url_from_env() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_test_schema(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -27,6 +33,7 @@ fn postgres_test_schema(prefix: &str) -> String {
     format!("durust_{prefix}_{}_{}", std::process::id(), millis)
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -44,10 +51,12 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+#[cfg(feature = "postgres")]
 fn block_on_tokio<F>(future: F) -> F::Output
 where
     F: std::future::Future,
@@ -149,6 +158,11 @@ async fn large_payload_result(_: UnitInput) -> durust::Result<LargePayload> {
     })
 }
 
+#[durust::activity(name = "tests.map-large-result")]
+async fn map_large_result(input: NumberInput) -> durust::Result<String> {
+    Ok(format!("{}:", input.value).repeat(2048))
+}
+
 #[durust::activity(name = "tests.version-a")]
 async fn version_activity_a(_: UnitInput) -> durust::Result<String> {
     Ok("a".to_owned())
@@ -233,6 +247,7 @@ async fn child_spawn_wait_workflow(input: NumberInput) -> durust::Result<u64> {
     child.result().await
 }
 
+#[cfg(feature = "postgres")]
 #[durust::workflow(name = "tests.postgres-inline-child-signal-timer", version = 1)]
 async fn postgres_inline_child_signal_timer(input: NumberInput) -> durust::Result<String> {
     let input = input.value;
@@ -319,6 +334,34 @@ async fn activity_spawn_await_later_workflow(input: NumberInput) -> durust::Resu
         .spawn()
         .await?;
     first.result().await
+}
+
+const HELD_HANDLE_TEST_SLEEPS: u64 = 3;
+
+#[durust::workflow(name = "tests.held-handle-sleeps", version = 1)]
+async fn held_handle_sleeps_workflow(input: NumberInput) -> durust::Result<u64> {
+    let input = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    for _ in 0..HELD_HANDLE_TEST_SLEEPS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    handle.result().await
+}
+
+#[durust::workflow(name = "tests.timer-count-change", version = 1)]
+async fn two_timers_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(1)).await?;
+    durust::sleep(Duration::from_millis(1)).await?;
+    Ok(2)
+}
+
+#[durust::workflow(name = "tests.timer-count-change", version = 1)]
+async fn one_timer_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(1)).await?;
+    Ok(1)
 }
 
 #[durust::workflow(name = "tests.sleep-before-large-activity-result", version = 1)]
@@ -659,6 +702,52 @@ async fn select_then_wait(input: NumberInput) -> durust::Result<String> {
     Ok(format!("{first}:{after}"))
 }
 
+// Structurally identical to `select_then_wait` (same branches, same order,
+// same commands) but with renamed bind patterns, a differently-spelled future
+// expression, and different variable names inside the branch bodies. The
+// select digest hashes only the branch count, so replaying a history recorded
+// by `select_then_wait` against this refactor must succeed.
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait_reformatted(input: NumberInput) -> durust::Result<String> {
+    let millis = input.value;
+    let first = durust::select! {
+        sig = durust::signal::<String>("ready") => {
+            let payload = sig?;
+            format!("signal:{payload}")
+        }
+        t = durust::sleep(core::time::Duration::from_millis(millis)) => {
+            t?;
+            String::from("timer")
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
+// Same name and same first two branches as `select_then_wait`, plus a third
+// branch appended after them. The appended branch leaves the select command
+// id and every previously recorded branch command at its original sequence,
+// so the branch-count digest is the only validation that can catch the
+// change.
+#[durust::workflow(name = "tests.select-reorder", version = 1)]
+async fn select_then_wait_extra_branch(input: NumberInput) -> durust::Result<String> {
+    let input = input.value;
+    let first = durust::select! {
+        signal = durust::signal::<String>("ready") => {
+            format!("signal:{}", signal?)
+        }
+        timer = durust::sleep(Duration::from_millis(input)) => {
+            timer?;
+            "timer".to_owned()
+        }
+        extra = durust::signal::<String>("extra") => {
+            format!("extra:{}", extra?)
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
 #[durust::workflow(name = "tests.select-reorder", version = 1)]
 async fn select_then_wait_reordered(input: NumberInput) -> durust::Result<String> {
     let input = input.value;
@@ -876,6 +965,24 @@ async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
     })
 }
 
+#[durust::workflow(name = "tests.activity-map-large-results", version = 1)]
+async fn activity_map_large_results(input: ValuesInput) -> durust::Result<u64> {
+    let input_manifest =
+        durust::activity_map_manifest(input.values.into_iter().map(|value| NumberInput { value }))?;
+    let mapped = durust::activity_map(map_large_result)
+        .task_queue("map-activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("large-results")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    result_refs.iter().try_fold(0_u64, |total, payload| {
+        Ok(total + durust::decode_payload::<String>(payload)?.len() as u64)
+    })
+}
+
 macro_rules! child_workflow_map_sum_body {
     (
         $input:expr,
@@ -1031,6 +1138,125 @@ async fn child_workflow_map_sum_changed_failure_mode(input: ValuesInput) -> duru
     )
 }
 
+// The reproduced replay bug: after the spawned activity completes before the
+// first timer fires, the replay chunk is [ActivityCompleted, TimerFired] and
+// the second sleep must schedule past the unconsumed completion at the cursor.
+#[durust::workflow(name = "tests.spawn-sleep-sleep", version = 1)]
+async fn spawn_sleep_sleep_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    handle.result().await
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-activity", version = 1)]
+async fn spawn_sleep_then_activity_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let second = durust::call_activity!(double(NumberInput { value: value + 1 }))
+        .task_queue("activities")
+        .await?;
+    let first = handle.result().await?;
+    Ok(first + second)
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-side-effect", version = 1)]
+async fn spawn_sleep_then_side_effect_workflow(input: NumberInput) -> durust::Result<String> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let tag: String = durust::side_effect("post-sleep-tag", || "tagged".to_owned()).await?;
+    let first = handle.result().await?;
+    Ok(format!("{tag}:{first}"))
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-version", version = 1)]
+async fn spawn_sleep_then_version_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let version = durust::get_version("post-sleep-change", 1, 1)?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let first = handle.result().await?;
+    Ok(first + version as u64)
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-child", version = 1)]
+async fn spawn_sleep_then_child_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let child = durust::child!(child_double_workflow(number(value + 1)))
+        .workflow_id(format!("wf/spawn-sleep-then-child/{value}"))
+        .spawn()
+        .await?;
+    let child_result = child.result().await?;
+    let first = handle.result().await?;
+    Ok(first + child_result)
+}
+
+#[durust::workflow(name = "tests.select-two-signals-then-signal", version = 1)]
+async fn select_two_signals_then_signal_workflow(_: UnitInput) -> durust::Result<String> {
+    let first = durust::select! {
+        left = durust::signal::<String>("left") => {
+            format!("left:{}", left?)
+        }
+        right = durust::signal::<String>("right") => {
+            format!("right:{}", right?)
+        }
+    };
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{first}:{after}"))
+}
+
+#[durust::workflow(name = "tests.same-signal-twice", version = 1)]
+async fn same_signal_twice_workflow(_: UnitInput) -> durust::Result<String> {
+    let first = durust::signal::<String>("gate").await?;
+    let second = durust::signal::<String>("gate").await?;
+    Ok(format!("{first}:{second}"))
+}
+
+#[durust::workflow(name = "tests.same-signal-join", version = 1)]
+async fn same_signal_join_workflow(_: UnitInput) -> durust::Result<String> {
+    let (first, second) = durust::join!(
+        durust::signal::<String>("gate"),
+        durust::signal::<String>("gate"),
+    )
+    .await?;
+    Ok(format!("{first}:{second}"))
+}
+
+#[durust::workflow(name = "tests.signal-fingerprint", version = 1)]
+async fn signal_gate_then_after_workflow(_: UnitInput) -> durust::Result<String> {
+    let gate = durust::signal::<String>("gate").await?;
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{gate}:{after}"))
+}
+
+#[durust::workflow(name = "tests.signal-fingerprint", version = 1)]
+async fn signal_door_then_after_workflow(_: UnitInput) -> durust::Result<String> {
+    let door = durust::signal::<String>("door").await?;
+    let after = durust::signal::<String>("after").await?;
+    Ok(format!("{door}:{after}"))
+}
+
 #[test]
 fn simple_workflow_schedules_activity_and_completes_from_cache() {
     block_on(async {
@@ -1184,6 +1410,220 @@ fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
             panic!("workflow did not complete after timer and activity result");
         };
         assert_eq!(durust::decode_payload::<usize>(result).unwrap(), 64 * 1024);
+    });
+}
+
+// Bug C pin: manifest levels offload independently, so an activity-map result
+// manifest can have an inline root while its item results are blob refs. The
+// pre-fix runtime short-circuited any inline payload past hydration, handing
+// the workflow raw blob refs that fail decode; the manifest hydrator must run
+// even for inline roots.
+#[test]
+fn inline_result_manifest_root_with_blob_item_results_hydrates_for_the_workflow() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        // Item results (~4 KiB) offload; pages and root hold compact refs and
+        // stay inline under the 2 KiB threshold.
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner.clone(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(2048),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_large_results>(
+                "wf/inline-root-blob-items",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("inline-root-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_large_results)
+            .register_activity(map_large_result)
+            .build();
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.activity_tasks, 3);
+
+        // Shape guard: the recorded manifest must actually be the Bug C shape
+        // (inline root and pages, blob item results); otherwise this test
+        // stops pinning the inline short-circuit.
+        let raw_events = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id: run_id.clone(),
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1_000_000),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let completed = raw_events
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ActivityMapCompleted(completed) => Some(completed),
+                _ => None,
+            })
+            .expect("activity map completed event");
+        assert!(
+            matches!(completed.result_manifest, durust::PayloadRef::Inline { .. }),
+            "result manifest root should be inline, got {:?}",
+            completed.result_manifest
+        );
+        let manifest: durust::ActivityMapResultManifest =
+            durust::decode_payload(&completed.result_manifest).unwrap();
+        for page in &manifest.pages {
+            assert!(
+                matches!(page, durust::PayloadRef::Inline { .. }),
+                "manifest page should be inline, got {page:?}"
+            );
+            let page: durust::ActivityMapResultPage = durust::decode_payload(page).unwrap();
+            for result in &page.results {
+                assert!(
+                    matches!(result, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("memory-blob://payload/")),
+                    "item result should be an offloaded blob ref, got {result:?}"
+                );
+            }
+        }
+
+        // The workflow observed every blob-backed item result and summed the
+        // decoded lengths: three single-digit values at "N:" x 2048.
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 3 * 4096);
+    });
+}
+
+// Perf pin: committing a ref that is already offloaded validates it with a
+// cheap existence probe instead of downloading and re-hashing the blob.
+#[test]
+fn commit_validates_already_offloaded_refs_without_downloading() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner,
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
+        );
+        let run_id = backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/offloaded-ref-commit"),
+                workflow_type: WorkflowType::new("tests.double-plus-one", 1),
+                task_queue: TaskQueue::new("workflows"),
+                input: durust::encode_payload(&"x".repeat(8 * 1024)).unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let raw_events = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+            panic!("expected workflow start event");
+        };
+        assert!(matches!(input, durust::PayloadRef::Blob { .. }));
+
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new("offloaded-ref-committer"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                durust::WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: Vec::new(),
+                    upsert_waits: Vec::new(),
+                    schedule_activities: Vec::new(),
+                    schedule_activity_maps: Vec::new(),
+                    schedule_child_workflow_maps: Vec::new(),
+                    start_child_workflows: Vec::new(),
+                    consume_signals: Vec::new(),
+                    delete_waits: Vec::new(),
+                    cancel_commands: Vec::new(),
+                    query_projection: Some(input.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            blob_store.get_count(),
+            0,
+            "commit must not download already-offloaded refs"
+        );
+        assert!(
+            blob_store.exists_probe_count() >= 1,
+            "commit should validate the offloaded ref with an existence probe"
+        );
+    });
+}
+
+// Perf pin: the scheduling commit carries each map input manifest twice (the
+// history event and the operational task) but must rebuild and upload each
+// distinct blob at most once.
+#[test]
+fn activity_map_schedule_commit_uploads_each_manifest_blob_once() {
+    block_on(async {
+        let inner = MemoryBackend::new();
+        let blob_store = CountingBlobStore::default();
+        let backend = durust::PayloadBackend::with_payload_storage(
+            inner,
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<activity_map_sum>(
+                "wf/map-put-once",
+                "workflows",
+                values(vec![1, 2, 3]),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("map-put-once-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("map-activities")
+            .register_workflow(activity_map_sum)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("activity map workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 12);
+        assert_eq!(
+            blob_store.max_puts_for_one_digest(),
+            1,
+            "each manifest item, page, and root must upload at most once"
+        );
+        assert!(blob_store.put_count() >= 5);
     });
 }
 
@@ -1368,6 +1808,7 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when_configured() {
     block_on_tokio(async {
@@ -2079,6 +2520,645 @@ fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
         assert_eq!(
             durust::decode_payload::<String>(result).unwrap(),
             "1:activity:14"
+        );
+    });
+}
+
+fn out_of_order_worker<W>(
+    backend: MemoryBackend,
+    workflow: W,
+    chunk_events: Option<usize>,
+) -> Worker<MemoryBackend>
+where
+    W: durust::Workflow + Default,
+{
+    let mut builder = Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(workflow)
+        .register_activity(double);
+    if let Some(chunk_events) = chunk_events {
+        builder = builder.history_chunk_events(chunk_events);
+    }
+    builder.build()
+}
+
+// Drives the verified repro ordering for the spawn/sleep workflows: the first
+// workflow task commits ActivityScheduled(cmd 1) + TimerStarted(cmd 2), the
+// activity completes, and the timer fires, so the run's next replay chunk is
+// [ActivityCompleted, TimerFired] with the unconsumed completion sitting at
+// the replay cursor head when the post-sleep command schedules.
+async fn drive_completion_before_timer_fired(
+    backend: &MemoryBackend,
+    worker: &mut Worker<MemoryBackend>,
+    run_id: &durust::RunId,
+) {
+    assert!(worker.run_workflow_once().await.unwrap());
+    assert!(worker.run_activity_once().await.unwrap());
+    backend.advance_time(Duration::from_secs(1));
+    assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+
+    let history = stream_all(backend, run_id).await;
+    assert!(matches!(
+        history[3].data,
+        HistoryEventData::ActivityCompleted(_)
+    ));
+    assert!(matches!(history[4].data, HistoryEventData::TimerFired(_)));
+}
+
+// `cold_chunk_events` = None runs the critical task against the scheduling
+// worker's cached future; Some(n) drops that worker first so a fresh worker
+// cold-replays the full history in n-event chunks.
+async fn run_spawn_sleep_sleep_out_of_order_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_sleep_workflow>(
+            "wf/spawn-sleep-sleep",
+            "workflows",
+            number(21),
+        )
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(backend.clone(), spawn_sleep_sleep_workflow, None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_sleep_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // The critical task: the second sleep's TimerStarted must be scheduled
+    // past the unconsumed ActivityCompleted at the replay cursor head instead
+    // of failing with Nondeterminism("expected TimerStarted ... found
+    // ActivityCompleted").
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(history[5].data, HistoryEventData::TimerStarted(_)));
+
+    backend.advance_time(Duration::from_secs(1));
+    assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+    assert!(worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("spawn-sleep-sleep workflow did not complete");
+    };
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+}
+
+#[test]
+fn spawn_sleep_sleep_schedules_second_timer_past_out_of_order_completion_cached() {
+    block_on(run_spawn_sleep_sleep_out_of_order_case(None));
+}
+
+#[test]
+fn spawn_sleep_sleep_schedules_second_timer_past_out_of_order_completion_cold() {
+    block_on(run_spawn_sleep_sleep_out_of_order_case(Some(100)));
+}
+
+#[test]
+fn spawn_sleep_sleep_schedules_second_timer_past_out_of_order_completion_multi_chunk() {
+    block_on(run_spawn_sleep_sleep_out_of_order_case(Some(1)));
+}
+
+async fn run_out_of_order_completion_before_new_activity_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_activity_workflow>(
+            "wf/spawn-sleep-then-activity",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(backend.clone(), spawn_sleep_then_activity_workflow, None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_then_activity_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // The second activity's ActivityScheduled must schedule past the
+    // unconsumed first completion at the cursor head.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ActivityScheduled(_)
+    ));
+
+    assert!(worker.run_activity_once().await.unwrap());
+    assert!(worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("spawn-sleep-then-activity workflow did not complete");
+    };
+    // 2*10 from the spawned activity plus 2*11 from the sequential one.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+}
+
+#[test]
+fn out_of_order_completion_before_new_activity_command_cached() {
+    block_on(run_out_of_order_completion_before_new_activity_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_new_activity_command_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_new_activity_case(Some(
+        1,
+    )));
+}
+
+async fn run_out_of_order_completion_before_side_effect_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_side_effect_workflow>(
+            "wf/spawn-sleep-then-side-effect",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let mut worker =
+        out_of_order_worker(backend.clone(), spawn_sleep_then_side_effect_workflow, None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_then_side_effect_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // The side effect marker records past the unconsumed completion; the
+    // pending activity result then resolves through the index, completing the
+    // workflow in the same task.
+    assert!(worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::SideEffectMarker(_)
+    ));
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("spawn-sleep-then-side-effect workflow did not complete");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(result).unwrap(),
+        "tagged:20"
+    );
+}
+
+#[test]
+fn out_of_order_completion_before_side_effect_cached() {
+    block_on(run_out_of_order_completion_before_side_effect_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_side_effect_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_side_effect_case(Some(1)));
+}
+
+async fn run_out_of_order_completion_before_version_marker_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_version_workflow>(
+            "wf/spawn-sleep-then-version",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(backend.clone(), spawn_sleep_then_version_workflow, None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_then_version_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // get_version must record its marker past the unconsumed completion.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::VersionMarker(_)
+    ));
+    assert!(matches!(history[6].data, HistoryEventData::TimerStarted(_)));
+
+    backend.advance_time(Duration::from_secs(1));
+    assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+    assert!(worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("spawn-sleep-then-version workflow did not complete");
+    };
+    // 2*10 from the spawned activity plus version 1.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 21);
+}
+
+#[test]
+fn out_of_order_completion_before_version_marker_cached() {
+    block_on(run_out_of_order_completion_before_version_marker_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_version_marker_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_version_marker_case(
+        Some(1),
+    ));
+}
+
+// Crashes after the version marker committed, so the cold replay preconsumes
+// the marker from the provider's change-version index while an out-of-order
+// completion sits at the cursor head and the marker event is still unloaded.
+#[test]
+fn recorded_version_marker_preconsumes_past_out_of_order_completion_on_cold_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<spawn_sleep_then_version_workflow>(
+                "wf/spawn-sleep-then-version-preconsume",
+                "workflows",
+                number(10),
+            )
+            .await
+            .unwrap();
+        let mut worker =
+            out_of_order_worker(backend.clone(), spawn_sleep_then_version_workflow, None);
+        drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+        assert!(worker.run_workflow_once().await.unwrap());
+        drop(worker);
+
+        backend.advance_time(Duration::from_secs(1));
+        let mut replay_worker =
+            out_of_order_worker(backend.clone(), spawn_sleep_then_version_workflow, Some(1));
+        assert_eq!(replay_worker.run_timers_once().await.unwrap(), 1);
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("spawn-sleep-then-version workflow did not complete after cold replay");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 21);
+    });
+}
+
+async fn run_out_of_order_completion_before_child_spawn_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_child_workflow>(
+            "wf/spawn-sleep-then-child",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let build_worker = |chunk_events: Option<usize>| {
+        let mut builder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(spawn_sleep_then_child_workflow)
+            .register_workflow(child_double_workflow)
+            .register_activity(double);
+        if let Some(chunk_events) = chunk_events {
+            builder = builder.history_chunk_events(chunk_events);
+        }
+        builder.build()
+    };
+    let mut worker = build_worker(None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = build_worker(Some(chunk_events));
+    }
+
+    // The child start request must schedule past the unconsumed completion.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ChildWorkflowStartRequested(_)
+    ));
+
+    let stats = worker.run_until_idle().await.unwrap();
+    assert!(stats.child_workflow_starts_dispatched >= 1);
+
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("spawn-sleep-then-child workflow did not complete");
+    };
+    // 2*10 from the spawned activity plus 2*11 from the child workflow.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+}
+
+#[test]
+fn out_of_order_completion_before_child_spawn_cached() {
+    block_on(run_out_of_order_completion_before_child_spawn_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_child_spawn_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_child_spawn_case(Some(1)));
+}
+
+// Cold replay of a two-signal select where the SECOND branch won: the
+// recorded SignalConsumed for the later branch sits at the cursor head when
+// the first branch replays, and must be skipped instead of reported as a
+// command sequence mismatch.
+async fn run_cold_replay_of_second_branch_signal_select_case(chunk_events: usize) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<select_two_signals_then_signal_workflow>(
+            "wf/select-two-signals-then-signal",
+            "workflows",
+            unit(),
+        )
+        .await
+        .unwrap();
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .register_workflow(select_two_signals_then_signal_workflow)
+        .build();
+
+    assert!(worker.run_workflow_once().await.unwrap());
+    client
+        .signal_workflow(
+            "wf/select-two-signals-then-signal",
+            "right",
+            "signal/select-two/right",
+            "go",
+        )
+        .await
+        .unwrap();
+    assert!(worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[1].data,
+        HistoryEventData::SignalConsumed(_)
+    ));
+    assert!(matches!(history[2].data, HistoryEventData::SelectWinner(_)));
+    drop(worker);
+
+    client
+        .signal_workflow(
+            "wf/select-two-signals-then-signal",
+            "after",
+            "signal/select-two/after",
+            "done",
+        )
+        .await
+        .unwrap();
+    let mut replay_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .history_chunk_events(chunk_events)
+        .register_workflow(select_two_signals_then_signal_workflow)
+        .build();
+    assert!(replay_worker.run_workflow_once().await.unwrap());
+
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("select-two-signals workflow did not complete after cold replay");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(result).unwrap(),
+        "right:go:done"
+    );
+}
+
+#[test]
+fn cold_replay_of_two_signal_select_with_second_branch_winner() {
+    block_on(run_cold_replay_of_second_branch_signal_select_case(100));
+}
+
+#[test]
+fn cold_replay_of_two_signal_select_with_second_branch_winner_multi_chunk() {
+    block_on(run_cold_replay_of_second_branch_signal_select_case(1));
+}
+
+fn consumed_signal_ids(history: &[durust::HistoryEvent]) -> Vec<durust::SignalId> {
+    history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::SignalConsumed(consumed) => Some(consumed.signal_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// One live delivery must satisfy at most one waiter: signal consumption only
+// commits with the task, so the second sequential wait re-reads the same
+// inbox record mid-task and must stay pending until a distinct delivery.
+#[test]
+fn one_signal_delivery_is_consumed_once_by_sequential_same_name_waits() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<same_signal_twice_workflow>(
+                "wf/same-signal-twice",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(same_signal_twice_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow("wf/same-signal-twice", "gate", "gate/1", "one")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            consumed_signal_ids(&history),
+            vec![durust::SignalId::new("gate/1")],
+            "one delivery must produce exactly one SignalConsumed"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowCompleted { .. })),
+            "second wait must stay pending until a distinct delivery"
+        );
+
+        client
+            .signal_workflow("wf/same-signal-twice", "gate", "gate/2", "two")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            consumed_signal_ids(&history),
+            vec![
+                durust::SignalId::new("gate/1"),
+                durust::SignalId::new("gate/2")
+            ],
+            "each wait must consume a distinct delivery"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("same-signal-twice workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "one:two");
+    });
+}
+
+// Concurrent same-name waiters in one poll batch both read the same
+// min-sequence inbox record; exactly one branch may resolve per delivery.
+#[test]
+fn one_signal_delivery_resolves_exactly_one_concurrent_same_name_waiter() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<same_signal_join_workflow>("wf/same-signal-join", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(same_signal_join_workflow)
+            .build();
+
+        assert!(worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow("wf/same-signal-join", "gate", "gate/1", "one")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            consumed_signal_ids(&history),
+            vec![durust::SignalId::new("gate/1")],
+            "one delivery must resolve exactly one of the joined waiters"
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowCompleted { .. })),
+            "join must stay pending until the second delivery"
+        );
+
+        client
+            .signal_workflow("wf/same-signal-join", "gate", "gate/2", "two")
+            .await
+            .unwrap();
+        assert!(worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            consumed_signal_ids(&history),
+            vec![
+                durust::SignalId::new("gate/1"),
+                durust::SignalId::new("gate/2")
+            ],
+            "the joined waiters must consume distinct deliveries"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("same-signal-join workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<String>(result).unwrap(), "one:two");
+    });
+}
+
+// With the seq-mismatch checks removed from SignalFuture, the fingerprint
+// comparison in decode_consumed_signal is the only guard that detects a
+// changed signal name at a recorded consumption's command position. Replaying
+// a recorded "gate" consumption against code awaiting "door" at the same
+// position must fail as nondeterminism, and the task must be released
+// without appending a WorkflowFailed terminal.
+#[test]
+fn changed_signal_name_at_recorded_consumption_is_detected_as_nondeterminism() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<signal_gate_then_after_workflow>(
+                "wf/signal-fingerprint-changed",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(signal_gate_then_after_workflow)
+            .build();
+
+        // Record SignalConsumed("gate") at command 1, then leave the run
+        // non-terminal blocked on the "after" wait.
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        client
+            .signal_workflow(
+                "wf/signal-fingerprint-changed",
+                "gate",
+                "signal/fingerprint/gate",
+                "go",
+            )
+            .await
+            .unwrap();
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history[1].data,
+            HistoryEventData::SignalConsumed(_)
+        ));
+
+        // Wake the run so the changed worker cold-replays the recorded
+        // consumption against code awaiting "door" at the same position.
+        client
+            .signal_workflow(
+                "wf/signal-fingerprint-changed",
+                "after",
+                "signal/fingerprint/after",
+                "done",
+            )
+            .await
+            .unwrap();
+        let mut changed_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(signal_door_then_after_workflow)
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .build();
+        let err = changed_worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Nondeterminism(_)));
+
+        // Nondeterminism releases the task for retry against fixed code; it
+        // must not fail the workflow.
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
         );
     });
 }
@@ -2993,6 +4073,130 @@ fn select_replays_recorded_winner_after_worker_crash() {
     });
 }
 
+// Regression: the select digest must not hash branch source text. A benign
+// refactor (renamed bind patterns, reformatted future expressions, renamed
+// body locals) replays a recorded SelectWinner cleanly because the digest
+// pins only the branch count; the stored form is asserted directly.
+#[test]
+fn select_branch_source_refactor_replays_recorded_winner() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_then_wait>("wf/select-refactor", "workflows", number(10))
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        let history = stream_all(&backend, &run_id).await;
+        let winner = history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::SelectWinner(winner) => Some(winner.clone()),
+                _ => None,
+            })
+            .expect("recorded SelectWinner");
+        assert_eq!(winner.branches_digest, "select:2");
+
+        client
+            .signal_workflow(
+                "wf/select-refactor",
+                "after",
+                "signal/select/refactor-after",
+                "done",
+            )
+            .await
+            .unwrap();
+        // Cold replay (single-event chunks) through the refactored workflow
+        // must accept the recorded winner and complete.
+        let mut refactored_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .history_chunk_events(1)
+            .register_workflow(select_then_wait_reformatted)
+            .build();
+        assert!(refactored_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } =
+            &history.last().expect("completed event").data
+        else {
+            panic!("refactored select workflow did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "timer:done"
+        );
+    });
+}
+
+// Regression for the count-only select digest: a branch appended after the
+// recorded ones keeps the select command id and all prior command
+// fingerprints valid, so the `select:{count}` digest is the sole check that
+// can detect the change. Replay must fail with the digest's nondeterminism
+// error and must not append a terminal event.
+#[test]
+fn select_branch_count_change_is_detected_on_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<select_then_wait>("wf/select-count-change", "workflows", number(10))
+            .await
+            .unwrap();
+        let mut original_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait)
+            .build();
+
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_millis(10));
+        assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+        assert!(original_worker.run_workflow_once().await.unwrap());
+        drop(original_worker);
+
+        client
+            .signal_workflow(
+                "wf/select-count-change",
+                "after",
+                "signal/select/count-after",
+                "done",
+            )
+            .await
+            .unwrap();
+        let mut changed_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .register_workflow(select_then_wait_extra_branch)
+            .nondeterminism_retry_backoff(Duration::from_millis(25))
+            .build();
+        let err = changed_worker.run_workflow_once().await.unwrap_err();
+        let durust::Error::Nondeterminism(message) = err else {
+            panic!("expected nondeterminism error, got {err:?}");
+        };
+        assert!(
+            message.contains("select branch set changed"),
+            "unexpected nondeterminism message: {message}"
+        );
+
+        // The failed replay left the run open: no terminal event appended.
+        let history = stream_all(&backend, &run_id).await;
+        assert!(!history.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::WorkflowCompleted { .. }
+                | HistoryEventData::WorkflowFailed { .. }
+                | HistoryEventData::WorkflowCancelled { .. }
+        )));
+    });
+}
+
 #[test]
 fn select_branch_reorder_is_detected_on_replay() {
     block_on(async {
@@ -3025,6 +4229,256 @@ fn select_branch_reorder_is_detected_on_replay() {
         let err = changed_worker.run_workflow_once().await.unwrap_err();
         assert!(matches!(err, durust::Error::Nondeterminism(_)));
     });
+}
+
+fn held_handle_worker(backend: RecordingBackend) -> Worker<RecordingBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(held_handle_sleeps_workflow)
+        .register_activity(double)
+        .build()
+}
+
+// A workflow holding an unawaited handle across tasks (spawn early, await
+// late) leaves the activity completion unconsumed in every intermediate
+// task. The unconsumed index entries are carried in the workflow cache, so
+// only the initial task may replay from the beginning of history.
+#[test]
+fn held_handle_across_sleeps_completes_without_cold_replay_when_cached() {
+    block_on(async {
+        // Claim prefetch is disabled so every task must stream history,
+        // making a cold replay visible as a from-zero stream request.
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<held_handle_sleeps_workflow>(
+                "wf/held-handle",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+        let mut worker = held_handle_worker(backend.clone());
+
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.activity_tasks, 1);
+        assert_eq!(stats.timers_fired, HELD_HANDLE_TEST_SLEEPS as usize);
+
+        let from_zero = backend
+            .stream_requests()
+            .iter()
+            .filter(|req| req.after_event_id == EventId::ZERO)
+            .count();
+        assert_eq!(
+            from_zero,
+            1,
+            "only the initial task may replay from the beginning, got {:?}",
+            backend.stream_requests()
+        );
+
+        let history = stream_all(&backend.inner, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("held-handle workflow did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+    });
+}
+
+// The cold variant: a worker crash mid-pattern forces one full recovery
+// replay, after which the rebuilt unconsumed indexes are carried again and
+// the remaining tasks stay cached.
+#[test]
+fn held_handle_across_sleeps_recovers_with_one_cold_replay_after_crash() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<held_handle_sleeps_workflow>(
+                "wf/held-handle-cold",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+        let mut crashed_worker = held_handle_worker(backend.clone());
+        // Spawn the activity and the first sleep, land the out-of-order
+        // completion, then crash before the next workflow task.
+        assert!(crashed_worker.run_workflow_once().await.unwrap());
+        assert!(crashed_worker.run_activity_once().await.unwrap());
+        drop(crashed_worker);
+        backend.clear_stream_requests();
+
+        let mut recovered_worker = held_handle_worker(backend.clone());
+        let stats = recovered_worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.timers_fired, HELD_HANDLE_TEST_SLEEPS as usize);
+
+        let from_zero = backend
+            .stream_requests()
+            .iter()
+            .filter(|req| req.after_event_id == EventId::ZERO)
+            .count();
+        assert_eq!(
+            from_zero,
+            1,
+            "recovery replays the full history once and then stays cached, got {:?}",
+            backend.stream_requests()
+        );
+
+        let history = stream_all(&backend.inner, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("held-handle workflow did not complete after recovery");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 42);
+    });
+}
+
+// Drives three interleaved two-timer workflows (initial task plus one task
+// per timer fire) under a given cache bound and reports how many replay
+// streams started from the beginning of history plus the largest cache size
+// observed at pass boundaries. Claim prefetch is disabled so every cold
+// replay is visible as a from-zero stream request.
+async fn run_interleaved_two_timer_workflows_with_cache_bound(
+    max_cached_workflows: usize,
+) -> (usize, usize) {
+    let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+    let client = Client::new(backend.clone());
+    let mut run_ids = Vec::new();
+    for i in 0..3 {
+        run_ids.push(
+            client
+                .start_workflow::<two_timers_workflow>(
+                    format!("wf/cache-bound-{i}"),
+                    "workflows",
+                    unit(),
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .max_cached_workflows(max_cached_workflows)
+        .register_workflow(two_timers_workflow)
+        .build();
+
+    let mut max_cache_len = 0usize;
+    for _ in 0..3 {
+        worker.run_until_idle().await.unwrap();
+        max_cache_len = max_cache_len.max(worker.cached_workflow_count());
+        backend.inner.advance_time(Duration::from_millis(1));
+    }
+    worker.run_until_idle().await.unwrap();
+
+    for run_id in &run_ids {
+        let history = stream_all(&backend.inner, run_id).await;
+        assert!(
+            matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ),
+            "workflow {run_id:?} did not complete under cache bound {max_cached_workflows}"
+        );
+    }
+    let from_zero = backend
+        .stream_requests()
+        .iter()
+        .filter(|req| req.after_event_id == EventId::ZERO)
+        .count();
+    (from_zero, max_cache_len)
+}
+
+// With room for one cached run, three interleaved runs evict each other on
+// almost every task: eight of the nine workflow tasks (three per run)
+// cold-replay from the beginning of history. The single warm task is the
+// last run's terminal task: earlier tasks in that round are terminal and do
+// not re-enter the cache, so its round-two entry survives until claimed.
+#[test]
+fn cache_bound_of_one_forces_cold_replays_for_interleaved_runs() {
+    block_on(async {
+        let (from_zero, max_cache_len) =
+            run_interleaved_two_timer_workflows_with_cache_bound(1).await;
+        assert_eq!(
+            from_zero, 8,
+            "all but the sole cache-resident task must cold-replay under a bound of one"
+        );
+        assert!(max_cache_len <= 1, "cache exceeded its bound of 1");
+    });
+}
+
+// With a bound above the run count the same scenario replays from zero only
+// for each run's initial task; timer tasks resume the cached futures.
+#[test]
+fn cache_bound_above_run_count_keeps_interleaved_runs_cached() {
+    block_on(async {
+        let (from_zero, max_cache_len) =
+            run_interleaved_two_timer_workflows_with_cache_bound(1_000).await;
+        assert_eq!(
+            from_zero, 3,
+            "only the initial task per run may replay from the beginning"
+        );
+        // All three non-terminal runs were cached simultaneously.
+        assert_eq!(max_cache_len, 3);
+    });
+}
+
+// Records two timers, then replays against a version with one timer that
+// completes: the leftover TimerStarted command event is divergence, so the
+// task must fail with Nondeterminism and append no terminal event.
+async fn assert_two_timer_recording_rejects_one_timer_completion(history_chunk_events: usize) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<two_timers_workflow>("wf/timer-count-change", "workflows", unit())
+        .await
+        .unwrap();
+    let mut original_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .register_workflow(two_timers_workflow)
+        .build();
+    // Record both timers but crash before the completing task commits, so
+    // the run stays claimable with the second TimerStarted/TimerFired pair
+    // at the history tail.
+    assert!(original_worker.run_workflow_once().await.unwrap());
+    backend.advance_time(Duration::from_millis(1));
+    assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+    assert!(original_worker.run_workflow_once().await.unwrap());
+    backend.advance_time(Duration::from_millis(1));
+    assert_eq!(original_worker.run_timers_once().await.unwrap(), 1);
+    drop(original_worker);
+
+    let mut changed_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .history_chunk_events(history_chunk_events)
+        .register_workflow(one_timer_workflow)
+        .nondeterminism_retry_backoff(Duration::from_millis(25))
+        .build();
+    let err = changed_worker.run_workflow_once().await.unwrap_err();
+    assert!(
+        matches!(err, durust::Error::Nondeterminism(_)),
+        "expected Nondeterminism, got {err:?}"
+    );
+
+    // No terminal event was committed: history still ends at the recorded
+    // second timer fire.
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history.last().unwrap().data,
+        HistoryEventData::TimerFired(_)
+    ));
+}
+
+#[test]
+fn terminal_with_leftover_command_events_is_nondeterminism() {
+    block_on(assert_two_timer_recording_rejects_one_timer_completion(128));
+}
+
+// Single-event chunks leave the leftover command events unloaded when the
+// workflow returns; the divergence check must stream the rest of history
+// instead of trusting the loaded prefix.
+#[test]
+fn terminal_with_leftover_command_events_in_unloaded_chunks_is_nondeterminism() {
+    block_on(assert_two_timer_recording_rejects_one_timer_completion(1));
 }
 
 #[test]
@@ -3938,9 +5392,20 @@ fn retryable_activity_failure_does_not_append_failure_history() {
             .register_activity(flaky_activity)
             .build();
 
-        let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.workflow_tasks, 2);
-        assert_eq!(stats.activity_tasks, 2);
+        // The first attempt fails; the exponential backoff hides the retry
+        // until virtual time passes its visibility deadline, so the worker
+        // goes idle after one activity task.
+        let first_pass = worker.run_until_idle().await.unwrap();
+        assert_eq!(first_pass.activity_tasks, 1);
+        assert_eq!(*FLAKY_ATTEMPTS.lock().unwrap(), 1);
+        backend.advance_time(Duration::from_secs(1));
+        let second_pass = worker.run_until_idle().await.unwrap();
+        assert_eq!(
+            first_pass.workflow_tasks + second_pass.workflow_tasks,
+            2,
+            "one scheduling task and one completion task"
+        );
+        assert_eq!(second_pass.activity_tasks, 1);
         assert_eq!(*FLAKY_ATTEMPTS.lock().unwrap(), 2);
 
         let history = stream_all(&backend, &run_id).await;
@@ -4675,7 +6140,8 @@ fn cached_workflow_wake_ignores_cold_recovery_saturation() {
 #[test]
 fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
     block_on(async {
-        let backend = RecordingBackend::new(MemoryBackend::new());
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner.clone());
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<double_plus_one>("wf/recovery-admission", "workflows", number(7))
@@ -4720,7 +6186,7 @@ fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
                 .any(|event| matches!(event.data, HistoryEventData::WorkflowFailed { .. }))
         );
 
-        std::thread::sleep(Duration::from_millis(40));
+        inner.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-recovery-admission-delay"),
@@ -4830,7 +6296,8 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
 #[test]
 fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
     block_on(async {
-        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner.clone()).without_claim_prefetch();
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<double_plus_one>("wf/recovery-backpressure", "workflows", number(9))
@@ -4873,7 +6340,7 @@ fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        inner.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-provider-backpressure-delay"),
@@ -4882,6 +6349,325 @@ fn provider_backpressure_defers_cold_recovery_without_workflow_failure() {
             .await
             .unwrap();
         assert!(visible.is_some());
+    });
+}
+
+// Builds a two-slot batch worker so run_workflow_batch_once takes the batched
+// claim/prepare/commit path instead of delegating to run_workflow_once.
+fn batch_error_worker(backend: RecordingBackend) -> Worker<RecordingBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .max_concurrent_workflow_tasks(2)
+        .workflow_task_prefetch_limit(2)
+        .workflow_task_commit_batch_size(2)
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build()
+}
+
+#[test]
+fn claim_is_released_when_current_time_fails_before_prepare() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/current-time-error", "workflows", number(9))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+
+        backend.fail_next_current_time();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        // The failed prepare released its claim immediately: the task is
+        // claimable again without waiting for lease expiry.
+        let reclaimed = backend
+            .claim_workflow_task(
+                WorkerId::new("after-current-time-error"),
+                double_plus_one_claim_options(),
+            )
+            .await
+            .unwrap()
+            .expect("claim released by failed prepare");
+        backend
+            .release_workflow_task(
+                reclaimed.claim,
+                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+            )
+            .await
+            .unwrap();
+
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+    });
+}
+
+// Drives a workflow through its first task and activity with one worker, then
+// injects `inject` before a fresh worker's cold recovery and asserts the error
+// surfaced without stranding the claim or the single recovery slot: the same
+// worker must afterwards recover and complete the run unaided.
+async fn cold_recovery_error_releases_claim_and_recovery_slot(
+    inject: impl FnOnce(&RecordingBackend),
+    chunk_events: usize,
+) {
+    let backend = RecordingBackend::new(MemoryBackend::new());
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<double_plus_one>("wf/cold-recovery-error", "workflows", number(9))
+        .await
+        .unwrap();
+    let mut first_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build();
+    assert!(first_worker.run_workflow_once().await.unwrap());
+    assert!(first_worker.run_activity_once().await.unwrap());
+    drop(first_worker);
+
+    let mut recovered_worker = Worker::builder(backend.clone())
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .history_chunk_events(chunk_events)
+        .max_concurrent_recoveries(1)
+        .recovery_defer_delay(Duration::from_millis(1))
+        .register_workflow(double_plus_one)
+        .register_activity(double)
+        .build();
+
+    inject(&backend);
+    let err = recovered_worker.run_workflow_once().await.unwrap_err();
+    assert!(matches!(err, durust::Error::Backend(_)));
+
+    // A leaked claim would keep the run unclaimable (its lease never expires
+    // under virtual time) and a leaked recovery slot would defer every future
+    // cold recovery, so completing here proves both were released.
+    recovered_worker.run_until_idle().await.unwrap();
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history.last().unwrap().data,
+        HistoryEventData::WorkflowCompleted { .. }
+    ));
+}
+
+#[test]
+fn cold_recovery_change_versions_error_releases_claim_and_recovery_slot() {
+    block_on(async {
+        // A one-event chunk keeps `has_more` true so the prepare pipeline
+        // queries the change-version index, which is where the fault fires.
+        cold_recovery_error_releases_claim_and_recovery_slot(
+            |backend| backend.fail_next_change_versions(),
+            1,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn cold_recovery_hydrate_error_releases_claim_and_recovery_slot() {
+    block_on(async {
+        cold_recovery_error_releases_claim_and_recovery_slot(
+            |backend| backend.fail_hydrate_payload_calls(1),
+            128,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn batch_prepare_error_releases_failed_claim_and_still_commits_neighbors() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-prepare-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-prepare-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        // The first claimed task (run a, lowest run id) fails its input
+        // hydration during prepare; its batch neighbor must still commit.
+        backend.fail_hydrate_payload_calls(1);
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        let history_a = stream_all(&backend, &run_a).await;
+        assert_eq!(history_a.len(), 1);
+        let history_b = stream_all(&backend, &run_b).await;
+        assert_eq!(history_b.len(), 2);
+        assert!(matches!(
+            history_b[1].data,
+            HistoryEventData::ActivityScheduled(_)
+        ));
+
+        // The failed task's claim was released, so the worker finishes both
+        // workflows without any lease expiry.
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
+#[test]
+fn batch_commit_rpc_error_releases_every_claim_in_the_batch() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-rpc-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-rpc-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        backend.fail_next_commit_batch();
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
+
+        // Nothing committed, and both claims were released.
+        for run_id in [&run_a, &run_b] {
+            assert_eq!(stream_all(&backend, run_id).await.len(), 1);
+        }
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
+#[test]
+fn activity_lease_duration_knob_bounds_default_option_activity_runtime() {
+    block_on(async {
+        // An activity with default options (no timeout, no heartbeat, no
+        // retries) whose virtual runtime exceeds the worker's configured
+        // activity lease is reclaimed mid-flight: the maintenance scan turns
+        // it into a permanent ActivityTimedOut, the late completion is
+        // idempotently rejected, and the workflow observes the timeout.
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/lease-too-short", "workflows", number(4))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .activity_task_lease_duration(Duration::from_secs(1))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_and_scan_before_activity_completion(Duration::from_secs(2));
+        assert!(worker.run_activity_once().await.unwrap());
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityTimedOut(_)))
+        );
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+        );
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowFailed { .. }
+        ));
+
+        // The same activity under a lease longer than its runtime completes
+        // normally and the workflow finishes.
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<double_plus_one>("wf/lease-long-enough", "workflows", number(4))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .activity_task_lease_duration(Duration::from_secs(60))
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_and_scan_before_activity_completion(Duration::from_secs(2));
+        assert!(worker.run_activity_once().await.unwrap());
+        worker.run_until_idle().await.unwrap();
+        let history = stream_all(&backend, &run_id).await;
+        assert!(
+            !history
+                .iter()
+                .any(|event| matches!(event.data, HistoryEventData::ActivityTimedOut(_)))
+        );
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
+    });
+}
+
+#[test]
+fn batch_per_item_conflict_does_not_abort_the_rest_of_the_chunk() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new());
+        let client = Client::new(backend.clone());
+        let run_a = client
+            .start_workflow::<double_plus_one>("wf/batch-conflict-a", "workflows", number(1))
+            .await
+            .unwrap();
+        let run_b = client
+            .start_workflow::<double_plus_one>("wf/batch-conflict-b", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = batch_error_worker(backend.clone());
+
+        backend.conflict_batch_commit_for_run(run_a.clone());
+        let committed = worker.run_workflow_batch_once().await.unwrap();
+        assert_eq!(committed, 1);
+
+        let history_a = stream_all(&backend, &run_a).await;
+        assert_eq!(history_a.len(), 1);
+        let history_b = stream_all(&backend, &run_b).await;
+        assert_eq!(history_b.len(), 2);
+
+        worker.run_until_idle().await.unwrap();
+        for run_id in [&run_a, &run_b] {
+            let history = stream_all(&backend, run_id).await;
+            assert!(matches!(
+                history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
     });
 }
 
@@ -4976,7 +6762,7 @@ fn configured_nondeterminism_backoff_releases_workflow_after_delay() {
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        backend.advance_time(Duration::from_millis(40));
         let visible = backend
             .claim_workflow_task(
                 WorkerId::new("after-backoff"),
@@ -5408,11 +7194,31 @@ fn lazy_payload_worker(
 struct CountingBlobStore {
     blobs: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
     gets: Arc<Mutex<usize>>,
+    puts_by_digest: Arc<Mutex<BTreeMap<String, usize>>>,
+    exists_probes: Arc<Mutex<usize>>,
 }
 
 impl CountingBlobStore {
     fn get_count(&self) -> usize {
         *self.gets.lock().unwrap()
+    }
+
+    fn exists_probe_count(&self) -> usize {
+        *self.exists_probes.lock().unwrap()
+    }
+
+    fn max_puts_for_one_digest(&self) -> usize {
+        self.puts_by_digest
+            .lock()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn put_count(&self) -> usize {
+        self.puts_by_digest.lock().unwrap().values().sum()
     }
 }
 
@@ -5423,7 +7229,13 @@ impl durust::PayloadBlobStore for CountingBlobStore {
         bytes: Vec<u8>,
     ) -> BoxFuture<'static, durust::Result<String>> {
         let blobs = self.blobs.clone();
+        let puts_by_digest = self.puts_by_digest.clone();
         Box::pin(async move {
+            *puts_by_digest
+                .lock()
+                .unwrap()
+                .entry(digest.clone())
+                .or_insert(0) += 1;
             blobs.lock().unwrap().insert(digest.clone(), bytes);
             Ok(format!("memory-blob://payload/{digest}"))
         })
@@ -5443,9 +7255,28 @@ impl durust::PayloadBlobStore for CountingBlobStore {
         })
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
         let blobs = self.blobs.clone();
-        Box::pin(async move { Ok(blobs.lock().unwrap().keys().cloned().collect()) })
+        let exists_probes = self.exists_probes.clone();
+        Box::pin(async move {
+            *exists_probes.lock().unwrap() += 1;
+            Ok(blobs.lock().unwrap().contains_key(&digest))
+        })
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            let now = durust::TimestampMs(0);
+            Ok(blobs
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|digest| (digest.clone(), now))
+                .collect())
+        })
     }
 
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
@@ -5500,6 +7331,12 @@ struct RecordingBackend {
     signal_batch_requests: Arc<Mutex<Vec<durust::ReadSignalInboxesRequest>>>,
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
+    fail_next_current_time: Arc<Mutex<bool>>,
+    fail_next_change_versions: Arc<Mutex<bool>>,
+    hydrate_failures_remaining: Arc<Mutex<u32>>,
+    fail_next_commit_batch: Arc<Mutex<bool>>,
+    conflict_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
+    advance_before_activity_completion: Arc<Mutex<Option<Duration>>>,
     claim_prefetch_enabled: bool,
 }
 
@@ -5511,6 +7348,12 @@ impl RecordingBackend {
             signal_batch_requests: Arc::new(Mutex::new(Vec::new())),
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
+            fail_next_current_time: Arc::new(Mutex::new(false)),
+            fail_next_change_versions: Arc::new(Mutex::new(false)),
+            hydrate_failures_remaining: Arc::new(Mutex::new(0)),
+            fail_next_commit_batch: Arc::new(Mutex::new(false)),
+            conflict_batch_commit_run: Arc::new(Mutex::new(None)),
+            advance_before_activity_completion: Arc::new(Mutex::new(None)),
             claim_prefetch_enabled: true,
         }
     }
@@ -5539,6 +7382,38 @@ impl RecordingBackend {
     fn backpressure_next_replay_stream(&self, retry_after: Duration) {
         *self.backpressure_next_replay_stream.lock().unwrap() = Some(retry_after);
     }
+
+    fn fail_next_current_time(&self) {
+        *self.fail_next_current_time.lock().unwrap() = true;
+    }
+
+    fn fail_next_change_versions(&self) {
+        *self.fail_next_change_versions.lock().unwrap() = true;
+    }
+
+    fn fail_hydrate_payload_calls(&self, count: u32) {
+        *self.hydrate_failures_remaining.lock().unwrap() = count;
+    }
+
+    fn fail_next_commit_batch(&self) {
+        *self.fail_next_commit_batch.lock().unwrap() = true;
+    }
+
+    fn conflict_batch_commit_for_run(&self, run_id: durust::RunId) {
+        *self.conflict_batch_commit_run.lock().unwrap() = Some(run_id);
+    }
+
+    // Simulates an activity whose execution outlives `advance` of virtual time
+    // while the maintenance scanner keeps running elsewhere: before the next
+    // completion is applied, the clock moves and due activities are timed out.
+    fn advance_and_scan_before_activity_completion(&self, advance: Duration) {
+        *self.advance_before_activity_completion.lock().unwrap() = Some(advance);
+    }
+
+    fn take_flag(flag: &Arc<Mutex<bool>>) -> bool {
+        let mut flag = flag.lock().unwrap();
+        std::mem::take(&mut *flag)
+    }
 }
 
 impl DurableBackend for RecordingBackend {
@@ -5557,6 +7432,13 @@ impl DurableBackend for RecordingBackend {
     }
 
     fn current_time(&self) -> BoxFuture<'static, durust::Result<durust::TimestampMs>> {
+        if Self::take_flag(&self.fail_next_current_time) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected current_time failure".to_owned(),
+                ))
+            });
+        }
         self.inner.current_time()
     }
 
@@ -5584,6 +7466,24 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
         self.inner.stream_history(req)
+    }
+
+    fn hydrate_payload(
+        &self,
+        payload: durust::PayloadRef,
+    ) -> BoxFuture<'static, durust::Result<durust::PayloadRef>> {
+        {
+            let mut remaining = self.hydrate_failures_remaining.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Box::pin(async {
+                    Err(durust::Error::Backend(
+                        "injected hydrate failure".to_owned(),
+                    ))
+                });
+            }
+        }
+        self.inner.hydrate_payload(payload)
     }
 
     fn stream_history_for_replay(
@@ -5629,6 +7529,53 @@ impl DurableBackend for RecordingBackend {
             });
         }
         self.inner.commit_workflow_task(claim, batch)
+    }
+
+    // Overridden (instead of relying on the default per-item loop) so tests
+    // can fail the whole batch RPC or fabricate a per-item conflict while the
+    // other items commit for real.
+    fn commit_workflow_tasks(
+        &self,
+        batch: durust::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
+        if Self::take_flag(&self.fail_next_commit_batch) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected batch commit failure".to_owned(),
+                ))
+            });
+        }
+        let conflict_run = self.conflict_batch_commit_run.lock().unwrap().take();
+        let backend = self.clone();
+        Box::pin(async move {
+            let mut results = Vec::with_capacity(batch.commits.len());
+            for input in batch.commits {
+                let claim = input.claim;
+                if conflict_run.as_ref() == Some(&claim.run_id) {
+                    // Mirror a real conflict: the provider releases the claim
+                    // as part of reporting it.
+                    backend
+                        .inner
+                        .release_workflow_task(
+                            claim.clone(),
+                            durust::WorkflowTaskRelease::immediate(
+                                durust::WorkflowTaskReason::CacheEvicted,
+                            ),
+                        )
+                        .await?;
+                    results.push(durust::WorkflowTaskCommitBatchResult {
+                        claim,
+                        result: Ok(durust::CommitOutcome::Conflict),
+                    });
+                    continue;
+                }
+                let result = backend
+                    .commit_workflow_task(claim.clone(), input.commit)
+                    .await;
+                results.push(durust::WorkflowTaskCommitBatchResult { claim, result });
+            }
+            Ok(results)
+        })
     }
 
     fn release_workflow_task(
@@ -5694,7 +7641,26 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
-        self.inner.complete_activity(req)
+        let advance = self
+            .advance_before_activity_completion
+            .lock()
+            .unwrap()
+            .take();
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            if let Some(advance) = advance {
+                inner.advance_time(advance);
+                let now = inner.current_time().await?;
+                inner
+                    .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                        namespace: Namespace::default(),
+                        now,
+                        limit: 16,
+                    })
+                    .await?;
+            }
+            inner.complete_activity(req).await
+        })
     }
 
     fn fail_activity(
@@ -5722,6 +7688,13 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: durust::WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
+        if Self::take_flag(&self.fail_next_change_versions) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected change versions failure".to_owned(),
+                ))
+            });
+        }
         self.inner.workflow_change_versions(req)
     }
 

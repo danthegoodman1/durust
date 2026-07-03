@@ -1,0 +1,5 @@
+error: strict mode is not implemented yet; remove `strict` or pin the durust version that ships it
+ --> tests/ui/strict_mode.rs:4:59
+  |
+4 | #[durust::workflow(name = "bad.strict-mode", version = 1, strict)]
+  |                                                           ^^^^^^

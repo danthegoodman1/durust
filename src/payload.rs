@@ -339,6 +339,12 @@ where
         .into_iter()
         .map(|page| {
             let page = load_container(page)?;
+            // A page the loader could not inline belongs to another layer
+            // (foreign scheme); it passes through opaquely and its items are
+            // that layer's responsibility.
+            if matches!(page, PayloadRef::Blob { .. }) {
+                return Ok(page);
+            }
             let page_codec = page.codec();
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page

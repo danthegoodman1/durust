@@ -348,12 +348,14 @@
   ],
   "payloadGarbageCollection": {
     "request": {
-      "dryRun": true
+      "dryRun": true,
+      "minAgeMs": 3600000
     },
     "rustProviderOutcome": {
       "scannedBlobs": 3,
       "retainedBlobs": 2,
-      "deletedBlobs": 0
+      "deletedBlobs": 0,
+      "failedBlobs": 0
     },
     "typescriptPlan": {
       "reachableUris": [

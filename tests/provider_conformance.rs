@@ -4,18 +4,22 @@ use durust::{
     ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CommitOutcome,
     CompleteActivityRequest, CompleteActivityTasksRequest, DurableBackend, Error, EventId,
     FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent,
-    PayloadBackend, PostgresBackend, PostgresBackendConfig, Registry, SqliteBackend, TaskQueue,
-    Worker, WorkerId, WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput,
-    WorkflowType,
+    PayloadBackend, PayloadBlobStore, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
+    WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
 };
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use futures::future::{BoxFuture, ready};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::future::Future;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "s3")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Input {
@@ -26,10 +30,12 @@ fn input(value: u64) -> Input {
     Input { value }
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_url_from_env() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_test_schema(prefix: &str) -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -38,6 +44,7 @@ fn postgres_test_schema(prefix: &str) -> String {
     format!("durust_{prefix}_{}_{}", std::process::id(), millis)
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -55,6 +62,7 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
@@ -67,6 +75,44 @@ async fn echo(input: Input) -> durust::Result<u64> {
 #[durust::workflow(name = "conformance.workflow", version = 1)]
 async fn workflow(input: Input) -> durust::Result<u64> {
     durust::call_activity!(echo(Input { value: input.value })).await
+}
+
+#[durust::workflow(name = "conformance.signal-race", version = 1)]
+async fn signal_race_workflow(_: Input) -> durust::Result<String> {
+    durust::signal::<String>("go").await
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PageItem {
+    label: String,
+}
+
+#[durust::activity(name = "conformance.page-item-len")]
+async fn page_item_len(input: PageItem) -> durust::Result<u64> {
+    Ok(input.label.len() as u64)
+}
+
+// Items are ~600 bytes each so a page of five overflows a 2 KiB decorator
+// threshold (page offloaded to the custom scheme) while the manifest root —
+// a handful of page refs — stays inline.
+#[durust::workflow(name = "conformance.foreign-page-map", version = 1)]
+async fn foreign_page_map_workflow(input: Input) -> durust::Result<u64> {
+    let items = (0..input.value).map(|ordinal| PageItem {
+        label: format!("{ordinal:0>600}"),
+    });
+    let input_manifest = durust::activity_map_manifest(items)?;
+    let mapped = durust::activity_map(page_item_len)
+        .task_queue("foreign-page-map-activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("page-item-lens")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok(sum + durust::decode_payload::<u64>(payload)?)
+    })
 }
 
 mod default_name_handlers {
@@ -98,6 +144,7 @@ fn sqlite_provider_passes_basic_conformance() {
     });
 }
 
+#[cfg(feature = "postgres")]
 #[test]
 fn postgres_provider_passes_basic_conformance_when_configured() {
     block_on_tokio(async {
@@ -177,6 +224,130 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
 }
 
 #[test]
+fn memory_workflow_lease_expiry_reclaims_and_fences_stale_holder() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/memory-lease-expiry",
+            "memory-lease-expiry-workflows",
+            Duration::from_secs(30),
+            |backend| async move { backend },
+            move || async move {
+                advance_backend.advance_time(Duration::from_secs(31));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_workflow_lease_expiry_reclaims_and_fences_stale_holder_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lease-expiry.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/sqlite-lease-expiry",
+            "sqlite-lease-expiry-workflows",
+            Duration::from_millis(50),
+            move |backend| async move {
+                drop(backend);
+                SqliteBackend::open(&path).unwrap()
+            },
+            || async { std::thread::sleep(Duration::from_millis(120)) },
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres lease expiry conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("lease_expiry");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        workflow_lease_expiry_reclaims_and_fences_stale_holder(
+            backend,
+            "wf/postgres-lease-expiry",
+            "postgres-lease-expiry-workflows",
+            Duration::from_millis(50),
+            |backend| async move { backend },
+            || async { tokio::time::sleep(Duration::from_millis(120)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[test]
+fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/memory-delayed-release",
+            "memory-delayed-release-workflows",
+            move || async move {
+                advance_backend.advance_time(Duration::from_millis(40));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("delayed-release.sqlite3")).unwrap();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/sqlite-delayed-release",
+            "sqlite-delayed-release-workflows",
+            || async { std::thread::sleep(Duration::from_millis(40)) },
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres delayed release conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("delayed_release");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        delayed_released_workflow_task_is_not_claimable_until_visible(
+            backend,
+            "wf/postgres-delayed-release",
+            "postgres-delayed-release-workflows",
+            || async { tokio::time::sleep(Duration::from_millis(40)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[test]
 fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
@@ -228,6 +399,242 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             .unwrap();
         assert!(visible.is_some());
     });
+}
+
+#[test]
+fn memory_activity_retry_backoff_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        exponential_backoff_hides_retry_until_visible(
+            backend.clone(),
+            backend,
+            "memory",
+            move |activity_opts| async move {
+                // Pin the exact visibility boundary: one millisecond before
+                // the 1s first-attempt backoff the retry is still hidden.
+                advance_backend.advance_time(Duration::from_millis(999));
+                let hidden = advance_backend
+                    .claim_activity_task(WorkerId::new("memory-backoff-boundary"), activity_opts)
+                    .await
+                    .unwrap();
+                assert!(hidden.is_none(), "retry visible before its backoff elapsed");
+                advance_backend.advance_time(Duration::from_millis(1));
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_activity_retry_backoff_persists_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retry-backoff.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        // The retry side runs on a reopened provider so the visibility
+        // deadline is proven to live in the database, not in memory.
+        let reopened = SqliteBackend::open(&path).unwrap();
+        exponential_backoff_hides_retry_until_visible(backend, reopened, "sqlite", |_| async {
+            std::thread::sleep(Duration::from_millis(1_000));
+        })
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_activity_retry_backoff_delays_reclaim_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres retry backoff conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("retry_backoff");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        exponential_backoff_hides_retry_until_visible(
+            backend.clone(),
+            backend,
+            "postgres",
+            |_| async {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+            },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+// Shared exponential-backoff suite: a failing activity's retry is hidden from
+// claims until `now + base * 2^(attempt - 1)`, claimable afterwards, and the
+// workflow still completes on the retried attempt. `pass_backoff` moves the
+// provider clock past the 1s first-attempt backoff (virtual time for memory,
+// wall-clock waiting for the SQL providers); `retry_backend` performs every
+// post-failure call so SQLite can prove the persisted deadline across a
+// reopen.
+async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
+    backend: B,
+    retry_backend: R,
+    prefix: &str,
+    pass_backoff: F,
+) where
+    B: DurableBackend,
+    R: DurableBackend,
+    F: FnOnce(ClaimActivityOptions) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let client = Client::new(backend.clone());
+    let workflow_queue = format!("{prefix}-backoff-workflows");
+    let activity_queue = format!("{prefix}-backoff-activities");
+    let run_id = client
+        .start_workflow::<workflow>(format!("wf/{prefix}-backoff"), &workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(&workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("backoff-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(&activity_queue),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(&activity_queue),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let first = backend
+        .claim_activity_task(WorkerId::new("backoff-worker-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+    assert_eq!(
+        backend
+            .fail_activity(FailActivityRequest {
+                claim: first.claim,
+                failure: durust::DurableFailure::new("test.transient", "transient"),
+            })
+            .await
+            .unwrap(),
+        durust::FailActivityOutcome::RetryScheduled { next_attempt: 2 }
+    );
+
+    // The scheduled retry exists but is hidden until its backoff elapses.
+    let hidden = retry_backend
+        .claim_activity_task(WorkerId::new("backoff-worker-2"), activity_opts.clone())
+        .await
+        .unwrap();
+    assert!(hidden.is_none(), "retry visible before its backoff elapsed");
+
+    pass_backoff(activity_opts.clone()).await;
+
+    // Wall clocks are inexact, so the SQL providers poll for the deadline;
+    // memory succeeds on the first claim because virtual time has passed it.
+    let mut second = None;
+    for _ in 0..200 {
+        if let Some(claimed) = retry_backend
+            .claim_activity_task(WorkerId::new("backoff-worker-3"), activity_opts.clone())
+            .await
+            .unwrap()
+        {
+            second = Some(claimed);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let second = second.expect("retry should become claimable after its backoff");
+    assert_eq!(second.task.attempt, 2);
+    retry_backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+
+    // The workflow wakes on the retried completion and still runs to a
+    // terminal state.
+    let ready = retry_backend
+        .claim_workflow_task(WorkerId::new("backoff-finisher"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion should wake workflow");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    retry_backend
+        .commit_workflow_task(
+            ready.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: ready.replay_target_event_id,
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCompleted {
+                        result: durust::encode_payload(&9_u64).unwrap(),
+                    },
+                )],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let history = retry_backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    assert!(matches!(
+        history.last().expect("terminal event").data,
+        HistoryEventData::WorkflowCompleted { .. }
+    ));
+    // The retried attempt left no failure event behind.
+    assert!(!history.iter().any(|event| matches!(
+        event.data,
+        HistoryEventData::ActivityFailed(_) | HistoryEventData::ActivityTimedOut(_)
+    )));
 }
 
 #[test]
@@ -480,6 +887,7 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
     });
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
     block_on_tokio(async {
@@ -510,7 +918,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-garage").await;
         let (gc_workflow_id, gc_projection) =
             payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-garage").await;
-        let external_blobs = durust::PayloadBlobStore::list_payload_blob_digests(&blob_store)
+        let external_blobs = durust::PayloadBlobStore::list_payload_blobs(&blob_store)
             .await
             .unwrap();
         assert!(external_blobs.len() >= 8);
@@ -555,6 +963,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
     });
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     block_on_tokio(async {
@@ -614,6 +1023,7 @@ where
         .block_on(future)
 }
 
+#[cfg(feature = "s3")]
 fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
     let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
@@ -631,6 +1041,7 @@ fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     })
 }
 
+#[cfg(feature = "s3")]
 async fn wait_for_blob_store<S>(blob_store: &S)
 where
     S: durust::PayloadBlobStore,
@@ -638,7 +1049,7 @@ where
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_error = None;
     while Instant::now() < deadline {
-        match blob_store.list_payload_blob_digests().await {
+        match blob_store.list_payload_blobs().await {
             Ok(_) => return,
             Err(err) => {
                 last_error = Some(err);
@@ -707,8 +1118,14 @@ impl durust::PayloadBlobStore for FailingBlobStore {
         )))))
     }
 
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, durust::Result<BTreeSet<String>>> {
-        Box::pin(ready(Ok(BTreeSet::new())))
+    fn payload_blob_exists(&self, _digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        Box::pin(ready(Ok(false)))
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        Box::pin(ready(Ok(BTreeMap::new())))
     }
 
     fn delete_payload_blob(&self, _digest: String) -> BoxFuture<'static, durust::Result<()>> {
@@ -718,6 +1135,909 @@ impl durust::PayloadBlobStore for FailingBlobStore {
     fn owns_payload_blob_uri(&self, _uri: &str) -> bool {
         false
     }
+}
+
+// A blob store with a scheme none of the built-in providers know about. Inner
+// providers must treat its refs as opaque; only this store hydrates or
+// garbage-collects them.
+#[derive(Clone, Debug, Default)]
+struct TestCustomBlobStore {
+    blobs: Arc<Mutex<BTreeMap<String, (Vec<u8>, durust::TimestampMs)>>>,
+}
+
+impl TestCustomBlobStore {
+    fn blob_count(&self) -> usize {
+        self.blobs.lock().unwrap().len()
+    }
+}
+
+fn wall_clock_ms() -> durust::TimestampMs {
+    durust::TimestampMs(
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX),
+    )
+}
+
+impl durust::PayloadBlobStore for TestCustomBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            let now = wall_clock_ms();
+            let mut blobs = blobs.lock().unwrap();
+            match blobs.get_mut(&digest) {
+                Some(record) => record.1 = now,
+                None => {
+                    blobs.insert(digest.clone(), (bytes, now));
+                }
+            }
+            Ok(format!("test-custom://payload/{digest}"))
+        })
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs
+                .lock()
+                .unwrap()
+                .get(&digest)
+                .map(|(bytes, _)| bytes.clone())
+                .ok_or_else(|| Error::PayloadDecode(format!("missing payload blob `{digest}`")))
+        })
+    }
+
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move { Ok(blobs.lock().unwrap().contains_key(&digest)) })
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            Ok(blobs
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(digest, (_, last_modified))| (digest.clone(), *last_modified))
+                .collect())
+        })
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        let blobs = self.blobs.clone();
+        Box::pin(async move {
+            blobs.lock().unwrap().remove(&digest);
+            Ok(())
+        })
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        uri.starts_with("test-custom://payload/")
+    }
+}
+
+// Bug B pin: a custom-scheme blob store must work over any inner provider.
+// Against the pre-fix scheme allowlist this fails at the first commit because
+// the inner provider tries to resolve `test-custom://` refs from its own
+// store.
+async fn custom_scheme_blob_store_round_trips_and_survives_gc<B>(inner: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let blob_store = TestCustomBlobStore::default();
+    let backend = PayloadBackend::with_payload_storage(
+        inner,
+        blob_store.clone(),
+        durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+    );
+    let run_id = payload_offload_public_api_round_trip(
+        backend.clone(),
+        &format!("wf/{prefix}-custom-scheme"),
+        &format!("{prefix}-custom-scheme-workflows"),
+        &format!("{prefix}-custom-scheme-activities"),
+    )
+    .await;
+    payload_offload_activity_map_round_trip(backend.clone(), &format!("{prefix}-custom")).await;
+    assert!(blob_store.blob_count() >= 4);
+
+    // Raw replay refs carry the custom scheme end to end.
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+        panic!("expected raw workflow start event");
+    };
+    assert!(
+        matches!(input, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("test-custom://payload/")),
+        "raw workflow input should be a custom-scheme blob ref, got {input:?}"
+    );
+
+    // GC with a zero grace period must still leave every reachable
+    // custom-scheme blob alone.
+    let before = blob_store.blob_count();
+    let outcome = backend
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: false,
+            min_age: Duration::ZERO,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.failed_blobs, 0);
+    assert_eq!(blob_store.blob_count(), before - outcome.deleted_blobs);
+
+    // Hydration after GC proves reachable blobs survived.
+    let history = backend
+        .stream_history(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+        panic!("expected hydrated workflow start event");
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(input).unwrap(),
+        large_payload("workflow-input")
+    );
+}
+
+// 4F pin: a decorator-owned (foreign-scheme) blob page under an inline
+// manifest root must commit and run to completion on every inner provider.
+// Against the pre-fix normalize functions the first commit fails with "blob
+// payload must be hydrated by the durability provider before decode" (the
+// inner provider tries to decode the foreign page) and the task poison-loops.
+async fn inline_root_foreign_page_activity_map_completes<B>(inner: B, prefix: &str)
+where
+    B: DurableBackend,
+{
+    let blob_store = TestCustomBlobStore::default();
+    let backend = PayloadBackend::with_payload_storage(
+        inner,
+        blob_store.clone(),
+        durust::PayloadStorageConfig::new().inline_threshold_bytes(2048),
+    );
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<foreign_page_map_workflow>(
+            &format!("wf/{prefix}-foreign-page-map"),
+            "foreign-page-map-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue("foreign-page-map-workflows")
+        .activity_task_queue("foreign-page-map-activities")
+        .register_workflow(foreign_page_map_workflow)
+        .register_activity(page_item_len)
+        .build();
+    worker.run_until_idle().await.unwrap();
+
+    // Shape guard: the raw recorded manifest must be an inline root holding
+    // at least one foreign-scheme blob page, or this test stops exercising
+    // the guarded path.
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let scheduled = raw_events
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ActivityMapScheduled(scheduled) => Some(scheduled),
+            _ => None,
+        })
+        .expect("activity map scheduled event");
+    assert!(
+        matches!(&scheduled.input_manifest, durust::PayloadRef::Inline { .. }),
+        "manifest root must stay inline, got {:?}",
+        scheduled.input_manifest
+    );
+    let manifest: ActivityMapInputManifest =
+        durust::decode_payload(&scheduled.input_manifest).unwrap();
+    assert!(!manifest.pages.is_empty());
+    for page in &manifest.pages {
+        assert!(
+            matches!(page, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("test-custom://payload/")),
+            "pages must be foreign-scheme blobs, got {page:?}"
+        );
+    }
+
+    // The run completed with the decoded item lengths, proving materialized
+    // map items and result assembly worked over the foreign pages.
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "expected WorkflowCompleted, got {:?}",
+            history.last().unwrap().data
+        );
+    };
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 5 * 600);
+}
+
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_memory_provider() {
+    block_on(async {
+        inline_root_foreign_page_activity_map_completes(MemoryBackend::new(), "memory").await;
+    });
+}
+
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_sqlite_provider() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("foreign-page.sqlite3")).unwrap();
+        inline_root_foreign_page_activity_map_completes(backend, "sqlite").await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn inline_manifest_root_with_foreign_scheme_pages_completes_over_postgres_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres foreign-page conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("foreign_page");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        inline_root_foreign_page_activity_map_completes(backend, "postgres").await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[test]
+fn custom_scheme_blob_store_works_over_memory_provider() {
+    block_on(async {
+        custom_scheme_blob_store_round_trips_and_survives_gc(MemoryBackend::new(), "memory").await;
+    });
+}
+
+#[test]
+fn custom_scheme_blob_store_works_over_sqlite_provider() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom-scheme.sqlite3");
+        let blob_store = TestCustomBlobStore::default();
+        let backend = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let run_id = payload_offload_public_api_round_trip(
+            backend.clone(),
+            "wf/sqlite-custom-scheme",
+            "sqlite-custom-scheme-workflows",
+            "sqlite-custom-scheme-activities",
+        )
+        .await;
+        drop(backend);
+
+        // Reopen: the persisted custom-scheme refs must hydrate through the
+        // custom store and survive GC with a zero grace period.
+        let reopened = PayloadBackend::with_payload_storage(
+            SqliteBackend::open(&path).unwrap(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let outcome = reopened
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed_blobs, 0);
+        let history = reopened
+            .stream_history(durust::StreamHistoryRequest {
+                run_id,
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1),
+                max_events: 100,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events;
+        let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
+            panic!("expected hydrated workflow start after reopen");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(input).unwrap(),
+            large_payload("workflow-input")
+        );
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres custom-scheme conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("custom_scheme");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        custom_scheme_blob_store_round_trips_and_survives_gc(backend, "postgres").await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+// Bug A pin, fresh-upload window: every write path uploads its blob before the
+// commit that makes it reachable, so GC must never delete an
+// unreachable-but-young blob. `min_age: 0` reproduces the pre-fix behavior;
+// the default grace period keeps the in-flight upload alive until its commit
+// lands, after which reachability protects it unconditionally.
+#[test]
+fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
+    block_on(async {
+        let blob_store = durust::MemoryBlobStore::new();
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let value = large_payload("gc-race-input");
+        let payload = durust::encode_payload(&value).unwrap();
+        let durust::PayloadRef::Inline { bytes, .. } = payload.clone() else {
+            panic!("freshly encoded payload should be inline");
+        };
+        let digest = durust::digest_bytes(&bytes);
+
+        // The in-flight window: uploaded, not yet referenced by any commit.
+        blob_store
+            .put_payload_blob(digest.clone(), bytes.clone())
+            .await
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert_eq!(outcome.scanned_blobs, 1);
+        blob_store
+            .get_payload_blob(digest.clone())
+            .await
+            .expect("grace period must protect the in-flight upload");
+
+        // Zero grace period restores the pre-fix delete-anything-unreachable
+        // behavior: the same window now loses the blob.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        blob_store
+            .get_payload_blob(digest.clone())
+            .await
+            .expect_err("zero grace period deletes the uncommitted upload");
+
+        // Upload again and land the commit; reachability now protects the
+        // blob at any grace period.
+        blob_store
+            .put_payload_blob(digest.clone(), bytes)
+            .await
+            .unwrap();
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new("wf/gc-race-committed"),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new("gc-race-workflows"),
+                input: payload,
+            })
+            .await
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        blob_store
+            .get_payload_blob(digest)
+            .await
+            .expect("committed blob must always survive GC");
+    });
+}
+
+// Drives one projection replacement against the single-event conformance
+// workflow: wakes the run with a signal when `signal_seq > 0`, claims it, and
+// commits a projection holding `value` plus a re-armed signal wait so the next
+// replacement can wake the run again. Replacing a projection is the simplest
+// way to turn an offloaded blob into garbage.
+async fn commit_projection_replacement<B>(
+    backend: &B,
+    workflow_id: &str,
+    queue: &str,
+    signal_seq: u64,
+    value: &str,
+) where
+    B: DurableBackend,
+{
+    // Idempotent re-start resolves the run id; the tiny input stays inline so
+    // it cannot perturb blob-store contents.
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(queue),
+            input: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let mut consume_signals = Vec::new();
+    if signal_seq > 0 {
+        backend
+            .signal_workflow(durust::SignalWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                signal_id: durust::SignalId::new(format!("{workflow_id}/replace/{signal_seq}")),
+                signal_name: durust::SignalName::new("replace"),
+                payload: durust::encode_payload(&signal_seq).unwrap(),
+            })
+            .await
+            .unwrap();
+        let inbox = backend
+            .read_signal_inbox(durust::ReadSignalInboxRequest {
+                run_id: run_id.clone(),
+                signal_name: durust::SignalName::new("replace"),
+            })
+            .await
+            .unwrap()
+            .expect("replacement signal");
+        consume_signals.push(inbox.signal_id);
+    }
+    let claimed = claim_conformance_workflow(
+        backend,
+        &format!("{workflow_id}-projection-{signal_seq}"),
+        queue,
+    )
+    .await;
+    let command_id = durust::command_id(&run_id, 1);
+    let wait_id = durust::WaitId::new(format!("{}:{}:signal", command_id.run_id, command_id.seq.0));
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                consume_signals,
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id,
+                    run_id,
+                    command_id,
+                    kind: durust::WaitKind::Signal,
+                    key: "replace".to_owned(),
+                    ready_at: None,
+                }],
+                ..projection_only_commit(durust::encode_payload(&value.to_owned()).unwrap())
+            },
+        )
+        .await
+        .unwrap();
+}
+
+// Bug A pin, memory provider: the provider-internal store follows the virtual
+// clock, so deterministic tests control blob age with `advance_time`. Old
+// unreachable blobs are collected, young ones survive the grace period, and
+// `min_age: 0` collects unconditionally.
+#[test]
+fn memory_gc_grace_period_follows_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        let workflow_id = "wf/memory-gc-grace";
+        let queue = "memory-gc-grace-workflows";
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new(queue),
+                input: durust::encode_payload(&large_payload("memory-gc-input")).unwrap(),
+            })
+            .await
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 0, "projection-old").await;
+        commit_projection_replacement(&backend, workflow_id, queue, 1, "projection-mid").await;
+
+        // The replaced projection blob is unreachable but young: the default
+        // grace period retains it because it could belong to an in-flight
+        // commit.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+
+        // Two virtual hours later the same blob is old garbage.
+        backend.advance_time(Duration::from_secs(2 * 60 * 60));
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "projection-old blob aged past the grace period"
+        );
+
+        // A replacement after the clock advance leaves young garbage again:
+        // default grace retains it, zero grace collects it.
+        commit_projection_replacement(&backend, workflow_id, queue, 2, "projection-new").await;
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "projection-mid blob aged past the grace period while projection-new's predecessor stayed protected"
+        );
+        commit_projection_replacement(&backend, workflow_id, queue, 3, "projection-final").await;
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 0,
+            "projection-new blob is young garbage the grace period retains"
+        );
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.deleted_blobs, 1,
+            "zero grace period collects the young garbage"
+        );
+
+        // The live projection and workflow input always survive.
+        let projection = backend
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected live projection");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            "projection-final"
+        );
+    });
+}
+
+// Bug A pin, SQLite local-directory store (close/reopen): directory blobs are
+// written before their transaction commits, so GC ages them by file mtime.
+// Content-addressed re-puts refresh the mtime so a blob a new in-flight commit
+// deduplicated against regains its full grace period.
+#[test]
+fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let object_dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gc-grace.sqlite3");
+        let config = durust::PayloadStorageConfig::new()
+            .inline_threshold_bytes(1)
+            .blob_store(durust::BlobStoreConfig::LocalDirectory {
+                root: object_dir.path().to_path_buf(),
+                prefix: "payloads".to_owned(),
+            });
+        let backend = SqliteBackend::open_with_payload_storage(&path, config.clone()).unwrap();
+        let workflow_id = "wf/sqlite-gc-grace";
+        let queue = "sqlite-gc-grace-workflows";
+        backend
+            .start_workflow(durust::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+                workflow_type: WorkflowType::new("conformance.workflow", 1),
+                task_queue: TaskQueue::new(queue),
+                input: durust::encode_payload(&large_payload("sqlite-gc-input")).unwrap(),
+            })
+            .await
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 0, "projection-old").await;
+        commit_projection_replacement(&backend, workflow_id, queue, 1, "projection-live").await;
+
+        let blob_dir = object_dir.path().join("payloads");
+        let garbage_digest = durust::digest_bytes(
+            durust::encode_payload(&"projection-old".to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        );
+        let garbage_path = blob_dir.join(&garbage_digest);
+        assert!(garbage_path.exists());
+
+        // Young unreachable garbage survives the default grace period.
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert!(garbage_path.exists());
+
+        // Backdated past the grace period the same file is collected.
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        fs::File::options()
+            .write(true)
+            .open(&garbage_path)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert_eq!(outcome.failed_blobs, 0);
+        assert!(!garbage_path.exists());
+
+        // Fresh-upload window: a file written by an in-flight commit (upload
+        // happens before the transaction commits) survives the grace period
+        // and dies only under min_age zero.
+        let in_flight = durust::encode_payload(&large_payload("sqlite-in-flight")).unwrap();
+        let in_flight_bytes = in_flight.inline_bytes().unwrap().to_vec();
+        let in_flight_digest = durust::digest_bytes(&in_flight_bytes);
+        let in_flight_path = blob_dir.join(&in_flight_digest);
+        fs::write(&in_flight_path, &in_flight_bytes).unwrap();
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 0);
+        assert!(in_flight_path.exists());
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert!(!in_flight_path.exists());
+
+        // Dedup window: a commit that reuses an existing old blob must refresh
+        // its mtime, restarting the grace period for the reused content.
+        let reused_value = "projection-reused";
+        let reused_digest = durust::digest_bytes(
+            durust::encode_payload(&reused_value.to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        );
+        let reused_path = blob_dir.join(&reused_digest);
+        fs::write(
+            &reused_path,
+            durust::encode_payload(&reused_value.to_owned())
+                .unwrap()
+                .inline_bytes()
+                .unwrap(),
+        )
+        .unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&reused_path)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+        commit_projection_replacement(&backend, workflow_id, queue, 2, reused_value).await;
+        let refreshed = fs::metadata(&reused_path).unwrap().modified().unwrap();
+        assert!(
+            refreshed.duration_since(two_hours_ago).unwrap_or_default()
+                > Duration::from_secs(60 * 60),
+            "content-addressed re-put must refresh the blob mtime"
+        );
+        drop(backend);
+
+        // Close/reopen: the refreshed blob is now reachable (live projection)
+        // and hydrates from disk.
+        let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
+        let outcome = reopened
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.failed_blobs, 0);
+        assert!(reused_path.exists());
+        let projection = reopened
+            .query_projection(durust::QueryProjectionRequest {
+                namespace: Namespace::default(),
+                workflow_id: durust::WorkflowId::new(workflow_id),
+            })
+            .await
+            .unwrap();
+        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected reopened projection");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(&payload).unwrap(),
+            reused_value
+        );
+    });
+}
+
+// A delete failure on one garbage blob must not abort the sweep: the failure
+// is recorded in the outcome and the remaining garbage is still collected.
+#[derive(Clone, Debug)]
+struct PoisonedDeleteBlobStore {
+    inner: durust::MemoryBlobStore,
+    poisoned_digest: String,
+}
+
+impl durust::PayloadBlobStore for PoisonedDeleteBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, durust::Result<String>> {
+        self.inner.put_payload_blob(digest, bytes)
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<Vec<u8>>> {
+        self.inner.get_payload_blob(digest)
+    }
+
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, durust::Result<bool>> {
+        self.inner.payload_blob_exists(digest)
+    }
+
+    fn list_payload_blobs(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<BTreeMap<String, durust::TimestampMs>>> {
+        self.inner.list_payload_blobs()
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, durust::Result<()>> {
+        if digest == self.poisoned_digest {
+            return Box::pin(ready(Err(Error::Backend(
+                "intentional blob delete failure".to_owned(),
+            ))));
+        }
+        self.inner.delete_payload_blob(digest)
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        self.inner.owns_payload_blob_uri(uri)
+    }
+}
+
+#[test]
+fn payload_backend_gc_records_delete_failures_and_continues() {
+    block_on(async {
+        let poisoned_payload = durust::encode_payload(&large_payload("poisoned-garbage")).unwrap();
+        let poisoned_bytes = poisoned_payload.inline_bytes().unwrap().to_vec();
+        let poisoned_digest = durust::digest_bytes(&poisoned_bytes);
+        let deletable_payload =
+            durust::encode_payload(&large_payload("deletable-garbage")).unwrap();
+        let deletable_bytes = deletable_payload.inline_bytes().unwrap().to_vec();
+        let deletable_digest = durust::digest_bytes(&deletable_bytes);
+
+        let blob_store = PoisonedDeleteBlobStore {
+            inner: durust::MemoryBlobStore::new(),
+            poisoned_digest: poisoned_digest.clone(),
+        };
+        let backend = PayloadBackend::with_payload_storage(
+            MemoryBackend::new(),
+            blob_store.clone(),
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+        );
+        blob_store
+            .put_payload_blob(poisoned_digest.clone(), poisoned_bytes)
+            .await
+            .unwrap();
+        blob_store
+            .put_payload_blob(deletable_digest.clone(), deletable_bytes)
+            .await
+            .unwrap();
+
+        // Dry run reports both as would-delete without attempting deletes.
+        let dry_run = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(dry_run.deleted_blobs, 2);
+        assert_eq!(dry_run.failed_blobs, 0);
+
+        let outcome = backend
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.deleted_blobs, 1);
+        assert_eq!(outcome.failed_blobs, 1);
+        blob_store
+            .get_payload_blob(deletable_digest)
+            .await
+            .expect_err("healthy garbage must still be deleted");
+        blob_store
+            .get_payload_blob(poisoned_digest)
+            .await
+            .expect("failed delete leaves the blob for the next sweep");
+    });
 }
 
 #[test]
@@ -748,12 +2068,18 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
 
         fs::write(object_dir.path().join("payloads").join("orphan"), b"orphan").unwrap();
         let dry_run = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert!(dry_run.deleted_blobs >= 1);
         let collected = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
@@ -928,7 +2254,7 @@ fn registry_generates_manifest_metadata_from_handlers() {
     );
     assert!(
         manifest.workflows[0]
-            .input_schema_hash
+            .input_type_name_hash
             .starts_with("sha256:")
     );
 
@@ -941,7 +2267,7 @@ fn registry_generates_manifest_metadata_from_handlers() {
     );
     assert!(
         manifest.activities[0]
-            .output_schema_hash
+            .output_type_name_hash
             .starts_with("sha256:")
     );
 }
@@ -965,7 +2291,7 @@ fn macros_export_manifest_metadata_for_linked_handlers() {
         <workflow as durust::Workflow>::input_type_name()
     );
     assert_eq!(
-        workflow_export.input_schema_hash,
+        workflow_export.input_type_name_hash,
         durust::type_fingerprint::<<workflow as durust::Workflow>::Input>()
     );
 
@@ -980,7 +2306,7 @@ fn macros_export_manifest_metadata_for_linked_handlers() {
         <echo as durust::Activity>::output_type_name()
     );
     assert_eq!(
-        activity.output_schema_hash,
+        activity.output_type_name_hash,
         durust::type_fingerprint::<<echo as durust::Activity>::Output>()
     );
 }
@@ -1005,13 +2331,19 @@ where
     workflow_claim_filters_by_queue_and_registered_type(backend.clone()).await;
     stream_history_honors_bounds(backend.clone()).await;
     released_workflow_task_is_claimable_again(backend.clone()).await;
-    delayed_released_workflow_task_is_not_claimable_until_visible(backend.clone()).await;
     query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
     missing_provider_blob_ref_is_rejected(backend.clone()).await;
     provider_blob_ref_metadata_mismatch_is_rejected(backend.clone()).await;
     workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
     continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
     signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
+    signal_between_claim_and_commit_wakes_workflow(backend.clone()).await;
+    signal_during_claim_window_survives_empty_commit(backend.clone()).await;
+    signal_between_claim_and_commit_wakes_workflows_in_batch_commit(backend.clone()).await;
+    terminal_run_fences_stale_mutating_commits_identically(backend.clone()).await;
+    late_activity_completion_after_cancel_is_idempotent_across_retries(backend.clone()).await;
+    terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals(backend.clone()).await;
+    consumed_signal_dedup_survives_continue_as_new(backend.clone()).await;
     timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
     activity_retry_reschedules_until_max_attempts(backend.clone()).await;
     non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
@@ -1035,7 +2367,14 @@ where
     stale_workflow_task_commit_conflicts(backend.clone()).await;
     batch_workflow_task_claim_and_commit_results_are_ordered(backend.clone()).await;
     batch_activity_completion_reports_ordered_duplicate_and_stale_results(backend.clone()).await;
-    activity_claim_filters_and_stale_completion_is_rejected(backend).await;
+    activity_claim_filters_and_stale_completion_is_rejected(backend.clone()).await;
+    unexpired_workflow_claim_lease_is_not_reclaimable(backend.clone()).await;
+    // Run last: their timeout scans use far-future `now`s that must not
+    // disturb other cases' pending activities.
+    timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder(backend.clone()).await;
+    timeoutless_activity_reclaims_one_lease_after_heartbeats_stop(backend.clone()).await;
+    timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat(backend.clone()).await;
+    explicit_heartbeat_timeout_takes_precedence_over_claim_lease(backend).await;
 }
 
 async fn start_large_payload_workflow<B>(
@@ -1571,7 +2910,10 @@ where
         .unwrap();
 
     let dry_run = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: true,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert!(
@@ -1590,13 +2932,19 @@ where
     );
 
     let collected = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: false })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: false,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
 
     let after = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest { dry_run: true })
+        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            dry_run: true,
+            min_age: Duration::ZERO,
+        })
         .await
         .unwrap();
     assert_eq!(after.deleted_blobs, 0);
@@ -2624,18 +3972,27 @@ where
     assert!(reclaimed.is_some());
 }
 
-async fn delayed_released_workflow_task_is_not_claimable_until_visible<B>(backend: B)
-where
+// Parametrized on how time passes because delayed visibility is a clock
+// comparison: memory follows the virtual clock (`advance_time`) while the SQL
+// providers compare against the wall clock and must really sleep.
+async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance, AdvanceFut>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    advance_past_delay: Advance,
+) where
     B: DurableBackend,
+    Advance: FnOnce() -> AdvanceFut,
+    AdvanceFut: Future<Output = ()>,
 {
     let client = Client::new(backend.clone());
     client
-        .start_workflow::<workflow>("wf/delayed-release", "delayed-release-workflows", input(5))
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
     let claim_opts = ClaimWorkflowTaskOptions {
         namespace: Namespace::default(),
-        task_queue: TaskQueue::new("delayed-release-workflows"),
+        task_queue: TaskQueue::new(workflow_queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
         lease_duration: Duration::from_secs(30),
     };
@@ -2661,7 +4018,7 @@ where
         .unwrap();
     assert!(hidden.is_none());
 
-    std::thread::sleep(Duration::from_millis(40));
+    advance_past_delay().await;
     let visible = backend
         .claim_workflow_task(WorkerId::new("worker-c"), claim_opts)
         .await
@@ -2777,89 +4134,208 @@ where
     );
 }
 
-async fn missing_provider_blob_ref_is_rejected<B>(backend: B)
+// Reads back the provider-minted blob ref for a freshly started large-input
+// workflow so tests can derive the provider's own URI scheme without
+// hardcoding it. The input exceeds the default inline threshold so it offloads
+// under any payload configuration.
+async fn provider_offloaded_input_ref<B>(
+    backend: &B,
+    workflow_id: &str,
+    workflow_queue: &str,
+) -> durust::PayloadRef
 where
     B: DurableBackend,
 {
-    let client = Client::new(backend.clone());
-    client
-        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", input(5))
+    let run_id = backend
+        .start_workflow(durust::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new(workflow_id),
+            workflow_type: WorkflowType::new("conformance.workflow", 1),
+            task_queue: TaskQueue::new(workflow_queue),
+            input: durust::encode_payload(&format!("{workflow_id}:{}", "x".repeat(64 * 1024)))
+                .unwrap(),
+        })
         .await
-        .unwrap();
-    let claimed = backend
+        .unwrap()
+        .run_id()
+        .clone();
+    let raw_events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id,
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let HistoryEventData::WorkflowStarted { input, .. } = &raw_events[0].data else {
+        panic!("expected workflow start event");
+    };
+    assert!(
+        matches!(input, durust::PayloadRef::Blob { .. }),
+        "large workflow input should be provider-offloaded"
+    );
+    input.clone()
+}
+
+async fn claim_conformance_workflow<B>(
+    backend: &B,
+    worker: &str,
+    queue: &str,
+) -> durust::ClaimedWorkflowTask
+where
+    B: DurableBackend,
+{
+    backend
         .claim_workflow_task(
-            WorkerId::new("missing-blob-worker"),
+            WorkerId::new(worker),
             ClaimWorkflowTaskOptions {
                 namespace: Namespace::default(),
-                task_queue: TaskQueue::new("missing-blob-workflows"),
+                task_queue: TaskQueue::new(queue),
                 registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
                 lease_duration: Duration::from_secs(30),
             },
         )
         .await
         .unwrap()
-        .expect("workflow task");
-    let missing = durust::PayloadRef::Blob {
-        codec: durust::CodecId::MessagePack,
-        schema_fingerprint: durust::SchemaFingerprint("sha256:test".to_owned()),
-        compression: durust::CompressionId::None,
-        encryption: None,
-        digest: "sha256:missing".to_owned(),
-        size: 9,
-        uri: "durust://missing".to_owned(),
+        .expect("workflow task")
+}
+
+fn projection_only_commit(payload: durust::PayloadRef) -> WorkflowTaskCommit {
+    WorkflowTaskCommit {
+        expected_tail_event_id: EventId(1),
+        append_events: Vec::new(),
+        upsert_waits: Vec::new(),
+        schedule_activities: Vec::new(),
+        schedule_activity_maps: Vec::new(),
+        schedule_child_workflow_maps: Vec::new(),
+        start_child_workflows: Vec::new(),
+        consume_signals: Vec::new(),
+        delete_waits: Vec::new(),
+        cancel_commands: Vec::new(),
+        query_projection: Some(payload),
+    }
+}
+
+async fn missing_provider_blob_ref_is_rejected<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    // A ref carrying the provider's own scheme must be validated at commit
+    // time: a digest missing from the provider's store rejects the commit.
+    let source_ref = provider_offloaded_input_ref(
+        &backend,
+        "wf/missing-blob-source",
+        "missing-blob-source-workflows",
+    )
+    .await;
+    let durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
+        digest,
+        size,
+        uri,
+    } = source_ref
+    else {
+        unreachable!();
     };
+    let missing = durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint: schema_fingerprint.clone(),
+        compression,
+        encryption: encryption.clone(),
+        digest: "sha256:missing".to_owned(),
+        size,
+        uri: uri.replace(digest.as_str(), "sha256:missing"),
+    };
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/missing-blob", "missing-blob-workflows", input(5))
+        .await
+        .unwrap();
+    let claimed =
+        claim_conformance_workflow(&backend, "missing-blob-worker", "missing-blob-workflows").await;
     let err = backend
-        .commit_workflow_task(
-            claimed.claim,
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: Some(missing),
-            },
-        )
+        .commit_workflow_task(claimed.claim, projection_only_commit(missing))
         .await
         .unwrap_err();
     assert!(
         matches!(err, Error::PayloadDecode(message) if message.contains("missing payload blob"))
     );
+
+    // A scheme the provider does not own is opaque: the commit persists the
+    // ref unchanged and provider hydration returns it as-is. Only a decorating
+    // payload layer that owns the scheme may resolve it.
+    let foreign = durust::PayloadRef::Blob {
+        codec,
+        schema_fingerprint,
+        compression,
+        encryption,
+        digest: "sha256:foreign".to_owned(),
+        size,
+        uri: "test-unknown://payload/sha256:foreign".to_owned(),
+    };
+    client
+        .start_workflow::<workflow>(
+            "wf/foreign-scheme-blob",
+            "foreign-scheme-blob-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = claim_conformance_workflow(
+        &backend,
+        "foreign-scheme-blob-worker",
+        "foreign-scheme-blob-workflows",
+    )
+    .await;
+    backend
+        .commit_workflow_task(claimed.claim, projection_only_commit(foreign.clone()))
+        .await
+        .unwrap();
+    let projection = backend
+        .query_projection(durust::QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: durust::WorkflowId::new("wf/foreign-scheme-blob"),
+        })
+        .await
+        .unwrap();
+    let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        panic!("expected opaque foreign-scheme projection");
+    };
+    assert_eq!(payload, foreign);
+    let hydrated = backend.hydrate_payload(payload).await.unwrap();
+    assert_eq!(hydrated, foreign);
 }
 
 async fn provider_blob_ref_metadata_mismatch_is_rejected<B>(backend: B)
 where
     B: DurableBackend,
 {
-    let large_value = "x".repeat(16 * 1024);
-    let source_payload = durust::encode_payload(&large_value).unwrap();
-    let durust::PayloadRef::Inline {
+    // Metadata validation applies to refs carrying the provider's own scheme;
+    // the source ref supplies that scheme with its real digest.
+    let source_ref = provider_offloaded_input_ref(
+        &backend,
+        "wf/blob-metadata-source",
+        "blob-metadata-source-workflows",
+    )
+    .await;
+    let durust::PayloadRef::Blob {
         codec,
         schema_fingerprint,
         compression,
         encryption,
-        bytes,
-    } = source_payload.clone()
+        digest,
+        size,
+        uri,
+    } = source_ref
     else {
-        panic!("freshly encoded payload should be inline before provider storage");
+        unreachable!();
     };
-    let digest = durust::digest_bytes(&bytes);
-    let size = u64::try_from(bytes.len()).unwrap();
-    backend
-        .start_workflow(durust::StartWorkflowRequest {
-            namespace: Namespace::default(),
-            workflow_id: durust::WorkflowId::new("wf/blob-metadata-source"),
-            workflow_type: WorkflowType::new("conformance.workflow", 1),
-            task_queue: TaskQueue::new("blob-metadata-source-workflows"),
-            input: source_payload,
-        })
-        .await
-        .unwrap();
 
     let cases = [
         (
@@ -2871,7 +4347,7 @@ where
                 encryption: encryption.clone(),
                 digest: digest.clone(),
                 size,
-                uri: format!("durust://payload/{digest}"),
+                uri: uri.clone(),
             },
         ),
         (
@@ -2883,7 +4359,7 @@ where
                 encryption: encryption.clone(),
                 digest: digest.clone(),
                 size,
-                uri: format!("durust://payload/{digest}"),
+                uri: uri.clone(),
             },
         ),
     ];
@@ -3324,6 +4800,953 @@ where
     );
 }
 
+fn signal_race_claim_opts(queue: &str) -> ClaimWorkflowTaskOptions {
+    ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.signal-race", 1)],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+/// The commit the signal-race workflow's first task produces: no appends, one
+/// signal wait registered for command seq 1 on signal name `go`.
+fn signal_wait_commit(run_id: &durust::RunId, expected_tail: EventId) -> WorkflowTaskCommit {
+    let command_id = durust::command_id(run_id, 1);
+    WorkflowTaskCommit {
+        expected_tail_event_id: expected_tail,
+        upsert_waits: vec![durust::WaitRecord {
+            wait_id: durust::WaitId::new(format!(
+                "{}:{}:signal",
+                command_id.run_id, command_id.seq.0
+            )),
+            run_id: run_id.clone(),
+            command_id,
+            kind: durust::WaitKind::Signal,
+            key: "go".to_owned(),
+            ready_at: None,
+        }],
+        ..WorkflowTaskCommit::default()
+    }
+}
+
+/// Runs a real worker until idle and asserts the signal-race run finished by
+/// consuming a signal and completing with the expected payload.
+async fn assert_signal_race_run_completes<B>(
+    backend: &B,
+    queue: &str,
+    run_id: durust::RunId,
+    expected_result: &str,
+) where
+    B: DurableBackend,
+{
+    let mut worker = Worker::builder(backend.clone())
+        .workflow_task_queue(queue)
+        .activity_task_queue(queue)
+        .register_workflow(signal_race_workflow)
+        .build();
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_history(backend, run_id).await;
+    assert_eq!(
+        history.len(),
+        3,
+        "expected WorkflowStarted, SignalConsumed, WorkflowCompleted; got {history:?}"
+    );
+    assert!(matches!(
+        history[1].data,
+        HistoryEventData::SignalConsumed(_)
+    ));
+    let HistoryEventData::WorkflowCompleted { result } = &history[2].data else {
+        panic!("expected WorkflowCompleted, got {:?}", history[2].data);
+    };
+    assert_eq!(
+        durust::decode_payload::<String>(result).unwrap(),
+        expected_result
+    );
+}
+
+/// A signal delivered after a task is claimed but before its commit registers
+/// the signal wait must leave the run immediately claimable with
+/// `SignalReceived`; the commit's ready-reason recomputation is what prevents
+/// the delivery from being lost until an unrelated event pokes the run.
+async fn signal_between_claim_and_commit_wakes_workflow<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/signal-race-new-wait",
+            "signal-race-new-wait",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-race-claimer"),
+            signal_race_claim_opts("signal-race-new-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    assert_eq!(claimed.reason, durust::WorkflowTaskReason::WorkflowStarted);
+
+    // The race: the signal lands while the task is claimed and the wait it
+    // matches is only created by the claimed task's commit below.
+    let accepted = client
+        .signal_workflow(
+            "wf/signal-race-new-wait",
+            "go",
+            "signal/race-new-wait/1",
+            "raced-hello",
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+
+    let outcome = backend
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        }
+    );
+
+    let woken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-race-waker"),
+            signal_race_claim_opts("signal-race-new-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("run should be immediately claimable after the racing signal");
+    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+    backend
+        .release_workflow_task(
+            woken.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+        )
+        .await
+        .unwrap();
+
+    // The real workflow consumes the raced signal on its next task.
+    assert_signal_race_run_completes(
+        &backend,
+        "signal-race-new-wait",
+        run_id.clone(),
+        "raced-hello",
+    )
+    .await;
+    let inbox = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id,
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap();
+    assert!(inbox.is_none(), "raced signal should be consumed");
+}
+
+/// A signal delivered during the claim window for a wait that already existed
+/// before the claim must survive a commit that carries no mutations: the
+/// commit's unconditional ready-reason write would otherwise erase the wakeup
+/// the delivery recorded.
+async fn signal_during_claim_window_survives_empty_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/signal-race-existing-wait",
+            "signal-race-existing-wait",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-scheduler"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    backend
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .await
+        .unwrap();
+    // Blocked on the signal: not claimable until a delivery arrives.
+    assert!(
+        backend
+            .claim_workflow_task(
+                WorkerId::new("signal-existing-early"),
+                signal_race_claim_opts("signal-race-existing-wait"),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let first = client
+        .signal_workflow(
+            "wf/signal-race-existing-wait",
+            "go",
+            "signal/race-existing/1",
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, durust::SignalWorkflowOutcome::Accepted);
+    let woken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-claimer"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("signal delivery should wake the run");
+    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+
+    // Second delivery lands while the task is claimed, matching the
+    // pre-existing wait; the claimed task then commits nothing (a spurious
+    // wake), which must not erase the pending delivery's readiness.
+    let second = client
+        .signal_workflow(
+            "wf/signal-race-existing-wait",
+            "go",
+            "signal/race-existing/2",
+            "second",
+        )
+        .await
+        .unwrap();
+    assert_eq!(second, durust::SignalWorkflowOutcome::Accepted);
+    let outcome = backend
+        .commit_workflow_task(
+            woken.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        }
+    );
+
+    let rewoken = backend
+        .claim_workflow_task(
+            WorkerId::new("signal-existing-rewake"),
+            signal_race_claim_opts("signal-race-existing-wait"),
+        )
+        .await
+        .unwrap()
+        .expect("pending signals must keep the run claimable after an empty commit");
+    assert_eq!(rewoken.reason, durust::WorkflowTaskReason::SignalReceived);
+    backend
+        .release_workflow_task(
+            rewoken.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+        )
+        .await
+        .unwrap();
+
+    // The real workflow consumes the oldest delivery; the second stays in the
+    // inbox for the (now terminal) run.
+    assert_signal_race_run_completes(
+        &backend,
+        "signal-race-existing-wait",
+        run_id.clone(),
+        "first",
+    )
+    .await;
+    let remaining = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id,
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap()
+        .expect("second delivery stays unconsumed");
+    assert_eq!(
+        remaining.signal_id,
+        durust::SignalId::new("signal/race-existing/2")
+    );
+}
+
+/// The claim-window signal race applied to a multi-run `commit_workflow_tasks`
+/// batch: every committed run with a pending consumable signal must come out
+/// claimable, exercising the set-based batch commit path on providers that
+/// have one.
+async fn signal_between_claim_and_commit_wakes_workflows_in_batch_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let queue = "signal-race-batch";
+    let mut claims = Vec::new();
+    for index in 0..2 {
+        let workflow_id = format!("wf/signal-race-batch/{index}");
+        let run_id = client
+            .start_workflow::<signal_race_workflow>(&workflow_id, queue, input(index))
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("signal-batch-claimer-{index}")),
+                signal_race_claim_opts(queue),
+            )
+            .await
+            .unwrap()
+            .expect("workflow task");
+        assert_eq!(claimed.run_id, run_id);
+        let accepted = client
+            .signal_workflow(
+                &workflow_id,
+                "go",
+                format!("signal/race-batch/{index}"),
+                format!("batch-{index}"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+        claims.push(claimed);
+    }
+
+    let results = backend
+        .commit_workflow_tasks(WorkflowTaskCommitBatch {
+            commits: claims
+                .iter()
+                .map(|claimed| WorkflowTaskCommitInput {
+                    claim: claimed.claim.clone(),
+                    commit: signal_wait_commit(&claimed.run_id, EventId(1)),
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2);
+    for result in &results {
+        assert_eq!(
+            *result.result.as_ref().unwrap(),
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(1)
+            }
+        );
+    }
+
+    let mut woken = Vec::new();
+    for index in 0..2 {
+        let task = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("signal-batch-waker-{index}")),
+                signal_race_claim_opts(queue),
+            )
+            .await
+            .unwrap()
+            .expect("both committed runs should be claimable after racing signals");
+        assert_eq!(task.reason, durust::WorkflowTaskReason::SignalReceived);
+        woken.push(task);
+    }
+    let woken_run_ids = woken
+        .iter()
+        .map(|task| task.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(woken_run_ids.len(), 2, "each run wakes exactly once");
+    for task in woken {
+        backend
+            .release_workflow_task(
+                task.claim,
+                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::SignalReceived),
+            )
+            .await
+            .unwrap();
+    }
+
+    for (index, claimed) in claims.into_iter().enumerate() {
+        assert_signal_race_run_completes(
+            &backend,
+            queue,
+            claimed.run_id,
+            &format!("batch-{index}"),
+        )
+        .await;
+    }
+}
+
+/// Once a run is terminal every mutation kind in a stale holder's commit is
+/// rejected identically across providers. Terminal transitions clear the
+/// claim, so the fencing check fires first and the rejection is `StaleLease`
+/// for every kind; the deeper `TerminalWorkflow` guard is pinned per provider
+/// with forged state in the provider unit suites.
+async fn terminal_run_fences_stale_mutating_commits_identically<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<signal_race_workflow>(
+            "wf/terminal-fence",
+            "terminal-fence-workflows",
+            input(1),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("terminal-fence-claimer"),
+            signal_race_claim_opts("terminal-fence-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let cancelled = client
+        .cancel_workflow("wf/terminal-fence", "fence test")
+        .await
+        .unwrap();
+    let durust::CancelWorkflowOutcome::Cancelled { event_id, .. } = cancelled else {
+        panic!("expected cancellation, got {cancelled:?}");
+    };
+
+    for (kind, commit) in terminal_fence_commits(&run_id, event_id) {
+        let err = backend
+            .commit_workflow_task(claimed.claim.clone(), commit)
+            .await
+            .expect_err(kind);
+        assert!(
+            matches!(err, Error::StaleLease),
+            "stale `{kind}` commit against the cancelled run should fence as StaleLease, got {err:?}"
+        );
+    }
+}
+
+/// One commit per workflow-visible mutation kind, aimed at the post-cancel
+/// tail so only claim fencing (not a tail conflict) decides the outcome.
+fn terminal_fence_commits(
+    run_id: &durust::RunId,
+    expected_tail: EventId,
+) -> Vec<(&'static str, WorkflowTaskCommit)> {
+    let command_id = durust::command_id(run_id, 900);
+    let base = WorkflowTaskCommit {
+        expected_tail_event_id: expected_tail,
+        ..WorkflowTaskCommit::default()
+    };
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("terminal-fence-activities"),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(1),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    vec![
+        (
+            "append_events",
+            WorkflowTaskCommit {
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&0_u64).unwrap(),
+                })],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_activities",
+            WorkflowTaskCommit {
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..base.clone()
+            },
+        ),
+        (
+            "upsert_waits",
+            WorkflowTaskCommit {
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: durust::WaitId::new(format!("{run_id}:900:signal")),
+                    run_id: run_id.clone(),
+                    command_id: command_id.clone(),
+                    kind: durust::WaitKind::Signal,
+                    key: "go".to_owned(),
+                    ready_at: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "consume_signals",
+            WorkflowTaskCommit {
+                consume_signals: vec![durust::SignalId::new("terminal-fence-signal")],
+                ..base.clone()
+            },
+        ),
+        (
+            "delete_waits",
+            WorkflowTaskCommit {
+                delete_waits: vec![durust::WaitId::new(format!("{run_id}:900:signal"))],
+                ..base.clone()
+            },
+        ),
+        (
+            "start_child_workflows",
+            WorkflowTaskCommit {
+                start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                    command_id: command_id.clone(),
+                    workflow_id: durust::WorkflowId::new(format!("{run_id}/fence-child")),
+                    workflow_type: WorkflowType::new("conformance.signal-race", 1),
+                    task_queue: TaskQueue::new("terminal-fence-workflows"),
+                    input: durust::encode_payload(&Input { value: 0 }).unwrap(),
+                    parent_close_policy: durust::ParentClosePolicy::Cancel,
+                    child_map_item: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_activity_maps",
+            WorkflowTaskCommit {
+                schedule_activity_maps: vec![durust::ActivityMapTask {
+                    map_command_id: command_id.clone(),
+                    activity_name: ActivityName::new("conformance.echo"),
+                    task_queue: TaskQueue::new("terminal-fence-activities"),
+                    input_manifest: durust::encode_payload(&0_u64).unwrap(),
+                    result_manifest_name: "results".to_owned(),
+                    max_in_flight: 1,
+                    retry_policy: durust::RetryPolicy::exponential().max_attempts(1),
+                    start_to_close_timeout: None,
+                    heartbeat_timeout: None,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "schedule_child_workflow_maps",
+            WorkflowTaskCommit {
+                schedule_child_workflow_maps: vec![ChildWorkflowMapTask {
+                    map_command_id: command_id.clone(),
+                    workflow_type: WorkflowType::new("conformance.signal-race", 1),
+                    task_queue: TaskQueue::new("terminal-fence-workflows"),
+                    input_manifest: durust::encode_payload(&0_u64).unwrap(),
+                    result_manifest_name: "results".to_owned(),
+                    workflow_id_prefix: format!("{run_id}/fence-child-map"),
+                    max_in_flight: 1,
+                    parent_close_policy: durust::ParentClosePolicy::Cancel,
+                    failure_mode: durust::ChildWorkflowMapFailureMode::FailFast,
+                }],
+                ..base.clone()
+            },
+        ),
+        (
+            "cancel_commands",
+            WorkflowTaskCommit {
+                cancel_commands: vec![command_id],
+                ..base.clone()
+            },
+        ),
+        (
+            "query_projection",
+            WorkflowTaskCommit {
+                query_projection: Some(durust::encode_payload(&0_u64).unwrap()),
+                ..base
+            },
+        ),
+    ]
+}
+
+/// Terminal cleanup deletes the run's operational rows, so late activity
+/// calls (heartbeat included) must answer `AlreadyCompleted` from row
+/// absence across retries, claim scans must not see the terminal run's
+/// tasks, undelivered signals must stay readable through the inbox, and
+/// their `signal_id` dedup must survive while new sends fail terminally.
+async fn terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(
+            "wf/terminal-cleanup",
+            "terminal-cleanup-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("terminal-cleanup-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("terminal-cleanup-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_payload = durust::encode_payload(&Input { value: 3 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("terminal-cleanup-activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: Some(Duration::from_secs(30)),
+        input: input_payload.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input_payload),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled.clone(),
+                ))],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("terminal-cleanup-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    let activity = backend
+        .claim_activity_task(
+            WorkerId::new("terminal-cleanup-worker"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+    // An undelivered signal lands before the run closes.
+    let undelivered = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/undelivered",
+            "pending",
+        )
+        .await
+        .unwrap();
+    assert_eq!(undelivered, durust::SignalWorkflowOutcome::Accepted);
+
+    client
+        .cancel_workflow("wf/terminal-cleanup", "terminal cleanup test")
+        .await
+        .unwrap();
+
+    // Late calls answer idempotently from row absence, on every retry.
+    for attempt in 0..2 {
+        let heartbeat = backend
+            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+                claim: activity.claim.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            heartbeat,
+            durust::ActivityHeartbeatOutcome::AlreadyCompleted,
+            "heartbeat retry {attempt}"
+        );
+        let completed = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim.clone(),
+                result: durust::encode_payload(&3_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            completed,
+            durust::CompleteActivityOutcome::AlreadyCompleted,
+            "complete retry {attempt}"
+        );
+        let failed = backend
+            .fail_activity(FailActivityRequest {
+                claim: activity.claim.clone(),
+                failure: durust::DurableFailure::new("test.late", "late failure"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            durust::FailActivityOutcome::AlreadyCompleted,
+            "fail retry {attempt}"
+        );
+    }
+
+    // Claim scans no longer see the terminal run's tasks.
+    assert!(
+        backend
+            .claim_activity_task(WorkerId::new("terminal-cleanup-leftover"), activity_opts)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // The undelivered signal stays readable and its dedup record survives;
+    // a genuinely new send fails terminally.
+    let inboxed = backend
+        .read_signal_inbox(durust::ReadSignalInboxRequest {
+            run_id: run_id.clone(),
+            signal_name: durust::SignalName::new("go"),
+        })
+        .await
+        .unwrap()
+        .expect("undelivered signal survives terminal cleanup");
+    assert_eq!(
+        inboxed.signal_id,
+        durust::SignalId::new("signal/terminal-cleanup/undelivered")
+    );
+    let duplicate = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/undelivered",
+            "pending",
+        )
+        .await
+        .unwrap();
+    assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+    let fresh = client
+        .signal_workflow(
+            "wf/terminal-cleanup",
+            "go",
+            "signal/terminal-cleanup/fresh",
+            "rejected",
+        )
+        .await;
+    assert!(matches!(fresh, Err(durust::Error::TerminalWorkflow)));
+}
+
+/// Consumed signal rows are the `signal_id` dedup record, and continue-as-new
+/// keeps accepting sends under the same workflow id, so cleanup after a
+/// continue-as-new transition must retain them: a retried send of an already
+/// consumed id must stay `Duplicate` instead of delivering again to the next
+/// run.
+async fn consumed_signal_dedup_survives_continue_as_new<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>("wf/can-signal-dedup", "can-signal-workflows", input(2))
+        .await
+        .unwrap();
+    let consumed_signal_id = durust::SignalId::new("signal/can-dedup/consumed");
+    let accepted = client
+        .signal_workflow(
+            "wf/can-signal-dedup",
+            "go",
+            consumed_signal_id.0.clone(),
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("can-signal-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("can-signal-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let signal_payload = durust::encode_payload(&"first").unwrap();
+    // One commit consumes the delivery and continues the run as new.
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![
+                    NewHistoryEvent::new(HistoryEventData::SignalConsumed(
+                        durust::SignalConsumed {
+                            command_id: command_id.clone(),
+                            signal_id: consumed_signal_id.clone(),
+                            signal_name: durust::SignalName::new("go"),
+                            payload: signal_payload,
+                            fingerprint: durust::signal_fingerprint(durust::SignalName::new("go")),
+                        },
+                    )),
+                    NewHistoryEvent::new(HistoryEventData::WorkflowContinuedAsNew {
+                        input: durust::encode_payload(&Input { value: 3 }).unwrap(),
+                    }),
+                ],
+                consume_signals: vec![consumed_signal_id.clone()],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The retried send of the consumed id must stay deduplicated instead of
+    // delivering a second time to the next run.
+    let retried = client
+        .signal_workflow(
+            "wf/can-signal-dedup",
+            "go",
+            consumed_signal_id.0.clone(),
+            "first",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried, durust::SignalWorkflowOutcome::Duplicate);
+
+    // The continued run is live under the same workflow id: fresh sends land.
+    let fresh = client
+        .signal_workflow("wf/can-signal-dedup", "go", "signal/can-dedup/next", "next")
+        .await
+        .unwrap();
+    assert_eq!(fresh, durust::SignalWorkflowOutcome::Accepted);
+}
+
+/// Late completion and failure of an activity whose run was cancelled must be
+/// idempotently absorbed, and repeated retries must keep returning the same
+/// outcome on every provider (cancellation deletes the run's activity rows
+/// atomically with the terminal transition; absence answers late calls).
+async fn late_activity_completion_after_cancel_is_idempotent_across_retries<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(
+            "wf/late-completion-cancel",
+            "late-completion-workflows",
+            input(5),
+        )
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("late-completion-scheduler"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("late-completion-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_payload = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("late-completion-activities"),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input_payload.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input_payload),
+            "sha256:test-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    scheduled.clone(),
+                ))],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity = backend
+        .claim_activity_task(
+            WorkerId::new("late-completion-worker"),
+            ClaimActivityOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("late-completion-activities"),
+                registered_activity_names: vec![ActivityName::new("conformance.echo")],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("activity task");
+
+    client
+        .cancel_workflow("wf/late-completion-cancel", "late completion test")
+        .await
+        .unwrap();
+
+    // Retried completions and failures after cancellation must return the
+    // same idempotent outcome every time; a provider that mutates before
+    // validating would flip between error kinds across retries.
+    for attempt in 0..2 {
+        let completed = backend
+            .complete_activity(CompleteActivityRequest {
+                claim: activity.claim.clone(),
+                result: durust::encode_payload(&9_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            completed,
+            durust::CompleteActivityOutcome::AlreadyCompleted,
+            "complete retry {attempt}"
+        );
+        let failed = backend
+            .fail_activity(FailActivityRequest {
+                claim: activity.claim.clone(),
+                failure: durust::DurableFailure::new("test.late", "late failure"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            failed,
+            durust::FailActivityOutcome::AlreadyCompleted,
+            "fail retry {attempt}"
+        );
+    }
+
+    // The cancelled run's history is untouched by the late attempts.
+    let history = stream_history(&backend, run_id).await;
+    assert!(matches!(
+        history.last().map(|event| &event.data),
+        Some(HistoryEventData::WorkflowCancelled { .. })
+    ));
+}
+
 async fn timer_waits_fire_only_when_due_and_make_workflow_claimable<B>(backend: B)
 where
     B: DurableBackend,
@@ -3451,7 +5874,10 @@ where
         .expect("workflow task");
     let command_id = durust::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let retry_policy = durust::RetryPolicy::exponential().max_attempts(2);
+    // No backoff: this suite pins retry bookkeeping (attempt counts, history
+    // silence, terminal failure), not retry pacing, and must stay immediate
+    // for every provider clock. Backoff pacing has its own conformance tests.
+    let retry_policy = durust::RetryPolicy::none().max_attempts(2);
     let scheduled = durust::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
@@ -4115,6 +6541,881 @@ where
         lease_duration: Duration::from_secs(30),
     };
     (run_id, claim_opts, activity_opts)
+}
+
+async fn unexpired_workflow_claim_lease_is_not_reclaimable<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/lease-unexpired", "lease-unexpired-workflows", input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("lease-unexpired-workflows"),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-holder"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+
+    // The holder's lease is nowhere near expiry, so the task must not be
+    // handed out to another worker.
+    let blocked = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-thief"), claim_opts.clone())
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // Releasing the claim restores normal claimability.
+    backend
+        .release_workflow_task(
+            claimed.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+        )
+        .await
+        .unwrap();
+    let reclaimed = backend
+        .claim_workflow_task(WorkerId::new("lease-unexpired-after-release"), claim_opts)
+        .await
+        .unwrap();
+    assert!(reclaimed.is_some());
+}
+
+// Claims a workflow task, "crashes" the holder (drops it without commit or
+// release), advances time past the lease, and verifies the task is reclaimed
+// with the identical state a fresh claim would produce while every operation
+// from the dead holder is fenced as stale. `crash` lets SQLite close and
+// reopen the database between claim and reclaim; `advance_past_lease` is
+// virtual time for the memory provider and a real sleep for SQL providers,
+// whose claim scans read their own wall clock.
+async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
+    B,
+    Crash,
+    CrashFut,
+    Advance,
+    AdvanceFut,
+>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    lease_duration: Duration,
+    crash: Crash,
+    advance_past_lease: Advance,
+) where
+    B: DurableBackend,
+    Crash: FnOnce(B) -> CrashFut,
+    CrashFut: Future<Output = B>,
+    Advance: FnOnce() -> AdvanceFut,
+    AdvanceFut: Future<Output = ()>,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration,
+    };
+    let original = backend
+        .claim_workflow_task(WorkerId::new("lease-crash-holder"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+
+    let backend = crash(backend).await;
+    advance_past_lease().await;
+
+    let reclaimed = backend
+        .claim_workflow_task(WorkerId::new("lease-crash-reclaimer"), claim_opts)
+        .await
+        .unwrap()
+        .expect("expired lease should be reclaimable");
+    // The reclaim must look exactly like a fresh claim of the same task,
+    // under a new fencing token.
+    assert_eq!(reclaimed.run_id, run_id);
+    assert_eq!(reclaimed.reason, original.reason);
+    assert_eq!(
+        reclaimed.replay_target_event_id,
+        original.replay_target_event_id
+    );
+    assert_eq!(
+        reclaimed
+            .prefetched_history
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+        original
+            .prefetched_history
+            .iter()
+            .map(|event| event.event_id)
+            .collect::<Vec<_>>(),
+    );
+    assert_ne!(reclaimed.claim.token, original.claim.token);
+
+    // The dead holder is fenced: its commit and release are rejected as stale
+    // and leave the new claim untouched.
+    let stale_commit = backend
+        .commit_workflow_task(
+            original.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: original.replay_target_event_id,
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_commit, Error::StaleLease));
+    let stale_release = backend
+        .release_workflow_task(
+            original.claim,
+            durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_release, Error::StaleLease));
+
+    let outcome = backend
+        .commit_workflow_task(
+            reclaimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: reclaimed.replay_target_event_id,
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&5_u64).unwrap(),
+                })],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+}
+
+async fn schedule_timeoutless_activity<B>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+) -> (
+    durust::RunId,
+    ClaimWorkflowTaskOptions,
+    ClaimActivityOptions,
+)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
+        .await
+        .unwrap();
+    let claim_opts = ClaimWorkflowTaskOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(workflow_queue),
+        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
+        lease_duration: Duration::from_secs(30),
+    };
+    let claimed = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-scheduler"), claim_opts.clone())
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input = durust::encode_payload(&Input { value: 9 }).unwrap();
+    let scheduled = durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new(activity_queue),
+        retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-timeoutless-options".to_owned(),
+        ),
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled.clone()),
+                )],
+                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let activity_opts = ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new(activity_queue),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    };
+    (run_id, claim_opts, activity_opts)
+}
+
+// An activity with neither a start-to-close timeout nor a heartbeat timeout
+// (the `ActivityOptions` defaults) must be reclaimable after its claim lease
+// expires, through the same timeout/retry path explicit deadlines use.
+async fn timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-activity-lease",
+        "timeoutless-lease-workflows",
+        "timeoutless-lease-activities",
+    )
+    .await;
+
+    let first = backend
+        .claim_activity_task(WorkerId::new("timeoutless-worker-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+    let claimed_at = backend.current_time().await.unwrap();
+
+    // While the lease is unexpired the timeout scan leaves the claim alone and
+    // the task is not claimable by anyone else.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(claimed_at.0.saturating_add(100)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-worker-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // Past the 30s claim lease the timeout scan reclaims the task through the
+    // existing retry machinery, making it claimable as attempt 2.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(claimed_at.0.saturating_add(31_000)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let second = backend
+        .claim_activity_task(WorkerId::new("timeoutless-worker-2"), activity_opts)
+        .await
+        .unwrap()
+        .expect("lease-expired activity should be reclaimable");
+    assert_eq!(second.task.attempt, 2);
+
+    // Every operation from the crashed holder is fenced as stale.
+    let stale_heartbeat = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_heartbeat, Error::StaleLease));
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim.clone(),
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+    let stale_failure = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: durust::DurableFailure::new("conformance.crashed", "stale holder"),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_failure, Error::StaleLease));
+
+    // The new holder completes normally and the workflow wakes up.
+    let completed = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: second.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        durust::CompleteActivityOutcome::Completed { .. }
+    ));
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(ready.run_id, run_id);
+}
+
+// A timeout-less activity whose holder heartbeats and then stops must be
+// reclaimed exactly one lease after the last heartbeat: the heartbeat re-arms
+// the implicit lease-as-heartbeat deadline, so the scan leaves the claim
+// alone just short of it and reclaims reliably once it lapses. The terminal
+// miss records the lease-flavored attribution.
+async fn timeoutless_activity_reclaims_one_lease_after_heartbeats_stop<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-heartbeat-stop",
+        "timeoutless-hb-stop-workflows",
+        "timeoutless-hb-stop-activities",
+    )
+    .await;
+    let lease_ms = i64::try_from(activity_opts.lease_duration.as_millis()).unwrap();
+
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-worker-1"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // The refreshed deadline sits at least one lease past the pre-heartbeat
+    // instant, so a scan just short of that must leave the claim alone.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_none(),
+        "claim must hold until one lease past the last heartbeat"
+    );
+
+    // One lease after the last heartbeat the holder counts as crashed and
+    // the scan reclaims the task as attempt 2.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let second = backend
+        .claim_activity_task(
+            WorkerId::new("timeoutless-hb-stop-worker-2"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("stopped heartbeats must reclaim one lease after the last one");
+    assert_eq!(second.task.attempt, 2);
+
+    // Every operation from the stopped holder is fenced as stale.
+    let stale_heartbeat = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_heartbeat, Error::StaleLease));
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim.clone(),
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+    let stale_failure = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: durust::DurableFailure::new("conformance.crashed", "stale holder"),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_failure, Error::StaleLease));
+
+    // Attempt 2 exhausts the retry budget without heartbeating; the terminal
+    // miss persists the lease-expiry attribution rather than a
+    // missed-heartbeat or start-to-close message.
+    let second_claimed_at = backend.current_time().await.unwrap();
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(second_claimed_at.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-hb-stop-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("terminal timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out
+            .message
+            .contains("claim lease expired without heartbeat on attempt 2"),
+        "implicit deadline misses need the lease attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// The batch claim RPC must stamp the implicit lease-as-heartbeat state
+// exactly like the scalar claim: Postgres routes it through a set-based
+// unnest update with -1 sentinels while memory/SQLite loop the scalar path.
+// A swapped unnest array or a broken sentinel decode either stamps a garbage
+// deadline (reclaimed immediately, tripping the blocked assertion) or none at
+// all (never reclaimed, tripping the reclaim assertion), so the boundary
+// scans pin both sides.
+async fn timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_timeoutless_activity(
+        backend.clone(),
+        "wf/timeoutless-batch-claim",
+        "timeoutless-batch-claim-workflows",
+        "timeoutless-batch-claim-activities",
+    )
+    .await;
+    let lease_ms = i64::try_from(activity_opts.lease_duration.as_millis()).unwrap();
+
+    let mut claimed = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-worker-1"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    let first = claimed.remove(0);
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // Just short of one lease past the last heartbeat the claim holds: the
+    // heartbeat re-armed the batch-stamped implicit deadline.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-blocked"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_empty(),
+        "batch-claimed implicit deadline must hold until one lease past the last heartbeat"
+    );
+
+    // One lease after the last heartbeat the task reclaims as attempt 2,
+    // again through the batch claim RPC; the old holder is fenced.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let before_second_claim = backend.current_time().await.unwrap();
+    let mut reclaimed = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-worker-2"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts.clone(),
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reclaimed.len(),
+        1,
+        "batch-claimed timeout-less task must reclaim one lease after the last heartbeat"
+    );
+    let second = reclaimed.remove(0);
+    assert_eq!(second.task.attempt, 2);
+    let after_second_claim = backend.current_time().await.unwrap();
+    let stale_completion = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_completion, Error::StaleLease));
+
+    // Attempt 2 never heartbeats, so the deadline observed below is exactly
+    // what the batch claim stamped: it must hold just short of one lease and
+    // lapse just past it. A batch claim that stamps no deadline (or a garbage
+    // one) fails one of these two boundaries. The lapse exhausts the retry
+    // budget and records the lease attribution.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_second_claim.0.saturating_add(lease_ms - 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_tasks(
+            WorkerId::new("timeoutless-batch-blocked-2"),
+            ClaimActivityTasksOptions {
+                claim: activity_opts,
+                limit: 4,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        blocked.is_empty(),
+        "batch claim must stamp the implicit deadline one full lease ahead"
+    );
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_second_claim.0.saturating_add(lease_ms + 1)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("timeoutless-batch-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("terminal timeout workflow task (batch claim must stamp a deadline)");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out
+            .message
+            .contains("claim lease expired without heartbeat on attempt 2"),
+        "batch-claimed implicit misses need the lease attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// An explicit heartbeat timeout stays authoritative over the claim lease: an
+// activity with a 200ms heartbeat timeout under a 30s lease is reclaimed on
+// the 200ms cadence when heartbeats stop, and the miss is attributed to the
+// heartbeat, not the lease.
+async fn explicit_heartbeat_timeout_takes_precedence_over_claim_lease<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (run_id, claim_opts, activity_opts) = schedule_heartbeat_activity(
+        backend.clone(),
+        "wf/explicit-heartbeat-precedence",
+        "explicit-hb-precedence-workflows",
+        "explicit-hb-precedence-activities",
+        durust::RetryPolicy::exponential().max_attempts(1),
+    )
+    .await;
+    assert_eq!(activity_opts.lease_duration, Duration::from_secs(30));
+
+    let first = backend
+        .claim_activity_task(
+            WorkerId::new("explicit-hb-precedence-worker"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("heartbeat activity");
+    assert_eq!(first.task.attempt, 1);
+
+    let before_heartbeat = backend.current_time().await.unwrap();
+    let recorded = backend
+        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            claim: first.claim.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    let after_heartbeat = backend.current_time().await.unwrap();
+
+    // Just short of the 200ms explicit cadence the claim holds.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(before_heartbeat.0.saturating_add(199)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let blocked = backend
+        .claim_activity_task(
+            WorkerId::new("explicit-hb-precedence-blocked"),
+            activity_opts.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(blocked.is_none());
+
+    // 201ms after the last heartbeat — far inside the 30s lease — the
+    // explicit cadence reclaims the task; the exhausted retry budget makes
+    // the miss terminal with the missed-heartbeat attribution.
+    backend
+        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(after_heartbeat.0.saturating_add(201)),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("explicit-hb-precedence-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("heartbeat timeout workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
+        panic!("expected ActivityTimedOut event, got {:?}", history[2].data);
+    };
+    assert!(
+        timed_out.message.contains("missed heartbeat on attempt 1"),
+        "explicit heartbeat misses keep the heartbeat attribution, got `{}`",
+        timed_out.message
+    );
+}
+
+// A timeout-less activity whose holder heartbeats faithfully must survive
+// past the original claim lease indefinitely: each heartbeat re-arms the
+// implicit lease-as-heartbeat deadline. `pass_partial_lease` moves provider
+// time a large fraction of the lease per cycle (virtual time for memory,
+// wall-clock waiting for the SQL providers), so three cycles put provider
+// time well past the deadline stamped at claim.
+async fn heartbeating_timeoutless_activity_survives_lease_periods<B, F, Fut>(
+    backend: B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+    lease: Duration,
+    pass_partial_lease: F,
+) where
+    B: DurableBackend,
+    F: Fn() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let (run_id, claim_opts, mut activity_opts) =
+        schedule_timeoutless_activity(backend.clone(), workflow_id, workflow_queue, activity_queue)
+            .await;
+    activity_opts.lease_duration = lease;
+    let lease_ms = i64::try_from(lease.as_millis()).unwrap();
+
+    let claimed = backend
+        .claim_activity_task(WorkerId::new("hb-timeoutless-worker"), activity_opts)
+        .await
+        .unwrap()
+        .expect("first attempt");
+    assert_eq!(claimed.task.attempt, 1);
+    let claimed_at = backend.current_time().await.unwrap();
+
+    for _ in 0..3 {
+        pass_partial_lease().await;
+        // The scan runs before this cycle's heartbeat, so it observes the
+        // deadline as re-armed by the previous heartbeat only.
+        let now = backend.current_time().await.unwrap();
+        backend
+            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                namespace: Namespace::default(),
+                now,
+                limit: 16,
+            })
+            .await
+            .unwrap();
+        let recorded = backend
+            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+                claim: claimed.claim.clone(),
+            })
+            .await
+            .expect("heartbeating holder must never be reclaimed");
+        assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    }
+    let now = backend.current_time().await.unwrap();
+    assert!(
+        now.0 > claimed_at.0.saturating_add(lease_ms),
+        "test must outlive the deadline stamped at claim time"
+    );
+
+    // The original holder completes normally: exactly one attempt ran and no
+    // timeout was recorded.
+    let completed = backend
+        .complete_activity(CompleteActivityRequest {
+            claim: claimed.claim,
+            result: durust::encode_payload(&9_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        completed,
+        durust::CompleteActivityOutcome::Completed { .. }
+    ));
+    let ready = backend
+        .claim_workflow_task(WorkerId::new("hb-timeoutless-ready"), claim_opts)
+        .await
+        .unwrap()
+        .expect("activity completion workflow task");
+    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(ready.run_id, run_id);
+    let history = stream_history(&backend, run_id).await;
+    assert!(
+        history
+            .iter()
+            .all(|event| !matches!(event.data, HistoryEventData::ActivityTimedOut(_))),
+        "no timeout may fire for a heartbeating holder: {history:?}"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::ActivityCompleted(_)))
+            .count(),
+        1,
+        "exactly one attempt completes"
+    );
+}
+
+#[test]
+fn memory_heartbeating_timeoutless_activity_survives_lease_periods_on_virtual_clock() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let advance_backend = backend.clone();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/memory-hb-timeoutless",
+            "memory-hb-timeoutless-workflows",
+            "memory-hb-timeoutless-activities",
+            Duration::from_secs(30),
+            move || {
+                let advance_backend = advance_backend.clone();
+                async move {
+                    advance_backend.advance_time(Duration::from_secs(20));
+                }
+            },
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_heartbeating_timeoutless_activity_survives_lease_periods() {
+    block_on_tokio(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("hb-timeoutless.sqlite3")).unwrap();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/sqlite-hb-timeoutless",
+            "sqlite-hb-timeoutless-workflows",
+            "sqlite-hb-timeoutless-activities",
+            Duration::from_millis(500),
+            || async { tokio::time::sleep(Duration::from_millis(200)).await },
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_heartbeating_timeoutless_activity_survives_lease_periods_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres heartbeat lease conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("hb_timeoutless");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        heartbeating_timeoutless_activity_survives_lease_periods(
+            backend,
+            "wf/postgres-hb-timeoutless",
+            "postgres-hb-timeoutless-workflows",
+            "postgres-hb-timeoutless-activities",
+            Duration::from_millis(500),
+            || async { tokio::time::sleep(Duration::from_millis(200)).await },
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
 }
 
 async fn cancel_commands_clear_activity_tasks<B>(backend: B)
@@ -5108,7 +8409,9 @@ where
     .unwrap();
     let activity_name = ActivityName::new("conformance.echo");
     let task_queue = TaskQueue::new("map-failure-activities");
-    let retry_policy = durust::RetryPolicy::exponential().max_attempts(2);
+    // No backoff: the map-failure suite reclaims the retried item
+    // immediately; backoff pacing has its own conformance tests.
+    let retry_policy = durust::RetryPolicy::none().max_attempts(2);
     let map_task = ActivityMapTask {
         map_command_id: command_id.clone(),
         activity_name: activity_name.clone(),

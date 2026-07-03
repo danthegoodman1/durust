@@ -210,12 +210,12 @@ fn phase_0012_mixed_sqlite_baseline_is_dimensioned_and_semantic() {
     assert_eq!(counters["timersFired"], 1000);
     assert_eq!(counters["childWorkflowStartsDispatched"], 1000);
 
-    let workload_source = include_str!("../src/bin/durust-benchmark-workload.rs");
+    let workload_source = include_str!("../benchtools/src/bin/durust-benchmark-workload.rs");
     assert!(workload_source.contains("bench.workload.parent"));
     assert!(workload_source.contains("bench.workload.child"));
     assert!(workload_source.contains("bench.workload.activity"));
 
-    let compare_source = include_str!("../src/bin/durust-benchmark-compare.rs");
+    let compare_source = include_str!("../benchtools/src/bin/durust-benchmark-compare.rs");
     assert!(compare_source.contains("processingWorkflowsPerSecond"));
     assert!(compare_source.contains("benchmark dimensions differ"));
 

@@ -247,8 +247,8 @@ The manifest records every workflow and activity exported by the crate:
       "rustPath": "order_service::workflows::checkout::order",
       "inputType": "order_service::types::OrderInput",
       "outputType": "order_service::types::OrderOutput",
-      "inputSchemaHash": "sha256:...",
-      "outputSchemaHash": "sha256:..."
+      "inputTypeNameHash": "sha256:...",
+      "outputTypeNameHash": "sha256:..."
     }
   ],
   "activities": [
@@ -257,12 +257,18 @@ The manifest records every workflow and activity exported by the crate:
       "rustPath": "order_service::activities::payments::charge_card",
       "inputType": "order_service::types::ChargeInput",
       "outputType": "order_service::types::ChargeOutput",
-      "inputSchemaHash": "sha256:...",
-      "outputSchemaHash": "sha256:..."
+      "inputTypeNameHash": "sha256:...",
+      "outputTypeNameHash": "sha256:..."
     }
   ]
 }
 ```
+
+The `*TypeNameHash` fields are SHA-256 fingerprints of the Rust type names.
+They detect type-identity changes (a handler switching to a different
+input/output type), not structural changes: fields added, removed, or retyped
+inside the same-named type do not change the hash. Structural evolution is
+governed by the Serde guidance and version markers, not the manifest.
 
 The `#[workflow]` and `#[activity]` macros submit linked handler metadata into
 Durust's manifest inventory. A binary or test harness that links the handlers can
@@ -274,11 +280,15 @@ the explicit cargo helper.
 CLI:
 
 ```text
-cargo durable manifest write
+cargo durable manifest normalize
 cargo durable manifest check
 cargo durable manifest diff
 cargo durable manifest accept
 ```
+
+`manifest normalize` re-serializes the `--current` manifest to `--output` in
+canonical form; it does not regenerate metadata (that requires a binary that
+links the handlers).
 
 Normal local compilation should not fail just because the manifest changed. If a checked-in manifest exists, the macro/build integration may emit warnings for obvious drift, but the explicit CLI is the source of hard failures.
 
@@ -573,7 +583,7 @@ Workers are local processes that register code they can execute and poll durable
 Registration is local capability registration, not durable schema mutation:
 
 ```rust
-let worker = durust::Worker::builder(backend.clone())
+let mut worker = durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("orders-a")
     .workflow_task_queue("orders")
@@ -586,9 +596,16 @@ let worker = durust::Worker::builder(backend.clone())
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
     .activity_completion_batch_size(32)
-    .run()
-    .await?;
+    .build();
+
+let shutdown = worker.shutdown_handle();
+worker.run().await?;
 ```
+
+`Worker::run` loops full work passes and parks in the provider's
+`wait_for_ready` while idle; `shutdown.shutdown()` stops it gracefully.
+`WorkerBuilder::run` builds and runs in one step for workers that never need
+the `Worker` value itself.
 
 Workflow-only worker:
 
@@ -1046,14 +1063,24 @@ fingerprint includes that resolved option set, so changing defaults or
 overrides before a recorded activity command is a nondeterministic replay change
 unless it is protected by a version marker.
 
-Heartbeat enforcement is disabled by default. If a scheduled activity has a
-heartbeat timeout, the provider starts an operational heartbeat deadline when
-the activity task is claimed. Activity code may call
-`durust::heartbeat_activity().await?`; providers must accept only the currently
-claimed activity token, reject stale heartbeat claims, and refresh the deadline.
-Missed heartbeats are handled by the generic activity timeout scanner: retry
-attempts are rescheduled according to the stored retry policy, and only the
-terminal miss appends `ActivityTimedOut`.
+Activity liveness has three deadline sources. An explicit start-to-close
+timeout stamps the task's `timeout_at` when it is scheduled (restarting at
+retry visibility). An explicit heartbeat timeout starts an operational
+heartbeat deadline when the activity task is claimed; each accepted heartbeat
+refreshes it by the explicit interval. A task with neither timeout uses its
+claim lease as an implicit heartbeat interval: the claim stamps the heartbeat
+deadline one lease ahead and persists the interval on the claimed row, and
+each accepted heartbeat re-arms it, so a faithfully heartbeating holder
+survives indefinitely while a hung or crashed one is reclaimed one lease after
+its last heartbeat (or one lease after the claim if it never heartbeat).
+Activity code may call `durust::heartbeat_activity().await?`; providers must
+accept only the currently claimed activity token, reject stale heartbeat
+claims, and refresh the deadline, with an explicit heartbeat timeout taking
+precedence over the implicit lease interval. Missed deadlines are handled by
+the generic activity timeout scanner: retry attempts are rescheduled according
+to the stored retry policy, and only the terminal miss appends
+`ActivityTimedOut`, attributed to the start-to-close deadline, the missed
+heartbeat, or the expired claim lease.
 
 Activity and workflow errors must be represented as a serializable Durust
 failure envelope before they are written to history:
@@ -1072,6 +1099,17 @@ Providers do not classify application errors; they only honor the generic
 `non_retryable` flag on a failed activity request. If `non_retryable` is true,
 the provider records the terminal activity failure immediately even when the
 stored retry policy has remaining attempts.
+
+Retry pacing is provider-enforced through delayed visibility. When a failed
+attempt is rescheduled under `RetryBackoff::Exponential`, the provider stamps
+the task with `visible_at = now + 1s * 2^(failed_attempt - 1)` (saturating)
+and claim queries skip tasks whose `visible_at` is in the future, so a
+fast-failing activity cannot hot-loop. The retry's start-to-close clock starts
+at the visibility instant, which keeps the timeout scanner from firing on a
+task that was never claimable. `RetryBackoff::None` retries are immediately
+visible. Timeout-driven retries carry no extra backoff: the expired deadline
+already paced the attempt, and delaying crash recovery further would only add
+latency.
 
 The durable future behaves like this:
 
@@ -1947,6 +1985,7 @@ SelectWinner {
     select_command_id: CommandId,
     branch_ordinal: u32,
     winning_event_id: EventId,
+    branches_digest: String, // "select:{branch_count}"
 }
 ```
 
@@ -1956,6 +1995,13 @@ Tie-break:
 1. earliest history event id
 2. lexical branch order
 ```
+
+`branches_digest` is structural: it records only the branch count
+(`select:{count}`; `select_all` records `select_all:{count}`), so benign
+refactors of branch source text replay cleanly. Reordering or swapping
+branches is detected through the recorded winner ordinal and the per-command
+fingerprints of the branch commands, and a changed branch count fails digest
+validation as nondeterminism.
 
 ---
 
@@ -2269,13 +2315,16 @@ durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
 
-The macro/lint layer should be fail-closed in strict mode:
+Strict mode is a fail-closed variant of the lint layer:
 
 ```rust
 #[durust::workflow(strict)]
 ```
 
-The `#[workflow]` macro should run a best-effort AST lint pass over the annotated workflow function. Strict mode should reject:
+Strict mode is not implemented yet. Until it ships, the `strict` argument is
+rejected at compile time with an explicit error so a build can never silently
+claim strict guarantees it does not have. When implemented, strict mode should
+reject:
 
 ```text
 unknown .await
@@ -2432,7 +2481,8 @@ Production object-store target:
 pub trait PayloadBlobStore {
     fn put_payload_blob(&self, digest: String, bytes: Vec<u8>) -> BoxFuture<'static, Result<String>>;
     fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>>;
-    fn list_payload_blob_digests(&self) -> BoxFuture<'static, Result<BTreeSet<String>>>;
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>>;
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>>;
     fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>>;
     fn owns_payload_blob_uri(&self, uri: &str) -> bool;
 }
@@ -2474,9 +2524,15 @@ local deployments. Production object stores should be provider-agnostic: wrap th
 durability provider in `PayloadBackend<B, S>`, where `S` is an async
 `PayloadBlobStore` such as `S3BlobStore`. The wrapper uploads external payloads
 before delegating durable writes to the inner provider and hydrates external
-`PayloadRef::Blob` values after reads. Concrete providers persist unknown blob
-refs opaquely; they must not know S3, Garage, signing, endpoints, or retry
-policy.
+`PayloadRef::Blob` values after reads.
+
+Blob URI ownership is exclusive and total: every blob ref has exactly one owner,
+identified by its URI scheme. A concrete provider validates, hydrates, and
+garbage-collects only refs carrying its own scheme(s) and persists every other
+scheme opaquely; it must not know S3, Garage, signing, endpoints, retry policy,
+or the set of schemes other layers use. A ref whose scheme no layer owns commits
+and persists unchanged and surfaces an error only when hydration is attempted at
+the outermost payload layer.
 
 Tests should use local Garage as the S3-compatible service so
 `PayloadBackend<SqliteBackend, S3BlobStore>` behavior is covered without
@@ -2493,8 +2549,11 @@ payload-observing operation. When the runtime observes such a payload, the
 worker calls `hydrate_payload` or, for paged activity-map result manifests,
 `hydrate_activity_map_result_manifest` or
 `hydrate_child_workflow_map_result_manifest` at an explicit async boundary
-before polling the workflow again. Workflow polling must not perform hidden
-object-store or database I/O.
+before polling the workflow again. Manifest hydration runs even when the root
+manifest is inline: each manifest level offloads independently by size, so an
+inline root can still hold blob-backed pages or item results. Only plain
+payloads short-circuit hydration when inline. Workflow polling must not perform
+hidden object-store or database I/O.
 
 Providers should expose generic payload garbage collection for provider-owned
 blob stores. GC treats workflow history, activity tasks, activity map manifests
@@ -2502,9 +2561,41 @@ and results, child workflow map manifests and results, child outbox entries,
 signal inbox rows, and query projections as roots. A dry-run mode must report
 retained and deleted blob counts without mutating storage. Counts are for blobs
 owned by the GC target: concrete providers count provider-owned blobs, while
-wrapper GC counts wrapper-owned object-store blobs. If a committed reachable
-`PayloadRef::Blob` is missing or fails
-digest/size validation, GC must fail rather than deleting unrelated blobs.
+wrapper GC counts wrapper-owned object-store blobs.
+
+Blob uploads precede the durable commit that makes them reachable, so a
+reachability snapshot alone can sentence a blob an in-flight commit is about to
+reference — either a fresh upload or an existing blob a content-addressed put
+deduplicated against. GC therefore never deletes a blob whose last-modified
+timestamp is younger than `PayloadGarbageCollectionRequest::min_age` (default
+one hour). Blob listings return last-modified timestamps, and stores that can
+cheaply refresh the timestamp on a deduplicated put do so: local directories
+touch the file mtime, the in-memory stores refresh under their lock, and the
+SQL providers refresh through the row-conflict update whose lock the GC
+delete's timestamp predicate re-evaluates under, which closes the
+sentence-then-reuse race transactionally for provider-internal blobs. The
+decorator sweep re-probes each candidate's last-modified timestamp immediately
+before deleting it (`PayloadBlobStore::payload_blob_last_modified`; the
+in-tree memory and S3 stores implement it, S3 via HEAD Last-Modified), so a
+re-put that lands after the sweep's listing but before that blob's pre-delete
+probe is retained; only the sliver between the probe and the delete itself
+stays exposed. The
+residual window shrinks to stores that cannot report a fresh timestamp — the
+defaulted probe returns no information and the sweep trusts its listing
+snapshot — and to S3 deduplicated puts, which skip the timestamp refresh
+because a copy-object round trip per put is not worth it (fresh S3 uploads do
+get a new Last-Modified the re-probe observes). Operators size `min_age`
+accordingly: above the maximum upload-to-commit latency plus one full GC
+sweep, which the one-hour default dwarfs.
+
+Reachability marks leaf blobs from the ref's digest alone; only manifest
+containers load, because traversal needs their contents. If a committed
+reachable container is missing or fails digest/size validation, GC must fail
+rather than deleting unrelated blobs. Object-store deletes (decorator blob
+stores and the SQLite local directory) continue past individual failures: the
+failure count is reported in the outcome and the blob remains a candidate for
+the next run. SQL-provider row deletes run inside the sweep's transaction and
+abort atomically, so those sweeps report zero failed blobs by construction.
 
 For provider-agnostic object stores, concrete providers also expose durable
 payload roots without object-store policy. Roots are typed so an outer
@@ -2570,7 +2661,7 @@ ready_workflows
   run_id
   latest_event_id
   reason
-  lease_owner
+  claim_token
   lease_until
 
 signals
@@ -2599,8 +2690,11 @@ activities
   failure_ref
   attempt
   retry_policy_ref
-  lease_owner
-  lease_until
+  claim_token
+  timeout_at
+  heartbeat_deadline_at
+  implicit_heartbeat_ms
+  visible_at
   status
 
 activity_maps
@@ -2670,6 +2764,38 @@ idempotency
   result_ref
   expires_at
 ```
+
+Claims carry a fencing `claim_token`, not an owner identity: every claim and
+reclaim mints a fresh token and stale holders are rejected by token
+comparison, which is strictly stronger than matching an owner id. A
+`lease_owner` column is deliberately omitted; an implementation that records
+the claiming worker id keeps it as observability metadata only. Workflow
+claims store `lease_until` for reclaim eligibility. Activity claims need no
+separate lease column: explicit deadlines reclaim through `timeout_at` and
+`heartbeat_deadline_at`, and a timeout-less activity persists its claim lease
+as `implicit_heartbeat_ms`, which drives the same heartbeat deadline (section
+6.3).
+
+## 19.1 Terminal cleanup
+
+Operational rows exist to drive a live run; append history stays the
+authoritative record. When a run reaches a terminal state, the provider
+deletes the run's waits, activity tasks, map descriptors, map results, and
+dispatched child outbox rows in the same transaction as the terminal
+transition, so operational storage does not grow with closed runs and claim,
+timeout, and dispatch scans never revisit them. Late activity completions,
+failures, and heartbeats for a cleaned-up run answer `AlreadyCompleted` from
+the row's absence, identically on every retry.
+
+Signal rows are the exception. Undelivered signal rows stay readable through
+the inbox after the run closes. Consumed signal rows are the `signal_id`
+dedup record: a closed run (completed, failed, or cancelled) deletes them
+because those rows are then only reachable by retried sends against the
+closed run, which are rejected with `TerminalWorkflow` once the row is gone —
+no delivery can result either way. Continue-as-new keeps them because the
+next run continues to accept sends under the same workflow id. Undispatched
+child outbox rows also survive cleanup so an abandoned child can still start
+after its parent closes.
 
 ---
 
@@ -2981,6 +3107,16 @@ durust::run_many_seeds(
 `SimRun` owns virtual time, deterministic scheduling, fault injection, trace
 logging, and invariant failure reporting. `SimFailure` includes the failing seed
 and trace so a CI failure can be replayed locally.
+
+Simulations exercise production code, not models of it: `FaultInjectingBackend`
+wraps a real provider (the in-memory provider, whose clock is fully virtual)
+with seeded per-call fault decisions — transient errors on any backend method,
+duplicated activity completions replayed through the provider's idempotency
+path, scripted crashes that strand a live claim between claim and commit, and
+a post-claim hook for racing appends that force genuine commit conflicts. Real
+`Worker` instances run over the wrapped backend and every invariant is
+asserted from durable state (streamed history), with a same-seed rerun pinning
+byte-identical final histories.
 
 Run profiles:
 

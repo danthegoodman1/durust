@@ -1,5 +1,8 @@
+use crate::{CommitOutcome, CompleteActivityOutcome, DurableBackend, Error, PayloadStorageConfig};
+use futures::future::BoxFuture;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -157,6 +160,7 @@ pub enum FaultPoint {
     TimerDuplicateFire,
     SignalStorm,
     BlobStoreTransient,
+    BackendTransient,
     ProviderBackpressure,
     RecoveryBudgetExhausted,
     ShardLeaseLoss,
@@ -172,6 +176,7 @@ impl FaultPoint {
             Self::CrossShardDelayedDelivery => 4,
             Self::DispatcherCrash(_) => 5,
             Self::ProviderBackpressure | Self::RecoveryBudgetExhausted => 4,
+            Self::BackendTransient => 10,
             _ => 6,
         }
     }
@@ -184,6 +189,7 @@ impl FaultPoint {
             | Self::ProviderBackpressure
             | Self::RecoveryBudgetExhausted => 2,
             Self::DispatcherCrash(_) => 3,
+            Self::BackendTransient => 4,
             _ => 3,
         }
     }
@@ -255,13 +261,19 @@ pub struct SimRun {
 
 impl SimRun {
     pub fn new(seed: u64) -> Self {
-        let seed = seed.max(1);
+        // Scramble the caller's seed before it becomes RNG state so seed 0 is
+        // usable (XorShift state cannot be zero) and every requested seed maps
+        // to a distinct schedule, while `SimRun::seed` and failure reports
+        // keep the caller's value for reproduction.
+        let mut mix = seed;
+        let scheduler_seed = splitmix64(&mut mix);
+        let fault_seed = splitmix64(&mut mix);
         Self {
             seed,
             fault_profile: FaultProfile::None,
             clock: VirtualClock::new(),
-            scheduler: SeededScheduler::new(seed),
-            fault_rng: XorShift64::new(seed ^ 0x9e37_79b9_7f4a_7c15),
+            scheduler: SeededScheduler::new(scheduler_seed),
+            fault_rng: XorShift64::new(fault_seed),
             trace: SimTrace {
                 seed,
                 entries: Vec::new(),
@@ -401,6 +413,396 @@ impl SimRun {
     }
 }
 
+type ClaimHook = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
+/// Deterministic fault-injecting `DurableBackend` decorator for simulation.
+///
+/// Wraps any backend (the deterministic target is `MemoryBackend`) and makes
+/// seeded per-call fault decisions before forwarding:
+///
+/// - Transient errors on any fallible method, decided by the `FaultProfile`
+///   from a seeded RNG. A failed call never reaches the inner backend, so a
+///   "delayed delivery" is simply a read that fails now and succeeds when the
+///   caller retries.
+/// - Duplicate activity completions: the identical `complete_activity`
+///   request is replayed against the inner backend, exercising provider
+///   idempotency; the duplicate outcome is recorded for assertions.
+/// - Scripted worker crashes: after the next successful workflow-task claim
+///   every call fails until `revive`, so a real `Worker` can be "killed"
+///   between claim and commit while the inner backend keeps the claim.
+/// - A one-shot post-claim hook, so a scenario can commit racing work (e.g.
+///   an activity completion) between a worker's claim and its commit to force
+///   genuine tail conflicts.
+///
+/// Determinism contract: callers drive the backend serially (the worker is
+/// single-threaded), every fallible call consumes RNG state in call order,
+/// and hooks run synchronously inside the call that triggered them. Same
+/// seed + same call sequence => same decisions. The wrapper never mutates
+/// inner state directly; it only fails, replays, or forwards calls.
+#[derive(Clone)]
+pub struct FaultInjectingBackend<B>
+where
+    B: DurableBackend,
+{
+    inner: B,
+    state: Arc<Mutex<FaultInjectorState>>,
+}
+
+struct FaultInjectorState {
+    rng: XorShift64,
+    profile: FaultProfile,
+    crashed: bool,
+    crash_after_next_workflow_claim: bool,
+    after_workflow_claim_hook: Option<ClaimHook>,
+    injected_faults: u64,
+    duplicated_completions: u64,
+    duplicate_completion_outcomes: Vec<CompleteActivityOutcome>,
+    observed_commit_conflicts: u64,
+}
+
+impl<B> FaultInjectingBackend<B>
+where
+    B: DurableBackend,
+{
+    pub fn new(inner: B, seed: u64, profile: FaultProfile) -> Self {
+        // Seed the wrapper from SplitMix64 output 3: a same-seed `SimRun`
+        // consumes outputs 1 (scheduler) and 2 (fault RNG), so the wrapper's
+        // decision stream must start later in the sequence to stay
+        // decorrelated from both.
+        let mut mix = seed;
+        let _ = splitmix64(&mut mix);
+        let _ = splitmix64(&mut mix);
+        let rng_seed = splitmix64(&mut mix);
+        Self {
+            inner,
+            state: Arc::new(Mutex::new(FaultInjectorState {
+                rng: XorShift64::new(rng_seed),
+                profile,
+                crashed: false,
+                crash_after_next_workflow_claim: false,
+                after_workflow_claim_hook: None,
+                injected_faults: 0,
+                duplicated_completions: 0,
+                duplicate_completion_outcomes: Vec::new(),
+                observed_commit_conflicts: 0,
+            })),
+        }
+    }
+
+    /// Stops profile-driven fault decisions (crash state is separate; see
+    /// `revive`). Scenarios use this for a convergence phase in which the
+    /// system must quiesce and every workflow must finish.
+    pub fn disable_faults(&self) {
+        self.lock().profile = FaultProfile::None;
+    }
+
+    /// Arms a one-shot crash: after the next workflow-task claim succeeds,
+    /// every call fails until `revive`. The inner backend keeps the claim,
+    /// which is exactly the state a worker crash between claim and commit
+    /// leaves behind.
+    pub fn crash_after_next_workflow_claim(&self) {
+        self.lock().crash_after_next_workflow_claim = true;
+    }
+
+    /// Clears the crashed state (and any armed crash), modeling a replacement
+    /// worker reaching the backend.
+    pub fn revive(&self) {
+        let mut state = self.lock();
+        state.crashed = false;
+        state.crash_after_next_workflow_claim = false;
+    }
+
+    pub fn is_crashed(&self) -> bool {
+        self.lock().crashed
+    }
+
+    /// One-shot hook that runs immediately after the next successful
+    /// workflow-task claim, before the claim is returned to the caller.
+    /// Racing appends committed here (through the inner backend's public
+    /// API) land between the worker's claim and its commit.
+    pub fn on_next_workflow_claim<F>(&self, hook: F)
+    where
+        F: FnOnce() -> BoxFuture<'static, ()> + Send + 'static,
+    {
+        self.lock().after_workflow_claim_hook = Some(Box::new(hook));
+    }
+
+    pub fn injected_faults(&self) -> u64 {
+        self.lock().injected_faults
+    }
+
+    pub fn duplicated_completions(&self) -> u64 {
+        self.lock().duplicated_completions
+    }
+
+    pub fn duplicate_completion_outcomes(&self) -> Vec<CompleteActivityOutcome> {
+        self.lock().duplicate_completion_outcomes.clone()
+    }
+
+    pub fn observed_commit_conflicts(&self) -> u64 {
+        self.lock().observed_commit_conflicts
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FaultInjectorState> {
+        self.state.lock().expect("fault injector mutex poisoned")
+    }
+
+    // One deterministic decision per fallible call: crashed backends fail
+    // without consuming RNG state; live ones draw once for the transient
+    // fault decision.
+    fn fault(&self, op: &'static str) -> Option<Error> {
+        let mut state = self.lock();
+        if state.crashed {
+            return Some(Error::Backend(format!(
+                "simulated worker crash: backend unreachable during {op}"
+            )));
+        }
+        let state = &mut *state;
+        if state
+            .profile
+            .should_inject(&mut state.rng, FaultPoint::BackendTransient)
+        {
+            state.injected_faults += 1;
+            return Some(Error::Backend(format!(
+                "injected transient backend fault during {op}"
+            )));
+        }
+        None
+    }
+
+    fn decide(&self, point: FaultPoint) -> bool {
+        let mut state = self.lock();
+        if state.crashed {
+            return false;
+        }
+        let state = &mut *state;
+        state.profile.should_inject(&mut state.rng, point)
+    }
+
+    // Runs crash arming and the one-shot post-claim hook after a successful
+    // claim; shared by the single and batch claim paths.
+    fn after_workflow_claim(&self) -> Option<ClaimHook> {
+        let mut state = self.lock();
+        if state.crash_after_next_workflow_claim {
+            state.crash_after_next_workflow_claim = false;
+            state.crashed = true;
+        }
+        state.after_workflow_claim_hook.take()
+    }
+}
+
+/// Errors produced by `FaultInjectingBackend` (as opposed to real backend
+/// errors, which a scenario should treat as bugs).
+pub fn is_injected_fault(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Backend(message)
+            if message.starts_with("injected transient backend fault")
+                || message.starts_with("simulated worker crash")
+    )
+}
+
+macro_rules! forward_faultable {
+    ($(fn $method:ident($($arg:ident: $arg_ty:ty),*) -> $out:ty;)*) => {
+        $(
+            fn $method(&self, $($arg: $arg_ty),*) -> BoxFuture<'static, crate::Result<$out>> {
+                if let Some(err) = self.fault(stringify!($method)) {
+                    return Box::pin(futures::future::ready(Err(err)));
+                }
+                self.inner.$method($($arg),*)
+            }
+        )*
+    };
+}
+
+impl<B> DurableBackend for FaultInjectingBackend<B>
+where
+    B: DurableBackend,
+{
+    fn payload_storage_config(&self) -> PayloadStorageConfig {
+        self.inner.payload_storage_config()
+    }
+
+    forward_faultable! {
+        fn start_workflow(req: crate::StartWorkflowRequest) -> crate::StartWorkflowOutcome;
+        fn cancel_workflow(req: crate::CancelWorkflowRequest) -> crate::CancelWorkflowOutcome;
+        fn current_time() -> crate::TimestampMs;
+        fn stream_history(req: crate::StreamHistoryRequest) -> crate::HistoryChunk;
+        fn stream_history_for_replay(req: crate::StreamHistoryRequest) -> crate::HistoryChunk;
+        fn hydrate_payload(payload: crate::PayloadRef) -> crate::PayloadRef;
+        fn hydrate_activity_map_result_manifest(payload: crate::PayloadRef) -> crate::PayloadRef;
+        fn hydrate_child_workflow_map_result_manifest(
+            payload: crate::PayloadRef
+        ) -> crate::PayloadRef;
+        fn release_workflow_task(
+            claim: crate::WorkflowTaskClaim,
+            release: crate::WorkflowTaskRelease
+        ) -> ();
+        fn signal_workflow(req: crate::SignalWorkflowRequest) -> crate::SignalWorkflowOutcome;
+        fn read_signal_inbox(
+            req: crate::ReadSignalInboxRequest
+        ) -> Option<crate::SignalInboxRecord>;
+        fn read_signal_inboxes(
+            req: crate::ReadSignalInboxesRequest
+        ) -> Vec<Option<crate::SignalInboxRecord>>;
+        fn fire_due_timers(req: crate::FireDueTimersRequest) -> crate::FireDueTimersOutcome;
+        fn timeout_due_activities(
+            req: crate::TimeoutDueActivitiesRequest
+        ) -> crate::TimeoutDueActivitiesOutcome;
+        fn run_due_maintenance(
+            req: crate::RunDueMaintenanceRequest
+        ) -> crate::RunDueMaintenanceOutcome;
+        fn claim_activity_task(
+            worker_id: crate::WorkerId,
+            opts: crate::ClaimActivityOptions
+        ) -> Option<crate::ClaimedActivityTask>;
+        fn claim_activity_tasks(
+            worker_id: crate::WorkerId,
+            opts: crate::ClaimActivityTasksOptions
+        ) -> Vec<crate::ClaimedActivityTask>;
+        fn heartbeat_activity(
+            req: crate::ActivityHeartbeatRequest
+        ) -> crate::ActivityHeartbeatOutcome;
+        fn fail_activity(req: crate::FailActivityRequest) -> crate::FailActivityOutcome;
+        fn dispatch_child_workflow_starts(
+            req: crate::DispatchChildWorkflowStartsRequest
+        ) -> crate::DispatchChildWorkflowStartsOutcome;
+        fn query_projection(
+            req: crate::QueryProjectionRequest
+        ) -> crate::QueryProjectionOutcome;
+        fn workflow_change_versions(
+            req: crate::WorkflowChangeVersionsRequest
+        ) -> crate::WorkflowChangeVersionsOutcome;
+        fn payload_roots() -> crate::PayloadRootsOutcome;
+        fn gc_payload_blobs(
+            req: crate::PayloadGarbageCollectionRequest
+        ) -> crate::PayloadGarbageCollectionOutcome;
+    }
+
+    fn claim_workflow_task(
+        &self,
+        worker_id: crate::WorkerId,
+        opts: crate::ClaimWorkflowTaskOptions,
+    ) -> BoxFuture<'static, crate::Result<Option<crate::ClaimedWorkflowTask>>> {
+        if let Some(err) = self.fault("claim_workflow_task") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        let inner = self.inner.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            let claimed = inner.claim_workflow_task(worker_id, opts).await?;
+            if claimed.is_some()
+                && let Some(hook) = this.after_workflow_claim()
+            {
+                hook().await;
+            }
+            Ok(claimed)
+        })
+    }
+
+    fn claim_workflow_tasks(
+        &self,
+        worker_id: crate::WorkerId,
+        opts: crate::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, crate::Result<Vec<crate::ClaimedWorkflowTask>>> {
+        if let Some(err) = self.fault("claim_workflow_tasks") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        let inner = self.inner.clone();
+        let this = self.clone();
+        Box::pin(async move {
+            let claimed = inner.claim_workflow_tasks(worker_id, opts).await?;
+            if !claimed.is_empty()
+                && let Some(hook) = this.after_workflow_claim()
+            {
+                hook().await;
+            }
+            Ok(claimed)
+        })
+    }
+
+    fn commit_workflow_task(
+        &self,
+        claim: crate::WorkflowTaskClaim,
+        batch: crate::WorkflowTaskCommit,
+    ) -> BoxFuture<'static, crate::Result<CommitOutcome>> {
+        if let Some(err) = self.fault("commit_workflow_task") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        let inner = self.inner.clone();
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let outcome = inner.commit_workflow_task(claim, batch).await?;
+            if outcome == CommitOutcome::Conflict {
+                state
+                    .lock()
+                    .expect("fault injector mutex poisoned")
+                    .observed_commit_conflicts += 1;
+            }
+            Ok(outcome)
+        })
+    }
+
+    fn commit_workflow_tasks(
+        &self,
+        batch: crate::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, crate::Result<Vec<crate::WorkflowTaskCommitBatchResult>>> {
+        if let Some(err) = self.fault("commit_workflow_tasks") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        let inner = self.inner.clone();
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let results = inner.commit_workflow_tasks(batch).await?;
+            let conflicts = results
+                .iter()
+                .filter(|result| result.result == Ok(CommitOutcome::Conflict))
+                .count() as u64;
+            if conflicts > 0 {
+                state
+                    .lock()
+                    .expect("fault injector mutex poisoned")
+                    .observed_commit_conflicts += conflicts;
+            }
+            Ok(results)
+        })
+    }
+
+    fn complete_activity(
+        &self,
+        req: crate::CompleteActivityRequest,
+    ) -> BoxFuture<'static, crate::Result<CompleteActivityOutcome>> {
+        if let Some(err) = self.fault("complete_activity") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        let duplicate = self.decide(FaultPoint::ActivityDuplicateCompletion);
+        let inner = self.inner.clone();
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            let first = inner.complete_activity(req.clone()).await?;
+            if duplicate {
+                // Replay the identical request; the provider must report the
+                // duplicate idempotently without appending a second event.
+                let second = inner.complete_activity(req).await?;
+                let mut state = state.lock().expect("fault injector mutex poisoned");
+                state.duplicated_completions += 1;
+                state.duplicate_completion_outcomes.push(second);
+            }
+            Ok(first)
+        })
+    }
+
+    fn complete_activity_tasks(
+        &self,
+        req: crate::CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, crate::Result<Vec<crate::CompleteActivityTaskBatchResult>>> {
+        if let Some(err) = self.fault("complete_activity_tasks") {
+            return Box::pin(futures::future::ready(Err(err)));
+        }
+        self.inner.complete_activity_tasks(req)
+    }
+}
+
 pub fn run_many_seeds<F>(
     first_seed: u64,
     count: usize,
@@ -447,6 +849,16 @@ impl XorShift64 {
     }
 }
 
+// SplitMix64: sequential calls yield independent well-mixed seeds, so small
+// consecutive caller seeds (0, 1, 2, ...) produce decorrelated RNG states.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +895,119 @@ mod tests {
         let labels =
             std::iter::from_fn(|| scheduler.next_step().map(|step| step.label)).collect::<Vec<_>>();
         assert_eq!(labels, vec!["second", "third"]);
+    }
+
+    #[test]
+    fn requested_seed_round_trips_and_seed_zero_is_a_distinct_run() {
+        fn schedule(seed: u64) -> Vec<String> {
+            let mut sim = SimRun::new(seed);
+            for i in 0..8 {
+                sim.schedule(format!("task:{i}"));
+            }
+            let mut labels = Vec::new();
+            sim.run_until_idle(64, |_, step| {
+                labels.push(step.label);
+                Ok(())
+            })
+            .unwrap();
+            labels
+        }
+
+        fn fault_decisions(seed: u64) -> Vec<bool> {
+            let mut sim = SimRun::new(seed).with_fault_profile(FaultProfile::Aggressive);
+            (0..64)
+                .map(|_| sim.inject(FaultPoint::WorkerCrash))
+                .collect()
+        }
+
+        // Seed 0 must report itself (not seed 1) and produce its own schedule
+        // and fault decisions instead of collapsing into seed 1's run.
+        assert_eq!(SimRun::new(0).seed(), 0);
+        assert_eq!(SimRun::new(0).trace().seed, 0);
+        assert_eq!(schedule(0), schedule(0));
+        assert_ne!(schedule(0), schedule(1));
+        assert_ne!(fault_decisions(0), fault_decisions(1));
+    }
+
+    #[test]
+    fn fault_injecting_backend_decisions_are_deterministic_per_seed() {
+        use futures::executor::block_on;
+
+        fn decision_trace(seed: u64) -> Vec<bool> {
+            let backend = FaultInjectingBackend::new(
+                crate::MemoryBackend::new(),
+                seed,
+                FaultProfile::Aggressive,
+            );
+            (0..64)
+                .map(|_| block_on(backend.current_time()).is_err())
+                .collect()
+        }
+
+        assert_eq!(decision_trace(7), decision_trace(7));
+        assert_ne!(decision_trace(7), decision_trace(8));
+        // The aggressive profile must actually fail some calls while letting
+        // others through to the inner backend.
+        let trace = decision_trace(7);
+        assert!(trace.iter().any(|failed| *failed));
+        assert!(trace.iter().any(|failed| !*failed));
+
+        // The wrapper's stream must be decorrelated from a same-seed
+        // `SimRun`'s fault stream: identical fault point (same denominator),
+        // identical seed, different decisions.
+        let mut sim = SimRun::new(7).with_fault_profile(FaultProfile::Aggressive);
+        let sim_trace: Vec<bool> = (0..64)
+            .map(|_| sim.inject(FaultPoint::BackendTransient))
+            .collect();
+        assert_ne!(trace, sim_trace);
+    }
+
+    #[test]
+    fn crash_arming_holds_the_inner_claim_until_revive() {
+        use futures::executor::block_on;
+
+        let inner = crate::MemoryBackend::new();
+        let backend = FaultInjectingBackend::new(inner.clone(), 3, FaultProfile::None);
+        block_on(backend.start_workflow(crate::StartWorkflowRequest {
+            namespace: crate::Namespace::default(),
+            workflow_id: crate::WorkflowId::new("wf/sim-crash"),
+            workflow_type: crate::WorkflowType::new("sim.crash", 1),
+            task_queue: crate::TaskQueue::new("sim-crash-queue"),
+            input: crate::encode_payload(&1_u64).unwrap(),
+        }))
+        .unwrap();
+        let opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: crate::TaskQueue::new("sim-crash-queue"),
+            registered_workflow_types: vec![crate::WorkflowType::new("sim.crash", 1)],
+            lease_duration: Duration::from_secs(1),
+        };
+
+        backend.crash_after_next_workflow_claim();
+        let claimed =
+            block_on(backend.claim_workflow_task(crate::WorkerId::new("w1"), opts.clone()))
+                .unwrap()
+                .expect("workflow task");
+        assert!(backend.is_crashed());
+        assert!(is_injected_fault(
+            &block_on(backend.current_time()).unwrap_err()
+        ));
+
+        // The inner backend still holds the crashed worker's claim, so the
+        // run is invisible until the lease expires.
+        assert!(
+            block_on(inner.claim_workflow_task(crate::WorkerId::new("w2"), opts.clone()))
+                .unwrap()
+                .is_none()
+        );
+
+        backend.revive();
+        assert!(block_on(backend.current_time()).is_ok());
+        inner.advance_time(Duration::from_secs(2));
+        let reclaimed = block_on(backend.claim_workflow_task(crate::WorkerId::new("w2"), opts))
+            .unwrap()
+            .expect("reclaim after lease expiry");
+        assert_ne!(reclaimed.claim.token, claimed.claim.token);
     }
 
     #[test]

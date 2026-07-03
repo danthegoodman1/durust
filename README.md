@@ -86,6 +86,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
 - [Recovery Model](#recovery-model)
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
+- [Benchmarks](#benchmarks)
 - [Examples](#examples)
 
 ## Why Durust
@@ -171,7 +172,7 @@ Workflow workers and activity workers can run in the same process or on
 different machines.
 
 ```rust
-let worker = durust::Worker::builder(backend.clone())
+let mut worker = durust::Worker::builder(backend.clone())
     .namespace("prod")
     .worker_id("orders-a")
     .workflow_task_queue("orders")
@@ -184,12 +185,29 @@ let worker = durust::Worker::builder(backend.clone())
     .max_concurrent_workflow_tasks(256)
     .max_concurrent_activities(512)
     .activity_completion_batch_size(32)
-    .run()
-    .await?;
+    .build();
+
+let shutdown = worker.shutdown_handle();
+worker.run().await?;
 ```
 
+`Worker::run` loops work passes until `shutdown.shutdown()` is called from
+another task, parking in the provider's `wait_for_ready` while idle. The
+throughput knobs:
+
+- `max_cached_workflows` bounds the in-memory workflow future cache (LRU);
+  evicted runs cold-replay from history on their next task.
+- `max_concurrent_workflow_tasks` bounds how many workflow tasks one pass
+  claims and pipelines through commit.
+- `max_concurrent_activities` bounds how many claimed activities execute
+  concurrently within one activity pass.
+- `activity_task_batch_size` sets how many tasks one claim RPC requests (the
+  per-RPC size is the min of both activity knobs); raise it under high
+  concurrency to issue fewer, larger claim RPCs instead of single-task ones.
+- `activity_completion_batch_size` batches activity completion RPCs.
+
 Activity-only workers are just workers that register activities and poll an
-activity queue:
+activity queue (`WorkerBuilder::run` builds and runs in one step):
 
 ```rust
 durust::Worker::builder(backend.clone())
@@ -204,7 +222,11 @@ durust::Worker::builder(backend.clone())
 Handlers annotated with `#[durust::workflow]` and `#[durust::activity]` also
 export manifest metadata for the binary that links them. Use
 `durust::exported_manifest()` with `durust::write_manifest(...)` to materialize a
-current `durable.manifest.json` candidate for review.
+current `durable.manifest.json` candidate for review, and the `cargo durable
+manifest <normalize|check|diff|accept>` CLI to normalize, gate, and accept it.
+The manifest's `*TypeNameHash` fields fingerprint Rust type names: they catch a
+handler switching input/output types, not fields changing inside a same-named
+type.
 
 Workflow and activity handlers take exactly one named input struct. Wrap scalar,
 tuple, collection, and no-input cases in an explicit request type so durable
@@ -280,6 +302,19 @@ The heartbeat timeout is disabled by default. When enabled, the provider starts
 the heartbeat deadline when the activity task is claimed and refreshes it when
 the activity calls `durust::heartbeat_activity().await?`. A missed heartbeat
 uses the same retry policy as other activity timeouts.
+
+Activities with neither a start-to-close timeout nor a heartbeat timeout use
+their claim lease as an implicit heartbeat interval: a timeout-less activity
+that outlives the worker's activity lease (default 30s) must heartbeat, and
+each heartbeat keeps the claim alive for one more lease. One that stops
+heartbeating — a hung or crashed worker — is reclaimed and retried one lease
+after its last heartbeat.
+
+`RetryPolicy::exponential()` paces retries with provider-enforced backoff: a
+failed attempt's retry becomes claimable `1s * 2^(failed_attempt - 1)` after
+the failure, so a fast-failing activity cannot hot-loop. `RetryPolicy::none()`
+disables both retries and pacing. Timeout-driven retries are re-claimable
+immediately because the expired deadline already paced the attempt.
 
 Activities return serializable Durust errors. A retry policy is skipped when the
 activity returns a non-retryable application error:
@@ -696,12 +731,23 @@ activities or ordinary payload refs for larger values.
 
 The SQLite local-directory store is content-addressed and keeps large encoded
 bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
-use `PayloadBackend` so the async object-store implementation works across
-durability providers instead of being duplicated inside each provider. Providers
-also expose dry-run-capable payload GC that removes blobs no longer reachable
-from durable history or operational indexes; `PayloadBackend` applies the same
-contract to its external object store by asking the inner provider for generic
-payload roots and deleting only wrapper-owned unreachable objects.
+use `PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
+async object-store implementation works across durability providers instead of
+being duplicated inside each provider. Blob URI
+ownership is exclusive: each provider resolves only refs carrying its own
+scheme and persists every other scheme opaquely, so custom `PayloadBlobStore`
+implementations work over any inner provider.
+
+Providers also expose dry-run-capable payload GC that removes blobs no longer
+reachable from durable history or operational indexes; `PayloadBackend` applies
+the same contract to its external object store by asking the inner provider for
+generic payload roots and deleting only wrapper-owned unreachable objects.
+Because blobs upload before the commit that makes them reachable, GC never
+deletes a blob younger than `PayloadGarbageCollectionRequest::min_age` (default
+one hour); stores that can cheaply refresh a blob's timestamp on a
+content-addressed re-put do so, while S3 skips the refresh and relies on the
+grace period exceeding the worst upload-to-commit latency plus one GC scan.
+Delete failures are recorded in the outcome and the sweep continues.
 
 To run the local Garage-backed S3 conformance test:
 
@@ -713,7 +759,7 @@ DURUST_GARAGE_REGION=garage \
 DURUST_GARAGE_PREFIX=local/payloads \
 DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
 DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-cargo test --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+cargo test --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
 docker compose -f tests/fixtures/garage.compose.yml down -v
 ```
 
@@ -759,7 +805,12 @@ Replay and command fingerprints remain the correctness backstop.
 
 Runtime and provider fault tests use the deterministic simulator primitives
 (`SimRun`, `FaultProfile`, and `run_many_seeds`) so failures report a seed and
-trace that can be replayed locally.
+trace that can be replayed locally. `FaultInjectingBackend` wraps any
+`DurableBackend` with seeded per-call fault decisions (transient errors,
+duplicated activity completions, scripted worker crashes) so simulations drive
+the real `Worker` over the real in-memory provider under fault injection; the
+memory provider's clock is fully virtual (`advance_time`), so leases, timers,
+delayed visibility, and retry backoffs are simulation-controlled.
 
 ## Durability Providers
 
@@ -785,12 +836,123 @@ provider conformance tests
 Durust includes:
 
 ```text
-memory provider for fast tests
-SQLite provider for local development and conformance
-production-oriented provider examples
+memory provider for fast tests (always available)
+SQLite provider for local development and conformance (`sqlite` feature, default)
+Postgres provider (`postgres` feature)
+S3-compatible payload blob store (`s3` feature)
 ```
 
-SQLite is included for local development, testing, and provider conformance.
+### Cargo Features
+
+```toml
+[dependencies]
+durust = "0.1"                                            # memory + SQLite
+durust = { version = "0.1", features = ["postgres"] }     # + Postgres
+durust = { version = "0.1", features = ["s3"] }           # + S3BlobStore
+durust = { version = "0.1", default-features = false }    # memory only
+```
+
+- `sqlite` (default) gates `SqliteBackend` and the `cargo-durable` CLI binary.
+- `postgres` gates `PostgresBackend` and its `tokio-postgres`/`deadpool-postgres`
+  dependencies.
+- `s3` gates `S3BlobStore`; the `PayloadBackend` decorator and the SQLite
+  local-directory blob store are always available.
+
+The benchmark workload, comparison, and reporting binaries live in the
+unpublished `durust-benchtools` workspace crate
+(`cargo run -p durust-benchtools --bin durust-benchmark-workload`), so library
+consumers never compile them.
+
+## Benchmarks
+
+These numbers are local medians from three runs on a shared Darwin 25.5.0
+machine. They are useful for close comparisons on the same machine, not as
+portable capacity claims. The mixed workload starts each parent workflow, runs
+three activities, sends one signal, fires one timer, starts and completes one
+child workflow, then verifies completion. The TypeScript implementation has its
+own benchmark section in [`typescript/README.md`](typescript/README.md).
+
+Mixed workload medians:
+
+| Backend | Config | Processing workflows/s before -> current | Processing actions/s before -> current | Variance | Commit p95 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| SQLite | 1000 workflows, 4 workers, batch 32 | 206.10 -> 226.82 (+10.0%) | 1648.83 -> 1814.52 (+10.0%) | 9.6% | 3.769 ms |
+| SQLite | 1000 workflows, 1 worker, batch 32 | 215.63 -> 224.78 (+4.2%) | 1725.01 -> 1798.21 (+4.2%) | 4.2% | 0.402 ms |
+| Postgres | 1000 workflows, 4 workers, pool 8 | 38.46 -> 47.94 (+24.7%) | 307.68 -> 383.52 (+24.7%) | 9.9% | 7.912 ms |
+| Postgres | 1000 workflows, 100 shard leases, 10 workers, pool 24 | 141.72 -> 320.50 (+126.1%) | 1133.77 -> 2563.98 (+126.1%) | 7.3% | 15.838 ms |
+
+The 100-shard Postgres profile still runs, but it now means batched normalized
+Postgres operation under 100 shard leases. The write-only shard journal and
+snapshot tables were removed, so this is not a shard-journal recovery profile.
+
+Criterion headline medians, current versus the saved `phase6-before` baseline:
+
+| Benchmark | Current median | Delta |
+| --- | ---: | ---: |
+| Cached wake poll, memory | 4.0 us | -3.1% |
+| Replay small history, memory | 8.1 us | -4.5% |
+| Replay large history, memory | 45.9 us | -10.3% |
+| Activity claim/complete, memory | 1.5 us | +0.4% |
+| Activity claim/complete, SQLite | 2.1 ms | -43.2% |
+| Activity claim/complete, Postgres | 3.4 ms | -17.8% |
+| Workflow append commit, memory | 1.0 us | -3.9% |
+| Workflow append commit, SQLite | 0.428 ms | -20.1% |
+| Workflow append commit, Postgres | 2.1 ms | -26.7% |
+| Held handle across sleeps, memory | 75.2 us | -62.5% |
+| Child fanout completion, memory | 131.4 us | -2.7% |
+| Child fanout completion, SQLite | 14.7 ms | -0.0% |
+| Child start dispatch, memory | 1.6 us | +8.5% |
+| Child parent wakeup, Postgres | 3.1 ms | -32.2% |
+| History stream, Postgres | 0.339 ms | -22.7% |
+| Chunked history replay stream, Postgres | 4.3 ms | -25.7% |
+
+Reproduce the mixed workload reports with release benchtools:
+
+```bash
+cargo build --release -p durust-benchtools
+
+cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend sqlite --mode mixed --sqlite-layout single-file \
+  --workflows 1000 --workers 4 --shards 1 --physical-partitions 1 \
+  --activation-concurrency 1 --activation-prefetch-limit 1 \
+  --batch 32 --activity-completion-batch 1 --max-rounds 10000 --json
+
+cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend sqlite --mode mixed --sqlite-layout single-file \
+  --workflows 1000 --workers 1 --shards 1 --physical-partitions 1 \
+  --activation-concurrency 1 --activation-prefetch-limit 1 \
+  --batch 32 --activity-completion-batch 1 --max-rounds 10000 --json
+
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend postgres --mode mixed --workflows 1000 --workers 4 \
+  --shards 1 --physical-partitions 1 --activation-concurrency 1 \
+  --activation-prefetch-limit 1 --batch 32 --activity-completion-batch 1 \
+  --postgres-pool-size 8 --max-rounds 10000 --json
+
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo run --release -p durust-benchtools --bin durust-benchmark-workload -- \
+  --backend postgres --mode mixed --workflows 1000 --workers 10 \
+  --shards 100 --physical-partitions 16 --activation-concurrency 8 \
+  --activation-prefetch-limit 32 --batch 32 --activity-completion-batch 32 \
+  --postgres-pool-size 24 --max-rounds 10000 --json
+```
+
+Compare a captured mixed workload report with its checked-in baseline:
+
+```bash
+cargo run --release -p durust-benchtools --bin durust-benchmark-compare -- \
+  --durust target/benchmark-runs/rust/durust-mixed-postgres-median.json \
+  --baseline benches/baselines/durust-mixed-postgres.json
+```
+
+Run the scoped Criterion comparison against a saved baseline:
+
+```bash
+DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
+  cargo bench --bench replay_core -- --baseline phase6-before \
+  '^(workflow_cached_wake_poll_memory|workflow_replay_(small|large)_history_memory|held_handle_spawn_then_sleeps_memory|child_fanout_completion_(memory|sqlite)|child_start_dispatch_memory|activity_claim_complete_(memory|sqlite)|workflow_task_append_commit_(memory|sqlite)|postgres_provider_hot_paths/(workflow_task_append_commit|history_stream|history_stream_chunked_replay|activity_claim_complete|child_workflow_start_parent_wakeup)_postgres)$'
+```
 
 ## Examples
 

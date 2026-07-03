@@ -4,17 +4,63 @@ use crate::{
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
     Namespace, NewHistoryEvent, ReadSignalInboxRequest, ReadSignalInboxesRequest, Registry, Result,
     RunDueMaintenanceRequest, RunId, ShardId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, TimestampMs, WorkerId, Workflow, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsRequest,
-    WorkflowId, WorkflowTaskCommit, WorkflowTaskReason, WorkflowTaskRelease,
-    poll_with_activity_context, poll_with_runtime_context,
+    TimeoutDueActivitiesRequest, TimestampMs, WaitForReadyRequest, WorkerId, Workflow,
+    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
+    WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Poll;
 use std::time::Duration;
+
+const DEFAULT_TASK_LEASE_DURATION: Duration = Duration::from_secs(30);
+// A lease shorter than this cannot reliably outlive a single claim-to-commit
+// round trip, so claims would be reclaimed while their holder is still alive.
+const MIN_TASK_LEASE_DURATION: Duration = Duration::from_secs(1);
+const DEFAULT_IDLE_WAIT: Duration = Duration::from_millis(100);
+// Below this an idle worker degenerates into a busy poll against providers
+// without push notifications.
+const MIN_IDLE_WAIT: Duration = Duration::from_millis(5);
+const DEFAULT_MAX_CACHED_WORKFLOWS: usize = 10_000;
+// `Worker::run` tolerates this many consecutive failing passes before
+// surfacing the error, so one transient backend hiccup does not kill an
+// unattended worker while a dead backend still fails loudly.
+const MAX_CONSECUTIVE_RUN_PASS_FAILURES: usize = 16;
+
+/// Requests a graceful stop of `Worker::run`. Cheap to clone and safe to
+/// trigger from any task or thread; `run` returns `Ok(())` at the next loop
+/// iteration after `shutdown` is called.
+#[derive(Clone)]
+pub struct WorkerShutdown {
+    inner: Arc<(AtomicBool, tokio::sync::Notify)>,
+}
+
+impl WorkerShutdown {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new((AtomicBool::new(false), tokio::sync::Notify::new())),
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.inner.0.store(true, Ordering::SeqCst);
+        self.inner.1.notify_waiters();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.inner.0.load(Ordering::SeqCst)
+    }
+
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.inner.1.notified()
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkerRunOptions {
@@ -162,11 +208,18 @@ where
     nondeterminism_retry_backoff: Duration,
     workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
-    active_recoveries: usize,
+    active_recoveries: Arc<AtomicUsize>,
+    workflow_task_lease_duration: Duration,
+    activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
+    max_concurrent_activities: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     completed_local_activity_tasks: usize,
+    max_cached_workflows: usize,
+    cache_access_seq: u64,
+    idle_wait: Duration,
+    shutdown: WorkerShutdown,
 }
 
 struct CachedWorkflow {
@@ -175,6 +228,15 @@ struct CachedWorkflow {
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
     change_versions: Vec<WorkflowChangeVersionRecord>,
+    // Ready events the committed task left unconsumed (for example a spawned
+    // handle's completion the workflow has not awaited yet). They seed the
+    // next task's context so the run stays cached; the next chunk starts
+    // after `last_event_id`, so carried entries cannot be collected twice.
+    unconsumed_indexes: crate::runtime::ReadyEventIndexes,
+    // Monotonic worker counter stamped on insert; the bounded cache evicts
+    // the minimum, giving LRU behavior because cached runs re-enter the
+    // cache through insert after every task.
+    last_accessed_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +276,23 @@ impl Default for RecoveryFlowControl {
             prefetch_chunks: usize::MAX,
             defer_delay: Duration::from_millis(100),
         }
+    }
+}
+
+// Holds one slot of the worker's cold-recovery concurrency budget. Dropping
+// the guard releases the slot, so no error or early-return path in the
+// prepare pipeline can leak `active_recoveries`. The counter lives behind an
+// `Arc` because the guard must outlive individual `&mut self` borrows of the
+// worker while prepare awaits backend calls.
+struct RecoverySlotGuard {
+    active_recoveries: Arc<AtomicUsize>,
+}
+
+impl Drop for RecoverySlotGuard {
+    fn drop(&mut self) {
+        // The guard's existence proves the counter was incremented at acquire,
+        // so a plain decrement cannot underflow.
+        self.active_recoveries.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -275,6 +354,7 @@ struct PreparedWorkflowTask {
     default_activity_options: crate::ActivityOptions,
     change_versions: Vec<WorkflowChangeVersionRecord>,
     appended_change_marker: bool,
+    unconsumed_indexes: crate::runtime::ReadyEventIndexes,
     terminal: bool,
 }
 
@@ -306,9 +386,67 @@ where
             nondeterminism_retry_backoff: Duration::from_secs(60),
             workflow_task_concurrency: WorkflowTaskConcurrency::default(),
             recovery_flow_control: RecoveryFlowControl::default(),
+            workflow_task_lease_duration: DEFAULT_TASK_LEASE_DURATION,
+            activity_task_lease_duration: DEFAULT_TASK_LEASE_DURATION,
             activity_task_batch_size: 1,
+            max_concurrent_activities: 1,
             activity_completion_batch_size: 1,
             max_local_activities_per_workflow_task: 0,
+            max_cached_workflows: DEFAULT_MAX_CACHED_WORKFLOWS,
+            idle_wait: DEFAULT_IDLE_WAIT,
+        }
+    }
+
+    /// Handle for requesting a graceful stop of [`Worker::run`].
+    pub fn shutdown_handle(&self) -> WorkerShutdown {
+        self.shutdown.clone()
+    }
+
+    /// Runs the worker until [`WorkerShutdown::shutdown`] is requested,
+    /// looping full work passes (workflow tasks, local activities, due
+    /// maintenance, child dispatch, activity tasks) and parking in the
+    /// backend's `wait_for_ready` while idle.
+    ///
+    /// A failing pass does not kill the loop: transient backend errors are
+    /// retried after the idle wait, and only [`MAX_CONSECUTIVE_RUN_PASS_FAILURES`]
+    /// consecutive failing passes surface the last error, so a dead backend
+    /// still fails loudly. Any successful pass resets the failure count.
+    pub async fn run(&mut self) -> Result<()> {
+        let shutdown = self.shutdown_handle();
+        let mut consecutive_failures = 0usize;
+        loop {
+            if shutdown.is_requested() {
+                return Ok(());
+            }
+            let mut stats = WorkerRunStats::default();
+            match self.run_pass_once(&mut stats).await {
+                Ok(true) => {
+                    consecutive_failures = 0;
+                    continue;
+                }
+                Ok(false) => {
+                    consecutive_failures = 0;
+                }
+                Err(err) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= MAX_CONSECUTIVE_RUN_PASS_FAILURES {
+                        return Err(err);
+                    }
+                }
+            }
+            if shutdown.is_requested() {
+                return Ok(());
+            }
+            let wait = self.backend.wait_for_ready(WaitForReadyRequest {
+                namespace: self.namespace.clone(),
+                workflow_task_queue: self.workflow_task_queue.clone(),
+                activity_task_queue: self.activity_task_queue.clone(),
+                max_wait: self.idle_wait,
+            });
+            let notified = std::pin::pin!(shutdown.notified());
+            // A wait_for_ready error is ignored: the wait is bounded either
+            // way, and a genuinely dead backend trips the failure cap above.
+            let _ = futures::future::select(notified, wait).await;
         }
     }
 
@@ -321,7 +459,7 @@ where
                     namespace: self.namespace.clone(),
                     task_queue: self.workflow_task_queue.clone(),
                     registered_workflow_types: self.registry.workflow_types(),
-                    lease_duration: Duration::from_secs(30),
+                    lease_duration: self.workflow_task_lease_duration,
                 },
             )
             .await?;
@@ -353,7 +491,7 @@ where
                         namespace: self.namespace.clone(),
                         task_queue: self.workflow_task_queue.clone(),
                         registered_workflow_types: self.registry.workflow_types(),
-                        lease_duration: Duration::from_secs(30),
+                        lease_duration: self.workflow_task_lease_duration,
                     },
                     limit,
                     shard_filter: self.workflow_task_concurrency.shard_filter.clone(),
@@ -364,38 +502,74 @@ where
             return Ok(0);
         }
 
+        // One task's failure must not abandon its batch neighbors' claims:
+        // prepare and per-item commit errors release the affected claim and
+        // continue, and the first such error is propagated only after every
+        // claim in the batch has been committed or released.
+        let mut first_error: Option<Error> = None;
         let mut prepared = Vec::with_capacity(claimed.len());
         for task in claimed {
-            match self.prepare_claimed_workflow_task(task).await? {
-                PreparedWorkflowTaskOutcome::Prepared(task) => prepared.push(task),
-                PreparedWorkflowTaskOutcome::Deferred => {}
+            match self.prepare_claimed_workflow_task(task).await {
+                Ok(PreparedWorkflowTaskOutcome::Prepared(task)) => prepared.push(task),
+                Ok(PreparedWorkflowTaskOutcome::Deferred) => {}
+                // The prepare funnel already released this task's claim.
+                Err(err) => {
+                    first_error.get_or_insert(err);
+                }
             }
-        }
-        if prepared.is_empty() {
-            return Ok(0);
         }
 
         let mut committed = 0usize;
-        for chunk in prepared.chunks_mut(self.workflow_task_concurrency.commit_batch_size.max(1)) {
-            let commits = chunk
+        let chunk_size = self.workflow_task_concurrency.commit_batch_size.max(1);
+        let mut start = 0usize;
+        while start < prepared.len() {
+            let end = (start + chunk_size).min(prepared.len());
+            let commits = prepared[start..end]
                 .iter()
                 .map(|task| crate::WorkflowTaskCommitInput {
                     claim: task.claim.clone(),
                     commit: task.commit.clone(),
                 })
                 .collect::<Vec<_>>();
-            let results = self
+            let results = match self
                 .backend
                 .commit_workflow_tasks(crate::WorkflowTaskCommitBatch { commits })
-                .await?;
-            for (task, result) in chunk.iter_mut().zip(results.into_iter()) {
-                let crate::CommitOutcome::Committed {
-                    new_tail_event_id: last_event_id,
-                } = result.result?
-                else {
-                    continue;
+                .await
+            {
+                Ok(results) => results,
+                Err(err) => {
+                    // The commit RPC failed wholesale: nothing in this chunk or
+                    // any later chunk was committed, so release every remaining
+                    // claim (delayed for backpressure, immediate otherwise).
+                    for task in &prepared[start..] {
+                        if let Err(err) = self
+                            .release_failed_workflow_task(task.claim.clone(), err.clone())
+                            .await
+                        {
+                            first_error.get_or_insert(err);
+                        }
+                    }
+                    break;
+                }
+            };
+            for (task, result) in prepared[start..end].iter_mut().zip(results.into_iter()) {
+                let last_event_id = match result.result {
+                    Ok(crate::CommitOutcome::Committed { new_tail_event_id }) => new_tail_event_id,
+                    // The provider released the claim as part of reporting the
+                    // conflict; the task retries from fresh history.
+                    Ok(crate::CommitOutcome::Conflict) => continue,
+                    Err(err) => {
+                        if let Err(err) = self
+                            .release_failed_workflow_task(task.claim.clone(), err)
+                            .await
+                        {
+                            first_error.get_or_insert(err);
+                        }
+                        continue;
+                    }
                 };
                 committed += 1;
+                // Mirrors `commit_prepared_workflow_task`'s cache decision.
                 if task.terminal
                     || task.appended_change_marker
                     || last_event_id > task.runtime_appended_tail
@@ -408,17 +582,22 @@ where
                         "committed workflow future was already moved".to_owned(),
                     )))),
                 );
-                self.cache.insert(
-                    task.run_id.clone(),
-                    CachedWorkflow {
-                        future,
-                        last_event_id,
-                        next_command_seq: task.next_command_seq,
-                        default_activity_options: task.default_activity_options.clone(),
-                        change_versions: task.change_versions.clone(),
-                    },
-                );
+                let run_id = task.run_id.clone();
+                let entry = CachedWorkflow {
+                    future,
+                    last_event_id,
+                    next_command_seq: task.next_command_seq,
+                    default_activity_options: task.default_activity_options.clone(),
+                    change_versions: task.change_versions.clone(),
+                    unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
+                    last_accessed_seq: 0,
+                };
+                self.insert_cached_workflow(run_id, entry);
             }
+            start = end;
+        }
+        if let Some(err) = first_error {
+            return Err(err);
         }
 
         if committed > 0 {
@@ -449,7 +628,7 @@ where
             }
         };
         if let Some(entry) = entry {
-            self.cache.insert(run_id, entry);
+            self.insert_cached_workflow(run_id, entry);
         }
         self.run_local_activities_after_workflow_tasks(1).await?;
         Ok(())
@@ -465,6 +644,7 @@ where
         let runtime_appended_tail = prepared.runtime_appended_tail;
         let terminal = prepared.terminal;
         let appended_change_marker = prepared.appended_change_marker;
+        let unconsumed_indexes = prepared.unconsumed_indexes;
         let next_command_seq = prepared.next_command_seq;
         let default_activity_options = prepared.default_activity_options.clone();
         let change_versions = prepared.change_versions.clone();
@@ -480,6 +660,9 @@ where
             return Ok(None);
         };
 
+        // Provider-appended events past the runtime's tail (for example
+        // inline child starts) are invisible to the cached future, so the
+        // next task must cold-replay to pick them up.
         if terminal || appended_change_marker || last_event_id > runtime_appended_tail {
             return Ok(None);
         }
@@ -490,6 +673,8 @@ where
             next_command_seq,
             default_activity_options,
             change_versions,
+            unconsumed_indexes,
+            last_accessed_seq: 0,
         }))
     }
 
@@ -526,169 +711,154 @@ where
         Err(err)
     }
 
+    // Single reconciliation point for claim ownership: every error escaping
+    // the inner pipeline releases the claim here, so no fallible await between
+    // claim and commit can strand the run until its lease expires.
     async fn prepare_claimed_workflow_task(
         &mut self,
         claimed: crate::ClaimedWorkflowTask,
     ) -> Result<PreparedWorkflowTaskOutcome> {
         let claim_for_release = claimed.claim.clone();
-        let cached = self.cache.remove(&claimed.run_id);
-        let now = self.backend.current_time().await?;
-        let entry_result = if let Some(mut cached) = cached {
-            let chunk = self
-                .claim_history_chunk(&claimed, cached.last_event_id)
-                .await;
-            match chunk {
-                Ok(chunk) => {
-                    let change_versions = self
-                        .change_versions_for_loaded_history(
-                            &claimed,
-                            &chunk,
-                            Some(cached.change_versions.clone()),
-                        )
-                        .await?;
-                    let mut context = crate::runtime::RuntimeContext::new(
-                        claimed.run_id.clone(),
-                        self.workflow_task_queue.clone(),
-                        self.activity_task_queue.clone(),
-                        self.payload_codec,
-                        now,
-                        chunk.events,
-                        cached.default_activity_options,
-                        cached.next_command_seq,
-                        chunk.last_event_id,
-                        claimed.replay_target_event_id,
-                        change_versions.clone(),
-                    );
-                    let poll = self
-                        .poll_until_history_blocked_or_ready(
-                            &claimed.run_id,
-                            &claimed,
-                            &mut cached.future,
-                            &mut context,
-                            claimed.replay_target_event_id,
-                            None,
-                        )
-                        .await;
-                    match poll {
-                        Ok(WorkflowPollOutcome::Ready(poll)) => self
-                            .prepare_workflow_poll(
-                                claimed,
-                                cached.future,
-                                context,
-                                poll,
-                                change_versions,
-                            )
-                            .await
-                            .map(PreparedWorkflowTaskOutcome::Prepared),
-                        Ok(WorkflowPollOutcome::Deferred) => {
-                            Ok(PreparedWorkflowTaskOutcome::Deferred)
-                        }
-                        Err(err) => Err(err),
-                    }
-                }
-                Err(err) => Err(err),
-            }
-        } else {
-            let is_recovery = claimed.replay_target_event_id > EventId(1);
-            if is_recovery && !self.try_acquire_recovery() {
-                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
-                    .await
-                    .map(|_| PreparedWorkflowTaskOutcome::Deferred)
-            } else {
-                let mut recovery_budget =
-                    is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
-                let first_chunk = match recovery_budget.as_mut() {
-                    Some(budget) => {
-                        self.claim_recovery_history_chunk(&claimed, EventId::ZERO, budget)
-                            .await
-                    }
-                    None => self
-                        .claim_history_chunk(&claimed, EventId::ZERO)
-                        .await
-                        .map(Some),
-                };
-                let result = match first_chunk {
-                    Ok(Some(first_chunk)) => {
-                        let last_loaded_event_id = first_chunk.last_event_id;
-                        let change_versions = self
-                            .change_versions_for_loaded_history(&claimed, &first_chunk, None)
-                            .await?;
-                        match split_start_event(&first_chunk.events) {
-                            Err(err) => Err(err),
-                            Ok((input, replay_events)) => {
-                                let input = self.hydrate_payload_for_decode(input).await?;
-                                match self.registry.workflow(&claimed.workflow_type) {
-                                    None => Err(Error::WorkflowNotRegistered(
-                                        claimed.workflow_type.clone(),
-                                    )),
-                                    Some(registration) => {
-                                        let mut future =
-                                            registration.run(input, self.payload_codec);
-                                        let mut context = crate::runtime::RuntimeContext::new(
-                                            claimed.run_id.clone(),
-                                            self.workflow_task_queue.clone(),
-                                            self.activity_task_queue.clone(),
-                                            self.payload_codec,
-                                            now,
-                                            replay_events,
-                                            crate::ActivityOptions::default(),
-                                            0,
-                                            last_loaded_event_id,
-                                            claimed.replay_target_event_id,
-                                            change_versions.clone(),
-                                        );
-                                        let poll = self
-                                            .poll_until_history_blocked_or_ready(
-                                                &claimed.run_id,
-                                                &claimed,
-                                                &mut future,
-                                                &mut context,
-                                                claimed.replay_target_event_id,
-                                                recovery_budget.as_mut(),
-                                            )
-                                            .await;
-                                        match poll {
-                                            Ok(WorkflowPollOutcome::Ready(poll)) => self
-                                                .prepare_workflow_poll(
-                                                    claimed,
-                                                    future,
-                                                    context,
-                                                    poll,
-                                                    change_versions,
-                                                )
-                                                .await
-                                                .map(PreparedWorkflowTaskOutcome::Prepared),
-                                            Ok(WorkflowPollOutcome::Deferred) => self
-                                                .defer_workflow_task(
-                                                    claimed.claim,
-                                                    self.recovery_flow_control.defer_delay,
-                                                )
-                                                .await
-                                                .map(|_| PreparedWorkflowTaskOutcome::Deferred),
-                                            Err(err) => Err(err),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => self
-                        .defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
-                        .await
-                        .map(|_| PreparedWorkflowTaskOutcome::Deferred),
-                    Err(err) => Err(err),
-                };
-                if is_recovery {
-                    self.release_recovery();
-                }
-                result
-            }
-        };
-
-        match entry_result {
-            Ok(entry) => Ok(entry),
+        match self.prepare_claimed_workflow_task_inner(claimed).await {
+            Ok(outcome) => Ok(outcome),
             Err(err) => {
                 self.release_failed_workflow_task(claim_for_release, err)
+                    .await?;
+                Ok(PreparedWorkflowTaskOutcome::Deferred)
+            }
+        }
+    }
+
+    // Errors returned here leave the claim held; the caller releases it. The
+    // recovery slot is a drop guard, so `?` cannot leak it.
+    async fn prepare_claimed_workflow_task_inner(
+        &mut self,
+        claimed: crate::ClaimedWorkflowTask,
+    ) -> Result<PreparedWorkflowTaskOutcome> {
+        let cached = self.cache.remove(&claimed.run_id);
+        let now = self.backend.current_time().await?;
+
+        if let Some(mut cached) = cached {
+            let chunk = self
+                .claim_history_chunk(&claimed, cached.last_event_id)
+                .await?;
+            let change_versions = self
+                .change_versions_for_loaded_history(
+                    &claimed,
+                    &chunk,
+                    Some(cached.change_versions.clone()),
+                )
+                .await?;
+            let mut context = crate::runtime::RuntimeContext::new(
+                claimed.run_id.clone(),
+                self.workflow_task_queue.clone(),
+                self.activity_task_queue.clone(),
+                self.payload_codec,
+                now,
+                chunk.events,
+                cached.default_activity_options,
+                cached.next_command_seq,
+                chunk.last_event_id,
+                claimed.replay_target_event_id,
+                change_versions.clone(),
+                cached.unconsumed_indexes,
+            );
+            let poll = self
+                .poll_until_history_blocked_or_ready(
+                    &claimed.run_id,
+                    &claimed,
+                    &mut cached.future,
+                    &mut context,
+                    claimed.replay_target_event_id,
+                    None,
+                )
+                .await?;
+            return match poll {
+                WorkflowPollOutcome::Ready(poll) => self
+                    .prepare_workflow_poll(claimed, cached.future, context, poll, change_versions)
+                    .await
+                    .map(PreparedWorkflowTaskOutcome::Prepared),
+                WorkflowPollOutcome::Deferred => {
+                    // Deferred is only produced under a recovery budget and the
+                    // cached path polls without one; if a budget is ever added
+                    // here, this arm must release the claim the way the
+                    // cold-path defer does or the claim leaks until its lease
+                    // expires.
+                    debug_assert!(
+                        false,
+                        "cached-path workflow poll deferred without a recovery budget"
+                    );
+                    Ok(PreparedWorkflowTaskOutcome::Deferred)
+                }
+            };
+        }
+
+        let is_recovery = claimed.replay_target_event_id > EventId(1);
+        let _recovery_slot = if is_recovery {
+            let Some(slot) = self.try_acquire_recovery() else {
+                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                    .await?;
+                return Ok(PreparedWorkflowTaskOutcome::Deferred);
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        let mut recovery_budget =
+            is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
+        let first_chunk = match recovery_budget.as_mut() {
+            Some(budget) => {
+                self.claim_recovery_history_chunk(&claimed, EventId::ZERO, budget)
+                    .await?
+            }
+            None => Some(self.claim_history_chunk(&claimed, EventId::ZERO).await?),
+        };
+        let Some(first_chunk) = first_chunk else {
+            self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                .await?;
+            return Ok(PreparedWorkflowTaskOutcome::Deferred);
+        };
+        let last_loaded_event_id = first_chunk.last_event_id;
+        let change_versions = self
+            .change_versions_for_loaded_history(&claimed, &first_chunk, None)
+            .await?;
+        let (input, replay_events) = split_start_event(&first_chunk.events)?;
+        let input = self.hydrate_payload_for_decode(input).await?;
+        let Some(registration) = self.registry.workflow(&claimed.workflow_type) else {
+            return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
+        };
+        let mut future = registration.run(input, self.payload_codec);
+        let mut context = crate::runtime::RuntimeContext::new(
+            claimed.run_id.clone(),
+            self.workflow_task_queue.clone(),
+            self.activity_task_queue.clone(),
+            self.payload_codec,
+            now,
+            replay_events,
+            crate::ActivityOptions::default(),
+            0,
+            last_loaded_event_id,
+            claimed.replay_target_event_id,
+            change_versions.clone(),
+            crate::runtime::ReadyEventIndexes::default(),
+        );
+        let poll = self
+            .poll_until_history_blocked_or_ready(
+                &claimed.run_id,
+                &claimed,
+                &mut future,
+                &mut context,
+                claimed.replay_target_event_id,
+                recovery_budget.as_mut(),
+            )
+            .await?;
+        match poll {
+            WorkflowPollOutcome::Ready(poll) => self
+                .prepare_workflow_poll(claimed, future, context, poll, change_versions)
+                .await
+                .map(PreparedWorkflowTaskOutcome::Prepared),
+            WorkflowPollOutcome::Deferred => {
+                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
                     .await?;
                 Ok(PreparedWorkflowTaskOutcome::Deferred)
             }
@@ -704,7 +874,7 @@ where
                     namespace: self.namespace.clone(),
                     task_queue: self.activity_task_queue.clone(),
                     registered_activity_names: self.registry.activity_names(),
-                    lease_duration: Duration::from_secs(30),
+                    lease_duration: self.activity_task_lease_duration,
                 },
             )
             .await?;
@@ -718,56 +888,89 @@ where
     }
 
     pub async fn run_activity_batch_once(&mut self) -> Result<usize> {
-        let limit = self.activity_task_batch_size.max(1);
-        if limit == 1 {
+        let max_in_flight = self.max_concurrent_activities.max(1);
+        let claim_batch = self.activity_task_batch_size.max(1);
+        if max_in_flight == 1 && claim_batch == 1 {
             return self.run_activity_once().await.map(usize::from);
         }
 
-        let claimed = self
-            .backend
-            .claim_activity_tasks(
-                self.worker_id.clone(),
-                ClaimActivityTasksOptions {
-                    claim: ClaimActivityOptions {
-                        namespace: self.namespace.clone(),
-                        task_queue: self.activity_task_queue.clone(),
-                        registered_activity_names: self.registry.activity_names(),
-                        lease_duration: Duration::from_secs(30),
+        // Claim up to the concurrency bound, `claim_batch` tasks per claim
+        // RPC; a short claim means the queue is drained for now.
+        let mut claimed = Vec::new();
+        while claimed.len() < max_in_flight {
+            let want = claim_batch.min(max_in_flight - claimed.len());
+            let batch = self
+                .backend
+                .claim_activity_tasks(
+                    self.worker_id.clone(),
+                    ClaimActivityTasksOptions {
+                        claim: ClaimActivityOptions {
+                            namespace: self.namespace.clone(),
+                            task_queue: self.activity_task_queue.clone(),
+                            registered_activity_names: self.registry.activity_names(),
+                            lease_duration: self.activity_task_lease_duration,
+                        },
+                        limit: want,
                     },
-                    limit,
-                },
-            )
-            .await?;
+                )
+                .await?;
+            let got = batch.len();
+            claimed.extend(batch);
+            if got < want {
+                break;
+            }
+        }
         if claimed.is_empty() {
             return Ok(0);
         }
+        self.execute_claimed_activities(claimed).await
+    }
 
+    async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
+        let finish = self.start_claimed_activity(claimed)?.await;
+        self.finish_activity(finish).await
+    }
+
+    // Executes claimed activities concurrently on the worker task and
+    // reports each completion as it finishes. Trade-off: genuinely async
+    // activities interleave here, but this drains every claimed execution
+    // before returning, so any long-running activity — even a well-behaved
+    // heartbeating one — holds the whole pass (and the whole `run` loop,
+    // workflow tasks included) until it finishes; a CPU-bound activity that
+    // never yields additionally starves its concurrent neighbors.
+    async fn execute_claimed_activities(
+        &self,
+        claimed: Vec<crate::ClaimedActivityTask>,
+    ) -> Result<usize> {
+        let mut executions = FuturesUnordered::new();
+        for task in claimed {
+            executions.push(self.start_claimed_activity(task)?);
+        }
+        let flush_size = self.activity_completion_batch_size.max(1);
         let mut completed = 0usize;
-        if self.activity_completion_batch_size <= 1 {
-            for task in claimed {
-                self.run_claimed_activity(task).await?;
-                completed += 1;
+        let mut finishes = Vec::new();
+        while let Some(finish) = executions.next().await {
+            finishes.push(finish);
+            completed += 1;
+            // Flush as soon as a completion batch fills so fast activities
+            // reach the backend while slower ones are still running.
+            if finishes.len() >= flush_size {
+                self.finish_activities(std::mem::take(&mut finishes))
+                    .await?;
             }
-        } else {
-            let mut finishes = Vec::with_capacity(claimed.len());
-            for task in claimed {
-                finishes.push(self.prepare_activity_finish(task).await?);
-                completed += 1;
-            }
+        }
+        if !finishes.is_empty() {
             self.finish_activities(finishes).await?;
         }
         Ok(completed)
     }
 
-    async fn run_claimed_activity(&mut self, claimed: crate::ClaimedActivityTask) -> Result<()> {
-        let finish = self.prepare_activity_finish(claimed).await?;
-        self.finish_activity(finish).await
-    }
-
-    async fn prepare_activity_finish(
-        &mut self,
+    // Builds the self-contained execution future for one claimed activity;
+    // the future owns its heartbeat context so many can run concurrently.
+    fn start_claimed_activity(
+        &self,
         claimed: crate::ClaimedActivityTask,
-    ) -> Result<ActivityFinish> {
+    ) -> Result<impl Future<Output = ActivityFinish> + Send + 'static> {
         let registration = self
             .registry
             .activity(&claimed.task.activity_name)
@@ -784,20 +987,19 @@ where
             })
         });
         let mut future = registration.run(claimed.task.input, self.payload_codec);
-        let result = std::future::poll_fn(|cx| {
-            poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
-        })
-        .await;
-
-        Ok(match result {
-            Ok(result) => ActivityFinish::Complete(CompleteActivityRequest {
-                claim: claimed.claim,
-                result,
-            }),
-            Err(err) => ActivityFinish::Fail(FailActivityRequest {
-                claim: claimed.claim,
-                failure: err.durable_failure(),
-            }),
+        let claim = claimed.claim;
+        Ok(async move {
+            let result = std::future::poll_fn(|cx| {
+                poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
+            })
+            .await;
+            match result {
+                Ok(result) => ActivityFinish::Complete(CompleteActivityRequest { claim, result }),
+                Err(err) => ActivityFinish::Fail(FailActivityRequest {
+                    claim,
+                    failure: err.durable_failure(),
+                }),
+            }
         })
     }
 
@@ -899,39 +1101,7 @@ where
     pub async fn run_until_idle_with(&mut self, opts: WorkerRunOptions) -> Result<WorkerRunStats> {
         let mut stats = WorkerRunStats::default();
         for _ in 0..opts.max_iterations {
-            let mut progressed = false;
-
-            let workflow_tasks = self.run_workflow_batch_once().await?;
-            if workflow_tasks > 0 {
-                stats.workflow_tasks += workflow_tasks;
-                progressed = true;
-            }
-            let local_activity_tasks = self.take_completed_local_activity_tasks();
-            if local_activity_tasks > 0 {
-                stats.activity_tasks += local_activity_tasks;
-                progressed = true;
-            }
-            let maintenance = self.run_due_maintenance_once().await?;
-            if maintenance.timers_fired > 0 {
-                stats.timers_fired += maintenance.timers_fired;
-                progressed = true;
-            }
-            if maintenance.activities_timed_out > 0 {
-                stats.activities_timed_out += maintenance.activities_timed_out;
-                progressed = true;
-            }
-            let child_starts = self.run_child_workflow_starts_once().await?;
-            if child_starts > 0 {
-                stats.child_workflow_starts_dispatched += child_starts;
-                progressed = true;
-            }
-            let activity_tasks = self.run_activity_batch_once().await?;
-            if activity_tasks > 0 {
-                stats.activity_tasks += activity_tasks;
-                progressed = true;
-            }
-
-            if !progressed {
+            if !self.run_pass_once(&mut stats).await? {
                 return Ok(stats);
             }
         }
@@ -940,6 +1110,44 @@ where
             "worker did not become idle within {} iterations",
             opts.max_iterations
         )))
+    }
+
+    // One full work pass, shared by `run_until_idle` and the production
+    // `run` loop. Returns whether any work was performed.
+    async fn run_pass_once(&mut self, stats: &mut WorkerRunStats) -> Result<bool> {
+        let mut progressed = false;
+
+        let workflow_tasks = self.run_workflow_batch_once().await?;
+        if workflow_tasks > 0 {
+            stats.workflow_tasks += workflow_tasks;
+            progressed = true;
+        }
+        let local_activity_tasks = self.take_completed_local_activity_tasks();
+        if local_activity_tasks > 0 {
+            stats.activity_tasks += local_activity_tasks;
+            progressed = true;
+        }
+        let maintenance = self.run_due_maintenance_once().await?;
+        if maintenance.timers_fired > 0 {
+            stats.timers_fired += maintenance.timers_fired;
+            progressed = true;
+        }
+        if maintenance.activities_timed_out > 0 {
+            stats.activities_timed_out += maintenance.activities_timed_out;
+            progressed = true;
+        }
+        let child_starts = self.run_child_workflow_starts_once().await?;
+        if child_starts > 0 {
+            stats.child_workflow_starts_dispatched += child_starts;
+            progressed = true;
+        }
+        let activity_tasks = self.run_activity_batch_once().await?;
+        if activity_tasks > 0 {
+            stats.activity_tasks += activity_tasks;
+            progressed = true;
+        }
+
+        Ok(progressed)
     }
 
     async fn stream_history_chunk(
@@ -1090,6 +1298,10 @@ where
                         signal_requests.len()
                     )));
                 }
+                // Only an accepted record counts as progress: the runtime
+                // rejects duplicate deliveries of one inbox record within a
+                // task, and re-polling on a rejected record would re-request
+                // and re-read the same record forever.
                 let mut fulfilled = false;
                 for (request, signal) in signal_requests.into_iter().zip(signals) {
                     let signal = signal.map(|signal| crate::runtime::SignalInboxRecordForRuntime {
@@ -1097,8 +1309,7 @@ where
                         signal_name: signal.signal_name,
                         payload: signal.payload,
                     });
-                    fulfilled |= signal.is_some();
-                    context.fulfill_signal_request(request.command_id, signal);
+                    fulfilled |= context.fulfill_signal_request(request.command_id, signal);
                 }
                 if fulfilled {
                     continue;
@@ -1172,16 +1383,19 @@ where
             .await
     }
 
-    fn try_acquire_recovery(&mut self) -> bool {
-        if self.active_recoveries >= self.recovery_flow_control.max_concurrent_recoveries {
-            return false;
+    // Worker methods run one at a time behind `&mut self`, so a load-then-add
+    // check is race-free; the atomic exists only so the guard can decrement
+    // without borrowing the worker.
+    fn try_acquire_recovery(&self) -> Option<RecoverySlotGuard> {
+        if self.active_recoveries.load(Ordering::Relaxed)
+            >= self.recovery_flow_control.max_concurrent_recoveries
+        {
+            return None;
         }
-        self.active_recoveries += 1;
-        true
-    }
-
-    fn release_recovery(&mut self) {
-        self.active_recoveries = self.active_recoveries.saturating_sub(1);
+        self.active_recoveries.fetch_add(1, Ordering::Relaxed);
+        Some(RecoverySlotGuard {
+            active_recoveries: Arc::clone(&self.active_recoveries),
+        })
     }
 
     fn backpressure_delay(&self, retry_after: Duration) -> Duration {
@@ -1243,11 +1457,24 @@ where
         &mut self,
         claimed: crate::ClaimedWorkflowTask,
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
-        context: crate::runtime::RuntimeContext,
+        mut context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
         change_versions: Vec<WorkflowChangeVersionRecord>,
     ) -> Result<PreparedWorkflowTask> {
+        let poll_reached_terminal_state = match &poll {
+            Poll::Pending => false,
+            Poll::Ready(Ok(_)) => true,
+            Poll::Ready(Err(err)) => !matches!(
+                err,
+                Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
+            ),
+        };
+        if poll_reached_terminal_state {
+            self.reject_terminal_with_unreplayed_command_events(&claimed, &mut context)
+                .await?;
+        }
         let next_command_seq = context.next_command_seq();
+        let unconsumed_indexes = context.take_unconsumed_ready_event_indexes();
         let parts = context.into_commit_parts();
         let default_activity_options = parts.default_activity_options.clone();
         let mut append_events = parts.append_events;
@@ -1315,8 +1542,47 @@ where
             default_activity_options,
             change_versions,
             appended_change_marker,
+            unconsumed_indexes,
             terminal,
         })
+    }
+
+    // A workflow that reaches a terminal state while un-replayed command
+    // events remain in history diverged from its recording (for example a
+    // removed trailing command); committing the terminal event would
+    // silently corrupt replay, so the task fails with nondeterminism and the
+    // claim is released with backoff. Unconsumed ready events are legal
+    // (fire-and-forget completions), so only command events count; unloaded
+    // chunks are streamed in to check the rest of history.
+    async fn reject_terminal_with_unreplayed_command_events(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        context: &mut crate::runtime::RuntimeContext,
+    ) -> Result<()> {
+        loop {
+            if let Some((event_id, event_type)) = context.unreplayed_command_event() {
+                return Err(Error::Nondeterminism(format!(
+                    "workflow reached a terminal state while command event {event_type:?} at event {event_id} was not replayed"
+                )));
+            }
+            let Some(after_event_id) = context.unloaded_history_after() else {
+                return Ok(());
+            };
+            let chunk = self
+                .stream_history_chunk(
+                    claimed.run_id.clone(),
+                    after_event_id,
+                    claimed.replay_target_event_id,
+                )
+                .await?;
+            if chunk.events.is_empty() {
+                return Err(Error::Backend(format!(
+                    "history stream ended at event {after_event_id} before replay target {}",
+                    claimed.replay_target_event_id
+                )));
+            }
+            context.append_replay_events(chunk.events, chunk.last_event_id);
+        }
     }
 
     async fn run_local_activities_after_workflow_tasks(
@@ -1344,6 +1610,36 @@ where
         let completed = self.completed_local_activity_tasks;
         self.completed_local_activity_tasks = 0;
         completed
+    }
+
+    // Single insertion point for the workflow cache: stamps the access
+    // sequence and enforces `max_cached_workflows` by dropping the
+    // least-recently-inserted entry. Eviction is a plain drop; the next task
+    // for an evicted run cold-replays from history. The O(n) min scan is
+    // fine because the map is bounded and eviction only runs at the bound;
+    // no extra index or dependency is warranted.
+    fn insert_cached_workflow(&mut self, run_id: RunId, mut entry: CachedWorkflow) {
+        self.cache_access_seq += 1;
+        entry.last_accessed_seq = self.cache_access_seq;
+        self.cache.insert(run_id, entry);
+        while self.cache.len() > self.max_cached_workflows {
+            let Some(evict) = self
+                .cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed_seq)
+                .map(|(run_id, _)| run_id.clone())
+            else {
+                break;
+            };
+            self.cache.remove(&evict);
+        }
+    }
+
+    // Test-only visibility into the cache bound; hidden because integration
+    // tests need it but it is not part of the supported API.
+    #[doc(hidden)]
+    pub fn cached_workflow_count(&self) -> usize {
+        self.cache.len()
     }
 }
 
@@ -1505,9 +1801,14 @@ where
     nondeterminism_retry_backoff: Duration,
     workflow_task_concurrency: WorkflowTaskConcurrency,
     recovery_flow_control: RecoveryFlowControl,
+    workflow_task_lease_duration: Duration,
+    activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
+    max_concurrent_activities: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
+    max_cached_workflows: usize,
+    idle_wait: Duration,
 }
 
 impl<B> WorkerBuilder<B>
@@ -1549,6 +1850,22 @@ where
         self
     }
 
+    // How long a claimed workflow task stays fenced to this worker before a
+    // crash makes it reclaimable. Must comfortably exceed one claim-to-commit
+    // round trip.
+    pub fn workflow_task_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.workflow_task_lease_duration = lease_duration.max(MIN_TASK_LEASE_DURATION);
+        self
+    }
+
+    // How long a claimed activity task stays fenced to this worker. For
+    // activities without an explicit timeout or heartbeat this is also the
+    // reclaim deadline, so it must exceed the slowest such activity's runtime.
+    pub fn activity_task_lease_duration(mut self, lease_duration: Duration) -> Self {
+        self.activity_task_lease_duration = lease_duration.max(MIN_TASK_LEASE_DURATION);
+        self
+    }
+
     pub fn max_concurrent_workflow_tasks(mut self, limit: usize) -> Self {
         self.workflow_task_concurrency.max_concurrent_workflow_tasks = limit.max(1);
         self
@@ -1570,13 +1887,21 @@ where
         self
     }
 
+    // How many activity tasks one claim RPC requests; purely a round-trip
+    // batching knob, not a concurrency bound. One activity pass claims up to
+    // `max_concurrent_activities` tasks in total, `min` of the two knobs per
+    // RPC — so setting only this knob still claims one task per pass
+    // (max_concurrent_activities defaults to 1), and high concurrency with
+    // this knob unset issues single-task claim RPCs.
     pub fn activity_task_batch_size(mut self, limit: usize) -> Self {
         self.activity_task_batch_size = limit.max(1);
         self
     }
 
+    // How many claimed activities execute concurrently within one activity
+    // pass.
     pub fn max_concurrent_activities(mut self, limit: usize) -> Self {
-        self.activity_task_batch_size = limit.max(1);
+        self.max_concurrent_activities = limit.max(1);
         self
     }
 
@@ -1612,6 +1937,20 @@ where
 
     pub fn max_local_activities_per_workflow_task(mut self, limit: usize) -> Self {
         self.max_local_activities_per_workflow_task = limit;
+        self
+    }
+
+    // Upper bound on cached workflow futures; the least recently used run is
+    // dropped at the bound and cold-replays on its next task.
+    pub fn max_cached_workflows(mut self, limit: usize) -> Self {
+        self.max_cached_workflows = limit.max(1);
+        self
+    }
+
+    // How long an idle `Worker::run` pass waits in the backend's
+    // `wait_for_ready` before re-polling.
+    pub fn idle_wait(mut self, wait: Duration) -> Self {
+        self.idle_wait = wait.max(MIN_IDLE_WAIT);
         self
     }
 
@@ -1667,12 +2006,26 @@ where
             nondeterminism_retry_backoff: self.nondeterminism_retry_backoff,
             workflow_task_concurrency: self.workflow_task_concurrency,
             recovery_flow_control: self.recovery_flow_control,
-            active_recoveries: 0,
+            active_recoveries: Arc::new(AtomicUsize::new(0)),
+            workflow_task_lease_duration: self.workflow_task_lease_duration,
+            activity_task_lease_duration: self.activity_task_lease_duration,
             activity_task_batch_size: self.activity_task_batch_size,
+            max_concurrent_activities: self.max_concurrent_activities,
             activity_completion_batch_size: self.activity_completion_batch_size,
             max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
             completed_local_activity_tasks: 0,
+            max_cached_workflows: self.max_cached_workflows,
+            cache_access_seq: 0,
+            idle_wait: self.idle_wait,
+            shutdown: WorkerShutdown::new(),
         }
+    }
+
+    /// Builds the worker and runs it until shutdown or a persistent backend
+    /// failure; a convenience for workers that never need the [`Worker`]
+    /// value itself (for example activity-only workers).
+    pub async fn run(self) -> Result<()> {
+        self.build().run().await
     }
 }
 

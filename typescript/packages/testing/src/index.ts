@@ -25,12 +25,14 @@ import {
   historyEventType,
   namespace,
   payloadDigest,
+  runId,
   signalFingerprint,
   signalId,
   taskQueue,
   timestampMs,
   timerFingerprint,
   waitId,
+  workflowTaskCommitHasWorkflowVisibleMutations,
   workflowId,
   workflowType
 } from "@durust/core";
@@ -192,6 +194,92 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(committed.kind === "Committed", "replacement claim should be able to commit");
+      }
+    },
+    {
+      name: "released workflow task claims are immediately reclaimable and stale releases are no-ops",
+      async run(factory) {
+        const backend = factory();
+        await backend.startWorkflow({
+          namespace: namespace(),
+          workflowId: workflowId("wf/release-workflow-lease"),
+          workflowType: workflowType("conformance.workflow", 1),
+          taskQueue: taskQueue("workflows"),
+          input: encodePayload({ value: 1 }, { codec: "Json" })
+        });
+
+        const first = await backend.claimWorkflowTask("worker-a", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(first !== null, "initial workflow claim should be granted");
+
+        await backend.releaseWorkflowTask(first.claim);
+        const second = await backend.claimWorkflowTask("worker-b", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(second !== null, "released workflow task should be immediately reclaimable");
+        assert(second.reason === "WorkflowStarted", "release should preserve the wake reason");
+        assert(second.claim.token !== first.claim.token, "reclaim should receive a fresh token");
+
+        await backend.releaseWorkflowTask(first.claim);
+        const stolen = await backend.claimWorkflowTask("worker-c", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(stolen === null, "stale release must not clear a newer claim");
+
+        await backend.releaseWorkflowTask(second.claim, { visibilityDelayMs: 1_000 });
+        const delayed = await backend.claimWorkflowTask("worker-delayed", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(delayed === null, "delayed release should not be immediately visible");
+      }
+    },
+    {
+      name: "terminal workflow task commits are fenced through the public API",
+      async run(factory) {
+        for (const testCase of workflowVisibleMutationCommitCases(runId("run-placeholder"), eventId(2))) {
+          assert(
+            workflowTaskCommitHasWorkflowVisibleMutations(testCase.commit),
+            `${testCase.name} should be classified as workflow-visible`
+          );
+        }
+        assert(
+          !workflowTaskCommitHasWorkflowVisibleMutations({ expectedTailEventId: eventId(2) }),
+          "empty commit should not be workflow-visible"
+        );
+
+        const { backend, claim } = await startedAndClaimed(factory);
+        const terminal = await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ ok: true }, { codec: "Json" })
+              }
+            }
+          ]
+        });
+        assert(terminal.kind === "Committed", "terminal commit should close the run");
+
+        for (const testCase of workflowVisibleMutationCommitCases(claim.runId, eventId(2))) {
+          await assertRejects(
+            () => backend.commitWorkflowTask(claim, testCase.commit),
+            "stale workflow task lease"
+          );
+        }
       }
     },
     {
@@ -976,6 +1064,202 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           timedOut.data.timedOut.message.includes("missed heartbeat"),
           "heartbeat timeout event should include a useful message"
         );
+      }
+    },
+    {
+      name: "timeout-less activity heartbeat extends lease and expired reclaim bumps attempt",
+      async run(factory) {
+        const originalDateNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
+        try {
+          const { backend, claim } = await startedAndClaimed(factory);
+          const input = encodePayload({ value: 1 }, { codec: "Json" });
+          const scheduled = {
+            commandId: commandId(claim.runId, 1),
+            activityName: "conformance.implicit-heartbeat",
+            taskQueue: "activities",
+            retryPolicy: RetryPolicy.exponential({
+              initialIntervalMs: 0,
+              maxIntervalMs: 0,
+              maxAttempts: 2,
+              backoffCoefficient: 1
+            }),
+            startToCloseTimeoutMs: null,
+            heartbeatTimeoutMs: null,
+            input,
+            fingerprint: activityFingerprint(
+              "conformance.implicit-heartbeat",
+              payloadDigest(input),
+              "sha256:test-options"
+            )
+          };
+          await backend.commitWorkflowTask(claim, {
+            expectedTailEventId: eventId(1),
+            appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+            scheduleActivities: [activityTaskFromScheduled(scheduled)]
+          });
+
+          const first = await backend.claimActivityTask("implicit-heartbeat-worker-1", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(first !== null, "first timeout-less activity attempt should be claimable");
+          assert(first.task.attempt === 1, "first implicit heartbeat attempt should be attempt 1");
+
+          now = 1_009;
+          assert(
+            (await backend.heartbeatActivity({ claim: first.claim })).kind === "Recorded",
+            "heartbeat before the original lease expires should be accepted"
+          );
+          now = 1_018;
+          assert(
+            (await backend.heartbeatActivity({ claim: first.claim })).kind === "Recorded",
+            "second heartbeat should extend the lease past two original periods"
+          );
+          now = 1_027;
+          const competingClaim = await backend.claimActivityTask("implicit-heartbeat-competitor", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(competingClaim === null, "heartbeating holder should not be reclaimed early");
+          const stillLive = await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+          assert(stillLive.timedOut === 0, "heartbeating holder should survive multiple leases");
+
+          now = 1_028;
+          const expired = await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+          assert(expired.timedOut === 1, "stopped heartbeats should reclaim one lease later");
+
+          const noWorkflowWake = await backend.claimWorkflowTask("implicit-heartbeat-premature", {
+            namespace: namespace(),
+            taskQueue: taskQueue("workflows"),
+            registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+            leaseDurationMs: 30_000
+          });
+          assert(noWorkflowWake === null, "retryable lease expiry should not wake workflow early");
+
+          const second = await backend.claimActivityTask("implicit-heartbeat-worker-2", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.implicit-heartbeat"],
+            leaseDurationMs: 10
+          });
+          assert(second !== null, "expired timeout-less activity should be retried");
+          assert(second.task.attempt === 2, "expired lease reclaim should bump attempt");
+
+          await assertRejects(
+            () =>
+              backend.completeActivity({
+                claim: first.claim,
+                result: encodePayload({ value: 2 }, { codec: "Json" })
+              }),
+            "stale activity task lease"
+          );
+          await assertRejects(
+            () => backend.heartbeatActivity({ claim: first.claim }),
+            "stale activity task lease"
+          );
+        } finally {
+          Date.now = originalDateNow;
+        }
+      }
+    },
+    {
+      name: "expired timeout-less activity lease honors nonzero retry backoff before reclaim",
+      async run(factory) {
+        const originalDateNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
+        try {
+          const { backend, claim } = await startedAndClaimed(factory);
+          const input = encodePayload({ value: 1 }, { codec: "Json" });
+          const scheduled = {
+            commandId: commandId(claim.runId, 1),
+            activityName: "conformance.backoff-reclaim",
+            taskQueue: "activities",
+            retryPolicy: RetryPolicy.exponential({
+              initialIntervalMs: 5_000,
+              maxIntervalMs: 5_000,
+              maxAttempts: 3,
+              backoffCoefficient: 1
+            }),
+            startToCloseTimeoutMs: null,
+            heartbeatTimeoutMs: null,
+            input,
+            fingerprint: activityFingerprint(
+              "conformance.backoff-reclaim",
+              payloadDigest(input),
+              "sha256:test-options"
+            )
+          };
+          await backend.commitWorkflowTask(claim, {
+            expectedTailEventId: eventId(1),
+            appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+            scheduleActivities: [activityTaskFromScheduled(scheduled)]
+          });
+
+          const first = await backend.claimActivityTask("backoff-reclaim-worker-1", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(first !== null, "first backoff activity attempt should be claimable");
+          assert(first.task.attempt === 1, "first backoff attempt should be attempt 1");
+
+          // The lease expired at 1_010 with no heartbeat; the next attempt's
+          // 5s retry backoff starts at reclaim time, so a claim right after
+          // expiry must be refused rather than handed out mid-backoff.
+          now = 1_011;
+          const duringBackoff = await backend.claimActivityTask("backoff-reclaim-worker-2", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(duringBackoff === null, "expired lease must not be reclaimed during retry backoff");
+
+          // Timeout maintenance persists the retry with the paced visibility
+          // so the backoff window is durable rather than recomputed per poll.
+          await backend.timeoutDueActivities({
+            namespace: namespace(),
+            now,
+            limit: 8
+          });
+
+          now = 6_010;
+          const stillBackedOff = await backend.claimActivityTask("backoff-reclaim-worker-3", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(stillBackedOff === null, "retry must stay invisible until the backoff elapses");
+
+          now = 6_011;
+          const second = await backend.claimActivityTask("backoff-reclaim-worker-4", {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["conformance.backoff-reclaim"],
+            leaseDurationMs: 10
+          });
+          assert(second !== null, "retry should be claimable after the backoff elapses");
+          assert(second.task.attempt === 2, "backoff reclaim should be the next attempt");
+        } finally {
+          Date.now = originalDateNow;
+        }
       }
     },
     {
@@ -2196,6 +2480,149 @@ async function startedAndClaimed(
   });
   assert(claimed !== null, "started workflow should be claimable");
   return { backend, claim: claimed.claim };
+}
+
+export function workflowVisibleMutationCommitCases(
+  runIdValue: WorkflowTaskClaim["runId"],
+  expectedTailEventId: WorkflowTaskCommit["expectedTailEventId"]
+): readonly { readonly name: string; readonly commit: WorkflowTaskCommit }[] {
+  const activityInput = encodePayload({ value: "activity" }, { codec: "Json" });
+  const activityCommand = commandId(runIdValue, 1);
+  const scheduledActivity = {
+    commandId: activityCommand,
+    activityName: "conformance.terminal.activity",
+    taskQueue: "activities",
+    retryPolicy: RetryPolicy.none(),
+    startToCloseTimeoutMs: null,
+    heartbeatTimeoutMs: null,
+    input: activityInput,
+    fingerprint: activityFingerprint(
+      "conformance.terminal.activity",
+      payloadDigest(activityInput),
+      "sha256:test-options"
+    )
+  };
+  const activityMapInput = activityMapManifest([{ value: 1 }], 1);
+  const activityMapCommand = commandId(runIdValue, 2);
+  const childType = workflowType("conformance.terminal.child", 1);
+  const childInput = encodePayload({ value: "child" }, { codec: "Json" });
+  const childCommand = commandId(runIdValue, 3);
+  const childMapInput = activityMapManifest([{ value: "child-map" }], 1);
+  const childMapCommand = commandId(runIdValue, 4);
+  return [
+    {
+      name: "appendEvents",
+      commit: {
+        expectedTailEventId,
+        appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
+      }
+    },
+    {
+      name: "upsertWaits",
+      commit: {
+        expectedTailEventId,
+        upsertWaits: [
+          {
+            waitId: waitId(`${runIdValue}:terminal-wait`),
+            runId: runIdValue,
+            commandId: commandId(runIdValue, 5),
+            kind: "Timer",
+            key: "terminal-wait",
+            readyAt: timestampMs(10)
+          }
+        ]
+      }
+    },
+    {
+      name: "deleteWaits",
+      commit: {
+        expectedTailEventId,
+        deleteWaits: [waitId(`${runIdValue}:terminal-wait`)]
+      }
+    },
+    {
+      name: "consumeSignals",
+      commit: {
+        expectedTailEventId,
+        consumeSignals: [signalId("terminal-signal")]
+      }
+    },
+    {
+      name: "scheduleActivities",
+      commit: {
+        expectedTailEventId,
+        scheduleActivities: [activityTaskFromScheduled(scheduledActivity)]
+      }
+    },
+    {
+      name: "scheduleActivityMaps",
+      commit: {
+        expectedTailEventId,
+        scheduleActivityMaps: [
+          {
+            mapCommandId: activityMapCommand,
+            activityName: "conformance.terminal.map",
+            taskQueue: "activities",
+            retryPolicy: RetryPolicy.none(),
+            startToCloseTimeoutMs: null,
+            heartbeatTimeoutMs: null,
+            inputManifest: activityMapInput,
+            resultManifestName: "terminal-map",
+            maxInFlight: 1
+          }
+        ]
+      }
+    },
+    {
+      name: "startChildWorkflows",
+      commit: {
+        expectedTailEventId,
+        startChildWorkflows: [
+          {
+            commandId: childCommand,
+            workflowType: childType,
+            workflowId: workflowId("wf/terminal-child"),
+            taskQueue: "child-workflows",
+            input: childInput,
+            parentClosePolicy: "Cancel",
+            fingerprint: childWorkflowFingerprint(
+              childType,
+              workflowId("wf/terminal-child"),
+              payloadDigest(childInput),
+              "child-workflows",
+              "Cancel"
+            )
+          }
+        ]
+      }
+    },
+    {
+      name: "scheduleChildWorkflowMaps",
+      commit: {
+        expectedTailEventId,
+        scheduleChildWorkflowMaps: [
+          {
+            mapCommandId: childMapCommand,
+            workflowType: childType,
+            taskQueue: "child-workflows",
+            inputManifest: childMapInput,
+            resultManifestName: "terminal-child-map",
+            workflowIdPrefix: "wf/terminal-child-map",
+            maxInFlight: 1,
+            parentClosePolicy: "Cancel",
+            failureMode: "CollectAll"
+          }
+        ]
+      }
+    },
+    {
+      name: "queryProjection",
+      commit: {
+        expectedTailEventId,
+        queryProjection: encodePayload({ status: "terminal" }, { codec: "Json" })
+      }
+    }
+  ];
 }
 
 function assert(condition: boolean, message: string): asserts condition {

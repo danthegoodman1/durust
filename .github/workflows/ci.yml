@@ -17,10 +17,15 @@ jobs:
         run: rustup default stable
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: Check feature matrix
+        run: |
+          cargo check --locked --no-default-features
+          cargo check --locked --features postgres,s3
 
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --locked --workspace --all-features
 
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d
@@ -33,7 +38,7 @@ jobs:
           DURUST_GARAGE_PREFIX: ci/${{ github.run_id }}/${{ github.run_attempt }}
           DURUST_GARAGE_ACCESS_KEY_ID: GK0123456789abcdef0123456789abcdef
           DURUST_GARAGE_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: cargo test --locked --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+        run: cargo test --locked --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
 
       - name: Stop Garage
         if: always()

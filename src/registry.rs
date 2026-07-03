@@ -74,9 +74,9 @@ pub struct WorkflowRegistration {
     pub input_type: &'static str,
     pub output_type: &'static str,
     pub query_state_type: Option<&'static str>,
-    pub input_schema_hash: String,
-    pub output_schema_hash: String,
-    pub query_state_schema_hash: Option<String>,
+    pub input_type_name_hash: String,
+    pub output_type_name_hash: String,
+    pub query_state_type_name_hash: Option<String>,
     run: Arc<dyn Fn(PayloadRef, CodecId) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
 }
 
@@ -91,9 +91,10 @@ impl WorkflowRegistration {
             input_type: W::input_type_name(),
             output_type: W::output_type_name(),
             query_state_type: W::query_state_type_name(),
-            input_schema_hash: crate::type_fingerprint::<W::Input>(),
-            output_schema_hash: crate::type_fingerprint::<W::Output>(),
-            query_state_schema_hash: W::query_state_type_name().map(crate::type_name_fingerprint),
+            input_type_name_hash: crate::type_fingerprint::<W::Input>(),
+            output_type_name_hash: crate::type_fingerprint::<W::Output>(),
+            query_state_type_name_hash: W::query_state_type_name()
+                .map(crate::type_name_fingerprint),
             run: Arc::new(|input, codec| {
                 Box::pin(async move {
                     let input = crate::decode_payload::<W::Input>(&input)?;
@@ -115,8 +116,8 @@ pub struct ActivityRegistration {
     pub rust_path: &'static str,
     pub input_type: &'static str,
     pub output_type: &'static str,
-    pub input_schema_hash: String,
-    pub output_schema_hash: String,
+    pub input_type_name_hash: String,
+    pub output_type_name_hash: String,
     run: Arc<dyn Fn(PayloadRef, CodecId) -> BoxFuture<'static, Result<PayloadRef>> + Send + Sync>,
 }
 
@@ -130,8 +131,8 @@ impl ActivityRegistration {
             rust_path: A::RUST_PATH,
             input_type: A::input_type_name(),
             output_type: A::output_type_name(),
-            input_schema_hash: crate::type_fingerprint::<A::Input>(),
-            output_schema_hash: crate::type_fingerprint::<A::Output>(),
+            input_type_name_hash: crate::type_fingerprint::<A::Input>(),
+            output_type_name_hash: crate::type_fingerprint::<A::Output>(),
             run: Arc::new(|input, codec| {
                 Box::pin(async move {
                     let input = crate::decode_payload::<A::Input>(&input)?;
@@ -212,9 +213,9 @@ impl Registry {
                     input_type: registration.input_type.to_owned(),
                     output_type: registration.output_type.to_owned(),
                     query_state_type: registration.query_state_type.map(str::to_owned),
-                    input_schema_hash: registration.input_schema_hash.clone(),
-                    output_schema_hash: registration.output_schema_hash.clone(),
-                    query_state_schema_hash: registration.query_state_schema_hash.clone(),
+                    input_type_name_hash: registration.input_type_name_hash.clone(),
+                    output_type_name_hash: registration.output_type_name_hash.clone(),
+                    query_state_type_name_hash: registration.query_state_type_name_hash.clone(),
                 })
                 .collect(),
             activities: self
@@ -225,8 +226,8 @@ impl Registry {
                     rust_path: registration.rust_path.to_owned(),
                     input_type: registration.input_type.to_owned(),
                     output_type: registration.output_type.to_owned(),
-                    input_schema_hash: registration.input_schema_hash.clone(),
-                    output_schema_hash: registration.output_schema_hash.clone(),
+                    input_type_name_hash: registration.input_type_name_hash.clone(),
+                    output_type_name_hash: registration.output_type_name_hash.clone(),
                 })
                 .collect(),
         }

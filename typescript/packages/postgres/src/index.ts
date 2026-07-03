@@ -5,7 +5,8 @@ import {
   encodePayload,
   eventId,
   historyEventType,
-  runId
+  runId,
+  workflowTaskCommitHasWorkflowVisibleMutations
 } from "@durust/core";
 import type {
   ActivityMapInputManifest,
@@ -49,6 +50,7 @@ import type {
   QueryWorkflowOutcome,
   QueryWorkflowRequest,
   ReadSignalInboxRequest,
+  ReleaseWorkflowTaskOptions,
   RunId,
   SignalInboxRecord,
   SignalName,
@@ -77,6 +79,7 @@ interface WorkflowState {
   readonly runId: RunId;
   history: HistoryEvent[];
   readyReason: WorkflowTaskReason | null;
+  readyAtMs: number;
   claim: WorkflowLease | null;
   queryProjection: PayloadRef | null;
   terminal: boolean;
@@ -120,6 +123,7 @@ interface ActivityLease {
   readonly startedAtMs: number;
   readonly heartbeatDeadlineAtMs: number | null;
   readonly expiresAtMs: number;
+  readonly leaseDurationMs: number;
 }
 
 interface ActivityMapState {
@@ -477,6 +481,7 @@ export class PostgresBackend implements DurableBackend {
             task_queue,
             tail_event_id,
             ready_reason,
+            ready_at_ms,
             claim_worker_id,
             claim_token,
             claim_reason,
@@ -485,7 +490,7 @@ export class PostgresBackend implements DurableBackend {
             terminal,
             parent
           )
-          values ($1, $2, $3, $4, $5::integer, $6::jsonb, $7, 1, 'WorkflowStarted',
+          values ($1, $2, $3, $4, $5::integer, $6::jsonb, $7, 1, 'WorkflowStarted', 0,
             null, null, null, null, null, false, null)
         `,
         [
@@ -580,6 +585,7 @@ export class PostgresBackend implements DurableBackend {
             and runs.task_queue = $2
             and runs.terminal = false
             and runs.ready_reason is not null
+            and runs.ready_at_ms <= $7::bigint
             and runs.claim_token is null
           order by runs.run_id asc
           limit $6::bigint
@@ -625,7 +631,8 @@ export class PostgresBackend implements DurableBackend {
         registeredTypes,
         String(workerId),
         String(leaseExpiresAt),
-        String(limit)
+        String(limit),
+        String(this.#nowMs())
       ]
     );
     return workflowClaimRowsInDeterministicOrder(result.rows);
@@ -802,10 +809,14 @@ export class PostgresBackend implements DurableBackend {
     ) {
       throw new Error("stale workflow task lease");
     }
+    if (state.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+      throw new Error("terminal workflow rejects workflow-visible mutations");
+    }
 
     if (commit.expectedTailEventId !== tailEventId(state)) {
       state.claim = null;
       state.readyReason = "CacheEvicted";
+      state.readyAtMs = 0;
       if (targetedProjectionUpdates) {
         await this.#upsertNormalizedWorkflowRow(client, state);
       }
@@ -903,6 +914,36 @@ export class PostgresBackend implements DurableBackend {
     }, targetedProjectionUpdates ? simpleWorkflowCommitRewriteScope : fullNormalizedRewriteScope);
   }
 
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options: ReleaseWorkflowTaskOptions = {}
+  ): Promise<void> {
+    await this.#ensureReady();
+    const readyAtMs = this.#nowMs() + Math.max(0, options.visibilityDelayMs ?? 0);
+    await this.#pool.query(
+      `
+        update ${this.#workflowRunsTableName}
+        set
+          ready_reason = claim_reason,
+          ready_at_ms = $4::bigint,
+          claim_worker_id = null,
+          claim_token = null,
+          claim_reason = null,
+          claim_expires_at_ms = null
+        where run_id = $1
+          and claim_worker_id = $2
+          and claim_token = $3::bigint
+          and claim_reason is not null
+      `,
+      [
+        String(claim.runId),
+        String(claim.workerId),
+        String(claim.token),
+        String(readyAtMs)
+      ]
+    );
+  }
+
   async #commitWorkflowTaskSqlNative(
     claim: WorkflowTaskClaim,
     commit: WorkflowTaskCommit
@@ -920,6 +961,7 @@ export class PostgresBackend implements DurableBackend {
             task_queue,
             tail_event_id,
             ready_reason,
+            ready_at_ms,
             claim_worker_id,
             claim_token,
             claim_reason,
@@ -948,6 +990,9 @@ export class PostgresBackend implements DurableBackend {
       ) {
         throw new Error("stale workflow task lease");
       }
+      if (row.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+        throw new Error("terminal workflow rejects workflow-visible mutations");
+      }
 
       const currentTail = postgresRequiredNumber(row.tail_event_id);
       if (Number(commit.expectedTailEventId) !== currentTail) {
@@ -956,6 +1001,7 @@ export class PostgresBackend implements DurableBackend {
             update ${this.#workflowRunsTableName}
             set
               ready_reason = 'CacheEvicted',
+              ready_at_ms = 0,
               claim_worker_id = null,
               claim_token = null,
               claim_reason = null,
@@ -1039,6 +1085,7 @@ export class PostgresBackend implements DurableBackend {
             runId: childRunId,
             history: [childStarted],
             readyReason: "WorkflowStarted",
+            readyAtMs: 0,
             claim: null,
             queryProjection: null,
             terminal: false,
@@ -1127,6 +1174,7 @@ export class PostgresBackend implements DurableBackend {
           set
             tail_event_id = $2::integer,
             ready_reason = $3,
+            ready_at_ms = 0,
             claim_worker_id = null,
             claim_token = null,
             claim_reason = null,
@@ -1224,9 +1272,17 @@ export class PostgresBackend implements DurableBackend {
       if (row === undefined) {
         return null;
       }
-      const task = parsePostgresJson(row.task) as ActivityTask;
+      let task = parsePostgresJson(row.task) as ActivityTask;
+      if (postgresOptionalNumber(row.claim_token) !== null) {
+        const retry = retryActivityTaskAfterTimeout(task, now);
+        if (retry !== null && retry.readyAtMs > now) {
+          return null;
+        }
+        task = retry?.task ?? task;
+      }
       const token = await this.#allocateCounterRange(client, "activity_claim", 1);
-      const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now);
+      const leaseDurationMs = Math.max(0, opts.leaseDurationMs);
+      const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now, leaseDurationMs);
       const timeoutDeadline = activityTimeoutDeadlineFromTask(task, now, heartbeatDeadline);
       const claim: ActivityTaskClaim = {
         activityId: row.activity_id,
@@ -1242,7 +1298,10 @@ export class PostgresBackend implements DurableBackend {
             claim_started_at_ms = $4::bigint,
             heartbeat_deadline_at_ms = $5::bigint,
             timeout_deadline_at_ms = $6::bigint,
-            claim_expires_at_ms = $7::bigint
+            claim_expires_at_ms = $7::bigint,
+            claim_lease_duration_ms = $8::bigint,
+            task = $9::jsonb,
+            available_at_ms = $4::bigint
           where activity_id = $1
         `,
         [
@@ -1252,7 +1311,9 @@ export class PostgresBackend implements DurableBackend {
           String(now),
           heartbeatDeadline === null ? null : String(heartbeatDeadline),
           timeoutDeadline === null ? null : String(timeoutDeadline),
-          String(this.#leaseExpiresAt(opts.leaseDurationMs))
+          String(this.#leaseExpiresAt(opts.leaseDurationMs)),
+          String(leaseDurationMs),
+          stringifyJson(task)
         ]
       );
       return { task, claim };
@@ -1309,13 +1370,21 @@ export class PostgresBackend implements DurableBackend {
         "activity_claim",
         selected.rows.length
       );
+      const leaseDurationMs = Math.max(0, opts.leaseDurationMs);
       const claimExpiresAt = this.#leaseExpiresAt(opts.leaseDurationMs);
-      const claims = selected.rows.map((row, index) => {
-        const task = parsePostgresJson(row.task) as ActivityTask;
+      const claims = selected.rows.flatMap((row, index) => {
+        let task = parsePostgresJson(row.task) as ActivityTask;
+        if (postgresOptionalNumber(row.claim_token) !== null) {
+          const retry = retryActivityTaskAfterTimeout(task, now);
+          if (retry !== null && retry.readyAtMs > now) {
+            return [];
+          }
+          task = retry?.task ?? task;
+        }
         const token = firstToken + index;
-        const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now);
+        const heartbeatDeadline = activityHeartbeatDeadlineAt(task, now, leaseDurationMs);
         const timeoutDeadline = activityTimeoutDeadlineFromTask(task, now, heartbeatDeadline);
-        return {
+        return [{
           activityId: row.activity_id,
           task,
           claim: {
@@ -1325,9 +1394,13 @@ export class PostgresBackend implements DurableBackend {
           } satisfies ActivityTaskClaim,
           heartbeatDeadline,
           timeoutDeadline,
-          claimExpiresAt
-        };
+          claimExpiresAt,
+          leaseDurationMs
+        }];
       });
+      if (claims.length === 0) {
+        return [];
+      }
 
       await client.query(
         `
@@ -1339,7 +1412,9 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms bigint,
               heartbeat_deadline_at_ms bigint,
               timeout_deadline_at_ms bigint,
-              claim_expires_at_ms bigint
+              claim_expires_at_ms bigint,
+              claim_lease_duration_ms bigint,
+              task jsonb
             )
           )
           update ${this.#activityTasksTableName} activities
@@ -1349,7 +1424,10 @@ export class PostgresBackend implements DurableBackend {
             claim_started_at_ms = updates.claim_started_at_ms,
             heartbeat_deadline_at_ms = updates.heartbeat_deadline_at_ms,
             timeout_deadline_at_ms = updates.timeout_deadline_at_ms,
-            claim_expires_at_ms = updates.claim_expires_at_ms
+            claim_expires_at_ms = updates.claim_expires_at_ms,
+            claim_lease_duration_ms = updates.claim_lease_duration_ms,
+            task = updates.task,
+            available_at_ms = updates.claim_started_at_ms
           from updates
           where activities.activity_id = updates.activity_id
         `,
@@ -1362,7 +1440,9 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms: now,
               heartbeat_deadline_at_ms: claim.heartbeatDeadline,
               timeout_deadline_at_ms: claim.timeoutDeadline,
-              claim_expires_at_ms: claim.claimExpiresAt
+              claim_expires_at_ms: claim.claimExpiresAt,
+              claim_lease_duration_ms: claim.leaseDurationMs,
+              task: claim.task
             }))
           )
         ]
@@ -1445,6 +1525,7 @@ export class PostgresBackend implements DurableBackend {
             heartbeat_deadline_at_ms,
             timeout_deadline_at_ms,
             claim_expires_at_ms,
+            claim_lease_duration_ms,
             terminal_event_id,
             map_command_key,
             map_item_ordinal
@@ -1558,7 +1639,8 @@ export class PostgresBackend implements DurableBackend {
               claim_started_at_ms = null,
               heartbeat_deadline_at_ms = null,
               timeout_deadline_at_ms = null,
-              claim_expires_at_ms = null
+              claim_expires_at_ms = null,
+              claim_lease_duration_ms = null
             from jsonb_to_recordset($1::jsonb) as updates(
               activity_id text,
               terminal_event_id integer
@@ -1619,7 +1701,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityCompleted";
+    markWorkflowReady(activity.workflow, "ActivityCompleted");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     recordProjectionUpdate?.({ activity, workflow: activity.workflow });
@@ -1700,7 +1782,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     activity.workflow.history.push(event);
-    activity.workflow.readyReason = "ActivityFailed";
+    markWorkflowReady(activity.workflow, "ActivityFailed");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     recordProjectionUpdate?.({ activity, workflow: activity.workflow });
@@ -1724,9 +1806,15 @@ export class PostgresBackend implements DurableBackend {
         throw new Error("stale activity task lease");
       }
       const currentClaim = activity.claim;
+      const now = this.#nowMs();
       activity.claim = {
         ...currentClaim,
-        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+          activity.task,
+          now,
+          currentClaim.leaseDurationMs
+        ),
+        expiresAtMs: now + currentClaim.leaseDurationMs
       };
       await this.#upsertNormalizedActivityTaskRow(client, activity);
       return { kind: "Recorded" };
@@ -1740,12 +1828,20 @@ export class PostgresBackend implements DurableBackend {
   #restoreExpiredWorkflowLease(state: WorkflowState): void {
     if (state.claim !== null && state.claim.expiresAtMs <= this.#nowMs()) {
       state.readyReason ??= state.claim.reason;
+      state.readyAtMs = 0;
       state.claim = null;
     }
   }
 
   #restoreExpiredActivityLease(activity: ActivityState): void {
     if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      const retry = retryActivityAfterTimeout(activity, this.#nowMs());
+      if (retry === null) {
+        activity.claim = null;
+        return;
+      }
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
       activity.claim = null;
     }
   }
@@ -1853,7 +1949,7 @@ export class PostgresBackend implements DurableBackend {
           }
         });
         activity.workflow.history.push(event);
-        activity.workflow.readyReason = "ActivityTimedOut";
+        markWorkflowReady(activity.workflow, "ActivityTimedOut");
         activity.terminalEventId = event.eventId;
         activity.claim = null;
         timedOut += 1;
@@ -1921,7 +2017,9 @@ export class PostgresBackend implements DurableBackend {
         await client.query(
           `
             update ${this.#workflowRunsTableName}
-            set ready_reason = 'SignalReceived'
+            set
+              ready_reason = 'SignalReceived',
+              ready_at_ms = 0
             where run_id = $1
               and terminal = false
           `,
@@ -2130,6 +2228,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue text not null,
         tail_event_id integer not null,
         ready_reason text,
+        ready_at_ms bigint not null default 0,
         claim_worker_id text,
         claim_token bigint,
         claim_reason text,
@@ -2139,6 +2238,10 @@ export class PostgresBackend implements DurableBackend {
         parent jsonb
       )
     `);
+    await this.#pool.query(
+      `alter table ${this.#workflowRunsTableName}
+       add column if not exists ready_at_ms bigint not null default 0`
+    );
     await this.#pool.query(`
       create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "workflow_runs_ready_idx")}
       on ${this.#workflowRunsTableName}(
@@ -2146,6 +2249,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue,
         terminal,
         ready_reason,
+        ready_at_ms,
         workflow_type_name,
         workflow_type_version
       )
@@ -2157,6 +2261,7 @@ export class PostgresBackend implements DurableBackend {
         task_queue,
         workflow_type_name,
         workflow_type_version,
+        ready_at_ms,
         run_id
       )
       where terminal = false
@@ -2269,10 +2374,15 @@ export class PostgresBackend implements DurableBackend {
         heartbeat_deadline_at_ms bigint,
         timeout_deadline_at_ms bigint,
         claim_expires_at_ms bigint,
+        claim_lease_duration_ms bigint,
         terminal_event_id integer,
         map_command_key text,
         map_item_ordinal integer
       )
+    `);
+    await this.#pool.query(`
+      alter table ${this.#activityTasksTableName}
+      add column if not exists claim_lease_duration_ms bigint
     `);
     await this.#pool.query(`
       create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "activity_tasks_claim_idx")}
@@ -2572,6 +2682,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+            ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -2605,6 +2716,7 @@ export class PostgresBackend implements DurableBackend {
         runId: runId(row.run_id),
         history: historiesByRun.get(row.run_id) ?? [],
         readyReason: row.ready_reason as WorkflowTaskReason | null,
+            readyAtMs: postgresRequiredNumber(row.ready_at_ms),
         claim,
         queryProjection:
           row.query_projection === null
@@ -2690,6 +2802,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -2717,7 +2830,14 @@ export class PostgresBackend implements DurableBackend {
                 },
                 startedAtMs: postgresRequiredNumber(row.claim_started_at_ms),
                 heartbeatDeadlineAtMs: postgresOptionalNumber(row.heartbeat_deadline_at_ms),
-                expiresAtMs: postgresRequiredNumber(row.claim_expires_at_ms)
+                expiresAtMs: postgresRequiredNumber(row.claim_expires_at_ms),
+                leaseDurationMs:
+                  postgresOptionalNumber(row.claim_lease_duration_ms) ??
+                  Math.max(
+                    0,
+                    postgresRequiredNumber(row.claim_expires_at_ms) -
+                      postgresRequiredNumber(row.claim_started_at_ms)
+                  )
               },
         availableAtMs: postgresRequiredNumber(row.available_at_ms),
         terminalEventId:
@@ -3004,6 +3124,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3022,6 +3143,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3039,6 +3161,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3071,6 +3194,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3089,6 +3213,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3106,6 +3231,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3137,6 +3263,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3155,6 +3282,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue,
           tail_event_id,
           ready_reason,
+          ready_at_ms,
           claim_worker_id,
           claim_token,
           claim_reason,
@@ -3172,6 +3300,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue text,
           tail_event_id integer,
           ready_reason text,
+          ready_at_ms bigint,
           claim_worker_id text,
           claim_token bigint,
           claim_reason text,
@@ -3190,6 +3319,7 @@ export class PostgresBackend implements DurableBackend {
           task_queue = excluded.task_queue,
           tail_event_id = excluded.tail_event_id,
           ready_reason = excluded.ready_reason,
+          ready_at_ms = excluded.ready_at_ms,
           claim_worker_id = excluded.claim_worker_id,
           claim_token = excluded.claim_token,
           claim_reason = excluded.claim_reason,
@@ -3218,7 +3348,8 @@ export class PostgresBackend implements DurableBackend {
         update ${this.#workflowRunsTableName} runs
         set
           tail_event_id = updates.tail_event_id,
-          ready_reason = updates.ready_reason
+          ready_reason = updates.ready_reason,
+          ready_at_ms = 0
         from jsonb_to_recordset($1::jsonb) as updates(
           run_id text,
           tail_event_id integer,
@@ -3549,6 +3680,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3568,6 +3700,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3586,6 +3719,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3617,6 +3751,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3636,6 +3771,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3654,6 +3790,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3673,6 +3810,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms = excluded.heartbeat_deadline_at_ms,
           timeout_deadline_at_ms = excluded.timeout_deadline_at_ms,
           claim_expires_at_ms = excluded.claim_expires_at_ms,
+          claim_lease_duration_ms = excluded.claim_lease_duration_ms,
           terminal_event_id = excluded.terminal_event_id,
           map_command_key = excluded.map_command_key,
           map_item_ordinal = excluded.map_item_ordinal
@@ -3705,6 +3843,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3724,6 +3863,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms,
           timeout_deadline_at_ms,
           claim_expires_at_ms,
+          claim_lease_duration_ms,
           terminal_event_id,
           map_command_key,
           map_item_ordinal
@@ -3742,6 +3882,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms bigint,
           timeout_deadline_at_ms bigint,
           claim_expires_at_ms bigint,
+          claim_lease_duration_ms bigint,
           terminal_event_id integer,
           map_command_key text,
           map_item_ordinal integer
@@ -3761,6 +3902,7 @@ export class PostgresBackend implements DurableBackend {
           heartbeat_deadline_at_ms = excluded.heartbeat_deadline_at_ms,
           timeout_deadline_at_ms = excluded.timeout_deadline_at_ms,
           claim_expires_at_ms = excluded.claim_expires_at_ms,
+          claim_lease_duration_ms = excluded.claim_lease_duration_ms,
           terminal_event_id = excluded.terminal_event_id,
           map_command_key = excluded.map_command_key,
           map_item_ordinal = excluded.map_item_ordinal
@@ -4008,7 +4150,7 @@ export class PostgresBackend implements DurableBackend {
         )
     );
     if (ready) {
-      state.readyReason = "SignalReceived";
+      markWorkflowReady(state, "SignalReceived");
     }
   }
 
@@ -4109,7 +4251,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapFailed";
+    markWorkflowReady(map.workflow, "ActivityMapFailed");
     return event.eventId;
   }
 
@@ -4137,7 +4279,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ActivityMapCompleted";
+    markWorkflowReady(map.workflow, "ActivityMapCompleted");
     return event.eventId;
   }
 
@@ -4204,6 +4346,7 @@ export class PostgresBackend implements DurableBackend {
           })
         ],
         readyReason: "WorkflowStarted",
+        readyAtMs: 0,
         claim: null,
         queryProjection: null,
         terminal: false,
@@ -4302,7 +4445,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapCompleted";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapCompleted");
     return event.eventId;
   }
 
@@ -4320,7 +4463,7 @@ export class PostgresBackend implements DurableBackend {
       }
     });
     map.workflow.history.push(event);
-    map.workflow.readyReason = "ChildWorkflowMapFailed";
+    markWorkflowReady(map.workflow, "ChildWorkflowMapFailed");
     this.#cancelRunningChildWorkflowMapItems(map);
     return event.eventId;
   }
@@ -4341,6 +4484,7 @@ export class PostgresBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -4360,6 +4504,7 @@ export class PostgresBackend implements DurableBackend {
       runId: newRunId,
       history: [started],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -4383,7 +4528,7 @@ export class PostgresBackend implements DurableBackend {
           }
         }
       }));
-      parent.readyReason = "ChildWorkflowFailed";
+      markWorkflowReady(parent, "ChildWorkflowFailed");
       return;
     }
 
@@ -4402,6 +4547,7 @@ export class PostgresBackend implements DurableBackend {
         })
       ],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -4422,7 +4568,7 @@ export class PostgresBackend implements DurableBackend {
         runId: childRunId
       }
     }));
-    parent.readyReason = "ChildWorkflowStarted";
+    markWorkflowReady(parent, "ChildWorkflowStarted");
   }
 
   #notifyParentOfChildTerminal(parentLink: ParentWorkflowLink, terminal: ChildTerminalUpdate): void {
@@ -4459,12 +4605,14 @@ export class PostgresBackend implements DurableBackend {
               }
             };
     parent.history.push(makeHistoryEvent(eventId(Number(tailEventId(parent)) + 1), data));
-    parent.readyReason =
+    markWorkflowReady(
+      parent,
       terminal.kind === "Completed"
         ? "ChildWorkflowCompleted"
         : terminal.kind === "Failed"
           ? "ChildWorkflowFailed"
-          : "ChildWorkflowCancelled";
+          : "ChildWorkflowCancelled"
+    );
   }
 
   #cancelChildrenForClosedParent(parent: WorkflowState): void {
@@ -4482,6 +4630,7 @@ export class PostgresBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
     }
   }
@@ -4528,6 +4677,7 @@ interface NormalizedWorkflowRunRow {
   readonly task_queue: string;
   readonly tail_event_id: number;
   readonly ready_reason: WorkflowTaskReason | null;
+  readonly ready_at_ms: number;
   readonly claim_worker_id: string | null;
   readonly claim_token: number | null;
   readonly claim_reason: WorkflowTaskReason | null;
@@ -4593,6 +4743,7 @@ interface NormalizedActivityTaskRow {
   readonly heartbeat_deadline_at_ms: number | null;
   readonly timeout_deadline_at_ms: number | null;
   readonly claim_expires_at_ms: number | null;
+  readonly claim_lease_duration_ms: number | null;
   readonly terminal_event_id: number | null;
   readonly map_command_key: string | null;
   readonly map_item_ordinal: number | null;
@@ -4613,6 +4764,7 @@ interface NormalizedActivityTaskLoadRow {
   readonly heartbeat_deadline_at_ms: number | string | null;
   readonly timeout_deadline_at_ms: number | string | null;
   readonly claim_expires_at_ms: number | string | null;
+  readonly claim_lease_duration_ms: number | string | null;
   readonly terminal_event_id: number | string | null;
   readonly map_command_key: string | null;
   readonly map_item_ordinal: number | string | null;
@@ -4628,6 +4780,7 @@ interface NormalizedWorkflowRunLoadRow {
   readonly task_queue: string;
   readonly tail_event_id: number | string;
   readonly ready_reason: string | null;
+  readonly ready_at_ms: number | string;
   readonly claim_worker_id: string | null;
   readonly claim_token: number | string | null;
   readonly claim_reason: string | null;
@@ -4896,6 +5049,11 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
+function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): void {
+  state.readyReason = reason;
+  state.readyAtMs = 0;
+}
+
 function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
   return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
 }
@@ -4951,17 +5109,24 @@ function retryActivityAfterTimeout(
   activity: ActivityState,
   nowMs: number
 ): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
+  return retryActivityTaskAfterTimeout(activity.task, nowMs);
+}
+
+function retryActivityTaskAfterTimeout(
+  task: ActivityTask,
+  nowMs: number
+): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
+  const policy = task.retryPolicy;
   const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (activity.task.attempt >= maxAttempts) {
+  if (task.attempt >= maxAttempts) {
     return null;
   }
   return {
     task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
+      ...task,
+      attempt: task.attempt + 1
     },
-    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+    readyAtMs: nowMs + retryDelayMs(task.attempt, policy)
   };
 }
 
@@ -4975,10 +5140,15 @@ function retryDelayMs(
   return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
-function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
-  return task.heartbeatTimeoutMs === null
-    ? null
-    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+function activityHeartbeatDeadlineAt(
+  task: ActivityTask,
+  nowMs: number,
+  leaseDurationMs: number
+): number | null {
+  if (task.heartbeatTimeoutMs !== null) {
+    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
+  }
+  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
 function activityTimeoutDeadlineFromTask(
@@ -5053,6 +5223,7 @@ function normalizedWorkflowRunRow(workflow: WorkflowState): NormalizedWorkflowRu
     task_queue: workflow.taskQueue,
     tail_event_id: Number(tailEventId(workflow)),
     ready_reason: workflow.readyReason,
+    ready_at_ms: workflow.readyAtMs,
     claim_worker_id: workflow.claim === null ? null : String(workflow.claim.claim.workerId),
     claim_token: workflow.claim?.claim.token ?? null,
     claim_reason: workflow.claim?.reason ?? null,
@@ -5119,6 +5290,7 @@ function normalizedActivityTaskRow(activity: ActivityState): NormalizedActivityT
     heartbeat_deadline_at_ms: activity.claim?.heartbeatDeadlineAtMs ?? null,
     timeout_deadline_at_ms: Number.isFinite(timeoutDeadline) ? timeoutDeadline : null,
     claim_expires_at_ms: activity.claim?.expiresAtMs ?? null,
+    claim_lease_duration_ms: activity.claim?.leaseDurationMs ?? null,
     terminal_event_id: activity.terminalEventId === null ? null : Number(activity.terminalEventId),
     map_command_key:
       activity.task.mapItem === null ? null : commandKey(activity.task.mapItem.mapCommandId),
@@ -5145,6 +5317,7 @@ function normalizedActivityTaskRowFromTask(
     heartbeat_deadline_at_ms: null,
     timeout_deadline_at_ms: null,
     claim_expires_at_ms: null,
+    claim_lease_duration_ms: null,
     terminal_event_id: null,
     map_command_key: task.mapItem === null ? null : commandKey(task.mapItem.mapCommandId),
     map_item_ordinal: task.mapItem?.itemOrdinal ?? null

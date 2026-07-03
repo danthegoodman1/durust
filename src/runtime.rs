@@ -113,18 +113,7 @@ pub(crate) struct RuntimeContext {
     needs_more_history: bool,
     last_ready_event_id: Option<crate::EventId>,
     next_command_seq: u64,
-    completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
-    failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
-    map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
-    map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_map_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)>,
-    child_map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_starts: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)>,
-    child_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)>,
-    child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
-    child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
-    timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
-    consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
+    indexes: ReadyEventIndexes,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
     hydrated_payloads: BTreeMap<String, PayloadRef>,
@@ -141,6 +130,110 @@ pub(crate) struct RuntimeContext {
     delete_waits: Vec<WaitId>,
     cancel_commands: Vec<CommandId>,
     query_projection: Option<PayloadRef>,
+}
+
+/// Per-command-seq indexes over ready events (completions, failures, timer
+/// fires, consumed signals, child lifecycle). They are the single consumption
+/// path for ready events during replay (see `take_indexed`); the replay
+/// cursor only skips over them. Entries a committed task did not consume are
+/// carried into the worker's `CachedWorkflow` and seed the next task's
+/// context, so a run holding an unawaited handle stays cached instead of
+/// cold-replaying: chunks are `after_event_id`-based, so a carried entry can
+/// never be re-collected from a later chunk.
+#[derive(Debug, Default)]
+pub(crate) struct ReadyEventIndexes {
+    completions: BTreeMap<CommandSeq, (crate::EventId, PayloadRef)>,
+    failures: BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)>,
+    map_completions: BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)>,
+    map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_map_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)>,
+    child_map_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_starts: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)>,
+    child_completions: BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)>,
+    child_failures: BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)>,
+    child_cancellations: BTreeMap<CommandSeq, (crate::EventId, String)>,
+    timers: BTreeMap<CommandSeq, (crate::EventId, TimerFired)>,
+    consumed_signals: BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)>,
+}
+
+impl ReadyEventIndexes {
+    /// Indexes every ready event in one pass over the chunk. Must run on both
+    /// the initial history and every appended chunk so out-of-order arrivals
+    /// stay claimable through the indexes.
+    fn index_events(&mut self, events: &[HistoryEvent]) {
+        for event in events {
+            let event_id = event.event_id;
+            match &event.data {
+                HistoryEventData::ActivityCompleted(completed) => {
+                    self.completions.insert(
+                        completed.command_id.seq,
+                        (event_id, completed.result.clone()),
+                    );
+                }
+                HistoryEventData::ActivityFailed(failed) => {
+                    self.failures.insert(
+                        failed.command_id.seq,
+                        (
+                            event_id,
+                            ActivityTerminalError::Failed(failed.failure.clone()),
+                        ),
+                    );
+                }
+                HistoryEventData::ActivityTimedOut(timed_out) => {
+                    self.failures.insert(
+                        timed_out.command_id.seq,
+                        (
+                            event_id,
+                            ActivityTerminalError::TimedOut(timed_out.message.clone()),
+                        ),
+                    );
+                }
+                HistoryEventData::ActivityMapCompleted(completed) => {
+                    self.map_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ActivityMapFailed(failed) => {
+                    self.map_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowMapCompleted(completed) => {
+                    self.child_map_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ChildWorkflowMapFailed(failed) => {
+                    self.child_map_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowStarted(started) => {
+                    self.child_starts
+                        .insert(started.command_id.seq, (event_id, started.clone()));
+                }
+                HistoryEventData::ChildWorkflowCompleted(completed) => {
+                    self.child_completions
+                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                }
+                HistoryEventData::ChildWorkflowFailed(failed) => {
+                    self.child_failures
+                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                }
+                HistoryEventData::ChildWorkflowCancelled(cancelled) => {
+                    self.child_cancellations.insert(
+                        cancelled.command_id.seq,
+                        (event_id, cancelled.reason.clone()),
+                    );
+                }
+                HistoryEventData::TimerFired(fired) => {
+                    self.timers
+                        .insert(fired.command_id.seq, (event_id, fired.clone()));
+                }
+                HistoryEventData::SignalConsumed(consumed) => {
+                    self.consumed_signals
+                        .insert(consumed.command_id.seq, (event_id, consumed.clone()));
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,27 +298,6 @@ pub(crate) struct PayloadHydrationRequest {
 }
 
 impl PayloadHydrationRequest {
-    fn payload(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::Payload,
-            payload,
-        }
-    }
-
-    fn activity_map_result_manifest(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::ActivityMapResultManifest,
-            payload,
-        }
-    }
-
-    fn child_workflow_map_result_manifest(payload: PayloadRef) -> Self {
-        Self {
-            kind: PayloadHydrationKind::ChildWorkflowMapResultManifest,
-            payload,
-        }
-    }
-
     pub(crate) fn key(&self) -> String {
         payload_hydration_key(self.kind, &self.payload)
     }
@@ -274,6 +346,7 @@ impl ActivityTerminalError {
 }
 
 impl RuntimeContext {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         run_id: RunId,
         worker_workflow_task_queue: TaskQueue,
@@ -286,19 +359,13 @@ impl RuntimeContext {
         last_loaded_event_id: crate::EventId,
         replay_target_event_id: crate::EventId,
         change_versions: Vec<WorkflowChangeVersionRecord>,
+        carried_indexes: ReadyEventIndexes,
     ) -> Self {
-        let completions = collect_completions(&replay_events);
-        let failures = collect_failures(&replay_events);
-        let map_completions = collect_map_completions(&replay_events);
-        let map_failures = collect_map_failures(&replay_events);
-        let child_map_completions = collect_child_map_completions(&replay_events);
-        let child_map_failures = collect_child_map_failures(&replay_events);
-        let child_starts = collect_child_starts(&replay_events);
-        let child_completions = collect_child_completions(&replay_events);
-        let child_failures = collect_child_failures(&replay_events);
-        let child_cancellations = collect_child_cancellations(&replay_events);
-        let timers = collect_timers(&replay_events);
-        let consumed_signals = collect_consumed_signals(&replay_events);
+        // Carried entries all precede this task's chunk (their events were
+        // loaded and committed by an earlier task), so indexing the new chunk
+        // on top cannot collide with them.
+        let mut indexes = carried_indexes;
+        indexes.index_events(&replay_events);
         let change_markers = change_versions
             .into_iter()
             .map(RuntimeChangeMarker::from_record)
@@ -320,18 +387,7 @@ impl RuntimeContext {
             needs_more_history: false,
             last_ready_event_id: None,
             next_command_seq,
-            completions,
-            failures,
-            map_completions,
-            map_failures,
-            child_map_completions,
-            child_map_failures,
-            child_starts,
-            child_completions,
-            child_failures,
-            child_cancellations,
-            timers,
-            consumed_signals,
+            indexes,
             live_signals: BTreeMap::new(),
             payload_hydration_requests: BTreeMap::new(),
             hydrated_payloads: BTreeMap::new(),
@@ -371,6 +427,14 @@ impl RuntimeContext {
         self.next_command_seq
     }
 
+    /// Extracts the ready-event entries this task did not consume so the
+    /// worker can carry them into `CachedWorkflow`; the next task's context
+    /// is constructed with them and the run stays cached instead of
+    /// cold-replaying to rebuild the indexes.
+    pub(crate) fn take_unconsumed_ready_event_indexes(&mut self) -> ReadyEventIndexes {
+        std::mem::take(&mut self.indexes)
+    }
+
     fn encode_payload<T>(&self, value: &T) -> Result<PayloadRef>
     where
         T: serde::Serialize + ?Sized,
@@ -396,27 +460,7 @@ impl RuntimeContext {
             self.replay_events.drain(..self.replay_cursor);
             self.replay_cursor = 0;
         }
-        self.completions.extend(collect_completions(&events));
-        self.failures.extend(collect_failures(&events));
-        self.map_completions
-            .extend(collect_map_completions(&events));
-        self.map_failures.extend(collect_map_failures(&events));
-        // Child-workflow-map terminal events must be indexed on appended chunks too,
-        // mirroring `new()`, so a completion/failure arriving in a later recovery
-        // chunk is still found by the indexed lookup path during multi-chunk replay.
-        self.child_map_completions
-            .extend(collect_child_map_completions(&events));
-        self.child_map_failures
-            .extend(collect_child_map_failures(&events));
-        self.child_starts.extend(collect_child_starts(&events));
-        self.child_completions
-            .extend(collect_child_completions(&events));
-        self.child_failures.extend(collect_child_failures(&events));
-        self.child_cancellations
-            .extend(collect_child_cancellations(&events));
-        self.timers.extend(collect_timers(&events));
-        self.consumed_signals
-            .extend(collect_consumed_signals(&events));
+        self.indexes.index_events(&events);
         self.replay_events.extend(events);
         self.last_loaded_event_id = last_loaded_event_id;
     }
@@ -425,14 +469,30 @@ impl RuntimeContext {
         std::mem::take(&mut self.signal_requests)
     }
 
+    /// Hands an inbox record to a live signal waiter and reports whether the
+    /// record was accepted. Signal consumption only commits with the task, so
+    /// the same inbox record can be re-read mid-task; a record already
+    /// consumed by this task (`consume_signals`) or already handed to another
+    /// waiter (`live_signals`) is dropped and the waiter stays pending until a
+    /// distinct delivery arrives.
     pub(crate) fn fulfill_signal_request(
         &mut self,
         command_id: CommandId,
         signal: Option<SignalInboxRecordForRuntime>,
-    ) {
-        if let Some(signal) = signal {
-            self.live_signals.insert(command_id.seq, signal);
+    ) -> bool {
+        let Some(signal) = signal else {
+            return false;
+        };
+        let consumed_by_task = self.consume_signals.contains(&signal.signal_id);
+        let handed_to_other_waiter = self
+            .live_signals
+            .values()
+            .any(|live| live.signal_id == signal.signal_id);
+        if consumed_by_task || handed_to_other_waiter {
+            return false;
         }
+        self.live_signals.insert(command_id.seq, signal);
+        true
     }
 
     pub(crate) fn take_payload_hydration_requests(&mut self) -> Vec<PayloadHydrationRequest> {
@@ -485,8 +545,21 @@ impl RuntimeContext {
         }
     }
 
-    fn peek_replay_event(&mut self) -> Option<&HistoryEvent> {
-        self.skip_consumed_replay_events();
+    /// Peeks the next replay event that can match a new command, skipping
+    /// ready events (activity/timer/signal/child/map completions and facts)
+    /// that valid histories interleave ahead of command events. Skipped
+    /// events are not consumed: they stay claimable through the per-command
+    /// index maps, and `record_indexed_ready_event_id` only tracks ids the
+    /// cursor has not passed, so every event is handed out exactly once.
+    fn peek_replay_command_event(&mut self) -> Option<&HistoryEvent> {
+        loop {
+            self.skip_consumed_replay_events();
+            let event = self.replay_events.get(self.replay_cursor)?;
+            if !is_index_consumable_ready_event(&event.data) {
+                break;
+            }
+            self.replay_cursor += 1;
+        }
         self.replay_events.get(self.replay_cursor)
     }
 
@@ -553,6 +626,25 @@ impl RuntimeContext {
             && self.last_loaded_event_id >= self.replay_target_event_id
     }
 
+    /// The next un-replayed command event still sitting in loaded history.
+    /// Unconsumed ready events are legal at any point (fire-and-forget), so
+    /// the peek skips them without consuming; a command event left behind
+    /// when the workflow reaches a terminal state is divergence.
+    pub(crate) fn unreplayed_command_event(
+        &mut self,
+    ) -> Option<(crate::EventId, crate::HistoryEventType)> {
+        self.peek_replay_command_event()
+            .map(|event| (event.event_id, event.event_type))
+    }
+
+    /// Where loading must resume when events up to the replay target are not
+    /// loaded yet, so the terminal divergence check can inspect the rest of
+    /// history.
+    pub(crate) fn unloaded_history_after(&self) -> Option<crate::EventId> {
+        (self.last_loaded_event_id < self.replay_target_event_id)
+            .then_some(self.last_loaded_event_id)
+    }
+
     fn request_more_history_if_available(&mut self) -> bool {
         if self.last_loaded_event_id < self.replay_target_event_id {
             self.needs_more_history = true;
@@ -567,299 +659,251 @@ impl RuntimeContext {
     }
 
     fn record_indexed_ready_event_id(&mut self, event_id: crate::EventId) {
-        self.consumed_replay_event_ids.insert(event_id);
+        // Only remember ids the cursor has not passed yet. The cursor skips
+        // ready events without consuming them, so an id behind the cursor will
+        // never be encountered again and would otherwise accumulate in the
+        // consumed set for the lifetime of the cached context.
+        let cursor_before_event = self
+            .replay_events
+            .get(self.replay_cursor)
+            .is_some_and(|event| event_id >= event.event_id);
+        if cursor_before_event {
+            self.consumed_replay_event_ids.insert(event_id);
+        }
         self.record_ready_event_id(event_id);
     }
 
-    fn ready_payload_or_request(&mut self, request: PayloadHydrationRequest) -> Option<PayloadRef> {
-        if matches!(request.payload, PayloadRef::Inline { .. }) {
-            return Some(request.payload);
+    /// True once every loaded replay event has been matched, consumed, or
+    /// skipped and no more history remains to load. Live (non-replay) signal
+    /// consumption must wait for this point: a consumption recorded in a
+    /// not-yet-loaded chunk must win over handing the waiter a fresh inbox
+    /// record for the same wait.
+    fn replay_drained_for_live_events(&mut self) -> bool {
+        self.peek_replay_command_event().is_none() && self.at_replay_tail()
+    }
+
+    /// Resolves a payload for consumption without cloning it: inline plain
+    /// payloads short-circuit, a fulfilled hydration is claimed, and an
+    /// unresolved blob registers a hydration request (cloning only the small
+    /// blob ref) and hands the original back through `Err` so the caller can
+    /// re-file it for the retry poll. Manifest kinds never short-circuit:
+    /// they offload each level independently, so an inline root can still
+    /// hold blob-backed pages and always goes through the provider's manifest
+    /// hydrator.
+    fn ready_payload_or_request(
+        &mut self,
+        kind: PayloadHydrationKind,
+        payload: PayloadRef,
+    ) -> std::result::Result<PayloadRef, PayloadRef> {
+        if kind == PayloadHydrationKind::Payload && matches!(payload, PayloadRef::Inline { .. }) {
+            return Ok(payload);
         }
-        let key = request.key();
+        let key = payload_hydration_key(kind, &payload);
         if let Some(hydrated) = self.hydrated_payloads.remove(&key) {
-            return Some(hydrated);
+            return Ok(hydrated);
         }
         self.payload_hydration_requests
             .entry(key)
-            .or_insert(request);
-        None
+            .or_insert_with(|| PayloadHydrationRequest {
+                kind,
+                payload: payload.clone(),
+            });
+        Err(payload)
+    }
+
+    /// Consumes an indexed ready event exactly once. Every ready event is
+    /// collected into its per-command-seq index map at chunk load, so the
+    /// index is the single consumption path; the replay cursor only skips
+    /// ready events and never hands them out. The entry is removed before
+    /// hydration and re-filed through `Err` when hydration is still pending,
+    /// so a later poll can retry without ever cloning the value.
+    fn take_indexed<V>(
+        &mut self,
+        command_id: &CommandId,
+        index: impl Fn(&mut ReadyEventIndexes) -> &mut BTreeMap<CommandSeq, (crate::EventId, V)>,
+        hydrate: impl FnOnce(&mut Self, V) -> std::result::Result<V, V>,
+    ) -> Option<V> {
+        let (event_id, value) = index(&mut self.indexes).remove(&command_id.seq)?;
+        match hydrate(self, value) {
+            Ok(value) => {
+                self.record_indexed_ready_event_id(event_id);
+                Some(value)
+            }
+            Err(value) => {
+                index(&mut self.indexes).insert(command_id.seq, (event_id, value));
+                None
+            }
+        }
     }
 
     fn take_completion(&mut self, command_id: &CommandId) -> Option<PayloadRef> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ActivityCompleted(completed) = event.data {
-                if completed.command_id.seq == command_id.seq {
-                    let result = self.ready_payload_or_request(
-                        PayloadHydrationRequest::payload(completed.result),
-                    )?;
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.completions.remove(&command_id.seq);
-                    return Some(result);
-                }
-            }
-        }
-        let (event_id, result) = self.completions.get(&command_id.seq).cloned()?;
-        let result = self.ready_payload_or_request(PayloadHydrationRequest::payload(result))?;
-        self.completions.remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(result)
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.completions,
+            |runtime, result| {
+                runtime.ready_payload_or_request(PayloadHydrationKind::Payload, result)
+            },
+        )
     }
 
     fn take_failure(&mut self, command_id: &CommandId) -> Option<ActivityTerminalError> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            match event.data {
-                HistoryEventData::ActivityFailed(failed)
-                    if failed.command_id.seq == command_id.seq =>
-                {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.failures.remove(&command_id.seq);
-                    return Some(ActivityTerminalError::Failed(failed.failure));
-                }
-                HistoryEventData::ActivityTimedOut(timed_out)
-                    if timed_out.command_id.seq == command_id.seq =>
-                {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.failures.remove(&command_id.seq);
-                    return Some(ActivityTerminalError::TimedOut(timed_out.message));
-                }
-                _ => {}
-            }
-        }
-        self.failures
-            .remove(&command_id.seq)
-            .map(|(event_id, failure)| {
-                self.record_indexed_ready_event_id(event_id);
-                failure
-            })
+        self.take_indexed(command_id, |indexes| &mut indexes.failures, |_, v| Ok(v))
     }
 
     fn take_timer(&mut self, command_id: &CommandId) -> Option<TimerFired> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::TimerFired(fired) = event.data {
-                if fired.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.timers.remove(&command_id.seq);
-                    return Some(fired);
-                }
-            }
-        }
-        self.timers
-            .remove(&command_id.seq)
-            .map(|(event_id, fired)| {
-                self.record_indexed_ready_event_id(event_id);
-                fired
-            })
+        self.take_indexed(command_id, |indexes| &mut indexes.timers, |_, v| Ok(v))
     }
 
     fn take_map_completion(&mut self, command_id: &CommandId) -> Option<ActivityMapCompleted> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ActivityMapCompleted(completed) = event.data {
-                if completed.command_id.seq == command_id.seq {
-                    let mut completed = completed;
-                    completed.result_manifest = self.ready_payload_or_request(
-                        PayloadHydrationRequest::activity_map_result_manifest(
-                            completed.result_manifest,
-                        ),
-                    )?;
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.map_completions.remove(&command_id.seq);
-                    return Some(completed);
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.map_completions,
+            |runtime, mut completed| match runtime.ready_payload_or_request(
+                PayloadHydrationKind::ActivityMapResultManifest,
+                completed.result_manifest,
+            ) {
+                Ok(manifest) => {
+                    completed.result_manifest = manifest;
+                    Ok(completed)
                 }
-            }
-        }
-        let (event_id, mut completed) = self.map_completions.get(&command_id.seq).cloned()?;
-        completed.result_manifest = self.ready_payload_or_request(
-            PayloadHydrationRequest::activity_map_result_manifest(completed.result_manifest),
-        )?;
-        self.map_completions.remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(completed)
+                Err(manifest) => {
+                    completed.result_manifest = manifest;
+                    Err(completed)
+                }
+            },
+        )
     }
 
     fn take_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ActivityMapFailed(failed) = event.data {
-                if failed.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.map_failures.remove(&command_id.seq);
-                    return Some(failed.failure);
-                }
-            }
-        }
-        self.map_failures
-            .remove(&command_id.seq)
-            .map(|(event_id, failure)| {
-                self.record_indexed_ready_event_id(event_id);
-                failure
-            })
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.map_failures,
+            |_, v| Ok(v),
+        )
     }
 
     fn take_child_map_completion(
         &mut self,
         command_id: &CommandId,
     ) -> Option<ChildWorkflowMapCompleted> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowMapCompleted(completed) = event.data {
-                if completed.command_id.seq == command_id.seq {
-                    let mut completed = completed;
-                    completed.result_manifest = self.ready_payload_or_request(
-                        PayloadHydrationRequest::child_workflow_map_result_manifest(
-                            completed.result_manifest,
-                        ),
-                    )?;
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_map_completions.remove(&command_id.seq);
-                    return Some(completed);
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_map_completions,
+            |runtime, mut completed| match runtime.ready_payload_or_request(
+                PayloadHydrationKind::ChildWorkflowMapResultManifest,
+                completed.result_manifest,
+            ) {
+                Ok(manifest) => {
+                    completed.result_manifest = manifest;
+                    Ok(completed)
                 }
-            }
-        }
-        let (event_id, mut completed) = self.child_map_completions.get(&command_id.seq).cloned()?;
-        completed.result_manifest = self.ready_payload_or_request(
-            PayloadHydrationRequest::child_workflow_map_result_manifest(completed.result_manifest),
-        )?;
-        self.child_map_completions.remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(completed)
+                Err(manifest) => {
+                    completed.result_manifest = manifest;
+                    Err(completed)
+                }
+            },
+        )
     }
 
     fn take_child_map_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowMapFailed(failed) = event.data {
-                if failed.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_map_failures.remove(&command_id.seq);
-                    return Some(failed.failure);
-                }
-            }
-        }
-        self.child_map_failures
-            .remove(&command_id.seq)
-            .map(|(event_id, failure)| {
-                self.record_indexed_ready_event_id(event_id);
-                failure
-            })
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_map_failures,
+            |_, v| Ok(v),
+        )
     }
 
     fn take_child_started(&mut self, command_id: &CommandId) -> Option<ChildWorkflowStarted> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowStarted(started) = event.data {
-                if started.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_starts.remove(&command_id.seq);
-                    return Some(started);
-                }
-            }
-        }
-        self.child_starts
-            .remove(&command_id.seq)
-            .map(|(event_id, started)| {
-                self.record_indexed_ready_event_id(event_id);
-                started
-            })
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_starts,
+            |_, v| Ok(v),
+        )
     }
 
     fn take_child_completion(&mut self, command_id: &CommandId) -> Option<ChildWorkflowCompleted> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowCompleted(completed) = event.data {
-                if completed.command_id.seq == command_id.seq {
-                    let mut completed = completed;
-                    completed.result = self.ready_payload_or_request(
-                        PayloadHydrationRequest::payload(completed.result),
-                    )?;
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_completions.remove(&command_id.seq);
-                    return Some(completed);
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_completions,
+            |runtime, mut completed| match runtime
+                .ready_payload_or_request(PayloadHydrationKind::Payload, completed.result)
+            {
+                Ok(result) => {
+                    completed.result = result;
+                    Ok(completed)
                 }
-            }
-        }
-        let (event_id, mut completed) = self.child_completions.get(&command_id.seq).cloned()?;
-        completed.result =
-            self.ready_payload_or_request(PayloadHydrationRequest::payload(completed.result))?;
-        self.child_completions.remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(completed)
+                Err(result) => {
+                    completed.result = result;
+                    Err(completed)
+                }
+            },
+        )
     }
 
     fn take_child_failure(&mut self, command_id: &CommandId) -> Option<crate::DurableFailure> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowFailed(failed) = event.data {
-                if failed.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_failures.remove(&command_id.seq);
-                    return Some(failed.failure);
-                }
-            }
-        }
-        self.child_failures
-            .remove(&command_id.seq)
-            .map(|(event_id, failure)| {
-                self.record_indexed_ready_event_id(event_id);
-                failure
-            })
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_failures,
+            |_, v| Ok(v),
+        )
     }
 
     fn take_child_cancellation(&mut self, command_id: &CommandId) -> Option<String> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::ChildWorkflowCancelled(cancelled) = event.data {
-                if cancelled.command_id.seq == command_id.seq {
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.child_cancellations.remove(&command_id.seq);
-                    return Some(cancelled.reason);
-                }
-            }
-        }
-        self.child_cancellations
-            .remove(&command_id.seq)
-            .map(|(event_id, reason)| {
-                self.record_indexed_ready_event_id(event_id);
-                reason
-            })
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.child_cancellations,
+            |_, v| Ok(v),
+        )
     }
 
     fn take_live_signal(&mut self, command_id: &CommandId) -> Option<SignalInboxRecordForRuntime> {
-        let mut signal = self.live_signals.get(&command_id.seq).cloned()?;
-        signal.payload =
-            self.ready_payload_or_request(PayloadHydrationRequest::payload(signal.payload))?;
-        self.live_signals.remove(&command_id.seq);
-        Some(signal)
+        if !self.replay_drained_for_live_events() {
+            return None;
+        }
+        let mut signal = self.live_signals.remove(&command_id.seq)?;
+        match self.ready_payload_or_request(PayloadHydrationKind::Payload, signal.payload) {
+            Ok(payload) => {
+                signal.payload = payload;
+                Some(signal)
+            }
+            Err(payload) => {
+                signal.payload = payload;
+                self.live_signals.insert(command_id.seq, signal);
+                None
+            }
+        }
     }
 
     fn take_consumed_signal(&mut self, command_id: &CommandId) -> Option<SignalConsumed> {
-        if let Some(event) = self.peek_replay_event().cloned() {
-            if let HistoryEventData::SignalConsumed(consumed) = event.data {
-                if consumed.command_id.seq == command_id.seq {
-                    let mut consumed = consumed;
-                    consumed.payload = self.ready_payload_or_request(
-                        PayloadHydrationRequest::payload(consumed.payload),
-                    )?;
-                    self.advance_replay();
-                    self.record_ready_event_id(event.event_id);
-                    self.consumed_signals.remove(&command_id.seq);
-                    return Some(consumed);
+        self.take_indexed(
+            command_id,
+            |indexes| &mut indexes.consumed_signals,
+            |runtime, mut consumed| match runtime
+                .ready_payload_or_request(PayloadHydrationKind::Payload, consumed.payload)
+            {
+                Ok(payload) => {
+                    consumed.payload = payload;
+                    Ok(consumed)
                 }
-            }
-        }
-        let (event_id, mut consumed) = self.consumed_signals.get(&command_id.seq).cloned()?;
-        consumed.payload =
-            self.ready_payload_or_request(PayloadHydrationRequest::payload(consumed.payload))?;
-        self.consumed_signals.remove(&command_id.seq);
-        self.record_indexed_ready_event_id(event_id);
-        Some(consumed)
+                Err(payload) => {
+                    consumed.payload = payload;
+                    Err(consumed)
+                }
+            },
+        )
+    }
+
+    fn has_recorded_signal_consumption(&self, command_id: &CommandId) -> bool {
+        self.indexes.consumed_signals.contains_key(&command_id.seq)
     }
 
     fn request_signal(&mut self, command_id: CommandId, signal_name: SignalName) {
+        // Requesting a live inbox record before replay is drained could hand
+        // the waiter a fresh record while its recorded consumption still sits
+        // in a not-yet-loaded chunk, consuming two records for one wait.
+        if !self.replay_drained_for_live_events() {
+            return;
+        }
         if !self
             .signal_requests
             .iter()
@@ -870,6 +914,16 @@ impl RuntimeContext {
                 signal_name,
             });
         }
+    }
+
+    /// Releases a waiter's claim on any pending live signal delivery, used
+    /// when a select loser is cancelled so an already-fulfilled inbox record
+    /// becomes available to other waiters instead of being blocked by the
+    /// duplicate-delivery guard in `fulfill_signal_request`.
+    fn abandon_live_signal(&mut self, command_id: &CommandId) {
+        self.live_signals.remove(&command_id.seq);
+        self.signal_requests
+            .retain(|request| request.command_id.seq != command_id.seq);
     }
 
     fn effective_activity_options(&self, overrides: ActivityOptions) -> ActivityOptions {
@@ -887,7 +941,7 @@ impl RuntimeContext {
     ) -> Result<i32> {
         validate_version_range(&change_id, min_supported, max_supported)?;
 
-        if let Some(event) = self.peek_replay_event().cloned() {
+        if let Some(event) = self.peek_replay_command_event().cloned() {
             match event.data {
                 HistoryEventData::VersionMarker(marker) => {
                     if marker.change_id != change_id {
@@ -955,7 +1009,7 @@ impl RuntimeContext {
     }
 
     fn deprecate_patch(&mut self, patch_id: String) -> Result<()> {
-        if let Some(event) = self.peek_replay_event().cloned() {
+        if let Some(event) = self.peek_replay_command_event().cloned() {
             match event.data {
                 HistoryEventData::VersionMarker(marker) => {
                     if marker.change_id != patch_id {
@@ -1186,7 +1240,7 @@ where
                 )));
             }
 
-            if let Some(event) = runtime.peek_replay_event().cloned() {
+            if let Some(event) = runtime.peek_replay_command_event().cloned() {
                 let HistoryEventData::SideEffectMarker(marker) = event.data else {
                     return Poll::Ready(Err(Error::Nondeterminism(format!(
                         "expected SideEffectMarker `{}`, found {:?}",
@@ -1696,40 +1750,34 @@ fn record_select_winner(
     branches_digest: &str,
 ) -> Poll<Result<()>> {
     with_context(|runtime| {
-        while let Some(event) = runtime.peek_replay_event().cloned() {
-            match event.data {
-                HistoryEventData::SelectWinner(winner) => {
-                    if winner.select_command_id.seq != select_command_id.seq {
-                        return Poll::Ready(Err(Error::Nondeterminism(format!(
-                            "expected SelectWinner command {}, found {}",
-                            select_command_id.seq.0, winner.select_command_id.seq.0
-                        ))));
-                    }
-                    if winner.branches_digest != branches_digest {
-                        return Poll::Ready(Err(Error::Nondeterminism(format!(
-                            "select branch order changed for command {}",
-                            select_command_id.seq.0
-                        ))));
-                    }
-                    if winner.branch_ordinal != branch_ordinal {
-                        return Poll::Ready(Err(Error::Nondeterminism(format!(
-                            "select winner changed for command {}: recorded {}, observed {}",
-                            select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
-                        ))));
-                    }
-                    if winner.winning_event_id != winning_event_id {
-                        return Poll::Ready(Err(Error::Nondeterminism(format!(
-                            "select winning event changed for command {}: recorded {}, observed {}",
-                            select_command_id.seq.0, winner.winning_event_id, winning_event_id
-                        ))));
-                    }
-                    runtime.advance_replay();
-                    return Poll::Ready(Ok(()));
+        if let Some(event) = runtime.peek_replay_command_event().cloned() {
+            if let HistoryEventData::SelectWinner(winner) = event.data {
+                if winner.select_command_id.seq != select_command_id.seq {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "expected SelectWinner command {}, found {}",
+                        select_command_id.seq.0, winner.select_command_id.seq.0
+                    ))));
                 }
-                other if select_can_ignore_losing_ready_event(&other) => {
-                    runtime.advance_replay();
+                if winner.branches_digest != branches_digest {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "select branch set changed for command {}: recorded digest `{}`, current `{}`",
+                        select_command_id.seq.0, winner.branches_digest, branches_digest
+                    ))));
                 }
-                _ => break,
+                if winner.branch_ordinal != branch_ordinal {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "select winner changed for command {}: recorded {}, observed {}",
+                        select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
+                    ))));
+                }
+                if winner.winning_event_id != winning_event_id {
+                    return Poll::Ready(Err(Error::Nondeterminism(format!(
+                        "select winning event changed for command {}: recorded {}, observed {}",
+                        select_command_id.seq.0, winner.winning_event_id, winning_event_id
+                    ))));
+                }
+                runtime.advance_replay();
+                return Poll::Ready(Ok(()));
             }
         }
         if runtime.request_more_history_if_available() {
@@ -1749,7 +1797,12 @@ fn record_select_winner(
     })
 }
 
-fn select_can_ignore_losing_ready_event(data: &HistoryEventData) -> bool {
+/// Ready events are facts about futures (completions, failures, timer fires,
+/// consumed signals, child lifecycle) that valid histories interleave ahead of
+/// command events. All of them are collected into the replay index maps at
+/// chunk load, so the cursor can skip past them and their waiters can still
+/// claim them through the indexes.
+fn is_index_consumable_ready_event(data: &HistoryEventData) -> bool {
     matches!(
         data,
         HistoryEventData::ActivityCompleted(_)
@@ -2014,7 +2067,7 @@ fn poll_activity_schedule<A>(
 where
     A: Activity,
 {
-    if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+    if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
         runtime.request_more_history_if_available();
         return Poll::Pending;
     }
@@ -2042,7 +2095,7 @@ where
         fingerprint_options.digest()?,
     );
 
-    if let Some(event) = runtime.peek_replay_event().cloned() {
+    if let Some(event) = runtime.peek_replay_command_event().cloned() {
         let HistoryEventData::ActivityScheduled(scheduled) = event.data else {
             return Poll::Ready(Err(Error::Nondeterminism(format!(
                 "expected ActivityScheduled for command {}, found {:?}",
@@ -2235,7 +2288,7 @@ where
     A: Activity,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ActivityMapHandle>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
             runtime.request_more_history_if_available();
             return Poll::Pending;
         }
@@ -2270,7 +2323,7 @@ where
             fingerprint_options.digest()?,
         );
 
-        if let Some(event) = runtime.peek_replay_event().cloned() {
+        if let Some(event) = runtime.peek_replay_command_event().cloned() {
             let HistoryEventData::ActivityMapScheduled(scheduled) = event.data else {
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected ActivityMapScheduled for command {}, found {:?}",
@@ -2519,7 +2572,7 @@ where
     W: Workflow,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowMapHandle>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
             runtime.request_more_history_if_available();
             return Poll::Pending;
         }
@@ -2551,7 +2604,7 @@ where
             self.failure_mode,
         );
 
-        if let Some(event) = runtime.peek_replay_event().cloned() {
+        if let Some(event) = runtime.peek_replay_command_event().cloned() {
             let HistoryEventData::ChildWorkflowMapScheduled(scheduled) = event.data else {
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected ChildWorkflowMapScheduled for command {}, found {:?}",
@@ -2790,7 +2843,7 @@ where
     W: Workflow,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowHandle<W>>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
             runtime.request_more_history_if_available();
             return Poll::Pending;
         }
@@ -2818,7 +2871,7 @@ where
             self.parent_close_policy,
         );
 
-        if let Some(event) = runtime.peek_replay_event().cloned() {
+        if let Some(event) = runtime.peek_replay_command_event().cloned() {
             let HistoryEventData::ChildWorkflowStartRequested(requested) = event.data else {
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected ChildWorkflowStartRequested for command {}, found {:?}",
@@ -3016,7 +3069,7 @@ impl DurableJoinBranch for TimerFuture {}
 
 impl TimerFuture {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<()>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
             runtime.request_more_history_if_available();
             return Poll::Pending;
         }
@@ -3024,7 +3077,7 @@ impl TimerFuture {
         let command_id = runtime.next_command_id();
         let (fingerprint, fire_at) = self.timer.fingerprint_and_fire_at(runtime.now);
 
-        if let Some(event) = runtime.peek_replay_event().cloned() {
+        if let Some(event) = runtime.peek_replay_command_event().cloned() {
             let HistoryEventData::TimerStarted(started) = event.data else {
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected TimerStarted for command {}, found {:?}",
@@ -3156,7 +3209,10 @@ where
 {
     fn __durust_cancel_branch(&self) {
         if let SignalFutureState::Waiting(command_id) = &self.state {
-            with_context(|runtime| runtime.delete_waits.push(signal_wait_id(command_id)));
+            with_context(|runtime| {
+                runtime.delete_waits.push(signal_wait_id(command_id));
+                runtime.abandon_live_signal(command_id);
+            });
         }
     }
 }
@@ -3168,7 +3224,7 @@ where
     T: serde::de::DeserializeOwned,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<T>> {
-        if runtime.peek_replay_event().is_none() && !runtime.at_replay_tail() {
+        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
             runtime.request_more_history_if_available();
             return Poll::Pending;
         }
@@ -3184,27 +3240,16 @@ where
                 consumed,
             ));
         }
-
-        if let Some(event) = runtime.peek_replay_event().cloned() {
-            if let HistoryEventData::SignalConsumed(consumed) = event.data {
-                if consumed.command_id.seq != command_id.seq {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "expected command seq {}, found {}",
-                        command_id.seq.0, consumed.command_id.seq.0
-                    ))));
-                }
-                self.state = SignalFutureState::Waiting(command_id);
-                runtime.request_more_history_if_available();
-                return Poll::Pending;
-            }
-
-            self.register_wait(runtime, &command_id);
-            runtime.request_more_history_if_available();
+        if runtime.has_recorded_signal_consumption(&command_id) {
+            // The recorded consumption is loaded but its payload hydration is
+            // still pending; wait without registering a live wait.
             self.state = SignalFutureState::Waiting(command_id);
+            runtime.request_more_history_if_available();
             return Poll::Pending;
         }
 
         self.register_wait(runtime, &command_id);
+        runtime.request_more_history_if_available();
         self.state = SignalFutureState::Waiting(command_id);
         Poll::Pending
     }
@@ -3223,17 +3268,10 @@ where
                 consumed,
             ));
         }
-        if let Some(event) = runtime.peek_replay_event().cloned() {
-            if let HistoryEventData::SignalConsumed(consumed) = event.data {
-                if consumed.command_id.seq == command_id.seq {
-                    runtime.request_more_history_if_available();
-                    return Poll::Pending;
-                }
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, consumed.command_id.seq.0
-                ))));
-            }
+        if runtime.has_recorded_signal_consumption(command_id) {
+            // Recorded consumption pending payload hydration.
+            runtime.request_more_history_if_available();
+            return Poll::Pending;
         }
         if let Some(signal) = runtime.take_live_signal(command_id) {
             runtime.consume_signals.push(signal.signal_id.clone());
@@ -3287,191 +3325,6 @@ where
         )));
     }
     crate::decode_payload::<T>(&consumed.payload)
-}
-
-fn collect_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, PayloadRef)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityCompleted(completed) => Some((
-                completed.command_id.seq,
-                (event.event_id, completed.result.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ActivityTerminalError)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityFailed(failed) => Some((
-                failed.command_id.seq,
-                (
-                    event.event_id,
-                    ActivityTerminalError::Failed(failed.failure.clone()),
-                ),
-            )),
-            HistoryEventData::ActivityTimedOut(timed_out) => Some((
-                timed_out.command_id.seq,
-                (
-                    event.event_id,
-                    ActivityTerminalError::TimedOut(timed_out.message.clone()),
-                ),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_map_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ActivityMapCompleted)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityMapCompleted(completed) => Some((
-                completed.command_id.seq,
-                (event.event_id, completed.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_map_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ActivityMapFailed(failed) => Some((
-                failed.command_id.seq,
-                (event.event_id, failed.failure.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_map_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowMapCompleted)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowMapCompleted(completed) => Some((
-                completed.command_id.seq,
-                (event.event_id, completed.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_map_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowMapFailed(failed) => Some((
-                failed.command_id.seq,
-                (event.event_id, failed.failure.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_starts(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowStarted)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowStarted(started) => {
-                Some((started.command_id.seq, (event.event_id, started.clone())))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_completions(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, ChildWorkflowCompleted)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowCompleted(completed) => Some((
-                completed.command_id.seq,
-                (event.event_id, completed.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_failures(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, crate::DurableFailure)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowFailed(failed) => Some((
-                failed.command_id.seq,
-                (event.event_id, failed.failure.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_child_cancellations(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, String)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => Some((
-                cancelled.command_id.seq,
-                (event.event_id, cancelled.reason.clone()),
-            )),
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_timers(events: &[HistoryEvent]) -> BTreeMap<CommandSeq, (crate::EventId, TimerFired)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::TimerFired(fired) => {
-                Some((fired.command_id.seq, (event.event_id, fired.clone())))
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-fn collect_consumed_signals(
-    events: &[HistoryEvent],
-) -> BTreeMap<CommandSeq, (crate::EventId, SignalConsumed)> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::SignalConsumed(consumed) => {
-                Some((consumed.command_id.seq, (event.event_id, consumed.clone())))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 pub(crate) fn is_terminal(data: &HistoryEventData) -> bool {
@@ -3621,7 +3474,10 @@ mod tests {
                     failure_count: 0,
                 })
             },
-            |runtime, command_id| runtime.take_map_completion(command_id).is_some(),
+            |runtime, command_id| {
+                take_after_hydration(runtime, |runtime| runtime.take_map_completion(command_id))
+                    .is_some()
+            },
         );
         assert_indexed_ready_event_skips(
             "activity_map_failed",
@@ -3700,6 +3556,51 @@ mod tests {
     }
 
     #[test]
+    fn peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them() {
+        // An unconsumed ready event at the cursor head must not block command
+        // matching: the peek skips it, it stays claimable through the index
+        // exactly once, and the following command event is returned.
+        let run_id = RunId::new("run/skip-unconsumed");
+        let completion_command_id = command_id(&run_id, 1);
+        let timer_command_id = command_id(&run_id, 2);
+        let mut runtime = runtime_with_history(
+            run_id,
+            vec![
+                event(
+                    1,
+                    HistoryEventData::ActivityCompleted(ActivityCompleted {
+                        command_id: completion_command_id.clone(),
+                        result: payload(&11_u64),
+                    }),
+                ),
+                event(
+                    2,
+                    HistoryEventData::TimerStarted(TimerStarted {
+                        command_id: timer_command_id,
+                        fire_at: TimestampMs(10),
+                        fingerprint: timer_fingerprint("sleep", TimestampMs(10)),
+                    }),
+                ),
+            ],
+        );
+
+        let next = runtime
+            .peek_replay_command_event()
+            .expect("command event past the unconsumed completion");
+        assert!(matches!(next.data, HistoryEventData::TimerStarted(_)));
+        assert_eq!(next.event_id, EventId(2));
+
+        assert!(
+            runtime.take_completion(&completion_command_id).is_some(),
+            "skipped completion must remain claimable through the index"
+        );
+        assert!(
+            runtime.take_completion(&completion_command_id).is_none(),
+            "skipped completion must be consumable exactly once"
+        );
+    }
+
+    #[test]
     fn appended_child_workflow_map_terminals_are_indexed_for_out_of_order_replay() {
         // A child-workflow-map terminal that streams in a later recovery chunk must be
         // indexed by `append_replay_events`, not only by `new()`. Otherwise the indexed
@@ -3717,7 +3618,12 @@ mod tests {
                     cancellation_count: 0,
                 })
             },
-            |runtime, command_id| runtime.take_child_map_completion(command_id).is_some(),
+            |runtime, command_id| {
+                take_after_hydration(runtime, |runtime| {
+                    runtime.take_child_map_completion(command_id)
+                })
+                .is_some()
+            },
         );
         assert_appended_indexed_event_skips(
             "child_workflow_map_failed",
@@ -3766,6 +3672,7 @@ mod tests {
             EventId(1),
             EventId(3),
             Vec::new(),
+            ReadyEventIndexes::default(),
         );
         runtime.append_replay_events(
             vec![
@@ -3784,7 +3691,7 @@ mod tests {
             "{case_name} should still consume the in-cursor event"
         );
         let next = runtime
-            .peek_replay_event()
+            .peek_replay_command_event()
             .unwrap_or_else(|| panic!("{case_name} should skip the consumed indexed event"));
         assert!(
             matches!(next.data, HistoryEventData::TimerStarted(_)),
@@ -3792,6 +3699,30 @@ mod tests {
             next.event_type
         );
         assert_eq!(next.event_id, EventId(3));
+    }
+
+    // Mirrors the worker's hydration round trip for manifest takes: the first
+    // take registers a hydration request (an inline manifest root may still
+    // hold blob-backed pages), the worker fulfills it, and the retry take
+    // consumes the event.
+    fn take_after_hydration<T>(
+        runtime: &mut RuntimeContext,
+        mut take: impl FnMut(&mut RuntimeContext) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(value) = take(runtime) {
+            return Some(value);
+        }
+        let requests = runtime.take_payload_hydration_requests();
+        if requests.is_empty() {
+            return None;
+        }
+        for request in requests {
+            let payload = request.payload.clone();
+            runtime
+                .fulfill_payload_hydration(request, payload)
+                .expect("inline manifest hydration fulfillment");
+        }
+        take(runtime)
     }
 
     fn assert_indexed_ready_event_skips(
@@ -3831,7 +3762,7 @@ mod tests {
         );
 
         let next = runtime
-            .peek_replay_event()
+            .peek_replay_command_event()
             .unwrap_or_else(|| panic!("{case_name} should skip the consumed indexed event"));
         assert!(
             matches!(next.data, HistoryEventData::TimerStarted(_)),
@@ -3854,6 +3785,7 @@ mod tests {
             EventId(3),
             EventId(3),
             Vec::new(),
+            ReadyEventIndexes::default(),
         )
     }
 

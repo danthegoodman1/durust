@@ -44,6 +44,7 @@ import {
   type QueryWorkflowOutcome,
   type QueryWorkflowRequest,
   type ReadSignalInboxRequest,
+  type ReleaseWorkflowTaskOptions,
   type RunId,
   type SignalInboxRecord,
   type SignalWorkflowOutcome,
@@ -57,7 +58,8 @@ import {
   type WorkflowTaskClaim,
   type WorkflowTaskCommit,
   type WorkflowTaskReason,
-  type WorkflowType
+  type WorkflowType,
+  workflowTaskCommitHasWorkflowVisibleMutations
 } from "@durust/core";
 import { decodePayload, encodePayload } from "@durust/core";
 
@@ -75,6 +77,7 @@ interface WorkflowState {
   readonly runId: RunId;
   history: HistoryEvent[];
   readyReason: WorkflowTaskReason | null;
+  readyAtMs: number;
   claim: WorkflowLease | null;
   queryProjection: PayloadRef | null;
   terminal: boolean;
@@ -117,6 +120,7 @@ interface ActivityLease {
   readonly startedAtMs: number;
   readonly heartbeatDeadlineAtMs: number | null;
   readonly expiresAtMs: number;
+  readonly leaseDurationMs: number;
 }
 
 interface ActivityMapState {
@@ -151,6 +155,7 @@ interface WorkflowRow {
   readonly task_queue: string;
   readonly history: string;
   readonly ready_reason: string | null;
+  readonly ready_at_ms: number | null;
   readonly claim_worker: string | null;
   readonly claim_token: number | null;
   readonly claim_reason: string | null;
@@ -190,6 +195,7 @@ interface ActivityRow {
   readonly claim_started_at_ms: number | null;
   readonly heartbeat_deadline_at_ms: number | null;
   readonly claim_expires_at_ms: number | null;
+  readonly claim_lease_duration_ms: number | null;
   readonly available_at_ms: number | null;
   readonly terminal_event_id: number | null;
 }
@@ -306,6 +312,7 @@ export class SqliteBackend implements DurableBackend {
         runId: newRunId,
         history: [started],
         readyReason: "WorkflowStarted",
+        readyAtMs: 0,
         claim: null,
         queryProjection: null,
         terminal: false,
@@ -341,12 +348,14 @@ export class SqliteBackend implements DurableBackend {
         where namespace = ? and task_queue = ? and terminal = 0
           and (${typeClauses})
           and (ready_reason is not null or claim_worker is not null)
+          and coalesce(ready_at_ms, 0) <= ?
           and (claim_worker is null or claim_expires_at_ms is null or claim_expires_at_ms <= ?)
         order by rowid asc
       `).all(
         String(opts.namespace),
         String(opts.taskQueue),
         ...typeParams,
+        this.#nowMs(),
         this.#nowMs()
       ) as unknown as WorkflowRow[];
 
@@ -371,6 +380,7 @@ export class SqliteBackend implements DurableBackend {
           expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
         };
         state.readyReason = null;
+        state.readyAtMs = 0;
         this.#saveWorkflow(state);
         return {
           runId: state.runId,
@@ -425,10 +435,15 @@ export class SqliteBackend implements DurableBackend {
         this.#saveWorkflow(state);
         throw new Error("stale workflow task lease");
       }
+      if (state.terminal && workflowTaskCommitHasWorkflowVisibleMutations(commit)) {
+        this.#saveWorkflow(state);
+        throw new Error("terminal workflow rejects workflow-visible mutations");
+      }
 
       if (commit.expectedTailEventId !== tailEventId(state)) {
         state.claim = null;
         state.readyReason = "CacheEvicted";
+        state.readyAtMs = 0;
         this.#saveWorkflow(state);
         return { kind: "Conflict" };
       }
@@ -504,6 +519,24 @@ export class SqliteBackend implements DurableBackend {
     });
   }
 
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options: ReleaseWorkflowTaskOptions = {}
+  ): Promise<void> {
+    this.#transaction(() => {
+      const state = this.#stateForRun(claim.runId);
+      this.#restoreExpiredWorkflowLease(state);
+      if (state.claim === null || !workflowLeaseMatches(state.claim, claim)) {
+        this.#saveWorkflow(state);
+        return;
+      }
+      state.readyReason = state.claim.reason;
+      state.readyAtMs = this.#nowMs() + Math.max(0, options.visibilityDelayMs ?? 0);
+      state.claim = null;
+      this.#saveWorkflow(state);
+    });
+  }
+
   async claimActivityTask(
     workerIdValue: string,
     opts: ClaimActivityOptions
@@ -533,6 +566,13 @@ export class SqliteBackend implements DurableBackend {
       for (const row of rows) {
         const activity = activityStateFromRow(row);
         this.#restoreExpiredActivityLease(activity);
+        // Restoring an expired lease may reschedule the next attempt with
+        // retry backoff; the SQL filter above used the stale available_at_ms,
+        // so persist the restored row and skip it until the backoff elapses.
+        if (activity.availableAtMs > this.#nowMs()) {
+          this.#insertActivity(activity);
+          continue;
+        }
         if (
           this.#activityMapForTask(activity.task)?.terminal === true
         ) {
@@ -547,8 +587,13 @@ export class SqliteBackend implements DurableBackend {
         activity.claim = {
           claim,
           startedAtMs: now,
-          heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, now),
-          expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs)
+          heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+            activity.task,
+            now,
+            opts.leaseDurationMs
+          ),
+          expiresAtMs: this.#leaseExpiresAt(opts.leaseDurationMs),
+          leaseDurationMs: Math.max(0, opts.leaseDurationMs)
         };
         this.#insertActivity(activity);
         return { task: activity.task, claim };
@@ -604,7 +649,7 @@ export class SqliteBackend implements DurableBackend {
       }
     });
     workflow.history.push(event);
-    workflow.readyReason = "ActivityCompleted";
+    markWorkflowReady(workflow, "ActivityCompleted");
     activity.terminalEventId = event.eventId;
     activity.claim = null;
     this.#saveWorkflow(workflow);
@@ -654,7 +699,7 @@ export class SqliteBackend implements DurableBackend {
         }
       });
       workflow.history.push(event);
-      workflow.readyReason = "ActivityFailed";
+      markWorkflowReady(workflow, "ActivityFailed");
       activity.terminalEventId = event.eventId;
       activity.claim = null;
       this.#saveWorkflow(workflow);
@@ -678,9 +723,15 @@ export class SqliteBackend implements DurableBackend {
       if (currentClaim === null) {
         throw new Error("stale activity task lease");
       }
+      const now = this.#nowMs();
       activity.claim = {
         ...currentClaim,
-        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(activity.task, this.#nowMs())
+        heartbeatDeadlineAtMs: activityHeartbeatDeadlineAt(
+          activity.task,
+          now,
+          currentClaim.leaseDurationMs
+        ),
+        expiresAtMs: now + currentClaim.leaseDurationMs
       };
       this.#insertActivity(activity);
       return { kind: "Recorded" };
@@ -711,7 +762,7 @@ export class SqliteBackend implements DurableBackend {
           }
         });
         state.history.push(event);
-        state.readyReason = "TimerFired";
+        markWorkflowReady(state, "TimerFired");
         this.#saveWorkflow(state);
         this.#db.prepare("delete from waits where wait_id = ?").run(row.wait_id);
         fired += 1;
@@ -766,7 +817,7 @@ export class SqliteBackend implements DurableBackend {
           }
         });
         workflow.history.push(event);
-        workflow.readyReason = "ActivityTimedOut";
+        markWorkflowReady(workflow, "ActivityTimedOut");
         activity.terminalEventId = event.eventId;
         activity.claim = null;
         this.#saveWorkflow(workflow);
@@ -902,6 +953,7 @@ export class SqliteBackend implements DurableBackend {
         task_queue text not null,
         history text not null,
         ready_reason text,
+        ready_at_ms integer not null default 0,
         claim_worker text,
         claim_token integer,
         claim_reason text,
@@ -949,6 +1001,7 @@ export class SqliteBackend implements DurableBackend {
         claim_started_at_ms integer,
         heartbeat_deadline_at_ms integer,
         claim_expires_at_ms integer,
+        claim_lease_duration_ms integer,
         available_at_ms integer,
         terminal_event_id integer
       );
@@ -1024,11 +1077,11 @@ export class SqliteBackend implements DurableBackend {
       );
 
       create index if not exists idx_workflows_ready
-        on workflows(namespace, task_queue, ready_reason, run_id)
+        on workflows(namespace, task_queue, ready_at_ms, ready_reason, run_id)
         where terminal = 0 and ready_reason is not null and claim_worker is null;
 
       create index if not exists idx_workflows_ready_type_projection
-        on workflows(namespace, task_queue, workflow_type_name, workflow_type_version, ready_reason, run_id)
+        on workflows(namespace, task_queue, workflow_type_name, workflow_type_version, ready_at_ms, ready_reason, run_id)
         where terminal = 0 and ready_reason is not null and claim_worker is null;
 
       create index if not exists idx_history_events_run_order
@@ -1057,6 +1110,24 @@ export class SqliteBackend implements DurableBackend {
       create index if not exists idx_signals_namespace_inbox
         on signals(namespace, run_id, signal_name, consumed, received_sequence);
     `);
+    try {
+      this.#db.exec(`
+        alter table workflows add column ready_at_ms integer not null default 0;
+      `);
+    } catch (error) {
+      if (!isSqliteDuplicateColumnError(error)) {
+        throw error;
+      }
+    }
+    try {
+      this.#db.exec(`
+        alter table activities add column claim_lease_duration_ms integer;
+      `);
+    } catch (error) {
+      if (!isSqliteDuplicateColumnError(error)) {
+        throw error;
+      }
+    }
     this.#db.exec(`
       create index if not exists idx_activities_ready_projection
         on activities(namespace, task_queue, activity_name, available_at_ms, activity_id)
@@ -1124,9 +1195,9 @@ export class SqliteBackend implements DurableBackend {
     this.#db.prepare(`
       insert into workflows(
         run_id, namespace, workflow_id, workflow_type, workflow_type_name,
-        workflow_type_version, task_queue, history, ready_reason,
+        workflow_type_version, task_queue, history, ready_reason, ready_at_ms,
         claim_worker, claim_token, claim_reason, claim_expires_at_ms, query_projection, terminal, parent
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       String(state.runId),
       state.namespace,
@@ -1137,6 +1208,7 @@ export class SqliteBackend implements DurableBackend {
       state.taskQueue,
       stringifyJson(state.history),
       state.readyReason,
+      state.readyAtMs,
       state.claim === null ? null : String(state.claim.claim.workerId),
       state.claim?.claim.token ?? null,
       state.claim?.reason ?? null,
@@ -1164,6 +1236,7 @@ export class SqliteBackend implements DurableBackend {
         task_queue = ?,
         history = ?,
         ready_reason = ?,
+        ready_at_ms = ?,
         claim_worker = ?,
         claim_token = ?,
         claim_reason = ?,
@@ -1179,6 +1252,7 @@ export class SqliteBackend implements DurableBackend {
       state.taskQueue,
       stringifyJson(state.history),
       state.readyReason,
+      state.readyAtMs,
       state.claim === null ? null : String(state.claim.claim.workerId),
       state.claim?.claim.token ?? null,
       state.claim?.reason ?? null,
@@ -1280,9 +1354,9 @@ export class SqliteBackend implements DurableBackend {
       insert or replace into activities(
         activity_id, namespace, run_id, command_key, activity_name, task_queue,
         map_command_key, map_item_ordinal, task, input, claim_worker, claim_token, claim_started_at_ms,
-        heartbeat_deadline_at_ms, claim_expires_at_ms,
+        heartbeat_deadline_at_ms, claim_expires_at_ms, claim_lease_duration_ms,
         available_at_ms, terminal_event_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       activity.task.activityId,
       activity.namespace,
@@ -1299,6 +1373,7 @@ export class SqliteBackend implements DurableBackend {
       activity.claim?.startedAtMs ?? null,
       activity.claim?.heartbeatDeadlineAtMs ?? null,
       activity.claim?.expiresAtMs ?? null,
+      activity.claim?.leaseDurationMs ?? null,
       activity.availableAtMs,
       activity.terminalEventId === null ? null : Number(activity.terminalEventId)
     );
@@ -1337,12 +1412,20 @@ export class SqliteBackend implements DurableBackend {
   #restoreExpiredWorkflowLease(state: WorkflowState): void {
     if (state.claim !== null && state.claim.expiresAtMs <= this.#nowMs()) {
       state.readyReason ??= state.claim.reason;
+      state.readyAtMs = 0;
       state.claim = null;
     }
   }
 
   #restoreExpiredActivityLease(activity: ActivityState): void {
     if (activity.claim !== null && activity.claim.expiresAtMs <= this.#nowMs()) {
+      const retry = retryActivityAfterTimeout(activity, this.#nowMs());
+      if (retry === null) {
+        activity.claim = null;
+        return;
+      }
+      activity.task = retry.task;
+      activity.availableAtMs = retry.readyAtMs;
       activity.claim = null;
     }
   }
@@ -1358,7 +1441,7 @@ export class SqliteBackend implements DurableBackend {
         limit 1
       `).get(String(state.runId), waitRow.wait_key);
       if (signal) {
-        state.readyReason = "SignalReceived";
+        markWorkflowReady(state, "SignalReceived");
         return;
       }
     }
@@ -1521,7 +1604,7 @@ export class SqliteBackend implements DurableBackend {
       }
     });
     workflow.history.push(event);
-    workflow.readyReason = "ActivityMapFailed";
+    markWorkflowReady(workflow, "ActivityMapFailed");
     this.#saveWorkflow(workflow);
     this.#insertActivity(activity);
     this.#insertActivityMap(map);
@@ -1554,7 +1637,7 @@ export class SqliteBackend implements DurableBackend {
       }
     });
     workflow.history.push(event);
-    workflow.readyReason = "ActivityMapCompleted";
+    markWorkflowReady(workflow, "ActivityMapCompleted");
     this.#saveWorkflow(workflow);
     this.#insertActivityMap(map);
     return event.eventId;
@@ -1575,6 +1658,7 @@ export class SqliteBackend implements DurableBackend {
       runId: newRunId,
       history: [started],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -1596,7 +1680,7 @@ export class SqliteBackend implements DurableBackend {
           }
         }
       }));
-      parent.readyReason = "ChildWorkflowFailed";
+      markWorkflowReady(parent, "ChildWorkflowFailed");
       return;
     }
 
@@ -1615,6 +1699,7 @@ export class SqliteBackend implements DurableBackend {
         })
       ],
       readyReason: "WorkflowStarted",
+      readyAtMs: 0,
       claim: null,
       queryProjection: null,
       terminal: false,
@@ -1634,7 +1719,7 @@ export class SqliteBackend implements DurableBackend {
         runId: childRunId
       }
     }));
-    parent.readyReason = "ChildWorkflowStarted";
+    markWorkflowReady(parent, "ChildWorkflowStarted");
   }
 
   #createChildWorkflowMap(workflow: WorkflowState, task: ChildWorkflowMapTask): void {
@@ -1741,6 +1826,7 @@ export class SqliteBackend implements DurableBackend {
           })
         ],
         readyReason: "WorkflowStarted",
+        readyAtMs: 0,
         claim: null,
         queryProjection: null,
         terminal: false,
@@ -1805,12 +1891,14 @@ export class SqliteBackend implements DurableBackend {
               }
             };
     parent.history.push(makeHistoryEvent(eventId(Number(tailEventId(parent)) + 1), data));
-    parent.readyReason =
+    markWorkflowReady(
+      parent,
       terminal.kind === "Completed"
         ? "ChildWorkflowCompleted"
         : terminal.kind === "Failed"
           ? "ChildWorkflowFailed"
-          : "ChildWorkflowCancelled";
+          : "ChildWorkflowCancelled"
+    );
     this.#saveWorkflow(parent);
   }
 
@@ -1884,7 +1972,7 @@ export class SqliteBackend implements DurableBackend {
       }
     });
     workflow.history.push(event);
-    workflow.readyReason = "ChildWorkflowMapCompleted";
+    markWorkflowReady(workflow, "ChildWorkflowMapCompleted");
     this.#saveWorkflow(workflow);
     this.#insertChildWorkflowMap(map);
     return event.eventId;
@@ -1905,7 +1993,7 @@ export class SqliteBackend implements DurableBackend {
       }
     });
     workflow.history.push(event);
-    workflow.readyReason = "ChildWorkflowMapFailed";
+    markWorkflowReady(workflow, "ChildWorkflowMapFailed");
     this.#saveWorkflow(workflow);
     this.#insertChildWorkflowMap(map);
     this.#cancelRunningChildWorkflowMapItems(map);
@@ -1930,6 +2018,7 @@ export class SqliteBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
       this.#saveWorkflow(child);
     }
@@ -1952,6 +2041,7 @@ export class SqliteBackend implements DurableBackend {
       }));
       child.terminal = true;
       child.readyReason = null;
+      child.readyAtMs = 0;
       child.claim = null;
       this.#saveWorkflow(child);
     }
@@ -1975,6 +2065,7 @@ function workflowStateFromRowWithHistory(
     runId: runId(row.run_id),
     history: [...history],
     readyReason: row.ready_reason as WorkflowTaskReason | null,
+    readyAtMs: row.ready_at_ms ?? 0,
     claim:
       row.claim_worker === null || row.claim_token === null
         ? null
@@ -2022,11 +2113,14 @@ function activityStateFromRow(row: ActivityRow): ActivityState {
               activityId: row.activity_id,
               workerId: row.claim_worker,
               token: row.claim_token
+            },
+            startedAtMs: row.claim_started_at_ms ?? 0,
+            heartbeatDeadlineAtMs: row.heartbeat_deadline_at_ms,
+            expiresAtMs: row.claim_expires_at_ms ?? 0,
+            leaseDurationMs:
+              row.claim_lease_duration_ms ??
+              Math.max(0, (row.claim_expires_at_ms ?? 0) - (row.claim_started_at_ms ?? 0))
           },
-          startedAtMs: row.claim_started_at_ms ?? 0,
-          heartbeatDeadlineAtMs: row.heartbeat_deadline_at_ms,
-          expiresAtMs: row.claim_expires_at_ms ?? 0
-        },
     terminalEventId: row.terminal_event_id === null ? null : eventId(row.terminal_event_id)
   };
 }
@@ -2203,6 +2297,11 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
+function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): void {
+  state.readyReason = reason;
+  state.readyAtMs = 0;
+}
+
 function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
   return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
 }
@@ -2258,10 +2357,15 @@ function retryDelayMs(
   return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
-function activityHeartbeatDeadlineAt(task: ActivityTask, nowMs: number): number | null {
-  return task.heartbeatTimeoutMs === null
-    ? null
-    : nowMs + Math.max(0, task.heartbeatTimeoutMs);
+function activityHeartbeatDeadlineAt(
+  task: ActivityTask,
+  nowMs: number,
+  leaseDurationMs: number
+): number | null {
+  if (task.heartbeatTimeoutMs !== null) {
+    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
+  }
+  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
 function activityTimeoutMessage(
@@ -2301,6 +2405,13 @@ function parseJson<T>(value: string): T {
     }
     return nested;
   }) as T;
+}
+
+function isSqliteDuplicateColumnError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    error.message.includes("duplicate column name:")
+  );
 }
 
 function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {

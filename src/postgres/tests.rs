@@ -188,6 +188,161 @@ async fn start_inline_child_for_tests(
     )
 }
 
+async fn start_and_claim_for_terminal_guard(
+    backend: &PostgresBackend,
+    workflow_id: &str,
+    queue: &str,
+) -> crate::ClaimedWorkflowTask {
+    let workflow_type = WorkflowType::new("tests.postgres-terminal-guard", 1);
+    backend
+        .start_workflow(crate::StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: crate::WorkflowId::new(workflow_id),
+            workflow_type: workflow_type.clone(),
+            task_queue: crate::TaskQueue::new(queue),
+            input: crate::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    backend
+        .claim_workflow_task(
+            WorkerId::new("postgres-terminal-guard"),
+            crate::ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: crate::TaskQueue::new(queue),
+                registered_workflow_types: vec![workflow_type],
+                lease_duration: Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap()
+        .expect("claimable workflow task")
+}
+
+async fn force_terminal_for_tests(backend: &PostgresBackend, schema: &str, run_id: &RunId) {
+    let client = backend.client().await.unwrap();
+    client
+        .execute(
+            &format!(
+                "update {}.workflow_instances set terminal = true where run_id = $1",
+                quote_ident(schema)
+            ),
+            &[&run_id.0],
+        )
+        .await
+        .unwrap();
+}
+
+#[test]
+fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres terminal guard test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        // Every terminal transition clears the workflow claim, so the guard is
+        // defense-in-depth: forge the terminal flag while a valid claim and
+        // matching tail survive, then require each mutation kind to be
+        // rejected on the scalar commit path and the set-based batch path
+        // (SPEC: "terminal workflow rejects new workflow-visible commands").
+        let schema = test_schema("terminal_guard");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+
+        let claimed = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard",
+            "postgres-terminal-guard",
+        )
+        .await;
+        force_terminal_for_tests(&backend, &schema, &claimed.run_id).await;
+        for (kind, commit) in
+            crate::provider_util::commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+        {
+            let err = backend
+                .commit_workflow_task(claimed.claim.clone(), commit)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::TerminalWorkflow),
+                "commit kind `{kind}` should be rejected as TerminalWorkflow, got {err:?}"
+            );
+        }
+        // The rejection must not consume the claim, and a fully empty commit
+        // stays an accepted no-op against the terminal run.
+        let outcome = backend
+            .commit_workflow_task(
+                claimed.claim.clone(),
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            CommitOutcome::Committed {
+                new_tail_event_id: EventId(1)
+            }
+        );
+
+        // Batch path: two simple-eligible mutating commits on two forged
+        // terminal runs route through the set-based batch apply and must both
+        // be rejected per item.
+        let first = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard-batch-1",
+            "postgres-terminal-guard-batch",
+        )
+        .await;
+        let second = start_and_claim_for_terminal_guard(
+            &backend,
+            "wf/postgres-terminal-guard-batch-2",
+            "postgres-terminal-guard-batch",
+        )
+        .await;
+        force_terminal_for_tests(&backend, &schema, &first.run_id).await;
+        force_terminal_for_tests(&backend, &schema, &second.run_id).await;
+        let batch_commits = [&first, &second]
+            .iter()
+            .map(|claimed| {
+                let (kind, commit) = crate::provider_util::commit_test_support::mutating_commits(
+                    &claimed.run_id,
+                    EventId(1),
+                )
+                .into_iter()
+                .find(|(kind, _)| *kind == "upsert_waits")
+                .expect("upsert_waits catalog entry");
+                assert!(postgres_simple_batch_commit_eligible(&commit), "{kind}");
+                crate::WorkflowTaskCommitInput {
+                    claim: claimed.claim.clone(),
+                    commit,
+                }
+            })
+            .collect::<Vec<_>>();
+        let results = backend
+            .commit_workflow_tasks(crate::WorkflowTaskCommitBatch {
+                commits: batch_commits,
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for result in results {
+            assert!(
+                matches!(result.result, Err(Error::TerminalWorkflow)),
+                "batch item should be rejected as TerminalWorkflow, got {:?}",
+                result.result
+            );
+        }
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
 #[test]
 fn postgres_schema_migration_runs_when_configured() {
     block_on_tokio(async {
@@ -202,7 +357,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .await
         .unwrap();
         assert_eq!(backend.schema(), schema);
-        assert_eq!(backend.schema_version().await.unwrap(), 1);
+        assert_eq!(backend.schema_version().await.unwrap(), 6);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -223,13 +378,6 @@ fn postgres_shard_key_uses_namespace() {
     let a = shard_for_workflow(&Namespace::new("a"), &workflow_id, 4096);
     let b = shard_for_workflow(&Namespace::new("b"), &workflow_id, 4096);
     assert_ne!(a, b);
-}
-
-#[test]
-fn postgres_partition_suffix_width_tracks_partition_count() {
-    assert_eq!(partition_suffix(0, 1), "p0");
-    assert_eq!(partition_suffix(3, 16), "p03");
-    assert_eq!(partition_suffix(12, 128), "p012");
 }
 
 #[test]
@@ -769,35 +917,21 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
             }
         );
 
-        let suffix = partition_suffix(
-            shard_id.0 % backend.physical_partitions(),
-            backend.physical_partitions(),
-        );
-        let client = backend.client().await.unwrap();
-        let journal_rows: i64 = client
-            .query_one(
-                &format!(
-                    "select count(*) from {}.shard_journal_{suffix} where shard_id = $1",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(shard_id.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(journal_rows, 1);
+        let leases = shard_leases_for_tests(&backend, &schema, &[shard_id]).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1.as_deref(), Some("unfiltered-shard-worker"));
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
 
 #[test]
-fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
+fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
     block_on_tokio(async {
         let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch journal test; set DURUST_POSTGRES_URL");
+            eprintln!("skipping Postgres batch shard commit test; set DURUST_POSTGRES_URL");
             return;
         };
-        let schema = test_schema("batch_journal");
+        let schema = test_schema("batch_shard_commit");
         let backend = PostgresBackend::connect_with_config(
             PostgresBackendConfig::new(url)
                 .schema(schema.clone())
@@ -885,6 +1019,11 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
+        let committed_run_ids = results
+            .iter()
+            .map(|result| result.claim.run_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(committed_run_ids, expected_run_ids);
         for result in results {
             assert_eq!(
                 result.result.unwrap(),
@@ -894,66 +1033,12 @@ fn postgres_batch_commit_appends_one_shard_journal_operation_when_configured() {
             );
         }
 
-        let suffix = partition_suffix(
-            target_shard.0 % backend.physical_partitions(),
-            backend.physical_partitions(),
-        );
-        let client = backend.client().await.unwrap();
-        let rows = client
-            .query(
-                &format!(
-                    "select journal_seq, lease_epoch, operation
-                     from {}.shard_journal_{suffix}
-                     where shard_id = $1
-                     order by journal_seq asc",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 1);
-        let journal_seq: i64 = rows[0].get(0);
-        let journal_lease_epoch: i64 = rows[0].get(1);
-        assert_eq!(journal_seq, 1);
-        assert_eq!(journal_lease_epoch, acquired_lease_epoch);
-        let head_seq: i64 = client
-            .query_one(
-                &format!(
-                    "select journal_seq from {}.shard_heads_{suffix} where shard_id = $1",
-                    quote_ident(&schema)
-                ),
-                &[&(i32::try_from(target_shard.0).unwrap_or(i32::MAX))],
-            )
-            .await
-            .unwrap()
-            .get(0);
-        assert_eq!(head_seq, 1);
-        let operation_blob: Vec<u8> = rows[0].get(2);
-        let operation: ShardJournalOperation = rmp_serde::from_slice(&operation_blob).unwrap();
-        assert!(matches!(
-            operation.kind,
-            ShardJournalOperationKind::WorkflowTaskBatch
-        ));
-        assert_eq!(operation.entries.len(), 2);
-        let actual_run_ids = operation
-            .entries
-            .iter()
-            .map(|entry| {
-                assert_eq!(entry.expected_tail_event_id, EventId(1));
-                assert_eq!(entry.new_tail_event_id, EventId(2));
-                assert!(matches!(
-                    entry.result,
-                    ShardJournalCommitResult::Committed {
-                        appended_events: 1,
-                        terminal: true,
-                        ready_reason: None,
-                    }
-                ));
-                entry.run_id.clone()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(actual_run_ids, expected_run_ids);
+        // Committing through the acquired lease must not bump its epoch:
+        // fencing only rotates ownership on reclaim.
+        let leases = shard_leases_for_tests(&backend, &schema, &[target_shard]).await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1.as_deref(), Some("batch-journal-worker"));
+        assert_eq!(leases[0].2, acquired_lease_epoch);
         backend.drop_schema_for_tests().await.unwrap();
     });
 }
@@ -2304,45 +2389,93 @@ fn postgres_payload_roots_and_gc_when_configured() {
             )
         }));
 
-        let orphan_bytes = b"postgres unreachable payload".to_vec();
-        let orphan_digest = digest_bytes(&orphan_bytes);
-        let client = backend.client().await.unwrap();
-        let orphan_codec = "messagepack".to_owned();
-        let orphan_schema = "test.orphan".to_owned();
-        let orphan_compression = "none".to_owned();
-        client
-            .execute(
-                &format!(
-                    "insert into {}.payload_blobs
-                         (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                         values ($1, $2, $3, $4, null, $5, $6)",
-                    quote_ident(&schema)
-                ),
-                &[
-                    &orphan_digest,
-                    &orphan_codec,
-                    &orphan_schema,
-                    &orphan_compression,
-                    &i64::try_from(orphan_bytes.len()).unwrap_or(i64::MAX),
-                    &orphan_bytes,
-                ],
-            )
-            .await
-            .unwrap();
+        // Two unreachable orphans: one predating the grace period (the column
+        // default 0 is the epoch) and one freshly written, standing in for a
+        // blob an in-flight commit deduplicated against.
+        let insert_orphan = |suffix: &str, created_at_ms: i64| {
+            let bytes = format!("postgres unreachable payload {suffix}").into_bytes();
+            let digest = digest_bytes(&bytes);
+            let schema = quote_ident(&schema);
+            let backend = backend.clone();
+            async move {
+                let client = backend.client().await.unwrap();
+                client
+                    .execute(
+                        &format!(
+                            "insert into {schema}.payload_blobs
+                             (digest, codec, schema_fingerprint, compression, encryption, size,
+                              bytes, created_at_ms)
+                             values ($1, 'messagepack', 'test.orphan', 'none', null, $2, $3, $4)",
+                        ),
+                        &[
+                            &digest,
+                            &i64::try_from(bytes.len()).unwrap_or(i64::MAX),
+                            &bytes,
+                            &created_at_ms,
+                        ],
+                    )
+                    .await
+                    .unwrap();
+                digest
+            }
+        };
+        let old_orphan = insert_orphan("old", 0).await;
+        let young_orphan = insert_orphan("young", crate::provider_util::unix_epoch_millis()).await;
 
+        // The default grace period deletes only the old orphan; the young one
+        // could belong to an in-flight commit.
         let dry_run = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: true,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(dry_run.deleted_blobs, 1);
-        assert!(dry_run.retained_blobs >= 1);
+        assert!(dry_run.retained_blobs >= 2);
         let collected = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: false })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
             .await
             .unwrap();
         assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
+        assert_eq!(collected.failed_blobs, 0);
+        let remaining = backend
+            .client()
+            .await
+            .unwrap()
+            .query(
+                &format!(
+                    "select digest from {}.payload_blobs order by digest",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(!remaining.contains(&old_orphan));
+        assert!(remaining.contains(&young_orphan));
+
+        // A zero grace period restores unconditional collection of
+        // unreachable blobs, deleting the young orphan too.
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(collected.deleted_blobs, 1);
         let after = backend
-            .gc_payload_blobs(PayloadGarbageCollectionRequest { dry_run: true })
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: true,
+                min_age: Duration::ZERO,
+            })
             .await
             .unwrap();
         assert_eq!(after.deleted_blobs, 0);
@@ -2361,6 +2494,246 @@ fn postgres_payload_roots_and_gc_when_configured() {
             panic!("expected workflow start");
         };
         assert_eq!(crate::decode_payload::<String>(input).unwrap(), input_value);
+
+        backend.drop_schema_for_tests().await.unwrap();
+    });
+}
+
+// Pins the `on conflict do update set created_at_ms` arm of the payload-blob
+// insert: a commit that deduplicates against an existing row must restart the
+// GC grace period for it, otherwise GC can collect a blob the commit just
+// referenced. The control orphan proves the same sweep still collects
+// backdated rows that were NOT re-put; the final zero-grace sweep proves the
+// retained blob was genuinely unreachable, so only the refreshed timestamp
+// protected it. Reverting the conflict arm to `do nothing` fails this test.
+#[test]
+fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres dedup GC refresh test; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = test_schema("dedup_refresh");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url)
+                .schema(schema.clone())
+                .payload_storage(PayloadStorageConfig::new().inline_threshold_bytes(64)),
+        )
+        .await
+        .unwrap();
+        let workflow_id = crate::WorkflowId::new("wf/postgres-dedup-refresh");
+        let workflow_type = WorkflowType::new("postgres.dedup-refresh", 1);
+        let queue = crate::TaskQueue::new("postgres-dedup-refresh-workflows");
+        let run_id = backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: workflow_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: queue.clone(),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            })
+            .await
+            .unwrap()
+            .run_id()
+            .clone();
+        let claim_opts = crate::ClaimWorkflowTaskOptions {
+            namespace: crate::Namespace::default(),
+            task_queue: queue,
+            registered_workflow_types: vec![workflow_type],
+            lease_duration: Duration::from_secs(30),
+        };
+
+        let reused_value = "postgres-dedup-refresh-projection".repeat(8);
+        let reused_payload = crate::encode_payload(&reused_value).unwrap();
+        let reused_digest = digest_bytes(reused_payload.inline_bytes().unwrap());
+        let signal_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(1),
+        };
+        let signal_wait = crate::WaitRecord {
+            wait_id: crate::WaitId::new(format!("{}:1:signal", run_id.0)),
+            run_id: run_id.clone(),
+            command_id: signal_command_id,
+            kind: WaitKind::Signal,
+            key: "replace".to_owned(),
+            ready_at: None,
+        };
+        let wake_and_claim = |seq: u64| {
+            let backend = backend.clone();
+            let workflow_id = workflow_id.clone();
+            let run_id = run_id.clone();
+            let claim_opts = claim_opts.clone();
+            async move {
+                backend
+                    .signal_workflow(crate::SignalWorkflowRequest {
+                        namespace: crate::Namespace::default(),
+                        workflow_id,
+                        signal_id: crate::SignalId::new(format!("{}/replace/{seq}", run_id.0)),
+                        signal_name: crate::SignalName::new("replace"),
+                        payload: crate::encode_payload(&seq).unwrap(),
+                    })
+                    .await
+                    .unwrap();
+                let inbox = backend
+                    .read_signal_inbox(crate::ReadSignalInboxRequest {
+                        run_id,
+                        signal_name: crate::SignalName::new("replace"),
+                    })
+                    .await
+                    .unwrap()
+                    .expect("wake signal");
+                let claimed = backend
+                    .claim_workflow_task(
+                        WorkerId::new(format!("postgres-dedup-refresh-{seq}")),
+                        claim_opts,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("workflow task");
+                (claimed, inbox.signal_id)
+            }
+        };
+
+        // Commit 1 stores the projection blob and arms the signal wait.
+        let first_claim = backend
+            .claim_workflow_task(
+                WorkerId::new("postgres-dedup-refresh-0"),
+                claim_opts.clone(),
+            )
+            .await
+            .unwrap()
+            .expect("first workflow task");
+        backend
+            .commit_workflow_task(
+                first_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    upsert_waits: vec![signal_wait],
+                    query_projection: Some(reused_payload.clone()),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Backdate the blob row past any grace period, standing in for an old
+        // orphan a later commit deduplicates against.
+        let updated = backend
+            .client()
+            .await
+            .unwrap()
+            .execute(
+                &format!(
+                    "update {}.payload_blobs set created_at_ms = 0 where digest = $1",
+                    quote_ident(&schema)
+                ),
+                &[&reused_digest],
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated, 1, "projection blob row should exist to backdate");
+
+        // Commit 2 re-puts the identical payload: the insert hits
+        // `on conflict(digest)` and must refresh `created_at_ms`.
+        let (second_claim, first_signal) = wake_and_claim(1).await;
+        backend
+            .commit_workflow_task(
+                second_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    consume_signals: vec![first_signal],
+                    query_projection: Some(reused_payload),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Commit 3 replaces the projection, making the reused blob
+        // unreachable: from here only its timestamp can protect it.
+        let (third_claim, second_signal) = wake_and_claim(2).await;
+        backend
+            .commit_workflow_task(
+                third_claim.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    consume_signals: vec![second_signal],
+                    query_projection: Some(crate::encode_payload(&"replaced").unwrap()),
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // Control: a backdated row that is NOT re-put must be collected by the
+        // same sweep that retains the refreshed blob.
+        let control_bytes = b"postgres dedup refresh control orphan".to_vec();
+        let control_digest = digest_bytes(&control_bytes);
+        backend
+            .client()
+            .await
+            .unwrap()
+            .execute(
+                &format!(
+                    "insert into {}.payload_blobs
+                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes,
+                      created_at_ms)
+                     values ($1, 'messagepack', 'test.orphan', 'none', null, $2, $3, 0)",
+                    quote_ident(&schema)
+                ),
+                &[
+                    &control_digest,
+                    &i64::try_from(control_bytes.len()).unwrap_or(i64::MAX),
+                    &control_bytes,
+                ],
+            )
+            .await
+            .unwrap();
+
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            collected.deleted_blobs, 1,
+            "only the never-re-put control orphan is old garbage"
+        );
+        assert_eq!(collected.failed_blobs, 0);
+        let remaining = backend
+            .client()
+            .await
+            .unwrap()
+            .query(
+                &format!(
+                    "select digest from {}.payload_blobs order by digest",
+                    quote_ident(&schema)
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.contains(&reused_digest),
+            "the re-put must have restarted the reused blob's grace period"
+        );
+        assert!(!remaining.contains(&control_digest));
+
+        // Zero grace collects the reused blob, proving it was unreachable and
+        // only the refreshed timestamp retained it above.
+        let collected = backend
+            .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                dry_run: false,
+                min_age: Duration::ZERO,
+            })
+            .await
+            .unwrap();
+        assert_eq!(collected.deleted_blobs, 1);
 
         backend.drop_schema_for_tests().await.unwrap();
     });
@@ -4783,7 +5156,9 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             command_id: retry_command_id.clone(),
             activity_name: crate::ActivityName::new("postgres.retry"),
             task_queue: activity_queue.clone(),
-            retry_policy: crate::RetryPolicy::exponential().max_attempts(2),
+            // No backoff: this test reclaims the retry immediately; backoff
+            // pacing has its own conformance test.
+            retry_policy: crate::RetryPolicy::none().max_attempts(2),
             start_to_close_timeout: Some(Duration::from_secs(30)),
             heartbeat_timeout: None,
             input: crate::encode_payload(&"retry-input").unwrap(),

@@ -373,6 +373,44 @@ impl HistoryEventData {
             Self::SideEffectMarker(_) => HistoryEventType::SideEffectMarker,
         }
     }
+
+    /// The command sequence this event belongs to, when it carries one.
+    /// Providers persist it as an indexed column so per-command lookups
+    /// (for example child-terminal notification dedup) do not decode history
+    /// payloads; the column stays derivable from the event data.
+    pub fn command_seq(&self) -> Option<CommandSeq> {
+        let command_id = match self {
+            Self::WorkflowStarted { .. }
+            | Self::WorkflowCompleted { .. }
+            | Self::WorkflowFailed { .. }
+            | Self::WorkflowCancelled { .. }
+            | Self::WorkflowContinuedAsNew { .. }
+            | Self::WorkflowTaskStarted => return None,
+            Self::ActivityScheduled(event) => &event.command_id,
+            Self::ActivityMapScheduled(event) => &event.command_id,
+            Self::ActivityMapCompleted(event) => &event.command_id,
+            Self::ActivityMapFailed(event) => &event.command_id,
+            Self::ActivityCompleted(event) => &event.command_id,
+            Self::ActivityFailed(event) => &event.command_id,
+            Self::ActivityTimedOut(event) => &event.command_id,
+            Self::ChildWorkflowStartRequested(event) => &event.command_id,
+            Self::ChildWorkflowStarted(event) => &event.command_id,
+            Self::ChildWorkflowCompleted(event) => &event.command_id,
+            Self::ChildWorkflowFailed(event) => &event.command_id,
+            Self::ChildWorkflowCancelled(event) => &event.command_id,
+            Self::ChildWorkflowMapScheduled(event) => &event.command_id,
+            Self::ChildWorkflowMapCompleted(event) => &event.command_id,
+            Self::ChildWorkflowMapFailed(event) => &event.command_id,
+            Self::TimerStarted(event) => &event.command_id,
+            Self::TimerFired(event) => &event.command_id,
+            Self::SignalConsumed(event) => &event.command_id,
+            Self::SelectWinner(event) => &event.select_command_id,
+            Self::VersionMarker(event) => &event.command_id,
+            Self::DeprecatedPatchMarker(event) => &event.command_id,
+            Self::SideEffectMarker(event) => &event.command_id,
+        };
+        Some(command_id.seq)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

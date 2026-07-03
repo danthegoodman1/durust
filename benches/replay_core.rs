@@ -1,24 +1,33 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
+#[cfg(feature = "s3")]
+use durust::PayloadBlobStore;
 use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
     DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
-    MemoryBackend, Namespace, NewHistoryEvent, PayloadBlobStore, PayloadStorageConfig,
-    PostgresBackend, PostgresBackendConfig, SignalWorkflowRequest, TaskQueue, TimestampMs,
-    WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
+    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
+    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
+    WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
+#[cfg(any(feature = "postgres", feature = "s3"))]
 use std::env;
 use std::hint::black_box;
+#[cfg(feature = "postgres")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(feature = "postgres")]
+use std::time::Instant;
 
 const SQLITE_SINGLE_FILE_WORKFLOWS: usize = 1_000;
 const SQLITE_SINGLE_FILE_WORKERS: usize = 4;
 const SQLITE_DRAIN_MAX_ITERATIONS: usize = 50_000;
+#[cfg(feature = "postgres")]
 static POSTGRES_BENCH_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -178,6 +187,47 @@ async fn select_all_mixed(input: BenchInput) -> durust::Result<String> {
     Ok(format!("{}:{}", winner.branch_index, winner.value))
 }
 
+const LARGE_HISTORY_TIMERS: u64 = 64;
+const HELD_HANDLE_SLEEPS: u64 = 16;
+const CHILD_FANOUT_CHILDREN: u64 = 8;
+
+#[durust::workflow(name = "bench.timer-loop-then-signal", version = 1)]
+async fn timer_loop_then_signal(input: BenchInput) -> durust::Result<String> {
+    let _input = input.value;
+    for _ in 0..LARGE_HISTORY_TIMERS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    durust::signal::<String>("after").await
+}
+
+#[durust::workflow(name = "bench.held-handle", version = 1)]
+async fn held_handle_activity_then_sleeps(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
+    let handle = durust::call_activity!(double(BenchInput { value: input }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    for _ in 0..HELD_HANDLE_SLEEPS {
+        durust::sleep(Duration::ZERO).await?;
+    }
+    handle.result().await
+}
+
+#[durust::workflow(name = "bench.child-fanout", version = 1)]
+async fn child_fanout(input: BenchInput) -> durust::Result<u64> {
+    let input = input.value;
+    let mut results = Vec::new();
+    for offset in 0..CHILD_FANOUT_CHILDREN {
+        let child = durust::child!(child_double(bench_input(input + offset)))
+            .workflow_id(format!("bench/fanout-child/{offset}"))
+            .spawn()
+            .await?;
+        results.push(child.result());
+    }
+    let results = durust::join_all(results).await?;
+    Ok(results.into_iter().sum())
+}
+
 #[durust::workflow(name = "bench.select-then-wait", version = 1)]
 async fn select_then_wait(input: BenchInput) -> durust::Result<String> {
     let input = input.value;
@@ -308,6 +358,72 @@ fn crash_replay(c: &mut Criterion) {
                 block_on(async {
                     let mut recovered = worker(backend);
                     recovered.run_workflow_once().await.unwrap();
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("workflow_replay_large_history_memory", |b| {
+        b.iter_batched(
+            setup_large_history_replay,
+            |backend| {
+                block_on(async {
+                    let mut recovered = large_history_worker(backend);
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn held_handle_wake(c: &mut Criterion) {
+    c.bench_function("held_handle_spawn_then_sleeps_memory", |b| {
+        b.iter_batched(
+            setup_held_handle_workflow,
+            |backend| {
+                block_on(async {
+                    let mut worker = held_handle_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(stats.activity_tasks, 1);
+                    assert_eq!(stats.timers_fired, HELD_HANDLE_SLEEPS as usize);
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
+fn child_fanout_completion(c: &mut Criterion) {
+    c.bench_function("child_fanout_completion_memory", |b| {
+        b.iter_batched(
+            setup_child_fanout_memory,
+            |backend| {
+                block_on(async {
+                    let mut worker = child_fanout_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(
+                        stats.child_workflow_starts_dispatched,
+                        CHILD_FANOUT_CHILDREN as usize
+                    );
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("child_fanout_completion_sqlite", |b| {
+        b.iter_batched(
+            setup_child_fanout_sqlite,
+            |(_dir, backend)| {
+                block_on(async {
+                    let mut worker = child_fanout_sqlite_worker(backend);
+                    let stats = worker.run_until_idle().await.unwrap();
+                    assert_eq!(
+                        stats.child_workflow_starts_dispatched,
+                        CHILD_FANOUT_CHILDREN as usize
+                    );
                 });
             },
             BatchSize::SmallInput,
@@ -616,6 +732,7 @@ fn sqlite_single_file_mixed_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_provider_hot_paths(c: &mut Criterion) {
     let Some(database_url) = postgres_benchmark_url() else {
         return;
@@ -702,6 +819,50 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .unwrap();
                             assert_eq!(chunk.events.len(), 32);
                             assert!(chunk.has_more);
+                        }
+                    });
+                },
+            )
+        });
+    });
+
+    group.bench_function("history_stream_chunked_replay_postgres", |b| {
+        let database_url = database_url.clone();
+        b.iter_custom(|iters| {
+            measure_postgres_bench(
+                database_url.clone(),
+                "history_chunked",
+                iters,
+                setup_postgres_large_history_stream,
+                |fixture, run_ids| {
+                    fixture.runtime.block_on(async {
+                        for run_id in run_ids {
+                            let mut after = EventId::ZERO;
+                            let mut total = 0usize;
+                            loop {
+                                let chunk = fixture
+                                    .backend
+                                    .stream_history_for_replay(durust::StreamHistoryRequest {
+                                        run_id: run_id.clone(),
+                                        after_event_id: after,
+                                        up_to_event_id: EventId(
+                                            POSTGRES_CHUNKED_HISTORY_EVENTS + 1,
+                                        ),
+                                        max_events: 128,
+                                        max_bytes: usize::MAX,
+                                    })
+                                    .await
+                                    .unwrap();
+                                total += chunk.events.len();
+                                after = chunk.last_event_id;
+                                if !chunk.has_more {
+                                    break;
+                                }
+                            }
+                            assert_eq!(
+                                total,
+                                usize::try_from(POSTGRES_CHUNKED_HISTORY_EVENTS).unwrap() + 1
+                            );
                         }
                     });
                 },
@@ -1285,6 +1446,7 @@ fn payload_compression(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(feature = "s3")]
 fn payload_garage_object_store(c: &mut Criterion) {
     let Some(config) = garage_config_from_env() else {
         return;
@@ -1295,7 +1457,7 @@ fn payload_garage_object_store(c: &mut Criterion) {
         .unwrap();
     let store = durust::S3BlobStore::garage(config).unwrap();
     runtime
-        .block_on(store.list_payload_blob_digests())
+        .block_on(store.list_payload_blobs())
         .expect("Garage S3 benchmark store must be reachable");
 
     let bytes = encoded_payload_bytes(&large_payload());
@@ -1515,6 +1677,107 @@ fn setup_select_replay() -> MemoryBackend {
             .unwrap();
         backend
     })
+}
+
+fn setup_large_history_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<timer_loop_then_signal>(
+                "bench/large-history",
+                "workflows",
+                bench_input(1),
+            )
+            .await
+            .unwrap();
+        let mut worker = large_history_worker(backend.clone());
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.timers_fired, LARGE_HISTORY_TIMERS as usize);
+        drop(worker);
+        client
+            .signal_workflow(
+                "bench/large-history",
+                "after",
+                "bench/large-history/after",
+                "done",
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn large_history_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(timer_loop_then_signal)
+        .build()
+}
+
+fn setup_held_handle_workflow() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<held_handle_activity_then_sleeps>(
+                "bench/held-handle",
+                "workflows",
+                bench_input(21),
+            )
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn held_handle_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(held_handle_activity_then_sleeps)
+        .register_activity(double)
+        .build()
+}
+
+fn setup_child_fanout_memory() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<child_fanout>("bench/child-fanout", "workflows", bench_input(5))
+            .await
+            .unwrap();
+        backend
+    })
+}
+
+fn child_fanout_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(child_fanout)
+        .register_workflow(child_double)
+        .build()
+}
+
+fn setup_child_fanout_sqlite() -> (tempfile::TempDir, SqliteBackend) {
+    block_on(async {
+        let (dir, backend) = sqlite_backend();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<child_fanout>("bench/child-fanout", "workflows", bench_input(5))
+            .await
+            .unwrap();
+        (dir, backend)
+    })
+}
+
+fn child_fanout_sqlite_worker(backend: SqliteBackend) -> Worker<SqliteBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .register_workflow(child_fanout)
+        .register_workflow(child_double)
+        .build()
 }
 
 fn setup_child_start_outbox() -> MemoryBackend {
@@ -2230,6 +2493,7 @@ fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
         .to_vec()
 }
 
+#[cfg(feature = "s3")]
 fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
     let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
     let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
@@ -2485,6 +2749,7 @@ fn sqlite_mixed_worker(backend: SqliteBackend, worker_index: usize) -> Worker<Sq
         .build()
 }
 
+#[cfg(feature = "postgres")]
 struct PostgresBenchFixture {
     runtime: tokio::runtime::Runtime,
     database_url: String,
@@ -2492,15 +2757,18 @@ struct PostgresBenchFixture {
     backend: PostgresBackend,
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_benchmark_url() -> Option<String> {
     env::var("DURUST_POSTGRES_URL").ok()
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_bench_schema(prefix: &str) -> String {
     let counter = POSTGRES_BENCH_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("durust_bench_{prefix}_{}_{}", std::process::id(), counter)
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2508,6 +2776,7 @@ fn postgres_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
+#[cfg(feature = "postgres")]
 fn measure_postgres_bench<T, Setup, Measure>(
     database_url: String,
     prefix: &str,
@@ -2530,6 +2799,7 @@ where
     elapsed
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_backend(database_url: String, prefix: &str) -> PostgresBenchFixture {
     let runtime = postgres_runtime();
     let schema = postgres_bench_schema(prefix);
@@ -2548,6 +2818,7 @@ fn setup_postgres_backend(database_url: String, prefix: &str) -> PostgresBenchFi
     }
 }
 
+#[cfg(feature = "postgres")]
 fn finish_postgres_bench(fixture: PostgresBenchFixture) {
     let PostgresBenchFixture {
         runtime,
@@ -2559,6 +2830,7 @@ fn finish_postgres_bench(fixture: PostgresBenchFixture) {
     runtime.block_on(drop_postgres_schema(&database_url, &schema));
 }
 
+#[cfg(feature = "postgres")]
 async fn drop_postgres_schema(database_url: &str, schema: &str) {
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
         .await
@@ -2576,14 +2848,17 @@ async fn drop_postgres_schema(database_url: &str, schema: &str) {
     connection.abort();
 }
 
+#[cfg(feature = "postgres")]
 fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+#[cfg(feature = "postgres")]
 fn postgres_workflow_id(prefix: &str, schema: &str, iteration: u64) -> durust::WorkflowId {
     durust::WorkflowId::new(format!("bench/postgres/{prefix}/{schema}/{iteration}"))
 }
 
+#[cfg(feature = "postgres")]
 fn start_postgres_workflow(
     fixture: &PostgresBenchFixture,
     prefix: &str,
@@ -2607,6 +2882,7 @@ fn start_postgres_workflow(
     (workflow_id, outcome.run_id().clone())
 }
 
+#[cfg(feature = "postgres")]
 fn claim_postgres_workflow_task(
     fixture: &PostgresBenchFixture,
     worker_id: impl Into<String>,
@@ -2622,6 +2898,7 @@ fn claim_postgres_workflow_task(
         .expect("workflow task")
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_workflow_for_commit(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2664,6 +2941,7 @@ fn setup_postgres_claimed_workflow_for_commit(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: u64) {
     let (claimed, batch) = setup_postgres_claimed_workflow_for_commit(fixture, iteration);
     fixture
@@ -2672,6 +2950,7 @@ fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: 
         .unwrap();
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_heartbeat_activity(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2725,6 +3004,7 @@ fn setup_postgres_claimed_heartbeat_activity(
     activity.claim
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
     start_postgres_workflow(fixture, "timer", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-timer-worker");
@@ -2766,6 +3046,7 @@ fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
         .unwrap();
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_signal_wait(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2809,6 +3090,7 @@ fn setup_postgres_signal_wait(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_projection_update(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2821,6 +3103,7 @@ fn setup_postgres_claimed_projection_update(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_projection_read(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2853,6 +3136,7 @@ fn setup_postgres_projection_read(
     }
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64) -> durust::RunId {
     start_postgres_workflow(fixture, "history", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-history-worker");
@@ -2881,6 +3165,42 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
     claimed.run_id
 }
 
+#[cfg(feature = "postgres")]
+const POSTGRES_CHUNKED_HISTORY_EVENTS: u64 = 1024;
+
+#[cfg(feature = "postgres")]
+fn setup_postgres_large_history_stream(
+    fixture: &PostgresBenchFixture,
+    iteration: u64,
+) -> durust::RunId {
+    start_postgres_workflow(fixture, "history_chunked", iteration);
+    let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-history-chunked-worker");
+    let events = (0..POSTGRES_CHUNKED_HISTORY_EVENTS)
+        .map(|_| NewHistoryEvent::new(HistoryEventData::WorkflowTaskStarted))
+        .collect::<Vec<_>>();
+    fixture
+        .runtime
+        .block_on(fixture.backend.commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: events,
+                upsert_waits: Vec::new(),
+                schedule_activities: Vec::new(),
+                schedule_activity_maps: Vec::new(),
+                schedule_child_workflow_maps: Vec::new(),
+                start_child_workflows: Vec::new(),
+                consume_signals: Vec::new(),
+                delete_waits: Vec::new(),
+                cancel_commands: Vec::new(),
+                query_projection: None,
+            },
+        ))
+        .unwrap();
+    claimed.run_id
+}
+
+#[cfg(feature = "postgres")]
 fn setup_postgres_child_start(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -2929,6 +3249,7 @@ fn setup_postgres_child_start(
     )
 }
 
+#[cfg(feature = "postgres")]
 fn setup_postgres_claimed_activity_map_workflow(
     fixture: &PostgresBenchFixture,
     iteration: u64,
@@ -3054,6 +3375,12 @@ fn version_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
         .build()
 }
 
+#[cfg(not(feature = "postgres"))]
+fn postgres_provider_hot_paths(_: &mut Criterion) {}
+
+#[cfg(not(feature = "s3"))]
+fn payload_garage_object_store(_: &mut Criterion) {}
+
 criterion_group!(
     benches,
     workflow_task_schedule,
@@ -3061,6 +3388,8 @@ criterion_group!(
     workflow_task_append_commit,
     cached_wake_poll,
     crash_replay,
+    held_handle_wake,
+    child_fanout_completion,
     recovery_flow_control,
     select_registration,
     select_replay,

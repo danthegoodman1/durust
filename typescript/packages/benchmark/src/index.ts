@@ -558,6 +558,15 @@ class MeasuredBackend implements DurableBackend {
     );
   }
 
+  async releaseWorkflowTask(
+    claim: WorkflowTaskClaim,
+    options?: Parameters<DurableBackend["releaseWorkflowTask"]>[1]
+  ): Promise<void> {
+    return this.#measure("releaseWorkflowTask", 1, () =>
+      this.inner.releaseWorkflowTask(claim, options)
+    );
+  }
+
   async claimActivityTask(
     workerId: string,
     opts: ClaimActivityOptions

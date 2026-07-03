@@ -264,7 +264,17 @@ export class HotWorkflowExecution {
           this.#context.notifyHotProgress();
           return;
         }
-        this.#context.failWorkflow(durableFailureFromUnknown(error));
+        // failWorkflow can itself raise fatal nondeterminism (terminal reached
+        // with unconsumed recorded commands). Nothing catches a throw from this
+        // .catch handler, so route it to #fatalError like other fatal errors
+        // instead of leaving nextCommit() waiting forever.
+        try {
+          this.#context.failWorkflow(durableFailureFromUnknown(error));
+        } catch (failError: unknown) {
+          this.#fatalError = failError;
+          this.#context.notifyHotProgress();
+          return;
+        }
         this.#terminalCommitPending = true;
       });
   }
@@ -861,6 +871,7 @@ class WorkflowRuntimeContext {
   #nowMs: number;
   #liveSignals: SignalInboxRecord[];
   readonly #replayEvents: readonly HistoryEvent[];
+  readonly #replayHistoryComplete: boolean;
   readonly #activityCompletions = new Map<string, HistoryEvent>();
   readonly #activityFailures = new Map<string, HistoryEvent>();
   readonly #activityMapCompletions = new Map<string, HistoryEvent>();
@@ -918,6 +929,10 @@ class WorkflowRuntimeContext {
         event.eventType !== "ChildWorkflowCancelled" &&
         event.eventType !== "TimerFired"
     );
+    const lastPrefetchedEventId = claimed.prefetchedHistory.at(-1)?.eventId;
+    this.#replayHistoryComplete =
+      lastPrefetchedEventId !== undefined &&
+      Number(lastPrefetchedEventId) >= Number(claimed.replayTargetEventId);
     this.#ingestHistory(claimed.prefetchedHistory);
   }
 
@@ -1808,6 +1823,7 @@ class WorkflowRuntimeContext {
     output: Output,
     workflowDefinition: WorkflowDefinition<any, Output, any, string>
   ): void {
+    this.#assertTerminalReplayConsumed("WorkflowCompleted");
     const result = encodePayload(output, {
       codec: this.#payloadCodec,
       ...(workflowDefinition.outputSchema === undefined
@@ -1821,6 +1837,7 @@ class WorkflowRuntimeContext {
   }
 
   failWorkflow(failure: DurableFailure): void {
+    this.#assertTerminalReplayConsumed("WorkflowFailed");
     this.#appendEvents.push({
       data: {
         kind: "WorkflowFailed",
@@ -1841,6 +1858,7 @@ class WorkflowRuntimeContext {
   }
 
   continueAsNew<Input extends object>(input: Input): never {
+    this.#assertTerminalReplayConsumed("WorkflowContinuedAsNew");
     assertDurableInputValue(input, "continueAsNew input");
     const payload = encodePayload(input, {
       codec: this.#payloadCodec,
@@ -2024,6 +2042,20 @@ class WorkflowRuntimeContext {
 
   #peekReplayEvent(): HistoryEvent | undefined {
     return this.#replayEvents[this.#replayCursor];
+  }
+
+  #assertTerminalReplayConsumed(terminalKind: string): void {
+    if (!this.#replayHistoryComplete) {
+      throw new Error(
+        `nondeterminism: ${terminalKind} reached before replay history was fully loaded`
+      );
+    }
+    const leftover = this.#peekReplayEvent();
+    if (leftover !== undefined) {
+      throw new Error(
+        `nondeterminism: ${terminalKind} reached with unconsumed recorded command ${leftover.eventType}`
+      );
+    }
   }
 
   #nextCommandId(): CommandId {

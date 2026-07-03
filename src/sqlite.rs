@@ -1,8 +1,14 @@
 use crate::provider_util::{
-    activity_timeout_at_ms, activity_timeout_at_ms_from, codec_from_str, codec_to_str,
-    compression_from_str, compression_to_str, decode_encryption_metadata,
-    encode_encryption_metadata, ready_at_ms_for_delay, should_retry_activity, timeout_message,
-    unix_epoch_millis,
+    ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
+    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
+    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
+    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
+    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
+    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
+    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
+    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
+    unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -14,20 +20,19 @@ use crate::{
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, ParentClosePolicy, PayloadBlob,
-    PayloadRef, PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest,
-    Result, RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest,
-    StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionRecord, WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit,
-    WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec,
+    HistoryChunk, HistoryEvent, HistoryEventData, ParentClosePolicy, PayloadBlob, PayloadRef,
+    PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result,
+    RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
+    WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, WorkflowType,
+    activity_map_input_at, digest_bytes, encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::ErrorKind;
@@ -88,7 +93,7 @@ impl SqliteBackend {
                 row.get::<_, usize>(0)
             })
             .map_err(sqlite_error)?;
-        let external_blobs = external_blob_digests(&self.payload_config)?.len();
+        let external_blobs = external_blob_listings(&self.payload_config)?.len();
         Ok(sqlite_blobs + external_blobs)
     }
 
@@ -205,7 +210,7 @@ impl DurableBackend for SqliteBackend {
             let event_id = EventId(tail).next();
             let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
             insert_history_event(&tx, &run_id, event_id, terminal_event.clone())?;
-            cleanup_run_operational_state(&tx, &run_id)?;
+            cleanup_run_operational_state(&tx, &run_id, TerminalCleanup::Closed)?;
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
@@ -239,6 +244,9 @@ impl DurableBackend for SqliteBackend {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
             let now_ms = unix_epoch_millis();
+            // A held claim blocks reclaiming only while its lease is unexpired.
+            // A held claim with a null lease (only possible for rows claimed
+            // before the lease column existed) stays unclaimable, failing safe.
             let mut stmt = tx
                 .prepare(
                     "select run_id, workflow_id, workflow_name, workflow_version, current_event_id, ready_reason
@@ -247,7 +255,7 @@ impl DurableBackend for SqliteBackend {
                        and task_queue = ?2
                        and ready_reason is not null
                        and ready_at_ms <= ?3
-                       and workflow_claim_token is null
+                       and (workflow_claim_token is null or claim_lease_until_ms <= ?3)
                        and terminal = 0
                      order by rowid asc",
                 )
@@ -294,12 +302,19 @@ impl DurableBackend for SqliteBackend {
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(None);
             };
+            // The ready reason and visibility stay on the row while claimed so
+            // a reclaim after lease expiry hands out the same task a fresh
+            // claim would; commit, conflict, and release overwrite them.
             let token = next_counter(&tx, "claim")?;
             tx.execute(
                 "update workflow_instances
-                 set workflow_claim_token = ?1, ready_reason = null, ready_at_ms = 0
-                 where run_id = ?2",
-                params![token, run_id.0],
+                 set workflow_claim_token = ?1, claim_lease_until_ms = ?2
+                 where run_id = ?3",
+                params![
+                    token,
+                    claim_lease_until_ms(TimestampMs(now_ms), opts.lease_duration),
+                    run_id.0
+                ],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
@@ -556,10 +571,7 @@ impl DurableBackend for SqliteBackend {
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(CommitOutcome::Conflict);
             }
-            if terminal
-                && (!batch.append_events.is_empty()
-                    || !batch.schedule_child_workflow_maps.is_empty())
-            {
+            if terminal && commit_has_workflow_visible_mutations(&batch) {
                 return Err(Error::TerminalWorkflow);
             }
 
@@ -693,7 +705,11 @@ impl DurableBackend for SqliteBackend {
             }
             let terminal_after_commit = became_terminal || terminal;
             if terminal_after_commit {
-                cleanup_run_operational_state(&tx, &claim.run_id)?;
+                let cleanup = terminal_event
+                    .as_ref()
+                    .map(TerminalCleanup::for_terminal_event)
+                    .unwrap_or(TerminalCleanup::Closed);
+                cleanup_run_operational_state(&tx, &claim.run_id, cleanup)?;
                 if let Some(event @ HistoryEventData::WorkflowContinuedAsNew { .. }) =
                     terminal_event.clone()
                 {
@@ -707,11 +723,13 @@ impl DurableBackend for SqliteBackend {
                     handle_terminal_run(&tx, &config, &claim.run_id, &event)?;
                 }
             }
-            let ready_reason = if !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)? {
-                Some(reason_to_str(&WorkflowTaskReason::SignalReceived))
-            } else {
-                None
-            };
+            // SQLite applies child starts through the outbox, so no
+            // same-commit child reason exists; only the signal recheck can
+            // re-mark the run.
+            let signal_ready = !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)?;
+            let ready_reason = post_commit_ready_reason(terminal_after_commit, None, signal_ready)
+                .as_ref()
+                .map(reason_to_str);
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
@@ -1088,6 +1106,7 @@ impl DurableBackend for SqliteBackend {
                        and a.completed = 0
                        and a.claim_token is null
                        and (a.timeout_at_ms is null or a.timeout_at_ms > ?3)
+                       and (a.visible_at_ms is null or a.visible_at_ms <= ?3)
                        and i.terminal = 0
                      order by a.rowid asc",
                 )
@@ -1117,7 +1136,8 @@ impl DurableBackend for SqliteBackend {
                             tx.execute(
                                 "update activity_tasks
                                  set completed = 1,
-                                     heartbeat_deadline_at_ms = null
+                                     heartbeat_deadline_at_ms = null,
+                                     implicit_heartbeat_ms = null
                                  where activity_id = ?1",
                                 params![activity_id],
                             )
@@ -1136,13 +1156,28 @@ impl DurableBackend for SqliteBackend {
                 return Ok(None);
             };
             let token = next_counter(&tx, "claim")?;
+            // Tasks without explicit timeouts get the lease as an implicit
+            // heartbeat interval; explicit deadlines stay authoritative and
+            // the stored timeout_at_ms is untouched by the claim.
+            let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
+                task.start_to_close_timeout,
+                task.heartbeat_timeout,
+                opts.lease_duration,
+            );
             tx.execute(
                 "update activity_tasks
-                 set claim_token = ?1, heartbeat_deadline_at_ms = ?2
-                 where activity_id = ?3",
+                 set claim_token = ?1,
+                     heartbeat_deadline_at_ms = ?2,
+                     implicit_heartbeat_ms = ?3
+                 where activity_id = ?4",
                 params![
                     token,
-                    activity_timeout_at_ms_from(now, task.heartbeat_timeout),
+                    activity_heartbeat_deadline_at_ms(
+                        now,
+                        task.heartbeat_timeout,
+                        implicit_heartbeat_ms
+                    ),
+                    implicit_heartbeat_ms,
                     activity_id.0
                 ],
             )
@@ -1169,9 +1204,9 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let Some((task_blob, claim_token, completed)) = tx
+            let Some((task_blob, claim_token, completed, implicit_heartbeat_ms)) = tx
                 .query_row(
-                    "select task, claim_token, completed
+                    "select task, claim_token, completed, implicit_heartbeat_ms
                      from activity_tasks
                      where activity_id = ?1",
                     params![req.claim.activity_id.0],
@@ -1180,16 +1215,17 @@ impl DurableBackend for SqliteBackend {
                             row.get::<_, Vec<u8>>(0)?,
                             row.get::<_, Option<u64>>(1)?,
                             row.get::<_, bool>(2)?,
+                            row.get::<_, Option<i64>>(3)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Activity rows exist until their run's terminal cleanup
+                // deletes them, so a missing row is a completed activity.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -1206,7 +1242,11 @@ impl DurableBackend for SqliteBackend {
                  set heartbeat_deadline_at_ms = ?1
                  where activity_id = ?2",
                 params![
-                    activity_timeout_at_ms(task.heartbeat_timeout),
+                    activity_heartbeat_deadline_at_ms(
+                        TimestampMs(unix_epoch_millis()),
+                        task.heartbeat_timeout,
+                        implicit_heartbeat_ms
+                    ),
                     req.claim.activity_id.0
                 ],
             )
@@ -1241,10 +1281,9 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Missing row means the run's terminal cleanup deleted it.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(CompleteActivityOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -1306,7 +1345,8 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
@@ -1341,10 +1381,9 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "activity `{}` not found",
-                    req.claim.activity_id.0
-                )));
+                // Missing row means the run's terminal cleanup deleted it.
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(FailActivityOutcome::AlreadyCompleted);
             };
             if completed {
                 tx.commit().map_err(sqlite_error)?;
@@ -1355,29 +1394,41 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            if should_retry_activity(&task) && !req.failure.non_retryable {
+            if let ActivityFailureDecision::Retry { next_attempt } =
+                activity_failure_decision(&task, req.failure.non_retryable)
+            {
                 let mut retry_task = task.clone();
-                retry_task.attempt = retry_task.attempt.saturating_add(1);
+                retry_task.attempt = next_attempt;
                 let retry_blob = rmp_serde::to_vec_named(&retry_task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                // The retry backoff delays visibility; the start-to-close
+                // clock restarts at the visibility instant so the timeout
+                // scanner cannot fire on a task that was never claimable.
+                let now = TimestampMs(unix_epoch_millis());
+                let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
+                let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
                 tx.execute(
                     "update activity_tasks
                      set task = ?1,
                          claim_token = null,
                          timeout_at_ms = ?2,
-                         heartbeat_deadline_at_ms = null
-                     where activity_id = ?3",
+                         heartbeat_deadline_at_ms = null,
+                         implicit_heartbeat_ms = null,
+                         visible_at_ms = ?3
+                     where activity_id = ?4",
                     params![
                         retry_blob,
-                        activity_timeout_at_ms(retry_task.start_to_close_timeout),
+                        activity_timeout_at_ms_from(
+                            visible_from,
+                            retry_task.start_to_close_timeout
+                        ),
+                        visible_at_ms,
                         req.claim.activity_id.0
                     ],
                 )
                 .map_err(sqlite_error)?;
                 tx.commit().map_err(sqlite_error)?;
-                return Ok(FailActivityOutcome::RetryScheduled {
-                    next_attempt: retry_task.attempt,
-                });
+                return Ok(FailActivityOutcome::RetryScheduled { next_attempt });
             }
             let failure = normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?;
             if let Some(map_item) = task.map_item.clone() {
@@ -1424,7 +1475,8 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
-                     heartbeat_deadline_at_ms = null
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
                  where activity_id = ?1",
                 params![req.claim.activity_id.0],
             )
@@ -1627,42 +1679,60 @@ impl DurableBackend for SqliteBackend {
                 .map_err(sqlite_error)?;
             let mut reachable = BTreeSet::new();
             collect_reachable_payload_blobs(&tx, &self.payload_config, &mut reachable)?;
-            let sqlite_digests = {
+            // Directory-store files are written before the transaction that
+            // makes them reachable commits, so an unreachable-but-young blob
+            // may belong to an in-flight commit. Only blobs older than the
+            // grace period are garbage.
+            let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
+            let mut all_blobs: BTreeMap<String, i64> = {
                 let mut stmt = tx
-                    .prepare("select digest from payload_blobs order by digest asc")
+                    .prepare("select digest, created_at_ms from payload_blobs order by digest asc")
                     .map_err(sqlite_error)?;
-                stmt.query_map([], |row| row.get::<_, String>(0))
-                    .map_err(sqlite_error)?
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(sqlite_error)?
+                stmt.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })
+                .map_err(sqlite_error)?
+                .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+                .map_err(sqlite_error)?
             };
-            let mut all_digests = sqlite_digests.into_iter().collect::<BTreeSet<_>>();
-            all_digests.extend(external_blob_digests(&self.payload_config)?);
-            let scanned_blobs = all_digests.len();
-            let retained_blobs = all_digests
+            for (digest, last_modified) in external_blob_listings(&self.payload_config)? {
+                // A digest present in both stores keeps the younger timestamp
+                // so the grace period stays conservative.
+                let entry = all_blobs.entry(digest).or_insert(last_modified.0);
+                *entry = (*entry).max(last_modified.0);
+            }
+            let scanned_blobs = all_blobs.len();
+            let garbage = all_blobs
                 .iter()
-                .filter(|digest| reachable.contains(*digest))
-                .count();
-            let garbage = all_digests
-                .into_iter()
-                .filter(|digest| !reachable.contains(digest))
+                .filter(|(digest, last_modified)| {
+                    !reachable.contains(*digest) && **last_modified <= cutoff
+                })
+                .map(|(digest, _)| digest.clone())
                 .collect::<Vec<_>>();
-            let deleted_blobs = garbage.len();
+            let mut deleted_blobs = garbage.len();
+            let mut failed_blobs = 0_usize;
             if !req.dry_run {
+                deleted_blobs = 0;
                 for digest in garbage {
                     tx.execute(
                         "delete from payload_blobs where digest = ?1",
                         params![digest.as_str()],
                     )
                     .map_err(sqlite_error)?;
-                    delete_external_blob(&self.payload_config, &digest)?;
+                    // A file that cannot be deleted is recorded and retried on
+                    // the next sweep instead of aborting the rest.
+                    match delete_external_blob(&self.payload_config, &digest) {
+                        Ok(()) => deleted_blobs += 1,
+                        Err(_) => failed_blobs += 1,
+                    }
                 }
             }
             tx.commit().map_err(sqlite_error)?;
             Ok(crate::PayloadGarbageCollectionOutcome {
                 scanned_blobs,
-                retained_blobs,
+                retained_blobs: scanned_blobs - deleted_blobs - failed_blobs,
                 deleted_blobs,
+                failed_blobs,
             })
         })();
         Box::pin(ready(result))
@@ -2324,8 +2394,6 @@ fn collect_payload_blob_ref(
     if let PayloadRef::Blob { digest, uri, .. } = payload {
         if is_sqlite_payload_uri(uri) {
             load_payload_blob(conn, config, payload, false)?;
-        } else if !is_opaque_external_payload_uri(uri) {
-            load_payload_blob(conn, config, payload, false)?;
         }
         reachable.insert(digest.clone());
     }
@@ -2606,6 +2674,13 @@ fn normalize_activity_map_input_manifest_for_storage(
         .pages
         .into_iter()
         .map(|page| {
+            // A foreign-scheme page under an inline root is opaque: the
+            // owning layer normalized its items before this commit, so it
+            // passes through untouched (mirroring the reachability
+            // collectors' external-page skip).
+            if is_external_payload_ref(&page) {
+                return Ok(page);
+            }
             let page = hydrate_payload_from_storage(conn, config, page)?;
             let mut page: ActivityMapInputPage = crate::decode_payload(&page)?;
             page.items = page
@@ -2817,10 +2892,14 @@ fn normalize_payload_for_storage(
                 uri
             } else {
                 let encryption_blob = encode_encryption_metadata(&encryption)?;
+                // A content-addressed reuse keeps the first row's blob but
+                // restarts the GC grace period for it.
                 conn.execute(
-                    "insert or ignore into payload_blobs
-                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    "insert into payload_blobs
+                     (digest, codec, schema_fingerprint, compression, encryption, size, bytes,
+                      created_at_ms)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     on conflict(digest) do update set created_at_ms = excluded.created_at_ms",
                     params![
                         digest.as_str(),
                         codec_to_str(codec),
@@ -2828,7 +2907,8 @@ fn normalize_payload_for_storage(
                         compression_to_str(compression),
                         encryption_blob,
                         size,
-                        bytes.as_slice()
+                        bytes.as_slice(),
+                        unix_epoch_millis(),
                     ],
                 )
                 .map_err(sqlite_error)?;
@@ -2846,8 +2926,9 @@ fn normalize_payload_for_storage(
         }
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_opaque_external_payload_uri(uri))
-            {
+            // Only refs with this provider's schemes are validated against its
+            // stores; every other scheme is opaque and persists unchanged.
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(uri)) {
                 load_payload_blob(conn, config, &payload, true)?;
             }
             Ok(payload)
@@ -2863,8 +2944,7 @@ fn hydrate_payload_from_storage(
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-            {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri)) {
                 return Ok(payload);
             }
             let PayloadRef::Blob {
@@ -2997,7 +3077,31 @@ fn store_external_payload_blob(
             let path = dir.join(digest);
             if path.exists() {
                 let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                load_external_payload_blob(config, digest, &expected_size)?;
+                let metadata = fs::metadata(&path).map_err(|err| {
+                    Error::Backend(format!(
+                        "failed to inspect local payload blob `{}`: {err}",
+                        path.display()
+                    ))
+                })?;
+                if metadata.len() != expected_size {
+                    return Err(Error::PayloadDecode(format!(
+                        "payload blob size mismatch: expected {expected_size}, got {}",
+                        metadata.len()
+                    )));
+                }
+                // Refresh the mtime so the GC grace period keeps protecting a
+                // blob that this in-flight commit is about to reference; the
+                // digest is re-validated on every read.
+                fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+                    .map_err(|err| {
+                        Error::Backend(format!(
+                            "failed to refresh local payload blob `{}`: {err}",
+                            path.display()
+                        ))
+                    })?;
                 return Ok(Some(local_blob_uri(digest)));
             }
             let tmp_path = dir.join(format!("{digest}.tmp-{}", std::process::id()));
@@ -3064,14 +3168,14 @@ fn load_external_payload_blob(
     }
 }
 
-fn external_blob_digests(config: &PayloadStorageConfig) -> Result<BTreeSet<String>> {
+fn external_blob_listings(config: &PayloadStorageConfig) -> Result<BTreeMap<String, TimestampMs>> {
     let Some(blob_store) = &config.blob_store else {
-        return Ok(BTreeSet::new());
+        return Ok(BTreeMap::new());
     };
     match blob_store {
         BlobStoreConfig::LocalDirectory { root, prefix } => {
             let dir = local_blob_dir(root, prefix);
-            let mut digests = BTreeSet::new();
+            let mut blobs = BTreeMap::new();
             match fs::read_dir(&dir) {
                 Ok(entries) => {
                     for entry in entries {
@@ -3081,26 +3185,36 @@ fn external_blob_digests(config: &PayloadStorageConfig) -> Result<BTreeSet<Strin
                                 dir.display()
                             ))
                         })?;
-                        if !entry
-                            .file_type()
-                            .map_err(|err| {
-                                Error::Backend(format!(
-                                    "failed to inspect local payload blob `{}`: {err}",
-                                    entry.path().display()
-                                ))
-                            })?
-                            .is_file()
-                        {
+                        let metadata = entry.metadata().map_err(|err| {
+                            Error::Backend(format!(
+                                "failed to inspect local payload blob `{}`: {err}",
+                                entry.path().display()
+                            ))
+                        })?;
+                        if !metadata.is_file() {
                             continue;
                         }
                         let name = entry.file_name().to_string_lossy().into_owned();
-                        if !name.contains(".tmp-") {
-                            digests.insert(name);
+                        if name.contains(".tmp-") {
+                            continue;
                         }
+                        // A file without a readable mtime counts as brand new
+                        // so GC retains rather than deletes when unsure.
+                        let last_modified = metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| {
+                                modified.duration_since(std::time::UNIX_EPOCH).ok()
+                            })
+                            .map(|since_epoch| {
+                                i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
+                            })
+                            .unwrap_or_else(unix_epoch_millis);
+                        blobs.insert(name, TimestampMs(last_modified));
                     }
-                    Ok(digests)
+                    Ok(blobs)
                 }
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(digests),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(blobs),
                 Err(err) => Err(Error::Backend(format!(
                     "failed to list local payload blob directory `{}`: {err}",
                     dir.display()
@@ -3149,12 +3263,11 @@ fn is_sqlite_payload_uri(uri: &str) -> bool {
     uri.starts_with("sqlite://payload/") || uri.starts_with("local://payload/")
 }
 
+// Every blob ref this provider did not mint is opaque: it belongs to whatever
+// layer owns its scheme (a `PayloadBackend` blob store), so the provider never
+// hydrates, validates, or garbage-collects it.
 fn is_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if is_opaque_external_payload_uri(uri))
-}
-
-fn is_opaque_external_payload_uri(uri: &str) -> bool {
-    uri.starts_with("memory-blob://payload/") || uri.starts_with("s3://")
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri))
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -3176,6 +3289,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ready_reason text,
             ready_at_ms integer not null default 0,
             workflow_claim_token integer,
+            claim_lease_until_ms integer,
             terminal integer not null,
             parent_run_id text,
             parent_command_seq integer,
@@ -3188,6 +3302,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             run_id text not null,
             event_id integer not null,
             event_type text not null,
+            command_seq integer,
             data blob not null,
             primary key(run_id, event_id)
         );
@@ -3199,7 +3314,8 @@ fn init_schema(conn: &Connection) -> Result<()> {
             compression text not null,
             encryption blob,
             size integer not null,
-            bytes blob
+            bytes blob,
+            created_at_ms integer not null default 0
         );
 
         create table if not exists activity_tasks (
@@ -3212,7 +3328,9 @@ fn init_schema(conn: &Connection) -> Result<()> {
             claim_token integer,
             completed integer not null,
             timeout_at_ms integer,
-            heartbeat_deadline_at_ms integer
+            heartbeat_deadline_at_ms integer,
+            implicit_heartbeat_ms integer,
+            visible_at_ms integer
         );
 
         create table if not exists activity_maps (
@@ -3307,12 +3425,6 @@ fn init_schema(conn: &Connection) -> Result<()> {
         create index if not exists idx_workflow_change_versions_workflow
             on workflow_change_versions(namespace, workflow_id, change_id);
 
-        create index if not exists idx_workflow_instances_ready
-            on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
-            where ready_reason is not null
-              and workflow_claim_token is null
-              and terminal = 0;
-
         create index if not exists idx_active_waits_timer_due
             on active_waits(kind, ready_at_ms, wait_id);
 
@@ -3366,16 +3478,131 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "parent_close_policy",
         "text not null default 'cancel'",
     )?;
+    ensure_column(
+        conn,
+        "workflow_instances",
+        "claim_lease_until_ms",
+        "integer",
+    )?;
     ensure_column(conn, "activity_tasks", "timeout_at_ms", "integer")?;
     ensure_column(
         conn,
         "activity_tasks",
         "heartbeat_deadline_at_ms",
         "integer",
+    )?;
+    ensure_column(conn, "activity_tasks", "visible_at_ms", "integer")?;
+    ensure_column(conn, "activity_tasks", "implicit_heartbeat_ms", "integer")?;
+    // Default 0 makes pre-existing blobs immediately past any GC grace period,
+    // which is correct: they are old.
+    ensure_column(
+        conn,
+        "payload_blobs",
+        "created_at_ms",
+        "integer not null default 0",
+    )?;
+    // One transaction for the whole command_seq migration: the backfill runs
+    // only on the open that adds the column, so a crash between the ALTER and
+    // the backfill must roll the column back too — otherwise the next open
+    // would skip the backfill and child-terminal dedup would miss legacy
+    // rows. The index is created after the column exists.
+    let command_seq_migration = conn.unchecked_transaction().map_err(sqlite_error)?;
+    if ensure_column(
+        &command_seq_migration,
+        "history_events",
+        "command_seq",
+        "integer",
+    )? {
+        backfill_history_event_command_seqs(&command_seq_migration)?;
+    }
+    command_seq_migration
+        .execute(
+            "create index if not exists idx_history_events_command_seq
+             on history_events(run_id, command_seq)
+             where command_seq is not null",
+            [],
+        )
+        .map_err(sqlite_error)?;
+    command_seq_migration.commit().map_err(sqlite_error)?;
+    ensure_index(
+        conn,
+        "idx_workflow_instances_ready",
+        WORKFLOW_INSTANCES_READY_INDEX_SQL,
     )
 }
 
-fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+// Databases created before the `command_seq` column carry null for existing
+// rows; child-terminal dedup reads the column, so a one-time decode of the
+// legacy child lifecycle events keeps dedup correct across the migration.
+fn backfill_history_event_command_seqs(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "select rowid, data from history_events
+             where command_seq is null
+               and event_type in (
+                 'child_workflow_started',
+                 'child_workflow_completed',
+                 'child_workflow_failed',
+                 'child_workflow_cancelled'
+               )",
+        )
+        .map_err(sqlite_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(sqlite_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    drop(stmt);
+    for (rowid, blob) in rows {
+        let data: HistoryEventData =
+            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+        let Some(command_seq) = data.command_seq() else {
+            continue;
+        };
+        conn.execute(
+            "update history_events set command_seq = ?1 where rowid = ?2",
+            params![command_seq.0, rowid],
+        )
+        .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+// The ready-scan index must not filter on workflow_claim_token: lease-expiry
+// reclaims match rows whose token is still set, so a claim-token predicate
+// would exclude them from the index. Databases created before lease-based
+// reclaim carry that narrower predicate, and `create index if not exists`
+// never updates an existing index, so init_schema recreates the index from
+// this definition whenever the stored one differs.
+const WORKFLOW_INSTANCES_READY_INDEX_SQL: &str = "create index idx_workflow_instances_ready
+    on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
+    where ready_reason is not null
+      and terminal = 0";
+
+fn ensure_index(conn: &Connection, index: &str, create_sql: &str) -> Result<()> {
+    // sqlite_master stores the create statement verbatim, so a stale
+    // definition (or a missing index) shows up as a text mismatch.
+    let existing = conn
+        .query_row(
+            "select sql from sqlite_master where type = 'index' and name = ?1",
+            params![index],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if existing.as_deref() == Some(create_sql) {
+        return Ok(());
+    }
+    conn.execute(&format!("drop index if exists {index}"), [])
+        .map_err(sqlite_error)?;
+    conn.execute(create_sql, []).map_err(sqlite_error)?;
+    Ok(())
+}
+
+// Returns whether the column was added by this call.
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<bool> {
     let mut stmt = conn
         .prepare(&format!("pragma table_info({table})"))
         .map_err(sqlite_error)?;
@@ -3384,7 +3611,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         .map_err(sqlite_error)?;
     for existing in columns {
         if existing.map_err(sqlite_error)? == column {
-            return Ok(());
+            return Ok(false);
         }
     }
     conn.execute(
@@ -3392,7 +3619,7 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
         [],
     )
     .map_err(sqlite_error)?;
-    Ok(())
+    Ok(true)
 }
 
 fn signal_wait_ready(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
@@ -3413,35 +3640,62 @@ fn signal_wait_ready(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
         .is_some())
 }
 
-fn cleanup_run_operational_state(tx: &Transaction<'_>, run_id: &RunId) -> Result<()> {
+// Deletes the terminal run's operational rows; see `TerminalCleanup` for the
+// contract (history stays authoritative, missing activity rows answer late
+// calls as `AlreadyCompleted`, signal rows survive continue-as-new). Undis-
+// patched child outbox rows stay: an abandoned child may still start after
+// its parent closes.
+fn cleanup_run_operational_state(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    cleanup: TerminalCleanup,
+) -> Result<()> {
     tx.execute(
         "delete from active_waits where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update activity_tasks
-         set completed = 1,
-             claim_token = null,
-             heartbeat_deadline_at_ms = null
-         where run_id = ?1",
+        "delete from activity_tasks where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update activity_maps
-         set completed = 1, in_flight = 0
-         where run_id = ?1",
+        "delete from activity_map_results
+         where map_command_id in (select map_command_id from activity_maps where run_id = ?1)",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
     tx.execute(
-        "update child_workflow_maps
-         set completed = 1, in_flight = 0
-         where run_id = ?1",
+        "delete from activity_maps where run_id = ?1",
         params![run_id.0],
     )
     .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_workflow_map_results
+         where map_command_id in (select map_command_id from child_workflow_maps where run_id = ?1)",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_workflow_maps where run_id = ?1",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    tx.execute(
+        "delete from child_outbox where parent_run_id = ?1 and dispatched = 1",
+        params![run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    if cleanup.deletes_consumed_signals() {
+        // Unconsumed deliveries stay readable through the inbox after the run
+        // closes; only the consumed dedup rows go.
+        tx.execute(
+            "delete from signals where run_id = ?1 and consumed = 1",
+            params![run_id.0],
+        )
+        .map_err(sqlite_error)?;
+    }
     Ok(())
 }
 
@@ -3538,21 +3792,8 @@ fn notify_parent_of_child_terminal(
         seq: parent_command_seq,
     };
     if let Some(item_ordinal) = parent_child_map_ordinal {
-        let outcome = match terminal_event {
-            HistoryEventData::WorkflowCompleted { result } => {
-                ChildWorkflowMapItemOutcome::Succeeded {
-                    result: result.clone(),
-                }
-            }
-            HistoryEventData::WorkflowFailed { failure } => ChildWorkflowMapItemOutcome::Failed {
-                failure: failure.clone(),
-            },
-            HistoryEventData::WorkflowCancelled { reason } => {
-                ChildWorkflowMapItemOutcome::Cancelled {
-                    reason: reason.clone(),
-                }
-            }
-            _ => return Ok(()),
+        let Some(outcome) = child_terminal_map_item_outcome(terminal_event) else {
+            return Ok(());
         };
         return complete_child_workflow_map_item(
             tx,
@@ -3574,68 +3815,35 @@ fn notify_parent_of_child_terminal(
         return Ok(());
     }
     let event_id = EventId(tail).next();
-    let (data, reason) = match terminal_event {
-        HistoryEventData::WorkflowCompleted { result } => (
-            HistoryEventData::ChildWorkflowCompleted(crate::ChildWorkflowCompleted {
-                command_id,
-                result: result.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCompleted,
-        ),
-        HistoryEventData::WorkflowFailed { failure } => (
-            HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
-                command_id,
-                failure: failure.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowFailed,
-        ),
-        HistoryEventData::WorkflowCancelled { reason } => (
-            HistoryEventData::ChildWorkflowCancelled(crate::ChildWorkflowCancelled {
-                command_id,
-                reason: reason.clone(),
-            }),
-            WorkflowTaskReason::ChildWorkflowCancelled,
-        ),
-        _ => return Ok(()),
+    let Some((data, reason)) = child_terminal_event_data_and_reason(command_id, terminal_event)
+    else {
+        return Ok(());
     };
     insert_history_event(tx, &parent_run_id, event_id, data)?;
     set_workflow_ready(tx, &parent_run_id, event_id, reason)
 }
 
 fn child_terminal_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
-    let mut stmt = tx
-        .prepare(
-            "select data from history_events
+    // Indexed lookup on (run_id, command_seq); the event-type filter
+    // distinguishes a terminal notification from the started event that
+    // shares the child command's sequence.
+    Ok(tx
+        .query_row(
+            "select 1 from history_events
              where run_id = ?1
+               and command_seq = ?2
                and event_type in (
                  'child_workflow_completed',
                  'child_workflow_failed',
                  'child_workflow_cancelled'
-               )",
+               )
+             limit 1",
+            params![command_id.run_id.0, command_id.seq.0],
+            |_| Ok(()),
         )
-        .map_err(sqlite_error)?;
-    let rows = stmt
-        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(sqlite_error)?;
-    for row in rows {
-        let blob = row.map_err(sqlite_error)?;
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .optional()
+        .map_err(sqlite_error)?
+        .is_some())
 }
 
 fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Result<()> {
@@ -3680,7 +3888,7 @@ fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Re
         };
         let event_id = EventId(tail).next();
         insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
-        cleanup_run_operational_state(tx, &child_run_id)?;
+        cleanup_run_operational_state(tx, &child_run_id, TerminalCleanup::Closed)?;
         tx.execute(
             "update workflow_instances
              set current_event_id = ?1,
@@ -3703,7 +3911,8 @@ fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId
         "update activity_tasks
          set completed = 1,
              claim_token = null,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1 or activity_id like ?2",
         params![activity_id.0, map_prefix],
     )
@@ -3749,13 +3958,6 @@ fn child_outbox_id(message: &ChildStartOutboxMessage) -> String {
 
 fn child_outbox_id_for_command(command_id: &CommandId) -> String {
     format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
-}
-
-fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static str {
-    match policy {
-        ParentClosePolicy::Cancel => "cancel",
-        ParentClosePolicy::Abandon => "abandon",
-    }
 }
 
 fn insert_activity_map(
@@ -4095,41 +4297,24 @@ fn set_workflow_ready(
 }
 
 fn child_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bool> {
-    let mut stmt = tx
-        .prepare(
-            "select data from history_events
+    Ok(tx
+        .query_row(
+            "select 1 from history_events
              where run_id = ?1
+               and command_seq = ?2
                and event_type in (
                  'child_workflow_started',
                  'child_workflow_completed',
                  'child_workflow_failed',
                  'child_workflow_cancelled'
-               )",
+               )
+             limit 1",
+            params![command_id.run_id.0, command_id.seq.0],
+            |_| Ok(()),
         )
-        .map_err(sqlite_error)?;
-    let rows = stmt
-        .query_map(params![command_id.run_id.0], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(sqlite_error)?;
-    for row in rows {
-        let blob = row.map_err(sqlite_error)?;
-        let event: HistoryEventData =
-            rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let matches = match event {
-            HistoryEventData::ChildWorkflowStarted(started) => started.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                completed.command_id == *command_id
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => failed.command_id == *command_id,
-            HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                cancelled.command_id == *command_id
-            }
-            _ => false,
-        };
-        if matches {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+        .optional()
+        .map_err(sqlite_error)?
+        .is_some())
 }
 
 fn materialize_activity_map_items(
@@ -4556,7 +4741,7 @@ fn cancel_child_workflow_map_children(
         };
         let event_id = EventId(tail).next();
         insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
-        cleanup_run_operational_state(tx, &child_run_id)?;
+        cleanup_run_operational_state(tx, &child_run_id, TerminalCleanup::Closed)?;
         tx.execute(
             "update workflow_instances
              set current_event_id = ?1,
@@ -4605,7 +4790,8 @@ fn complete_map_item(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -4759,7 +4945,8 @@ fn fail_map_item(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -4829,9 +5016,15 @@ fn timeout_activity(
     activity_id: ActivityId,
     now: TimestampMs,
 ) -> Result<bool> {
-    let Some((task_blob, completed, timeout_at_ms, heartbeat_deadline_at_ms)) = tx
+    let Some((
+        task_blob,
+        completed,
+        timeout_at_ms,
+        heartbeat_deadline_at_ms,
+        implicit_heartbeat_ms,
+    )) = tx
         .query_row(
-            "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms
+            "select task, completed, timeout_at_ms, heartbeat_deadline_at_ms, implicit_heartbeat_ms
              from activity_tasks
              where activity_id = ?1",
             params![activity_id.0],
@@ -4841,6 +5034,7 @@ fn timeout_activity(
                     row.get::<_, bool>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
                 ))
             },
         )
@@ -4854,13 +5048,20 @@ fn timeout_activity(
     if completed || !(start_timeout_due || heartbeat_timeout_due) {
         return Ok(false);
     }
-    let timed_out_by_heartbeat = heartbeat_timeout_due && !start_timeout_due;
+    let attribution = activity_timeout_attribution(
+        start_timeout_due,
+        heartbeat_timeout_due,
+        implicit_heartbeat_ms.is_some(),
+    );
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    if should_retry_activity(&task) {
+    if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
+        // Timeout retries carry no backoff: the expired deadline already
+        // paced this attempt, and delaying crash recovery further would only
+        // add latency.
         let mut retry_task = task.clone();
-        retry_task.attempt = retry_task.attempt.saturating_add(1);
+        retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
             .map_err(|err| Error::PayloadEncode(err.to_string()))?;
         tx.execute(
@@ -4868,7 +5069,9 @@ fn timeout_activity(
              set task = ?1,
                  claim_token = null,
                  timeout_at_ms = ?2,
-                 heartbeat_deadline_at_ms = null
+                 heartbeat_deadline_at_ms = null,
+                 implicit_heartbeat_ms = null,
+                 visible_at_ms = null
              where activity_id = ?3",
             params![
                 retry_blob,
@@ -4883,7 +5086,8 @@ fn timeout_activity(
     tx.execute(
         "update activity_tasks
          set completed = 1,
-             heartbeat_deadline_at_ms = null
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
          where activity_id = ?1",
         params![activity_id.0],
     )
@@ -4896,7 +5100,7 @@ fn timeout_activity(
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
-                timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+                timeout_message(&activity_id, task.attempt, attribution),
             ),
             activity_id,
         )?;
@@ -4924,7 +5128,7 @@ fn timeout_activity(
         event_id,
         HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: task.command_id,
-            message: timeout_message(&activity_id, task.attempt, timed_out_by_heartbeat),
+            message: timeout_message(&activity_id, task.attempt, attribution),
         }),
     )?;
     tx.execute(
@@ -5003,12 +5207,13 @@ fn insert_history_event(
     data: HistoryEventData,
 ) -> Result<()> {
     let event_type = event_type_to_str(&data.event_type());
+    let command_seq = data.command_seq().map(|seq| seq.0);
     let blob =
         rmp_serde::to_vec_named(&data).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
-        "insert into history_events(run_id, event_id, event_type, data)
-         values (?1, ?2, ?3, ?4)",
-        params![run_id.0, event_id.0, event_type, blob],
+        "insert into history_events(run_id, event_id, event_type, command_seq, data)
+         values (?1, ?2, ?3, ?4, ?5)",
+        params![run_id.0, event_id.0, event_type, command_seq, blob],
     )
     .map_err(sqlite_error)?;
     index_workflow_change_marker(tx, run_id, event_id, &data)?;
@@ -5178,138 +5383,565 @@ mod tests {
             assert!(exists, "missing SQLite index `{index_name}`");
         }
     }
-}
 
-fn reason_to_str(reason: &WorkflowTaskReason) -> &'static str {
-    match reason {
-        WorkflowTaskReason::WorkflowStarted => "workflow_started",
-        WorkflowTaskReason::ActivityCompleted => "activity_completed",
-        WorkflowTaskReason::ActivityFailed => "activity_failed",
-        WorkflowTaskReason::ActivityTimedOut => "activity_timed_out",
-        WorkflowTaskReason::ActivityMapCompleted => "activity_map_completed",
-        WorkflowTaskReason::ActivityMapFailed => "activity_map_failed",
-        WorkflowTaskReason::ChildWorkflowStarted => "child_workflow_started",
-        WorkflowTaskReason::ChildWorkflowCompleted => "child_workflow_completed",
-        WorkflowTaskReason::ChildWorkflowFailed => "child_workflow_failed",
-        WorkflowTaskReason::ChildWorkflowCancelled => "child_workflow_cancelled",
-        WorkflowTaskReason::ChildWorkflowMapCompleted => "child_workflow_map_completed",
-        WorkflowTaskReason::ChildWorkflowMapFailed => "child_workflow_map_failed",
-        WorkflowTaskReason::TimerFired => "timer_fired",
-        WorkflowTaskReason::SignalReceived => "signal_received",
-        WorkflowTaskReason::CacheEvicted => "cache_evicted",
+    // Databases created before `history_events.command_seq` must have their
+    // child lifecycle rows backfilled on the open that adds the column, and
+    // the backfilled values must feed child-terminal dedup; otherwise a
+    // re-delivered terminal notification would append a duplicate child event
+    // to the parent (silent replay corruption). Follows the Phase 2G legacy
+    // reopen pattern: build the history, strip the column with a raw
+    // connection, and reopen through `SqliteBackend::open`.
+    #[test]
+    fn sqlite_reopen_backfills_command_seq_and_preserves_child_terminal_dedup() {
+        use futures::executor::block_on;
+
+        block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("command-seq-backfill.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let namespace = crate::Namespace::default();
+            let parent_type = WorkflowType::new("tests.backfill-parent", 1);
+            let child_type = WorkflowType::new("tests.backfill-child", 1);
+            let parent_outcome = backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/backfill-parent"),
+                    workflow_type: parent_type.clone(),
+                    task_queue: crate::TaskQueue::new("backfill-workflows"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let parent_run_id = parent_outcome.run_id().clone();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("backfill-parent-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("backfill-workflows"),
+                        registered_workflow_types: vec![parent_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("parent workflow task");
+            let command_id = crate::command_id(&parent_run_id, 1);
+            let input = crate::encode_payload(&7_u64).unwrap();
+            let requested = crate::ChildWorkflowStartRequested {
+                command_id: command_id.clone(),
+                workflow_type: child_type.clone(),
+                workflow_id: WorkflowId::new("wf/backfill-child"),
+                task_queue: crate::TaskQueue::new("backfill-children"),
+                input: input.clone(),
+                parent_close_policy: ParentClosePolicy::Abandon,
+                fingerprint: crate::child_workflow_fingerprint(
+                    child_type.clone(),
+                    WorkflowId::new("wf/backfill-child"),
+                    crate::payload_digest(&input),
+                    crate::TaskQueue::new("backfill-children"),
+                    ParentClosePolicy::Abandon,
+                ),
+            };
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![crate::NewHistoryEvent::new(
+                            HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
+                        )],
+                        start_child_workflows: vec![ChildStartOutboxMessage::from_requested(
+                            &requested,
+                        )],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let dispatched = backend
+                .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
+                    namespace: namespace.clone(),
+                    limit: 16,
+                })
+                .await
+                .unwrap();
+            assert_eq!(dispatched.dispatched, 1);
+            let child_claim = backend
+                .claim_workflow_task(
+                    WorkerId::new("backfill-child-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("backfill-children"),
+                        registered_workflow_types: vec![child_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("child workflow task");
+            let child_run_id = child_claim.run_id.clone();
+            // The child completes, appending ChildWorkflowCompleted to the
+            // parent through the terminal notification path.
+            backend
+                .commit_workflow_task(
+                    child_claim.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![crate::NewHistoryEvent::new(
+                            HistoryEventData::WorkflowCompleted {
+                                result: crate::encode_payload(&14_u64).unwrap(),
+                            },
+                        )],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            drop(backend);
+
+            // Simulate the pre-command_seq schema: drop the index that
+            // references the column, then the column itself.
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(
+                "drop index if exists idx_history_events_command_seq;
+                 alter table history_events drop column command_seq;",
+            )
+            .unwrap();
+            drop(raw);
+
+            // Reopen: the migration adds the column and backfills the legacy
+            // child lifecycle rows in the same transaction.
+            let reopened = SqliteBackend::open(&path).unwrap();
+            let conn = reopened.connection().unwrap();
+            let unbackfilled: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where command_seq is null
+                       and event_type in (
+                         'child_workflow_started',
+                         'child_workflow_completed',
+                         'child_workflow_failed',
+                         'child_workflow_cancelled'
+                       )",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                unbackfilled, 0,
+                "legacy child lifecycle rows must be backfilled on reopen"
+            );
+            let backfilled_seqs: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where run_id = ?1 and command_seq = 1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                backfilled_seqs >= 2,
+                "started + completed rows should carry the child command seq"
+            );
+            let parent_tail_before: u64 = conn
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            // Simulate a re-delivered terminal transition: forge the child
+            // live again and cancel it, so notify_parent_of_child_terminal
+            // runs against the backfilled dedup data.
+            conn.execute(
+                "update workflow_instances set terminal = 0 where run_id = ?1",
+                params![child_run_id.0],
+            )
+            .unwrap();
+            drop(conn);
+            reopened
+                .cancel_workflow(crate::CancelWorkflowRequest {
+                    namespace,
+                    workflow_id: WorkflowId::new("wf/backfill-child"),
+                    reason: "duplicate terminal delivery".to_owned(),
+                })
+                .await
+                .unwrap();
+
+            let conn = reopened.connection().unwrap();
+            let parent_terminal_events: i64 = conn
+                .query_row(
+                    "select count(*) from history_events
+                     where run_id = ?1
+                       and event_type in (
+                         'child_workflow_completed',
+                         'child_workflow_failed',
+                         'child_workflow_cancelled'
+                       )",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                parent_terminal_events, 1,
+                "backfilled dedup must suppress the duplicate child-terminal notify"
+            );
+            let parent_tail_after: u64 = conn
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![parent_run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parent_tail_after, parent_tail_before);
+        });
     }
-}
 
-fn reason_from_str(value: &str) -> Result<WorkflowTaskReason> {
-    match value {
-        "workflow_started" => Ok(WorkflowTaskReason::WorkflowStarted),
-        "activity_completed" => Ok(WorkflowTaskReason::ActivityCompleted),
-        "activity_failed" => Ok(WorkflowTaskReason::ActivityFailed),
-        "activity_timed_out" => Ok(WorkflowTaskReason::ActivityTimedOut),
-        "activity_map_completed" => Ok(WorkflowTaskReason::ActivityMapCompleted),
-        "activity_map_failed" => Ok(WorkflowTaskReason::ActivityMapFailed),
-        "child_workflow_started" => Ok(WorkflowTaskReason::ChildWorkflowStarted),
-        "child_workflow_completed" => Ok(WorkflowTaskReason::ChildWorkflowCompleted),
-        "child_workflow_failed" => Ok(WorkflowTaskReason::ChildWorkflowFailed),
-        "child_workflow_cancelled" => Ok(WorkflowTaskReason::ChildWorkflowCancelled),
-        "child_workflow_map_completed" => Ok(WorkflowTaskReason::ChildWorkflowMapCompleted),
-        "child_workflow_map_failed" => Ok(WorkflowTaskReason::ChildWorkflowMapFailed),
-        "timer_fired" => Ok(WorkflowTaskReason::TimerFired),
-        "signal_received" => Ok(WorkflowTaskReason::SignalReceived),
-        "cache_evicted" => Ok(WorkflowTaskReason::CacheEvicted),
-        other => Err(Error::Backend(format!(
-            "unknown workflow task reason `{other}`"
-        ))),
+    #[test]
+    fn terminal_cleanup_deletes_operational_rows_across_reopen() {
+        use futures::executor::block_on;
+
+        block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("terminal-cleanup.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let workflow_type = WorkflowType::new("tests.sqlite-terminal-cleanup", 1);
+            let namespace = crate::Namespace::default();
+            let outcome = backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: crate::TaskQueue::new("sqlite-cleanup-workflows"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let run_id = outcome.run_id().clone();
+            for (signal_id, name) in [
+                ("signal/cleanup/consumed", "go"),
+                ("signal/cleanup/pending", "go"),
+            ] {
+                backend
+                    .signal_workflow(crate::SignalWorkflowRequest {
+                        namespace: namespace.clone(),
+                        workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                        signal_id: crate::SignalId::new(signal_id),
+                        signal_name: crate::SignalName::new(name),
+                        payload: crate::encode_payload(&"x").unwrap(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("sqlite-cleanup-worker"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("sqlite-cleanup-workflows"),
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("workflow task");
+            let activity_command = crate::command_id(&run_id, 1);
+            let map_command = crate::command_id(&run_id, 2);
+            let signal_command = crate::command_id(&run_id, 3);
+            let input = crate::encode_payload(&1_u64).unwrap();
+            let scheduled = crate::ActivityScheduled {
+                command_id: activity_command.clone(),
+                activity_name: crate::ActivityName::new("tests.echo"),
+                task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                fingerprint: crate::activity_fingerprint(
+                    crate::ActivityName::new("tests.echo"),
+                    crate::payload_digest(&input),
+                    "sha256:test-options".to_owned(),
+                ),
+                input: input.clone(),
+            };
+            let input_manifest =
+                crate::encode_activity_map_input_manifest(vec![input.clone(), input.clone()], 2)
+                    .unwrap();
+            let map_task = ActivityMapTask {
+                map_command_id: map_command.clone(),
+                activity_name: crate::ActivityName::new("tests.echo"),
+                task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                retry_policy: crate::RetryPolicy::none(),
+                start_to_close_timeout: None,
+                heartbeat_timeout: None,
+                input_manifest: input_manifest.clone(),
+                result_manifest_name: "cleanup-results".to_owned(),
+                max_in_flight: 2,
+            };
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                                scheduled.clone(),
+                            )),
+                            crate::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                                crate::ActivityMapScheduled {
+                                    command_id: map_command.clone(),
+                                    activity_name: crate::ActivityName::new("tests.echo"),
+                                    task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                                    retry_policy: crate::RetryPolicy::none(),
+                                    start_to_close_timeout: None,
+                                    heartbeat_timeout: None,
+                                    input_manifest: input_manifest.clone(),
+                                    result_manifest_name: "cleanup-results".to_owned(),
+                                    max_in_flight: 2,
+                                    fingerprint: crate::activity_map_fingerprint(
+                                        crate::ActivityName::new("tests.echo"),
+                                        crate::payload_digest(&input_manifest),
+                                        "cleanup-results".to_owned(),
+                                        2,
+                                        "sha256:test-options".to_owned(),
+                                    ),
+                                },
+                            )),
+                            crate::NewHistoryEvent::new(HistoryEventData::SignalConsumed(
+                                crate::SignalConsumed {
+                                    command_id: signal_command,
+                                    signal_id: crate::SignalId::new("signal/cleanup/consumed"),
+                                    signal_name: crate::SignalName::new("go"),
+                                    payload: crate::encode_payload(&"x").unwrap(),
+                                    fingerprint: crate::signal_fingerprint(crate::SignalName::new(
+                                        "go",
+                                    )),
+                                },
+                            )),
+                        ],
+                        schedule_activities: vec![ActivityTask::from_scheduled(&scheduled)],
+                        schedule_activity_maps: vec![map_task],
+                        consume_signals: vec![crate::SignalId::new("signal/cleanup/consumed")],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let activity = backend
+                .claim_activity_task(
+                    WorkerId::new("sqlite-cleanup-activity-worker"),
+                    crate::ClaimActivityOptions {
+                        namespace: namespace.clone(),
+                        task_queue: crate::TaskQueue::new("sqlite-cleanup-activities"),
+                        registered_activity_names: vec![crate::ActivityName::new("tests.echo")],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("activity task");
+
+            backend
+                .cancel_workflow(crate::CancelWorkflowRequest {
+                    namespace: namespace.clone(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-cleanup"),
+                    reason: "cleanup test".to_owned(),
+                })
+                .await
+                .unwrap();
+            drop(backend);
+
+            // Reopen: the deletions are durable, history is untouched, and
+            // only the undelivered signal survives as an inbox row.
+            let reopened = SqliteBackend::open(&path).unwrap();
+            let conn = reopened.connection().unwrap();
+            for (table, expected) in [
+                ("activity_tasks", 0_i64),
+                ("activity_maps", 0),
+                ("activity_map_results", 0),
+                ("active_waits", 0),
+            ] {
+                let count: i64 = conn
+                    .query_row(&format!("select count(*) from {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, expected, "terminal cleanup should empty `{table}`");
+            }
+            let (signal_count, unconsumed_count): (i64, i64) = conn
+                .query_row(
+                    "select count(*), sum(case when consumed = 0 then 1 else 0 end)
+                     from signals where run_id = ?1",
+                    params![run_id.0],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (signal_count, unconsumed_count),
+                (1, 1),
+                "only the undelivered signal survives cleanup"
+            );
+            let history_count: i64 = conn
+                .query_row(
+                    "select count(*) from history_events where run_id = ?1",
+                    params![run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(history_count, 5, "history stays authoritative");
+            drop(conn);
+
+            // Late calls answer from row absence after the reopen.
+            let late = reopened
+                .complete_activity(crate::CompleteActivityRequest {
+                    claim: activity.claim,
+                    result: crate::encode_payload(&1_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(late, crate::CompleteActivityOutcome::AlreadyCompleted);
+        });
     }
-}
 
-fn marker_kind_to_str(kind: WorkflowChangeMarkerKind) -> &'static str {
-    match kind {
-        WorkflowChangeMarkerKind::Version => "version",
-        WorkflowChangeMarkerKind::DeprecatedPatch => "deprecated_patch",
+    #[test]
+    fn terminal_run_with_live_claim_rejects_every_mutating_commit_kind() {
+        use crate::provider_util::commit_test_support;
+        use futures::executor::block_on;
+
+        block_on(async {
+            // Every terminal transition clears the workflow claim, so the
+            // guard is defense-in-depth: forge the terminal flag while a valid
+            // claim and matching tail survive, then require each mutation kind
+            // to be rejected (SPEC: "terminal workflow rejects new
+            // workflow-visible commands").
+            let dir = tempfile::tempdir().unwrap();
+            let backend = SqliteBackend::open(dir.path().join("terminal-guard.sqlite3")).unwrap();
+            let workflow_type = WorkflowType::new("tests.sqlite-terminal-guard", 1);
+            backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: crate::Namespace::default(),
+                    workflow_id: WorkflowId::new("wf/sqlite-terminal-guard"),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: crate::TaskQueue::new("sqlite-terminal-guard"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("sqlite-terminal-guard"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: crate::Namespace::default(),
+                        task_queue: crate::TaskQueue::new("sqlite-terminal-guard"),
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("claimable workflow task");
+            backend
+                .connection()
+                .unwrap()
+                .execute(
+                    "update workflow_instances set terminal = 1 where run_id = ?1",
+                    params![claimed.run_id.0],
+                )
+                .unwrap();
+
+            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+            {
+                let err = backend
+                    .commit_workflow_task(claimed.claim.clone(), commit)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(err, Error::TerminalWorkflow),
+                    "commit kind `{kind}` should be rejected as TerminalWorkflow, got {err:?}"
+                );
+            }
+            // The rejection must not consume the claim, and a fully empty
+            // commit stays an accepted no-op against the terminal run.
+            let outcome = backend
+                .commit_workflow_task(
+                    claimed.claim.clone(),
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                outcome,
+                CommitOutcome::Committed {
+                    new_tail_event_id: EventId(1)
+                }
+            );
+        });
     }
-}
 
-fn marker_kind_from_str(value: &str) -> Result<WorkflowChangeMarkerKind> {
-    match value {
-        "version" => Ok(WorkflowChangeMarkerKind::Version),
-        "deprecated_patch" => Ok(WorkflowChangeMarkerKind::DeprecatedPatch),
-        other => Err(Error::Backend(format!(
-            "unknown workflow change marker kind `{other}`"
-        ))),
-    }
-}
+    #[test]
+    fn sqlite_reopen_recreates_legacy_ready_index_and_claims_ready_workflows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-ready-index.sqlite3");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            futures::executor::block_on(backend.start_workflow(crate::StartWorkflowRequest {
+                namespace: crate::Namespace::default(),
+                workflow_id: WorkflowId::new("wf/legacy-index"),
+                workflow_type: WorkflowType::new("tests.legacy-index", 1),
+                task_queue: crate::TaskQueue::new("legacy-index-workflows"),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            }))
+            .unwrap();
+        }
+        // Simulate a database migrated from before lease-based reclaim: its
+        // ready index still filters on the claim token, which the lease-aware
+        // claim query no longer implies.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "drop index if exists idx_workflow_instances_ready;
+                 create index idx_workflow_instances_ready
+                     on workflow_instances(namespace, task_queue, ready_at_ms, run_id)
+                     where ready_reason is not null
+                       and workflow_claim_token is null
+                       and terminal = 0;",
+            )
+            .unwrap();
+        }
 
-fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
-    match event_type {
-        HistoryEventType::WorkflowStarted => "workflow_started",
-        HistoryEventType::WorkflowCompleted => "workflow_completed",
-        HistoryEventType::WorkflowFailed => "workflow_failed",
-        HistoryEventType::WorkflowCancelled => "workflow_cancelled",
-        HistoryEventType::WorkflowContinuedAsNew => "workflow_continued_as_new",
-        HistoryEventType::WorkflowTaskStarted => "workflow_task_started",
-        HistoryEventType::ActivityScheduled => "activity_scheduled",
-        HistoryEventType::ActivityMapScheduled => "activity_map_scheduled",
-        HistoryEventType::ActivityMapCompleted => "activity_map_completed",
-        HistoryEventType::ActivityMapFailed => "activity_map_failed",
-        HistoryEventType::ActivityCompleted => "activity_completed",
-        HistoryEventType::ActivityFailed => "activity_failed",
-        HistoryEventType::ActivityTimedOut => "activity_timed_out",
-        HistoryEventType::ChildWorkflowStartRequested => "child_workflow_start_requested",
-        HistoryEventType::ChildWorkflowStarted => "child_workflow_started",
-        HistoryEventType::ChildWorkflowCompleted => "child_workflow_completed",
-        HistoryEventType::ChildWorkflowFailed => "child_workflow_failed",
-        HistoryEventType::ChildWorkflowCancelled => "child_workflow_cancelled",
-        HistoryEventType::ChildWorkflowMapScheduled => "child_workflow_map_scheduled",
-        HistoryEventType::ChildWorkflowMapCompleted => "child_workflow_map_completed",
-        HistoryEventType::ChildWorkflowMapFailed => "child_workflow_map_failed",
-        HistoryEventType::TimerStarted => "timer_started",
-        HistoryEventType::TimerFired => "timer_fired",
-        HistoryEventType::SignalConsumed => "signal_consumed",
-        HistoryEventType::SelectWinner => "select_winner",
-        HistoryEventType::VersionMarker => "version_marker",
-        HistoryEventType::DeprecatedPatchMarker => "deprecated_patch_marker",
-        HistoryEventType::SideEffectMarker => "side_effect_marker",
-    }
-}
-
-fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
-    match value {
-        "workflow_started" => Ok(HistoryEventType::WorkflowStarted),
-        "workflow_completed" => Ok(HistoryEventType::WorkflowCompleted),
-        "workflow_failed" => Ok(HistoryEventType::WorkflowFailed),
-        "workflow_cancelled" => Ok(HistoryEventType::WorkflowCancelled),
-        "workflow_continued_as_new" => Ok(HistoryEventType::WorkflowContinuedAsNew),
-        "workflow_task_started" => Ok(HistoryEventType::WorkflowTaskStarted),
-        "activity_scheduled" => Ok(HistoryEventType::ActivityScheduled),
-        "activity_map_scheduled" => Ok(HistoryEventType::ActivityMapScheduled),
-        "activity_map_completed" => Ok(HistoryEventType::ActivityMapCompleted),
-        "activity_map_failed" => Ok(HistoryEventType::ActivityMapFailed),
-        "activity_completed" => Ok(HistoryEventType::ActivityCompleted),
-        "activity_failed" => Ok(HistoryEventType::ActivityFailed),
-        "activity_timed_out" => Ok(HistoryEventType::ActivityTimedOut),
-        "child_workflow_start_requested" => Ok(HistoryEventType::ChildWorkflowStartRequested),
-        "child_workflow_started" => Ok(HistoryEventType::ChildWorkflowStarted),
-        "child_workflow_completed" => Ok(HistoryEventType::ChildWorkflowCompleted),
-        "child_workflow_failed" => Ok(HistoryEventType::ChildWorkflowFailed),
-        "child_workflow_cancelled" => Ok(HistoryEventType::ChildWorkflowCancelled),
-        "child_workflow_map_scheduled" => Ok(HistoryEventType::ChildWorkflowMapScheduled),
-        "child_workflow_map_completed" => Ok(HistoryEventType::ChildWorkflowMapCompleted),
-        "child_workflow_map_failed" => Ok(HistoryEventType::ChildWorkflowMapFailed),
-        "timer_started" => Ok(HistoryEventType::TimerStarted),
-        "timer_fired" => Ok(HistoryEventType::TimerFired),
-        "signal_consumed" => Ok(HistoryEventType::SignalConsumed),
-        "select_winner" => Ok(HistoryEventType::SelectWinner),
-        "version_marker" => Ok(HistoryEventType::VersionMarker),
-        "deprecated_patch_marker" => Ok(HistoryEventType::DeprecatedPatchMarker),
-        "side_effect_marker" => Ok(HistoryEventType::SideEffectMarker),
-        other => Err(Error::Backend(format!("unknown event type `{other}`"))),
-    }
-}
-
-fn wait_kind_to_str(kind: &WaitKind) -> &'static str {
-    match kind {
-        WaitKind::Timer => "timer",
-        WaitKind::Signal => "signal",
+        let reopened = SqliteBackend::open(&path).unwrap();
+        {
+            let conn = reopened.connection().unwrap();
+            let sql = conn
+                .query_row(
+                    "select sql from sqlite_master
+                     where type = 'index' and name = 'idx_workflow_instances_ready'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert!(
+                !sql.contains("workflow_claim_token"),
+                "legacy ready-index predicate survived reopen: {sql}"
+            );
+        }
+        let claimed = futures::executor::block_on(reopened.claim_workflow_task(
+            WorkerId::new("legacy-index-worker"),
+            ClaimWorkflowTaskOptions {
+                namespace: crate::Namespace::default(),
+                task_queue: crate::TaskQueue::new("legacy-index-workflows"),
+                registered_workflow_types: vec![WorkflowType::new("tests.legacy-index", 1)],
+                lease_duration: Duration::from_secs(30),
+            },
+        ))
+        .unwrap();
+        assert!(
+            claimed.is_some(),
+            "migrated database should still claim ready workflows"
+        );
     }
 }
