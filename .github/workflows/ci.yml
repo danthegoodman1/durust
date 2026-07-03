@@ -10,11 +10,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
       - name: Use Rust stable
         run: rustup default stable
+
+      - name: Install TypeScript dependencies
+        run: npm ci --prefix typescript
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -26,6 +35,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked --workspace --all-features
+
+      - name: Run TypeScript checks
+        run: npm run check --prefix typescript
 
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d

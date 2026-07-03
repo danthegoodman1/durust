@@ -1,7 +1,11 @@
 name: Release
 
 on:
-  push:
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
     branches:
       - main
   workflow_dispatch:
@@ -27,41 +31,65 @@ concurrency:
 
 jobs:
   release:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip release]') && !startsWith(github.event.head_commit.message, 'chore(release):')) }}
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Check release eligibility
+        id: eligibility
+        run: |
+          message="$(git log -1 --format=%B)"
+          release=true
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            if [[ "$message" == *"[skip release]"* || "$message" == chore\(release\):* ]]; then
+              release=false
+            fi
+          fi
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          {
+            echo "message<<EOF"
+            echo "$message"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
+        if: steps.eligibility.outputs.release == 'true'
         run: rustup toolchain install stable --profile minimal
 
       - name: Use Rust stable
+        if: steps.eligibility.outputs.release == 'true'
         run: rustup default stable
 
       - uses: actions/setup-node@v4
+        if: steps.eligibility.outputs.release == 'true'
         with:
           node-version: 24
           cache: npm
           cache-dependency-path: typescript/package-lock.json
 
       - name: Configure Git author
+        if: steps.eligibility.outputs.release == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Determine release version
+        if: steps.eligibility.outputs.release == 'true'
         id: version
         env:
           RELEASE_BUMP: ${{ inputs.bump || 'auto' }}
-          RELEASE_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          RELEASE_MESSAGE: ${{ steps.eligibility.outputs.message }}
         run: |
           version="$(node scripts/release-version.mjs next --bump "$RELEASE_BUMP" --message "$RELEASE_MESSAGE")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing $version"
 
       - name: Apply lockstep version
+        if: steps.eligibility.outputs.release == 'true'
         run: |
           node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
           cargo update -w
@@ -69,23 +97,11 @@ jobs:
           node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
 
       - name: Install TypeScript dependencies
+        if: steps.eligibility.outputs.release == 'true'
         run: npm ci --prefix typescript
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Check Rust feature matrix
-        run: |
-          cargo check --locked --no-default-features
-          cargo check --locked --features postgres,s3
-
-      - name: Run Rust tests
-        run: cargo test --locked --workspace --all-features
-
-      - name: Run TypeScript checks
-        run: npm run check --prefix typescript
-
       - name: Commit and push release version
+        if: steps.eligibility.outputs.release == 'true'
         run: |
           git diff --check
           if git diff --quiet; then
@@ -97,6 +113,7 @@ jobs:
           git push origin HEAD:main
 
       - name: Publish crates
+        if: steps.eligibility.outputs.release == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -133,6 +150,7 @@ jobs:
           publish_crate durust
 
       - name: Publish npm packages
+        if: steps.eligibility.outputs.release == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
