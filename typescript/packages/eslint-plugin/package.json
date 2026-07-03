@@ -1,8 +1,8 @@
 {
   "name": "@durust/eslint-plugin",
-  "version": "0.0.0",
+  "version": "0.2.0",
+  "description": "ESLint rules for deterministic Durust workflow code.",
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=24.0.0"
   },
@@ -21,16 +21,33 @@
     "dist/**/*.js.map",
     "dist/**/*.json"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -b",
+    "prepack": "tsc -b",
     "test": "vitest run --root ../.. --config vitest.config.ts packages/eslint-plugin/test"
   },
   "peerDependencies": {
     "eslint": ">=8.57.0 || >=9.0.0"
   },
   "license": "MIT",
+  "keywords": [
+    "durust",
+    "durable-execution",
+    "durable-workflows",
+    "workflow",
+    "workflow-engine",
+    "temporal-alternative",
+    "eslint",
+    "eslint-plugin",
+    "determinism",
+    "node"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danthegoodman1/durust.git"
+    "url": "git+https://github.com/danthegoodman1/durust.git",
+    "directory": "typescript/packages/eslint-plugin"
   }
 }

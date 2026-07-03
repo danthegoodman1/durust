@@ -1,13 +1,13 @@
 {
   "name": "@durust/payload",
-  "version": "0.0.0",
+  "version": "0.2.0",
+  "description": "Payload offload wrapper and blob stores for Durust TypeScript backends.",
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@durust/core": "0.0.0"
+    "@durust/core": "^0.2.0"
   },
   "exports": {
     ".": {
@@ -24,16 +24,32 @@
     "dist/**/*.js.map",
     "dist/**/*.json"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -b",
+    "prepack": "tsc -b",
     "test": "vitest run --root ../.. --config vitest.config.ts packages/payload/test"
   },
   "devDependencies": {
-    "@durust/testing": "^0.0.0"
+    "@durust/testing": "^0.2.0"
   },
   "license": "MIT",
+  "keywords": [
+    "durust",
+    "durable-execution",
+    "durable-workflows",
+    "workflow",
+    "workflow-engine",
+    "temporal-alternative",
+    "payload",
+    "blob-storage",
+    "node"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danthegoodman1/durust.git"
+    "url": "git+https://github.com/danthegoodman1/durust.git",
+    "directory": "typescript/packages/payload"
   }
 }

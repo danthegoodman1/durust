@@ -1,8 +1,8 @@
 {
   "name": "@durust/core",
-  "version": "0.0.0",
+  "version": "0.2.0",
+  "description": "Durable workflow runtime core for TypeScript and Node.js.",
   "type": "module",
-  "private": true,
   "engines": {
     "node": ">=24.0.0"
   },
@@ -24,16 +24,30 @@
     "dist/**/*.js.map",
     "dist/**/*.json"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -b",
+    "prepack": "tsc -b",
     "test": "vitest run --root ../.. --config vitest.config.ts packages/core/test"
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.1.3"
   },
   "license": "MIT",
+  "keywords": [
+    "durust",
+    "durable-execution",
+    "durable-workflows",
+    "workflow",
+    "workflow-engine",
+    "temporal-alternative",
+    "node"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/danthegoodman1/durust.git"
+    "url": "git+https://github.com/danthegoodman1/durust.git",
+    "directory": "typescript/packages/core"
   }
 }

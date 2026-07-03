@@ -7,11 +7,22 @@ import { fileURLToPath } from "node:url";
 
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
 const packagesRoot = join(workspaceRoot, "packages");
+const expectedVersion = "0.2.0";
 const expectedLicense = "MIT";
+const expectedNodeEngine = ">=24.0.0";
 const expectedRepository = {
   type: "git",
   url: "git+https://github.com/danthegoodman1/durust.git"
 };
+const expectedPublishablePackages = new Map([
+  ["@durust/core", "typescript/packages/core"],
+  ["@durust/eslint-plugin", "typescript/packages/eslint-plugin"],
+  ["@durust/payload", "typescript/packages/payload"],
+  ["@durust/postgres", "typescript/packages/postgres"],
+  ["@durust/sqlite", "typescript/packages/sqlite"],
+  ["@durust/testing", "typescript/packages/testing"]
+]);
+const expectedPrivatePackages = new Set(["@durust/benchmark", "@durust/examples"]);
 const expectedFilesField = [
   "dist/**/*.d.ts",
   "dist/**/*.d.ts.map",
@@ -36,7 +47,21 @@ try {
     const packageDir = join(packagesRoot, entry.name);
     const packageJsonPath = join(packageDir, "package.json");
     const packageJson = readJson(packageJsonPath);
+    const packageName = packageJson.name ?? entry.name;
+    if (packageJson.private === true) {
+      if (!expectedPrivatePackages.has(packageName)) {
+        failures.push(`${packageName} is private but is not in the private package set`);
+      }
+      skippedPackages.push(packageName);
+      continue;
+    }
+
+    if (!expectedPublishablePackages.has(packageName)) {
+      failures.push(`${packageName} is publishable but is not in the publishable package set`);
+      continue;
+    }
     if (!hasPublishSurface(packageJson)) {
+      failures.push(`${packageName} package.json must declare a publish surface`);
       skippedPackages.push(packageJson.name ?? entry.name);
       continue;
     }
@@ -50,6 +75,12 @@ try {
   }
 } finally {
   rmSync(cacheDir, { force: true, recursive: true });
+}
+
+for (const packageName of expectedPublishablePackages.keys()) {
+  if (!checkedPackages.includes(packageName)) {
+    failures.push(`${packageName} was not checked as a publishable package`);
+  }
 }
 
 if (failures.length > 0) {
@@ -81,6 +112,39 @@ function hasPublishSurface(packageJson) {
 
 function validateManifest(packageJson) {
   const packageName = packageJson.name;
+  const expectedDirectory = expectedPublishablePackages.get(packageName);
+
+  if (packageJson.version !== expectedVersion) {
+    failures.push(`${packageName} package.json version must be ${expectedVersion}`);
+  }
+
+  if (packageJson.private !== undefined) {
+    failures.push(`${packageName} package.json must not set private`);
+  }
+
+  if (
+    typeof packageJson.description !== "string" ||
+    packageJson.description.trim().length === 0
+  ) {
+    failures.push(`${packageName} package.json must include a description`);
+  }
+
+  if (
+    packageJson.publishConfig === null ||
+    typeof packageJson.publishConfig !== "object" ||
+    packageJson.publishConfig.access !== "public"
+  ) {
+    failures.push(`${packageName} package.json publishConfig.access must be public`);
+  }
+
+  if (
+    packageJson.engines === null ||
+    typeof packageJson.engines !== "object" ||
+    packageJson.engines.node !== expectedNodeEngine
+  ) {
+    failures.push(`${packageName} package.json engines.node must be ${expectedNodeEngine}`);
+  }
+
   if (packageJson.license !== expectedLicense) {
     failures.push(`${packageName} package.json license must be ${expectedLicense}`);
   }
@@ -89,11 +153,21 @@ function validateManifest(packageJson) {
     packageJson.repository === null ||
     typeof packageJson.repository !== "object" ||
     packageJson.repository.type !== expectedRepository.type ||
-    packageJson.repository.url !== expectedRepository.url
+    packageJson.repository.url !== expectedRepository.url ||
+    packageJson.repository.directory !== expectedDirectory
   ) {
     failures.push(
-      `${packageName} package.json repository must point to ${expectedRepository.url}`
+      `${packageName} package.json repository must point to ${expectedRepository.url}` +
+        ` with directory ${expectedDirectory}`
     );
+  }
+
+  if (
+    !Array.isArray(packageJson.keywords) ||
+    packageJson.keywords.length === 0 ||
+    packageJson.keywords.some((keyword) => typeof keyword !== "string" || keyword.length === 0)
+  ) {
+    failures.push(`${packageName} package.json keywords must be a non-empty string array`);
   }
 
   if (!sameStringArray(packageJson.files, expectedFilesField)) {

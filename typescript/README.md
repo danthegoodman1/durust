@@ -17,6 +17,51 @@ items in `../impl-plan/0014-typescript-parity.md` are complete.
 The SQLite provider uses Node's built-in `node:sqlite` `DatabaseSync`, so the
 workspace uses a conservative Node 24+ floor across packages.
 
+## Installation
+
+Install the Durust runtime core and the durability provider your service uses:
+
+```bash
+npm install @durust/core @durust/sqlite
+```
+
+For Postgres-backed services:
+
+```bash
+npm install @durust/core @durust/postgres
+```
+
+Add payload offload when workflow inputs, activity results, signals, query
+projections, or map manifests can grow beyond the provider's inline payload
+budget:
+
+```bash
+npm install @durust/payload
+```
+
+Provider authors and advanced backend test suites can install the shared
+conformance package:
+
+```bash
+npm install --save-dev @durust/testing
+```
+
+Workflow packages should also enable the determinism lint:
+
+```bash
+npm install --save-dev @durust/eslint-plugin
+```
+
+The packages are intentionally split by deployment feature. `@durust/core`
+contains the workflow API, worker, client, memory backend, replay runtime, and
+shared backend contract. Provider packages add a concrete durability store:
+`@durust/sqlite` for local single-file development and tests, or
+`@durust/postgres` for the normalized SQL backend. `@durust/payload` composes
+with any provider when large values need blob-backed storage. `@durust/testing`
+is published for backend conformance, and `@durust/eslint-plugin` is published
+for consumer workflow determinism checks. Examples and benchmark tooling remain
+workspace-private.
+
 ## Packages
 
 - `@durust/core`: public API, worker, client, history types, memory provider,
@@ -550,10 +595,12 @@ until all of these are true for the target release:
 
 ## Release Readiness
 
-The TypeScript implementation should not be published or used as production
-infrastructure until the production-readiness gate in
-`../impl-plan/0014-typescript-parity.md` is satisfied. In particular, the
-remaining major gaps include:
+The TypeScript implementation should not be used as production infrastructure
+until the production-readiness gate in `../impl-plan/0014-typescript-parity.md`
+is satisfied. The npm packages are split so early adopters, provider authors,
+and conformance suites can install only the pieces they need while the remaining
+production-readiness work is completed. In particular, the remaining major gaps
+include:
 
 - broader public API docs and examples for every stable Rust primitive;
 - running and recording the opt-in `npm run test:soak` profile for the release

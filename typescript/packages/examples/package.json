@@ -11,8 +11,8 @@
     "test": "vitest run --root ../.. --config vitest.config.ts packages/examples/test"
   },
   "dependencies": {
-    "@durust/core": "^0.0.0",
-    "@durust/payload": "^0.0.0"
+    "@durust/core": "^0.2.0",
+    "@durust/payload": "^0.2.0"
   },
   "license": "MIT",
   "repository": {
