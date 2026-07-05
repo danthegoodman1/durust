@@ -957,12 +957,19 @@ DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
 
 ## Release Automation
 
-Pushes to `main` run CI first. When CI succeeds, the release workflow publishes
-a lockstep release for the Rust crates and TypeScript packages. It bumps the
-patch version by default, or bumps the minor or major version when the triggering
-commit message contains `#minor` or `#major`. It commits the updated manifests
-and lockfiles back to `main` with `[skip release]`, then publishes
-`durust-macros`, `durust`, and the public `@durust/*` npm packages.
+Pull requests run the CI test workflow only, with a read-only `GITHUB_TOKEN`.
+The repository's fork pull request workflow approval policy is
+`first_time_contributors`, so GitHub holds workflow runs when the PR author or
+event actor has not previously had a commit or pull request merged into this
+repository until a user with write access approves the run.
+
+Pushes to `main` run CI first. When push-triggered CI on `main` succeeds, the
+release workflow publishes a lockstep release for the Rust crates and TypeScript
+packages. It bumps the patch version by default, or bumps the minor or major
+version when the triggering commit message contains `#minor` or `#major`. It
+commits the updated manifests and lockfiles back to `main` with
+`[skip release]`, then publishes `durust-macros`, `durust`, and the public
+`@durust/*` npm packages.
 
 Manual dispatch can publish the `current` checked-in version without creating a
 new version commit. This is only for recovering a partially published release.
