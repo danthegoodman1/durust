@@ -191,6 +191,48 @@ const LARGE_HISTORY_TIMERS: u64 = 64;
 const HELD_HANDLE_SLEEPS: u64 = 16;
 const CHILD_FANOUT_CHILDREN: u64 = 8;
 
+// Replay of command events that carry bulk inline payloads. `crash_replay`'s
+// two histories are payload-free (one small activity; 64 empty timers), so
+// neither of them prices the command matcher stepping over a payload.
+//
+// `PayloadStorageConfig::inline_threshold_bytes` defaults to 8 KiB, so at the
+// default these inputs would reach replay as blob refs and this bench would
+// measure the opposite of its name. `large_inline_command_worker` raises the
+// threshold; `setup_large_inline_command_replay` asserts the recorded input is
+// still `Inline` so a future default change cannot hollow the bench out.
+const LARGE_INLINE_COMMANDS: u64 = 16;
+const LARGE_INLINE_COMMAND_BYTES: usize = 16 * 1024;
+const LARGE_INLINE_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+#[durust::activity(name = "bench.bulk")]
+async fn bulk(input: LargePayload) -> durust::Result<usize> {
+    Ok(input.body.len())
+}
+
+#[durust::workflow(name = "bench.large-inline-commands", version = 1)]
+async fn large_inline_commands(input: BenchInput) -> durust::Result<usize> {
+    let seed = input.value;
+    let mut handles = Vec::new();
+    for offset in 0..LARGE_INLINE_COMMANDS {
+        let handle = durust::call_activity!(bulk(LargePayload {
+            body: "b".repeat(LARGE_INLINE_COMMAND_BYTES) + &(seed + offset).to_string(),
+        }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+        handles.push(handle);
+    }
+    // Splits the run into a scheduling task and a replaying task, so the
+    // measured task has to match all `LARGE_INLINE_COMMANDS` recorded
+    // `ActivityScheduled` events before it can drain their completions.
+    durust::sleep(Duration::ZERO).await?;
+    let mut total = 0;
+    for handle in handles {
+        total += handle.result().await?;
+    }
+    Ok(total)
+}
+
 #[durust::workflow(name = "bench.timer-loop-then-signal", version = 1)]
 async fn timer_loop_then_signal(input: BenchInput) -> durust::Result<String> {
     let _input = input.value;
@@ -370,6 +412,19 @@ fn crash_replay(c: &mut Criterion) {
             |backend| {
                 block_on(async {
                     let mut recovered = large_history_worker(backend);
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("workflow_replay_large_inline_payload_memory", |b| {
+        b.iter_batched(
+            setup_large_inline_command_replay,
+            |backend| {
+                block_on(async {
+                    let mut recovered = large_inline_command_worker(backend);
                     assert!(recovered.run_workflow_once().await.unwrap());
                 });
             },
@@ -1712,6 +1767,75 @@ fn large_history_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
     Worker::builder(backend)
         .workflow_task_queue("workflows")
         .register_workflow(timer_loop_then_signal)
+        .build()
+}
+
+// Leaves the run one workflow task short of completing, with every bulk
+// `ActivityScheduled` and its completion already committed, so the measured
+// task cold-replays all of them.
+fn setup_large_inline_command_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            PayloadStorageConfig::new().inline_threshold_bytes(LARGE_INLINE_THRESHOLD_BYTES),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<large_inline_commands>(
+                "bench/large-inline-commands",
+                "workflows",
+                bench_input(1),
+            )
+            .await
+            .unwrap();
+        let mut worker = large_inline_command_worker(backend.clone());
+        assert!(worker.run_workflow_once().await.unwrap());
+        let mut completed = 0;
+        loop {
+            let batch = worker.run_activity_batch_once().await.unwrap();
+            if batch == 0 {
+                break;
+            }
+            completed += batch;
+        }
+        assert_eq!(completed, LARGE_INLINE_COMMANDS as usize);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        drop(worker);
+        // `stream_history_for_replay`, not `stream_history`: the hydrating read
+        // turns a blob ref back into an inline payload and would report
+        // "inline" whatever the backend stored. The replay path takes this
+        // variant, so this is the surface the matcher sees.
+        let scheduled = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id: run_id.clone(),
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1_000_000),
+                max_events: 1_000,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| match event.data {
+                HistoryEventData::ActivityScheduled(scheduled) => Some(scheduled.input),
+                _ => None,
+            })
+            .expect("the replayed history records a scheduled activity");
+        assert!(
+            matches!(scheduled, durust::PayloadRef::Inline { .. }),
+            "the bench payload must reach replay inline; as a blob ref the matcher copies \
+             nothing payload-sized and this bench measures the wrong thing"
+        );
+        backend
+    })
+}
+
+fn large_inline_command_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(large_inline_commands)
+        .register_activity(bulk)
         .build()
 }
 

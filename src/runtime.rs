@@ -327,6 +327,90 @@ impl ReadyEventIndexes {
     }
 }
 
+/// The command event a scheduling future expects to find in recorded history.
+/// One variant per durable command that appends a command event, so
+/// `match_or_append_command` can name the event in a divergence message and
+/// borrow the recorded seq and fingerprint out of it without cloning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandEventKind {
+    Activity,
+    ActivityMap,
+    ChildWorkflow,
+    ChildWorkflowMap,
+    Timer,
+}
+
+impl CommandEventKind {
+    /// History event variant name, used verbatim in the "expected X, found Y"
+    /// divergence message.
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::Activity => "ActivityScheduled",
+            Self::ActivityMap => "ActivityMapScheduled",
+            Self::ChildWorkflow => "ChildWorkflowStartRequested",
+            Self::ChildWorkflowMap => "ChildWorkflowMapScheduled",
+            Self::Timer => "TimerStarted",
+        }
+    }
+
+    /// Command label used in the fingerprint-drift message.
+    fn command_label(self) -> &'static str {
+        match self {
+            Self::Activity => "activity",
+            Self::ActivityMap => "activity map",
+            Self::ChildWorkflow => "child workflow",
+            Self::ChildWorkflowMap => "child workflow map",
+            Self::Timer => "timer",
+        }
+    }
+
+    /// Borrows the recorded command seq and fingerprint when `data` is this
+    /// kind's command event, so matching never has to copy the event.
+    ///
+    /// What the borrow saves is a fixed per-event allocation cost, roughly
+    /// eight allocations for a `HistoryEvent` — its `CommandId`'s run id, the
+    /// activity or workflow type name, the task queue, the retry policy, the
+    /// fingerprint's name and digest strings — measured at ~3.3 KiB and 75
+    /// allocations across a nine-command replay. It is *not* usually a payload
+    /// copy: `PayloadStorageConfig::inline_threshold_bytes` defaults to 8 KiB
+    /// (`crate::DEFAULT_INLINE_THRESHOLD_BYTES`), so anything bigger is a blob
+    /// ref by the time replay sees it, and `SideEffectMarker.value` is hard
+    /// capped at that same 8 KiB. A payload copy is only avoided when the
+    /// backend is configured with a larger inline threshold.
+    fn recorded(self, data: &HistoryEventData) -> Option<(CommandSeq, &CommandFingerprint)> {
+        match (self, data) {
+            (Self::Activity, HistoryEventData::ActivityScheduled(scheduled)) => {
+                Some((scheduled.command_id.seq, &scheduled.fingerprint))
+            }
+            (Self::ActivityMap, HistoryEventData::ActivityMapScheduled(scheduled)) => {
+                Some((scheduled.command_id.seq, &scheduled.fingerprint))
+            }
+            (Self::ChildWorkflow, HistoryEventData::ChildWorkflowStartRequested(requested)) => {
+                Some((requested.command_id.seq, &requested.fingerprint))
+            }
+            (Self::ChildWorkflowMap, HistoryEventData::ChildWorkflowMapScheduled(scheduled)) => {
+                Some((scheduled.command_id.seq, &scheduled.fingerprint))
+            }
+            (Self::Timer, HistoryEventData::TimerStarted(started)) => {
+                Some((started.command_id.seq, &started.fingerprint))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Which side of `match_or_append_command` produced the command, for the
+/// per-kind tail that runs afterwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandDisposition {
+    /// A recorded command event matched and the replay cursor advanced past
+    /// it. Ready events for the command may already be indexed.
+    Replayed,
+    /// No recorded command event remained, so the command event and its side
+    /// effect were appended.
+    Appended,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuntimeChangeMarker {
     pub command_id: CommandId,
@@ -749,6 +833,71 @@ impl RuntimeContext {
         self.replay_cursor += 1;
     }
 
+    /// The one scheduling protocol every command-appending future follows:
+    /// block while the command position is still in unloaded history, allocate
+    /// the command seq, build the fingerprint, then either match the recorded
+    /// command event or append this command plus its side effect.
+    ///
+    /// The order is the invariant, not an implementation detail. Command seqs
+    /// are baked into committed histories, so the seq must be allocated once
+    /// per admitted poll and before `prepare` runs, the fingerprint must be
+    /// computed from the same seq the match compares against, and `append`
+    /// must not run when a recorded event matched. Holding all three steps in
+    /// one function is what stops the five call sites from drifting apart
+    /// again; they previously carried five hand-written copies of it.
+    ///
+    /// `prepare` returns the fingerprint plus whatever the append side needs,
+    /// so the per-kind work happens exactly once whichever side wins. A
+    /// `Poll::Pending` return means the command position is not loaded yet and
+    /// the caller must return pending without touching its own state.
+    fn match_or_append_command<T>(
+        &mut self,
+        kind: CommandEventKind,
+        prepare: impl FnOnce(&mut Self) -> Result<(CommandFingerprint, T)>,
+        append: impl FnOnce(&mut Self, &CommandId, CommandFingerprint, T),
+    ) -> Poll<Result<(CommandId, CommandDisposition)>> {
+        if self.peek_replay_command_event().is_none() && !self.at_replay_tail() {
+            self.request_more_history_if_available();
+            return Poll::Pending;
+        }
+
+        let command_id = self.next_command_id();
+        let (fingerprint, prepared) = match prepare(self) {
+            Ok(prepared) => prepared,
+            Err(err) => return Poll::Ready(Err(err)),
+        };
+
+        if let Some(event) = self.peek_replay_command_event() {
+            let Some((recorded_seq, recorded_fingerprint)) = kind.recorded(&event.data) else {
+                let found = event.event_type;
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected {} for command {}, found {:?}",
+                    kind.event_name(),
+                    command_id.seq.0,
+                    found
+                ))));
+            };
+            if recorded_seq != command_id.seq {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected command seq {}, found {}",
+                    command_id.seq.0, recorded_seq.0
+                ))));
+            }
+            if recorded_fingerprint != &fingerprint {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "{} command fingerprint changed for command {}",
+                    kind.command_label(),
+                    command_id.seq.0
+                ))));
+            }
+            self.advance_replay();
+            return Poll::Ready(Ok((command_id, CommandDisposition::Replayed)));
+        }
+
+        append(self, &command_id, fingerprint, prepared);
+        Poll::Ready(Ok((command_id, CommandDisposition::Appended)))
+    }
+
     fn record_indexed_ready_event_id(&mut self, event_id: crate::EventId) {
         // Only remember ids the cursor has not passed yet. The cursor skips
         // ready events without consuming them, so an id behind the cursor will
@@ -1032,39 +1181,44 @@ impl RuntimeContext {
     ) -> Result<i32> {
         validate_version_range(&change_id, min_supported, max_supported)?;
 
-        if let Some(event) = self.peek_replay_command_event().cloned() {
-            match event.data {
-                HistoryEventData::VersionMarker(marker) => {
-                    if marker.change_id != change_id {
-                        return Err(Error::Nondeterminism(format!(
-                            "expected VersionMarker `{change_id}`, found `{}`",
-                            marker.change_id
-                        )));
-                    }
-                    let command_id = self.next_command_id();
-                    validate_marker_command(&change_id, &command_id, &marker.command_id)?;
-                    self.advance_replay();
-                    return validate_recorded_version(
-                        change_id,
-                        marker.version,
-                        min_supported,
-                        max_supported,
-                    );
-                }
-                HistoryEventData::DeprecatedPatchMarker(marker) => {
+        // Borrowed, not cloned: matching a marker only needs its change id,
+        // recorded seq, and version.
+        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
+            Some(HistoryEventData::VersionMarker(marker)) => {
+                if marker.change_id != change_id {
                     return Err(Error::Nondeterminism(format!(
-                        "expected VersionMarker `{change_id}`, found DeprecatedPatchMarker `{}`",
-                        marker.patch_id
+                        "expected VersionMarker `{change_id}`, found `{}`",
+                        marker.change_id
                     )));
                 }
-                _ => {
-                    if self.change_markers.contains_key(&change_id) {
-                        return Err(Error::Nondeterminism(format!(
-                            "version marker `{change_id}` moved relative to command history"
-                        )));
-                    }
-                }
+                Some((marker.command_id.seq, marker.version))
             }
+            Some(HistoryEventData::DeprecatedPatchMarker(marker)) => {
+                return Err(Error::Nondeterminism(format!(
+                    "expected VersionMarker `{change_id}`, found DeprecatedPatchMarker `{}`",
+                    marker.patch_id
+                )));
+            }
+            Some(_) => {
+                if self.change_markers.contains_key(&change_id) {
+                    return Err(Error::Nondeterminism(format!(
+                        "version marker `{change_id}` moved relative to command history"
+                    )));
+                }
+                None
+            }
+            None => None,
+        };
+        if let Some((recorded_seq, recorded_version)) = recorded {
+            let command_id = self.next_command_id();
+            validate_marker_command(&change_id, &command_id, recorded_seq)?;
+            self.advance_replay();
+            return validate_recorded_version(
+                change_id,
+                recorded_version,
+                min_supported,
+                max_supported,
+            );
         }
 
         if let Some(marker) = self.change_markers.get(&change_id).cloned() {
@@ -1100,48 +1254,53 @@ impl RuntimeContext {
     }
 
     fn deprecate_patch(&mut self, patch_id: String) -> Result<()> {
-        if let Some(event) = self.peek_replay_command_event().cloned() {
-            match event.data {
-                HistoryEventData::VersionMarker(marker) => {
-                    if marker.change_id != patch_id {
-                        return Err(Error::Nondeterminism(format!(
-                            "expected patch marker `{patch_id}`, found VersionMarker `{}`",
-                            marker.change_id
-                        )));
-                    }
-                    let command_id = self.next_command_id();
-                    validate_marker_command(&patch_id, &command_id, &marker.command_id)?;
-                    if marker.version <= DEFAULT_VERSION {
-                        return Err(Error::UnsupportedWorkflowVersion {
-                            change_id: patch_id,
-                            version: marker.version,
-                            min_supported: 1,
-                            max_supported: i32::MAX,
-                        });
-                    }
-                    self.advance_replay();
-                    return Ok(());
+        // Borrowed, not cloned, as in `get_version`. `Some(version)` carries a
+        // recorded `VersionMarker` whose version still needs the bridge check;
+        // `None` inside `Some(..)` carries a recorded `DeprecatedPatchMarker`.
+        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
+            Some(HistoryEventData::VersionMarker(marker)) => {
+                if marker.change_id != patch_id {
+                    return Err(Error::Nondeterminism(format!(
+                        "expected patch marker `{patch_id}`, found VersionMarker `{}`",
+                        marker.change_id
+                    )));
                 }
-                HistoryEventData::DeprecatedPatchMarker(marker) => {
-                    if marker.patch_id != patch_id {
-                        return Err(Error::Nondeterminism(format!(
-                            "expected DeprecatedPatchMarker `{patch_id}`, found `{}`",
-                            marker.patch_id
-                        )));
-                    }
-                    let command_id = self.next_command_id();
-                    validate_marker_command(&patch_id, &command_id, &marker.command_id)?;
-                    self.advance_replay();
-                    return Ok(());
-                }
-                _ => {
-                    if self.change_markers.contains_key(&patch_id) {
-                        return Err(Error::Nondeterminism(format!(
-                            "patch marker `{patch_id}` moved relative to command history"
-                        )));
-                    }
-                }
+                Some((marker.command_id.seq, Some(marker.version)))
             }
+            Some(HistoryEventData::DeprecatedPatchMarker(marker)) => {
+                if marker.patch_id != patch_id {
+                    return Err(Error::Nondeterminism(format!(
+                        "expected DeprecatedPatchMarker `{patch_id}`, found `{}`",
+                        marker.patch_id
+                    )));
+                }
+                Some((marker.command_id.seq, None))
+            }
+            Some(_) => {
+                if self.change_markers.contains_key(&patch_id) {
+                    return Err(Error::Nondeterminism(format!(
+                        "patch marker `{patch_id}` moved relative to command history"
+                    )));
+                }
+                None
+            }
+            None => None,
+        };
+        if let Some((recorded_seq, recorded_version)) = recorded {
+            let command_id = self.next_command_id();
+            validate_marker_command(&patch_id, &command_id, recorded_seq)?;
+            if let Some(version) = recorded_version
+                && version <= DEFAULT_VERSION
+            {
+                return Err(Error::UnsupportedWorkflowVersion {
+                    change_id: patch_id,
+                    version,
+                    min_supported: 1,
+                    max_supported: i32::MAX,
+                });
+            }
+            self.advance_replay();
+            return Ok(());
         }
 
         if let Some(marker) = self.change_markers.get(&patch_id).cloned() {
@@ -1182,7 +1341,7 @@ impl RuntimeContext {
             )));
         }
         let command_id = self.next_command_id();
-        validate_marker_command(change_id, &command_id, &marker.command_id)?;
+        validate_marker_command(change_id, &command_id, marker.command_id.seq)?;
         self.preconsumed_change_markers
             .insert(command_id.seq, marker.clone());
         Ok(())
@@ -1223,12 +1382,12 @@ fn validate_recorded_version(
 fn validate_marker_command(
     change_id: &str,
     expected: &CommandId,
-    recorded: &CommandId,
+    recorded_seq: CommandSeq,
 ) -> Result<()> {
-    if recorded.seq != expected.seq {
+    if recorded_seq != expected.seq {
         return Err(Error::Nondeterminism(format!(
             "version marker `{change_id}` command sequence changed: expected {}, found {}",
-            expected.seq.0, recorded.seq.0
+            expected.seq.0, recorded_seq.0
         )));
     }
     Ok(())
@@ -1331,32 +1490,50 @@ where
                 )));
             }
 
-            if let Some(event) = runtime.peek_replay_command_event().cloned() {
-                let HistoryEventData::SideEffectMarker(marker) = event.data else {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "expected SideEffectMarker `{}`, found {:?}",
-                        self.key, event.event_type
-                    ))));
-                };
+            // Borrowed, not cloned. The recorded marker carries the side
+            // effect's whole recorded value, which the old `.cloned()` peek
+            // duplicated on every replayed side effect only to decode it.
+            // The recorded seq is copied out and everything else the match
+            // needs is resolved inside the same borrow, in the order the
+            // divergence checks run, so no check is evaluated against a marker
+            // an earlier check already rejected: in particular the value is
+            // only decoded as `T` once the key matches and the marker
+            // validates, because a user `Deserialize` impl that panics on
+            // unexpected input would otherwise turn a clean `Nondeterminism`
+            // into a task panic.
+            let peeked = match runtime.peek_replay_command_event() {
+                Some(event) => match &event.data {
+                    HistoryEventData::SideEffectMarker(marker) => Some((
+                        marker.command_id.seq,
+                        replayed_side_effect(marker, &self.key),
+                    )),
+                    _ => {
+                        return Poll::Ready(Err(Error::Nondeterminism(format!(
+                            "expected SideEffectMarker `{}`, found {:?}",
+                            self.key, event.event_type
+                        ))));
+                    }
+                },
+                None => None,
+            };
+            if let Some((recorded_seq, replayed)) = peeked {
                 let command_id = runtime.next_command_id();
-                if marker.command_id.seq != command_id.seq {
+                if recorded_seq != command_id.seq {
                     return Poll::Ready(Err(Error::Nondeterminism(format!(
                         "side effect `{}` command sequence changed: expected {}, found {}",
-                        self.key, command_id.seq.0, marker.command_id.seq.0
+                        self.key, command_id.seq.0, recorded_seq.0
                     ))));
                 }
-                if marker.key != self.key {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "expected side effect `{}`, found `{}`",
-                        self.key, marker.key
-                    ))));
-                }
-                if let Err(err) = crate::validate_side_effect_marker(&marker) {
-                    return Poll::Ready(Err(err));
-                }
+                // A diverged marker leaves the cursor where it is; a decoded
+                // one consumes it whether or not decoding succeeded, matching
+                // the order the checks were written in.
+                let decoded = match replayed {
+                    ReplayedSideEffect::Diverged(err) => return Poll::Ready(Err(err)),
+                    ReplayedSideEffect::Decoded(decoded) => decoded,
+                };
                 runtime.advance_replay();
                 self.done = true;
-                Poll::Ready(crate::decode_payload(&marker.value))
+                Poll::Ready(decoded)
             } else if runtime.at_replay_tail() {
                 let command_id = runtime.next_command_id();
                 let Some(effect) = self.effect.take() else {
@@ -1387,6 +1564,33 @@ where
             }
         })
     }
+}
+
+/// Outcome of matching a workflow's `side_effect` call against the marker the
+/// replay cursor is parked on, resolved while the marker is still borrowed so
+/// the recorded value is read in place rather than copied out of history.
+enum ReplayedSideEffect<T> {
+    /// The marker does not belong to this call. The cursor must not advance.
+    Diverged(Error),
+    /// The marker matched. The cursor advances and this is the call's result,
+    /// success or decode failure.
+    Decoded(Result<T>),
+}
+
+fn replayed_side_effect<T>(marker: &SideEffectMarker, key: &str) -> ReplayedSideEffect<T>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if marker.key != key {
+        return ReplayedSideEffect::Diverged(Error::Nondeterminism(format!(
+            "expected side effect `{key}`, found `{}`",
+            marker.key
+        )));
+    }
+    if let Err(err) = crate::validate_side_effect_marker(marker) {
+        return ReplayedSideEffect::Diverged(err);
+    }
+    ReplayedSideEffect::Decoded(crate::decode_payload(&marker.value))
 }
 
 pub fn publish<T>(view: &T) -> Result<()>
@@ -1841,8 +2045,10 @@ fn record_select_winner(
     branches_digest: &str,
 ) -> Poll<Result<()>> {
     with_context(|runtime| {
-        if let Some(event) = runtime.peek_replay_command_event().cloned() {
-            if let HistoryEventData::SelectWinner(winner) = event.data {
+        // Borrowed, not cloned: the recorded winner is only ever compared
+        // field by field against what the select just observed.
+        if let Some(event) = runtime.peek_replay_command_event() {
+            if let HistoryEventData::SelectWinner(winner) = &event.data {
                 if winner.select_command_id.seq != select_command_id.seq {
                     return Poll::Ready(Err(Error::Nondeterminism(format!(
                         "expected SelectWinner command {}, found {}",
@@ -2158,76 +2364,58 @@ fn poll_activity_schedule<A>(
 where
     A: Activity,
 {
-    if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
-        runtime.request_more_history_if_available();
+    let Poll::Ready((command_id, _)) =
+        runtime.match_or_append_command(
+            CommandEventKind::Activity,
+            |runtime| {
+                let options = runtime.effective_activity_options(options);
+                let task_queue = options
+                    .task_queue
+                    .clone()
+                    .expect("effective activity options include task queue fallback");
+                let retry_policy = options.effective_retry_policy();
+                let fingerprint_options = ActivityOptions {
+                    task_queue: Some(task_queue.clone()),
+                    retry_policy: Some(retry_policy.clone()),
+                    start_to_close_timeout: options.start_to_close_timeout,
+                    heartbeat_timeout: options.heartbeat_timeout,
+                };
+                let activity_input = input
+                    .as_ref()
+                    .expect("activity input exists before schedule");
+                let input_ref = runtime.encode_payload(activity_input)?;
+                let fingerprint = activity_fingerprint(
+                    A::activity_name(),
+                    payload_digest(&input_ref),
+                    fingerprint_options.digest()?,
+                );
+                Ok((fingerprint, (options, task_queue, retry_policy, input_ref)))
+            },
+            |runtime, command_id, fingerprint, (options, task_queue, retry_policy, input_ref)| {
+                let scheduled = ActivityScheduled {
+                    command_id: command_id.clone(),
+                    activity_name: A::activity_name(),
+                    task_queue,
+                    retry_policy,
+                    start_to_close_timeout: options.start_to_close_timeout,
+                    heartbeat_timeout: options.heartbeat_timeout,
+                    input: input_ref,
+                    fingerprint,
+                };
+                // Derive the task from the borrow, then move the event in. The
+                // reverse order cloned the whole `ActivityScheduled` — including
+                // the encoded input — for every scheduled activity.
+                runtime
+                    .schedule_activities
+                    .push(ActivityTask::from_scheduled(&scheduled));
+                runtime.append_events.push(NewHistoryEvent::new(
+                    HistoryEventData::ActivityScheduled(scheduled),
+                ));
+            },
+        )?
+    else {
         return Poll::Pending;
-    }
-
-    let command_id = runtime.next_command_id();
-    let options = runtime.effective_activity_options(options);
-    let task_queue = options
-        .task_queue
-        .clone()
-        .expect("effective activity options include task queue fallback");
-    let retry_policy = options.effective_retry_policy();
-    let fingerprint_options = ActivityOptions {
-        task_queue: Some(task_queue.clone()),
-        retry_policy: Some(retry_policy.clone()),
-        start_to_close_timeout: options.start_to_close_timeout,
-        heartbeat_timeout: options.heartbeat_timeout,
     };
-    let activity_input = input
-        .as_ref()
-        .expect("activity input exists before schedule");
-    let input_ref = runtime.encode_payload(activity_input)?;
-    let fingerprint = activity_fingerprint(
-        A::activity_name(),
-        payload_digest(&input_ref),
-        fingerprint_options.digest()?,
-    );
-
-    if let Some(event) = runtime.peek_replay_command_event().cloned() {
-        let HistoryEventData::ActivityScheduled(scheduled) = event.data else {
-            return Poll::Ready(Err(Error::Nondeterminism(format!(
-                "expected ActivityScheduled for command {}, found {:?}",
-                command_id.seq.0, event.event_type
-            ))));
-        };
-        if scheduled.command_id.seq != command_id.seq {
-            return Poll::Ready(Err(Error::Nondeterminism(format!(
-                "expected command seq {}, found {}",
-                command_id.seq.0, scheduled.command_id.seq.0
-            ))));
-        }
-        if scheduled.fingerprint != fingerprint {
-            return Poll::Ready(Err(Error::Nondeterminism(format!(
-                "activity command fingerprint changed for command {}",
-                command_id.seq.0
-            ))));
-        }
-        runtime.advance_replay();
-        *input = None;
-        return Poll::Ready(Ok(command_id));
-    }
-
-    let scheduled = ActivityScheduled {
-        command_id: command_id.clone(),
-        activity_name: A::activity_name(),
-        task_queue,
-        retry_policy,
-        start_to_close_timeout: options.start_to_close_timeout,
-        heartbeat_timeout: options.heartbeat_timeout,
-        input: input_ref,
-        fingerprint,
-    };
-    runtime
-        .append_events
-        .push(NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
-            scheduled.clone(),
-        )));
-    runtime
-        .schedule_activities
-        .push(ActivityTask::from_scheduled(&scheduled));
     *input = None;
     Poll::Ready(Ok(command_id))
 }
@@ -2384,91 +2572,89 @@ where
     A: Activity,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ActivityMapHandle>> {
-        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let command_id = runtime.next_command_id();
-        let input_manifest = match self.input_manifest.clone() {
-            Some(input_manifest) => input_manifest,
-            None => {
-                return Poll::Ready(Err(Error::Backend(
-                    "activity_map requires input_manifest".to_owned(),
-                )));
-            }
-        };
-        let options = runtime.effective_activity_options(self.options.clone());
-        let task_queue = options
-            .task_queue
-            .clone()
-            .expect("effective activity options include task queue fallback");
-        let retry_policy = options.effective_retry_policy();
-        let fingerprint_options = ActivityOptions {
-            task_queue: Some(task_queue.clone()),
-            retry_policy: Some(retry_policy.clone()),
-            start_to_close_timeout: options.start_to_close_timeout,
-            heartbeat_timeout: options.heartbeat_timeout,
-        };
         let max_in_flight = self.max_in_flight.max(1);
-        let fingerprint = activity_map_fingerprint(
-            A::activity_name(),
-            payload_digest(&input_manifest),
-            self.result_manifest_name.clone(),
-            max_in_flight,
-            fingerprint_options.digest()?,
-        );
-
-        if let Some(event) = runtime.peek_replay_command_event().cloned() {
-            let HistoryEventData::ActivityMapScheduled(scheduled) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected ActivityMapScheduled for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
-            };
-            if scheduled.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, scheduled.command_id.seq.0
-                ))));
-            }
-            if scheduled.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "activity map command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-            self.state = ActivityMapSpawnState::Done;
-            return Poll::Ready(Ok(ActivityMapHandle { command_id }));
-        }
-
-        let scheduled = ActivityMapScheduled {
-            command_id: command_id.clone(),
-            activity_name: A::activity_name(),
-            task_queue,
-            retry_policy,
-            start_to_close_timeout: options.start_to_close_timeout,
-            heartbeat_timeout: options.heartbeat_timeout,
-            input_manifest: input_manifest.clone(),
-            result_manifest_name: self.result_manifest_name.clone(),
-            max_in_flight,
-            fingerprint,
+        let Poll::Ready((command_id, _)) = runtime.match_or_append_command(
+            CommandEventKind::ActivityMap,
+            |runtime| {
+                if self.input_manifest.is_none() {
+                    return Err(Error::Backend(
+                        "activity_map requires input_manifest".to_owned(),
+                    ));
+                }
+                let result_manifest_name = self.result_manifest_name.clone();
+                let options = runtime.effective_activity_options(self.options.clone());
+                let task_queue = options
+                    .task_queue
+                    .clone()
+                    .expect("effective activity options include task queue fallback");
+                let retry_policy = options.effective_retry_policy();
+                let fingerprint_options = ActivityOptions {
+                    task_queue: Some(task_queue.clone()),
+                    retry_policy: Some(retry_policy.clone()),
+                    start_to_close_timeout: options.start_to_close_timeout,
+                    heartbeat_timeout: options.heartbeat_timeout,
+                };
+                let options_digest = fingerprint_options.digest()?;
+                // Taken, not cloned, so a replayed map does not copy the
+                // manifest root it never uses. Taken only after every fallible
+                // step above has passed, so a rejected build leaves the future
+                // exactly as it found it. `ChildWorkflowMapSpawnFuture` follows
+                // the same discipline; keep them in step.
+                let input_manifest = self
+                    .input_manifest
+                    .take()
+                    .expect("input manifest checked above");
+                let fingerprint = activity_map_fingerprint(
+                    A::activity_name(),
+                    payload_digest(&input_manifest),
+                    result_manifest_name.clone(),
+                    max_in_flight,
+                    options_digest,
+                );
+                Ok((
+                    fingerprint,
+                    (
+                        options,
+                        task_queue,
+                        retry_policy,
+                        input_manifest,
+                        result_manifest_name,
+                    ),
+                ))
+            },
+            |runtime, command_id, fingerprint, prepared| {
+                let (options, task_queue, retry_policy, input_manifest, result_manifest_name) =
+                    prepared;
+                runtime.schedule_activity_maps.push(ActivityMapTask {
+                    map_command_id: command_id.clone(),
+                    activity_name: A::activity_name(),
+                    task_queue: task_queue.clone(),
+                    retry_policy: retry_policy.clone(),
+                    start_to_close_timeout: options.start_to_close_timeout,
+                    heartbeat_timeout: options.heartbeat_timeout,
+                    input_manifest: input_manifest.clone(),
+                    result_manifest_name: result_manifest_name.clone(),
+                    max_in_flight,
+                });
+                runtime.append_events.push(NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(ActivityMapScheduled {
+                        command_id: command_id.clone(),
+                        activity_name: A::activity_name(),
+                        task_queue,
+                        retry_policy,
+                        start_to_close_timeout: options.start_to_close_timeout,
+                        heartbeat_timeout: options.heartbeat_timeout,
+                        input_manifest,
+                        result_manifest_name,
+                        max_in_flight,
+                        fingerprint,
+                    }),
+                ));
+            },
+        )?
+        else {
+            return Poll::Pending;
         };
-        runtime.append_events.push(NewHistoryEvent::new(
-            HistoryEventData::ActivityMapScheduled(scheduled.clone()),
-        ));
-        runtime.schedule_activity_maps.push(ActivityMapTask {
-            map_command_id: command_id.clone(),
-            activity_name: scheduled.activity_name,
-            task_queue: scheduled.task_queue,
-            retry_policy: scheduled.retry_policy,
-            start_to_close_timeout: scheduled.start_to_close_timeout,
-            heartbeat_timeout: scheduled.heartbeat_timeout,
-            input_manifest,
-            result_manifest_name: scheduled.result_manifest_name,
-            max_in_flight,
-        });
         self.state = ActivityMapSpawnState::Done;
         Poll::Ready(Ok(ActivityMapHandle { command_id }))
     }
@@ -2669,90 +2855,88 @@ where
     W: Workflow,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowMapHandle>> {
-        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let command_id = runtime.next_command_id();
-        let Some(input_manifest) = self.input_manifest.clone() else {
-            return Poll::Ready(Err(Error::Backend(
-                "child_workflow_map requires input_manifest".to_owned(),
-            )));
-        };
-        let Some(workflow_id_prefix) = self.workflow_id_prefix.clone() else {
-            return Poll::Ready(Err(Error::Backend(
-                "child_workflow_map requires workflow_id_prefix".to_owned(),
-            )));
-        };
-        let task_queue = self
-            .task_queue
-            .clone()
-            .unwrap_or_else(|| runtime.worker_workflow_task_queue.clone());
         let max_in_flight = self.max_in_flight.max(1);
-        let fingerprint = child_workflow_map_fingerprint(
-            W::workflow_type(),
-            payload_digest(&input_manifest),
-            self.result_manifest_name.clone(),
-            workflow_id_prefix.clone(),
-            max_in_flight,
-            task_queue.clone(),
-            self.parent_close_policy,
-            self.failure_mode,
-        );
-
-        if let Some(event) = runtime.peek_replay_command_event().cloned() {
-            let HistoryEventData::ChildWorkflowMapScheduled(scheduled) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected ChildWorkflowMapScheduled for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
-            };
-            if scheduled.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, scheduled.command_id.seq.0
-                ))));
-            }
-            if scheduled.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "child workflow map command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-            self.state = ChildWorkflowMapSpawnState::Done;
-            return Poll::Ready(Ok(ChildWorkflowMapHandle { command_id }));
-        }
-
-        let scheduled = ChildWorkflowMapScheduled {
-            command_id: command_id.clone(),
-            workflow_type: W::workflow_type(),
-            task_queue: task_queue.clone(),
-            input_manifest: input_manifest.clone(),
-            result_manifest_name: self.result_manifest_name.clone(),
-            workflow_id_prefix: workflow_id_prefix.clone(),
-            max_in_flight,
-            parent_close_policy: self.parent_close_policy,
-            failure_mode: self.failure_mode,
-            fingerprint,
+        let parent_close_policy = self.parent_close_policy;
+        let failure_mode = self.failure_mode;
+        let Poll::Ready((command_id, _)) = runtime.match_or_append_command(
+            CommandEventKind::ChildWorkflowMap,
+            |runtime| {
+                if self.input_manifest.is_none() {
+                    return Err(Error::Backend(
+                        "child_workflow_map requires input_manifest".to_owned(),
+                    ));
+                }
+                let Some(workflow_id_prefix) = self.workflow_id_prefix.clone() else {
+                    return Err(Error::Backend(
+                        "child_workflow_map requires workflow_id_prefix".to_owned(),
+                    ));
+                };
+                // Taken, not cloned, after every fallible step above: see
+                // `ActivityMapSpawnFuture::poll_init`.
+                let input_manifest = self
+                    .input_manifest
+                    .take()
+                    .expect("input manifest checked above");
+                let result_manifest_name = self.result_manifest_name.clone();
+                let task_queue = self
+                    .task_queue
+                    .clone()
+                    .unwrap_or_else(|| runtime.worker_workflow_task_queue.clone());
+                let fingerprint = child_workflow_map_fingerprint(
+                    W::workflow_type(),
+                    payload_digest(&input_manifest),
+                    result_manifest_name.clone(),
+                    workflow_id_prefix.clone(),
+                    max_in_flight,
+                    task_queue.clone(),
+                    parent_close_policy,
+                    failure_mode,
+                );
+                Ok((
+                    fingerprint,
+                    (
+                        task_queue,
+                        input_manifest,
+                        result_manifest_name,
+                        workflow_id_prefix,
+                    ),
+                ))
+            },
+            |runtime, command_id, fingerprint, prepared| {
+                let (task_queue, input_manifest, result_manifest_name, workflow_id_prefix) =
+                    prepared;
+                runtime
+                    .schedule_child_workflow_maps
+                    .push(ChildWorkflowMapTask {
+                        map_command_id: command_id.clone(),
+                        workflow_type: W::workflow_type(),
+                        task_queue: task_queue.clone(),
+                        input_manifest: input_manifest.clone(),
+                        result_manifest_name: result_manifest_name.clone(),
+                        workflow_id_prefix: workflow_id_prefix.clone(),
+                        max_in_flight,
+                        parent_close_policy,
+                        failure_mode,
+                    });
+                runtime.append_events.push(NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowMapScheduled(ChildWorkflowMapScheduled {
+                        command_id: command_id.clone(),
+                        workflow_type: W::workflow_type(),
+                        task_queue,
+                        input_manifest,
+                        result_manifest_name,
+                        workflow_id_prefix,
+                        max_in_flight,
+                        parent_close_policy,
+                        failure_mode,
+                        fingerprint,
+                    }),
+                ));
+            },
+        )?
+        else {
+            return Poll::Pending;
         };
-        runtime.append_events.push(NewHistoryEvent::new(
-            HistoryEventData::ChildWorkflowMapScheduled(scheduled.clone()),
-        ));
-        runtime
-            .schedule_child_workflow_maps
-            .push(ChildWorkflowMapTask {
-                map_command_id: command_id.clone(),
-                workflow_type: scheduled.workflow_type,
-                task_queue,
-                input_manifest,
-                result_manifest_name: scheduled.result_manifest_name,
-                workflow_id_prefix,
-                max_in_flight,
-                parent_close_policy: scheduled.parent_close_policy,
-                failure_mode: scheduled.failure_mode,
-            });
         self.state = ChildWorkflowMapSpawnState::Done;
         Poll::Ready(Ok(ChildWorkflowMapHandle { command_id }))
     }
@@ -2940,89 +3124,90 @@ where
     W: Workflow,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowHandle<W>>> {
-        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
-            runtime.request_more_history_if_available();
+        let parent_close_policy = self.parent_close_policy;
+        let Poll::Ready((command_id, disposition)) = runtime.match_or_append_command(
+            CommandEventKind::ChildWorkflow,
+            |runtime| {
+                let Some(workflow_id) = self.workflow_id.clone() else {
+                    return Err(Error::Backend(
+                        "child workflow requires workflow_id".to_owned(),
+                    ));
+                };
+                let task_queue = self
+                    .task_queue
+                    .clone()
+                    .unwrap_or_else(|| runtime.worker_workflow_task_queue.clone());
+                let input_ref = {
+                    let input = self
+                        .input
+                        .as_ref()
+                        .expect("child workflow input exists before schedule");
+                    runtime.encode_payload(input)?
+                };
+                // `self.input` deliberately survives `prepare`. Clearing it
+                // here would also clear it on the divergence path, where the
+                // future can still be polled again with `state == Init`, and
+                // the `expect` above would then panic instead of re-producing
+                // the same clean `Error`. It is cleared below, on the append
+                // path only, exactly where it always was.
+                let fingerprint = child_workflow_fingerprint(
+                    W::workflow_type(),
+                    workflow_id.clone(),
+                    payload_digest(&input_ref),
+                    task_queue.clone(),
+                    parent_close_policy,
+                );
+                Ok((fingerprint, (workflow_id, task_queue, input_ref)))
+            },
+            |runtime, command_id, fingerprint, (workflow_id, task_queue, input_ref)| {
+                let requested = crate::ChildWorkflowStartRequested {
+                    command_id: command_id.clone(),
+                    workflow_type: W::workflow_type(),
+                    workflow_id: workflow_id.clone(),
+                    task_queue,
+                    input: input_ref,
+                    parent_close_policy,
+                    fingerprint,
+                };
+                // Derive the outbox message from the borrow, then move the
+                // event in, so the encoded child input is not deep-cloned.
+                runtime
+                    .start_child_workflows
+                    .push(ChildStartOutboxMessage::from_requested(&requested));
+                runtime.append_events.push(NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowStartRequested(requested),
+                ));
+                self.state = ChildWorkflowSpawnState::Waiting(command_id.clone(), workflow_id);
+            },
+        )?
+        else {
+            return Poll::Pending;
+        };
+
+        if disposition == CommandDisposition::Appended {
+            self.input = None;
             return Poll::Pending;
         }
 
-        let command_id = runtime.next_command_id();
-        let Some(workflow_id) = self.workflow_id.clone() else {
-            return Poll::Ready(Err(Error::Backend(
-                "child workflow requires workflow_id".to_owned(),
-            )));
-        };
-        let task_queue = self
-            .task_queue
+        if let Some(started) = runtime.take_child_started(&command_id) {
+            self.state = ChildWorkflowSpawnState::Done;
+            return Poll::Ready(Ok(ChildWorkflowHandle {
+                command_id,
+                workflow_id: started.workflow_id,
+                run_id: started.run_id,
+                _workflow: std::marker::PhantomData,
+            }));
+        }
+        if let Some(failure) = runtime.take_child_failure(&command_id) {
+            self.state = ChildWorkflowSpawnState::Done;
+            return Poll::Ready(Err(Error::ChildWorkflowFailed(failure)));
+        }
+        let workflow_id = self
+            .workflow_id
             .clone()
-            .unwrap_or_else(|| runtime.worker_workflow_task_queue.clone());
-        let input = self
-            .input
-            .as_ref()
-            .expect("child workflow input exists before schedule");
-        let input_ref = runtime.encode_payload(input)?;
-        let fingerprint = child_workflow_fingerprint(
-            W::workflow_type(),
-            workflow_id.clone(),
-            payload_digest(&input_ref),
-            task_queue.clone(),
-            self.parent_close_policy,
-        );
-
-        if let Some(event) = runtime.peek_replay_command_event().cloned() {
-            let HistoryEventData::ChildWorkflowStartRequested(requested) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected ChildWorkflowStartRequested for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
-            };
-            if requested.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, requested.command_id.seq.0
-                ))));
-            }
-            if requested.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "child workflow command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-            if let Some(started) = runtime.take_child_started(&command_id) {
-                self.state = ChildWorkflowSpawnState::Done;
-                return Poll::Ready(Ok(ChildWorkflowHandle {
-                    command_id,
-                    workflow_id: started.workflow_id,
-                    run_id: started.run_id,
-                    _workflow: std::marker::PhantomData,
-                }));
-            }
-            if let Some(failure) = runtime.take_child_failure(&command_id) {
-                self.state = ChildWorkflowSpawnState::Done;
-                return Poll::Ready(Err(Error::ChildWorkflowFailed(failure)));
-            }
-            self.state = ChildWorkflowSpawnState::Waiting(command_id, workflow_id);
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let requested = crate::ChildWorkflowStartRequested {
-            command_id: command_id.clone(),
-            workflow_type: W::workflow_type(),
-            workflow_id: workflow_id.clone(),
-            task_queue,
-            input: input_ref,
-            parent_close_policy: self.parent_close_policy,
-            fingerprint,
-        };
-        runtime.append_events.push(NewHistoryEvent::new(
-            HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
-        ));
-        runtime
-            .start_child_workflows
-            .push(ChildStartOutboxMessage::from_requested(&requested));
-        self.input = None;
+            .expect("child workflow id exists after schedule");
         self.state = ChildWorkflowSpawnState::Waiting(command_id, workflow_id);
+        runtime.request_more_history_if_available();
         Poll::Pending
     }
 
@@ -3166,64 +3351,43 @@ impl DurableJoinBranch for TimerFuture {}
 
 impl TimerFuture {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<()>> {
-        if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
-            runtime.request_more_history_if_available();
+        let timer = self.timer;
+        let Poll::Ready((command_id, disposition)) =
+            runtime.match_or_append_command(
+                CommandEventKind::Timer,
+                |runtime| Ok(timer.fingerprint_and_fire_at(runtime.now)),
+                |runtime, command_id, fingerprint, fire_at| {
+                    runtime.append_events.push(NewHistoryEvent::new(
+                        HistoryEventData::TimerStarted(TimerStarted {
+                            command_id: command_id.clone(),
+                            fire_at,
+                            fingerprint,
+                        }),
+                    ));
+                    runtime.upsert_waits.push(WaitRecord {
+                        wait_id: timer_wait_id(command_id),
+                        run_id: runtime.run_id.clone(),
+                        command_id: command_id.clone(),
+                        kind: WaitKind::Timer,
+                        key: "timer".to_owned(),
+                        ready_at: Some(fire_at),
+                    });
+                },
+            )?
+        else {
             return Poll::Pending;
-        }
-
-        let command_id = runtime.next_command_id();
-        let (fingerprint, fire_at) = self.timer.fingerprint_and_fire_at(runtime.now);
-
-        if let Some(event) = runtime.peek_replay_command_event().cloned() {
-            let HistoryEventData::TimerStarted(started) = event.data else {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected TimerStarted for command {}, found {:?}",
-                    command_id.seq.0, event.event_type
-                ))));
-            };
-            if started.command_id.seq != command_id.seq {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "expected command seq {}, found {}",
-                    command_id.seq.0, started.command_id.seq.0
-                ))));
-            }
-            if started.fingerprint != fingerprint {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "timer command fingerprint changed for command {}",
-                    command_id.seq.0
-                ))));
-            }
-            runtime.advance_replay();
-
-            if runtime.take_timer(&command_id).is_some() {
-                self.state = TimerFutureState::Done;
-                return Poll::Ready(Ok(()));
-            }
-
-            self.state = TimerFutureState::Waiting(command_id);
-            runtime.request_more_history_if_available();
-            return Poll::Pending;
-        }
-
-        let started = TimerStarted {
-            command_id: command_id.clone(),
-            fire_at,
-            fingerprint,
         };
-        runtime
-            .append_events
-            .push(NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                started,
-            )));
-        runtime.upsert_waits.push(WaitRecord {
-            wait_id: timer_wait_id(&command_id),
-            run_id: runtime.run_id.clone(),
-            command_id: command_id.clone(),
-            kind: WaitKind::Timer,
-            key: "timer".to_owned(),
-            ready_at: Some(fire_at),
-        });
+
+        if disposition == CommandDisposition::Replayed && runtime.take_timer(&command_id).is_some()
+        {
+            self.state = TimerFutureState::Done;
+            return Poll::Ready(Ok(()));
+        }
+
         self.state = TimerFutureState::Waiting(command_id);
+        if disposition == CommandDisposition::Replayed {
+            runtime.request_more_history_if_available();
+        }
         Poll::Pending
     }
 

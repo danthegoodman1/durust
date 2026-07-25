@@ -1,7 +1,8 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
+    MemoryBackend, Namespace, PayloadRef, PayloadStorageConfig, SqliteBackend, TaskQueue, Worker,
+    WorkerId, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -1798,6 +1799,10 @@ fn panicking_workflow_commits_nothing_from_the_failed_attempt() {
             .build();
 
         let err = worker.run_workflow_once().await.unwrap_err();
+        // `TaskPanic`, not `Nondeterminism`: routed identically (nothing
+        // committed, claim released with the retry backoff) but distinguishable
+        // from genuine history divergence, which needs a different operator
+        // response than a workflow bug.
         let durust::Error::TaskPanic(message) = &err else {
             panic!("a workflow panic must fail the task, got {err:?}");
         };
@@ -1851,6 +1856,9 @@ fn durable_api_inside_side_effect_fails_the_task_without_recording_markers() {
             .build();
 
         let err = worker.run_workflow_once().await.unwrap_err();
+        // The re-entrancy guard reports by panicking, so this arrives through
+        // the workflow-poll `catch_unwind` as `TaskPanic`. Both contract
+        // strings survive that reclassification.
         let durust::Error::TaskPanic(message) = &err else {
             panic!("a nested durable API call must fail the task, got {err:?}");
         };
@@ -2744,6 +2752,27 @@ fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
     });
 }
 
+// A recorded command event must be *matched* on the following replay, never
+// re-appended. Asserting only that the first task appended it leaves the
+// matcher's replay branch uncovered for that kind — an always-append mutation
+// of the matcher survives it.
+fn assert_command_event_recorded_once(
+    history: &[durust::HistoryEvent],
+    label: &str,
+    is_kind: impl Fn(&HistoryEventData) -> bool,
+) {
+    let count = history.iter().filter(|event| is_kind(&event.data)).count();
+    assert_eq!(
+        count,
+        1,
+        "the recorded {label} command must be matched on replay, not re-appended; history: {:?}",
+        history
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>()
+    );
+}
+
 fn out_of_order_worker<W>(
     backend: MemoryBackend,
     workflow: W,
@@ -2819,11 +2848,23 @@ async fn run_spawn_sleep_sleep_out_of_order_case(cold_chunk_events: Option<usize
     let history = stream_all(&backend, &run_id).await;
     assert!(matches!(history[5].data, HistoryEventData::TimerStarted(_)));
 
+    // Cold-replay both recorded TimerStarted events past the unconsumed
+    // completion.
+    drop(worker);
+    let mut worker = out_of_order_worker(backend.clone(), spawn_sleep_sleep_workflow, Some(1));
     backend.advance_time(Duration::from_secs(1));
     assert_eq!(worker.run_timers_once().await.unwrap(), 1);
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::TimerStarted(_)))
+            .count(),
+        2,
+        "both recorded timer commands must be matched on replay, not re-appended"
+    );
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-sleep workflow did not complete");
     };
@@ -2876,10 +2917,24 @@ async fn run_out_of_order_completion_before_new_activity_case(cold_chunk_events:
         HistoryEventData::ActivityScheduled(_)
     ));
 
+    // Cold-replay the two recorded ActivityScheduled events past the still
+    // unconsumed first completion, so the matcher's replay branch is covered
+    // for this kind and not just its append branch.
+    drop(worker);
+    let mut worker =
+        out_of_order_worker(backend.clone(), spawn_sleep_then_activity_workflow, Some(1));
     assert!(worker.run_activity_once().await.unwrap());
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::ActivityScheduled(_)))
+            .count(),
+        2,
+        "both recorded activity commands must be matched on replay, not re-appended"
+    );
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-activity workflow did not complete");
     };
@@ -2932,6 +2987,9 @@ async fn run_out_of_order_completion_before_side_effect_case(cold_chunk_events: 
         history[5].data,
         HistoryEventData::SideEffectMarker(_)
     ));
+    assert_command_event_recorded_once(&history, "side effect", |data| {
+        matches!(data, HistoryEventData::SideEffectMarker(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-side-effect workflow did not complete");
     };
@@ -2982,11 +3040,18 @@ async fn run_out_of_order_completion_before_version_marker_case(cold_chunk_event
     ));
     assert!(matches!(history[6].data, HistoryEventData::TimerStarted(_)));
 
+    // Cold-replay the recorded VersionMarker past the unconsumed completion.
+    drop(worker);
+    let mut worker =
+        out_of_order_worker(backend.clone(), spawn_sleep_then_version_workflow, Some(1));
     backend.advance_time(Duration::from_secs(1));
     assert_eq!(worker.run_timers_once().await.unwrap(), 1);
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "version marker", |data| {
+        matches!(data, HistoryEventData::VersionMarker(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-version workflow did not complete");
     };
@@ -3080,10 +3145,18 @@ async fn run_out_of_order_completion_before_child_spawn_case(cold_chunk_events: 
         HistoryEventData::ChildWorkflowStartRequested(_)
     ));
 
+    // Cold-replay the recorded ChildWorkflowStartRequested past the still
+    // unconsumed activity completion. Without this the case only proves the
+    // append branch, which is why plain ChildWorkflow sat at one covering test.
+    drop(worker);
+    let mut worker = build_worker(Some(1));
     let stats = worker.run_until_idle().await.unwrap();
     assert!(stats.child_workflow_starts_dispatched >= 1);
 
     let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "child workflow start", |data| {
+        matches!(data, HistoryEventData::ChildWorkflowStartRequested(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-child workflow did not complete");
     };
@@ -7928,4 +8001,544 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
         self.inner.gc_payload_blobs(req)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 row 3A/3B: the consolidated command matcher under unfavorable replay
+// orderings, and the borrow-based match on payload-carrying command events.
+//
+// `spawn_sleep_sleep_workflow`, `spawn_sleep_then_activity_workflow`,
+// `spawn_sleep_then_side_effect_workflow`, `spawn_sleep_then_version_workflow`
+// and `spawn_sleep_then_child_workflow` above already drive the timer,
+// activity, side effect, version marker and child spawn kinds past an
+// unconsumed completion sitting at the replay cursor head. The two map kinds
+// go through the same matcher and had no such case, so they get one here.
+// ---------------------------------------------------------------------------
+
+#[durust::workflow(name = "tests.spawn-sleep-then-activity-map", version = 1)]
+async fn spawn_sleep_then_activity_map_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let input_manifest = durust::activity_map_manifest(vec![
+        NumberInput { value: value + 1 },
+        NumberInput { value: value + 2 },
+    ])?;
+    let mapped = durust::activity_map(double)
+        .task_queue("activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("post-sleep-mapped")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
+    })?;
+    let first = handle.result().await?;
+    Ok(first + mapped_sum)
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-child-workflow-map", version = 1)]
+async fn spawn_sleep_then_child_workflow_map_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let input_manifest = durust::child_workflow_map_manifest(vec![
+        NumberInput { value: value + 1 },
+        NumberInput { value: value + 2 },
+    ])?;
+    let mapped = durust::child_workflow_map::<child_double_workflow>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/spawn-sleep-then-child-map/item")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("post-sleep-child-mapped")
+        .parent_close_policy(durust::ParentClosePolicy::Cancel)
+        .failure_mode(durust::ChildWorkflowMapFailureMode::FailFast)
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
+    })?;
+    let first = handle.result().await?;
+    Ok(first + mapped_sum)
+}
+
+async fn run_out_of_order_completion_before_activity_map_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_activity_map_workflow>(
+            "wf/spawn-sleep-then-activity-map",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(
+        backend.clone(),
+        spawn_sleep_then_activity_map_workflow,
+        None,
+    );
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_then_activity_map_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // The critical task: ActivityMapScheduled must be allocated and appended
+    // past the unconsumed ActivityCompleted at the replay cursor head instead
+    // of matching against it.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ActivityMapScheduled(_)
+    ));
+
+    // Now drive the recorded ActivityMapScheduled back through the matcher:
+    // dropping the worker makes the remaining tasks cold-replay it in
+    // one-event chunks, and the spawned activity's completion is still
+    // unconsumed ahead of it at the cursor head, so the map command has to be
+    // matched past a ready event rather than re-appended.
+    drop(worker);
+    let mut worker = out_of_order_worker(
+        backend.clone(),
+        spawn_sleep_then_activity_map_workflow,
+        Some(1),
+    );
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "activity map", |data| {
+        matches!(data, HistoryEventData::ActivityMapScheduled(_))
+    });
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "spawn-sleep-then-activity-map workflow did not complete; history: {:?}",
+            history
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>()
+        );
+    };
+    // 2*10 from the spawned activity plus 2*11 + 2*12 from the map.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 66);
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cached() {
+    block_on(run_out_of_order_completion_before_activity_map_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cold() {
+    block_on(run_out_of_order_completion_before_activity_map_case(Some(
+        100,
+    )));
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_activity_map_case(Some(
+        1,
+    )));
+}
+
+async fn run_out_of_order_completion_before_child_workflow_map_case(
+    cold_chunk_events: Option<usize>,
+) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_child_workflow_map_workflow>(
+            "wf/spawn-sleep-then-child-workflow-map",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let build_worker = |chunk_events: Option<usize>| {
+        let mut builder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(spawn_sleep_then_child_workflow_map_workflow)
+            .register_workflow(child_double_workflow)
+            .register_activity(double);
+        if let Some(chunk_events) = chunk_events {
+            builder = builder.history_chunk_events(chunk_events);
+        }
+        builder.build()
+    };
+    let mut worker = build_worker(None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = build_worker(Some(chunk_events));
+    }
+
+    // Same critical task for the child-map kind.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ChildWorkflowMapScheduled(_)
+    ));
+
+    // As above: cold-replay the recorded ChildWorkflowMapScheduled past the
+    // still-unconsumed activity completion.
+    drop(worker);
+    let mut worker = build_worker(Some(1));
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "child workflow map", |data| {
+        matches!(data, HistoryEventData::ChildWorkflowMapScheduled(_))
+    });
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "spawn-sleep-then-child-workflow-map workflow did not complete; history: {:?}",
+            history
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>()
+        );
+    };
+    // 2*10 from the spawned activity plus 2*11 + 2*12 from the child map.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 66);
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cached() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        None,
+    ));
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cold() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        Some(100),
+    ));
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        Some(1),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Row 3B: the command matcher borrows the recorded event instead of cloning
+// it, so the recorded `ActivityScheduled.input`, `SideEffectMarker.value` and
+// `ChildWorkflowStartRequested.input` are never duplicated to read a seq and a
+// fingerprint. A deep clone of an immutable event is not itself observable, so
+// what this pins is the correctness of the borrow-based comparison on the
+// events that actually carry bulk payloads: every one of them must still match
+// (never re-append) across cached and cold multi-chunk replay, and the
+// recorded payloads must survive byte-for-byte.
+// ---------------------------------------------------------------------------
+
+const LARGE_INLINE_COMMAND_PAYLOAD_BYTES: usize = 128 * 1024;
+// Just under `MAX_SIDE_EFFECT_PAYLOAD_BYTES` (8 KiB), which the marker
+// validator hard caps and which no backend configuration can raise.
+const LARGE_INLINE_SIDE_EFFECT_BYTES: usize = 7 * 1024;
+// `PayloadStorageConfig::inline_threshold_bytes` defaults to 8 KiB, so at the
+// default the 128 KiB inputs below would reach replay as blob refs and this
+// suite would silently stop testing what it names. Raising the threshold is
+// what makes them genuinely inline; `assert_command_payloads_are_inline`
+// re-checks that on the recorded events so a future default change cannot
+// quietly hollow these cases out again.
+const LARGE_INLINE_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BulkInput {
+    tag: String,
+    bytes: Vec<u8>,
+}
+
+fn bulk_input(seed: u8) -> BulkInput {
+    BulkInput {
+        tag: format!("bulk-{seed}"),
+        bytes: (0..LARGE_INLINE_COMMAND_PAYLOAD_BYTES)
+            .map(|index| (index as u8).wrapping_add(seed))
+            .collect(),
+    }
+}
+
+#[durust::activity(name = "tests.bulk-activity")]
+async fn bulk_activity(input: BulkInput) -> durust::Result<u64> {
+    Ok(input.bytes.len() as u64)
+}
+
+#[durust::workflow(name = "tests.bulk-child", version = 1)]
+async fn bulk_child_workflow(input: BulkInput) -> durust::Result<u64> {
+    Ok(input.bytes.len() as u64)
+}
+
+// One command of each payload-carrying kind, separated by a timer so the
+// following task must replay them rather than append them.
+#[durust::workflow(name = "tests.large-inline-command-payloads", version = 1)]
+async fn large_inline_command_payloads_workflow(_: UnitInput) -> durust::Result<u64> {
+    let activity_len = durust::call_activity!(bulk_activity(bulk_input(1)))
+        .task_queue("activities")
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let marker: String =
+        durust::side_effect("bulk-marker", || "m".repeat(LARGE_INLINE_SIDE_EFFECT_BYTES)).await?;
+    let child = durust::child!(bulk_child_workflow(bulk_input(2)))
+        .workflow_id("wf/large-inline-command-payloads/child")
+        .spawn()
+        .await?;
+    let child_len = child.result().await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    Ok(activity_len + child_len + marker.len() as u64)
+}
+
+// `cold_chunk_events = None` keeps one worker for the whole run; `Some(n)`
+// drops the worker before every pass, so each task cold-replays the whole
+// prefix — including all three bulk command events — in n-event chunks.
+async fn drive_large_inline_command_payload_run(
+    workflow_id: &str,
+    cold_chunk_events: Option<usize>,
+) -> (u64, Vec<durust::HistoryEvent>) {
+    let backend = MemoryBackend::with_payload_storage(
+        PayloadStorageConfig::new().inline_threshold_bytes(LARGE_INLINE_THRESHOLD_BYTES),
+    );
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<large_inline_command_payloads_workflow>(workflow_id, "workflows", unit())
+        .await
+        .unwrap();
+    let build_worker = || {
+        let mut builder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(large_inline_command_payloads_workflow)
+            .register_workflow(bulk_child_workflow)
+            .register_activity(bulk_activity);
+        if let Some(chunk_events) = cold_chunk_events {
+            builder = builder.history_chunk_events(chunk_events);
+        }
+        builder.build()
+    };
+
+    let mut worker = build_worker();
+    for _ in 0..40 {
+        let mut progressed = worker.run_workflow_once().await.unwrap();
+        progressed |= worker.run_activity_once().await.unwrap();
+        progressed |= worker.run_child_workflow_starts_once().await.unwrap() > 0;
+        if !progressed {
+            backend.advance_time(Duration::from_secs(1));
+            if worker.run_timers_once().await.unwrap() == 0 {
+                break;
+            }
+        }
+        if cold_chunk_events.is_some() {
+            drop(worker);
+            worker = build_worker();
+        }
+    }
+
+    assert_replay_command_payloads_are_inline(&backend, &run_id).await;
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("large inline command payload workflow did not complete: {history:#?}");
+    };
+    (durust::decode_payload::<u64>(result).unwrap(), history)
+}
+
+fn assert_large_inline_command_payloads(history: &[durust::HistoryEvent]) {
+    let scheduled: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ActivityScheduled(scheduled) => Some(scheduled),
+            _ => None,
+        })
+        .collect();
+    let markers: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::SideEffectMarker(marker) => Some(marker),
+            _ => None,
+        })
+        .collect();
+    let requested: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStartRequested(requested) => Some(requested),
+            _ => None,
+        })
+        .collect();
+
+    // Exactly one of each: a matcher that failed to recognise its own recorded
+    // command event would append a second copy instead of replaying it.
+    assert_eq!(scheduled.len(), 1, "expected one ActivityScheduled");
+    assert_eq!(markers.len(), 1, "expected one SideEffectMarker");
+    assert_eq!(
+        requested.len(),
+        1,
+        "expected one ChildWorkflowStartRequested"
+    );
+
+    assert_eq!(
+        durust::decode_payload::<BulkInput>(&scheduled[0].input).unwrap(),
+        bulk_input(1)
+    );
+    assert_eq!(
+        durust::decode_payload::<BulkInput>(&requested[0].input).unwrap(),
+        bulk_input(2)
+    );
+    assert_eq!(
+        durust::decode_payload::<String>(&markers[0].value)
+            .unwrap()
+            .len(),
+        LARGE_INLINE_SIDE_EFFECT_BYTES
+    );
+}
+
+// The point of these cases is that the matcher steps over command events whose
+// payloads are genuinely inline and genuinely large.
+//
+// This has to read `stream_history_for_replay`, not `stream_history`. The
+// hydrating read that `stream_all` uses turns a blob ref back into an inline
+// payload, so it reports "inline" whatever the backend actually stored; the
+// replay path takes the non-hydrating variant and is what the matcher sees.
+async fn assert_replay_command_payloads_are_inline<B>(backend: &B, run_id: &durust::RunId)
+where
+    B: DurableBackend,
+{
+    let events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1_000_000),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let mut checked = 0;
+    for event in &events {
+        let (label, payload) = match &event.data {
+            HistoryEventData::ActivityScheduled(scheduled) => ("activity input", &scheduled.input),
+            HistoryEventData::ChildWorkflowStartRequested(requested) => {
+                ("child workflow input", &requested.input)
+            }
+            _ => continue,
+        };
+        let PayloadRef::Inline { bytes, .. } = payload else {
+            panic!(
+                "{label} reaches replay as a blob ref, not a large inline payload, so this case \
+                 exercises the hydration path instead of the command matcher"
+            );
+        };
+        assert!(
+            bytes.len() > durust::DEFAULT_INLINE_THRESHOLD_BYTES,
+            "{label} is {} bytes, below the {} byte default inline threshold",
+            bytes.len(),
+            durust::DEFAULT_INLINE_THRESHOLD_BYTES
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "expected one activity and one child command");
+}
+
+fn large_inline_command_payload_result() -> u64 {
+    (LARGE_INLINE_COMMAND_PAYLOAD_BYTES * 2 + LARGE_INLINE_SIDE_EFFECT_BYTES) as u64
+}
+
+#[test]
+fn large_inline_command_payloads_replay_from_cache() {
+    block_on(async {
+        let (result, history) =
+            drive_large_inline_command_payload_run("wf/large-inline-cached", None).await;
+        assert_eq!(result, large_inline_command_payload_result());
+        assert_large_inline_command_payloads(&history);
+    });
+}
+
+#[test]
+fn large_inline_command_payloads_replay_cold_multi_chunk() {
+    block_on(async {
+        let (result, history) =
+            drive_large_inline_command_payload_run("wf/large-inline-cold", Some(1)).await;
+        assert_eq!(result, large_inline_command_payload_result());
+        assert_large_inline_command_payloads(&history);
+    });
+}
+
+// Cold multi-chunk replay must produce the same history shape and the same
+// recorded command payloads as the cached drive; only the run-scoped ids
+// differ between the two runs.
+#[test]
+fn large_inline_command_payload_history_is_identical_cached_and_cold() {
+    block_on(async {
+        let (cached_result, cached) =
+            drive_large_inline_command_payload_run("wf/large-inline-compare-cached", None).await;
+        let (cold_result, cold) =
+            drive_large_inline_command_payload_run("wf/large-inline-compare-cold", Some(1)).await;
+
+        assert_eq!(cached_result, cold_result);
+        assert_eq!(
+            cached
+                .iter()
+                .map(|event| (event.event_id, event.event_type))
+                .collect::<Vec<_>>(),
+            cold.iter()
+                .map(|event| (event.event_id, event.event_type))
+                .collect::<Vec<_>>()
+        );
+        for (cached_event, cold_event) in cached.iter().zip(cold.iter()) {
+            match (&cached_event.data, &cold_event.data) {
+                (
+                    HistoryEventData::ActivityScheduled(cached_scheduled),
+                    HistoryEventData::ActivityScheduled(cold_scheduled),
+                ) => {
+                    assert_eq!(cached_scheduled.input, cold_scheduled.input);
+                    assert_eq!(cached_scheduled.fingerprint, cold_scheduled.fingerprint);
+                    assert_eq!(
+                        cached_scheduled.command_id.seq,
+                        cold_scheduled.command_id.seq
+                    );
+                }
+                (
+                    HistoryEventData::SideEffectMarker(cached_marker),
+                    HistoryEventData::SideEffectMarker(cold_marker),
+                ) => {
+                    assert_eq!(cached_marker.key, cold_marker.key);
+                    assert_eq!(cached_marker.value, cold_marker.value);
+                    assert_eq!(cached_marker.command_id.seq, cold_marker.command_id.seq);
+                }
+                (
+                    HistoryEventData::ChildWorkflowStartRequested(cached_requested),
+                    HistoryEventData::ChildWorkflowStartRequested(cold_requested),
+                ) => {
+                    assert_eq!(cached_requested.input, cold_requested.input);
+                    assert_eq!(cached_requested.fingerprint, cold_requested.fingerprint);
+                    assert_eq!(
+                        cached_requested.command_id.seq,
+                        cold_requested.command_id.seq
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
 }
