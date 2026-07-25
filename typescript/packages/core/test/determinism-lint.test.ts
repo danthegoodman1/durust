@@ -158,6 +158,42 @@ describe("workflow determinism lint", () => {
     }
   });
 
+  // 0017 Phase 5 moved primary enforcement onto this static gate: rows 5B and 5C
+  // removed the process-introspection guards and the `process.env` Proxy from
+  // the runtime, and row 5A turns the remaining runtime guards off in production
+  // by default. That trade is only sound if the lint independently rejects every
+  // shape the runtime stopped catching, so this test asserts exactly that list
+  // rather than relying on the broad assertions above to happen to cover it.
+  it("rejects every process API the runtime guard no longer covers", async () => {
+    try {
+      await runLint("--workflow-source", "test-d/determinism/invalid/**/*.ts");
+      throw new Error("expected determinism lint to fail");
+    } catch (error) {
+      const stderr = String((error as { readonly stderr?: unknown }).stderr ?? "");
+      // Row 5B: dropped from the runtime guarded set.
+      for (const api of [
+        "process.chdir()",
+        "process.cpuUsage()",
+        "process.memoryUsage()",
+        "process.memoryUsage.rss()",
+        "process.resourceUsage()",
+        "process.uptime()"
+      ]) {
+        expect(stderr).toContain(`${api} is not allowed in workflow code`);
+      }
+      // Row 5C: the runtime accessor still catches every `process.env...`
+      // expression, but only the lint catches a captured reference. All four
+      // alias spellings the fixture exercises must be reported.
+      const envDiagnostics = stderr
+        .split("\n")
+        .filter((line) => line.includes("read is not allowed in workflow code"))
+        .filter((line) => line.includes("process.env") || line.includes("process[\"env\"]"));
+      expect(envDiagnostics.length).toBeGreaterThanOrEqual(6);
+      expect(stderr).toContain("process.env read is not allowed in workflow code");
+      expect(stderr).toContain("globalThis.process.env read is not allowed in workflow code");
+    }
+  });
+
   it("rejects computed string access to forbidden static APIs", async () => {
     await expect(
       runLint("--workflow-source", "test-d/determinism/computed-invalid/**/*.ts")

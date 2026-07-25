@@ -18,8 +18,10 @@ import { decodePayload, encodePayload, type CodecId, type PayloadRef } from "./p
 import type { Registry } from "./registry.js";
 import {
   HotWorkflowExecution,
+  REPLAY_WINDOW_LOOKAHEAD_EVENTS,
   UnsupportedWorkflowVersionError,
-  durableFailureFromUnknown
+  durableFailureFromUnknown,
+  isReplayCommandEvent
 } from "./runtime.js";
 import {
   eventId,
@@ -48,8 +50,29 @@ export interface WorkerOptions {
   readonly historyFetchMaxEvents?: number;
   readonly historyFetchMaxBytes?: number;
   readonly workflowHistoryCacheSize?: number;
+  /**
+   * Total bytes of recorded history the workflow history cache may retain
+   * across all runs.
+   *
+   * The binding limit. `workflowHistoryCacheSize` counts runs, which says
+   * nothing about memory: a thousand cached runs are a few kilobytes or a few
+   * gigabytes depending on how much payload their events carry inline. This
+   * bounds the cache by what it actually holds, and a run whose history alone
+   * exceeds the budget is simply not cached — it streams from the provider,
+   * which is what the chunked replay path is for.
+   *
+   * Defaults to 32 MiB.
+   */
+  readonly workflowHistoryCacheBytes?: number;
   readonly workflowExecutionCacheSize?: number;
   readonly nondeterminismRetryBackoffMs?: number;
+  /**
+   * Installs the process-global determinism guards when this worker builds a
+   * workflow execution. Leaving it undefined selects the default: on unless
+   * `process.env.NODE_ENV === "production"`. See
+   * {@link PrepareWorkflowTaskOptions.nondeterminismGuards}.
+   */
+  readonly nondeterminismGuards?: boolean;
   readonly onEvent?: WorkerEventSink;
 }
 
@@ -81,6 +104,12 @@ export type RunActivityTaskBatchOnceOutcome =
 
 export interface WorkerRunOptions {
   readonly signal?: AbortSignal;
+  /**
+   * Bounds each task loop independently: the workflow loop and the activity
+   * loop each run at most this many passes. `WorkerRunOutcome.iterations`
+   * reports the workflow loop's count. The maintenance loop is interval-paced
+   * rather than pass-paced, so it runs until both task loops have finished.
+   */
   readonly maxIterations?: number;
   readonly idleBackoffMs?: number;
   readonly maxIdleBackoffMs?: number;
@@ -89,6 +118,22 @@ export interface WorkerRunOptions {
   readonly runTimerMaintenance?: boolean;
   readonly timerMaintenanceLimit?: number;
   readonly activityTimeoutMaintenanceLimit?: number;
+  /**
+   * Delay before the first maintenance scan and after a scan that found nothing
+   * due, in milliseconds. A scan that fired timers or timed out activities
+   * re-runs immediately; consecutive empty scans double this up to
+   * `maxMaintenanceIntervalMs`. Every delay is jittered by a factor in
+   * `[0.5, 1.5)` drawn from a generator seeded with the worker id, so a fleet
+   * started at once does not scan in lockstep and a given worker id always
+   * reproduces the same schedule.
+   *
+   * `0` disables pacing: the loop then scans once per event-loop iteration,
+   * independently of the task loops. It is not "a scan per task-loop pass" —
+   * the loops no longer share a pass.
+   */
+  readonly maintenanceIntervalMs?: number;
+  /** Ceiling for the maintenance backoff, in milliseconds. */
+  readonly maxMaintenanceIntervalMs?: number;
   readonly onError?: (error: unknown) => void | Promise<void>;
 }
 
@@ -209,12 +254,30 @@ interface WorkflowExecutionCacheEntry {
   readonly workflowType: WorkflowType;
 }
 
+/**
+ * A run's contiguous history prefix starting at event 1, with the bytes it
+ * retains so the cache can be bounded by memory rather than by entry count.
+ */
+interface WorkflowHistoryCacheEntry {
+  readonly events: HistoryEvent[];
+  bytes: number;
+}
+
 interface PreparedWorkflowExecution {
   readonly cacheKey: string | null;
   readonly execution: HotWorkflowExecution;
+  // Carried without `prefetchedHistory`. Only `runId` and `workflowType` are
+  // read after the commit, and the array a cold replay starts from now holds
+  // the runtime's whole reserve — keeping a reference to it here would pin that
+  // for the length of the task, on top of the copy the runtime already owns.
   readonly claim: ClaimedWorkflowTask;
-  readonly replayClaim: ClaimedWorkflowTask | null;
   readonly commit: WorkflowTaskCommit;
+}
+
+const NO_PREFETCHED_HISTORY: readonly HistoryEvent[] = [];
+
+function claimWithoutHistory(claimed: ClaimedWorkflowTask): ClaimedWorkflowTask {
+  return { ...claimed, prefetchedHistory: NO_PREFETCHED_HISTORY };
 }
 
 export class Worker {
@@ -232,11 +295,24 @@ export class Worker {
   readonly #historyFetchMaxEvents: number;
   readonly #historyFetchMaxBytes: number;
   readonly #workflowHistoryCacheSize: number;
+  readonly #workflowHistoryCacheBytes: number;
   readonly #workflowExecutionCacheSize: number;
   readonly #nondeterminismRetryBackoffMs: number;
+  // Undefined means "let the runtime apply its NODE_ENV default".
+  readonly #nondeterminismGuards: boolean | undefined;
   readonly #eventSink: WorkerEventSink | undefined;
   readonly #metrics: MutableWorkerMetrics = emptyWorkerMetrics();
-  readonly #workflowHistoryCache = new Map<string, readonly HistoryEvent[]>();
+  // Contiguous history prefixes, one per run, so a cold replay can be served
+  // without re-streaming from the provider.
+  //
+  // Bounded by retained bytes, not by entry count, and appended to in place.
+  // Both are consequences of chunked replay. It used to store a fresh copy of a
+  // run's whole history on every commit — two O(N) copies per task, so O(N²/k)
+  // allocation over a run — and to admit 1024 complete histories with all their
+  // inline payloads, which is unbounded memory expressed as a bounded-looking
+  // number.
+  readonly #workflowHistoryCache = new Map<string, WorkflowHistoryCacheEntry>();
+  #workflowHistoryCacheRetainedBytes = 0;
   readonly #workflowExecutionCache = new Map<string, WorkflowExecutionCacheEntry>();
 
   constructor(options: WorkerOptions) {
@@ -269,6 +345,10 @@ export class Worker {
       0,
       Math.trunc(options.workflowHistoryCacheSize ?? 1024)
     );
+    this.#workflowHistoryCacheBytes = Math.max(
+      0,
+      Math.trunc(options.workflowHistoryCacheBytes ?? 32 * 1024 * 1024)
+    );
     this.#workflowExecutionCacheSize = Math.max(
       0,
       Math.trunc(options.workflowExecutionCacheSize ?? 1024)
@@ -277,6 +357,7 @@ export class Worker {
       0,
       Math.trunc(options.nondeterminismRetryBackoffMs ?? 60_000)
     );
+    this.#nondeterminismGuards = options.nondeterminismGuards;
     this.#eventSink = options.onEvent;
   }
 
@@ -284,8 +365,26 @@ export class Worker {
     return { ...this.#metrics };
   }
 
+  /**
+   * Runs the worker until the caller's signal aborts or every task loop has
+   * used its `maxIterations` budget.
+   *
+   * Workflow processing, activity processing, and due maintenance run as three
+   * independent loops raced under one abort signal instead of as three
+   * sequential phases of one pass. A slow activity therefore no longer holds up
+   * workflow commits on the same worker, a failing stage no longer suppresses
+   * the others — each loop owns its own idle and error backoff — and
+   * maintenance load tracks elapsed time instead of the task rate.
+   *
+   * Connection-pool sizing: each loop keeps at most one backend call in flight,
+   * so a running worker demands at most three pooled connections (two when it
+   * has no activity queue, and a fourth is never needed because local
+   * activities run inside the workflow loop). Size the pool at three or more
+   * connections per worker; below that the loops queue against each other and
+   * the activity loop can delay workflow commits.
+   */
   async run(options: WorkerRunOptions = {}): Promise<WorkerRunOutcome> {
-    const stats = {
+    const stats: MutableRunStats = {
       iterations: 0,
       workflowTasks: 0,
       activityTasks: 0,
@@ -293,56 +392,241 @@ export class Worker {
       idleSleeps: 0,
       errors: 0
     };
-    const maxIterations = options.maxIterations;
-    const initialIdleBackoffMs = Math.max(0, options.idleBackoffMs ?? 50);
-    const maxIdleBackoffMs = Math.max(initialIdleBackoffMs, options.maxIdleBackoffMs ?? 1_000);
-    const initialErrorBackoffMs = Math.max(0, options.errorBackoffMs ?? 250);
-    const maxErrorBackoffMs = Math.max(initialErrorBackoffMs, options.maxErrorBackoffMs ?? 5_000);
-    const timerMaintenanceLimit = Math.max(1, options.timerMaintenanceLimit ?? 64);
-    const activityTimeoutMaintenanceLimit = Math.max(
-      1,
-      options.activityTimeoutMaintenanceLimit ?? timerMaintenanceLimit
-    );
-    let idleBackoffMs = initialIdleBackoffMs;
-    let errorBackoffMs = initialErrorBackoffMs;
-
-    while (!options.signal?.aborted && (maxIterations === undefined || stats.iterations < maxIterations)) {
-      stats.iterations += 1;
+    const config = resolveRunConfig(options);
+    // The worker's own stop signal, separate from the caller's. Aborted when the
+    // task loops have used their budgets — which is what unwinds the
+    // interval-paced maintenance loop, since it has no budget of its own — and
+    // when a loop fails outright.
+    const stopLoops = new AbortController();
+    const signal =
+      options.signal === undefined
+        ? stopLoops.signal
+        : AbortSignal.any([options.signal, stopLoops.signal]);
+    const stopPeersOnFailure = async (loop: Promise<void>): Promise<void> => {
       try {
-        const madeProgress = await this.#runLoopIteration(stats, {
-          signal: options.signal,
-          runTimerMaintenance: options.runTimerMaintenance ?? true,
-          timerMaintenanceLimit,
-          activityTimeoutMaintenanceLimit
-        });
-        errorBackoffMs = initialErrorBackoffMs;
-        if (madeProgress) {
-          idleBackoffMs = initialIdleBackoffMs;
-          continue;
-        }
-
-        stats.idleSleeps += 1;
-        this.#metrics.idleSleeps += 1;
-        if ((await sleepWithAbort(idleBackoffMs, options.signal)) === "aborted") {
-          break;
-        }
-        idleBackoffMs = nextBackoff(idleBackoffMs, maxIdleBackoffMs);
+        await loop;
       } catch (error) {
-        stats.errors += 1;
-        this.#metrics.loopErrors += 1;
-        await this.#emit({ kind: "WorkerLoopError", error: workerErrorInfo(error) });
-        await options.onError?.(error);
-        if ((await sleepWithAbort(errorBackoffMs, options.signal)) === "aborted") {
-          break;
-        }
-        errorBackoffMs = nextBackoff(errorBackoffMs, maxErrorBackoffMs);
+        // A loop only rejects when its error budget itself failed — an `onError`
+        // callback that threw. `run()` still waits for the peer loops below, so
+        // this abort is what keeps that wait bounded.
+        stopLoops.abort();
+        throw error;
       }
+    };
+
+    // Settled at creation, not at the `await` in `finally`. The task loops can
+    // idle for a full backoff before anything looks at this promise, and an
+    // unobserved rejection in that window reaches Node's default
+    // `--unhandled-rejections=throw` and kills the worker process.
+    const maintenance =
+      (options.runTimerMaintenance ?? true)
+        ? settleOutcome(
+            stopPeersOnFailure(this.#runMaintenanceLoop(stats, signal, config, options))
+          )
+        : null;
+    try {
+      // `allSettled` rather than `all`: a loop that is still claiming tasks
+      // after `run()` has already thrown is exactly the loop outliving its
+      // worker that shutdown is supposed to prevent.
+      const taskLoops = await Promise.allSettled([
+        stopPeersOnFailure(this.#runWorkflowLoop(stats, signal, config, options)),
+        this.#activityTaskQueue === null
+          ? Promise.resolve()
+          : stopPeersOnFailure(this.#runActivityLoop(stats, signal, config, options))
+      ]);
+      stopLoops.abort();
+      // Maintenance is appended last so a task-loop failure stays the reported
+      // cause. Raising it from `finally` instead would silently replace one.
+      throwFirstRejection(
+        maintenance === null ? taskLoops : [...taskLoops, await maintenance]
+      );
+    } finally {
+      stopLoops.abort();
+      // Awaited unconditionally, including on the throwing path: a maintenance
+      // loop left running past `run()` would keep scanning the provider for a
+      // worker its caller believes has stopped.
+      await maintenance;
     }
 
     return {
       stopReason: options.signal?.aborted ? "abort" : "maxIterations",
       ...stats
     };
+  }
+
+  async #runWorkflowLoop(
+    stats: MutableRunStats,
+    signal: AbortSignal,
+    config: ResolvedRunConfig,
+    options: WorkerRunOptions
+  ): Promise<void> {
+    await this.#runTaskLoop(stats, signal, config, options, true, async () => {
+      const workflow = await this.#runWorkflowTaskOnce(signal);
+      if (workflow.kind === "NoTask") {
+        return false;
+      }
+      stats.workflowTasks += 1;
+      stats.activityTasks += workflow.localActivityTasks;
+      return true;
+    });
+  }
+
+  async #runActivityLoop(
+    stats: MutableRunStats,
+    signal: AbortSignal,
+    config: ResolvedRunConfig,
+    options: WorkerRunOptions
+  ): Promise<void> {
+    await this.#runTaskLoop(stats, signal, config, options, false, async () => {
+      const activityTasks = await this.#runActivityTasksForLoop(signal);
+      if (activityTasks === 0) {
+        return false;
+      }
+      stats.activityTasks += activityTasks;
+      return true;
+    });
+  }
+
+  /**
+   * Shared shape of the workflow and activity loops: poll, back off when idle,
+   * back off separately when the step throws. Each loop instance owns its own
+   * backoff state, so one stage's error budget cannot stop the other stage.
+   *
+   * A loop that keeps making progress never reaches its idle sleep, so it also
+   * yields the event loop every `PROGRESS_YIELD_PASSES` productive passes.
+   * Without that, a saturated loop starves its peers outright on any backend
+   * whose calls settle on the microtask queue — see `yieldToEventLoop`.
+   */
+  async #runTaskLoop(
+    stats: MutableRunStats,
+    signal: AbortSignal,
+    config: ResolvedRunConfig,
+    options: WorkerRunOptions,
+    countsIterations: boolean,
+    step: () => Promise<boolean>
+  ): Promise<void> {
+    let idleBackoffMs = config.initialIdleBackoffMs;
+    let errorBackoffMs = config.initialErrorBackoffMs;
+    let iterations = 0;
+    let passesSinceYield = 0;
+
+    while (
+      !signal.aborted &&
+      (config.maxIterations === undefined || iterations < config.maxIterations)
+    ) {
+      iterations += 1;
+      if (countsIterations) {
+        stats.iterations = iterations;
+      }
+      try {
+        const madeProgress = await step();
+        errorBackoffMs = config.initialErrorBackoffMs;
+        if (madeProgress) {
+          idleBackoffMs = config.initialIdleBackoffMs;
+          passesSinceYield += 1;
+          if (passesSinceYield >= PROGRESS_YIELD_PASSES) {
+            passesSinceYield = 0;
+            await yieldToEventLoop();
+          }
+          continue;
+        }
+
+        // The idle and error sleeps below are themselves macrotask yields, so
+        // reaching either one discharges the progress-yield debt.
+        passesSinceYield = 0;
+        stats.idleSleeps += 1;
+        this.#metrics.idleSleeps += 1;
+        if ((await sleepWithAbort(idleBackoffMs, signal)) === "aborted") {
+          break;
+        }
+        idleBackoffMs = nextBackoff(idleBackoffMs, config.maxIdleBackoffMs);
+      } catch (error) {
+        passesSinceYield = 0;
+        stats.errors += 1;
+        this.#metrics.loopErrors += 1;
+        await this.#emit({ kind: "WorkerLoopError", error: workerErrorInfo(error) });
+        await options.onError?.(error);
+        if ((await sleepWithAbort(errorBackoffMs, signal)) === "aborted") {
+          break;
+        }
+        errorBackoffMs = nextBackoff(errorBackoffMs, config.maxErrorBackoffMs);
+      }
+    }
+  }
+
+  /**
+   * Interval-paced maintenance. `SPEC.md` §11 gives due-timer delivery to an
+   * independent timer service, so a worker scanning for due timers is a
+   * convenience, not a durability obligation: pacing it by elapsed time keeps
+   * provider load proportional to the interval and the fleet size instead of to
+   * the task rate.
+   */
+  async #runMaintenanceLoop(
+    stats: MutableRunStats,
+    signal: AbortSignal,
+    config: ResolvedRunConfig,
+    options: WorkerRunOptions
+  ): Promise<void> {
+    const jitter = maintenanceJitterSource(String(this.#workerId));
+    let errorBackoffMs = config.initialErrorBackoffMs;
+    let intervalMs = config.maintenanceIntervalMs;
+    // The first delay is a phase offset: without it every worker in a fleet
+    // scans at startup, which is exactly the synchronized load the jitter exists
+    // to break up.
+    let delayMs = jitteredDelayMs(intervalMs, jitter);
+
+    while (!signal.aborted) {
+      if ((await sleepWithAbort(delayMs, signal)) === "aborted") {
+        break;
+      }
+      try {
+        const scanned = await this.#runMaintenanceScanOnce(stats, signal, config);
+        errorBackoffMs = config.initialErrorBackoffMs;
+        if (scanned) {
+          intervalMs = config.maintenanceIntervalMs;
+          delayMs = 0;
+          continue;
+        }
+        intervalMs = nextBackoff(intervalMs, config.maxMaintenanceIntervalMs);
+        delayMs = jitteredDelayMs(intervalMs, jitter);
+      } catch (error) {
+        stats.errors += 1;
+        this.#metrics.loopErrors += 1;
+        await this.#emit({ kind: "WorkerLoopError", error: workerErrorInfo(error) });
+        await options.onError?.(error);
+        if ((await sleepWithAbort(errorBackoffMs, signal)) === "aborted") {
+          break;
+        }
+        errorBackoffMs = nextBackoff(errorBackoffMs, config.maxErrorBackoffMs);
+        delayMs = 0;
+      }
+    }
+  }
+
+  async #runMaintenanceScanOnce(
+    stats: MutableRunStats,
+    signal: AbortSignal,
+    config: ResolvedRunConfig
+  ): Promise<boolean> {
+    let scanned = false;
+    const timers = await this.#backend.fireDueTimers({
+      namespace: this.#namespace,
+      now: Date.now(),
+      limit: config.timerMaintenanceLimit
+    });
+    if (timers.fired > 0) {
+      stats.timersFired += timers.fired;
+      this.#metrics.timersFired += timers.fired;
+      await this.#emit({ kind: "TimersFired", fired: timers.fired });
+      scanned = true;
+    }
+    if (signal.aborted) {
+      return scanned;
+    }
+    const timeouts = await this.runActivityTimeoutMaintenanceOnce(
+      config.activityTimeoutMaintenanceLimit
+    );
+    return scanned || timeouts.timedOut > 0;
   }
 
   async runWorkflowTaskOnce(): Promise<RunWorkflowTaskOnceOutcome> {
@@ -476,15 +760,13 @@ export class Worker {
     if (outcome.kind === "Committed") {
       prepared.execution.markCommitted(outcome.newTailEventId);
       this.#updateWorkflowExecutionCacheAfterCommit(prepared, outcome.newTailEventId);
-      if (prepared.replayClaim !== null) {
-        this.#updateWorkflowHistoryCacheAfterCommit(prepared.replayClaim, prepared.commit);
-      } else {
-        this.#updateWorkflowHistoryCacheAfterHotCommit(
-          prepared.claim,
-          prepared.commit,
-          outcome.newTailEventId
-        );
-      }
+      // One path for both cold and hot commits: the cached prefix is extended
+      // by the events this task appended, or dropped if it no longer lines up.
+      this.#appendCommittedEventsToHistoryCache(
+        prepared.claim.runId,
+        prepared.commit,
+        outcome.newTailEventId
+      );
     } else {
       if (prepared.cacheKey !== null) {
         this.#workflowExecutionCache.delete(prepared.cacheKey);
@@ -679,8 +961,7 @@ export class Worker {
         return {
           cacheKey,
           execution: cached.execution,
-          claim: hotClaim,
-          replayClaim: null,
+          claim: claimWithoutHistory(hotClaim),
           commit
         };
       }
@@ -703,22 +984,62 @@ export class Worker {
       }
     }
     this.#metrics.workflowExecutionCacheMisses += 1;
-    const replayClaim = await this.#claimWithCompleteReplayHistory(claimed);
+    let replayClaim: ClaimedWorkflowTask | null = await this.#claimWithInitialReplayChunk(claimed);
     const input = decodePayload(
       workflowStartedInput(replayClaim.prefetchedHistory) as PayloadRef<unknown>,
       definition.inputSchema
     );
-    const execution = new HotWorkflowExecution(definition, input as object, replayClaim, {
-      payloadCodec: this.#payloadCodec,
-      defaultWorkflowTaskQueue: String(this.#workflowTaskQueue),
-      liveSignals
-    });
-    const commit = await execution.nextCommit();
+    let execution = this.#buildColdExecution(definition, input, replayClaim, liveSignals);
+    // Everything past this point needs the claim's identity, never its events.
+    const preparedClaim = claimWithoutHistory(replayClaim);
+    // Released as soon as the execution has ingested it. That array now carries
+    // the runtime's whole reserve, and the runtime keeps its own split of it —
+    // window and indexes — so a second reference alive for the length of the
+    // task would double the replay's memory. A repair re-derives it instead of
+    // holding it against a case that almost never happens.
+    replayClaim = null;
+    let commit: WorkflowTaskCommit;
+    try {
+      commit = await execution.nextCommit();
+    } catch (error: unknown) {
+      // Asked of the execution rather than inferred from the error. A workflow
+      // that catches the refusal runs on with an unverified marker and usually
+      // fails later for some other reason — a nondeterminism mismatch against
+      // the recorded command it skipped — so the error that surfaces is not
+      // reliably the overrun. The latch is.
+      if (execution.replayWindowOverrun() === null) {
+        throw error;
+      }
+      // A workflow whose synchronous markers outran the replay window's
+      // reserve. Repairable rather than fatal: nothing was committed, replay is
+      // deterministic, and the only thing wrong with the attempt is how much
+      // history it was willing to hold. Replay the run once more with no
+      // reserve limit — the window then carries the whole recorded history, the
+      // markers cannot outrun it, and this run alone gives up the chunk-sized
+      // memory bound. One wasted replay, no provider contract change, and no
+      // retry loop for an operator to interpret.
+      execution.dispose("replay window reserve exhausted");
+      // Primed to the whole history, not just to a bigger reserve. The reserve
+      // governs the runtime's own refills, but the first marker of a storm runs
+      // inside the execution's constructor, before any refill can happen — so
+      // the repair has to arrive with everything already loaded.
+      const repairClaim = await this.#claimWithInitialReplayChunk(
+        claimed,
+        Number.POSITIVE_INFINITY
+      );
+      execution = this.#buildColdExecution(
+        definition,
+        input,
+        repairClaim,
+        liveSignals,
+        Number.POSITIVE_INFINITY
+      );
+      commit = await execution.nextCommit();
+    }
     return {
       cacheKey,
       execution,
-      claim: replayClaim,
-      replayClaim,
+      claim: preparedClaim,
       commit
     };
   }
@@ -764,101 +1085,209 @@ export class Worker {
     return { ...claimed, prefetchedHistory: wakeHistory };
   }
 
-  async #claimWithCompleteReplayHistory(
-    claimed: ClaimedWorkflowTask
+  #buildColdExecution(
+    definition: WorkflowDefinition<any, any, any, string>,
+    input: unknown,
+    replayClaim: ClaimedWorkflowTask,
+    liveSignals: readonly SignalInboxRecord[],
+    replayWindowLookaheadEvents?: number
+  ): HotWorkflowExecution {
+    // The loader closes over ids, not over the claim: the claim holds the
+    // provider's prefetched event array, and a loader that captured it would
+    // pin the whole history for the length of the replay it exists to chunk.
+    const replayRunId = replayClaim.runId;
+    const replayTargetEventId = replayClaim.replayTargetEventId;
+    return new HotWorkflowExecution(definition, input as object, replayClaim, {
+      payloadCodec: this.#payloadCodec,
+      defaultWorkflowTaskQueue: String(this.#workflowTaskQueue),
+      liveSignals,
+      // The pull side of chunked replay. The runtime calls this when its replay
+      // window runs low, so the whole history is never in memory at once, and
+      // the claim above carries only the head.
+      loadReplayHistory: (afterEventId) =>
+        this.#loadReplayHistoryChunk(replayRunId, replayTargetEventId, afterEventId),
+      ...(replayWindowLookaheadEvents === undefined
+        ? {}
+        : { replayWindowLookaheadEvents }),
+      // Spread rather than assigned to satisfy `exactOptionalPropertyTypes`,
+      // which rejects an explicit `undefined` for an optional property. Both
+      // forms behave identically at runtime — the runtime tests
+      // `requested !== undefined` and falls back to its NODE_ENV default either
+      // way — so this is a type-level requirement, not a behavioural one.
+      ...(this.#nondeterminismGuards === undefined
+        ? {}
+        : { nondeterminismGuards: this.#nondeterminismGuards })
+    });
+  }
+
+  /**
+   * Builds the claim a cold replay starts from: the head of history, not all of
+   * it.
+   *
+   * The rest arrives through {@link #loadReplayHistoryChunk} as the runtime
+   * asks for it. Two things have to be in this first slice. `WorkflowStarted`,
+   * which carries the workflow input and is event 1; and enough recorded
+   * command events to fill the runtime's reserve, because a workflow whose
+   * *first* durable call is a synchronous marker — `getVersion` at the top of a
+   * handler is idiomatic — runs that call inside the execution's constructor,
+   * before any pump exists to fetch for it. Priming here is the only place that
+   * can serve it, and the size it primes to is the same reserve the window
+   * maintains from then on, so this costs nothing extra in steady state.
+   */
+  async #claimWithInitialReplayChunk(
+    claimed: ClaimedWorkflowTask,
+    minCommandEvents: number = REPLAY_WINDOW_LOOKAHEAD_EVENTS
   ): Promise<ClaimedWorkflowTask> {
-    const target = Number(claimed.replayTargetEventId);
-    const history = contiguousHistoryPrefix(claimed.prefetchedHistory, claimed.replayTargetEventId);
-    this.#mergeCachedWorkflowHistory(claimed.runId, history, claimed.replayTargetEventId);
-    let afterEventId = history.at(-1)?.eventId ?? eventId(0);
-
-    while (Number(afterEventId) < target) {
-      const chunk = await this.#backend.streamHistory({
-        runId: claimed.runId,
-        afterEventId,
-        upToEventId: claimed.replayTargetEventId,
-        maxEvents: this.#historyFetchMaxEvents,
-        maxBytes: this.#historyFetchMaxBytes
-      });
-      this.#recordHistoryChunk(chunk);
-      if (chunk.events.length === 0) {
-        throw new Error(
-          `streamHistory returned no events for ${claimed.runId} after ${afterEventId} before replay target ${claimed.replayTargetEventId}`
-        );
-      }
-      history.push(...chunk.events);
-      const nextAfterEventId = chunk.lastEventId;
-      if (Number(nextAfterEventId) <= Number(afterEventId)) {
-        throw new Error(
-          `streamHistory did not advance for ${claimed.runId}: still at ${nextAfterEventId}`
-        );
-      }
-      afterEventId = nextAfterEventId;
+    const prefix = contiguousHistoryPrefix(claimed.prefetchedHistory, claimed.replayTargetEventId);
+    this.#recordHistoryCacheOutcome(claimed.runId, claimed.replayTargetEventId, prefix.length);
+    if (prefix.length > 0) {
+      // The claim brought these for free, so record them: the chunk loader and
+      // any later cold replay of this run read them back instead of streaming
+      // the head of history again.
+      this.#appendHistoryCacheChunk(claimed.runId, eventId(0), prefix);
     }
-
-    assertContiguousHistoryThroughTarget(history, claimed.replayTargetEventId);
-    this.#storeWorkflowHistory(claimed.runId, history);
-    return { ...claimed, prefetchedHistory: history };
+    // Capped at one chunk even when the provider volunteered the whole history
+    // in the claim. Handing the runtime everything a generous provider sends
+    // would put replay memory back under the provider's control.
+    const initial =
+      prefix.length > this.#historyFetchMaxEvents
+        ? prefix.slice(0, this.#historyFetchMaxEvents)
+        : prefix;
+    let lastEventId = initial.at(-1)?.eventId ?? eventId(0);
+    let commandEvents = initial.reduce(
+      (count, event) => count + (isReplayCommandEvent(event) ? 1 : 0),
+      0
+    );
+    while (
+      commandEvents <= minCommandEvents &&
+      Number(lastEventId) < Number(claimed.replayTargetEventId)
+    ) {
+      const chunk = await this.#loadReplayHistoryChunk(
+        claimed.runId,
+        claimed.replayTargetEventId,
+        lastEventId
+      );
+      for (const event of chunk.events) {
+        initial.push(event);
+        if (isReplayCommandEvent(event)) {
+          commandEvents += 1;
+        }
+      }
+      lastEventId = chunk.lastEventId;
+    }
+    return { ...claimed, prefetchedHistory: initial };
   }
 
-  #mergeCachedWorkflowHistory(
+  /**
+   * Counts one history-cache outcome per cold replay: a hit when the cached
+   * prefix reaches further than what the claim already carried and so can save
+   * streaming, a miss otherwise. Counted here rather than per chunk so the
+   * metric keeps meaning the same thing it did before replay was chunked —
+   * "could this replay be seeded from the cache?".
+   */
+  #recordHistoryCacheOutcome(
     runIdValue: RunId,
-    history: HistoryEvent[],
-    targetEventId: EventId
+    targetEventId: EventId,
+    claimPrefixLength: number
   ): void {
-    const cached = this.#workflowHistoryCache.get(String(runIdValue));
-    if (cached === undefined) {
+    const key = String(runIdValue);
+    const entry = this.#workflowHistoryCache.get(key);
+    if (entry === undefined) {
       this.#metrics.workflowHistoryCacheMisses += 1;
       return;
     }
-    const cachedPrefix = contiguousHistoryPrefix(cached, targetEventId);
-    if (cachedPrefix.length <= history.length) {
+    const cachedThroughTarget = Math.min(entry.events.length, Number(targetEventId));
+    if (cachedThroughTarget > claimPrefixLength) {
+      this.#metrics.workflowHistoryCacheHits += 1;
+    } else {
       this.#metrics.workflowHistoryCacheMisses += 1;
-      this.#touchWorkflowHistoryCacheEntry(runIdValue, cached);
-      return;
     }
-    history.splice(0, history.length, ...cachedPrefix);
-    this.#metrics.workflowHistoryCacheHits += 1;
-    this.#touchWorkflowHistoryCacheEntry(runIdValue, cached);
+    this.#touchWorkflowHistoryCacheEntry(key, entry);
   }
 
-  #updateWorkflowHistoryCacheAfterCommit(
-    claim: ClaimedWorkflowTask,
-    commit: WorkflowTaskCommit
-  ): void {
-    const history = [...claim.prefetchedHistory];
-    for (const [index, event] of (commit.appendEvents ?? []).entries()) {
-      const nextEventId = eventId(Number(commit.expectedTailEventId) + index + 1);
-      history.push({
-        eventId: nextEventId,
-        eventType: historyEventType(event.data),
-        data: event.data
-      });
+  /**
+   * Streams the events after `afterEventId`, from the history cache when it has
+   * them and from the provider otherwise.
+   *
+   * Every validation the old bulk loader ran once over the whole history runs
+   * here per chunk: non-empty, watermark advanced, events contiguous from
+   * `afterEventId`. Since each chunk is contiguous from where the last one
+   * ended, and the runtime refuses to commit until its watermark reaches the
+   * replay target, the concatenation is still exactly "contiguous events 1
+   * through the target".
+   */
+  async #loadReplayHistoryChunk(
+    runIdValue: RunId,
+    replayTargetEventId: EventId,
+    afterEventId: EventId
+  ): Promise<{ readonly events: readonly HistoryEvent[]; readonly lastEventId: EventId }> {
+    const cached = this.#cachedHistoryChunkAfter(runIdValue, afterEventId, replayTargetEventId);
+    if (cached !== null) {
+      return cached;
     }
-    this.#storeWorkflowHistory(claim.runId, history);
+    const chunk = await this.#backend.streamHistory({
+      runId: runIdValue,
+      afterEventId,
+      upToEventId: replayTargetEventId,
+      maxEvents: this.#historyFetchMaxEvents,
+      maxBytes: this.#historyFetchMaxBytes
+    });
+    this.#recordHistoryChunk(chunk);
+    if (chunk.events.length === 0) {
+      throw new Error(
+        `streamHistory returned no events for ${runIdValue} after ${afterEventId} before replay target ${replayTargetEventId}`
+      );
+    }
+    if (Number(chunk.lastEventId) <= Number(afterEventId)) {
+      throw new Error(
+        `streamHistory did not advance for ${runIdValue}: still at ${chunk.lastEventId}`
+      );
+    }
+    assertContiguousHistoryRange(chunk.events, afterEventId, chunk.lastEventId);
+    this.#appendHistoryCacheChunk(runIdValue, afterEventId, chunk.events);
+    return { events: chunk.events, lastEventId: chunk.lastEventId };
   }
 
-  #updateWorkflowHistoryCacheAfterHotCommit(
-    claim: ClaimedWorkflowTask,
+  /**
+   * Records the events a committed task appended.
+   *
+   * Appends in place. The two functions this replaced each rebuilt the run's
+   * whole history array on every commit, so a run of N events across N/k tasks
+   * paid O(N²/k) copying; this pays O(appended).
+   */
+  #appendCommittedEventsToHistoryCache(
+    runIdValue: RunId,
     commit: WorkflowTaskCommit,
     newTailEventId: EventId
   ): void {
-    const cached = this.#workflowHistoryCache.get(String(claim.runId));
-    if (cached === undefined || Number(cached.at(-1)?.eventId ?? 0) !== Number(commit.expectedTailEventId)) {
+    const appended = commit.appendEvents ?? [];
+    if (appended.length === 0) {
       return;
     }
-    const history = [...cached];
-    for (const [index, event] of (commit.appendEvents ?? []).entries()) {
-      const nextEventId = eventId(Number(commit.expectedTailEventId) + index + 1);
-      history.push({
-        eventId: nextEventId,
+    const key = String(runIdValue);
+    const entry = this.#workflowHistoryCache.get(key);
+    if (entry === undefined) {
+      return;
+    }
+    if (Number(entry.events.at(-1)?.eventId ?? 0) !== Number(commit.expectedTailEventId)) {
+      // The cached prefix does not end where this commit began, so appending
+      // would fabricate a history that never existed. Drop the entry instead;
+      // the next cold replay rebuilds it from the provider.
+      this.#deleteWorkflowHistoryCacheEntry(key);
+      return;
+    }
+    if (Number(commit.expectedTailEventId) + appended.length > Number(newTailEventId)) {
+      return;
+    }
+    const events: HistoryEvent[] = [];
+    for (const [index, event] of appended.entries()) {
+      events.push({
+        eventId: eventId(Number(commit.expectedTailEventId) + index + 1),
         eventType: historyEventType(event.data),
         data: event.data
       });
     }
-    if (Number(history.at(-1)?.eventId ?? 0) <= Number(newTailEventId)) {
-      this.#storeWorkflowHistory(claim.runId, history);
-    }
+    this.#pushHistoryCacheEvents(key, entry, events);
   }
 
   #updateWorkflowExecutionCacheAfterCommit(
@@ -896,21 +1325,129 @@ export class Worker {
     });
   }
 
-  #storeWorkflowHistory(runIdValue: RunId, history: readonly HistoryEvent[]): void {
-    if (this.#workflowHistoryCacheSize === 0 || history.length === 0) {
+  /**
+   * Serves the next chunk from the cached prefix, or `null` when the cache
+   * cannot cover it.
+   *
+   * Slices at the same `historyFetchMaxEvents` the provider would, so a cache
+   * hit hands the runtime the same shape a stream would and the replay window
+   * stays the same size either way.
+   */
+  #cachedHistoryChunkAfter(
+    runIdValue: RunId,
+    afterEventId: EventId,
+    targetEventId: EventId
+  ): { readonly events: readonly HistoryEvent[]; readonly lastEventId: EventId } | null {
+    const key = String(runIdValue);
+    const entry = this.#workflowHistoryCache.get(key);
+    if (entry === undefined) {
+      return null;
+    }
+    const first = Number(entry.events[0]?.eventId ?? 0);
+    const last = Number(entry.events.at(-1)?.eventId ?? 0);
+    const from = Number(afterEventId) + 1;
+    if (first !== 1 || last < from) {
+      return null;
+    }
+    const upTo = Math.min(last, Number(targetEventId), from + this.#historyFetchMaxEvents - 1);
+    if (upTo < from) {
+      return null;
+    }
+    const events = entry.events.slice(from - 1, upTo);
+    if (events.length === 0) {
+      return null;
+    }
+    this.#touchWorkflowHistoryCacheEntry(key, entry);
+    return { events, lastEventId: eventId(upTo) };
+  }
+
+  /**
+   * Extends a run's cached prefix with a freshly streamed chunk, in place.
+   */
+  #appendHistoryCacheChunk(
+    runIdValue: RunId,
+    afterEventId: EventId,
+    events: readonly HistoryEvent[]
+  ): void {
+    if (this.#workflowHistoryCacheSize === 0 || this.#workflowHistoryCacheBytes === 0) {
+      return;
+    }
+    if (events.length === 0) {
       return;
     }
     const key = String(runIdValue);
-    this.#workflowHistoryCache.delete(key);
-    this.#workflowHistoryCache.set(key, [...history]);
-    while (this.#workflowHistoryCache.size > this.#workflowHistoryCacheSize) {
-      const oldest = this.#workflowHistoryCache.keys().next().value as string | undefined;
-      if (oldest === undefined) {
+    const entry = this.#workflowHistoryCache.get(key);
+    if (entry === undefined) {
+      if (Number(afterEventId) !== 0) {
+        // Only a prefix starting at event 1 is usable, because that is the only
+        // shape `#cachedHistoryChunkAfter` can answer from.
         return;
       }
-      this.#workflowHistoryCache.delete(oldest);
+      const created: WorkflowHistoryCacheEntry = { events: [], bytes: 0 };
+      this.#workflowHistoryCache.set(key, created);
+      this.#pushHistoryCacheEvents(key, created, events);
+      return;
+    }
+    if (Number(entry.events.at(-1)?.eventId ?? 0) !== Number(afterEventId)) {
+      return;
+    }
+    this.#pushHistoryCacheEvents(key, entry, events);
+  }
+
+  #pushHistoryCacheEvents(
+    key: string,
+    entry: WorkflowHistoryCacheEntry,
+    events: readonly HistoryEvent[]
+  ): void {
+    let added = 0;
+    for (const event of events) {
+      entry.events.push(event);
+      added += historyEventRetainedBytes(event);
+    }
+    entry.bytes += added;
+    this.#workflowHistoryCacheRetainedBytes += added;
+    // Most-recently-used goes last, so the eviction loop below can take the
+    // oldest from the front.
+    this.#workflowHistoryCache.delete(key);
+    this.#workflowHistoryCache.set(key, entry);
+    this.#enforceWorkflowHistoryCacheBounds(key);
+  }
+
+  /**
+   * Evicts until the cache is inside both bounds.
+   *
+   * Bytes first, because that is the limit that means anything: an entry-count
+   * limit lets a thousand runs with megabyte payloads sit in memory while
+   * reporting a healthy-looking size. A single run bigger than the whole budget
+   * is dropped outright rather than evicting everything else to hold it.
+   */
+  #enforceWorkflowHistoryCacheBounds(protectedKey: string): void {
+    const protectedEntry = this.#workflowHistoryCache.get(protectedKey);
+    if (protectedEntry !== undefined && protectedEntry.bytes > this.#workflowHistoryCacheBytes) {
+      this.#deleteWorkflowHistoryCacheEntry(protectedKey);
+      this.#metrics.workflowHistoryCacheEvictions += 1;
+      return;
+    }
+    while (
+      this.#workflowHistoryCache.size > this.#workflowHistoryCacheSize ||
+      this.#workflowHistoryCacheRetainedBytes > this.#workflowHistoryCacheBytes
+    ) {
+      const oldest = this.#workflowHistoryCache.keys().next().value as string | undefined;
+      if (oldest === undefined || oldest === protectedKey) {
+        return;
+      }
+      this.#deleteWorkflowHistoryCacheEntry(oldest);
       this.#metrics.workflowHistoryCacheEvictions += 1;
     }
+  }
+
+  #deleteWorkflowHistoryCacheEntry(key: string): void {
+    const entry = this.#workflowHistoryCache.get(key);
+    if (entry === undefined) {
+      return;
+    }
+    this.#workflowHistoryCacheRetainedBytes -= entry.bytes;
+    this.#workflowHistoryCache.delete(key);
   }
 
   #storeWorkflowExecution(key: string, entry: WorkflowExecutionCacheEntry): void {
@@ -939,82 +1476,14 @@ export class Worker {
     this.#workflowExecutionCache.set(key, entry);
   }
 
-  #touchWorkflowHistoryCacheEntry(
-    runIdValue: RunId,
-    history: readonly HistoryEvent[]
-  ): void {
-    const key = String(runIdValue);
+  #touchWorkflowHistoryCacheEntry(key: string, entry: WorkflowHistoryCacheEntry): void {
     this.#workflowHistoryCache.delete(key);
-    this.#workflowHistoryCache.set(key, history);
+    this.#workflowHistoryCache.set(key, entry);
   }
 
   #recordHistoryChunk(chunk: HistoryChunk): void {
     this.#metrics.historyStreamChunks += 1;
     this.#metrics.historyStreamEvents += chunk.events.length;
-  }
-
-  async #runLoopIteration(
-    stats: {
-      workflowTasks: number;
-      activityTasks: number;
-      timersFired: number;
-    },
-    options: {
-      readonly signal: AbortSignal | undefined;
-      readonly runTimerMaintenance: boolean;
-      readonly timerMaintenanceLimit: number;
-      readonly activityTimeoutMaintenanceLimit: number;
-    }
-  ): Promise<boolean> {
-    let madeProgress = false;
-
-    const workflow = await this.#runWorkflowTaskOnce(options.signal);
-    if (workflow.kind !== "NoTask") {
-      stats.workflowTasks += 1;
-      stats.activityTasks += workflow.localActivityTasks;
-      madeProgress = true;
-    }
-
-    if (options.signal?.aborted) {
-      return madeProgress;
-    }
-
-    if (this.#activityTaskQueue !== null) {
-      const activityTasks = await this.#runActivityTasksForLoop(options.signal);
-      if (activityTasks > 0) {
-        stats.activityTasks += activityTasks;
-        madeProgress = true;
-      }
-    }
-
-    if (options.signal?.aborted) {
-      return madeProgress;
-    }
-
-    if (options.runTimerMaintenance) {
-      const timers = await this.#backend.fireDueTimers({
-        namespace: this.#namespace,
-        now: Date.now(),
-        limit: options.timerMaintenanceLimit
-      });
-      if (timers.fired > 0) {
-        stats.timersFired += timers.fired;
-        this.#metrics.timersFired += timers.fired;
-        await this.#emit({ kind: "TimersFired", fired: timers.fired });
-        madeProgress = true;
-      }
-      if (options.signal?.aborted) {
-        return madeProgress;
-      }
-      const timeouts = await this.runActivityTimeoutMaintenanceOnce(
-        options.activityTimeoutMaintenanceLimit
-      );
-      if (timeouts.timedOut > 0) {
-        madeProgress = true;
-      }
-    }
-
-    return madeProgress;
   }
 
   async #runActivityTasksForLoop(signal?: AbortSignal): Promise<number> {
@@ -1318,6 +1787,109 @@ function emptyWorkerMetrics(): MutableWorkerMetrics {
   };
 }
 
+interface MutableRunStats {
+  iterations: number;
+  workflowTasks: number;
+  activityTasks: number;
+  timersFired: number;
+  idleSleeps: number;
+  errors: number;
+}
+
+interface ResolvedRunConfig {
+  readonly maxIterations: number | undefined;
+  readonly initialIdleBackoffMs: number;
+  readonly maxIdleBackoffMs: number;
+  readonly initialErrorBackoffMs: number;
+  readonly maxErrorBackoffMs: number;
+  readonly timerMaintenanceLimit: number;
+  readonly activityTimeoutMaintenanceLimit: number;
+  readonly maintenanceIntervalMs: number;
+  readonly maxMaintenanceIntervalMs: number;
+}
+
+function resolveRunConfig(options: WorkerRunOptions): ResolvedRunConfig {
+  const initialIdleBackoffMs = Math.max(0, options.idleBackoffMs ?? 50);
+  const initialErrorBackoffMs = Math.max(0, options.errorBackoffMs ?? 250);
+  const timerMaintenanceLimit = Math.max(1, options.timerMaintenanceLimit ?? 64);
+  const maintenanceIntervalMs = Math.max(0, Math.trunc(options.maintenanceIntervalMs ?? 250));
+  return {
+    maxIterations: options.maxIterations,
+    initialIdleBackoffMs,
+    maxIdleBackoffMs: Math.max(initialIdleBackoffMs, options.maxIdleBackoffMs ?? 1_000),
+    initialErrorBackoffMs,
+    maxErrorBackoffMs: Math.max(initialErrorBackoffMs, options.maxErrorBackoffMs ?? 5_000),
+    timerMaintenanceLimit,
+    activityTimeoutMaintenanceLimit: Math.max(
+      1,
+      options.activityTimeoutMaintenanceLimit ?? timerMaintenanceLimit
+    ),
+    maintenanceIntervalMs,
+    maxMaintenanceIntervalMs: Math.max(
+      maintenanceIntervalMs,
+      Math.trunc(options.maxMaintenanceIntervalMs ?? 1_000)
+    )
+  };
+}
+
+/**
+ * Single-promise `Promise.allSettled`. Attaching both handlers here is what
+ * keeps a loop's rejection observed from the moment it is created, rather than
+ * from whenever the caller gets around to awaiting it.
+ */
+async function settleOutcome(loop: Promise<void>): Promise<PromiseSettledResult<void>> {
+  try {
+    return { status: "fulfilled", value: await loop };
+  } catch (reason) {
+    return { status: "rejected", reason };
+  }
+}
+
+function throwFirstRejection(results: readonly PromiseSettledResult<unknown>[]): void {
+  for (const result of results) {
+    if (result.status === "rejected") {
+      throw result.reason;
+    }
+  }
+}
+
+/**
+ * Deterministic per-worker jitter for the maintenance cadence.
+ *
+ * Seeded from the worker id and advanced once per sleep, so a given worker id
+ * always reproduces the same schedule while two ids diverge immediately. A
+ * global RNG would break both properties, and `Math.random` in particular is one
+ * of the globals the determinism guard replaces.
+ */
+function maintenanceJitterSource(workerId: string): () => number {
+  let state = fnv1a32(workerId);
+  return () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+    let mixed = state;
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1);
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61);
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4_294_967_296;
+  };
+}
+
+function fnv1a32(value: string): number {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+/** Spreads `intervalMs` over `[0.5x, 1.5x)`. Zero stays zero, so a caller can
+ * opt out of pacing entirely with `maintenanceIntervalMs: 0`. */
+function jitteredDelayMs(intervalMs: number, jitter: () => number): number {
+  if (intervalMs <= 0) {
+    return 0;
+  }
+  return Math.max(1, Math.round(intervalMs * (0.5 + jitter())));
+}
+
 function nextBackoff(currentMs: number, maxMs: number): number {
   if (currentMs <= 0) {
     return 0;
@@ -1325,6 +1897,53 @@ function nextBackoff(currentMs: number, maxMs: number): number {
   return Math.min(maxMs, currentMs * 2);
 }
 
+/**
+ * Productive passes a task loop may take before it must yield the event loop.
+ *
+ * Bounds how long a saturated loop can hold the thread against its peers, in
+ * that loop's own tasks. Not a public knob: the cost on a synchronous backend is
+ * one event-loop iteration per eight tasks, and on an I/O backend every task
+ * already yields several times, so there is no configuration worth exposing.
+ */
+const PROGRESS_YIELD_PASSES = 8;
+
+/**
+ * Yields to the event loop's macrotask phases so a peer loop parked on a timer
+ * can run.
+ *
+ * The worker's loops are cooperatively scheduled on one event loop, and Node
+ * drains the entire microtask queue before any macrotask. On a backend whose
+ * calls settle on the microtask queue — `MemoryBackend`, and `@durust/sqlite`
+ * because `node:sqlite`'s `DatabaseSync` is synchronous work behind an `async`
+ * wrapper — a loop that makes progress every pass therefore starves its peers
+ * outright rather than merely delaying them. Only a socket-backed provider such
+ * as Postgres interleaves on its own.
+ *
+ * `setImmediate` rather than `setTimeout(…, 0)`: Node clamps sub-millisecond
+ * timeouts to 1 ms, which would cap a busy loop near one task per millisecond.
+ */
+async function yieldToEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+/**
+ * Sleeps for `delayMs`, resolving early when `signal` aborts.
+ *
+ * A zero delay yields the event loop rather than resolving on the microtask
+ * queue. The worker's loops are peers now: one that only yielded microtasks
+ * would drain the microtask queue forever between timer phases, starving the
+ * interval-paced maintenance loop and every other timer in the process.
+ *
+ * It yields through `setImmediate`, not `setTimeout(…, 0)`. Node clamps a zero
+ * timeout to 1 ms, and a peer parked on a clamped timer cannot wake inside a
+ * backlog that a saturated loop drains in under a millisecond — the ordinary
+ * case on a synchronous backend, where a whole workflow task costs microseconds.
+ * `yieldToEventLoop` hands the peer a turn; this is what lets the peer be ready
+ * to take it. With the clamp in place the two straddle the 1 ms boundary and the
+ * handoff succeeds only about half the time.
+ */
 async function sleepWithAbort(
   delayMs: number,
   signal: AbortSignal | undefined
@@ -1333,7 +1952,17 @@ async function sleepWithAbort(
     return "aborted";
   }
   if (delayMs <= 0) {
-    return signal?.aborted ? "aborted" : "elapsed";
+    return await new Promise((resolve) => {
+      const immediate = setImmediate(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve("elapsed");
+      });
+      const onAbort = () => {
+        clearImmediate(immediate);
+        resolve("aborted");
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
   return await new Promise((resolve) => {
     const timeout = setTimeout(() => {
@@ -1422,22 +2051,6 @@ function contiguousHistoryRange(
   return range;
 }
 
-function assertContiguousHistoryThroughTarget(
-  events: readonly HistoryEvent[],
-  targetEventId: EventId
-): void {
-  const target = Number(targetEventId);
-  if (target === 0) {
-    return;
-  }
-  const prefix = contiguousHistoryPrefix(events, targetEventId);
-  const tail = Number(prefix.at(-1)?.eventId ?? 0);
-  if (tail !== target) {
-    throw new Error(
-      `workflow replay history is incomplete: expected contiguous events through ${target}, got through ${tail}`
-    );
-  }
-}
 
 function assertContiguousHistoryRange(
   events: readonly HistoryEvent[],
@@ -1456,6 +2069,69 @@ function assertContiguousHistoryRange(
       `workflow hot wake history is incomplete: expected contiguous events from ${after + 1} through ${target}, got through ${tail}`
     );
   }
+}
+
+/**
+ * Approximates what one recorded event costs to keep in the history cache.
+ *
+ * Inline payload bytes are the term that matters and the only one that varies
+ * by orders of magnitude, so they are measured; everything else is charged a
+ * flat per-event and per-payload overhead.
+ *
+ * A switch over the event kinds rather than a walk over the data. This runs for
+ * every event a commit appends, on every commit, so it is on the warm hot path
+ * — and a generic walk pays `Object.values` there, allocating an array per
+ * object per event to rediscover a layout that is fixed at compile time. The
+ * switch names the payload-bearing fields directly and allocates nothing.
+ */
+function historyEventRetainedBytes(event: HistoryEvent): number {
+  const data = event.data;
+  switch (data.kind) {
+    case "WorkflowStarted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.input);
+    case "WorkflowCompleted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.result);
+    case "WorkflowContinuedAsNew":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.input);
+    case "ActivityScheduled":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.scheduled.input);
+    case "ActivityCompleted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.completed.result);
+    case "ActivityMapScheduled":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.scheduled.inputManifest);
+    case "ActivityMapCompleted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.completed.resultManifest);
+    case "ChildWorkflowMapScheduled":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.scheduled.inputManifest);
+    case "ChildWorkflowMapCompleted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.completed.resultManifest);
+    case "ChildWorkflowStartRequested":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.requested.input);
+    case "ChildWorkflowCompleted":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.completed.result);
+    case "SignalConsumed":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.consumed.payload);
+    case "SideEffectMarker":
+      return HISTORY_EVENT_BASE_BYTES + payloadRefBytes(data.marker.value);
+    default:
+      // Every remaining kind carries identifiers, fingerprints, and failure
+      // messages only — bounded, small, and covered by the flat charge.
+      return HISTORY_EVENT_BASE_BYTES;
+  }
+}
+
+const HISTORY_EVENT_BASE_BYTES = 192;
+const PAYLOAD_REF_BASE_BYTES = 128;
+
+function payloadRefBytes(payload: PayloadRef | undefined): number {
+  if (payload === undefined) {
+    return 0;
+  }
+  // A blob ref keeps only its metadata in memory; the payload itself lives in
+  // the blob store, so it is charged the flat overhead alone.
+  return payload.kind === "Inline"
+    ? PAYLOAD_REF_BASE_BYTES + payload.bytes.byteLength
+    : PAYLOAD_REF_BASE_BYTES;
 }
 
 function isHotWorkflowWakeEvent(event: HistoryEvent): boolean {

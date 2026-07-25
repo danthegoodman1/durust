@@ -303,6 +303,88 @@ npm run lint:determinism
 Nondeterminism is a hard failure. The runtime does not restart workflows on
 determinism failures as a compatibility mechanism.
 
+### Two Gates, And Which One Runs In Production
+
+Determinism is enforced twice, and the two gates do not cover the same ground.
+
+**Static lint — `@durust/eslint-plugin`.** Always on, costs nothing at runtime,
+names the offending API precisely. **This is the enforcement path in
+production.** Point it at every file that workflow code lives in:
+
+```json
+{
+  "durust": {
+    "workflowSources": ["src/workflows/**/*.ts"]
+  }
+}
+```
+
+Its limit is the one that matters when you scope it: **it checks only the files
+the globs match, and it does not follow calls into other modules.** A workflow
+that calls a helper in an unlisted file gets no coverage for anything that
+helper does — including a bare `Date.now()`:
+
+```ts
+// src/workflows/order.ts   (listed in workflowSources)
+import { stamp } from "../util/clock.js";
+export const order = workflow({ /* ... */ handler: async () => stamp() });
+
+// src/util/clock.ts        (NOT listed -> never linted)
+export const stamp = (): number => Date.now();   // reported by nothing
+```
+
+The second limit pulls against the first: the lint is **file-granular and
+assumes every file it is pointed at is workflow code end to end.** Driver code
+sharing a file with a workflow definition is reported as if it were inside the
+handler — `new Worker(...)` and `await client.startWorkflow(...)` trip
+`no-hidden-io` and `no-unknown-await`. The bundled examples in
+`packages/examples/src` are written that way on purpose, for readability, and
+would report ~87 diagnostics with zero real determinism violations among them.
+
+So scope the globs like this:
+
+- Put workflow handlers in files that contain nothing but workflow code. Keep
+  worker construction, client calls, and test drivers out of them.
+- Then list every helper module those handlers import, too. Widening the globs
+  is cheap; missing a module is silent.
+
+**Runtime guards.** A backstop that replaces process-global built-ins (`Date`,
+`Math.random`, `crypto.*`, the timer family, `fetch`, the promise combinators)
+with wrappers that throw when called inside workflow code. They catch what the
+lint cannot see — including calls through unlinted modules and dynamic
+dispatch — but they alter shared globals for the entire host process, so they
+are **on by default in development and test, and off by default in production**:
+
+```ts
+new Worker({
+  /* ... */
+  nondeterminismGuards: true   // force on; omit for the NODE_ENV default
+});
+```
+
+The default is `process.env.NODE_ENV !== "production"`, re-read per execution.
+Set the option explicitly in either direction to override it. Hosts that enable
+the guards can put every original global back — by identity, not just
+behaviour — with `uninstallNondeterminismGuards()`, which is the right thing to
+call on worker shutdown or between test cases. It is safe to call mid-flight,
+but from that moment already-running workflows stop being checked.
+
+Two things the runtime guards deliberately do not cover, both delegated to the
+lint:
+
+- **`process.env` is never patched**, in any form. An accessor or `Proxy` there
+  taxes every environment read in the whole process, and it throws from places
+  nobody wrote it: `console.log` and `console.error` detect colour support
+  whenever an argument is not already a string, and that detection reads the
+  environment. So `console.log(someObject)` inside workflow code would fail
+  while naming `process.env`. The lint rejects `process.env` in every spelling
+  instead.
+- **`process.cpuUsage`, `process.memoryUsage`, `process.resourceUsage`, and
+  `process.chdir` are not guarded at runtime.** They are statically rejected.
+
+Because production runs on the lint alone, treat the `workflowSources` globs as
+part of the deployment contract, not as a local convenience.
+
 ## Payloads
 
 Payload refs hide inline versus blob-backed storage from workflow code.
@@ -575,9 +657,12 @@ until all of these are true for the target release:
 - SQLite and Postgres recovery tests prove append history, active indexes,
   leases, signals, timers, child workflows, activity maps, child workflow maps,
   query projections, and payload roots survive process restart.
-- Workflow determinism is enforced by runtime guards and source linting, and
-  nondeterminism remains a hard failure rather than a restart/compatibility
-  mechanism.
+- Workflow determinism is enforced by source linting in production and
+  additionally by runtime guards outside it, and nondeterminism remains a hard
+  failure rather than a restart/compatibility mechanism. Confirm the
+  `workflowSources` globs cover every module reachable from workflow code: the
+  lint does not follow calls into files it was not pointed at, and it is the
+  only gate running in production unless `nondeterminismGuards: true` is set.
 - Payload blob storage has a durability, availability, and GC plan. GC roots
   must be read from provider-owned durable state, not reconstructed from
   application memory.

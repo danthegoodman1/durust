@@ -1,3 +1,7 @@
+import { Console } from "node:console";
+import { Writable } from "node:stream";
+import v8 from "node:v8";
+import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 import {
   Client,
@@ -41,12 +45,26 @@ import {
   type ActivityHandle,
   type ChildWorkflowHandle,
   type ClaimedWorkflowTask,
+  type HistoryEvent,
   type RunId,
   type SchemaAdapter,
   type WorkflowTaskCommit
 } from "@durust/core";
 import { HotWorkflowExecution, HotWorkflowExecutionDisposedError } from "../src/runtime.js";
 import { prepareWorkflowTaskCommit } from "@durust/testing";
+
+// Captured at module load, before any workflow execution installs the
+// determinism guards, so this is Node's real environment object rather than
+// anything the guards hand out.
+const originalProcessEnvObject = process.env;
+const currentWorkingDirectory = process.cwd();
+const nodeConsole = new Console({
+  stdout: new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    }
+  })
+});
 
 interface QuoteInput {
   readonly sku: string;
@@ -3671,7 +3689,10 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow("nondeterminism: Date.now() is not allowed inside workflow code");
     expect(() => Date.now()).not.toThrow();
   });
@@ -3684,89 +3705,157 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow("nondeterminism: Math.random() is not allowed inside workflow code");
     expect(() => Math.random()).not.toThrow();
   });
 
-  it("rejects process.env reads inside workflow code", async () => {
-    const invalidWorkflow = workflow({
-      name: "tests.nondeterministic-process-env",
-      version: 1,
-      handler: async (_input: TestNoInput): Promise<string | undefined> =>
-        process.env.DURUST_TEST_ENV
-    });
+  // 0017 row 5C: `process.env` is not patched at runtime at all — no Proxy and
+  // no accessor. An accessor that throws on every `process.env` read is a
+  // false-positive generator rather than a determinism guard, because Node's own
+  // `Console` reads the environment to detect colour support whenever an
+  // argument is not already a string: with the accessor in place,
+  // `console.log(someObject)` inside workflow code threw and named
+  // `process.env`, an API the author never wrote. Guards default on in
+  // development and test, which is exactly where people log.
+  //
+  // `durust/no-hidden-io` rejects `process.env` statically in every spelling and
+  // names the right API — see determinism-lint.test.ts, "rejects every process
+  // API the runtime guard no longer covers". These three tests pin the runtime
+  // half of that trade so it cannot be reintroduced by accident.
+  it("does not guard process.env reads inside workflow code", async () => {
+    const previousEnvValue = process.env.DURUST_TEST_ENV;
+    process.env.DURUST_TEST_ENV = "visible";
+    try {
+      const readWorkflow = workflow({
+        name: "tests.unguarded-process-env-read",
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<string | undefined> =>
+          process.env.DURUST_TEST_ENV
+      });
 
-    await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
-    ).rejects.toThrow("nondeterminism: process.env is not allowed inside workflow code");
-    expect(() => process.env.PATH).not.toThrow();
+      const commit = await prepareWorkflowTaskCommit(readWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      });
+      const completed = commit.appendEvents?.[0]?.data;
+      if (completed?.kind !== "WorkflowCompleted") {
+        throw new Error("expected WorkflowCompleted");
+      }
+      expect(decodePayload(completed.result)).toBe("visible");
+    } finally {
+      if (previousEnvValue === undefined) {
+        delete process.env.DURUST_TEST_ENV;
+      } else {
+        process.env.DURUST_TEST_ENV = previousEnvValue;
+      }
+    }
   });
 
-  it("rejects captured process.env proxy aliases inside workflow code", async () => {
-    const installer = workflow({
-      name: "tests.install-process-env-guard",
+  // The concrete false positive that decided row 5C. `Console` detects colour
+  // support whenever an argument is not already a string, and that detection
+  // reads `process.env`; under the accessor guard this threw
+  // `nondeterminism: process.env ...` from a line the author wrote as
+  // `console.log`.
+  it("lets workflow code console.log an object without tripping a guard", async () => {
+    const loggingWorkflow = workflow({
+      name: "tests.workflow-console-log-object",
       version: 1,
-      handler: async (_input: TestNoInput): Promise<string> => "installed"
-    });
-    await prepareWorkflowTaskCommit(installer, {}, fakeClaimed, { payloadCodec: "Json" });
-    const capturedEnv = process.env;
-    const invalidWorkflow = workflow({
-      name: "tests.nondeterministic-process-env-alias",
-      version: 1,
-      handler: async (_input: TestNoInput): Promise<string | undefined> =>
-        capturedEnv.DURUST_TEST_ENV
-    });
-
-    await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
-    ).rejects.toThrow("nondeterminism: process.env is not allowed inside workflow code");
-  });
-
-  it("rejects captured process.env proxy mutations inside workflow code", async () => {
-    const installer = workflow({
-      name: "tests.install-process-env-mutation-guard",
-      version: 1,
-      handler: async (_input: TestNoInput): Promise<string> => "installed"
-    });
-    await prepareWorkflowTaskCommit(installer, {}, fakeClaimed, { payloadCodec: "Json" });
-    const capturedEnv = process.env;
-    const invalidWorkflow = workflow({
-      name: "tests.nondeterministic-process-env-mutation",
-      version: 1,
-      handler: async (_input: TestNoInput): Promise<void> => {
-        capturedEnv.DURUST_TEST_ENV = "bad";
+      // Node's own `Console` over a sink, not `globalThis.console`: vitest
+      // replaces the global one with an interceptor that does no colour
+      // detection, so this would pass even with the guard reinstated.
+      handler: async (_input: TestNoInput): Promise<string> => {
+        nodeConsole.log({ nested: { value: 1 } });
+        return "logged";
       }
     });
 
-    await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
-    ).rejects.toThrow("nondeterminism: process.env mutation is not allowed inside workflow code");
+    const commit = await prepareWorkflowTaskCommit(loggingWorkflow, {}, fakeClaimed, {
+      payloadCodec: "Json",
+      nondeterminismGuards: true
+    });
+    const completed = commit.appendEvents?.[0]?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload<string>(completed.result)).toBe("logged");
   });
 
-  it("rejects process working-directory APIs inside workflow code", async () => {
-    const currentDirectory = process.cwd();
+  it("leaves process.env an ordinary data property while guards are installed", async () => {
+    const installer = workflow({
+      name: "tests.process-env-descriptor",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => "installed"
+    });
+    await prepareWorkflowTaskCommit(installer, {}, fakeClaimed, {
+      payloadCodec: "Json",
+      nondeterminismGuards: true
+    });
+
+    const descriptor = Object.getOwnPropertyDescriptor(process, "env");
+    expect(descriptor?.get).toBeUndefined();
+    expect(descriptor?.set).toBeUndefined();
+    expect(descriptor?.value).toBe(originalProcessEnvObject);
+    expect(process.env).toBe(originalProcessEnvObject);
+  });
+
+  it("rejects process.cwd inside workflow code", async () => {
     const cwdWorkflow = workflow({
       name: "tests.nondeterministic-process-cwd",
       version: 1,
       handler: async (_input: TestNoInput): Promise<string> => process.cwd()
     });
-    const chdirWorkflow = workflow({
-      name: "tests.nondeterministic-process-chdir",
-      version: 1,
-      handler: async (_input: TestNoInput): Promise<void> => {
-        process.chdir(currentDirectory);
-      }
-    });
 
     await expect(
-      prepareWorkflowTaskCommit(cwdWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(cwdWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow("nondeterminism: process.cwd() is not allowed inside workflow code");
-    await expect(
-      prepareWorkflowTaskCommit(chdirWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
-    ).rejects.toThrow("nondeterminism: process.chdir() is not allowed inside workflow code");
     expect(() => process.cwd()).not.toThrow();
   });
+
+  // 0017 row 5B narrowed the guarded set to the APIs whose results workflow
+  // logic plausibly branches on. These four stayed patched for marginal
+  // determinism value while widening the blast radius: every patched global is a
+  // permanent identity change visible to every library in the host process.
+  // `process.uptime()` is NOT in this list — see the guarded table above; it is
+  // a monotonic clock, not introspection, and keeping it costs nothing.
+  // `durust/no-native-async` rejects all four statically; this test pins that
+  // the runtime no longer does, so the removal cannot be undone by accident.
+  it.each([
+    // chdir'ing to the directory the process is already in keeps the test inert.
+    { apiName: "process.chdir()", run: (): unknown => process.chdir(currentWorkingDirectory) },
+    { apiName: "process.cpuUsage()", run: (): unknown => process.cpuUsage() },
+    { apiName: "process.memoryUsage()", run: (): unknown => process.memoryUsage() },
+    { apiName: "process.memoryUsage.rss()", run: (): unknown => process.memoryUsage.rss() },
+    { apiName: "process.resourceUsage()", run: (): unknown => process.resourceUsage() }
+  ])(
+    "no longer guards process-introspection API $apiName at runtime",
+    async ({ apiName, run }) => {
+      const introspectionWorkflow = workflow({
+        name: `tests.unguarded-${apiName}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<string> => {
+          run();
+          return "reached";
+        }
+      });
+
+      const commit = await prepareWorkflowTaskCommit(introspectionWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      });
+      const completed = commit.appendEvents?.[0]?.data;
+      if (completed?.kind !== "WorkflowCompleted") {
+        throw new Error("expected WorkflowCompleted");
+      }
+      expect(decodePayload(completed.result)).toBe("reached");
+    }
+  );
 
   it.each([
     {
@@ -3798,22 +3887,8 @@ describe("minimal workflow runtime", () => {
       run: (): unknown => process.hrtime.bigint()
     },
     {
-      apiName: "process.cpuUsage()",
-      run: (): unknown => process.cpuUsage()
-    },
-    {
-      apiName: "process.memoryUsage()",
-      run: (): unknown => process.memoryUsage()
-    },
-    {
-      apiName: "process.memoryUsage.rss()",
-      run: (): unknown => process.memoryUsage.rss()
-    },
-    {
-      apiName: "process.resourceUsage()",
-      run: (): unknown => process.resourceUsage()
-    },
-    {
+      // Kept against row 5B's drop list: a monotonic clock, same class as
+      // performance.now() and process.hrtime(), which both stay guarded.
       apiName: "process.uptime()",
       run: (): unknown => process.uptime()
     }
@@ -3825,7 +3900,10 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
   });
 
@@ -3951,7 +4029,8 @@ describe("minimal workflow runtime", () => {
       });
 
       commit = await prepareWorkflowTaskCommit(recordedWorkflow, {}, fakeClaimed, {
-        payloadCodec: "Json"
+        payloadCodec: "Json",
+        nondeterminismGuards: true
       });
     } finally {
       if (previousEnvValue === undefined) {
@@ -4019,7 +4098,10 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
   });
 
@@ -4070,7 +4152,10 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow(`nondeterminism: ${apiName} is not allowed inside workflow code`);
   });
 
@@ -4093,7 +4178,10 @@ describe("minimal workflow runtime", () => {
     });
 
     await expect(
-      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json",
+        nondeterminismGuards: true
+      })
     ).rejects.toThrow("nondeterminism: process.nextTick() is not allowed inside workflow code");
   });
 
@@ -4751,7 +4839,435 @@ describe("minimal workflow runtime", () => {
       process.off("unhandledRejection", onUnhandledRejection);
     }
   });
+
+  // Row 4E. `#hotWaiters` is keyed by command id, so a second suspension on a
+  // command that is already parked used to replace the first entry. The
+  // displaced waiter's deferred was then unreachable — including from
+  // `dispose()`, which settles waiters by walking that map — so the run hung
+  // silently and stayed hung through disposal, with no side effect involved to
+  // report the stall.
+  it("refuses a second concurrent await on one handle and keeps the first working", async () => {
+    const trace: string[] = [];
+    let secondError: unknown = null;
+    const doubleAwait = workflow({
+      name: "orders.double-await-handle",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        const handle = await callActivity(
+          priceQuote,
+          { sku: input.sku },
+          { taskQueue: "payments" }
+        ).spawn();
+        // Both frames start awaiting before either can settle, which is the
+        // shape that used to clobber the first waiter.
+        const firstAwait = handle.result().then(
+          (quote) => {
+            trace.push(`first:${quote.cents}`);
+            return quote;
+          },
+          (error: unknown) => {
+            trace.push("first:rejected");
+            throw error;
+          }
+        );
+        const secondAwait = handle.result().then(
+          () => {
+            trace.push("second:resolved");
+          },
+          (error: unknown) => {
+            secondError = error;
+            trace.push("second:rejected");
+          }
+        );
+        await secondAwait;
+        return await firstAwait;
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-double-await"),
+      workflowType: doubleAwait.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [doubleAwait.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(doubleAwait, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+
+    // The task commits at all only because the second await was refused rather
+    // than silently displacing the first. Before the fix both frames were
+    // parked on deferreds nothing could settle and this never resolved.
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled"
+    ]);
+    expect(trace).toEqual(["second:rejected"]);
+    expect((secondError as Error).message).toContain("is already awaited by another frame");
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
+    );
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 99 }, { codec: "Json" })
+    });
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [doubleAwait.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+
+    // The retained waiter is the *first* one, and it still resolves normally.
+    const completionCommit = await hot.advance(secondClaim);
+    const completed = completionCommit.appendEvents?.at(-1)?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 99 });
+    expect(trace).toEqual(["second:rejected", "first:99"]);
+  });
+
+  // Row 4D. Reading a handle's result twice in sequence is ordinary workflow
+  // code, and the ready event backing it is now consumed out of the runtime's
+  // index on the first read, so the handle has to own the value afterwards.
+  it("serves a second sequential read of one activity handle from the handle itself", async () => {
+    const rereadHandle = workflow({
+      name: "orders.handle-reread",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        const handle = await callActivity(
+          priceQuote,
+          { sku: input.sku },
+          { taskQueue: "payments" }
+        ).spawn();
+        const first = await handle.result();
+        const second = await handle.result();
+        return { cents: first.cents + second.cents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-handle-reread"),
+      workflowType: rereadHandle.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [rereadHandle.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(rereadHandle, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, await hot.nextCommit()))
+    );
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 7 }, { codec: "Json" })
+    });
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [rereadHandle.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const commit = await hot.advance(secondClaim);
+    const completed = commit.appendEvents?.at(-1)?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 14 });
+  });
+
+  // Row 4D's exactly-once rule, across tasks. Each branch's ready event is
+  // consumed on the probe that resolves it, and the composite is re-probed on
+  // every later ingest, so a branch that resolved in an earlier task must not
+  // be asked to produce its value again from an index it has already left.
+  //
+  // Also covers a silent hang this test found: a wake that settles nothing —
+  // the first of two branches completing — reported no progress at all, so
+  // `nextCommit()` parked forever and the task never committed.
+  it("settles a joinAll whose branches complete in separate tasks", async () => {
+    const partialJoin = workflow({
+      name: "orders.joinall-across-tasks",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        const [first, second] = await joinAll([
+          callActivity(priceQuote, { sku: `${input.sku}-a` }, { taskQueue: "payments" }),
+          callActivity(priceQuote, { sku: `${input.sku}-b` }, { taskQueue: "payments" })
+        ]);
+        return {
+          cents: (first as QuoteOutput).cents + (second as QuoteOutput).cents
+        };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/hot-joinall-across-tasks"),
+      workflowType: partialJoin.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const claimWorkflow = async (worker: string): Promise<ClaimedWorkflowTask> => {
+      const claimed = await backend.claimWorkflowTask(worker, {
+        namespace: namespace(),
+        taskQueue: taskQueue("workflows"),
+        registeredWorkflowTypes: [partialJoin.workflowType],
+        leaseDurationMs: 30_000
+      });
+      if (!claimed) {
+        throw new Error(`expected a workflow claim for ${worker}`);
+      }
+      return claimed;
+    };
+    const completeOneActivity = async (cents: number): Promise<void> => {
+      const task = await backend.claimActivityTask("activity-worker", {
+        namespace: namespace(),
+        taskQueue: taskQueue("payments"),
+        registeredActivityNames: ["payments.price-quote"],
+        leaseDurationMs: 30_000
+      });
+      if (!task) {
+        throw new Error("expected an activity task");
+      }
+      await backend.completeActivity({
+        claim: task.claim,
+        result: encodePayload<QuoteOutput>({ cents }, { codec: "Json" })
+      });
+    };
+
+    const firstClaim = await claimWorkflow("worker-a");
+    const hot = new HotWorkflowExecution(partialJoin, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "ActivityScheduled"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
+    );
+
+    // Only the first branch completes. The join stays pending, so this task has
+    // nothing to record — but it must still commit rather than park forever.
+    await completeOneActivity(11);
+    const partialClaim = await claimWorkflow("worker-b");
+    const partialCommit = await hot.advance(partialClaim);
+    expect(partialCommit.appendEvents ?? []).toEqual([]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(partialClaim.claim, partialCommit))
+    );
+
+    // The second branch completes in a later task, and the join is re-probed.
+    // The first branch's completion left the runtime's index two tasks ago, so
+    // the composite has to remember it.
+    await completeOneActivity(31);
+    const finalClaim = await claimWorkflow("worker-c");
+    const finalCommit = await hot.advance(finalClaim);
+    const completed = finalCommit.appendEvents?.at(-1)?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 42 });
+  });
+
+  // Row 4D, the memory claim itself. Before removal-on-consume a hot workflow
+  // kept one `HistoryEvent` — payload included — per ready event it had ever
+  // seen, so retained memory grew with the number of activities the run had
+  // completed and never came back down.
+  //
+  // Asserted as a *slope*, not as a band. An absolute band cannot tell flat
+  // from leaky: a mutant retaining one completion in four draws a textbook
+  // straight line and still lands inside any band wide enough to be robust.
+  // What has to be true is that retained bytes do not grow with the number of
+  // activities completed, so this runs the same workflow at two lengths and
+  // measures the bytes each extra activity costs.
+  it("retains no measurable memory per completed hot activity", async () => {
+    const payloadBytes = 96 * 1024;
+    const filler = "x".repeat(payloadBytes);
+
+    // Retained bytes held by one hot execution after it has completed
+    // `activityCount` activities, measured against the heap just before it was
+    // created so the fixture itself cancels out.
+    const retainedAfterActivities = async (activityCount: number): Promise<number> => {
+      const manyActivities = workflow({
+        name: `orders.hot-memory-soak-${activityCount}`,
+        version: 1,
+        handler: async (input: CheckoutInput): Promise<{ readonly total: number }> => {
+          let total = 0;
+          for (let index = 0; index < activityCount; index += 1) {
+            const quote = await callActivity(
+              priceQuote,
+              { sku: `${input.sku}-${index}` },
+              { taskQueue: "payments" }
+            );
+            total += quote.cents;
+          }
+          return { total };
+        }
+      });
+      const claim = syntheticWorkflowClaim(
+        manyActivities.workflowType,
+        [
+          {
+            eventId: eventId(1),
+            eventType: "WorkflowStarted",
+            data: {
+              kind: "WorkflowStarted",
+              workflowType: manyActivities.workflowType,
+              input: encodePayload({ sku: "sku" }, { codec: "Json" })
+            }
+          }
+        ],
+        eventId(1)
+      );
+      const baseline = retainedBytes();
+      const hot = new HotWorkflowExecution(manyActivities, { sku: "sku" }, claim, {
+        payloadCodec: "Json"
+      });
+      let tail = 1;
+      for (let index = 0; index < activityCount; index += 1) {
+        const commit = await (index === 0
+          ? hot.nextCommit()
+          : hot.advance(
+              syntheticWorkflowClaim(
+                manyActivities.workflowType,
+                [
+                  {
+                    eventId: eventId(tail + 1),
+                    eventType: "ActivityCompleted",
+                    data: {
+                      kind: "ActivityCompleted",
+                      completed: {
+                        commandId: { runId: claim.runId, seq: index },
+                        // Big enough that retaining even a fraction of these is
+                        // unmistakable next to measurement noise.
+                        result: encodePayload({ cents: 1, filler }, { codec: "Json" })
+                      }
+                    }
+                  }
+                ],
+                eventId(tail + 1)
+              )
+            ));
+        const appended = commit.appendEvents?.length ?? 0;
+        expect(appended).toBeGreaterThan(0);
+        if (index > 0) {
+          tail += 1;
+        }
+        tail += appended;
+        hot.markCommitted(eventId(tail));
+      }
+      const retained = retainedBytes() - baseline;
+      // Referenced after the measurement so the execution cannot be collected
+      // before it is taken.
+      expect(hot.closed).toBe(false);
+      return retained;
+    };
+
+    const shortRun = 100;
+    const longRun = 500;
+    const retainedShort = await retainedAfterActivities(shortRun);
+    const retainedLong = await retainedAfterActivities(longRun);
+    const bytesPerActivity = (retainedLong - retainedShort) / (longRun - shortRun);
+
+    // Retaining one completion in ten would cost ~9.8 KiB per activity here,
+    // and one in four ~24 KiB. Flat costs a rounding error.
+    expect(bytesPerActivity).toBeLessThan(2 * 1024);
+  }, 120_000);
 });
+
+// Builds a claim without a provider so a memory test measures the runtime and
+// nothing else: a `MemoryBackend` accumulates the run's history by design, and
+// that growth would swamp what is being asserted.
+function syntheticWorkflowClaim(
+  type: ReturnType<typeof workflowType>,
+  prefetchedHistory: readonly HistoryEvent[],
+  replayTargetEventId: ReturnType<typeof eventId>
+): ClaimedWorkflowTask {
+  return {
+    runId: runId("run/memory"),
+    workflowId: workflowId("wf/memory"),
+    workflowType: type,
+    claim: {
+      runId: runId("run/memory"),
+      workerId: "worker-memory",
+      leaseToken: "lease-memory",
+      leaseExpiresAtMs: 0
+    } as ClaimedWorkflowTask["claim"],
+    replayTargetEventId,
+    reason: "Start",
+    prefetchedHistory
+  };
+}
+
+// Retained bytes after a forced full GC.
+//
+// `heapUsed` alone is not enough: payload bytes live in `Uint8Array` backing
+// stores, which V8 accounts as external memory, so a test that watched only the
+// JS heap would report a flat line whether or not the payloads were retained.
+// The GC is triggered through `vm` rather than requiring `--expose-gc` on the
+// runner so the assertion works under the project's normal test command.
+const forceGarbageCollection: () => void = (() => {
+  v8.setFlagsFromString("--expose-gc");
+  try {
+    return vm.runInNewContext("gc") as () => void;
+  } finally {
+    v8.setFlagsFromString("--no-expose-gc");
+  }
+})();
+
+function retainedBytes(): number {
+  forceGarbageCollection();
+  forceGarbageCollection();
+  forceGarbageCollection();
+  const usage = process.memoryUsage();
+  return usage.heapUsed + usage.arrayBuffers;
+}
 
 // Starts a hot execution over a fresh backend so a disposal test can drive the
 // runtime directly, without the worker in the way.

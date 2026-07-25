@@ -1,4 +1,6 @@
-import { describe, expect, it } from "vitest";
+import v8 from "node:v8";
+import vm from "node:vm";
+import { describe, expect, it, vi } from "vitest";
 import {
   Client,
   MemoryBackend,
@@ -14,9 +16,11 @@ import {
   childWorkflowMap,
   childWorkflow,
   callActivity,
+  joinAll,
   decodeActivityMapResults,
   decodeChildWorkflowMapSuccesses,
   eventId,
+  getVersion,
   heartbeat,
   namespace,
   runId,
@@ -25,9 +29,13 @@ import {
   workflow,
   workflowId,
   type DurableBackend,
+  type HistoryEvent,
   type WorkerEvent
 } from "@durust/core";
-import { HotWorkflowExecutionDisposedError } from "../src/runtime.js";
+import {
+  HotWorkflowExecutionDisposedError,
+  REPLAY_WINDOW_LOOKAHEAD_EVENTS
+} from "../src/runtime.js";
 
 interface EchoInput {
   readonly value: string;
@@ -835,6 +843,15 @@ describe("Worker", () => {
     const outcome = await worker.run({
       maxIterations: 6,
       idleBackoffMs: 0,
+      // Maintenance is interval-paced, so a six-pass run would finish long
+      // before the first jittered scan. Zero opts out of pacing: the loop then
+      // scans once per macrotask turn, independently of the task loops.
+      //
+      // Ordering note: maintenance used to run inside the workflow pass,
+      // strictly after the workflow task, so this was ordered by construction.
+      // It is now concurrent, and the assertions below depend on the unpaced
+      // maintenance loop getting a turn within the workflow loop's six passes.
+      maintenanceIntervalMs: 0,
       timerMaintenanceLimit: 8
     });
 
@@ -3231,7 +3248,11 @@ describe("Worker claim release on error paths", () => {
       workflowTaskQueue: "workflows",
       leaseDurationMs: 30_000,
       nondeterminismRetryBackoffMs: 100,
-      payloadCodec: "Json"
+      payloadCodec: "Json",
+      // The workflow trips the guard with a bare `Date.now()`, so this case
+      // needs the runtime guards regardless of the ambient NODE_ENV. They are
+      // off by default in production.
+      nondeterminismGuards: true
     });
 
     await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("nondeterminism:");
@@ -3294,6 +3315,1454 @@ describe("Worker claim release on error paths", () => {
     expect(wake?.reason).toBe("ActivityFailed");
   });
 });
+
+describe("Worker run loops", () => {
+  it("commits a workflow task while a multi-second activity is in flight on the same worker", async () => {
+    const parked = deferred<void>();
+    const release = deferred<void>();
+    let parkedActivityFinished = false;
+    const parkedActivity = activity({
+      name: "loops.parked-quote",
+      handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+        parked.resolve();
+        // Stands in for a multi-second activity without a multi-second sleep:
+        // the handler cannot return until the test releases it.
+        await release.promise;
+        parkedActivityFinished = true;
+        return { cents: input.sku.length };
+      }
+    });
+    const parkedWorkflow = workflow({
+      name: "loops.parked-quote-workflow",
+      version: 1,
+      handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+        const quote = await callActivity(
+          parkedActivity,
+          { sku: input.sku },
+          { taskQueue: "activities" }
+        );
+        return { cents: quote.cents };
+      }
+    });
+
+    const backend = new MemoryBackend();
+    const registry = new Registry()
+      .registerWorkflow(parkedWorkflow)
+      .registerWorkflow(echoWorkflow)
+      .registerActivity(parkedActivity);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const controller = new AbortController();
+    const echoCommitted = deferred<void>();
+    let parkedRunId: string | null = null;
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "loop-split-worker",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json",
+      onEvent: (event) => {
+        // Only a commit for some run other than the parked one proves the
+        // workflow loop moved while the activity loop was stuck.
+        if (event.kind === "WorkflowTaskCommitted" && String(event.runId) !== parkedRunId) {
+          echoCommitted.resolve();
+        }
+      }
+    });
+
+    const parkedHandle = await client.startWorkflow(
+      parkedWorkflow,
+      workflowId("wf/loop-split-parked"),
+      "workflows",
+      { sku: "sku-1" }
+    );
+    parkedRunId = String(parkedHandle.runId);
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+
+    const running = worker.run({
+      signal: controller.signal,
+      idleBackoffMs: 0,
+      errorBackoffMs: 0,
+      runTimerMaintenance: false
+    });
+    await parked.promise;
+
+    const echoHandle = await client.startWorkflow(
+      echoWorkflow,
+      workflowId("wf/loop-split-echo"),
+      "workflows",
+      { value: "ok" }
+    );
+    await expect(
+      raceDeadline(
+        echoCommitted.promise.then(() => "workflow-committed"),
+        2_000,
+        "activity-loop-blocked-the-workflow-loop"
+      )
+    ).resolves.toBe("workflow-committed");
+    expect(parkedActivityFinished).toBe(false);
+
+    release.resolve();
+    controller.abort();
+    await running;
+
+    await expect(echoHandle.result()).resolves.toEqual({ value: "ok" });
+    expect(parkedActivityFinished).toBe(true);
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    await expect(parkedHandle.result()).resolves.toEqual({ cents: 5 });
+  });
+
+  it("completes an activity while every workflow claim fails", async () => {
+    const inner = new MemoryBackend();
+    const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
+    const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
+    const setupWorker = new Worker({
+      backend: inner,
+      registry,
+      namespace: namespace(),
+      workerId: "isolation-setup-worker",
+      workflowTaskQueue: "workflows",
+      payloadCodec: "Json"
+    });
+    const handle = await client.startWorkflow(
+      quoteWorkflow,
+      workflowId("wf/loop-stage-isolation"),
+      "workflows",
+      { sku: "sku-1" }
+    );
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+
+    const backend = failBackendCall(
+      inner,
+      "claimWorkflowTask",
+      new Error("workflow claim exploded")
+    );
+    const controller = new AbortController();
+    const errors: unknown[] = [];
+    const loopWorker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "isolation-loop-worker",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json",
+      onEvent: (event) => {
+        if (event.kind === "ActivityTaskCompleted") {
+          controller.abort();
+        }
+      }
+    });
+
+    const running = loopWorker.run({
+      signal: controller.signal,
+      idleBackoffMs: 0,
+      errorBackoffMs: 1,
+      maxErrorBackoffMs: 1,
+      runTimerMaintenance: false,
+      onError: (error) => {
+        errors.push(error);
+      }
+    });
+    await expect(
+      raceDeadline(
+        running.then(() => "activity-completed"),
+        2_000,
+        "workflow-loop-error-suppressed-the-activity-loop"
+      )
+    ).resolves.toBe("activity-completed");
+    const stopped = await running;
+
+    expect(stopped).toMatchObject({ stopReason: "abort", activityTasks: 1, workflowTasks: 0 });
+    expect(stopped.errors).toBeGreaterThanOrEqual(1);
+    expect(errors.length).toBeGreaterThanOrEqual(1);
+    for (const error of errors) {
+      expect((error as Error).message).toBe("workflow claim exploded");
+    }
+    expect(loopWorker.metrics()).toMatchObject({ activityTaskCompletions: 1 });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    await expect(handle.result()).resolves.toEqual({ cents: 5 });
+  });
+
+  it("paces maintenance by elapsed time rather than by workflow task count", async () => {
+    const workflowTaskCount = 50;
+    const maintenanceIntervalMs = 100;
+    const timerScans: number[] = [];
+    const timeoutScans: number[] = [];
+    const backend = recordMaintenanceScans(new MemoryBackend(), timerScans, timeoutScans);
+    const registry = new Registry().registerWorkflow(echoWorkflow);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const controller = new AbortController();
+    const allCommitted = deferred<void>();
+    let commits = 0;
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "maintenance-cadence-worker",
+      workflowTaskQueue: "workflows",
+      payloadCodec: "Json",
+      onEvent: (event) => {
+        if (event.kind === "WorkflowTaskCommitted") {
+          commits += 1;
+          if (commits === workflowTaskCount) {
+            allCommitted.resolve();
+          }
+        }
+      }
+    });
+
+    for (let index = 0; index < workflowTaskCount; index += 1) {
+      await client.startWorkflow(
+        echoWorkflow,
+        workflowId(`wf/maintenance-cadence-${index}`),
+        "workflows",
+        { value: `v${index}` }
+      );
+    }
+
+    const startedAt = Date.now();
+    const running = worker.run({
+      signal: controller.signal,
+      idleBackoffMs: 0,
+      errorBackoffMs: 0,
+      maintenanceIntervalMs,
+      maxMaintenanceIntervalMs: maintenanceIntervalMs
+    });
+    await expect(
+      raceDeadline(allCommitted.promise.then(() => "committed"), 5_000, "not-committed")
+    ).resolves.toBe("committed");
+    // The commits finish in a few milliseconds, well inside the first jittered
+    // delay. Holding the run open across several intervals is what makes the
+    // cadence observable at all — without it every assertion below is satisfied
+    // by zero scans, which is equally true of a maintenance loop that never
+    // started.
+    const observationWindowMs = 700;
+    await new Promise<void>((resolve) => setTimeout(resolve, observationWindowMs));
+    controller.abort();
+    await running;
+    const elapsedMs = Date.now() - startedAt;
+
+    // Delays are jittered over [0.5x, 1.5x) of the interval, so the scan count
+    // is bracketed by elapsed time in both directions. One extra on each side
+    // for the scans that can land on the opening and closing edges.
+    const upperBound = Math.ceil(elapsedMs / (maintenanceIntervalMs * 0.5)) + 1;
+    const lowerBound = Math.max(1, Math.floor(elapsedMs / (maintenanceIntervalMs * 1.5)) - 1);
+    expect(commits).toBe(workflowTaskCount);
+    expect(timerScans.length).toBeGreaterThanOrEqual(lowerBound);
+    expect(timerScans.length).toBeLessThanOrEqual(upperBound);
+    expect(timeoutScans.length).toBeGreaterThanOrEqual(lowerBound);
+    expect(timeoutScans.length).toBeLessThanOrEqual(upperBound);
+    // The O(elapsed / interval) claim, stated against the work rate it replaces.
+    expect(timerScans.length).toBeLessThan(workflowTaskCount);
+  });
+
+  it("polls activities while the workflow loop is saturated with back-to-back tasks", async () => {
+    // MemoryBackend settles every call on the microtask queue, so a loop that
+    // makes progress every pass holds the thread unless it yields deliberately.
+    // This is the converse of the parked-activity test: there the busy loop
+    // awaits a real promise and yields for free.
+    //
+    // `setTimeout` is faked and never advanced, but `setImmediate` is left real.
+    // Both halves of the handoff then become decidable instead of a race
+    // against the 1 ms timer clamp: the busy loop can only give up the thread
+    // through its `setImmediate` progress yield, and the idle activity loop can
+    // only take it if a zero backoff resumes off the timer queue. Either half
+    // reverted parks the activity loop forever rather than merely making it
+    // late, so this fails deterministically instead of about a third of runs.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await runSaturatedWorkflowLoopScenario();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  const runSaturatedWorkflowLoopScenario = async (): Promise<void> => {
+    const backend = new MemoryBackend();
+    const registry = new Registry()
+      .registerWorkflow(echoWorkflow)
+      .registerWorkflow(quoteWorkflow)
+      .registerActivity(quoteActivity);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const controller = new AbortController();
+    const activityCompleted = deferred<void>();
+    const workflowBacklogDrained = deferred<void>();
+    // 50 echo tasks plus the quote workflow's scheduling task; the quote
+    // workflow's second task cannot run until the activity completes.
+    const backlogTasks = 51;
+    let commits = 0;
+    let commitsWhenActivityCompleted: number | null = null;
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "saturated-workflow-loop-worker",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json",
+      onEvent: (event) => {
+        if (event.kind === "WorkflowTaskCommitted") {
+          commits += 1;
+          if (commits === backlogTasks) {
+            workflowBacklogDrained.resolve();
+          }
+        }
+        if (event.kind === "ActivityTaskCompleted") {
+          commitsWhenActivityCompleted ??= commits;
+          activityCompleted.resolve();
+        }
+      }
+    });
+
+    for (let index = 0; index < 25; index += 1) {
+      await client.startWorkflow(
+        echoWorkflow,
+        workflowId(`wf/saturated-before-${index}`),
+        "workflows",
+        { value: `v${index}` }
+      );
+    }
+    await client.startWorkflow(
+      quoteWorkflow,
+      workflowId("wf/saturated-quote"),
+      "workflows",
+      { sku: "sku-1" }
+    );
+    for (let index = 0; index < 25; index += 1) {
+      await client.startWorkflow(
+        echoWorkflow,
+        workflowId(`wf/saturated-after-${index}`),
+        "workflows",
+        { value: `v${index}` }
+      );
+    }
+
+    const running = worker.run({
+      signal: controller.signal,
+      idleBackoffMs: 0,
+      errorBackoffMs: 0,
+      runTimerMaintenance: false
+    });
+    await expect(
+      Promise.race([
+        activityCompleted.promise.then(() => "activity-ran-during-workflow-backlog"),
+        workflowBacklogDrained.promise.then(() => "workflow-loop-starved-the-activity-loop")
+      ])
+    ).resolves.toBe("activity-ran-during-workflow-backlog");
+
+    controller.abort();
+    await running;
+
+    expect(worker.metrics().activityTaskCompletions).toBe(1);
+    expect(commitsWhenActivityCompleted).not.toBeNull();
+    expect(commitsWhenActivityCompleted).toBeLessThan(backlogTasks);
+  };
+
+  it("derives a reproducible per-worker maintenance schedule from the worker id", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const scheduleFor = async (workerIdValue: string): Promise<readonly number[]> => {
+        const scans: number[] = [];
+        const backend = recordMaintenanceScans(new MemoryBackend(), scans, []);
+        const worker = new Worker({
+          backend,
+          registry: new Registry().registerWorkflow(echoWorkflow),
+          namespace: namespace(),
+          workerId: workerIdValue,
+          workflowTaskQueue: "workflows",
+          payloadCodec: "Json"
+        });
+        const controller = new AbortController();
+        const startedAt = Date.now();
+        const running = worker.run({
+          signal: controller.signal,
+          // Non-zero so the idle workflow loop schedules a bounded number of
+          // fake timers instead of one per virtual millisecond.
+          idleBackoffMs: 25,
+          maxIdleBackoffMs: 25,
+          maintenanceIntervalMs: 100,
+          maxMaintenanceIntervalMs: 100
+        });
+        await vi.advanceTimersByTimeAsync(1_000);
+        controller.abort();
+        await vi.advanceTimersByTimeAsync(0);
+        await running;
+        return scans.map((at) => at - startedAt);
+      };
+
+      const first = await scheduleFor("worker-jitter-a");
+      const repeat = await scheduleFor("worker-jitter-a");
+      const other = await scheduleFor("worker-jitter-b");
+
+      expect(first.length).toBeGreaterThanOrEqual(5);
+      expect(repeat).toEqual(first);
+      expect(other).not.toEqual(first);
+      expect(other[0]).not.toBe(first[0]);
+      for (const at of [...first, ...other]) {
+        expect(at).toBeGreaterThanOrEqual(50);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves no loop running and no unhandled rejection after aborting mid-flight", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const parked = deferred<void>();
+      const release = deferred<void>();
+      const parkedActivity = activity({
+        name: "loops.shutdown-quote",
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          parked.resolve();
+          await release.promise;
+          return { cents: input.sku.length };
+        }
+      });
+      const parkedWorkflow = workflow({
+        name: "loops.shutdown-workflow",
+        version: 1,
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          const quote = await callActivity(
+            parkedActivity,
+            { sku: input.sku },
+            { taskQueue: "activities" }
+          );
+          return { cents: quote.cents };
+        }
+      });
+
+      const calls: string[] = [];
+      const backend = recordBackendCalls(new MemoryBackend(), calls);
+      const registry = new Registry()
+        .registerWorkflow(parkedWorkflow)
+        .registerActivity(parkedActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const controller = new AbortController();
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: "shutdown-worker",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      const handle = await client.startWorkflow(
+        parkedWorkflow,
+        workflowId("wf/loop-shutdown"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      const running = worker.run({
+        signal: controller.signal,
+        idleBackoffMs: 5,
+        maxIdleBackoffMs: 5,
+        errorBackoffMs: 5,
+        maintenanceIntervalMs: 20,
+        maxMaintenanceIntervalMs: 20
+      });
+      await parked.promise;
+      // Abort with a workflow frame parked on its activity waiter and the
+      // activity itself mid-await.
+      let runResolved = false;
+      const settled = (): void => {
+        runResolved = true;
+      };
+      running.then(settled, settled);
+      controller.abort();
+
+      // No loop may outlive `run()`: the activity loop is still inside its
+      // handler, so `run()` must not resolve yet however long the loops are
+      // given to unwind.
+      await new Promise<void>((resolve) => setTimeout(resolve, 40));
+      await flushUnhandledRejectionTurn();
+      expect(runResolved).toBe(false);
+
+      release.resolve();
+      const stopped = await running;
+
+      expect(stopped.stopReason).toBe("abort");
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+
+      const afterStop = calls.length;
+      await new Promise<void>((resolve) => setTimeout(resolve, 80));
+      await flushUnhandledRejectionTurn();
+      expect(calls.length).toBe(afterStop);
+      expect(unhandledRejections).toEqual([]);
+
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await expect(handle.result()).resolves.toEqual({ cents: 5 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("waits for the peer loop before failing out of run when a loop escapes its error budget", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const parked = deferred<void>();
+      const release = deferred<void>();
+      const parkedActivity = activity({
+        name: "loops.error-budget-quote",
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          parked.resolve();
+          await release.promise;
+          return { cents: input.sku.length };
+        }
+      });
+      const parkedWorkflow = workflow({
+        name: "loops.error-budget-workflow",
+        version: 1,
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          const quote = await callActivity(
+            parkedActivity,
+            { sku: input.sku },
+            { taskQueue: "activities" }
+          );
+          return { cents: quote.cents };
+        }
+      });
+
+      const inner = new MemoryBackend();
+      const registry = new Registry()
+        .registerWorkflow(parkedWorkflow)
+        .registerActivity(parkedActivity);
+      const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
+      const setupWorker = new Worker({
+        backend: inner,
+        registry,
+        namespace: namespace(),
+        workerId: "error-budget-setup-worker",
+        workflowTaskQueue: "workflows",
+        payloadCodec: "Json"
+      });
+      await client.startWorkflow(
+        parkedWorkflow,
+        workflowId("wf/loop-error-budget"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+
+      const worker = new Worker({
+        backend: failBackendCall(inner, "claimWorkflowTask", new Error("workflow claim exploded")),
+        registry,
+        namespace: namespace(),
+        workerId: "error-budget-worker",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      const running = worker.run({
+        idleBackoffMs: 0,
+        errorBackoffMs: 0,
+        runTimerMaintenance: false,
+        onError: () => {
+          throw new Error("onError exploded");
+        }
+      });
+      let runSettled = false;
+      const settled = (): void => {
+        runSettled = true;
+      };
+      running.then(settled, settled);
+
+      await parked.promise;
+      await new Promise<void>((resolve) => setTimeout(resolve, 40));
+      await flushUnhandledRejectionTurn();
+      // The workflow loop's `onError` has already thrown, but the activity loop
+      // is still inside its handler, so `run()` must not have settled.
+      expect(runSettled).toBe(false);
+
+      release.resolve();
+      await expect(running).rejects.toThrow("onError exploded");
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+      expect(worker.metrics()).toMatchObject({ activityTaskCompletions: 1 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("observes a maintenance failure while an in-flight activity holds shutdown open", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const parked = deferred<void>();
+      const release = deferred<void>();
+      const parkedActivity = activity({
+        name: "loops.maintenance-budget-quote",
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          parked.resolve();
+          await release.promise;
+          return { cents: input.sku.length };
+        }
+      });
+      const parkedWorkflow = workflow({
+        name: "loops.maintenance-budget-workflow",
+        version: 1,
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          const quote = await callActivity(
+            parkedActivity,
+            { sku: input.sku },
+            { taskQueue: "activities" }
+          );
+          return { cents: quote.cents };
+        }
+      });
+
+      const inner = new MemoryBackend();
+      const registry = new Registry()
+        .registerWorkflow(parkedWorkflow)
+        .registerActivity(parkedActivity);
+      const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
+      const setupWorker = new Worker({
+        backend: inner,
+        registry,
+        namespace: namespace(),
+        workerId: "maintenance-budget-setup-worker",
+        workflowTaskQueue: "workflows",
+        payloadCodec: "Json"
+      });
+      await client.startWorkflow(
+        parkedWorkflow,
+        workflowId("wf/maintenance-error-budget"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+
+      const worker = new Worker({
+        backend: failBackendCall(inner, "fireDueTimers", new Error("timers exploded")),
+        registry,
+        namespace: namespace(),
+        workerId: "maintenance-error-budget-worker",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      const running = worker.run({
+        idleBackoffMs: 10,
+        maxIdleBackoffMs: 10,
+        errorBackoffMs: 0,
+        // Late enough that the activity loop has claimed and parked before the
+        // first scan fails, so the failure lands with shutdown already blocked.
+        maintenanceIntervalMs: 60,
+        maxMaintenanceIntervalMs: 60,
+        onError: (error) => {
+          throw new Error(`onError rethrew: ${(error as Error).message}`);
+        }
+      });
+      let runSettled = false;
+      const settled = (): void => {
+        runSettled = true;
+      };
+      running.then(settled, settled);
+
+      await parked.promise;
+      // Maintenance fails inside this window, and `run()` cannot reach the
+      // `await` in its `finally` while the activity handler is still parked.
+      // Nothing else is watching the maintenance promise, so a handler attached
+      // only at that `await` leaves the rejection unobserved for the whole
+      // window — which under Node's default `--unhandled-rejections=throw`
+      // kills the worker process.
+      await new Promise<void>((resolve) => setTimeout(resolve, 200));
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+      expect(runSettled).toBe(false);
+
+      release.resolve();
+      // A failed maintenance loop must also stop the task loops, or `run()`
+      // would carry the rejection for as long as they kept polling.
+      await expect(
+        raceDeadline(
+          running.then(() => "resolved", (error: unknown) => (error as Error).message),
+          2_000,
+          "maintenance-failure-did-not-stop-the-task-loops"
+        )
+      ).resolves.toBe("onError rethrew: timers exploded");
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("reports the task-loop failure rather than the maintenance failure when both escape", async () => {
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      // Both loops must genuinely reject, which needs the workflow claim to be
+      // already in flight when maintenance fails: stopping the peers cannot
+      // cancel an outstanding backend call, so the workflow loop still reaches
+      // its own rethrowing `onError` afterwards.
+      const backend = failBackendCallAfter(
+        failBackendCall(new MemoryBackend(), "fireDueTimers", new Error("timers exploded")),
+        "claimWorkflowTask",
+        new Error("workflow claim exploded"),
+        30
+      );
+      const worker = new Worker({
+        backend,
+        registry: new Registry().registerWorkflow(echoWorkflow),
+        namespace: namespace(),
+        workerId: "both-budgets-fail-worker",
+        workflowTaskQueue: "workflows",
+        payloadCodec: "Json"
+      });
+
+      await expect(
+        worker.run({
+          idleBackoffMs: 0,
+          errorBackoffMs: 0,
+          maintenanceIntervalMs: 0,
+          onError: (error) => {
+            throw new Error(`onError rethrew: ${(error as Error).message}`);
+          }
+        })
+      ).rejects.toThrow("onError rethrew: workflow claim exploded");
+
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("keeps the one-shot drivers to a single sequential pass with no maintenance", async () => {
+    const cases = [
+      {
+        name: "runWorkflowTaskOnce",
+        claim: "claimWorkflowTask",
+        foreignClaim: "claimActivityTask",
+        drive: async (worker: Worker) => await worker.runWorkflowTaskOnce()
+      },
+      {
+        name: "runWorkflowTaskBatchOnce",
+        claim: "claimWorkflowTask",
+        foreignClaim: "claimActivityTask",
+        drive: async (worker: Worker) => await worker.runWorkflowTaskBatchOnce(1)
+      },
+      {
+        name: "runActivityTaskOnce",
+        claim: "claimActivityTask",
+        foreignClaim: "claimWorkflowTask",
+        drive: async (worker: Worker) => await worker.runActivityTaskOnce()
+      },
+      {
+        name: "runActivityTaskBatchOnce",
+        claim: "claimActivityTask",
+        foreignClaim: "claimWorkflowTask",
+        drive: async (worker: Worker) => await worker.runActivityTaskBatchOnce(1)
+      }
+    ] as const;
+
+    for (const testCase of cases) {
+      const calls: string[] = [];
+      const backend = recordBackendCalls(new MemoryBackend(), calls);
+      const registry = new Registry()
+        .registerWorkflow(quoteWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: `one-shot-${testCase.name}`,
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      await client.startWorkflow(
+        quoteWorkflow,
+        workflowId(`wf/one-shot-${testCase.name}`),
+        "workflows",
+        { sku: "sku-1" }
+      );
+      // Stage the activity task with a driver that is itself under test only for
+      // the workflow cases, so each case starts from the same durable state.
+      await worker.runWorkflowTaskOnce();
+      calls.length = 0;
+
+      await testCase.drive(worker);
+
+      expect({
+        driver: testCase.name,
+        claims: calls.filter((call) => call === testCase.claim).length,
+        foreignClaims: calls.filter((call) => call === testCase.foreignClaim).length,
+        timerScans: calls.filter((call) => call === "fireDueTimers").length,
+        timeoutScans: calls.filter((call) => call === "timeoutDueActivities").length
+      }).toEqual({
+        driver: testCase.name,
+        claims: 1,
+        foreignClaims: 0,
+        timerScans: 0,
+        timeoutScans: 0
+      });
+    }
+  });
+
+  it("keeps runActivityTimeoutMaintenanceOnce to a single timeout scan", async () => {
+    const calls: string[] = [];
+    const backend = recordBackendCalls(new MemoryBackend(), calls);
+    const worker = new Worker({
+      backend,
+      registry: new Registry().registerWorkflow(echoWorkflow),
+      namespace: namespace(),
+      workerId: "one-shot-timeout-maintenance",
+      workflowTaskQueue: "workflows",
+      payloadCodec: "Json"
+    });
+
+    await expect(worker.runActivityTimeoutMaintenanceOnce()).resolves.toEqual({ timedOut: 0 });
+
+    expect(calls).toEqual(["timeoutDueActivities"]);
+  });
+});
+
+// Row 4D, exactly-once ready-event consumption over the worker's real hot-wake
+// deltas. A hot wake carries only the events since the last commit, so a
+// completion consumed in one task is never redelivered — the composite that
+// consumed it has to own it from then on.
+describe("Worker hot join settlement", () => {
+  const joinQuote = activity({
+    name: "worker.join-quote",
+    handler: async (input: { readonly cents: number }): Promise<{ readonly cents: number }> =>
+      input
+  });
+  const joinWorkflow = workflow({
+    name: "worker.join-across-tasks",
+    version: 1,
+    handler: async (input: { readonly seed: number }): Promise<{ readonly total: number }> => {
+      const [first, second] = await joinAll([
+        callActivity(joinQuote, { cents: input.seed }, { taskQueue: "activities" }),
+        callActivity(joinQuote, { cents: input.seed * 2 }, { taskQueue: "activities" })
+      ]);
+      return {
+        total:
+          (first as { readonly cents: number }).cents +
+          (second as { readonly cents: number }).cents
+      };
+    }
+  });
+
+  it("settles a joinAll whose branches complete in separate hot tasks", async () => {
+    const backend = new MemoryBackend();
+    const registry = new Registry().registerWorkflow(joinWorkflow).registerActivity(joinQuote);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "join-across-tasks",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json"
+    });
+    const handle = await client.startWorkflow(
+      joinWorkflow,
+      workflowId("wf/worker-join-across-tasks"),
+      "workflows",
+      { seed: 5 }
+    );
+
+    // Schedules both branches.
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    // One branch completes and wakes a task that can record nothing: the join
+    // is still pending. It must commit anyway rather than park until its lease
+    // expires.
+    await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    // The second branch completes in a later task. The first branch's
+    // completion left the runtime's ready-event index two tasks ago and is not
+    // in this wake's delta, so the join has to remember it.
+    await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+
+    await expect(handle.result()).resolves.toEqual({ total: 15 });
+  });
+});
+
+// The one absolute limit chunked replay introduces, and its repair.
+//
+// `getVersion` and friends return plain values rather than thenables, so they
+// cannot suspend to wait for the next chunk; they spend from the window's
+// reserve. A long enough unbroken run of them exhausts it. That is refused
+// rather than mis-replayed — appending a duplicate marker the rest of history
+// contradicts is the failure worth preventing — and then repaired by replaying
+// the run once with no reserve limit.
+describe("Worker replay window reserve", () => {
+  const markerActivity = activity({
+    name: "worker.marker-quote",
+    handler: async (input: { readonly step: number }): Promise<{ readonly step: number }> => input
+  });
+
+  // Runs a long unbroken sequence of synchronous version markers *before* its
+  // first awaited durable call, which is the shape that has no chunk boundary
+  // to park at.
+  function markerStormWorkflow(name: string, markers: number, swallow: boolean) {
+    return workflow({
+      name,
+      version: 1,
+      handler: async (input: { readonly seed: number }): Promise<{ readonly total: number }> => {
+        let total = input.seed;
+        for (let index = 0; index < markers; index += 1) {
+          if (swallow) {
+            // A workflow that hides the refusal must still not be able to
+            // commit a task built on a marker the runtime could not verify.
+            try {
+              total += getVersion(`worker.change-${index}`, -1, 1);
+            } catch {
+              total += 1000;
+            }
+          } else {
+            total += getVersion(`worker.change-${index}`, -1, 1);
+          }
+        }
+        const quote = await callActivity(markerActivity, { step: 1 }, { taskQueue: "activities" });
+        return { total: total + quote.step };
+      }
+    });
+  }
+
+  async function recordThenColdReplay(
+    label: string,
+    markers: number,
+    swallow: boolean,
+    historyFetchMaxEvents: number
+  ): Promise<readonly string[]> {
+    const definition = markerStormWorkflow(`worker.marker-storm-${label}`, markers, swallow);
+    const backend = new MemoryBackend();
+    const registry = new Registry().registerWorkflow(definition).registerActivity(markerActivity);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const recorder = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: `marker-recorder-${label}`,
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json"
+    });
+    await client.startWorkflow(
+      definition,
+      workflowId(`wf/worker-marker-storm-${label}`),
+      "workflows",
+      { seed: 1 }
+    );
+    // Records the markers and the scheduled activity, then completes it so a
+    // cold replay has to walk the whole marker run.
+    await expect(recorder.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(recorder.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
+
+    const replayer = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: `marker-replayer-${label}`,
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      historyFetchMaxEvents,
+      // Cold, with nothing carried over from the recording worker.
+      workflowExecutionCacheSize: 0,
+      workflowHistoryCacheBytes: 0,
+      payloadCodec: "Json"
+    });
+    const outcome = await replayer.runWorkflowTaskOnce();
+    expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+    if (outcome.kind !== "Committed") {
+      throw new Error("expected a committed workflow task");
+    }
+    const history = await backend.streamHistory({
+      runId: outcome.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(1_000_000),
+      maxEvents: 100_000,
+      maxBytes: 100_000_000
+    });
+    return history.events.map((event) => `${Number(event.eventId)}:${event.eventType}`);
+  }
+
+  it("repairs a marker run that outgrows the replay window reserve", async () => {
+    // Comfortably past the reserve, and past the chunk quantisation on top of
+    // it: the refusal point is "reserve, rounded up by however much the last
+    // chunk overshot", so the limit is a floor rather than an exact number.
+    const markers = REPLAY_WINDOW_LOOKAHEAD_EVENTS * 3;
+    const chunked = await recordThenColdReplay("repair", markers, false, 16);
+    const unchunked = await recordThenColdReplay("whole", markers, false, 100_000);
+
+    // The repaired replay commits, and commits exactly what an unchunked one
+    // does — no duplicate markers, no missing ones.
+    expect(chunked).toEqual(unchunked);
+    expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
+    expect(chunked.at(-1)).toContain("WorkflowCompleted");
+  }, 240_000);
+
+  it("repairs it even when the workflow swallows the refusal", async () => {
+    const markers = REPLAY_WINDOW_LOOKAHEAD_EVENTS * 3;
+    const chunked = await recordThenColdReplay("swallowed", markers, true, 16);
+    const unchunked = await recordThenColdReplay("swallowed-whole", markers, true, 100_000);
+
+    // The latch is what makes this true. Catching the refusal lets the handler
+    // run on with an unverified marker; without a refusal that survives the
+    // `catch`, the task would commit a history with duplicate markers in it.
+    expect(chunked).toEqual(unchunked);
+    expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
+  }, 240_000);
+
+  it("replays a marker run that fits the reserve without repairing", async () => {
+    // Well inside the reserve: the priming load hands the window enough command
+    // events before the handler's first marker runs, so nothing is refused and
+    // the chunked replay streams normally.
+    const markers = 32;
+    const chunked = await recordThenColdReplay("within", markers, false, 16);
+    const unchunked = await recordThenColdReplay("within-whole", markers, false, 100_000);
+    expect(chunked).toEqual(unchunked);
+    expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
+  }, 240_000);
+});
+
+// Row 4A. Cold replay used to accumulate every event through the replay target
+// into one array and hand it to the execution, so replay memory scaled with
+// history length and the README's "No Event History Limit" held only for the
+// provider. These measure what the replay path actually retains.
+describe("Worker replay memory", () => {
+  // Split across the command event and the ready event on purpose: an
+  // `ActivityScheduled` carries the input and stays in the replay window until
+  // the workflow matches it, an `ActivityCompleted` carries the result and sits
+  // in the ready-event index until the workflow consumes it. Loading both sides
+  // heavily means the assertion below reacts to either one being retained.
+  const memoryPayloadBytes = 4 * 1024;
+  const memoryFiller = "f".repeat(memoryPayloadBytes);
+  const memoryActivity = activity({
+    name: "worker.memory-quote",
+    handler: async (input: {
+      readonly step: number;
+      readonly filler: string;
+    }): Promise<{ readonly step: number; readonly filler: string }> => ({
+      step: input.step,
+      filler: memoryFiller
+    })
+  });
+  const memoryWorkflow = workflow({
+    name: "worker.memory-replay",
+    version: 1,
+    handler: async (input: { readonly steps: number }): Promise<{ readonly total: number }> => {
+      let total = 0;
+      for (let step = 0; step < input.steps; step += 1) {
+        const quote = await callActivity(
+          memoryActivity,
+          { step, filler: memoryFiller },
+          { taskQueue: "activities" }
+        );
+        total += quote.step;
+      }
+      return { total };
+    }
+  });
+
+  // Builds a long real history, then leaves the final workflow task unrun so a
+  // fresh worker has to cold-replay all of it.
+  async function buildLongHistory(steps: number, runs = 1): Promise<{
+    readonly backend: MemoryBackend;
+    readonly registry: Registry;
+    readonly historyEvents: number;
+  }> {
+    const backend = new MemoryBackend();
+    const registry = new Registry()
+      .registerWorkflow(memoryWorkflow)
+      .registerActivity(memoryActivity);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const builder = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "memory-builder",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      payloadCodec: "Json"
+    });
+    // With more than one run the workflows are given one more activity than the
+    // build drives, so none of them reaches a terminal state and each is left
+    // with a claimable task for a cold replay to pick up. A single run is
+    // driven exactly to its last completion instead, which keeps
+    // `historyEvents` exact for the callers that predict against it.
+    const activitiesPerRun = runs === 1 ? steps : steps + 1;
+    for (let run = 0; run < runs; run += 1) {
+      await client.startWorkflow(
+        memoryWorkflow,
+        workflowId(`wf/worker-memory-replay-${run}`),
+        "workflows",
+        { steps: activitiesPerRun }
+      );
+    }
+    // Driven in rounds — every claimable workflow task, then every claimable
+    // activity — rather than as alternating single calls. Alternating leaves
+    // exactly one workflow task pending at the end no matter how many runs
+    // there are, because each iteration's workflow call consumes the task the
+    // previous iteration's activity woke. Rounds leave one pending per run.
+    const drain = async (once: () => Promise<{ readonly kind: string }>): Promise<void> => {
+      for (let guard = 0; guard < runs * 4 + 8; guard += 1) {
+        if ((await once()).kind === "NoTask") {
+          return;
+        }
+      }
+      throw new Error("benchmark fixture drained more tasks than it should have");
+    };
+    for (let round = 0; round < steps; round += 1) {
+      await drain(() => builder.runWorkflowTaskOnce());
+      await drain(() => builder.runActivityTaskOnce());
+    }
+    return { backend, registry, historyEvents: 1 + steps * 2 };
+  }
+
+  // Replays one long history at two chunk sizes and reads the answer off both.
+  //
+  // Two things have to hold, and one absolute number cannot show either. First,
+  // retained bytes must track `historyFetchMaxEvents` — that is the gate's
+  // actual wording, and a bulk load retains the same (large) amount at every
+  // chunk size, so a chunk-size sweep is what distinguishes them. Second, each
+  // measurement must sit near what the window *should* cost, because a partial
+  // fix that keeps a few hundred matched events still lands under any bound
+  // loose enough to be set by hand.
+  async function measureColdReplayRetention(
+    built: Awaited<ReturnType<typeof buildLongHistory>>,
+    historyFetchMaxEvents: number
+  ): Promise<number> {
+    const samples: number[] = [];
+    let chunks = 0;
+    const expectedChunks = Math.trunc(built.historyEvents / historyFetchMaxEvents);
+    const sampleAtChunks = new Set([
+      Math.max(1, Math.trunc(expectedChunks / 2)),
+      Math.max(1, Math.trunc(expectedChunks * 0.85))
+    ]);
+    const backend = materializeFreshHistoryChunks(built.backend, () => {
+      chunks += 1;
+      if (sampleAtChunks.has(chunks)) {
+        samples.push(retainedBytes());
+      }
+    });
+    const worker = new Worker({
+      backend,
+      registry: built.registry,
+      namespace: namespace(),
+      workerId: `memory-cold-replayer-${historyFetchMaxEvents}`,
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "activities",
+      historyFetchMaxEvents,
+      // Measured with the worker's own history cache off. It is a separate,
+      // explicitly byte-bounded retention (see the cache test below); leaving it
+      // on would fold its budget into this number and measure two things at once.
+      workflowHistoryCacheBytes: 0,
+      payloadCodec: "Json"
+    });
+    const baseline = retainedBytes();
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+      kind: "Committed",
+      outcome: { kind: "Committed" }
+    });
+    expect(samples.length).toBeGreaterThan(0);
+    return Math.max(...samples) - baseline;
+  }
+
+  // What the replay window should cost at a given chunk size: the runtime
+  // refills to `REPLAY_WINDOW_LOOKAHEAD_EVENTS` of reserve and pulls one chunk
+  // at a time, and this fixture splits its payload evenly between the command
+  // event that sits in the window and the ready event that sits in the index.
+  function predictedWindowBytes(historyFetchMaxEvents: number): number {
+    return 2 * (REPLAY_WINDOW_LOOKAHEAD_EVENTS + historyFetchMaxEvents) * memoryPayloadBytes;
+  }
+
+  it("holds replay memory proportional to historyFetchMaxEvents, not to history length", async () => {
+    const steps = 1800;
+    const smallChunk = 32;
+    const largeChunk = 384;
+    const totalPayloadBytes = steps * memoryPayloadBytes * 2;
+
+    const retainedSmall = await measureColdReplayRetention(
+      await buildLongHistory(steps),
+      smallChunk
+    );
+    const retainedLarge = await measureColdReplayRetention(
+      await buildLongHistory(steps),
+      largeChunk
+    );
+
+    // The history is an order of magnitude past either window.
+    expect(totalPayloadBytes).toBeGreaterThan(12 * 1024 * 1024);
+
+    // Ceiling, from the pull invariant: the window never holds more than the
+    // reserve plus one chunk. This is the edge that rejects a half-finished
+    // drain — keeping even a hundred extra matched events at the small chunk
+    // size breaks it.
+    expect(retainedSmall).toBeLessThan(predictedWindowBytes(smallChunk) * 1.25);
+    expect(retainedLarge).toBeLessThan(predictedWindowBytes(largeChunk) * 1.25);
+
+    // Floor, from the refill invariant: every awaited durable call tops the
+    // window back up to the reserve, so a correct replay is always holding at
+    // least that much. Without this the assertions above would also pass on a
+    // measurement that had collapsed to nothing.
+    const reserveFloorBytes = 2 * REPLAY_WINDOW_LOOKAHEAD_EVENTS * memoryPayloadBytes * 0.8;
+    expect(retainedSmall).toBeGreaterThan(reserveFloorBytes);
+    expect(retainedLarge).toBeGreaterThan(reserveFloorBytes);
+
+    // Proportionality itself, as a slope. Each extra event of chunk size buys
+    // retained bytes; a replay bounded by the run rather than by the chunk
+    // retains the same amount at both sizes and this collapses to zero.
+    const bytesPerChunkEvent = (retainedLarge - retainedSmall) / (largeChunk - smallChunk);
+    expect(bytesPerChunkEvent).toBeGreaterThan(memoryPayloadBytes * 0.25);
+  }, 240_000);
+
+  // Measured as the *difference* between two otherwise identical replay passes,
+  // one with the cache budgeted and one with it switched off.
+  //
+  // A single before/after reading around one replay cannot do this job: the
+  // replay frees as much fixture memory as the cache retains, so the number
+  // drifts with ordering and has been observed negative, which a one-sided
+  // "under the budget" assertion happily accepts. Differencing two passes
+  // cancels everything except the cache and gives the assertion a floor as well
+  // as a ceiling.
+  //
+  // Many small runs rather than one big one, deliberately. A single run whose
+  // history exceeds the whole budget is dropped outright — the byte bound
+  // refuses to evict everything else to hold one entry — which is correct but
+  // leaves nothing to measure. The shape that exercises eviction is what a
+  // worker actually sees: many runs that each fit, and together do not.
+  it("keeps the workflow history cache inside its retained-bytes budget", async () => {
+    const runs = 8;
+    const steps = 24;
+    const cacheBudget = 512 * 1024;
+    const historyBytes = runs * steps * memoryPayloadBytes * 2;
+
+    const replayRetaining = async (
+      workflowHistoryCacheBytes: number,
+      label: string
+    ): Promise<number> => {
+      const built = await buildLongHistory(steps, runs);
+      const worker = new Worker({
+        backend: materializeFreshHistoryChunks(built.backend, () => undefined),
+        registry: built.registry,
+        namespace: namespace(),
+        workerId: `memory-cache-${label}`,
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        historyFetchMaxEvents: 32,
+        // Far more entries than the byte budget can hold, so the byte bound is
+        // what has to do the work.
+        workflowHistoryCacheSize: 1024,
+        // A cold replay per run: the execution cache must not keep them hot, or
+        // the history cache is never exercised.
+        workflowExecutionCacheSize: 0,
+        workflowHistoryCacheBytes,
+        payloadCodec: "Json"
+      });
+      const baseline = retainedBytes();
+      // Drains whatever the build left claimable. Counted rather than assumed:
+      // the build round-robins, so how the activities landed across the runs is
+      // not fixed, and only "several runs were cold-replayed" matters here.
+      let commits = 0;
+      for (;;) {
+        const outcome = await worker.runWorkflowTaskOnce();
+        if (outcome.kind === "NoTask") {
+          break;
+        }
+        expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+        commits += 1;
+      }
+      const retained = retainedBytes() - baseline;
+      // Referenced after the measurement so the worker and its cache cannot be
+      // collected before it is taken.
+      expect(commits).toBeGreaterThanOrEqual(runs);
+      return retained;
+    };
+
+    const withoutCache = await replayRetaining(0, "off");
+    const withBudget = await replayRetaining(cacheBudget, "budgeted");
+    const cacheRetained = withBudget - withoutCache;
+
+    // Together the runs are several times the budget, so an entry-count bound
+    // alone would have kept all of them.
+    expect(historyBytes).toBeGreaterThan(cacheBudget * 2);
+    // Floor: the cache really did retain something, so the measurement is live
+    // rather than collapsed.
+    expect(cacheRetained).toBeGreaterThan(cacheBudget * 0.25);
+    // Ceiling: and it stayed inside its budget, with room for the per-entry
+    // bookkeeping the budget does not count.
+    expect(cacheRetained).toBeLessThan(cacheBudget * 2);
+  }, 240_000);
+
+  it("commits the same events whether history arrives in one chunk or many", async () => {
+    const steps = 40;
+    const recorded: string[][] = [];
+    for (const historyFetchMaxEvents of [4096, 1]) {
+      const built = await buildLongHistory(steps);
+      const worker = new Worker({
+        backend: built.backend,
+        registry: built.registry,
+        namespace: namespace(),
+        workerId: `memory-chunking-${historyFetchMaxEvents}`,
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        historyFetchMaxEvents,
+        workflowExecutionCacheSize: 0,
+        payloadCodec: "Json"
+      });
+      const outcome = await worker.runWorkflowTaskOnce();
+      expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+      if (outcome.kind !== "Committed") {
+        throw new Error("expected a committed workflow task");
+      }
+      const history = await built.backend.streamHistory({
+        runId: outcome.runId,
+        afterEventId: eventId(0),
+        upToEventId: eventId(1_000_000),
+        maxEvents: 10_000,
+        maxBytes: 100_000_000
+      });
+      recorded.push(
+        history.events.map(
+          (event) => `${Number(event.eventId)}:${event.eventType}:${payloadFingerprint(event)}`
+        )
+      );
+    }
+    // Identical committed history down to the payload bytes: the chunk size is
+    // a memory knob and must not be observable in what a run records.
+    expect(recorded[1]).toEqual(recorded[0]);
+    expect(recorded[0]?.length).toBe(1 + steps * 2 + 1);
+  }, 120_000);
+});
+
+// A stable digest of everything a recorded event carries, so the chunked and
+// unchunked replays are compared on their bytes rather than on their shapes.
+function payloadFingerprint(event: HistoryEvent): string {
+  return JSON.stringify(event.data, (_key, value: unknown) =>
+    value instanceof Uint8Array ? Array.from(value) : value
+  );
+}
+
+/**
+ * Wraps a backend so every streamed chunk and every claim carries freshly
+ * materialized events, the way a real provider that decodes rows does.
+ *
+ * Without this a memory assertion would be vacuous: an in-process backend hands
+ * back references to the events it already holds, so retaining all of them
+ * costs nothing extra and a bulk load looks identical to a chunked one.
+ */
+function materializeFreshHistoryChunks(
+  inner: DurableBackend,
+  onChunk: () => void
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "claimWorkflowTask") {
+        return async (...args: Parameters<DurableBackend["claimWorkflowTask"]>) => {
+          const claimed = await target.claimWorkflowTask(...args);
+          return claimed === null
+            ? null
+            : { ...claimed, prefetchedHistory: claimed.prefetchedHistory.slice(0, 1).map(cloneHistoryEvent) };
+        };
+      }
+      if (property === "streamHistory") {
+        return async (...args: Parameters<DurableBackend["streamHistory"]>) => {
+          const chunk = await target.streamHistory(...args);
+          onChunk();
+          return { ...chunk, events: chunk.events.map(cloneHistoryEvent) };
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+function cloneHistoryEvent(event: HistoryEvent): HistoryEvent {
+  return { ...event, data: clonePayloadsDeep(event.data) as HistoryEvent["data"] };
+}
+
+function clonePayloadsDeep(value: unknown): unknown {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (value instanceof Uint8Array) {
+    return value.slice();
+  }
+  if (Array.isArray(value)) {
+    return value.map(clonePayloadsDeep);
+  }
+  const cloned: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    cloned[key] = clonePayloadsDeep(item);
+  }
+  return cloned;
+}
+
+// Retained bytes after a forced full GC. `heapUsed` alone would miss the
+// payloads entirely: their `Uint8Array` backing stores are external memory, so
+// a test watching only the JS heap reports a flat line either way. Triggered
+// through `vm` so the assertion works under the project's normal test command
+// rather than requiring `--expose-gc` on the runner.
+const forceGarbageCollection: () => void = (() => {
+  v8.setFlagsFromString("--expose-gc");
+  try {
+    return vm.runInNewContext("gc") as () => void;
+  } finally {
+    v8.setFlagsFromString("--no-expose-gc");
+  }
+})();
+
+function retainedBytes(): number {
+  forceGarbageCollection();
+  forceGarbageCollection();
+  forceGarbageCollection();
+  const usage = process.memoryUsage();
+  return usage.heapUsed + usage.arrayBuffers;
+}
 
 function failFirstWorkflowClaim(inner: DurableBackend): DurableBackend {
   let failed = false;
@@ -3542,6 +5011,102 @@ function recordActivityCompletionBatches(
       return typeof value === "function" ? value.bind(target) : value;
     }
   }) as DurableBackend;
+}
+
+// Like `failBackendCall`, but the rejection lands only after `delayMs`, so the
+// call is still outstanding while another loop fails.
+function failBackendCallAfter<K extends keyof DurableBackend>(
+  inner: DurableBackend,
+  method: K,
+  error: Error,
+  delayMs: number
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === method) {
+        return async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+          throw error;
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+// Records the wall-clock instant of every maintenance scan so a test can assert
+// the cadence itself, not just the call count.
+function recordMaintenanceScans(
+  inner: DurableBackend,
+  timerScans: number[],
+  timeoutScans: number[]
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "fireDueTimers") {
+        return async (...args: Parameters<DurableBackend["fireDueTimers"]>) => {
+          timerScans.push(Date.now());
+          return await target.fireDueTimers(...args);
+        };
+      }
+      if (property === "timeoutDueActivities") {
+        return async (...args: Parameters<DurableBackend["timeoutDueActivities"]>) => {
+          timeoutScans.push(Date.now());
+          return await target.timeoutDueActivities(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+// Appends the name of every backend method the worker calls, which is how the
+// one-shot driver tests pin their single-pass shape and how the shutdown test
+// proves no loop outlived `run()`.
+function recordBackendCalls(inner: DurableBackend, calls: string[]): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function" || typeof property !== "string") {
+        return value;
+      }
+      return (...args: readonly unknown[]) => {
+        calls.push(property);
+        return (value as (...callArgs: readonly unknown[]) => unknown).apply(target, args);
+      };
+    }
+  }) as DurableBackend;
+}
+
+function deferred<T = void>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+// Resolves to `timedOutValue` if `promise` has not settled in `timeoutMs`, so a
+// coupling regression reports the invariant it broke instead of a bare timeout.
+async function raceDeadline<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timedOutValue: T
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<T>((resolve) => {
+    timer = setTimeout(() => resolve(timedOutValue), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function flushUnhandledRejectionTurn(): Promise<void> {

@@ -19,9 +19,11 @@ export {
   continueAsNew,
   deprecatePatch,
   getVersion,
+  installNondeterminismGuards,
   patched,
   publish,
-  sideEffect
+  sideEffect,
+  uninstallNondeterminismGuards
 } from "./runtime.js";
 export type { PrepareWorkflowTaskOptions } from "./runtime.js";
 export * from "./types.js";

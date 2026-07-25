@@ -16,6 +16,7 @@ import {
   type SignalName
 } from "./types.js";
 import { commandKey, sameCommandId } from "./internal.js";
+import { itemRetryDelayMs } from "./map-engine.js";
 import type {
   ActivityMapTask,
   ActivityTask,
@@ -1525,7 +1526,7 @@ function retryActivityAfterFailure(
       ...activity.task,
       attempt: activity.task.attempt + 1
     },
-    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
   };
 }
 
@@ -1543,18 +1544,8 @@ function retryActivityAfterTimeout(
       ...activity.task,
       attempt: activity.task.attempt + 1
     },
-    readyAtMs: nowMs + retryDelayMs(activity.task.attempt, policy)
+    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
   };
-}
-
-function retryDelayMs(
-  completedAttempt: number,
-  policy: ActivityTask["retryPolicy"]
-): number {
-  const initial = Math.max(0, policy.initialIntervalMs);
-  const max = Math.max(initial, policy.maxIntervalMs);
-  const coefficient = Math.max(1, policy.backoffCoefficient);
-  return Math.min(max, Math.round(initial * coefficient ** Math.max(0, completedAttempt - 1)));
 }
 
 function activityHeartbeatDeadlineAt(

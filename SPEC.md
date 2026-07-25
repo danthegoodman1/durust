@@ -623,6 +623,37 @@ enum PollOutcome {
 
 If replay needs more history, the driver fetches the next segment and polls again.
 
+### Synchronous change markers and the replay window reserve
+
+`NeedsMoreHistory` assumes the durable API that ran out of history can suspend.
+Most can. `get_version`, `patched`, and `deprecate_patch` cannot: they return
+plain values rather than futures, so a runtime whose durable APIs are promises
+— the TypeScript one — has no way to park them while a chunk is fetched.
+
+The replay window therefore keeps a **reserve** of recorded command events
+beyond whatever the current call needs, and every awaited durable call refills
+the window to at least that reserve. Synchronous markers spend from it. This
+gives one absolute limit, and it is the only limit chunked replay introduces:
+
+> A run of consecutive synchronous change-marker calls with no awaited durable
+> call between them may not exceed the replay window reserve.
+
+The reserve is `REPLAY_WINDOW_LOOKAHEAD_EVENTS` (128 by default, matched to the
+worker's default `historyFetchMaxEvents`). The effective limit is a floor rather
+than an exact number, because the last chunk loaded usually overshoots it.
+
+Exceeding it is refused, never mis-replayed: reading an unloaded window as "no
+recorded command" would append a duplicate marker that the rest of history
+contradicts. The refusal is recoverable rather than fatal — nothing has been
+committed when it is raised, and replay is deterministic — so the driver drops
+the execution and replays the run once more with no reserve limit, trading that
+one run's memory bound for completing the task. A worker does this
+automatically; the cost is one wasted replay and no provider contract change.
+
+Implementations that can suspend their marker APIs, or that carry a
+provider-maintained index of change markers, do not need the reserve and are not
+bound by this limit.
+
 ## 4.4 Worker registration and task queues
 
 Workers are local processes that register code they can execute and poll durable task queues. Workflow workers and activity workers may be the same process or separate processes.
@@ -1965,6 +1996,17 @@ TimerFired { command_id, fired_at }
 Replay validates `TimerStarted` and returns when `TimerFired` is reached.
 
 A pending timer is an active wait index row, not a future history row. Recovery streams `TimerStarted` and any committed `TimerFired` event at or below the claimed replay target. If the timer fires after that target while recovery is running, the timer service appends `TimerFired` as a later event; the current workflow task will catch it through a later wakeup or a commit conflict.
+
+Firing due timers is the timer service's obligation. A worker may also scan for
+due timers, and by default it does, but that is worker configuration rather than
+a durability guarantee: no run depends on any particular worker scanning, and a
+deployment may turn it off on every worker once a timer service is running.
+Because the guarantee does not rest on it, the scan is paced by elapsed time
+rather than by the worker's task rate, with per-worker jitter derived from the
+worker id so a fleet does not scan in lockstep. Timer latency is therefore
+bounded by the scan interval and not by how busy any worker is, and provider
+load from scanning is bounded by fleet size rather than by throughput. The same
+holds for reaping activities past their start-to-close deadline.
 
 For wall-clock schedules, require explicit timezone ambiguity policies:
 
