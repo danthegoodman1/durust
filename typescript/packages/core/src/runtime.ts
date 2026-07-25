@@ -973,19 +973,28 @@ class WorkflowRuntimeContext {
   readonly #scheduleChildWorkflowMaps: ChildWorkflowMapTask[] = [];
   #queryProjection: PayloadRef | null = null;
   #allowNondeterministicGlobalsDepth = 0;
-  // Key of the `sideEffect` callback currently executing on this context, or
-  // null when no callback is running. Durable APIs are rejected while it is
-  // set: `resolveSideEffect` allocates its command seq before running the
-  // callback and appends its `SideEffectMarker` after, so a durable call made
-  // from inside the callback would append its own marker first and record an
-  // out-of-order pair that can never replay.
+  // The durable API whose user-controlled code is running right now, or null
+  // when none is. Every durable API allocates its command seq before it appends
+  // its event, and runs user code in between: a `sideEffect` callback, or the
+  // payload conversion every other command performs — `encodePayload`, a schema
+  // adapter's `encode()`, a `toJSON()`, a `valueOf()`, a fingerprint template
+  // literal. A durable API called from inside that window takes the next seq
+  // and appends its own event first, recording an out-of-order pair that can
+  // never replay. Both frames are the same invariant and cannot overlap — the
+  // side-effect callback's window closes before its value is encoded — so they
+  // share one pair of fields and the gate pays one null compare.
+  //
+  // Two fields rather than one formatted string: entering a window happens on
+  // every durable call and must cost reference stores only. The message is
+  // assembled on the throwing path.
   //
   // Deliberately separate from `#allowNondeterministicGlobalsDepth`. That
   // counter relaxes the nondeterministic-globals guard; this one tightens the
   // durable-API guard. They are entered from the same place today, but they are
   // independent invariants and a future site that wants one must not silently
   // get the other.
-  #activeSideEffectKey: string | null = null;
+  #userCodeFrameApi: string | null = null;
+  #userCodeFrameDetail: string | null = null;
   // Set once the owning `HotWorkflowExecution` is disposed. Frames of an
   // abandoned workflow can still be scheduled after that point — a detached
   // continuation left behind by an async `sideEffect` callback is the known
@@ -1230,25 +1239,54 @@ class WorkflowRuntimeContext {
   // spinning. `api` names the call the workflow author made and `detail` is its
   // identifying argument; they are formatted only on the throwing path so a
   // durable call on the hot path costs one null compare and no allocation.
-  #assertDurableApiOutsideSideEffect(api: string, detail?: string): void {
+  #assertDurableApiAllowed(api: string, detail?: string): void {
     if (this.#disposalError !== null) {
       throw this.#disposalError;
     }
-    const key = this.#activeSideEffectKey;
-    if (key !== null) {
+    const frameApi = this.#userCodeFrameApi;
+    if (frameApi === null) {
+      return;
+    }
+    if (frameApi === SIDE_EFFECT_CALLBACK_FRAME) {
       throw new Error(
         `nondeterminism: durable APIs cannot be called from inside a sideEffect callback; ` +
-          `side effect "${key}" called ${detail === undefined ? api : `${api}(${detail})`}. ` +
+          `side effect "${this.#userCodeFrameDetail}" called ` +
+          `${describeDurableApi(api, detail)}. ` +
           `Compute durable values outside the callback and pass them in.`
       );
     }
+    // Name the shapes of user code that can be running inside the window rather
+    // than asserting one of them. The caller is not a `sideEffect` callback
+    // here: it is whatever the outer command invoked while turning user values
+    // into an event.
+    throw new Error(
+      `nondeterminism: durable APIs are not re-entrant; ` +
+        `${describeDurableApi(api, detail)} ran inside ` +
+        `${describeDurableApi(frameApi, this.#userCodeFrameDetail)} while it was ` +
+        `converting user-supplied values. The caller is user code that conversion invoked — ` +
+        `most often a toJSON() method, a schema adapter's encode(), or a valueOf() on a value ` +
+        `passed to the durable API. Compute the value first and pass in a plain value.`
+    );
+  }
+
+  // Opens the window in which a durable API runs user-controlled code after
+  // allocating its command seq. Every caller must close it in a `finally`, or a
+  // throw from user code would latch the guard for the rest of the run.
+  #beginUserCodeFrame(api: string, detail: string | null): void {
+    this.#userCodeFrameApi = api;
+    this.#userCodeFrameDetail = detail;
+  }
+
+  #endUserCodeFrame(): void {
+    this.#userCodeFrameApi = null;
+    this.#userCodeFrameDetail = null;
   }
 
   resolveSignal<Payload extends object>(
     name: string,
     payloadSchema?: SchemaAdapter<Payload>
   ): SignalResolution<Payload> {
-    this.#assertDurableApiOutsideSideEffect("signal", name);
+    this.#assertDurableApiAllowed("signal", name);
     const id = this.#nextCommandId();
     const fingerprint = signalFingerprint(name);
     const replayEvent = this.#peekReplayEvent();
@@ -1273,6 +1311,13 @@ class WorkflowRuntimeContext {
     const live = this.#takeLiveSignal(name);
     if (live) {
       const consumedEventId = this.#nextAppendEventId();
+      // This append must stay above the decode below. `decodePayload` runs the
+      // signal's schema `decode()`, which is user code; a durable API called
+      // from there would allocate the next command seq and append its own event
+      // first. Appending `SignalConsumed` first is what makes that harmless, so
+      // decode sites are deliberately outside the re-entrancy frame. Moving the
+      // decode above the push — to validate a payload before recording it, say
+      // — reopens the out-of-order pair, and no test would catch it.
       this.#appendEvents.push({
         data: {
           kind: "SignalConsumed",
@@ -1306,7 +1351,7 @@ class WorkflowRuntimeContext {
   }
 
   resolveTimer(spec: RuntimeTimerSpec): TimerResolution {
-    this.#assertDurableApiOutsideSideEffect("sleep()");
+    this.#assertDurableApiAllowed("sleep()");
     const started = this.#timerStartedEvent(spec);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1351,7 +1396,7 @@ class WorkflowRuntimeContext {
     input: ActivityInput<A>,
     options: ActivityCallOptions
   ): ActivityResolution<ActivityOutput<A>> {
-    this.#assertDurableApiOutsideSideEffect("callActivity", activityDefinition.name);
+    this.#assertDurableApiAllowed("callActivity", activityDefinition.name);
     const scheduled = this.#activityScheduledEvent(activityDefinition, input, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1408,7 +1453,7 @@ class WorkflowRuntimeContext {
     activityDefinition: A,
     id: CommandId
   ): ActivityResolution<ActivityOutput<A>> {
-    this.#assertDurableApiOutsideSideEffect("activityHandle.result", activityDefinition.name);
+    this.#assertDurableApiAllowed("activityHandle.result", activityDefinition.name);
     const terminal = this.#activityCompletions.get(commandKey(id));
     if (terminal?.data.kind === "ActivityCompleted") {
       return {
@@ -1503,6 +1548,10 @@ class WorkflowRuntimeContext {
       return { kind: "Pending" };
     }
     const consumedEventId = this.#nextAppendEventId();
+    // As in `resolveSignal`: this append must stay above the decode below. The
+    // schema `decode()` is user code, and only appending `SignalConsumed` first
+    // keeps a durable call made from it from recording its event ahead of this
+    // command's own.
     this.#appendEvents.push({
       data: {
         kind: "SignalConsumed",
@@ -1605,7 +1654,7 @@ class WorkflowRuntimeContext {
     activityDefinition: A,
     options: ActivityMapOptions<ActivityInput<A>>
   ): ActivityMapResolution<ActivityOutput<A>> {
-    this.#assertDurableApiOutsideSideEffect("activityMap", activityDefinition.name);
+    this.#assertDurableApiAllowed("activityMap", activityDefinition.name);
     const scheduled = this.#activityMapScheduledEvent(activityDefinition, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1658,7 +1707,7 @@ class WorkflowRuntimeContext {
     workflowDefinition: W,
     options: ChildWorkflowMapOptions<WorkflowInput<W>>
   ): ChildWorkflowMapResolution<WorkflowOutput<W>> {
-    this.#assertDurableApiOutsideSideEffect("childWorkflowMap", workflowDefinition.workflowType.name);
+    this.#assertDurableApiAllowed("childWorkflowMap", workflowDefinition.workflowType.name);
     const scheduled = this.#childWorkflowMapScheduledEvent(workflowDefinition, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1712,7 +1761,7 @@ class WorkflowRuntimeContext {
     input: WorkflowInput<W>,
     options: ChildWorkflowOptions
   ): ChildWorkflowStartResolution {
-    this.#assertDurableApiOutsideSideEffect("childWorkflow", workflowDefinition.workflowType.name);
+    this.#assertDurableApiAllowed("childWorkflow", workflowDefinition.workflowType.name);
     const requested = this.#childWorkflowStartRequested(workflowDefinition, input, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1765,7 +1814,7 @@ class WorkflowRuntimeContext {
     workflowDefinition: W,
     id: CommandId
   ): ChildWorkflowResultResolution<WorkflowOutput<W>> {
-    this.#assertDurableApiOutsideSideEffect(
+    this.#assertDurableApiAllowed(
       "childWorkflowHandle.result",
       workflowDefinition.workflowType.name
     );
@@ -1796,7 +1845,7 @@ class WorkflowRuntimeContext {
   }
 
   getVersion(changeId: string, minSupported: number, maxSupported: number): number {
-    this.#assertDurableApiOutsideSideEffect("getVersion", changeId);
+    this.#assertDurableApiAllowed("getVersion", changeId);
     validateVersionRange(changeId, minSupported, maxSupported);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1845,7 +1894,7 @@ class WorkflowRuntimeContext {
   }
 
   deprecatePatch(patchId: string): void {
-    this.#assertDurableApiOutsideSideEffect("deprecatePatch", patchId);
+    this.#assertDurableApiAllowed("deprecatePatch", patchId);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind === "VersionMarker") {
@@ -1895,7 +1944,7 @@ class WorkflowRuntimeContext {
   }
 
   resolveSideEffect<T>(key: string, effect: () => T): T {
-    this.#assertDurableApiOutsideSideEffect("sideEffect", key);
+    this.#assertDurableApiAllowed("sideEffect", key);
     if (key.length === 0) {
       throw new Error("side effect key must not be empty");
     }
@@ -1923,9 +1972,9 @@ class WorkflowRuntimeContext {
 
     const id = this.#nextCommandId();
     let value: T;
-    // The entry assert above proves no side effect is active here, so clearing
-    // to null in the finally restores the exact prior state.
-    this.#activeSideEffectKey = key;
+    // The entry assert above proves no frame is open here, so clearing to null
+    // in the finally restores the exact prior state.
+    this.#beginUserCodeFrame(SIDE_EFFECT_CALLBACK_FRAME, key);
     this.#allowNondeterministicGlobalsDepth += 1;
     try {
       value = effect();
@@ -1933,7 +1982,7 @@ class WorkflowRuntimeContext {
       // Cleared on the throwing path as well: a callback error is reported to
       // the workflow, which may catch it and keep using durable APIs.
       this.#allowNondeterministicGlobalsDepth -= 1;
-      this.#activeSideEffectKey = null;
+      this.#endUserCodeFrame();
     }
     if (isThenable(value)) {
       // The marker records `value` synchronously, so an async callback would
@@ -1952,7 +2001,16 @@ class WorkflowRuntimeContext {
           `returned a promise. Record a plain value and use an activity for asynchronous work.`
       );
     }
-    const payload = encodePayload(value, { codec: this.#payloadCodec });
+    // The callback's guard is already released here, but the value it returned
+    // is still user-controlled and is encoded before the marker is appended, so
+    // the window stays open across the encode.
+    this.#beginUserCodeFrame("sideEffect", key);
+    let payload: PayloadRef<T>;
+    try {
+      payload = encodePayload(value, { codec: this.#payloadCodec });
+    } finally {
+      this.#endUserCodeFrame();
+    }
     this.#appendEvents.push({
       data: {
         kind: "SideEffectMarker",
@@ -2020,12 +2078,22 @@ class WorkflowRuntimeContext {
     workflowDefinition: WorkflowDefinition<any, Output, any, string>
   ): void {
     this.#assertTerminalReplayConsumed("WorkflowCompleted");
-    const result = encodePayload(output, {
-      codec: this.#payloadCodec,
-      ...(workflowDefinition.outputSchema === undefined
-        ? {}
-        : { schema: workflowDefinition.outputSchema })
-    });
+    // No command seq is allocated here, so a durable call from the output's
+    // `toJSON` cannot invert a pair. It would instead append its event after
+    // the terminal-replay-consumed check already passed and ahead of the
+    // terminal event, which the check exists to make impossible.
+    let result: PayloadRef<Output>;
+    this.#beginUserCodeFrame("workflow completion", null);
+    try {
+      result = encodePayload(output, {
+        codec: this.#payloadCodec,
+        ...(workflowDefinition.outputSchema === undefined
+          ? {}
+          : { schema: workflowDefinition.outputSchema })
+      });
+    } finally {
+      this.#endUserCodeFrame();
+    }
     this.#appendEvents.push({
       data: { kind: "WorkflowCompleted", result }
     });
@@ -2044,26 +2112,37 @@ class WorkflowRuntimeContext {
   }
 
   publish<QueryState extends object>(view: QueryState): void {
-    this.#assertDurableApiOutsideSideEffect("publish()");
+    this.#assertDurableApiAllowed("publish()");
     assertDurableInputValue(view, "query projection");
-    this.#queryProjection = encodePayload(view, {
-      codec: this.#payloadCodec,
-      ...(this.#queryStateSchema === undefined
-        ? {}
-        : { schema: this.#queryStateSchema as SchemaAdapter<QueryState> })
-    });
+    this.#beginUserCodeFrame("publish()", null);
+    try {
+      this.#queryProjection = encodePayload(view, {
+        codec: this.#payloadCodec,
+        ...(this.#queryStateSchema === undefined
+          ? {}
+          : { schema: this.#queryStateSchema as SchemaAdapter<QueryState> })
+      });
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   continueAsNew<Input extends object>(input: Input): never {
-    this.#assertDurableApiOutsideSideEffect("continueAsNew()");
+    this.#assertDurableApiAllowed("continueAsNew()");
     this.#assertTerminalReplayConsumed("WorkflowContinuedAsNew");
     assertDurableInputValue(input, "continueAsNew input");
-    const payload = encodePayload(input, {
-      codec: this.#payloadCodec,
-      ...(this.#workflowInputSchema === undefined
-        ? {}
-        : { schema: this.#workflowInputSchema as SchemaAdapter<Input> })
-    });
+    let payload: PayloadRef<Input>;
+    this.#beginUserCodeFrame("continueAsNew()", null);
+    try {
+      payload = encodePayload(input, {
+        codec: this.#payloadCodec,
+        ...(this.#workflowInputSchema === undefined
+          ? {}
+          : { schema: this.#workflowInputSchema as SchemaAdapter<Input> })
+      });
+    } finally {
+      this.#endUserCodeFrame();
+    }
     this.#appendEvents.push({
       data: {
         kind: "WorkflowContinuedAsNew",
@@ -2101,32 +2180,41 @@ class WorkflowRuntimeContext {
     options: ActivityCallOptions
   ): ActivityScheduled {
     const id = this.#nextCommandId();
-    const inputRef = encodePayload(input, {
-      codec: this.#payloadCodec,
-      ...(activityDefinition.inputSchema === undefined ? {} : { schema: activityDefinition.inputSchema })
-    });
-    const taskQueue = options.taskQueue ?? this.#defaultActivityTaskQueue;
-    const retryPolicy = options.retry ?? RetryPolicy.none();
-    const fingerprint = activityFingerprint(
-      activityDefinition.name,
-      payloadDigest(inputRef),
-      activityOptionsDigest({
+    // `encodePayload` runs the input's `toJSON`/`valueOf` and the schema
+    // adapter's `encode`, and `activityOptionsDigest` stringifies a
+    // user-supplied retry policy. All of it runs after seq allocation and
+    // before the event is appended.
+    this.#beginUserCodeFrame("callActivity", activityDefinition.name);
+    try {
+      const inputRef = encodePayload(input, {
+        codec: this.#payloadCodec,
+        ...(activityDefinition.inputSchema === undefined ? {} : { schema: activityDefinition.inputSchema })
+      });
+      const taskQueue = options.taskQueue ?? this.#defaultActivityTaskQueue;
+      const retryPolicy = options.retry ?? RetryPolicy.none();
+      const fingerprint = activityFingerprint(
+        activityDefinition.name,
+        payloadDigest(inputRef),
+        activityOptionsDigest({
+          taskQueue,
+          retryPolicy,
+          startToCloseTimeoutMs: options.startToCloseTimeoutMs ?? null,
+          heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? null
+        })
+      );
+      return {
+        commandId: id,
+        activityName: activityDefinition.name,
         taskQueue,
         retryPolicy,
         startToCloseTimeoutMs: options.startToCloseTimeoutMs ?? null,
-        heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? null
-      })
-    );
-    return {
-      commandId: id,
-      activityName: activityDefinition.name,
-      taskQueue,
-      retryPolicy,
-      startToCloseTimeoutMs: options.startToCloseTimeoutMs ?? null,
-      heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? null,
-      input: inputRef,
-      fingerprint
-    };
+        heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? null,
+        input: inputRef,
+        fingerprint
+      };
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   #activityMapScheduledEvent<A extends ActivityDefinition<any, any, string>>(
@@ -2134,34 +2222,42 @@ class WorkflowRuntimeContext {
     options: ActivityMapOptions<ActivityInput<A>>
   ): ActivityMapScheduled {
     const id = this.#nextCommandId();
-    const taskQueue = options.taskQueue ?? this.#defaultActivityTaskQueue;
-    const retryPolicy = RetryPolicy.none();
-    const startToCloseTimeoutMs = null;
-    const heartbeatTimeoutMs = null;
-    const fingerprint = activityMapFingerprint(
-      activityDefinition.name,
-      payloadDigest(options.inputManifest),
-      options.resultManifest,
-      options.maxInFlight,
-      activityOptionsDigest({
+    // The manifest arrives already encoded, so this builder runs less user code
+    // than the others. It is guarded on the same terms anyway: the hazard is the
+    // window between allocation and append, not today's contents of it.
+    this.#beginUserCodeFrame("activityMap", activityDefinition.name);
+    try {
+      const taskQueue = options.taskQueue ?? this.#defaultActivityTaskQueue;
+      const retryPolicy = RetryPolicy.none();
+      const startToCloseTimeoutMs = null;
+      const heartbeatTimeoutMs = null;
+      const fingerprint = activityMapFingerprint(
+        activityDefinition.name,
+        payloadDigest(options.inputManifest),
+        options.resultManifest,
+        options.maxInFlight,
+        activityOptionsDigest({
+          taskQueue,
+          retryPolicy,
+          startToCloseTimeoutMs,
+          heartbeatTimeoutMs
+        })
+      );
+      return {
+        commandId: id,
+        activityName: activityDefinition.name,
         taskQueue,
         retryPolicy,
         startToCloseTimeoutMs,
-        heartbeatTimeoutMs
-      })
-    );
-    return {
-      commandId: id,
-      activityName: activityDefinition.name,
-      taskQueue,
-      retryPolicy,
-      startToCloseTimeoutMs,
-      heartbeatTimeoutMs,
-      inputManifest: options.inputManifest,
-      resultManifestName: options.resultManifest,
-      maxInFlight: options.maxInFlight,
-      fingerprint
-    };
+        heartbeatTimeoutMs,
+        inputManifest: options.inputManifest,
+        resultManifestName: options.resultManifest,
+        maxInFlight: options.maxInFlight,
+        fingerprint
+      };
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   #childWorkflowMapScheduledEvent<W extends WorkflowDefinition<any, any, any, string>>(
@@ -2175,31 +2271,36 @@ class WorkflowRuntimeContext {
       throw new Error("childWorkflowMap workflowIdPrefix must not be empty");
     }
     const id = this.#nextCommandId();
-    const taskQueue = options.taskQueue ?? this.#defaultWorkflowTaskQueue;
-    const parentClosePolicy = options.parentClosePolicy ?? "Cancel";
-    const failureMode = options.failureMode ?? "FailFast";
-    const fingerprint = childWorkflowMapFingerprint(
-      workflowDefinition.workflowType,
-      payloadDigest(options.inputManifest),
-      options.resultManifest,
-      options.workflowIdPrefix,
-      options.maxInFlight,
-      taskQueue,
-      parentClosePolicy,
-      failureMode
-    );
-    return {
-      commandId: id,
-      workflowType: workflowDefinition.workflowType,
-      taskQueue,
-      inputManifest: options.inputManifest,
-      resultManifestName: options.resultManifest,
-      workflowIdPrefix: options.workflowIdPrefix,
-      maxInFlight: options.maxInFlight,
-      parentClosePolicy,
-      failureMode,
-      fingerprint
-    };
+    this.#beginUserCodeFrame("childWorkflowMap", workflowDefinition.workflowType.name);
+    try {
+      const taskQueue = options.taskQueue ?? this.#defaultWorkflowTaskQueue;
+      const parentClosePolicy = options.parentClosePolicy ?? "Cancel";
+      const failureMode = options.failureMode ?? "FailFast";
+      const fingerprint = childWorkflowMapFingerprint(
+        workflowDefinition.workflowType,
+        payloadDigest(options.inputManifest),
+        options.resultManifest,
+        options.workflowIdPrefix,
+        options.maxInFlight,
+        taskQueue,
+        parentClosePolicy,
+        failureMode
+      );
+      return {
+        commandId: id,
+        workflowType: workflowDefinition.workflowType,
+        taskQueue,
+        inputManifest: options.inputManifest,
+        resultManifestName: options.resultManifest,
+        workflowIdPrefix: options.workflowIdPrefix,
+        maxInFlight: options.maxInFlight,
+        parentClosePolicy,
+        failureMode,
+        fingerprint
+      };
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   #childWorkflowStartRequested<W extends WorkflowDefinition<any, any, any, string>>(
@@ -2208,40 +2309,52 @@ class WorkflowRuntimeContext {
     options: ChildWorkflowOptions
   ): ChildWorkflowStartRequested {
     const id = this.#nextCommandId();
-    const inputRef = encodePayload(input, {
-      codec: this.#payloadCodec,
-      ...(workflowDefinition.inputSchema === undefined
-        ? {}
-        : { schema: workflowDefinition.inputSchema })
-    });
-    const taskQueue = options.taskQueue ?? this.#defaultWorkflowTaskQueue;
-    const parentClosePolicy = options.parentClosePolicy ?? "Cancel";
-    const fingerprint = childWorkflowFingerprint(
-      workflowDefinition.workflowType,
-      options.workflowId,
-      payloadDigest(inputRef),
-      taskQueue,
-      parentClosePolicy
-    );
-    return {
-      commandId: id,
-      workflowType: workflowDefinition.workflowType,
-      workflowId: options.workflowId,
-      taskQueue,
-      input: inputRef,
-      parentClosePolicy,
-      fingerprint
-    };
+    this.#beginUserCodeFrame("childWorkflow", workflowDefinition.workflowType.name);
+    try {
+      const inputRef = encodePayload(input, {
+        codec: this.#payloadCodec,
+        ...(workflowDefinition.inputSchema === undefined
+          ? {}
+          : { schema: workflowDefinition.inputSchema })
+      });
+      const taskQueue = options.taskQueue ?? this.#defaultWorkflowTaskQueue;
+      const parentClosePolicy = options.parentClosePolicy ?? "Cancel";
+      const fingerprint = childWorkflowFingerprint(
+        workflowDefinition.workflowType,
+        options.workflowId,
+        payloadDigest(inputRef),
+        taskQueue,
+        parentClosePolicy
+      );
+      return {
+        commandId: id,
+        workflowType: workflowDefinition.workflowType,
+        workflowId: options.workflowId,
+        taskQueue,
+        input: inputRef,
+        parentClosePolicy,
+        fingerprint
+      };
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   #timerStartedEvent(spec: RuntimeTimerSpec): TimerStarted {
     const id = this.#nextCommandId();
-    const { fireAt, fingerprintAt } = resolveTimerTimes(spec, this.#nowMs);
-    return {
-      commandId: id,
-      fireAt: timestampMs(fireAt),
-      fingerprint: timerFingerprint(spec.kind, timestampMs(fingerprintAt))
-    };
+    // `resolveTimerTimes` reads the user-supplied duration or deadline, which
+    // can carry a `valueOf()`.
+    this.#beginUserCodeFrame("sleep()", null);
+    try {
+      const { fireAt, fingerprintAt } = resolveTimerTimes(spec, this.#nowMs);
+      return {
+        commandId: id,
+        fireAt: timestampMs(fireAt),
+        fingerprint: timerFingerprint(spec.kind, timestampMs(fingerprintAt))
+      };
+    } finally {
+      this.#endUserCodeFrame();
+    }
   }
 
   #peekReplayEvent(): HistoryEvent | undefined {
@@ -2268,7 +2381,7 @@ class WorkflowRuntimeContext {
     // this should be unreachable; it guards the invariant at the one place that
     // defines command order, so a future command-producing path cannot record
     // an out-of-order marker by forgetting the named assert.
-    this.#assertDurableApiOutsideSideEffect("a durable command");
+    this.#assertDurableApiAllowed("a durable command");
     return commandId(this.#claimed.runId, this.#nextCommandSeq++);
   }
 
@@ -3272,6 +3385,15 @@ function validateMarkerCommand(changeId: string, expected: CommandId, recorded: 
       `nondeterminism: version marker ${changeId} command sequence changed: expected ${expected.seq}, found ${recorded.seq}`
     );
   }
+}
+
+// Marks a `sideEffect` callback frame in `#userCodeFrameApi`, selecting that
+// message instead of the value-conversion one. Compared by value against names
+// passed to the gate, none of which contains a space, so it cannot collide.
+const SIDE_EFFECT_CALLBACK_FRAME = "sideEffect callback";
+
+function describeDurableApi(api: string, detail: string | null | undefined): string {
+  return detail === undefined || detail === null ? api : `${api}(${detail})`;
 }
 
 function isThenable(value: unknown): boolean {

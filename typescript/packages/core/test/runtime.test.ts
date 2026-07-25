@@ -126,12 +126,17 @@ function committedTail(outcome: { readonly kind: string; readonly newTailEventId
 // out-of-order marker pair is visible in the assertion diff rather than hidden
 // behind matching event kinds. Accepts both appended and recorded events.
 function commandTrace(event: { readonly data: { readonly kind: string } }): string {
-  const seq = (
-    event.data as {
-      readonly marker?: { readonly commandId?: { readonly seq?: number } };
+  const data = event.data as Record<
+    string,
+    { readonly commandId?: { readonly seq?: number } } | undefined
+  >;
+  for (const slot of ["marker", "scheduled", "requested", "consumed", "started"]) {
+    const seq = data[slot]?.commandId?.seq;
+    if (seq !== undefined) {
+      return `${event.data.kind}#${seq}`;
     }
-  ).marker?.commandId?.seq;
-  return seq === undefined ? event.data.kind : `${event.data.kind}#${seq}`;
+  }
+  return event.data.kind;
 }
 
 describe("minimal workflow runtime", () => {
@@ -3007,7 +3012,7 @@ describe("minimal workflow runtime", () => {
           }
           void handle.result().then(() => undefined);
         },
-        caughtCommit: ["ActivityScheduled", "WorkflowCompleted"]
+        caughtCommit: ["ActivityScheduled#1", "WorkflowCompleted"]
       },
       {
         label: "child-workflow-result",
@@ -3076,6 +3081,400 @@ describe("minimal workflow runtime", () => {
         testCase.caughtCommit ?? ["WorkflowCompleted"]
       );
     }
+  });
+
+  it("rejects a durable API re-entered while a durable command converts its values", async () => {
+    // Every case re-enters the runtime from user code a durable API invokes
+    // *after* it has allocated its command seq and *before* it appends its
+    // event. Without the guard the inner call takes seq N+1 and appends first,
+    // recording an out-of-order pair that can never replay.
+    const reentrantInput = (changeId: string): { readonly sku: string } =>
+      ({
+        sku: "sku-1",
+        // JSON encoding of a durable payload calls this.
+        toJSON(): { readonly sku: string; readonly version: number } {
+          return { sku: "sku-1", version: getVersion(changeId, 1, 2) };
+        }
+      }) as unknown as { readonly sku: string };
+    // Types say these are a string and a number; at runtime a JS caller, an
+    // `any`, or deserialized config can put an object here, and the fingerprint
+    // template literal or the arithmetic then runs its hook inside the window.
+    // Carries both hooks: a fingerprint template literal invokes `toString`,
+    // while `activityOptionsDigest`'s `JSON.stringify` invokes `toJSON`.
+    const reentrantText = (changeId: string): string =>
+      ({
+        toString(): string {
+          return `q-${getVersion(changeId, 1, 2)}`;
+        },
+        toJSON(): string {
+          return `q-${getVersion(changeId, 1, 2)}`;
+        }
+      }) as unknown as string;
+    const reentrantNumber = (changeId: string): number =>
+      ({
+        valueOf(): number {
+          return getVersion(changeId, 1, 2);
+        }
+      }) as unknown as number;
+
+    const cases: readonly {
+      readonly label: string;
+      readonly frame: string;
+      readonly call: (changeId: string) => void;
+    }[] = [
+      {
+        label: "call-activity-input",
+        frame: "callActivity(payments.price-quote)",
+        call: (changeId) => {
+          void callActivity(priceQuote, reentrantInput(changeId), {
+            taskQueue: "payments"
+          }).then(() => undefined);
+        }
+      },
+      {
+        label: "child-workflow-input",
+        frame: "childWorkflow(orders.runtime-child-echo)",
+        call: (changeId) => {
+          void childWorkflow(
+            childEchoWorkflow,
+            reentrantInput(changeId) as unknown as { readonly value: string },
+            { workflowId: "wf/reentrant-encode-child", taskQueue: "workflows" }
+          )
+            .spawn()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "side-effect-value",
+        frame: "sideEffect(recorded)",
+        call: (changeId) => {
+          void sideEffect("recorded", () => reentrantInput(changeId)).then(() => undefined);
+        }
+      },
+      {
+        label: "sleep-duration",
+        frame: "sleep()",
+        call: (changeId) => {
+          void sleep(reentrantNumber(changeId)).then(() => undefined);
+        }
+      },
+      {
+        label: "activity-map-task-queue",
+        frame: "activityMap(payments.price-quote)",
+        call: (changeId) => {
+          void activityMap(priceQuote, {
+            inputManifest: activityMapManifest([{ sku: "a" }], 1),
+            resultManifest: "quotes",
+            taskQueue: reentrantText(changeId),
+            maxInFlight: 1
+          })
+            .resultManifest()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "child-workflow-map-task-queue",
+        frame: "childWorkflowMap(orders.runtime-child-echo)",
+        call: (changeId) => {
+          void childWorkflowMap(childEchoWorkflow, {
+            inputManifest: activityMapManifest([{ value: "a" }], 1),
+            resultManifest: "echoes",
+            workflowIdPrefix: "wf/reentrant-encode-map",
+            taskQueue: reentrantText(changeId),
+            maxInFlight: 1
+          })
+            .resultManifest()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "publish-view",
+        frame: "publish()",
+        call: (changeId) => {
+          publish(reentrantInput(changeId));
+        }
+      },
+      {
+        label: "continue-as-new-input",
+        frame: "continueAsNew()",
+        call: (changeId) => {
+          continueAsNew(reentrantInput(changeId));
+        }
+      }
+    ];
+
+    // Collected across every case and asserted once, so a regression reports
+    // all of them rather than stopping at the first.
+    const commitTraces: Record<string, readonly string[]> = {};
+    const taskErrors: Record<string, string> = {};
+
+    for (const testCase of cases) {
+      const changeId = `encode-${testCase.label}`;
+      const caughtWorkflow = workflow({
+        name: `tests.encode-reentrant-caught-${testCase.label}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<string> => {
+          try {
+            testCase.call(changeId);
+            return "durable call unexpectedly succeeded";
+          } catch (error) {
+            return (error as Error).message;
+          }
+        }
+      });
+      const caughtCommit = await prepareWorkflowTaskCommit(caughtWorkflow, {}, fakeClaimed, {
+        payloadCodec: "Json"
+      });
+      commitTraces[testCase.label] = caughtCommit.appendEvents?.map(commandTrace) ?? [];
+
+      const reentrantWorkflow = workflow({
+        name: `tests.encode-reentrant-${testCase.label}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<string> => {
+          testCase.call(changeId);
+          return "durable call unexpectedly succeeded";
+        }
+      });
+      taskErrors[testCase.label] = await prepareWorkflowTaskCommit(
+        reentrantWorkflow,
+        {},
+        fakeClaimed,
+        { payloadCodec: "Json" }
+      ).then(
+        (commit) => `committed ${JSON.stringify(commit.appendEvents?.map(commandTrace))}`,
+        (error: unknown) => String(error)
+      );
+    }
+
+    // The rejected inner call appends no VersionMarker and the outer command no
+    // event of its own. Without the guard each row records the out-of-order
+    // pair `[VersionMarker#N+1, <OuterCommand>#N]` instead.
+    expect(commitTraces).toEqual(
+      Object.fromEntries(cases.map((testCase) => [testCase.label, ["WorkflowCompleted"]]))
+    );
+
+    for (const testCase of cases) {
+      expect(taskErrors[testCase.label]).toContain(
+        `nondeterminism: durable APIs are not re-entrant; ` +
+          `getVersion(encode-${testCase.label}) ran inside ${testCase.frame} while it was ` +
+          `converting user-supplied values.`
+      );
+    }
+  });
+
+  it("appends no marker when the workflow output encoding re-enters a durable API", async () => {
+    // `completeWorkflow` runs in the `.then` attached outside
+    // `runtimeStorage.run`, so the output's `toJSON` has no AsyncLocalStorage
+    // store and cannot reach the context at all — the encode guard on that path
+    // is shadowed by the ALS boundary and never fires. What matters either way
+    // is the observable contract asserted below: the re-entrant call appends no
+    // VersionMarker ahead of the terminal event. This test holds whichever
+    // mechanism stops it, so it still pins the invariant if `completeWorkflow`
+    // ever moves inside the store.
+    const reentrantOutputWorkflow = workflow({
+      name: "tests.encode-reentrant-output",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly ok: boolean }> =>
+        ({
+          ok: true,
+          toJSON(): { readonly version: number } {
+            return { version: getVersion("encode-output", 1, 2) };
+          }
+        }) as unknown as { readonly ok: boolean }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/encode-reentrant-output"),
+      workflowType: reentrantOutputWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [reentrantOutputWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+
+    let commit: WorkflowTaskCommit | null = null;
+    let taskError: unknown = null;
+    try {
+      commit = await prepareWorkflowTaskCommit(reentrantOutputWorkflow, {}, claim, {
+        payloadCodec: "Json"
+      });
+    } catch (error) {
+      taskError = error;
+    }
+    if (commit !== null) {
+      await backend.commitWorkflowTask(claim.claim, commit);
+    }
+
+    const history = await backend.streamHistory({
+      runId: claim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    // No VersionMarker, and nothing appended ahead of the terminal event.
+    expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted", "WorkflowFailed"]);
+    expect(taskError).toBeNull();
+    const failed = commit?.appendEvents?.[0]?.data;
+    if (failed?.kind !== "WorkflowFailed") {
+      throw new Error("expected WorkflowFailed");
+    }
+    expect(failed.failure.message).toBe("durust durable APIs must be awaited inside a workflow task");
+  });
+
+  it("rejects parking on a hot waiter from inside a durable command's encoding", async () => {
+    // The encode window is also the only place a `toJSON` could reach
+    // `hotSuspendByKey`, whose unconditional `.set()` would replace the waiter
+    // the workflow is already parked on for that command.
+    let spawned: ActivityHandle<QuoteOutput> | null = null;
+    const waiterWorkflow = workflow({
+      name: "tests.encode-reentrant-hot-waiter",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => {
+        spawned = await callActivity(priceQuote, { sku: "outer" }, {
+          taskQueue: "payments"
+        }).spawn();
+        const handle = spawned;
+        void callActivity(
+          priceQuote,
+          {
+            sku: "inner",
+            toJSON(): { readonly sku: string } {
+              void handle.result().then(() => undefined);
+              return { sku: "inner" };
+            }
+          } as unknown as QuoteInput,
+          { taskQueue: "payments" }
+        ).then(() => undefined);
+        return "unreachable";
+      }
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(waiterWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow(
+      "nondeterminism: durable APIs are not re-entrant; " +
+        "activityHandle.result(payments.price-quote) ran inside callActivity(payments.price-quote) " +
+        "while it was converting user-supplied values."
+    );
+  });
+
+  it("allows a durable API called from a map-manifest item conversion", async () => {
+    // SPEC.md §16 makes the map-manifest builders the documented exception to
+    // the re-entrancy rule: `activityMapManifest` allocates no command and opens
+    // no guarded window, so the item conversions the caller supplies run outside
+    // it and a durable API called from one is legal. Its command is allocated
+    // and appended before the map command that consumes the manifest exists.
+    //
+    // The item schema's `encode` is the hook that matters here rather than
+    // `toJSON`: the builder encodes items with MessagePack unless told
+    // otherwise, and MessagePack does not honour `toJSON`.
+    let encoded = 0;
+    const manifestWorkflow = workflow({
+      name: "tests.manifest-item-durable-call",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const versionedItems: SchemaAdapter<QuoteInput> = {
+          fingerprint: "sha256:tests-manifest-item",
+          rootKind: "object",
+          encode: (item: QuoteInput): unknown => {
+            encoded += 1;
+            return { ...item, version: getVersion(`item-${item.sku}`, 1, 2) };
+          }
+        };
+        const mapped = activityMap(priceQuote, {
+          inputManifest: activityMapManifest([{ sku: "a" }, { sku: "b" }], {
+            pageSize: 2,
+            itemSchema: versionedItems
+          }),
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 2
+        });
+        await mapped.resultManifest();
+        return encoded;
+      }
+    });
+
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/manifest-item-durable-call"),
+      workflowType: manifestWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [manifestWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+
+    // The task does not fail, and both markers are allocated in call order
+    // ahead of the map command's own seq.
+    const commit = await prepareWorkflowTaskCommit(manifestWorkflow, {}, claim, {
+      payloadCodec: "Json"
+    });
+    expect(commit.appendEvents?.map(commandTrace)).toEqual([
+      "VersionMarker#1",
+      "VersionMarker#2",
+      "ActivityMapScheduled#3"
+    ]);
+    expect(
+      commit.appendEvents?.flatMap((event) =>
+        event.data.kind === "VersionMarker"
+          ? [[event.data.marker.changeId, Number(event.data.marker.commandId.seq)] as const]
+          : []
+      )
+    ).toEqual([
+      ["item-a", 1],
+      ["item-b", 2]
+    ]);
+    expect(encoded).toBe(2);
+    await backend.commitWorkflowTask(claim.claim, commit);
+
+    // And it replays: the handler re-runs from the top on a cold replay, so the
+    // conversions run again and must match the recorded commands in the same
+    // order. This holds because of the replay model itself, not because any
+    // runtime path re-encodes.
+    const history = await backend.streamHistory({
+      runId: claim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map(commandTrace)).toEqual([
+      "WorkflowStarted",
+      "VersionMarker#1",
+      "VersionMarker#2",
+      "ActivityMapScheduled#3"
+    ]);
+    encoded = 0;
+    const replayCommit = await prepareWorkflowTaskCommit(
+      manifestWorkflow,
+      {},
+      {
+        ...claim,
+        replayTargetEventId: eventId(4),
+        prefetchedHistory: history.events
+      },
+      { payloadCodec: "Json" }
+    );
+    expect(replayCommit.appendEvents).toEqual([]);
+    expect(encoded).toBe(2);
   });
 
   it("restores the durable API guard after a sideEffect callback throws", async () => {

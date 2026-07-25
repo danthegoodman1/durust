@@ -529,7 +529,22 @@ Eviction never loses durable state.
 A cache miss causes streaming replay.
 Replay happens on cache miss, not at every durable wait boundary.
 Keep non-terminal workflows resident while cache limits allow.
+Abandoned executions settle deterministically and never commit.
 ```
+
+A worker that drops a live workflow execution without committing it settles that
+execution. The causes are a rejected commit, a task that failed before commit,
+cache eviction, supersession by a cold replay, and a worker configured with no
+execution cache at all. In every case the dropped execution is disposed: its
+outstanding durable-API waiters settle, and it can never produce a commit
+afterwards. The run is re-claimed and replayed from durable history.
+
+Deterministic disposal is a property of the runtime, not of one language. The
+Rust runtime obtains it by dropping the boxed workflow future, which takes the
+whole tree of parked awaits with it. The TypeScript runtime cannot drop a pending
+promise chain, so it disposes the hot execution explicitly, raising a disposal
+error into every parked waiter and refusing every later commit from that
+execution.
 
 ## 4.2 Worker loop
 
@@ -546,6 +561,38 @@ Keep non-terminal workflows resident while cache limits allow.
 6. Commit generated commands/facts atomically.
 7. Keep future cached if still running.
 ```
+
+A failing workflow task fails that task, not the worker. Workflow code that
+panics in the Rust runtime, or throws in the TypeScript runtime, is caught by the
+runtime instead of escaping the worker loop. Nothing from the failed attempt is
+committed, and runs whose tasks were claimed in the same batch still commit.
+
+Some failures mean the attempt cannot be trusted rather than that the workflow is
+wrong: a detected nondeterministic command sequence, an unsupported workflow
+version, a re-entrant durable API call, a `sideEffect` callback returning a
+thenable, and a panic in Rust workflow code. These abort the task without
+appending `WorkflowFailed`. The worker releases the run with a worker-configured
+retry backoff, and the next claim replays it from durable history, so a redeploy
+that fixes the defect recovers the run. A panic in particular can be raised while
+replaying a run that has already made durable progress; appending a terminal
+failure there would discard recorded progress — in-flight activities, pending
+timers, consumed signals — on the evidence of a defect that says nothing about
+whether that progress was correct.
+
+A workflow that intends to fail terminally reports it through its normal return
+path: a Rust workflow returns `Err(...)`, a TypeScript workflow throws its error
+out of the handler. That is the path that appends `WorkflowFailed`. JavaScript
+cannot distinguish an unintended throw from an intended one, so a TypeScript
+workflow whose own code throws — a `TypeError`, a failed assertion — takes that
+terminal path too. Rust keeps the distinction, because a panic is not a returned
+`Err`.
+
+Panic isolation depends on unwinding, which is a deployment consideration for
+Rust binaries. A profile built with `panic = "abort"` gives `catch_unwind`
+nothing to catch, so a workflow or activity panic aborts the process and takes
+every cached run with it. This repository sets no `panic` profile key, so every
+profile here unwinds; a downstream crate that sets `panic = "abort"` is choosing
+process abort as its workflow-panic behavior.
 
 ## 4.3 Replay stream backpressure
 
@@ -1099,6 +1146,13 @@ Providers do not classify application errors; they only honor the generic
 `non_retryable` flag on a failed activity request. If `non_retryable` is true,
 the provider records the terminal activity failure immediately even when the
 stored retry policy has remaining attempts.
+
+Activity code that panics in the Rust runtime, or throws in the TypeScript
+runtime, fails that attempt through the same envelope. The worker records the
+panic or throw as a retryable `DurableFailure`, so the stored retry policy
+decides whether the activity runs again, exactly as for an activity that returned
+an error. A panicking activity is not a worker fault and does not disturb the
+other activities that worker has claimed.
 
 Retry pacing is provider-enforced through delayed visibility. When a failed
 attempt is rescheduled under `RetryBackoff::Exponential`, the provider stamps
@@ -2315,6 +2369,48 @@ durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
 
+Durable APIs are not re-entrant. In both runtimes a durable API fails the
+workflow task with an explicit error when it is called from inside a
+`side_effect`/`sideEffect` closure, from a `Serialize` impl, `toJSON()`,
+`valueOf()`, or schema `encode()` that a durable API invokes while converting
+user-supplied values, or from any other callback a durable API invokes. The Rust
+runtime rejects the same nesting for activity APIs called from inside an activity
+API's callback.
+
+The map-manifest builders are the exception, in both runtimes. They allocate no
+command and hold no context borrow across caller code, so the iterator adapters
+and item conversions the caller supplies run outside the guarded window. A
+durable API called from one of them is legal: its command is allocated and
+appended before the map command that consumes the manifest exists, in record and
+replay alike.
+
+Converting a workflow's returned output is not a durable API call, and the
+runtimes differ on it. TypeScript guards that conversion and rejects a durable
+API called from the output's `toJSON()` or schema `encode()`. Rust permits it:
+the call allocates its command sequence number and appends its event ahead of
+`WorkflowCompleted`, and the handler re-runs it in the same position on replay.
+
+Rejection everywhere else is forced by command order. A durable API allocates its
+command sequence number before it runs user code and appends its command event
+after, so a nested call appends ahead of the call that contains it:
+
+```text
+side_effect("make-id", || { patched("add-fee"); ... })
+
+    allocate command seq N          side effect
+    run closure
+        allocate command seq N+1    version marker
+        append VersionMarker(N+1)
+    append SideEffectMarker(N)
+
+recorded order: [VersionMarker(N+1), SideEffectMarker(N)]
+replay expects: [SideEffectMarker(N), VersionMarker(N+1)]
+```
+
+No replay of the same code can reproduce the recorded order, so the run would be
+permanently unreplayable. Compute the durable value first and call the durable
+API outside the callback.
+
 Strict mode is a fail-closed variant of the lint layer:
 
 ```rust
@@ -2387,6 +2483,16 @@ ordinary payload-ref APIs.
 
 The closure may run again if the workflow task crashes before commit, so it must
 not perform external side effects. External side effects belong in activities.
+
+The closure is synchronous. The marker records the closure's return value at the
+moment the closure returns, so a closure returning a future or a promise would
+record that object rather than the value it resolves to, and every replay would
+return the recorded encoding of the unresolved object. Rust's `FnOnce() -> T`
+cannot be asynchronous by construction; the TypeScript runtime rejects a
+`sideEffect` callback that returns a thenable and fails the workflow task.
+Asynchronous work belongs in activities.
+
+Durable APIs are not re-entrant and must not be called from inside the closure.
 
 ---
 
