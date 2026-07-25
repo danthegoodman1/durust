@@ -180,6 +180,14 @@ pub enum Error {
     /// own accounting) can tell a workflow bug from genuine history
     /// divergence, which need different operator responses.
     ///
+    /// The worker acts on that distinction: a panic increments
+    /// [`crate::WorkerMetrics::workflow_tasks_panicked`] while a divergence
+    /// increments [`crate::WorkerMetrics::workflow_tasks_nondeterministic`],
+    /// and both are reported through [`crate::WorkerEvent::WorkflowTaskFailed`]
+    /// carrying this error. The re-entrancy guard
+    /// (`durust durable APIs are not re-entrant`) reports by panicking, so it
+    /// arrives here too and is counted as the workflow bug it is.
+    ///
     /// The message keeps the stable `workflow task panicked:` prefix, so it
     /// stays greppable and countable without matching on the variant.
     #[error("{0}")]

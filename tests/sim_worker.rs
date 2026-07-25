@@ -259,18 +259,32 @@ fn tolerate_faults<T>(
 // `tolerate_faults`/`drain_error` are dead for divergence and a cold-replay
 // regression degrades into "workflows did not complete", with no cause. The
 // stats counter is the remaining signal, so every drain asserts on it.
-fn ensure_no_poisoned_workflow_tasks(
+fn ensure_no_poisoned_workflow_tasks<B>(
     sim: &SimRun,
     label: &str,
+    worker: &Worker<B>,
     stats: &WorkerRunStats,
-) -> Result<(), SimFailure> {
+) -> Result<(), SimFailure>
+where
+    B: durust::DurableBackend,
+{
+    // The worker's own metrics split the count by cause, so a failing seed
+    // names the defect class instead of leaving the reader to guess which of
+    // the three it was. They are cumulative across the scenario while `stats`
+    // covers one drain, so the drain's count is what gates and the metrics only
+    // describe.
+    let metrics = worker.metrics();
     sim.ensure(
         "no_poisoned_workflow_tasks",
         stats.workflow_tasks_failed == 0,
         format!(
-            "{label}: {} workflow task(s) failed without committing (nondeterministic replay, \
-             workflow panic, or unsupported recorded version)",
-            stats.workflow_tasks_failed
+            "{label}: {} workflow task(s) failed without committing; worker totals: \
+             {} nondeterministic replay(s), {} workflow panic(s), {} unsupported recorded \
+             version(s)",
+            stats.workflow_tasks_failed,
+            metrics.workflow_tasks_nondeterministic,
+            metrics.workflow_tasks_panicked,
+            metrics.workflow_tasks_unsupported_version,
         ),
     )
 }
@@ -464,7 +478,9 @@ fn run_storm(
         }
         if let Some(round) = suffix(&step.label, "drain:") {
             match block_on(worker.run_until_idle()) {
-                Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "storm drain", &stats)?,
+                Ok(stats) => {
+                    ensure_no_poisoned_workflow_tasks(sim, "storm drain", &worker, &stats)?;
+                }
                 Err(err) => return Err(sim.failure("drain_error", err.to_string())),
             }
             if all_completed(&env.inner, runs) {
@@ -567,7 +583,14 @@ fn crash_between_claim_and_commit_scenario(
         if step.label == "drain" {
             let mut replacement = build_worker(&env.backend, "sim-crash-replacement");
             match block_on(replacement.run_until_idle()) {
-                Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "post-crash drain", &stats)?,
+                Ok(stats) => {
+                    ensure_no_poisoned_workflow_tasks(
+                        sim,
+                        "post-crash drain",
+                        &replacement,
+                        &stats,
+                    )?;
+                }
                 Err(err) => return Err(sim.failure("post_crash_drain_error", err.to_string())),
             }
             if is_completed(&env.inner, &run_id) {
@@ -662,7 +685,9 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
         // through real execution.
         let mut worker_b = build_worker(&env.backend, "sim-stale-b");
         match block_on(worker_b.run_until_idle()) {
-            Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "reclaim drain", &stats)?,
+            Ok(stats) => {
+                ensure_no_poisoned_workflow_tasks(sim, "reclaim drain", &worker_b, &stats)?;
+            }
             Err(err) => return Err(sim.failure("reclaim_drain_error", err.to_string())),
         }
         for run in &runs[1..] {
