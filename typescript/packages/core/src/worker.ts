@@ -457,8 +457,15 @@ export class Worker {
       );
       outcome = await this.#backend.commitWorkflowTask(claimed.claim, prepared.commit);
     } catch (error) {
-      if (prepared?.cacheKey !== null && prepared?.cacheKey !== undefined) {
-        this.#workflowExecutionCache.delete(prepared.cacheKey);
+      if (prepared !== null) {
+        if (prepared.cacheKey !== null) {
+          this.#workflowExecutionCache.delete(prepared.cacheKey);
+        }
+        // The task is released below and the next claim replays the run from
+        // history, so this execution is abandoned. Dropping the reference is
+        // not enough in JavaScript: without disposal its workflow frame stays
+        // parked on an unsettled durable-API waiter forever.
+        prepared.execution.dispose("workflow task failed before commit");
       }
       await this.#releaseFailedWorkflowTask(claimed.claim, error);
       throw error;
@@ -478,8 +485,13 @@ export class Worker {
           outcome.newTailEventId
         );
       }
-    } else if (prepared.cacheKey !== null) {
-      this.#workflowExecutionCache.delete(prepared.cacheKey);
+    } else {
+      if (prepared.cacheKey !== null) {
+        this.#workflowExecutionCache.delete(prepared.cacheKey);
+      }
+      // The provider rejected the commit, so this execution's in-memory state
+      // has diverged from durable history and can never be used again.
+      prepared.execution.dispose("workflow task commit conflicted");
     }
     const localActivityTasks =
       outcome.kind === "Committed" && !signal?.aborted
@@ -676,7 +688,19 @@ export class Worker {
     }
 
     if (cached !== undefined) {
+      // Reached from both supersession paths: the entry failed the hot-wake
+      // criteria above, or it never met them. Either way the run is about to be
+      // replayed cold into a fresh execution, so this frame's in-memory
+      // position is dead and it is abandoned exactly like a conflicted one.
+      // The delete above is redundant with this one and left as it was.
       this.#workflowExecutionCache.delete(cacheKey);
+      // Same terminal skip as `#updateWorkflowExecutionCacheAfterCommit`: a
+      // closed execution owns no waiter, so disposing it would only pay for the
+      // error construction. A closed entry cannot reach the cache today; the
+      // two sites state that assumption identically rather than each guessing.
+      if (!cached.execution.closed) {
+        cached.execution.dispose("superseded by cold replay");
+      }
     }
     this.#metrics.workflowExecutionCacheMisses += 1;
     const replayClaim = await this.#claimWithCompleteReplayHistory(claimed);
@@ -844,8 +868,22 @@ export class Worker {
     if (prepared.cacheKey === null) {
       return;
     }
-    if (prepared.execution.closed || this.#workflowExecutionCacheSize === 0) {
+    // Split from the cache-disabled arm below on measured cost, not style. A
+    // terminal execution owns no parked waiter, so disposing it settles
+    // nothing — but `dispose()` constructs a `HotWorkflowExecutionDisposedError`
+    // eagerly, measured at ~1122 ns, dominated by stack capture. Merging the
+    // two arms would pay that on every committed terminal task whenever the
+    // execution cache is disabled, the highest-volume path through this
+    // function, against a memory-backend append-commit in the ~700 ns range.
+    if (prepared.execution.closed) {
       this.#workflowExecutionCache.delete(prepared.cacheKey);
+      return;
+    }
+    if (this.#workflowExecutionCacheSize === 0) {
+      this.#workflowExecutionCache.delete(prepared.cacheKey);
+      // The highest-volume disposal site: with the execution cache disabled,
+      // every committed non-terminal task abandons a still-parked frame.
+      prepared.execution.dispose("workflow execution cache disabled");
       return;
     }
     this.#storeWorkflowExecution(prepared.cacheKey, {
@@ -883,7 +921,12 @@ export class Worker {
       if (oldest === undefined) {
         return;
       }
+      const evicted = this.#workflowExecutionCache.get(oldest);
       this.#workflowExecutionCache.delete(oldest);
+      // An evicted run replays from history on its next claim, so its cached
+      // frame is dead. Disposal settles it; otherwise the eviction bounds the
+      // cache but not the parked promise chains it used to own.
+      evicted?.execution.dispose("workflow execution cache eviction");
       this.#metrics.workflowExecutionCacheEvictions += 1;
     }
   }

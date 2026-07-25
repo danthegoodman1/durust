@@ -27,6 +27,7 @@ import {
   type DurableBackend,
   type WorkerEvent
 } from "@durust/core";
+import { HotWorkflowExecutionDisposedError } from "../src/runtime.js";
 
 interface EchoInput {
   readonly value: string;
@@ -1865,6 +1866,411 @@ describe("Worker", () => {
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
+  it("disposes a parked hot workflow execution after a commit conflict", async () => {
+    let nowMs = 0;
+    const inner = new MemoryBackend({ nowMs: () => nowMs });
+    let conflictsRemaining = 1;
+    const backend = conflictActivitySchedulingOnce(inner, () => conflictsRemaining-- > 0);
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const conflictWorkflow = workflow({
+        name: "worker.hot-dispose-conflict",
+        version: 1,
+        handler: disposalTracingHandler(trace)
+      });
+      const registry = new Registry()
+        .registerWorkflow(conflictWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: "worker-a",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        leaseDurationMs: 1,
+        payloadCodec: "Json"
+      });
+      const handle = await client.startWorkflow(
+        conflictWorkflow,
+        workflowId("wf/worker-hot-dispose-conflict"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Conflict" }
+      });
+      await flushUnhandledRejectionTurn();
+      // The conflicted execution was parked on its activity waiter. Without
+      // disposal that frame stays pending for the life of the process.
+      expect(trace).toEqual(["start:sku-1", "waiter:workflow task commit conflicted"]);
+      expect(unhandledRejections).toEqual([]);
+
+      nowMs = 2;
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+        kind: "Completed",
+        outcome: { kind: "Completed" }
+      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+
+      expect(trace).toEqual([
+        "start:sku-1",
+        "waiter:workflow task commit conflicted",
+        "start:sku-1",
+        "after:5"
+      ]);
+      expect(unhandledRejections).toEqual([]);
+      await expect(handle.result()).resolves.toEqual({ cents: 5 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("disposes a parked hot workflow execution after a failed workflow task", async () => {
+    const inner = new MemoryBackend();
+    let failuresRemaining = 1;
+    const backend = failActivitySchedulingCommitOnce(inner, () => failuresRemaining-- > 0);
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const failingWorkflow = workflow({
+        name: "worker.hot-dispose-task-failure",
+        version: 1,
+        handler: disposalTracingHandler(trace)
+      });
+      const registry = new Registry()
+        .registerWorkflow(failingWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: "worker-a",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      const handle = await client.startWorkflow(
+        failingWorkflow,
+        workflowId("wf/worker-hot-dispose-task-failure"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("commit transport failed");
+      await flushUnhandledRejectionTurn();
+      expect(trace).toEqual(["start:sku-1", "waiter:workflow task failed before commit"]);
+      expect(unhandledRejections).toEqual([]);
+
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+        kind: "Completed",
+        outcome: { kind: "Completed" }
+      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+
+      expect(trace).toEqual([
+        "start:sku-1",
+        "waiter:workflow task failed before commit",
+        "start:sku-1",
+        "after:5"
+      ]);
+      expect(unhandledRejections).toEqual([]);
+      await expect(handle.result()).resolves.toEqual({ cents: 5 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("disposes a parked hot workflow execution evicted from a full execution cache", async () => {
+    const backend = new MemoryBackend();
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const evictedWorkflow = workflow({
+        name: "worker.hot-dispose-eviction",
+        version: 1,
+        handler: disposalTracingHandler(trace)
+      });
+      const registry = new Registry()
+        .registerWorkflow(evictedWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: "worker-a",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        workflowExecutionCacheSize: 1,
+        payloadCodec: "Json"
+      });
+      const first = await client.startWorkflow(
+        evictedWorkflow,
+        workflowId("wf/worker-hot-dispose-evicted-1"),
+        "workflows",
+        { sku: "one" }
+      );
+      await client.startWorkflow(
+        evictedWorkflow,
+        workflowId("wf/worker-hot-dispose-evicted-2"),
+        "workflows",
+        { sku: "two" }
+      );
+
+      // Driven by filling the cache to its bound: the second run's commit
+      // stores an entry over the size-1 limit and evicts the first run.
+      await worker.runWorkflowTaskOnce();
+      await worker.runWorkflowTaskOnce();
+      await flushUnhandledRejectionTurn();
+      expect(trace).toEqual([
+        "start:one",
+        "start:two",
+        "waiter:workflow execution cache eviction"
+      ]);
+      expect(worker.metrics()).toMatchObject({ workflowExecutionCacheEvictions: 1 });
+      expect(unhandledRejections).toEqual([]);
+
+      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+        kind: "Completed",
+        outcome: { kind: "Completed" }
+      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+
+      expect(trace).toEqual([
+        "start:one",
+        "start:two",
+        "waiter:workflow execution cache eviction",
+        "start:one",
+        "after:3"
+      ]);
+      expect(unhandledRejections).toEqual([]);
+      await expect(first.result()).resolves.toEqual({ cents: 3 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("disposes a parked hot workflow execution when the execution cache is disabled", async () => {
+    const backend = new MemoryBackend();
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const uncachedWorkflow = workflow({
+        name: "worker.hot-dispose-cache-disabled",
+        version: 1,
+        handler: disposalTracingHandler(trace)
+      });
+      const registry = new Registry()
+        .registerWorkflow(uncachedWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = new Worker({
+        backend,
+        registry,
+        namespace: namespace(),
+        workerId: "worker-a",
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        // The configuration where this fires on every committed task.
+        workflowExecutionCacheSize: 0,
+        payloadCodec: "Json"
+      });
+      const handle = await client.startWorkflow(
+        uncachedWorkflow,
+        workflowId("wf/worker-hot-dispose-cache-disabled"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+      // The task committed, but the frame it left parked on the activity waiter
+      // is never reused, so it is abandoned the moment the commit lands.
+      expect(trace).toEqual(["start:sku-1", "waiter:workflow execution cache disabled"]);
+      expect(unhandledRejections).toEqual([]);
+
+      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+        kind: "Completed",
+        outcome: { kind: "Completed" }
+      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+
+      expect(trace).toEqual([
+        "start:sku-1",
+        "waiter:workflow execution cache disabled",
+        "start:sku-1",
+        "after:5"
+      ]);
+      expect(worker.metrics()).toMatchObject({
+        workflowExecutionCacheHits: 0,
+        workflowExecutionCacheMisses: 2
+      });
+      expect(unhandledRejections).toEqual([]);
+      await expect(handle.result()).resolves.toEqual({ cents: 5 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("disposes a hot workflow execution superseded by a cold replay", async () => {
+    const backend = new MemoryBackend();
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      // Two sequential activities, so a second worker can advance the run past
+      // the point the first worker's cached frame is parked at.
+      const supersededWorkflow = workflow({
+        name: "worker.hot-dispose-superseded",
+        version: 1,
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          trace.push(`start:${input.sku}`);
+          let first: { readonly cents: number };
+          try {
+            first = await callActivity(
+              quoteActivity,
+              { sku: input.sku },
+              { taskQueue: "activities" }
+            );
+          } catch (error) {
+            trace.push(
+              error instanceof HotWorkflowExecutionDisposedError
+                ? `waiter:${error.reason}`
+                : `waiter:unexpected:${String(error)}`
+            );
+            throw error;
+          }
+          trace.push(`first:${first.cents}`);
+          const second = await callActivity(
+            quoteActivity,
+            { sku: `${input.sku}-2` },
+            { taskQueue: "activities" }
+          );
+          trace.push(`second:${second.cents}`);
+          return { cents: first.cents + second.cents };
+        }
+      });
+      const registry = new Registry()
+        .registerWorkflow(supersededWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+      const workerOptions = {
+        backend,
+        registry,
+        namespace: namespace(),
+        workflowTaskQueue: "workflows",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      } as const;
+      const cachingWorker = new Worker({ ...workerOptions, workerId: "worker-caching" });
+      const competingWorker = new Worker({ ...workerOptions, workerId: "worker-competing" });
+      const handle = await client.startWorkflow(
+        supersededWorkflow,
+        workflowId("wf/worker-hot-dispose-superseded"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      // The caching worker schedules the first activity and keeps the frame.
+      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await cachingWorker.runActivityTaskOnce();
+
+      // A different worker takes the wake task and appends command events the
+      // cached frame never saw, so it can no longer be woken hot.
+      await expect(competingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await competingWorker.runActivityTaskOnce();
+      await flushUnhandledRejectionTurn();
+      expect(unhandledRejections).toEqual([]);
+
+      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
+        kind: "Committed",
+        outcome: { kind: "Committed" }
+      });
+      await flushUnhandledRejectionTurn();
+
+      expect(trace).toEqual([
+        // caching worker, task 1
+        "start:sku-1",
+        // competing worker replays cold and schedules the second activity
+        "start:sku-1",
+        "first:5",
+        // caching worker finds its entry superseded, disposes it, replays cold.
+        // The replacement frame starts synchronously inside the constructor,
+        // so it runs before the disposed frame's rejection microtask.
+        "start:sku-1",
+        "waiter:superseded by cold replay",
+        "first:5",
+        "second:7"
+      ]);
+      expect(cachingWorker.metrics()).toMatchObject({
+        workflowExecutionCacheHits: 0,
+        workflowExecutionCacheMisses: 2
+      });
+      expect(unhandledRejections).toEqual([]);
+      await expect(handle.result()).resolves.toEqual({ cents: 12 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
   it("does not run local activity preference after aborting during a workflow task", async () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
@@ -3040,6 +3446,76 @@ function conflictWorkflowCompletionOnce(
             .some((event) => event.data.kind === "WorkflowCompleted");
           if (completing && shouldConflict()) {
             return { kind: "Conflict" };
+          }
+          return await target.commitWorkflowTask(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+// A workflow that parks on an activity and records whichever disposal reason
+// the runtime raises into that waiter, so a test pins the exact call site that
+// abandoned it. Re-running the run from history takes the normal path.
+function disposalTracingHandler(
+  trace: string[]
+): (input: { readonly sku: string }) => Promise<{ readonly cents: number }> {
+  return async (input) => {
+    trace.push(`start:${input.sku}`);
+    let quote: { readonly cents: number };
+    try {
+      quote = await callActivity(quoteActivity, { sku: input.sku }, { taskQueue: "activities" });
+    } catch (error) {
+      trace.push(
+        error instanceof HotWorkflowExecutionDisposedError
+          ? `waiter:${error.reason}`
+          : `waiter:unexpected:${String(error)}`
+      );
+      throw error;
+    }
+    trace.push(`after:${quote.cents}`);
+    return { cents: quote.cents };
+  };
+}
+
+// Conflicts the commit that schedules an activity, so the abandoned execution
+// is parked on a durable-API waiter rather than already terminal.
+function conflictActivitySchedulingOnce(
+  inner: DurableBackend,
+  shouldConflict: () => boolean
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "commitWorkflowTask") {
+        return async (...args: Parameters<DurableBackend["commitWorkflowTask"]>) => {
+          const scheduling = (args[1].scheduleActivities ?? []).length > 0;
+          if (scheduling && shouldConflict()) {
+            return { kind: "Conflict" };
+          }
+          return await target.commitWorkflowTask(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
+
+// Throws out of the commit call itself, which is the post-prepare failure path:
+// the execution is prepared and parked, and its task dies before any commit.
+function failActivitySchedulingCommitOnce(
+  inner: DurableBackend,
+  shouldFail: () => boolean
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "commitWorkflowTask") {
+        return async (...args: Parameters<DurableBackend["commitWorkflowTask"]>) => {
+          const scheduling = (args[1].scheduleActivities ?? []).length > 0;
+          if (scheduling && shouldFail()) {
+            throw new Error("commit transport failed");
           }
           return await target.commitWorkflowTask(...args);
         };

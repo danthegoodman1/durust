@@ -103,6 +103,9 @@ type HotSuspendResolution<T> =
 
 interface HotWaiter {
   readonly key: string;
+  // The deferred's own promise, kept so disposal can attach a handler before
+  // rejecting it. See `disposeHot`.
+  readonly promise: Promise<unknown>;
   tryResolve(): boolean;
   reject(error: unknown): void;
 }
@@ -228,12 +231,29 @@ export function continueAsNew<Input extends object>(input: DurableInput<Input>):
   return currentWorkflowRuntimeContext().continueAsNew(input);
 }
 
+// Raised into every promise a disposed hot execution still owns: the parked
+// durable-API waiters, and any later `nextCommit`/`advance`/`markCommitted`
+// call. Its own class rather than a message convention, because the worker must
+// be able to tell an abandoned execution apart from a workflow that genuinely
+// failed: a disposal is never a `WorkflowFailed`, it means the task was dropped
+// and the next claim replays the run from history.
+export class HotWorkflowExecutionDisposedError extends Error {
+  readonly reason: string;
+
+  constructor(reason: string) {
+    super(`durust: hot workflow execution disposed (${reason})`);
+    this.name = "HotWorkflowExecutionDisposedError";
+    this.reason = reason;
+  }
+}
+
 export class HotWorkflowExecution {
   readonly #context: WorkflowRuntimeContext;
   #observedProgressVersion: number;
   #fatalError: unknown = null;
   #terminalCommitPending = false;
   #closed = false;
+  #disposalError: HotWorkflowExecutionDisposedError | null = null;
 
   constructor(
     workflowDefinition: WorkflowDefinition<any, any, any, string>,
@@ -251,10 +271,33 @@ export class HotWorkflowExecution {
     this.#observedProgressVersion = this.#context.hotProgressVersion();
     void runtimeStorage.run(this.#context, () => workflowDefinition.handler(input))
       .then((output: unknown) => {
+        // These two early returns keep an abandoned execution's own state
+        // coherent. They are deliberately *not* what stops a disposed run from
+        // committing — `#assertLive()` and `toCommit()` refuse independently,
+        // and removing both of these leaves the suite green, so do not read
+        // them as the no-commit guard and do not delete them on finding that
+        // out.
+        //
+        // What they prevent: a workflow that swallows the disposal and returns
+        // would otherwise leave `#terminalCommitPending === true` and a
+        // terminal event appended on a dead context, and
+        // `completeWorkflow`'s `#assertTerminalReplayConsumed` can throw from
+        // inside this `.then` — a rejection that lands in the `.catch` below,
+        // which would then append a *second* terminal event to the same dead
+        // context. An abandoned execution records nothing at all.
+        if (this.#disposalError !== null) {
+          return;
+        }
         this.#context.completeWorkflow(output, workflowDefinition);
         this.#terminalCommitPending = true;
       })
       .catch((error: unknown) => {
+        // Same rule on the failing side, and this is the arm that actually
+        // runs: the rejection landing here is usually the disposal error
+        // itself, raised into whichever durable API the workflow was parked on.
+        if (this.#disposalError !== null) {
+          return;
+        }
         if (error instanceof ContinueAsNewRequested) {
           this.#terminalCommitPending = true;
           return;
@@ -283,11 +326,36 @@ export class HotWorkflowExecution {
     return this.#closed;
   }
 
-  async nextCommit(): Promise<WorkflowTaskCommit> {
-    if (this.#closed) {
-      throw new Error("hot workflow execution is closed");
+  /**
+   * Abandons this execution.
+   *
+   * The owner calls this whenever it drops its reference without committing —
+   * commit conflict, a failed task, cache eviction. Rust drops the boxed future
+   * and the whole tree of parked awaits dies with it; here the workflow's
+   * promise chain would otherwise stay pending forever with its durable-API
+   * waiters unsettled, so disposal raises {@link
+   * HotWorkflowExecutionDisposedError} into each parked waiter, which unwinds
+   * the handler and settles the chain.
+   *
+   * Idempotent: the same run can be evicted and then conflict. Terminal: a
+   * disposed execution can never produce another commit, and everything its
+   * abandoned frames do afterwards is inert.
+   */
+  dispose(reason: string): void {
+    if (this.#disposalError !== null) {
+      return;
     }
+    this.#disposalError = new HotWorkflowExecutionDisposedError(reason);
+    this.#context.disposeHot(this.#disposalError);
+  }
+
+  async nextCommit(): Promise<WorkflowTaskCommit> {
+    this.#assertLive();
     await this.#context.waitForHotProgressAfter(this.#observedProgressVersion);
+    // Re-checked after the await: disposal can land while this call is parked,
+    // and the commit it would otherwise return describes a run the owner has
+    // already abandoned.
+    this.#assertLive();
     this.#observedProgressVersion = this.#context.hotProgressVersion();
     if (this.#fatalError !== null) {
       throw this.#fatalError;
@@ -299,20 +367,25 @@ export class HotWorkflowExecution {
     claimed: ClaimedWorkflowTask,
     options: HotWorkflowTaskOptions = {}
   ): Promise<WorkflowTaskCommit> {
-    if (this.#closed) {
-      throw new Error("hot workflow execution is closed");
-    }
+    this.#assertLive();
     this.#context.advanceHotClaim(claimed, options);
     return this.nextCommit();
   }
 
   markCommitted(newTailEventId: EventId): void {
-    if (this.#closed) {
-      throw new Error("hot workflow execution is closed");
-    }
+    this.#assertLive();
     this.#context.markHotCommitAccepted(newTailEventId);
     if (this.#terminalCommitPending) {
       this.#closed = true;
+    }
+  }
+
+  #assertLive(): void {
+    if (this.#disposalError !== null) {
+      throw this.#disposalError;
+    }
+    if (this.#closed) {
+      throw new Error("hot workflow execution is closed");
     }
   }
 }
@@ -900,6 +973,25 @@ class WorkflowRuntimeContext {
   readonly #scheduleChildWorkflowMaps: ChildWorkflowMapTask[] = [];
   #queryProjection: PayloadRef | null = null;
   #allowNondeterministicGlobalsDepth = 0;
+  // Key of the `sideEffect` callback currently executing on this context, or
+  // null when no callback is running. Durable APIs are rejected while it is
+  // set: `resolveSideEffect` allocates its command seq before running the
+  // callback and appends its `SideEffectMarker` after, so a durable call made
+  // from inside the callback would append its own marker first and record an
+  // out-of-order pair that can never replay.
+  //
+  // Deliberately separate from `#allowNondeterministicGlobalsDepth`. That
+  // counter relaxes the nondeterministic-globals guard; this one tightens the
+  // durable-API guard. They are entered from the same place today, but they are
+  // independent invariants and a future site that wants one must not silently
+  // get the other.
+  #activeSideEffectKey: string | null = null;
+  // Set once the owning `HotWorkflowExecution` is disposed. Frames of an
+  // abandoned workflow can still be scheduled after that point — a detached
+  // continuation left behind by an async `sideEffect` callback is the known
+  // case — so command allocation and commit production both refuse once it is
+  // set, making those frames inert rather than merely unobserved.
+  #disposalError: HotWorkflowExecutionDisposedError | null = null;
   readonly #hotWaiters = new Map<string, HotWaiter>();
   #hotProgressVersion = 0;
   #hotProgressWaiters: Deferred<void>[] = [];
@@ -1026,6 +1118,7 @@ class WorkflowRuntimeContext {
     const deferred = createDeferred<T>();
     const waiter: HotWaiter = {
       key,
+      promise: deferred.promise,
       tryResolve: () => {
         const resolution = resolve();
         if (resolution.kind === "Pending") {
@@ -1076,6 +1169,34 @@ class WorkflowRuntimeContext {
     this.#queryProjection = null;
   }
 
+  // Abandons this context. Called once from `HotWorkflowExecution.dispose()`.
+  //
+  // Rejecting the parked waiters is what settles the workflow's promise chain,
+  // and `#disposalError` is what keeps the frames that resume from that
+  // rejection from mutating a context nobody will commit.
+  disposeHot(error: HotWorkflowExecutionDisposedError): void {
+    if (this.#disposalError !== null) {
+      return;
+    }
+    this.#disposalError = error;
+    const waiters = [...this.#hotWaiters.values()];
+    this.#hotWaiters.clear();
+    for (const waiter of waiters) {
+      // Adopt and discard before rejecting. Every current `hotSuspend*` caller
+      // attaches `.then(onfulfilled, onrejected)` to this promise in the same
+      // expression, so today it is always handled; that is a call-site
+      // invariant, not a property of this code, and one future site returning
+      // the promise raw would put an unowned rejection in front of Node's
+      // default `--unhandled-rejections=throw` and kill the worker. Dropping a
+      // workflow task must never fail the host.
+      waiter.promise.catch(() => undefined);
+      waiter.reject(error);
+    }
+    // Wakes a `nextCommit()` parked on progress. It re-checks disposal after
+    // the await and throws instead of returning a commit.
+    this.notifyHotProgress();
+  }
+
   #tryResolveHotWaiters(): void {
     for (const waiter of [...this.#hotWaiters.values()]) {
       try {
@@ -1090,11 +1211,45 @@ class WorkflowRuntimeContext {
     return this.#allowNondeterministicGlobalsDepth > 0;
   }
 
+  // The single gate every durable API passes through: the 13 named entry
+  // points assert here, and `#nextCommandId` asserts here as the backstop for
+  // any command-producing path that lacks a named one. It therefore carries
+  // both refusals a dead context needs.
+  //
+  // Disposal comes first. Once the owning execution is abandoned, a frame that
+  // is still scheduled — the detached continuation an async `sideEffect`
+  // callback leaves behind is the known case — must not append an event,
+  // allocate a command seq, set a query projection, or park on a fresh waiter
+  // in a context nobody will ever commit. Refusing at the gate makes all of
+  // that inert rather than merely unobserved.
+  //
+  // Then: rejects a durable API called from inside a `sideEffect` callback. The
+  // message is prefixed `nondeterminism:` so the existing classifiers treat it
+  // as a fatal workflow-task error: the task fails and is retried with the
+  // nondeterminism backoff instead of the workflow failing or the task
+  // spinning. `api` names the call the workflow author made and `detail` is its
+  // identifying argument; they are formatted only on the throwing path so a
+  // durable call on the hot path costs one null compare and no allocation.
+  #assertDurableApiOutsideSideEffect(api: string, detail?: string): void {
+    if (this.#disposalError !== null) {
+      throw this.#disposalError;
+    }
+    const key = this.#activeSideEffectKey;
+    if (key !== null) {
+      throw new Error(
+        `nondeterminism: durable APIs cannot be called from inside a sideEffect callback; ` +
+          `side effect "${key}" called ${detail === undefined ? api : `${api}(${detail})`}. ` +
+          `Compute durable values outside the callback and pass them in.`
+      );
+    }
+  }
+
   resolveSignal<Payload extends object>(
     name: string,
     payloadSchema?: SchemaAdapter<Payload>
   ): SignalResolution<Payload> {
-    const id = commandId(this.#claimed.runId, this.#nextCommandSeq++);
+    this.#assertDurableApiOutsideSideEffect("signal", name);
+    const id = this.#nextCommandId();
     const fingerprint = signalFingerprint(name);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent?.data.kind === "SignalConsumed") {
@@ -1151,6 +1306,7 @@ class WorkflowRuntimeContext {
   }
 
   resolveTimer(spec: RuntimeTimerSpec): TimerResolution {
+    this.#assertDurableApiOutsideSideEffect("sleep()");
     const started = this.#timerStartedEvent(spec);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1195,6 +1351,7 @@ class WorkflowRuntimeContext {
     input: ActivityInput<A>,
     options: ActivityCallOptions
   ): ActivityResolution<ActivityOutput<A>> {
+    this.#assertDurableApiOutsideSideEffect("callActivity", activityDefinition.name);
     const scheduled = this.#activityScheduledEvent(activityDefinition, input, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1251,6 +1408,7 @@ class WorkflowRuntimeContext {
     activityDefinition: A,
     id: CommandId
   ): ActivityResolution<ActivityOutput<A>> {
+    this.#assertDurableApiOutsideSideEffect("activityHandle.result", activityDefinition.name);
     const terminal = this.#activityCompletions.get(commandKey(id));
     if (terminal?.data.kind === "ActivityCompleted") {
       return {
@@ -1447,6 +1605,7 @@ class WorkflowRuntimeContext {
     activityDefinition: A,
     options: ActivityMapOptions<ActivityInput<A>>
   ): ActivityMapResolution<ActivityOutput<A>> {
+    this.#assertDurableApiOutsideSideEffect("activityMap", activityDefinition.name);
     const scheduled = this.#activityMapScheduledEvent(activityDefinition, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1499,6 +1658,7 @@ class WorkflowRuntimeContext {
     workflowDefinition: W,
     options: ChildWorkflowMapOptions<WorkflowInput<W>>
   ): ChildWorkflowMapResolution<WorkflowOutput<W>> {
+    this.#assertDurableApiOutsideSideEffect("childWorkflowMap", workflowDefinition.workflowType.name);
     const scheduled = this.#childWorkflowMapScheduledEvent(workflowDefinition, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1552,6 +1712,7 @@ class WorkflowRuntimeContext {
     input: WorkflowInput<W>,
     options: ChildWorkflowOptions
   ): ChildWorkflowStartResolution {
+    this.#assertDurableApiOutsideSideEffect("childWorkflow", workflowDefinition.workflowType.name);
     const requested = this.#childWorkflowStartRequested(workflowDefinition, input, options);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1604,6 +1765,10 @@ class WorkflowRuntimeContext {
     workflowDefinition: W,
     id: CommandId
   ): ChildWorkflowResultResolution<WorkflowOutput<W>> {
+    this.#assertDurableApiOutsideSideEffect(
+      "childWorkflowHandle.result",
+      workflowDefinition.workflowType.name
+    );
     const completed = this.#childCompletions.get(commandKey(id));
     if (completed?.data.kind === "ChildWorkflowCompleted") {
       return {
@@ -1631,6 +1796,7 @@ class WorkflowRuntimeContext {
   }
 
   getVersion(changeId: string, minSupported: number, maxSupported: number): number {
+    this.#assertDurableApiOutsideSideEffect("getVersion", changeId);
     validateVersionRange(changeId, minSupported, maxSupported);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
@@ -1679,6 +1845,7 @@ class WorkflowRuntimeContext {
   }
 
   deprecatePatch(patchId: string): void {
+    this.#assertDurableApiOutsideSideEffect("deprecatePatch", patchId);
     const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind === "VersionMarker") {
@@ -1728,6 +1895,7 @@ class WorkflowRuntimeContext {
   }
 
   resolveSideEffect<T>(key: string, effect: () => T): T {
+    this.#assertDurableApiOutsideSideEffect("sideEffect", key);
     if (key.length === 0) {
       throw new Error("side effect key must not be empty");
     }
@@ -1755,11 +1923,34 @@ class WorkflowRuntimeContext {
 
     const id = this.#nextCommandId();
     let value: T;
+    // The entry assert above proves no side effect is active here, so clearing
+    // to null in the finally restores the exact prior state.
+    this.#activeSideEffectKey = key;
     this.#allowNondeterministicGlobalsDepth += 1;
     try {
       value = effect();
     } finally {
+      // Cleared on the throwing path as well: a callback error is reported to
+      // the workflow, which may catch it and keep using durable APIs.
       this.#allowNondeterministicGlobalsDepth -= 1;
+      this.#activeSideEffectKey = null;
+    }
+    if (isThenable(value)) {
+      // The marker records `value` synchronously, so an async callback would
+      // record the promise itself and replay would return that instead of the
+      // resolved value. Rejecting also keeps the re-entrancy guard exact: the
+      // guard covers the callback's whole lifetime only when the callback
+      // cannot continue past an await after `effect()` returns.
+      //
+      // Adopt and discard the promise first. Nothing else will ever attach a
+      // handler to it, so a rejecting callback would otherwise reach
+      // `unhandledRejection` and kill the worker process under Node's default
+      // `--unhandled-rejections=throw`. Failing the task must not fail the host.
+      void Promise.resolve(value).catch(() => undefined);
+      throw new Error(
+        `nondeterminism: sideEffect callback must be synchronous; side effect "${key}" ` +
+          `returned a promise. Record a plain value and use an activity for asynchronous work.`
+      );
     }
     const payload = encodePayload(value, { codec: this.#payloadCodec });
     this.#appendEvents.push({
@@ -1853,6 +2044,7 @@ class WorkflowRuntimeContext {
   }
 
   publish<QueryState extends object>(view: QueryState): void {
+    this.#assertDurableApiOutsideSideEffect("publish()");
     assertDurableInputValue(view, "query projection");
     this.#queryProjection = encodePayload(view, {
       codec: this.#payloadCodec,
@@ -1863,6 +2055,7 @@ class WorkflowRuntimeContext {
   }
 
   continueAsNew<Input extends object>(input: Input): never {
+    this.#assertDurableApiOutsideSideEffect("continueAsNew()");
     this.#assertTerminalReplayConsumed("WorkflowContinuedAsNew");
     assertDurableInputValue(input, "continueAsNew input");
     const payload = encodePayload(input, {
@@ -1882,6 +2075,12 @@ class WorkflowRuntimeContext {
   }
 
   toCommit(): WorkflowTaskCommit {
+    // Last line of the no-commit-after-disposal invariant. `nextCommit()`
+    // already refuses, but this is the only function that can produce a commit
+    // at all, so the invariant is enforced where it is defined.
+    if (this.#disposalError !== null) {
+      throw this.#disposalError;
+    }
     return {
       expectedTailEventId: this.#claimed.replayTargetEventId,
       appendEvents: [...this.#appendEvents],
@@ -2064,6 +2263,12 @@ class WorkflowRuntimeContext {
   }
 
   #nextCommandId(): CommandId {
+    // Backstop for the durable-API re-entrancy contract. Every durable API a
+    // workflow can reach asserts with a named message before it gets here, so
+    // this should be unreachable; it guards the invariant at the one place that
+    // defines command order, so a future command-producing path cannot record
+    // an out-of-order marker by forgetting the named assert.
+    this.#assertDurableApiOutsideSideEffect("a durable command");
     return commandId(this.#claimed.runId, this.#nextCommandSeq++);
   }
 
@@ -3067,6 +3272,14 @@ function validateMarkerCommand(changeId: string, expected: CommandId, recorded: 
       `nondeterminism: version marker ${changeId} command sequence changed: expected ${expected.seq}, found ${recorded.seq}`
     );
   }
+}
+
+function isThenable(value: unknown): boolean {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    typeof (value as { readonly then?: unknown }).then === "function"
+  );
 }
 
 function isWorkflowTaskFatalError(error: unknown): boolean {

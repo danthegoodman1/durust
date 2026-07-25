@@ -38,11 +38,14 @@ import {
   workflow,
   workflowId,
   workflowType,
+  type ActivityHandle,
+  type ChildWorkflowHandle,
   type ClaimedWorkflowTask,
   type RunId,
-  type SchemaAdapter
+  type SchemaAdapter,
+  type WorkflowTaskCommit
 } from "@durust/core";
-import { HotWorkflowExecution } from "../src/runtime.js";
+import { HotWorkflowExecution, HotWorkflowExecutionDisposedError } from "../src/runtime.js";
 import { prepareWorkflowTaskCommit } from "@durust/testing";
 
 interface QuoteInput {
@@ -117,6 +120,18 @@ function committedTail(outcome: { readonly kind: string; readonly newTailEventId
     throw new Error(`expected committed outcome, got ${outcome.kind}`);
   }
   return eventId(outcome.newTailEventId);
+}
+
+// Renders an event as `Kind#seq` when it carries a marker command id, so an
+// out-of-order marker pair is visible in the assertion diff rather than hidden
+// behind matching event kinds. Accepts both appended and recorded events.
+function commandTrace(event: { readonly data: { readonly kind: string } }): string {
+  const seq = (
+    event.data as {
+      readonly marker?: { readonly commandId?: { readonly seq?: number } };
+    }
+  ).marker?.commandId?.seq;
+  return seq === undefined ? event.data.kind : `${event.data.kind}#${seq}`;
 }
 
 describe("minimal workflow runtime", () => {
@@ -2714,6 +2729,538 @@ describe("minimal workflow runtime", () => {
     ).rejects.toThrow("side effect key must not be empty");
   });
 
+  it("fails the workflow task when a durable API is called inside a sideEffect callback", async () => {
+    const reentrantWorkflow = workflow({
+      name: "tests.side-effect-reentrant",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> =>
+        await sideEffect("make-id", () => `id-${getVersion("side-effect-reentrant", 1, 2)}`)
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/side-effect-reentrant"),
+      workflowType: reentrantWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [reentrantWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+
+    // Commit whatever the task produces. Without the guard the task succeeds and
+    // this records the poisoned pair, so a regression is exhibited as the
+    // out-of-order markers in history rather than only as a missing throw.
+    let commit: WorkflowTaskCommit | null = null;
+    let taskError: unknown = null;
+    try {
+      commit = await prepareWorkflowTaskCommit(reentrantWorkflow, {}, claim, {
+        payloadCodec: "Json"
+      });
+    } catch (error) {
+      taskError = error;
+    }
+    if (commit !== null) {
+      await backend.commitWorkflowTask(claim.claim, commit);
+    }
+
+    const history = await backend.streamHistory({
+      runId: claim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted"]);
+    expect(commit).toBeNull();
+    expect(String(taskError)).toContain(
+      "nondeterminism: durable APIs cannot be called from inside a sideEffect callback"
+    );
+    expect(String(taskError)).toContain(
+      'side effect "make-id" called getVersion(side-effect-reentrant)'
+    );
+    // The `nondeterminism:` prefix is what makes the worker fail and retry the
+    // task with its nondeterminism backoff instead of failing the workflow.
+    expect(taskError).toBeInstanceOf(Error);
+    expect((taskError as Error).message.startsWith("nondeterminism:")).toBe(true);
+  });
+
+  it("appends no command for a durable API rejected inside a sideEffect callback", async () => {
+    const caughtWorkflow = workflow({
+      name: "tests.side-effect-reentrant-caught",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => {
+        try {
+          await sideEffect("make-id", () => `id-${getVersion("caught-change", 1, 2)}`);
+          return "side effect unexpectedly succeeded";
+        } catch (error) {
+          return (error as Error).message;
+        }
+      }
+    });
+
+    const commit = await prepareWorkflowTaskCommit(caughtWorkflow, {}, fakeClaimed, {
+      payloadCodec: "Json"
+    });
+    // Neither the inner VersionMarker nor the outer SideEffectMarker reaches the
+    // commit: the rejected call appends nothing and the side effect never
+    // records a marker it could not replay.
+    expect(commit.appendEvents?.map(commandTrace)).toEqual(["WorkflowCompleted"]);
+    const completed = commit.appendEvents?.[0]?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(String(decodePayload(completed.result))).toContain(
+      "durable APIs cannot be called from inside a sideEffect callback"
+    );
+  });
+
+  it("rejects each durable API called from inside a sideEffect callback", async () => {
+    // A child workflow handle only exists once its start is recorded, so the
+    // child-result case replays a history that already contains one.
+    const childStarter = workflow({
+      name: "tests.side-effect-reentrant-child-starter",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> => {
+        const child = await childWorkflow(
+          childEchoWorkflow,
+          { value: "v" },
+          { workflowId: "wf/reentrant-child-result", taskQueue: "workflows" }
+        ).spawn();
+        return String(child.runId);
+      }
+    });
+    const startCommit = await prepareWorkflowTaskCommit(childStarter, {}, fakeClaimed, {
+      payloadCodec: "Json"
+    });
+    const startRequested = startCommit.appendEvents?.[0]?.data;
+    if (startRequested?.kind !== "ChildWorkflowStartRequested") {
+      throw new Error("expected ChildWorkflowStartRequested");
+    }
+    const childStartedClaim: ClaimedWorkflowTask = {
+      ...fakeClaimed,
+      replayTargetEventId: eventId(3),
+      prefetchedHistory: [
+        ...fakeClaimed.prefetchedHistory,
+        {
+          eventId: eventId(2),
+          eventType: "ChildWorkflowStartRequested",
+          data: startRequested
+        },
+        {
+          eventId: eventId(3),
+          eventType: "ChildWorkflowStarted",
+          data: {
+            kind: "ChildWorkflowStarted",
+            started: {
+              commandId: startRequested.requested.commandId,
+              workflowId: startRequested.requested.workflowId,
+              runId: runId("run-child-1")
+            }
+          }
+        }
+      ]
+    };
+
+    let spawnedActivity: ActivityHandle<QuoteOutput> | null = null;
+    let spawnedChild: ChildWorkflowHandle<{ readonly value: string }> | null = null;
+
+    const cases: readonly {
+      readonly label: string;
+      readonly api: string;
+      readonly call: () => void;
+      // Runs inside the workflow before the side effect, for APIs that need a
+      // handle the callback can reach.
+      readonly setup?: () => Promise<void>;
+      readonly claimed?: ClaimedWorkflowTask;
+      // Commit produced when the workflow catches the rejection; defaults to a
+      // bare completion because a rejected durable call appends nothing.
+      readonly caughtCommit?: readonly string[];
+    }[] = [
+      {
+        label: "get-version",
+        api: "getVersion(reentrant)",
+        call: () => {
+          getVersion("reentrant", 1, 2);
+        }
+      },
+      {
+        label: "patched",
+        api: "getVersion(reentrant)",
+        call: () => {
+          patched("reentrant");
+        }
+      },
+      {
+        label: "deprecate-patch",
+        api: "deprecatePatch(reentrant)",
+        call: () => {
+          deprecatePatch("reentrant");
+        }
+      },
+      {
+        label: "publish",
+        api: "publish()",
+        call: () => {
+          publish({ done: true });
+        }
+      },
+      {
+        label: "continue-as-new",
+        api: "continueAsNew()",
+        call: () => {
+          continueAsNew({});
+        }
+      },
+      {
+        label: "side-effect",
+        api: "sideEffect(inner)",
+        call: () => {
+          void sideEffect("inner", () => 1).then(() => undefined);
+        }
+      },
+      {
+        label: "call-activity",
+        api: "callActivity(payments.price-quote)",
+        call: () => {
+          void callActivity(priceQuote, { sku: "sku-1" }, { taskQueue: "payments" }).then(
+            () => undefined
+          );
+        }
+      },
+      {
+        label: "sleep",
+        api: "sleep()",
+        call: () => {
+          void sleep(1).then(() => undefined);
+        }
+      },
+      {
+        label: "signal",
+        api: "signal(approval)",
+        call: () => {
+          void signal<ApprovalSignal>("approval").then(() => undefined);
+        }
+      },
+      {
+        label: "child-workflow",
+        api: "childWorkflow(orders.runtime-child-echo)",
+        call: () => {
+          void childWorkflow(
+            childEchoWorkflow,
+            { value: "v" },
+            { workflowId: "wf/reentrant-child", taskQueue: "workflows" }
+          )
+            .spawn()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "activity-map",
+        api: "activityMap(payments.price-quote)",
+        call: () => {
+          void activityMap(priceQuote, {
+            inputManifest: activityMapManifest([{ sku: "a" }], 1),
+            resultManifest: "quotes",
+            taskQueue: "payments",
+            maxInFlight: 1
+          })
+            .resultManifest()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "child-workflow-map",
+        api: "childWorkflowMap(orders.runtime-child-echo)",
+        call: () => {
+          void childWorkflowMap(childEchoWorkflow, {
+            inputManifest: activityMapManifest([{ value: "a" }], 1),
+            resultManifest: "echoes",
+            workflowIdPrefix: "wf/reentrant-child-map",
+            taskQueue: "workflows",
+            maxInFlight: 1
+          })
+            .resultManifest()
+            .then(() => undefined);
+        }
+      },
+      {
+        label: "activity-handle-result",
+        api: "activityHandle.result(payments.price-quote)",
+        setup: async (): Promise<void> => {
+          spawnedActivity = await callActivity(
+            priceQuote,
+            { sku: "sku-1" },
+            { taskQueue: "payments" }
+          ).spawn();
+        },
+        call: () => {
+          const handle = spawnedActivity;
+          if (handle === null) {
+            throw new Error("expected a spawned activity handle");
+          }
+          void handle.result().then(() => undefined);
+        },
+        caughtCommit: ["ActivityScheduled", "WorkflowCompleted"]
+      },
+      {
+        label: "child-workflow-result",
+        api: "childWorkflowHandle.result(orders.runtime-child-echo)",
+        claimed: childStartedClaim,
+        setup: async (): Promise<void> => {
+          spawnedChild = await childWorkflow(
+            childEchoWorkflow,
+            { value: "v" },
+            { workflowId: "wf/reentrant-child-result", taskQueue: "workflows" }
+          ).spawn();
+        },
+        call: () => {
+          const handle = spawnedChild;
+          if (handle === null) {
+            throw new Error("expected a spawned child workflow handle");
+          }
+          void handle.result().then(() => undefined);
+        }
+      }
+    ];
+
+    for (const testCase of cases) {
+      const claimed = testCase.claimed ?? fakeClaimed;
+      const reentrantWorkflow = workflow({
+        name: `tests.side-effect-reentrant-${testCase.label}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<number> => {
+          await testCase.setup?.();
+          return await sideEffect("guarded", () => {
+            testCase.call();
+            return 1;
+          });
+        }
+      });
+
+      await expect(
+        prepareWorkflowTaskCommit(reentrantWorkflow, {}, claimed, { payloadCodec: "Json" })
+      ).rejects.toThrow(
+        "nondeterminism: durable APIs cannot be called from inside a sideEffect callback; " +
+          `side effect "guarded" called ${testCase.api}.`
+      );
+
+      // The same rejection, caught by the workflow, must leave nothing
+      // half-appended: no command from the inner call and no side effect marker.
+      const caughtWorkflow = workflow({
+        name: `tests.side-effect-reentrant-caught-${testCase.label}`,
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<string> => {
+          await testCase.setup?.();
+          try {
+            await sideEffect("guarded", () => {
+              testCase.call();
+              return 1;
+            });
+            return "side effect unexpectedly succeeded";
+          } catch (error) {
+            return (error as Error).message;
+          }
+        }
+      });
+      const caughtCommit = await prepareWorkflowTaskCommit(caughtWorkflow, {}, claimed, {
+        payloadCodec: "Json"
+      });
+      expect(caughtCommit.appendEvents?.map(commandTrace)).toEqual(
+        testCase.caughtCommit ?? ["WorkflowCompleted"]
+      );
+    }
+  });
+
+  it("restores the durable API guard after a sideEffect callback throws", async () => {
+    const recoveringWorkflow = workflow({
+      name: "tests.side-effect-guard-restored",
+      version: 1,
+      handler: async (
+        _input: TestNoInput
+      ): Promise<{
+        readonly caught: readonly string[];
+        readonly version: number;
+        readonly recorded: string;
+      }> => {
+        const caught: string[] = [];
+        try {
+          await sideEffect("boom", (): string => {
+            throw new Error("callback failed");
+          });
+        } catch (error) {
+          caught.push((error as Error).name);
+        }
+        try {
+          await sideEffect("reentrant", () => getVersion("inner-change", 1, 2));
+        } catch (error) {
+          caught.push((error as Error).name);
+        }
+        // Latched on either throw path, both of these would fail instead.
+        const version = getVersion("outer-change", 1, 2);
+        const recorded = await sideEffect("after", () => "recorded");
+        return { caught, version, recorded };
+      }
+    });
+
+    const commit = await prepareWorkflowTaskCommit(recoveringWorkflow, {}, fakeClaimed, {
+      payloadCodec: "Json"
+    });
+    // Seqs 1 and 2 belong to the two failed side effects, which append nothing;
+    // the surviving markers keep allocation order.
+    expect(commit.appendEvents?.map(commandTrace)).toEqual([
+      "VersionMarker#3",
+      "SideEffectMarker#4",
+      "WorkflowCompleted"
+    ]);
+    const completed = commit.appendEvents?.at(-1)?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload(completed.result)).toEqual({
+      caught: ["Error", "Error"],
+      version: 2,
+      recorded: "recorded"
+    });
+  });
+
+  it("does not emit unhandled rejections when a sideEffect callback returns a rejecting promise", async () => {
+    const cases: readonly { readonly label: string; readonly effect: () => PromiseLike<string> }[] =
+      [
+        {
+          label: "throw-before-await",
+          effect: async (): Promise<string> => {
+            throw new Error("boom-sync");
+          }
+        },
+        {
+          label: "throw-after-await",
+          effect: async (): Promise<string> => {
+            await Promise.resolve();
+            throw new Error("boom-late");
+          }
+        },
+        {
+          label: "rejected-promise",
+          effect: (): PromiseLike<string> => Promise.reject(new Error("boom-plain"))
+        }
+      ];
+
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      for (const testCase of cases) {
+        const rejectingWorkflow = workflow({
+          name: `tests.side-effect-rejecting-${testCase.label}`,
+          version: 1,
+          handler: async (_input: TestNoInput): Promise<string> =>
+            await sideEffect("async-key", testCase.effect)
+        });
+
+        await expect(
+          prepareWorkflowTaskCommit(rejectingWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+        ).rejects.toThrow(
+          'nondeterminism: sideEffect callback must be synchronous; side effect "async-key" ' +
+            "returned a promise."
+        );
+        await flushUnhandledRejectionTurn();
+        // Nothing else ever attaches a handler to the callback's promise, so
+        // without adopting it the rejection reaches Node's default
+        // --unhandled-rejections=throw and kills the worker process.
+        expect(unhandledRejections).toEqual([]);
+      }
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("rejects a sideEffect callback that returns a promise", async () => {
+    const asyncWorkflow = workflow({
+      name: "tests.side-effect-async",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<string> =>
+        await sideEffect("async-key", () => Promise.resolve("async-value"))
+    });
+
+    await expect(
+      prepareWorkflowTaskCommit(asyncWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+    ).rejects.toThrow(
+      'nondeterminism: sideEffect callback must be synchronous; side effect "async-key" ' +
+        "returned a promise."
+    );
+  });
+
+  it("commits nothing when an async sideEffect callback calls a durable API after an await", async () => {
+    let durableCallsAfterAwait = 0;
+    const asyncWorkflow = workflow({
+      name: "tests.side-effect-async-reentrant",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> =>
+        await sideEffect("async-key", async () => {
+          await Promise.resolve();
+          durableCallsAfterAwait += 1;
+          return getVersion("after-await", 1, 2);
+        })
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/side-effect-async-reentrant"),
+      workflowType: asyncWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [asyncWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+
+    let commit: WorkflowTaskCommit | null = null;
+    let taskError: unknown = null;
+    try {
+      commit = await prepareWorkflowTaskCommit(asyncWorkflow, {}, claim, { payloadCodec: "Json" });
+    } catch (error) {
+      taskError = error;
+    }
+    if (commit !== null) {
+      await backend.commitWorkflowTask(claim.claim, commit);
+    }
+    await Promise.resolve();
+
+    // The continuation after the await runs detached from the task, so the
+    // re-entrancy guard cannot cover it: it has already been released by the
+    // time `getVersion` runs. Rejecting the promise return is what contains the
+    // damage — the task fails, so the VersionMarker that detached call appended
+    // to the abandoned context never reaches a commit.
+    expect(durableCallsAfterAwait).toBe(1);
+    expect(commit).toBeNull();
+    expect(String(taskError)).toContain(
+      'nondeterminism: sideEffect callback must be synchronous; side effect "async-key"'
+    );
+    const history = await backend.streamHistory({
+      runId: claim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted"]);
+  });
+
   it("rejects Date.now inside workflow code", async () => {
     const invalidWorkflow = workflow({
       name: "tests.nondeterministic-date-now",
@@ -3604,4 +4151,245 @@ describe("minimal workflow runtime", () => {
       })
     ).rejects.toThrow("nondeterminism: select winner branch changed");
   });
+
+  it("settles parked durable-API waiters when a hot execution is disposed", async () => {
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const { hot } = await startHotExecution("tests.dispose-parked-waiter", async (_input: TestNoInput) => {
+        trace.push("start");
+        try {
+          await callActivity(priceQuote, { sku: "sku-1" }, { taskQueue: "payments" });
+        } catch (error) {
+          trace.push(
+            error instanceof HotWorkflowExecutionDisposedError
+              ? `waiter:${error.reason}`
+              : `waiter:unexpected:${String(error)}`
+          );
+          throw error;
+        }
+        trace.push("resumed");
+        return "done";
+      });
+      const scheduleCommit = await hot.nextCommit();
+      expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+        "ActivityScheduled"
+      ]);
+      // The commit above proves the execution was live before disposal.
+      expect(trace).toEqual(["start"]);
+
+      hot.dispose("unit disposal");
+
+      await flushUnhandledRejectionTurn();
+      // The parked frame unwound instead of staying pending forever, and the
+      // rejection it received names the disposal rather than a workflow fault.
+      expect(trace).toEqual(["start", "waiter:unit disposal"]);
+      // Disposal is observed through the error it raises, not through a getter
+      // on the public surface that no production caller needs.
+      await expect(hot.nextCommit()).rejects.toThrow(HotWorkflowExecutionDisposedError);
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("disposes idempotently and never produces a commit afterwards", async () => {
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const { hot, claim } = await startHotExecution("tests.dispose-no-commit", async (_input: TestNoInput) => {
+        trace.push("start");
+        try {
+          await callActivity(priceQuote, { sku: "sku-1" }, { taskQueue: "payments" });
+        } catch {
+          // Worst case for the no-commit invariant: the workflow swallows the
+          // disposal and returns normally, so the handler chain settles
+          // *fulfilled* with a terminal value while the execution is disposed.
+          trace.push("swallowed");
+        }
+        return "done";
+      });
+      await hot.nextCommit();
+      expect(trace).toEqual(["start"]);
+
+      hot.dispose("first disposal");
+      // Evicted, then the same run conflicts: the second call must be a no-op
+      // and must not replace the recorded reason.
+      hot.dispose("second disposal");
+      await flushUnhandledRejectionTurn();
+      expect(trace).toEqual(["start", "swallowed"]);
+
+      await expect(hot.nextCommit()).rejects.toThrow(
+        "durust: hot workflow execution disposed (first disposal)"
+      );
+      await expect(hot.advance(claim)).rejects.toThrow(HotWorkflowExecutionDisposedError);
+      expect(() => hot.markCommitted(eventId(2))).toThrow(HotWorkflowExecutionDisposedError);
+      expect(hot.closed).toBe(false);
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
+
+  it("makes a detached side-effect continuation inert after disposal", async () => {
+    // One case per shape of context mutation a stranded frame could still
+    // reach: appending a command event, starting a timer, setting the query
+    // projection, recording a terminal event, and recording a marker.
+    const durableCalls: readonly {
+      readonly label: string;
+      readonly call: () => Promise<void>;
+    }[] = [
+      {
+        label: "callActivity",
+        call: async (): Promise<void> => {
+          await callActivity(priceQuote, { sku: "late" }, { taskQueue: "payments" });
+        }
+      },
+      {
+        label: "sleep",
+        call: async (): Promise<void> => {
+          await sleep(1_000);
+        }
+      },
+      {
+        label: "publish",
+        call: async (): Promise<void> => {
+          publish({ late: true });
+        }
+      },
+      {
+        label: "continueAsNew",
+        call: async (): Promise<void> => {
+          continueAsNew({ late: true });
+        }
+      },
+      {
+        label: "sideEffect",
+        call: async (): Promise<void> => {
+          await sideEffect("late", () => "late");
+        }
+      }
+    ];
+
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      for (const durableCall of durableCalls) {
+        let releaseContinuation = (): void => {};
+        const continuationGate = new Promise<void>((resolve) => {
+          releaseContinuation = resolve;
+        });
+        let markContinuationFinished = (): void => {};
+        const continuationFinished = new Promise<void>((resolve) => {
+          markContinuationFinished = resolve;
+        });
+
+        const { hot } = await startHotExecution(
+          `tests.dispose-detached-${durableCall.label}`,
+          async (_input: TestNoInput) => {
+            // An async `sideEffect` callback fails the task synchronously, but
+            // its continuation survives the failure holding a live reference to
+            // the context the worker is about to abandon.
+            return await sideEffect("detached", async () => {
+              await continuationGate;
+              try {
+                await durableCall.call();
+                trace.push(`${durableCall.label}:accepted`);
+              } catch (error) {
+                trace.push(
+                  error instanceof HotWorkflowExecutionDisposedError
+                    ? `${durableCall.label}:rejected:${error.reason}`
+                    : `${durableCall.label}:unexpected:${String(error)}`
+                );
+              }
+              markContinuationFinished();
+              return "value";
+            });
+          }
+        );
+
+        await expect(hot.nextCommit()).rejects.toThrow(
+          "nondeterminism: sideEffect callback must be synchronous"
+        );
+
+        hot.dispose("workflow task failed before commit");
+        releaseContinuation();
+        // Bounded, so that losing the guard shows up as a trace diff rather
+        // than a framework timeout: an unguarded continuation that parks on a
+        // fresh waiter in the abandoned context never finishes at all.
+        await Promise.race([
+          continuationFinished,
+          new Promise<void>((resolve) => {
+            setTimeout(resolve, 250);
+          })
+        ]);
+        await flushUnhandledRejectionTurn();
+        await expect(hot.nextCommit()).rejects.toThrow(HotWorkflowExecutionDisposedError);
+      }
+
+      // Asserted once over the whole table so a regression shows every affected
+      // API at once. Inert, not merely unobserved: each call is refused at the
+      // durable-API gate, so nothing reaches the abandoned context at all.
+      expect(trace).toEqual(
+        durableCalls.map(
+          (durableCall) => `${durableCall.label}:rejected:workflow task failed before commit`
+        )
+      );
+      expect(unhandledRejections).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
+  });
 });
+
+// Starts a hot execution over a fresh backend so a disposal test can drive the
+// runtime directly, without the worker in the way.
+async function startHotExecution(
+  name: string,
+  handler: (input: TestNoInput) => Promise<unknown>
+): Promise<{
+  readonly hot: HotWorkflowExecution;
+  readonly claim: ClaimedWorkflowTask;
+}> {
+  const definition = workflow({ name, version: 1, handler });
+  const backend = new MemoryBackend();
+  await backend.startWorkflow({
+    namespace: namespace(),
+    workflowId: workflowId(`wf/${name}`),
+    workflowType: definition.workflowType,
+    taskQueue: taskQueue("workflows"),
+    input: encodePayload({}, { codec: "Json" })
+  });
+  const claim = await backend.claimWorkflowTask("worker-a", {
+    namespace: namespace(),
+    taskQueue: taskQueue("workflows"),
+    registeredWorkflowTypes: [definition.workflowType],
+    leaseDurationMs: 30_000
+  });
+  if (!claim) {
+    throw new Error(`expected a workflow claim for ${name}`);
+  }
+  return {
+    hot: new HotWorkflowExecution(definition, {}, claim, { payloadCodec: "Json" }),
+    claim
+  };
+}
+
+// Lets a pending unhandled rejection reach the process listener before it is
+// asserted on. Mirrors the helper in worker.test.ts.
+async function flushUnhandledRejectionTurn(): Promise<void> {
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
