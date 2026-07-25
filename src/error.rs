@@ -55,6 +55,9 @@ impl DurableFailure {
             Error::Nondeterminism(message) => {
                 Self::new("durust.nondeterminism", message.clone()).marked_non_retryable()
             }
+            Error::TaskPanic(message) => {
+                Self::new("durust.task_panic", message.clone()).marked_non_retryable()
+            }
             Error::UnsupportedWorkflowVersion {
                 change_id,
                 version,
@@ -167,6 +170,20 @@ pub enum Error {
 
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),
+
+    /// A panic caught inside a workflow task poll. Routed exactly like
+    /// [`Error::Nondeterminism`] — nothing is committed and the claim is
+    /// released for retry — because a panic raised while replaying an
+    /// already-progressed run carries no evidence that the recorded progress
+    /// was wrong, so committing `WorkflowFailed` would destroy it for a bug a
+    /// redeploy fixes. It is a distinct variant so a caller (or the worker's
+    /// own accounting) can tell a workflow bug from genuine history
+    /// divergence, which need different operator responses.
+    ///
+    /// The message keeps the stable `workflow task panicked:` prefix, so it
+    /// stays greppable and countable without matching on the variant.
+    #[error("{0}")]
+    TaskPanic(String),
 
     #[error(
         "unsupported workflow version for `{change_id}`: recorded {version}, supported {min_supported}..={max_supported}"

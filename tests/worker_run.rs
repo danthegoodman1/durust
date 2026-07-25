@@ -102,6 +102,69 @@ async fn wr_panicking_batched(input: NumberInput) -> durust::Result<u64> {
     Ok(input.value)
 }
 
+// A third panicking workflow, with its own counter, for the run-loop test that
+// needs more consecutive failing passes than `Worker::run` tolerates. It cannot
+// share a counter with the tests above, which run concurrently in this binary.
+static MANY_PANICKING_WORKFLOW_POLLS: AtomicU64 = AtomicU64::new(0);
+
+#[durust::workflow(name = "worker-run.panicking-many", version = 1)]
+async fn wr_panicking_many(input: NumberInput) -> durust::Result<u64> {
+    if input.value == 0 {
+        MANY_PANICKING_WORKFLOW_POLLS.fetch_add(1, Ordering::SeqCst);
+        panic!("worker-run many-panics workflow panicked on purpose");
+    }
+    Ok(input.value)
+}
+
+// The two zero-backoff tests each assert an exact poll count, so each needs its
+// own workflow type and its own counter: every test in this binary runs
+// concurrently, and a shared counter would let one test's `store(0)` and polls
+// race the other's assertion.
+static ZERO_BACKOFF_IDLE_POLLS: AtomicU64 = AtomicU64::new(0);
+static ZERO_BACKOFF_RUN_POLLS: AtomicU64 = AtomicU64::new(0);
+
+#[durust::workflow(name = "worker-run.panicking-zero-backoff-idle", version = 1)]
+async fn wr_panicking_zero_backoff_idle(input: NumberInput) -> durust::Result<u64> {
+    if input.value == 0 {
+        ZERO_BACKOFF_IDLE_POLLS.fetch_add(1, Ordering::SeqCst);
+        panic!("worker-run zero-backoff idle workflow panicked on purpose");
+    }
+    Ok(input.value)
+}
+
+#[durust::workflow(name = "worker-run.panicking-zero-backoff-run", version = 1)]
+async fn wr_panicking_zero_backoff_run(input: NumberInput) -> durust::Result<u64> {
+    if input.value == 0 {
+        ZERO_BACKOFF_RUN_POLLS.fetch_add(1, Ordering::SeqCst);
+        panic!("worker-run zero-backoff run workflow panicked on purpose");
+    }
+    Ok(input.value)
+}
+
+// Parks on a timer, so its run has work only the pass's maintenance stage can
+// do.
+#[durust::workflow(name = "worker-run.sleeper", version = 1)]
+async fn wr_sleeper(input: NumberInput) -> durust::Result<u64> {
+    durust::sleep(Duration::from_millis(10)).await?;
+    Ok(input.value + 1)
+}
+
+#[durust::workflow(name = "worker-run.child-leaf", version = 1)]
+async fn wr_child_leaf(input: NumberInput) -> durust::Result<u64> {
+    Ok(input.value + 100)
+}
+
+// Parks on a child start, so its run has work only the pass's child dispatch
+// stage can do.
+#[durust::workflow(name = "worker-run.parent-waits-child", version = 1)]
+async fn wr_parent_waits_child(input: NumberInput) -> durust::Result<u64> {
+    let child = durust::child!(wr_child_leaf(NumberInput { value: input.value }))
+        .workflow_id("wf/pass-isolation-child")
+        .spawn()
+        .await?;
+    child.result().await
+}
+
 // Counts activity attempts across retries so the test can assert the retry
 // policy ran the activity again after the panicking attempt.
 static PANIC_ONCE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
@@ -435,15 +498,14 @@ fn panicking_workflow_fails_its_task_and_the_worker_keeps_serving() {
 
 // The production pass claims a *batch*, so a panicking task and a healthy task
 // can land in the same `run_workflow_batch_once` call. The batch loop commits
-// every prepared task before it checks `first_error`, so the healthy
-// neighbour's commit lands even though the pass then reports the panic as its
-// error. Both halves of that observed behaviour are pinned here: the commit
-// that lands, which is what "the worker keeps serving" means for a batch, and
-// the `Err` the pass still returns despite that progress — asserted rather
-// than papered over, so a change in either direction is caught. Reporting a
-// pass with committed work as failed also skips that pass's local activities,
-// maintenance, and activity execution; that is loop shape, owned by Phase 2
-// row 2H, not by this row.
+// every prepared task, and the panicking task is settled by the batch itself —
+// nothing committed, claim released with the retry backoff — so it is not the
+// batch's error. The batch therefore reports the neighbour's commit rather than
+// discarding it, which is what "the worker keeps serving" means for a batch.
+//
+// This assertion was `unwrap_err()` when Phase 1 landed, pinning the observed
+// short-circuit; Phase 2 row 2H is the row that fixes exactly that, so the
+// assertion moves to the committed count the batch now reports.
 #[test]
 fn panicking_workflow_batched_with_a_healthy_task_still_commits_its_neighbor() {
     block_on_tokio(async {
@@ -477,15 +539,12 @@ fn panicking_workflow_batched_with_a_healthy_task_still_commits_its_neighbor() {
             .workflow_task_prefetch_limit(4)
             .build();
 
-        // One batched pass over both tasks. It reports the panic...
-        let err = worker.run_workflow_batch_once().await.unwrap_err();
-        let durust::Error::Nondeterminism(message) = &err else {
-            panic!("a batched workflow panic must fail the task, got {err:?}");
-        };
-        assert!(
-            message.contains("workflow task panicked")
-                && message.contains("worker-run batched workflow panicked on purpose"),
-            "{message}"
+        // One batched pass over both tasks. The panicking task fails without
+        // failing the batch...
+        let committed = worker.run_workflow_batch_once().await.unwrap();
+        assert_eq!(
+            committed, 1,
+            "the batch must report its healthy neighbour's commit, not discard it"
         );
 
         // ...and the healthy neighbour claimed into that same batch still
@@ -509,6 +568,549 @@ fn panicking_workflow_batched_with_a_healthy_task_still_commits_its_neighbor() {
         // pass finds no claimable work and succeeds.
         let stats = worker.run_until_idle().await.unwrap();
         assert_eq!(stats.workflow_tasks, 0);
+    });
+}
+
+// A failed workflow task must not take the rest of its pass down with it. The
+// pass runs workflow tasks, then local activities, then maintenance, then child
+// dispatch, then activity execution; a `?` on the workflow stage skipped every
+// later stage for every other run on the worker.
+//
+// Each healthy run is parked on exactly one of those stages before the
+// panicking run is even started, and the assertions bracket a *single* pass
+// (`max_iterations: 1`, which runs one pass and then reports the iteration
+// bound), so nothing here can be satisfied by a later pass.
+#[test]
+fn panicking_workflow_task_does_not_suppress_the_rest_of_its_pass() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let sleeper_run = client
+            .start_workflow::<wr_sleeper>("wf/pass-sleeper", "workflows", NumberInput { value: 5 })
+            .await
+            .unwrap();
+        let parent_run = client
+            .start_workflow::<wr_parent_waits_child>(
+                "wf/pass-parent",
+                "workflows",
+                NumberInput { value: 1 },
+            )
+            .await
+            .unwrap();
+        let activity_run = client
+            .start_workflow::<wr_double_plus_one>(
+                "wf/pass-activity",
+                "workflows",
+                NumberInput { value: 3 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("pass-isolation-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(wr_sleeper)
+            .register_workflow(wr_parent_waits_child)
+            .register_workflow(wr_child_leaf)
+            .register_workflow(wr_double_plus_one)
+            .register_workflow(wr_panicking_batched)
+            .register_activity(wr_double)
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .build();
+
+        // Park each healthy run on the stage that owns its pending work: a
+        // timer for maintenance, an undispatched child start for child
+        // dispatch, and a scheduled activity for activity execution.
+        for _ in 0..3 {
+            assert!(worker.run_workflow_once().await.unwrap());
+        }
+        backend.advance_time(Duration::from_millis(50));
+
+        // None of the three stages has run yet, so each assertion below is a
+        // strict before/after over one pass.
+        assert!(
+            !has_event(&backend, &sleeper_run, |data| matches!(
+                data,
+                HistoryEventData::TimerFired(_)
+            ))
+            .await
+        );
+        assert!(
+            !has_event(&backend, &parent_run, |data| matches!(
+                data,
+                HistoryEventData::ChildWorkflowStarted(_)
+            ))
+            .await
+        );
+        assert!(
+            !has_event(&backend, &activity_run, |data| matches!(
+                data,
+                HistoryEventData::ActivityCompleted(_)
+            ))
+            .await
+        );
+
+        // The only claimable workflow task for the next pass: every healthy run
+        // is blocked on work a later stage of that same pass performs.
+        let panicking_run = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/pass-panicking",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+
+        let err = worker
+            .run_until_idle_with(durust::WorkerRunOptions { max_iterations: 1 })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, durust::Error::Backend(message) if message.contains("did not become idle")),
+            "the pass must run every stage and stop only at the iteration bound, got {err:?}"
+        );
+
+        // The failed workflow task did not suppress maintenance...
+        assert!(
+            has_event(&backend, &sleeper_run, |data| matches!(
+                data,
+                HistoryEventData::TimerFired(_)
+            ))
+            .await,
+            "a failed workflow task suppressed the pass's maintenance stage"
+        );
+        // ...child dispatch...
+        assert!(
+            has_event(&backend, &parent_run, |data| matches!(
+                data,
+                HistoryEventData::ChildWorkflowStarted(_)
+            ))
+            .await,
+            "a failed workflow task suppressed the pass's child dispatch stage"
+        );
+        // ...or activity execution.
+        assert!(
+            has_event(&backend, &activity_run, |data| matches!(
+                data,
+                HistoryEventData::ActivityCompleted(_)
+            ))
+            .await,
+            "a failed workflow task suppressed the pass's activity stage"
+        );
+        // The panicking task itself still committed nothing.
+        assert_eq!(history(&backend, &panicking_run).await.len(), 1);
+
+        // The worker is unharmed: every healthy run finishes.
+        worker.run_until_idle().await.unwrap();
+        assert_eq!(completed_result(&backend, &sleeper_run).await, Some(6));
+        assert_eq!(completed_result(&backend, &parent_run).await, Some(101));
+        assert_eq!(completed_result(&backend, &activity_run).await, Some(7));
+    });
+}
+
+// The pass's own accounting: a batch holding a panicking task and a healthy
+// task must record the healthy task as committed work, not discard it with the
+// error. Exactly two iterations are allowed, so the recorded task and the
+// recorded failure can only have come from the same (first) pass — the second
+// pass finds the panicking claim released with the retry backoff and nothing
+// else to do.
+#[test]
+fn panicking_workflow_batch_records_its_neighbors_committed_task_in_pass_stats() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/stats-panicking",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+        let healthy_run = client
+            .start_workflow::<wr_no_activity>(
+                "wf/stats-healthy",
+                "workflows",
+                NumberInput { value: 7 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("stats-panic-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_batched)
+            .register_workflow(wr_no_activity)
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .build();
+
+        let stats = worker
+            .run_until_idle_with(durust::WorkerRunOptions { max_iterations: 2 })
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.workflow_tasks, 1,
+            "the healthy neighbour's committed task must be recorded, got {stats:?}"
+        );
+        assert_eq!(
+            stats.workflow_tasks_failed, 1,
+            "the panicking task must be recorded as failed rather than swallowed, got {stats:?}"
+        );
+        assert_eq!(completed_result(&backend, &healthy_run).await, Some(8));
+        assert_eq!(history(&backend, &panicking_run).await.len(), 1);
+    });
+}
+
+// The local-activity drain sits at the tail of the workflow stage, so a batch
+// that reported a per-task fault as its own error skipped it for every task in
+// the batch. This asserts the drain from inside a single
+// `run_workflow_batch_once` call: no activity stage has run yet, so the only
+// thing that can have completed the neighbour's activity is that drain.
+#[test]
+fn panicking_workflow_batch_still_runs_its_neighbors_local_activities() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/local-panicking",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+        let activity_run = client
+            .start_workflow::<wr_double_plus_one>(
+                "wf/local-activity",
+                "workflows",
+                NumberInput { value: 4 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("local-activity-panic-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(wr_panicking_batched)
+            .register_workflow(wr_double_plus_one)
+            .register_activity(wr_double)
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .max_local_activities_per_workflow_task(2)
+            .build();
+
+        let committed = worker.run_workflow_batch_once().await.unwrap();
+        assert_eq!(committed, 1);
+        assert!(
+            has_event(&backend, &activity_run, |data| matches!(
+                data,
+                HistoryEventData::ActivityCompleted(_)
+            ))
+            .await,
+            "the panicking task suppressed its batch's local activity drain"
+        );
+        assert_eq!(history(&backend, &panicking_run).await.len(), 1);
+
+        worker.run_until_idle().await.unwrap();
+        assert_eq!(completed_result(&backend, &activity_run).await, Some(9));
+    });
+}
+
+// `run_until_idle` must drain the queue rather than abort on the first bad
+// workflow, and must not call itself idle while the failed task's neighbours
+// are still queued. The panicking run is started first, so it holds the single
+// workflow claim of the first pass by itself: that pass commits nothing, and
+// only a driver that treats the consumed claim as work to follow up reaches the
+// healthy run at all.
+#[test]
+fn run_until_idle_drains_the_queue_behind_a_panicking_workflow() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/idle-panicking",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+        let healthy_run = client
+            .start_workflow::<wr_no_activity>(
+                "wf/idle-healthy",
+                "workflows",
+                NumberInput { value: 11 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("idle-panic-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_batched)
+            .register_workflow(wr_no_activity)
+            .build();
+
+        // Terminates normally: the failed claim is released with the 60 s
+        // retry backoff against a virtual clock the idle loop never advances,
+        // so it cannot be re-claimed into a spin, and the loop goes idle
+        // instead of exhausting `max_iterations`.
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 1, "{stats:?}");
+        assert_eq!(stats.workflow_tasks_failed, 1, "{stats:?}");
+        assert_eq!(
+            completed_result(&backend, &healthy_run).await,
+            Some(12),
+            "the idle loop stopped before draining the run behind the panicking one"
+        );
+        // The poisoned run is left replayable, not failed.
+        assert_eq!(history(&backend, &panicking_run).await.len(), 1);
+    });
+}
+
+// A failed workflow task is reported as pass progress, so `Worker::run` skips
+// its idle wait after one, and the release delay is the only thing bounding how
+// fast a permanently poisoned run is retried. A zero backoff would therefore
+// make the workflow stage re-claim the same poisoned run every pass forever.
+// The builder clamps the knob for exactly that reason, mirroring `idle_wait` and
+// both lease durations.
+//
+// Bound proven, not assumed: the run is polled once, and the idle loop reaches
+// idle well inside its iteration budget instead of exhausting it.
+#[test]
+fn zero_nondeterminism_backoff_is_clamped_so_the_idle_loop_still_terminates() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking_zero_backoff_idle>(
+                "wf/zero-backoff-idle",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("zero-backoff-idle-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_zero_backoff_idle)
+            .nondeterminism_retry_backoff(Duration::ZERO)
+            .build();
+
+        let stats = worker
+            .run_until_idle_with(durust::WorkerRunOptions { max_iterations: 8 })
+            .await
+            .unwrap();
+        assert_eq!(stats.workflow_tasks_failed, 1, "{stats:?}");
+        assert_eq!(stats.workflow_tasks, 0, "{stats:?}");
+        assert_eq!(
+            ZERO_BACKOFF_IDLE_POLLS.load(Ordering::SeqCst),
+            1,
+            "an unclamped zero backoff re-claims the poisoned run every iteration"
+        );
+        // Still replayable, never failed.
+        assert_eq!(history(&backend, &panicking_run).await.len(), 1);
+    });
+}
+
+// The other half of the same bound, and the one that matters in production: with
+// an unclamped zero backoff every pass claims the poisoned run, so every pass
+// reports progress, so `Worker::run` never awaits anything pending. On a
+// current-thread runtime that starves the sibling task holding the shutdown
+// signal, and the loop becomes unstoppable rather than merely hot. This test
+// fails by hanging, which is precisely the reported symptom.
+#[test]
+fn zero_nondeterminism_backoff_keeps_the_run_loop_responsive_to_shutdown() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        client
+            .start_workflow::<wr_panicking_zero_backoff_run>(
+                "wf/zero-backoff-run",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("zero-backoff-run-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_zero_backoff_run)
+            .nondeterminism_retry_backoff(Duration::ZERO)
+            .idle_wait(Duration::from_millis(5))
+            .build();
+        let shutdown = worker.shutdown_handle();
+
+        let (run_result, ()) = futures::future::join(worker.run(), async {
+            wait_until(|| async { ZERO_BACKOFF_RUN_POLLS.load(Ordering::SeqCst) >= 1 }).await;
+            shutdown.shutdown();
+        })
+        .await;
+
+        run_result.expect("a poisoned run must not wedge the production loop");
+        assert_eq!(
+            ZERO_BACKOFF_RUN_POLLS.load(Ordering::SeqCst),
+            1,
+            "the clamped backoff must keep the poisoned run out of the claim queue"
+        );
+    });
+}
+
+// A workflow panic is `Error::TaskPanic`, not `Error::Nondeterminism`: routed
+// identically (nothing committed, claim released with the retry backoff) but
+// distinguishable, because "this build has a bug" and "this history diverged
+// from this build" need different operator responses. Genuine divergence is
+// still `Nondeterminism` — `tests/replay_core.rs` pins that separately.
+#[test]
+fn workflow_panic_is_task_panic_and_commits_no_terminal_event() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/task-panic-variant",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("task-panic-variant-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_batched)
+            .build();
+
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(
+            !matches!(err, durust::Error::Nondeterminism(_)),
+            "a panic must be distinguishable from history divergence, got {err:?}"
+        );
+        let durust::Error::TaskPanic(message) = &err else {
+            panic!("a workflow panic must be Error::TaskPanic, got {err:?}");
+        };
+        // Stable contract prefix: greppable and countable without matching on
+        // the variant.
+        assert!(
+            message.starts_with("workflow task panicked:")
+                && message.contains("worker-run batched workflow panicked on purpose"),
+            "{message}"
+        );
+
+        // Routed like `Nondeterminism` where routing matters: non-retryable
+        // durable failure, and non-committing.
+        let failure = err.durable_failure();
+        assert_eq!(failure.error_type, "durust.task_panic");
+        assert!(failure.non_retryable);
+        assert!(failure.message.starts_with("workflow task panicked:"));
+
+        let history = history(&backend, &run_id).await;
+        assert_eq!(
+            history.len(),
+            1,
+            "a task panic must commit nothing: {history:?}"
+        );
+        assert!(matches!(
+            history[0].data,
+            HistoryEventData::WorkflowStarted { .. }
+        ));
+        assert!(
+            !has_event(&backend, &run_id, |data| matches!(
+                data,
+                HistoryEventData::WorkflowFailed { .. }
+                    | HistoryEventData::WorkflowCompleted { .. }
+            ))
+            .await,
+            "a task panic must not commit a terminal event"
+        );
+        assert_eq!(worker.cached_workflow_count(), 0);
+    });
+}
+
+// `Worker::run` surfaces the last error after
+// `MAX_CONSECUTIVE_RUN_PASS_FAILURES` (16) consecutive failing passes, so a
+// dead backend fails loudly. A workflow whose task failed and released itself
+// is not that: with one poisoned run per pass, more than 16 such passes used to
+// exit the loop entirely and take the whole worker down. Twenty panicking runs
+// drive well past the cap before any healthy work exists.
+#[test]
+fn panicking_workflow_passes_do_not_trip_the_consecutive_failure_cap() {
+    block_on_tokio(async {
+        const PANICKING_RUNS: u64 = 20;
+        MANY_PANICKING_WORKFLOW_POLLS.store(0, Ordering::SeqCst);
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        for index in 0..PANICKING_RUNS {
+            client
+                .start_workflow::<wr_panicking_many>(
+                    format!("wf/many-panics-{index}"),
+                    "workflows",
+                    NumberInput { value: 0 },
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("many-panics-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_many)
+            .register_workflow(wr_no_activity)
+            .idle_wait(Duration::from_millis(5))
+            .build();
+        let shutdown = worker.shutdown_handle();
+
+        // Lets the waiter stop as soon as `run` returns, so a worker that dies
+        // early fails on its returned error instead of hanging the test.
+        let run_finished = std::sync::atomic::AtomicBool::new(false);
+        let (run_result, ()) = futures::future::join(
+            async {
+                let result = worker.run().await;
+                run_finished.store(true, Ordering::SeqCst);
+                result
+            },
+            async {
+                // Every panicking run is claimed and failed before any healthy
+                // work exists, so the failing passes are strictly consecutive.
+                wait_until(|| async {
+                    run_finished.load(Ordering::SeqCst)
+                        || MANY_PANICKING_WORKFLOW_POLLS.load(Ordering::SeqCst) >= PANICKING_RUNS
+                })
+                .await;
+                let healthy_run = client
+                    .start_workflow::<wr_no_activity>(
+                        "wf/many-panics-healthy",
+                        "workflows",
+                        NumberInput { value: 41 },
+                    )
+                    .await
+                    .unwrap();
+                wait_until(|| async {
+                    run_finished.load(Ordering::SeqCst)
+                        || completed_result(&backend, &healthy_run).await.is_some()
+                })
+                .await;
+                assert_eq!(
+                    completed_result(&backend, &healthy_run).await,
+                    Some(42),
+                    "the worker died before serving work queued behind the panicking runs"
+                );
+                shutdown.shutdown();
+            },
+        )
+        .await;
+
+        run_result.expect("passes that only failed their own task must not kill the worker");
+        assert_eq!(
+            MANY_PANICKING_WORKFLOW_POLLS.load(Ordering::SeqCst),
+            PANICKING_RUNS,
+            "each poisoned run must be polled exactly once and then backed off"
+        );
     });
 }
 

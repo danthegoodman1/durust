@@ -13,7 +13,7 @@ use durust::{
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId,
     FaultInjectingBackend, FaultPoint, FaultProfile, HistoryEvent, HistoryEventData, MemoryBackend,
     Namespace, NewHistoryEvent, RunId, SimFailure, SimRun, TaskQueue, Worker, WorkerId,
-    WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
+    WorkerRunStats, WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -173,6 +173,11 @@ fn build_worker(backend: &SimBackend, worker_id: &str) -> Worker<SimBackend> {
         .history_chunk_events(3)
         .workflow_task_lease_duration(Duration::from_secs(1))
         .activity_task_lease_duration(Duration::from_secs(1))
+        // Short enough that a poisoned task is claimable again inside the
+        // scenario's drain window, so `ensure_no_poisoned_workflow_tasks` sees
+        // divergence in the same seed that produced it instead of the seed
+        // ending in vague step exhaustion.
+        .nondeterminism_retry_backoff(Duration::from_millis(50))
         .register_workflow(sim_pipeline)
         .register_workflow(sim_lifecycle)
         .register_workflow(sim_chain)
@@ -240,6 +245,34 @@ fn tolerate_faults<T>(
         }
         Err(err) => Err(sim.failure("unexpected_worker_error", err.to_string())),
     }
+}
+
+// A workflow task that failed without committing is a *poisoned* task:
+// nondeterministic replay, a caught workflow panic, or a recorded version this
+// build cannot replay. No fault point injects any of those — the profile injects
+// backend errors, backpressure, and fencing rejections — so any occurrence here
+// is a real replay bug and must fail the seed naming its cause.
+//
+// This check exists because a poisoned task no longer errors its pass:
+// `run_workflow_batch_once` reports it as `Ok(0)`, which is indistinguishable
+// from an idle claim, and `run_until_idle` returns `Ok`. Without it
+// `tolerate_faults`/`drain_error` are dead for divergence and a cold-replay
+// regression degrades into "workflows did not complete", with no cause. The
+// stats counter is the remaining signal, so every drain asserts on it.
+fn ensure_no_poisoned_workflow_tasks(
+    sim: &SimRun,
+    label: &str,
+    stats: &WorkerRunStats,
+) -> Result<(), SimFailure> {
+    sim.ensure(
+        "no_poisoned_workflow_tasks",
+        stats.workflow_tasks_failed == 0,
+        format!(
+            "{label}: {} workflow task(s) failed without committing (nondeterministic replay, \
+             workflow panic, or unsupported recorded version)",
+            stats.workflow_tasks_failed
+        ),
+    )
 }
 
 // Durable-state invariants shared by every scenario: contiguous event ids,
@@ -408,7 +441,14 @@ fn run_storm(
                 worker = build_worker(&env.backend, "sim-storm-worker");
                 worker_rebuilds += 1;
             }
-            tolerate_faults(sim, block_on(worker.run_workflow_batch_once()))?;
+            // `run_workflow_once`, not `run_workflow_batch_once`: this worker
+            // sets no concurrency knobs, so the batch entry point delegates to
+            // this very call — but it also settles a poisoned task and reports
+            // `Ok(0)`, which is indistinguishable from an idle claim. The sim
+            // needs the per-task signal, because divergence is what this
+            // scenario exists to catch and `tolerate_faults` is where it is
+            // converted into a named seed failure.
+            tolerate_faults(sim, block_on(worker.run_workflow_once()))?;
             tolerate_faults(sim, block_on(worker.run_due_maintenance_once()))?;
             tolerate_faults(sim, block_on(worker.run_activity_batch_once()))?;
             if all_completed(&env.inner, runs) {
@@ -423,8 +463,9 @@ fn run_storm(
             return Ok(());
         }
         if let Some(round) = suffix(&step.label, "drain:") {
-            if let Err(err) = block_on(worker.run_until_idle()) {
-                return Err(sim.failure("drain_error", err.to_string()));
+            match block_on(worker.run_until_idle()) {
+                Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "storm drain", &stats)?,
+                Err(err) => return Err(sim.failure("drain_error", err.to_string())),
             }
             if all_completed(&env.inner, runs) {
                 return Ok(());
@@ -525,8 +566,9 @@ fn crash_between_claim_and_commit_scenario(
         }
         if step.label == "drain" {
             let mut replacement = build_worker(&env.backend, "sim-crash-replacement");
-            if let Err(err) = block_on(replacement.run_until_idle()) {
-                return Err(sim.failure("post_crash_drain_error", err.to_string()));
+            match block_on(replacement.run_until_idle()) {
+                Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "post-crash drain", &stats)?,
+                Err(err) => return Err(sim.failure("post_crash_drain_error", err.to_string())),
             }
             if is_completed(&env.inner, &run_id) {
                 return Ok(());
@@ -619,8 +661,9 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
         // Worker B reclaims the expired tail leases and completes the runs
         // through real execution.
         let mut worker_b = build_worker(&env.backend, "sim-stale-b");
-        if let Err(err) = block_on(worker_b.run_until_idle()) {
-            return Err(sim.failure("reclaim_drain_error", err.to_string()));
+        match block_on(worker_b.run_until_idle()) {
+            Ok(stats) => ensure_no_poisoned_workflow_tasks(sim, "reclaim drain", &stats)?,
+            Err(err) => return Err(sim.failure("reclaim_drain_error", err.to_string())),
         }
         for run in &runs[1..] {
             sim.ensure(

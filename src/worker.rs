@@ -27,6 +27,15 @@ const DEFAULT_IDLE_WAIT: Duration = Duration::from_millis(100);
 // Below this an idle worker degenerates into a busy poll against providers
 // without push notifications.
 const MIN_IDLE_WAIT: Duration = Duration::from_millis(5);
+// A workflow task that failed without committing is released with this delay at
+// minimum. It is the only thing standing between a permanently poisoned run and
+// a busy re-claim loop: the failed task is work the pass performed, so the pass
+// reports progress and `Worker::run` skips its idle wait, and a zero delay makes
+// the run immediately re-claimable. That combination never awaits anything
+// pending, so on a current-thread runtime it also starves every sibling task —
+// including the one holding the shutdown signal. Matching `MIN_IDLE_WAIT` keeps
+// the worst case at the same polling granularity an idle worker already costs.
+const MIN_NONDETERMINISM_RETRY_BACKOFF: Duration = MIN_IDLE_WAIT;
 const DEFAULT_MAX_CACHED_WORKFLOWS: usize = 10_000;
 // `Worker::run` tolerates this many consecutive failing passes before
 // surfacing the error, so one transient backend hiccup does not kill an
@@ -78,10 +87,44 @@ impl Default for WorkerRunOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WorkerRunStats {
     pub workflow_tasks: usize,
+    /// Workflow tasks that failed without committing anything and released
+    /// their claim for a later retry: a nondeterministic replay, a caught
+    /// workflow panic, or a recorded change version this build cannot replay.
+    ///
+    /// Separate from `workflow_tasks` because nothing was written — counting a
+    /// void attempt as a committed task would over-report progress.
+    ///
+    /// This is the only record of the fault, because a per-task fault no longer
+    /// fails its pass (that would take the pass's maintenance, child dispatch,
+    /// and activity stages down with one bad run). It is therefore observable
+    /// exactly to callers that read the returned stats: `run_until_idle` and
+    /// `run_until_idle_with`.
+    ///
+    /// It is *not* observable under [`Worker::run`], which builds fresh stats
+    /// per pass, discards them, and returns `Result<()>`. This crate has no
+    /// logging dependency, so under the production loop a permanently poisoned
+    /// run is retried on the backoff with no error, no log, and no metric. That
+    /// gap is real and is closed by the worker metrics and event sink, not by
+    /// this counter.
+    pub workflow_tasks_failed: usize,
     pub activity_tasks: usize,
     pub timers_fired: usize,
     pub activities_timed_out: usize,
     pub child_workflow_starts_dispatched: usize,
+}
+
+/// What one workflow-task stage did: tasks whose commit landed, and tasks that
+/// failed without committing and released their own claim.
+///
+/// The split exists because a driver must treat the two differently. A
+/// committed task is recorded progress. A failed task is not progress —
+/// nothing reached history — but the pass did consume a claim, so the driver
+/// has to take another pass rather than conclude the worker is idle while
+/// queued tasks remain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorkflowStageOutcome {
+    committed: usize,
+    failed: usize,
 }
 
 pub struct Client<B>
@@ -472,14 +515,43 @@ where
         Ok(true)
     }
 
+    /// Runs one workflow-task stage and reports how many tasks committed.
+    ///
+    /// A task that failed without committing (a nondeterministic replay, a
+    /// caught workflow panic, an unsupported recorded version) is not an error
+    /// of this call: it was already settled — nothing was written and its claim
+    /// was released with the retry backoff — so the batch reports the work that
+    /// did land. Only an error the stage could not settle per task, such as a
+    /// failed claim or commit RPC, is returned.
     pub async fn run_workflow_batch_once(&mut self) -> Result<usize> {
+        Ok(self.run_workflow_stage_once().await?.committed)
+    }
+
+    // `run_workflow_batch_once` with the failed-task count the pass driver
+    // needs and the public `usize` cannot carry.
+    async fn run_workflow_stage_once(&mut self) -> Result<WorkflowStageOutcome> {
         let limit = self
             .workflow_task_concurrency
             .prefetch_limit
             .min(self.workflow_task_concurrency.max_concurrent_workflow_tasks)
             .max(1);
         if limit == 1 && self.workflow_task_concurrency.shard_filter.is_none() {
-            return self.run_workflow_once().await.map(usize::from);
+            // `run_workflow_once` is also the deterministic single-task driver
+            // tests use to observe a task fault, so it keeps returning the
+            // error; the stage is where that fault stops being the pass's.
+            return match self.run_workflow_once().await {
+                Ok(ran) => Ok(WorkflowStageOutcome {
+                    committed: usize::from(ran),
+                    failed: 0,
+                }),
+                Err(err) if fails_workflow_task_without_committing(&err) => {
+                    Ok(WorkflowStageOutcome {
+                        committed: 0,
+                        failed: 1,
+                    })
+                }
+                Err(err) => Err(err),
+            };
         }
 
         let claimed = self
@@ -499,23 +571,22 @@ where
             )
             .await?;
         if claimed.is_empty() {
-            return Ok(0);
+            return Ok(WorkflowStageOutcome::default());
         }
 
         // One task's failure must not abandon its batch neighbors' claims:
         // prepare and per-item commit errors release the affected claim and
-        // continue, and the first such error is propagated only after every
-        // claim in the batch has been committed or released.
-        let mut first_error: Option<Error> = None;
+        // continue, and the first *pass-level* error is propagated only after
+        // every claim in the batch has been committed or released.
+        let mut pass_error: Option<Error> = None;
+        let mut failed = 0usize;
         let mut prepared = Vec::with_capacity(claimed.len());
         for task in claimed {
             match self.prepare_claimed_workflow_task(task).await {
                 Ok(PreparedWorkflowTaskOutcome::Prepared(task)) => prepared.push(task),
                 Ok(PreparedWorkflowTaskOutcome::Deferred) => {}
                 // The prepare funnel already released this task's claim.
-                Err(err) => {
-                    first_error.get_or_insert(err);
-                }
+                Err(err) => record_workflow_task_error(&mut pass_error, &mut failed, err),
             }
         }
 
@@ -546,7 +617,7 @@ where
                             .release_failed_workflow_task(task.claim.clone(), err.clone())
                             .await
                         {
-                            first_error.get_or_insert(err);
+                            record_workflow_task_error(&mut pass_error, &mut failed, err);
                         }
                     }
                     break;
@@ -563,7 +634,7 @@ where
                             .release_failed_workflow_task(task.claim.clone(), err)
                             .await
                         {
-                            first_error.get_or_insert(err);
+                            record_workflow_task_error(&mut pass_error, &mut failed, err);
                         }
                         continue;
                     }
@@ -596,7 +667,12 @@ where
             }
             start = end;
         }
-        if let Some(err) = first_error {
+        // Only a pass-level error short-circuits the rest of the stage: the
+        // backend could not settle this batch, so draining local activities
+        // against it is pointless. A per-task fault was already settled, so the
+        // committed neighbours' local activities still run and the committed
+        // count is still reported.
+        if let Some(err) = pass_error {
             return Err(err);
         }
 
@@ -604,7 +680,7 @@ where
             self.run_local_activities_after_workflow_tasks(committed)
                 .await?;
         }
-        Ok(committed)
+        Ok(WorkflowStageOutcome { committed, failed })
     }
 
     async fn run_claimed_workflow_task(
@@ -696,10 +772,7 @@ where
                 .await;
             return Ok(());
         }
-        let release = if matches!(
-            &err,
-            Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
-        ) {
+        let release = if fails_workflow_task_without_committing(&err) {
             WorkflowTaskRelease::delayed(
                 WorkflowTaskReason::CacheEvicted,
                 self.nondeterminism_retry_backoff,
@@ -1141,9 +1214,23 @@ where
     async fn run_pass_once(&mut self, stats: &mut WorkerRunStats) -> Result<bool> {
         let mut progressed = false;
 
-        let workflow_tasks = self.run_workflow_batch_once().await?;
-        if workflow_tasks > 0 {
-            stats.workflow_tasks += workflow_tasks;
+        let workflow_stage = self.run_workflow_stage_once().await?;
+        if workflow_stage.committed > 0 {
+            stats.workflow_tasks += workflow_stage.committed;
+            progressed = true;
+        }
+        if workflow_stage.failed > 0 {
+            // Not recorded progress — nothing was committed — but the pass did
+            // consume a claim, so the driver must take another pass instead of
+            // declaring the worker idle while the batch's neighbours are still
+            // queued.
+            //
+            // Reporting progress here is also what makes `nondeterminism_retry_backoff`
+            // load-bearing: `Worker::run` skips its idle wait on a progressing
+            // pass, so the release delay is the only thing keeping a poisoned
+            // run from being re-claimed immediately and forever. That is why the
+            // builder clamps it to `MIN_NONDETERMINISM_RETRY_BACKOFF`.
+            stats.workflow_tasks_failed += workflow_stage.failed;
             progressed = true;
         }
         let local_activity_tasks = self.take_completed_local_activity_tasks();
@@ -1491,10 +1578,7 @@ where
         let poll_reached_terminal_state = match &poll {
             Poll::Pending => false,
             Poll::Ready(Ok(_)) => true,
-            Poll::Ready(Err(err)) => !matches!(
-                err,
-                Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
-            ),
+            Poll::Ready(Err(err)) => !fails_workflow_task_without_committing(err),
         };
         if poll_reached_terminal_state {
             self.reject_terminal_with_unreplayed_command_events(&claimed, &mut context)
@@ -1520,10 +1604,7 @@ where
                         HistoryEventData::WorkflowContinuedAsNew { input },
                     ));
                     terminal = true;
-                } else if matches!(
-                    err,
-                    Error::Nondeterminism(_) | Error::UnsupportedWorkflowVersion { .. }
-                ) {
+                } else if fails_workflow_task_without_committing(&err) {
                     return Err(err);
                 } else {
                     append_events.push(NewHistoryEvent::new(HistoryEventData::WorkflowFailed {
@@ -1670,17 +1751,52 @@ where
     }
 }
 
+// The workflow-poll errors that fail one task without committing anything to
+// its history: nondeterministic replay, a caught workflow panic, and a recorded
+// change version this build cannot replay. All three mean "this attempt is
+// void", never "this run is over", so no terminal event is appended, the claim
+// is released with `nondeterminism_retry_backoff`, and the next attempt replays
+// from durable history against redeployed code.
+//
+// They are also the errors a work pass survives. The task is already settled —
+// nothing written, claim released — so failing the pass on top of that would
+// only take the pass's healthy neighbours, local activities, maintenance, child
+// dispatch, and activity execution down with one bad run. Every other error
+// (backend, conflict, decode, registration) keeps its pass-level meaning.
+//
+// One predicate rather than a `matches!` copied to each site, so a variant
+// added to this class cannot be routed at some sites and missed at others.
+fn fails_workflow_task_without_committing(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Nondeterminism(_) | Error::TaskPanic(_) | Error::UnsupportedWorkflowVersion { .. }
+    )
+}
+
+// Sorts one claim's error into "this task failed" and "this pass failed".
+// Either way the claim was already released by the funnel that produced the
+// error; the split decides only what the stage reports to its driver.
+fn record_workflow_task_error(pass_error: &mut Option<Error>, failed: &mut usize, err: Error) {
+    if fails_workflow_task_without_committing(&err) {
+        *failed += 1;
+    } else {
+        pass_error.get_or_insert(err);
+    }
+}
+
 // A panic in workflow code must fail its own task, not the worker: without the
 // catch, an `unwrap()` in one workflow unwinds out of `Worker::run` and takes
 // every other cached run in the process with it.
 //
-// The panic becomes `Error::Nondeterminism`, this worker's existing fatal
-// workflow-task error: nothing is committed, `release_failed_workflow_task`
+// The panic becomes `Error::TaskPanic`, routed exactly like
+// `Error::Nondeterminism`: nothing is committed, `release_failed_workflow_task`
 // re-releases the claim with `nondeterminism_retry_backoff`, and the next
 // attempt replays from durable history, so a fixed redeploy recovers the run.
 // Committing `WorkflowFailed` instead would make a panic raised while replaying
 // an already-progressed run permanently unrecoverable, and a panic carries no
-// evidence that the run's recorded progress was wrong.
+// evidence that the run's recorded progress was wrong. The variant is distinct
+// only so a caller can tell a workflow bug from genuine history divergence; the
+// `workflow task panicked:` message prefix is a stable contract.
 //
 // `AssertUnwindSafe` asserts only that nothing the closure touches is read
 // again after a caught unwind, which the `Err` return enforces rather than
@@ -1701,7 +1817,7 @@ fn poll_cached(
         poll_with_runtime_context(context, || future.as_mut().poll(&mut task_context))
     }))
     .map_err(|payload| {
-        Error::Nondeterminism(format!(
+        Error::TaskPanic(format!(
             "workflow task panicked: {}",
             panic_message(payload.as_ref())
         ))
@@ -1914,8 +2030,14 @@ where
         self
     }
 
+    // How long a workflow task that failed without committing — a
+    // nondeterministic replay, a caught workflow panic, an unsupported recorded
+    // version — stays invisible before another attempt may claim it. Clamped to
+    // [`MIN_NONDETERMINISM_RETRY_BACKOFF`]: this delay is the only bound on a
+    // permanently poisoned run's retry rate, so a zero value would turn one bad
+    // workflow into a busy loop that never yields.
     pub fn nondeterminism_retry_backoff(mut self, backoff: Duration) -> Self {
-        self.nondeterminism_retry_backoff = backoff;
+        self.nondeterminism_retry_backoff = backoff.max(MIN_NONDETERMINISM_RETRY_BACKOFF);
         self
     }
 

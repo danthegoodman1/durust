@@ -1798,7 +1798,7 @@ fn panicking_workflow_commits_nothing_from_the_failed_attempt() {
             .build();
 
         let err = worker.run_workflow_once().await.unwrap_err();
-        let durust::Error::Nondeterminism(message) = &err else {
+        let durust::Error::TaskPanic(message) = &err else {
             panic!("a workflow panic must fail the task, got {err:?}");
         };
         assert!(
@@ -1851,7 +1851,7 @@ fn durable_api_inside_side_effect_fails_the_task_without_recording_markers() {
             .build();
 
         let err = worker.run_workflow_once().await.unwrap_err();
-        let durust::Error::Nondeterminism(message) = &err else {
+        let durust::Error::TaskPanic(message) = &err else {
             panic!("a nested durable API call must fail the task, got {err:?}");
         };
         assert!(
