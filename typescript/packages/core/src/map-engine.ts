@@ -52,16 +52,20 @@ import type { ChildWorkflowMapFailureMode, RetryPolicy } from "./options.js";
 // `itemCount === 0`: the completion condition at `DescriptorCreated` is
 // `recordedOutcomes >= itemCount`, so for *any* such state this engine emits
 // `CompleteMap` where Rust emits nothing, and when `nextOrdinal < itemCount` it
-// emits `MaterializeItems` and `CompleteMap` in one list. Phase 7's corpus must
-// exclude every `DescriptorCreated` case with `recordedOutcomes >= itemCount`,
-// not merely the empty-manifest one, until 6G lands.
+// emits `MaterializeItems` and `CompleteMap` in one list. The shared
+// transition table (`typescript/fixtures/contract/map-transitions.json`)
+// therefore excludes every `DescriptorCreated` case with
+// `recordedOutcomes >= itemCount`, not merely the empty-manifest one, and both
+// runners assert that the exclusion is still declared; Phase 7's corpus must
+// carry the same exclusion until 6G lands.
 //
 // Descriptor-creation completion deliberately ignores `parentTerminal`, unlike
 // every other terminal path in this module — see `step`.
 //
-// Row 6D replaces the six hand-written TypeScript copies with calls into this
-// module; until then the package's only callers are its tests, so nothing is
-// exported from the package index.
+// All three TypeScript providers drive their activity-map and
+// child-workflow-map paths through `step` and apply the effect list it
+// returns, so the module is exported from the package index for the two
+// out-of-package providers to import.
 
 /** Which map machine a descriptor drives. */
 export type MapKind = "Activity" | "ChildWorkflow";
@@ -111,6 +115,38 @@ export type ItemRetryDecision =
   | { readonly kind: "Exhausted" };
 
 /**
+ * The retry-versus-exhaustion verdict for one item attempt, computed *without*
+ * applying it.
+ *
+ * Every provider used to fold this decision into the same statement that
+ * rescheduled the attempt, which meant the map path was reached only on the
+ * exhausting attempt. Splitting the verdict from its application is what lets
+ * `step` own both outcomes: only the engine knows whether the map is still
+ * running, and only it can decide that a retry of an item whose map already
+ * ended must reschedule nothing.
+ *
+ * `failure` is `null` for a lapsed deadline, which is paced by the deadline
+ * that fired rather than by the policy's non-retryable rules.
+ */
+export function itemRetryDecision(
+  failedAttempt: number,
+  policy: RetryPolicy,
+  failure: DurableFailure | null
+): ItemRetryDecision {
+  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
+  if (failedAttempt >= maxAttempts) {
+    return { kind: "Exhausted" };
+  }
+  if (
+    failure !== null &&
+    (failure.nonRetryable || policy.nonRetryableErrorTypes.includes(failure.errorType))
+  ) {
+    return { kind: "Exhausted" };
+  }
+  return { kind: "Retry", nextAttempt: failedAttempt + 1 };
+}
+
+/**
  * One input to the machine. Every field is a fact the provider has already read
  * inside its transaction, so the transition itself needs no further reads.
  */
@@ -151,12 +187,13 @@ export type MapEvent =
   /**
    * The parent cancelled this map command.
    *
-   * **No TypeScript producer yet.** Rust drives this from
+   * **No TypeScript producer.** Rust drives this from
    * `WorkflowTaskCommit::cancel_commands`; the TypeScript `WorkflowTaskCommit`
    * has no such field (`grep -rn "cancelCommands" typescript/packages` is
-   * empty), so no provider can raise it at row 6D. It is kept so the two
-   * engines stay twins and is awaiting `cancelCommands` on the TypeScript
-   * commit shape, not wired.
+   * empty), so no provider raises it — the wiring left it unreachable rather
+   * than inventing a producer. It is kept so the two engines stay twins and is
+   * awaiting `cancelCommands` on the TypeScript commit shape. The shared
+   * transition table excludes it for the same reason.
    */
   | { readonly kind: "ParentCancelled" };
 
@@ -184,6 +221,16 @@ export type MapEffect =
    * Persist the descriptor's admission cursor after a materialization batch.
    * Always immediately follows `MaterializeItems`, and is the only effect that
    * writes `inFlight` on a non-terminal path.
+   *
+   * Because it is emitted only alongside an admission, a released slot with
+   * nothing left to admit is not written back, so a stored `inFlight` can sit
+   * above the true number of outstanding items. That is safe in one direction
+   * only, and deliberately so: the stored count is never *below* the truth, so
+   * it can delay an admission but can never let concurrency past
+   * `maxInFlight`. It can only go stale once `nextOrdinal` has reached
+   * `itemCount`, where `materialize` yields an empty batch for any `inFlight`
+   * whatsoever, so no later decision reads it; `MarkDescriptorTerminal` then
+   * resets it to zero.
    */
   | { readonly kind: "AdvanceDescriptor"; readonly nextOrdinal: number; readonly inFlight: number }
   /**
@@ -269,6 +316,39 @@ export function mapSlotLimit(state: MapState): number {
 /** Whether `ordinal` addresses a real item of the input manifest. */
 export function mapOrdinalInBounds(state: MapState, ordinal: number): boolean {
   return Number.isInteger(ordinal) && ordinal >= 0 && ordinal < state.itemCount;
+}
+
+/**
+ * How many ordinals of a provider's slot array carry a persisted terminal
+ * outcome, which is `MapState.recordedOutcomes`.
+ *
+ * Providers store item outcomes as a dense array of length `itemCount` with a
+ * hole for every ordinal that has not landed yet. Projecting the count here
+ * keeps the three providers from each inventing their own predicate for what
+ * counts as recorded.
+ */
+export function recordedOutcomeCount(slots: readonly (unknown | null | undefined)[]): number {
+  let recorded = 0;
+  for (const slot of slots) {
+    if (slot !== null && slot !== undefined) {
+      recorded += 1;
+    }
+  }
+  return recorded;
+}
+
+/**
+ * The message a provider raises for a rejected transition. Rejections must not
+ * reach storage: the provider raises this and rolls its transaction back, and
+ * the transition's effects are never applied.
+ */
+export function mapRejectMessage(kind: MapKind, reject: MapReject): string {
+  if (reject.kind === "OutOfBounds") {
+    return kind === "Activity"
+      ? `activity map item ordinal ${reject.ordinal} out of bounds`
+      : `child workflow map item ordinal ${reject.ordinal} out of bounds`;
+  }
+  return "terminal workflow rejects workflow-visible mutations";
 }
 
 /** Tallies for a child map's terminal event, over the ordered outcome list. */

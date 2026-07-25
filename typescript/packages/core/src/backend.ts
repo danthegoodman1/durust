@@ -16,7 +16,19 @@ import {
   type SignalName
 } from "./types.js";
 import { commandKey, sameCommandId } from "./internal.js";
-import { itemRetryDelayMs } from "./map-engine.js";
+import {
+  activityOutcomeCounts,
+  itemRetryDecision,
+  itemRetryDelayMs,
+  mapRejectMessage,
+  outcomeCounts,
+  recordedOutcomeCount,
+  step as stepMap,
+  type ItemRetryDecision,
+  type MapEffect,
+  type MapEvent,
+  type MapState
+} from "./map-engine.js";
 import type {
   ActivityMapTask,
   ActivityTask,
@@ -26,7 +38,8 @@ import type {
   HistoryEventData
 } from "./history.js";
 import { historyEventType } from "./history.js";
-import { decodePayload, encodePayload, type PayloadRef } from "./payload.js";
+import type { PayloadRef } from "./payload.js";
+import { completeMapItems, readMapManifestItems, writeMapManifest } from "./map-manifest.js";
 import type {
   ActivityMapInputManifest,
   ActivityMapInputPage,
@@ -377,7 +390,12 @@ interface ActivityMapState {
   readonly task: ActivityMapTask;
   readonly inputs: readonly PayloadRef[];
   readonly results: (PayloadRef | null)[];
-  readonly inFlight: Set<number>;
+  /**
+   * Slots taken by admitted, not-yet-terminal items. Written only by
+   * `AdvanceDescriptor` and `MarkDescriptorTerminal`, never by the provider,
+   * so the engine's admission accounting has exactly one owner.
+   */
+  inFlight: number;
   nextOrdinal: number;
   terminal: boolean;
 }
@@ -388,7 +406,7 @@ interface ChildWorkflowMapState {
   readonly task: ChildWorkflowMapTask;
   readonly inputs: readonly PayloadRef[];
   readonly outcomes: (ChildWorkflowMapItemOutcome<unknown> | null)[];
-  readonly inFlight: Set<number>;
+  inFlight: number;
   nextOrdinal: number;
   terminal: boolean;
 }
@@ -737,10 +755,19 @@ export class MemoryBackend implements DurableBackend {
       throw new Error("stale activity task lease");
     }
 
-    const retry =
-      activity.task.mapItem === null || this.#activityMapForTask(activity.task)?.terminal !== true
-        ? retryActivityAfterFailure(activity, req.failure, this.#nowMs())
-        : null;
+    // A map item takes the engine route for *both* verdicts. Deciding
+    // retry-versus-exhaust here and only then dispatching to the map path
+    // would leave the engine's `ScheduleItemRetry` with no producer, and would
+    // reschedule an item onto a map that had already ended.
+    if (activity.task.mapItem !== null) {
+      return this.#failActivityMapItem(
+        activity,
+        req.failure,
+        itemRetryDecision(activity.task.attempt, activity.task.retryPolicy, req.failure)
+      );
+    }
+
+    const retry = retryActivityAfterFailure(activity, req.failure, this.#nowMs());
     if (retry !== null) {
       activity.task = retry.task;
       activity.availableAtMs = retry.readyAtMs;
@@ -750,11 +777,6 @@ export class MemoryBackend implements DurableBackend {
         attempt: retry.task.attempt,
         readyAtMs: retry.readyAtMs
       };
-    }
-
-    if (activity.task.mapItem !== null) {
-      const eventId = this.#failActivityMapItem(activity, req.failure);
-      return { kind: "Failed", eventId };
     }
 
     const event = makeHistoryEvent(eventId(Number(tailEventId(activity.workflow)) + 1), {
@@ -994,7 +1016,19 @@ export class MemoryBackend implements DurableBackend {
     }
   }
 
+  // ---------------------------------------------------------------------
+  // Map fanout. Every decision below — what to admit, when the bound is
+  // reached, whether a failed attempt retries, which failure mode ends the
+  // map, when the parent is notified — belongs to `map-engine.ts`. What is
+  // left here is storage: insert item tasks, start item children, write the
+  // descriptor cursor, append a parent event, tombstone leftovers.
+  // ---------------------------------------------------------------------
+
   #createActivityMap(workflow: WorkflowState, task: ActivityMapTask): void {
+    // Validation runs before the engine is consulted. The engine clamps a
+    // degenerate bound so an already-persisted descriptor cannot stall, but a
+    // caller typo must still be rejected at the scheduling boundary rather
+    // than silently reinterpreted as one.
     if (task.maxInFlight <= 0 || !Number.isInteger(task.maxInFlight)) {
       throw new Error("activity map maxInFlight must be a positive integer");
     }
@@ -1005,24 +1039,113 @@ export class MemoryBackend implements DurableBackend {
       task,
       inputs,
       results: Array.from({ length: inputs.length }, () => null),
-      inFlight: new Set(),
+      inFlight: 0,
       nextOrdinal: 0,
       terminal: false
     };
     this.#activityMapsByCommand.set(commandKey(task.mapCommandId), map);
-    this.#materializeActivityMapItems(map);
-    this.#completeActivityMapIfDone(map);
+    this.#stepActivityMap(map, {
+      kind: "DescriptorCreated",
+      parentTerminal: workflow.terminal
+    });
   }
 
-  #materializeActivityMapItems(map: ActivityMapState): void {
-    while (
-      !map.terminal &&
-      map.inFlight.size < map.task.maxInFlight &&
-      map.nextOrdinal < map.inputs.length
-    ) {
-      const ordinal = map.nextOrdinal++;
-      const activityId = `${map.task.mapCommandId.runId}:map:${map.task.mapCommandId.seq}:${ordinal}`;
-      const activityState: ActivityState = {
+  /** The activity-map descriptor as `map-engine.ts` sees it. */
+  #activityMapEngineState(map: ActivityMapState): MapState {
+    return {
+      mapCommandId: map.task.mapCommandId,
+      kind: "Activity",
+      // An activity map is always fail-fast; the field is inert for it.
+      failureMode: "FailFast",
+      itemCount: map.inputs.length,
+      nextOrdinal: map.nextOrdinal,
+      inFlight: map.inFlight,
+      maxInFlight: map.task.maxInFlight,
+      recordedOutcomes: recordedOutcomeCount(map.results),
+      completed: map.terminal
+    };
+  }
+
+  /**
+   * Run one activity-map transition: project the descriptor, ask the engine,
+   * apply the effects it returns. Returns the parent event the transition
+   * appended, if any.
+   */
+  #stepActivityMap(map: ActivityMapState, event: MapEvent): EventId | null {
+    const transition = stepMap(this.#activityMapEngineState(map), event);
+    if (transition.kind === "Reject") {
+      throw new Error(mapRejectMessage("Activity", transition.reject));
+    }
+    return this.#applyActivityMapEffects(map, transition.effects);
+  }
+
+  /**
+   * Apply an engine effect list in order. Each arm is one storage primitive;
+   * no arm decides anything the engine already decided.
+   */
+  #applyActivityMapEffects(
+    map: ActivityMapState,
+    effects: readonly MapEffect[]
+  ): EventId | null {
+    let appended: EventId | null = null;
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case "MaterializeItems":
+          this.#insertActivityMapItemBatch(map, effect.firstOrdinal, effect.count);
+          break;
+        case "AdvanceDescriptor":
+          map.nextOrdinal = effect.nextOrdinal;
+          map.inFlight = effect.inFlight;
+          break;
+        case "ScheduleItemRetry": {
+          const activity = this.#activitiesById.get(
+            activityMapItemId(map.task.mapCommandId, effect.ordinal)
+          );
+          if (activity !== undefined) {
+            activity.task = { ...activity.task, attempt: effect.nextAttempt };
+            // `null` means immediately claimable, which this provider spells
+            // as an availability instant already in the past.
+            activity.availableAtMs = effect.visibleAtMs ?? 0;
+            activity.claim = null;
+          }
+          // `effect.timeoutAtMs` has no consumer: map items are exempt from
+          // the start-to-close and heartbeat scanners in every TypeScript
+          // provider, which is tracked as its own plan row.
+          break;
+        }
+        case "CompleteMap":
+          appended = this.#appendActivityMapCompleted(map, effect.itemCount);
+          break;
+        case "FailMap":
+          appended = this.#appendActivityMapFailed(map, effect.failure);
+          break;
+        case "AbandonPendingItems":
+          this.#abandonPendingActivityMapItems(map);
+          break;
+        case "MarkDescriptorTerminal":
+          map.terminal = true;
+          map.inFlight = 0;
+          break;
+        case "RecordItemOutcome":
+        case "CancelChildren":
+          throw new Error(`activity maps never receive ${effect.kind}`);
+      }
+    }
+    return appended;
+  }
+
+  /**
+   * `MaterializeItems`: insert `[firstOrdinal, firstOrdinal + count)` as
+   * claimable item activity tasks.
+   */
+  #insertActivityMapItemBatch(
+    map: ActivityMapState,
+    firstOrdinal: number,
+    count: number
+  ): void {
+    for (let ordinal = firstOrdinal; ordinal < firstOrdinal + count; ordinal += 1) {
+      const activityId = activityMapItemId(map.task.mapCommandId, ordinal);
+      this.#activitiesById.set(activityId, {
         namespace: map.namespace,
         workflow: map.workflow,
         task: {
@@ -1044,10 +1167,67 @@ export class MemoryBackend implements DurableBackend {
         claim: null,
         availableAtMs: 0,
         terminalEventId: null
-      };
-      map.inFlight.add(ordinal);
-      this.#activitiesById.set(activityId, activityState);
+      });
     }
+  }
+
+  /**
+   * `AbandonPendingItems`: tombstone every not-yet-terminal item task of a map
+   * that is over, so neither the claim path nor a late completion can
+   * resurrect it. The claim-time guard that skips items of a terminal map
+   * stays as well: a claim already in flight when the map ended must not
+   * change the answer.
+   */
+  #abandonPendingActivityMapItems(map: ActivityMapState): void {
+    for (const activity of this.#activitiesById.values()) {
+      if (
+        activity.task.mapItem === null ||
+        !sameCommandId(activity.task.mapItem.mapCommandId, map.task.mapCommandId) ||
+        activity.terminalEventId !== null
+      ) {
+        continue;
+      }
+      activity.terminalEventId = tailEventId(map.workflow);
+      activity.claim = null;
+    }
+  }
+
+  /**
+   * `CompleteMap`: assemble the result manifest in ascending ordinal order,
+   * append the terminal success fact to the parent, and wake it.
+   */
+  #appendActivityMapCompleted(map: ActivityMapState, itemCount: number): EventId {
+    const counts = activityOutcomeCounts(itemCount);
+    const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
+      kind: "ActivityMapCompleted",
+      completed: {
+        commandId: map.task.mapCommandId,
+        resultManifest: encodeActivityMapResultManifest(
+          map.task.resultManifestName,
+          completeMapItems("activity map result manifest", itemCount, map.results)
+        ),
+        itemCount,
+        successCount: counts.successCount,
+        failureCount: counts.failureCount
+      }
+    });
+    map.workflow.history.push(event);
+    markWorkflowReady(map.workflow, "ActivityMapCompleted");
+    return event.eventId;
+  }
+
+  /** `FailMap`: append the terminal failure fact to the parent and wake it. */
+  #appendActivityMapFailed(map: ActivityMapState, failure: DurableFailure): EventId {
+    const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
+      kind: "ActivityMapFailed",
+      failed: {
+        commandId: map.task.mapCommandId,
+        failure
+      }
+    });
+    map.workflow.history.push(event);
+    markWorkflowReady(map.workflow, "ActivityMapFailed");
+    return event.eventId;
   }
 
   #completeActivityMapItem(activity: ActivityState, result: PayloadRef): EventId {
@@ -1061,15 +1241,41 @@ export class MemoryBackend implements DurableBackend {
       return tailEventId(map.workflow);
     }
     const ordinal = activity.task.mapItem.itemOrdinal;
-    map.results[ordinal] = result;
-    map.inFlight.delete(ordinal);
+    const alreadyRecorded = (map.results[ordinal] ?? null) !== null;
+    // Ask before writing. An activity map's result slot is a storage primitive
+    // rather than an effect, so it must not be written for a transition the
+    // engine rejects.
+    const transition = stepMap(this.#activityMapEngineState(map), {
+      kind: "ItemCompleted",
+      ordinal,
+      // The result payload rides the descriptor's result slot, not the
+      // outcome; the engine only needs to know this was a success.
+      outcome: { kind: "Succeeded", result },
+      alreadyRecorded,
+      parentTerminal: PARENT_TERMINAL_UNGUARDED
+    });
+    if (transition.kind === "Reject") {
+      throw new Error(mapRejectMessage("Activity", transition.reject));
+    }
+    if (!alreadyRecorded) {
+      map.results[ordinal] = result;
+    }
     activity.terminalEventId = tailEventId(map.workflow);
     activity.claim = null;
-    this.#materializeActivityMapItems(map);
-    return this.#completeActivityMapIfDone(map);
+    return this.#applyActivityMapEffects(map, transition.effects) ?? tailEventId(map.workflow);
   }
 
-  #failActivityMapItem(activity: ActivityState, failure: DurableFailure): EventId {
+  /**
+   * One activity-map item attempt ended. `decision` is the shared retry
+   * verdict, computed but not applied: the engine turns it into either a
+   * rescheduled attempt or the map's terminal failure, because only the engine
+   * knows whether the map is still running.
+   */
+  #failActivityMapItem(
+    activity: ActivityState,
+    failure: DurableFailure,
+    decision: ItemRetryDecision
+  ): FailActivityOutcome {
     const map = this.#activityMapForTask(activity.task);
     if (!map || activity.task.mapItem === null) {
       throw new Error("activity map item missing descriptor");
@@ -1077,50 +1283,32 @@ export class MemoryBackend implements DurableBackend {
     if (map.terminal) {
       activity.terminalEventId = tailEventId(map.workflow);
       activity.claim = null;
-      return tailEventId(map.workflow);
+      return { kind: "Failed", eventId: tailEventId(map.workflow) };
     }
-    map.terminal = true;
-    map.inFlight.clear();
-    activity.terminalEventId = tailEventId(map.workflow);
-    activity.claim = null;
-    const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
-      kind: "ActivityMapFailed",
-      failed: {
-        commandId: map.task.mapCommandId,
-        failure
-      }
+    const ordinal = activity.task.mapItem.itemOrdinal;
+    const appended = this.#stepActivityMap(map, {
+      kind: "ItemAttemptFailed",
+      ordinal,
+      failure,
+      attemptFailure: "Failed",
+      decision,
+      failedAttempt: activity.task.attempt,
+      retryPolicy: activity.task.retryPolicy,
+      startToCloseTimeoutMs: activity.task.startToCloseTimeoutMs,
+      nowMs: this.#nowMs(),
+      alreadyRecorded: (map.results[ordinal] ?? null) !== null,
+      parentTerminal: PARENT_TERMINAL_UNGUARDED
     });
-    map.workflow.history.push(event);
-    markWorkflowReady(map.workflow, "ActivityMapFailed");
-    return event.eventId;
-  }
-
-  #completeActivityMapIfDone(map: ActivityMapState): EventId {
-    if (map.terminal) {
-      return tailEventId(map.workflow);
+    if (decision.kind === "Retry") {
+      return {
+        kind: "RetryScheduled",
+        attempt: decision.nextAttempt,
+        readyAtMs: activity.availableAtMs
+      };
     }
-    if (map.results.some((result) => result === null)) {
-      return tailEventId(map.workflow);
-    }
-    map.terminal = true;
-    const results = map.results as PayloadRef[];
-    const resultManifest = encodeActivityMapResultManifest(
-      map.task.resultManifestName,
-      results
-    );
-    const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
-      kind: "ActivityMapCompleted",
-      completed: {
-        commandId: map.task.mapCommandId,
-        resultManifest,
-        itemCount: results.length,
-        successCount: results.length,
-        failureCount: 0
-      }
-    });
-    map.workflow.history.push(event);
-    markWorkflowReady(map.workflow, "ActivityMapCompleted");
-    return event.eventId;
+    return appended === null
+      ? { kind: "AlreadyCompleted" }
+      : { kind: "Failed", eventId: appended };
   }
 
   #activityMapForTask(task: ActivityTask): ActivityMapState | undefined {
@@ -1144,29 +1332,124 @@ export class MemoryBackend implements DurableBackend {
       task,
       inputs,
       outcomes: Array.from({ length: inputs.length }, () => null),
-      inFlight: new Set(),
+      inFlight: 0,
       nextOrdinal: 0,
       terminal: false
     };
     this.#childWorkflowMapsByCommand.set(commandKey(task.mapCommandId), map);
-    this.#materializeChildWorkflowMapItems(map);
-    this.#completeChildWorkflowMapIfDone(map);
+    this.#stepChildWorkflowMap(map, {
+      kind: "DescriptorCreated",
+      parentTerminal: workflow.terminal
+    });
   }
 
-  #materializeChildWorkflowMapItems(map: ChildWorkflowMapState): void {
-    while (
-      !map.terminal &&
-      map.inFlight.size < map.task.maxInFlight &&
-      map.nextOrdinal < map.inputs.length
-    ) {
-      const ordinal = map.nextOrdinal++;
+  /** The child-workflow-map descriptor as `map-engine.ts` sees it. */
+  #childWorkflowMapEngineState(map: ChildWorkflowMapState): MapState {
+    return {
+      mapCommandId: map.task.mapCommandId,
+      kind: "ChildWorkflow",
+      failureMode: map.task.failureMode,
+      itemCount: map.inputs.length,
+      nextOrdinal: map.nextOrdinal,
+      inFlight: map.inFlight,
+      maxInFlight: map.task.maxInFlight,
+      recordedOutcomes: recordedOutcomeCount(map.outcomes),
+      completed: map.terminal
+    };
+  }
+
+  /**
+   * Run child-map transitions until the queue drains. Starting an item child
+   * can fail on an id conflict, which is itself an item outcome; rather than
+   * deciding what that means, the batch primitive queues an `ItemCompleted`
+   * and the loop feeds it back through the engine.
+   */
+  #stepChildWorkflowMap(map: ChildWorkflowMapState, event: MapEvent): EventId | null {
+    const queue: MapEvent[] = [event];
+    let appended: EventId | null = null;
+    while (queue.length > 0) {
+      const next = queue.shift() as MapEvent;
+      const transition = stepMap(this.#childWorkflowMapEngineState(map), next);
+      if (transition.kind === "Reject") {
+        throw new Error(mapRejectMessage("ChildWorkflow", transition.reject));
+      }
+      appended = this.#applyChildWorkflowMapEffects(map, transition.effects, queue) ?? appended;
+    }
+    return appended;
+  }
+
+  #applyChildWorkflowMapEffects(
+    map: ChildWorkflowMapState,
+    effects: readonly MapEffect[],
+    queue: MapEvent[]
+  ): EventId | null {
+    let appended: EventId | null = null;
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case "RecordItemOutcome":
+          map.outcomes[effect.ordinal] = effect.outcome;
+          break;
+        case "MaterializeItems":
+          this.#startChildWorkflowMapItemBatch(map, effect.firstOrdinal, effect.count, queue);
+          break;
+        case "AdvanceDescriptor":
+          map.nextOrdinal = effect.nextOrdinal;
+          map.inFlight = effect.inFlight;
+          break;
+        case "CompleteMap":
+          appended = this.#appendChildWorkflowMapCompleted(map, effect.itemCount);
+          break;
+        case "FailMap":
+          appended = this.#appendChildWorkflowMapFailed(map, effect.failure);
+          break;
+        case "AbandonPendingItems":
+          // Nothing to tombstone: this provider starts an item's child inside
+          // `MaterializeItems`, so a map that is over has no undispatched item
+          // start, and ordinals at or past the cursor are never admitted
+          // again. `CancelChildren` covers the children that did start.
+          break;
+        case "CancelChildren":
+          this.#cancelRunningChildWorkflowMapItems(map, effect.reason);
+          break;
+        case "MarkDescriptorTerminal":
+          map.terminal = true;
+          map.inFlight = 0;
+          break;
+        case "ScheduleItemRetry":
+          throw new Error("child workflow maps never receive ScheduleItemRetry");
+      }
+    }
+    return appended;
+  }
+
+  /**
+   * `MaterializeItems`: start `[firstOrdinal, firstOrdinal + count)` as item
+   * children. An id conflict is not a start; it is the item's terminal
+   * outcome, queued for the engine to route through the map's failure mode.
+   */
+  #startChildWorkflowMapItemBatch(
+    map: ChildWorkflowMapState,
+    firstOrdinal: number,
+    count: number,
+    queue: MapEvent[]
+  ): void {
+    for (let ordinal = firstOrdinal; ordinal < firstOrdinal + count; ordinal += 1) {
       const childWorkflowId = `${map.task.workflowIdPrefix}/${ordinal}`;
       const key = workflowKey(map.namespace, childWorkflowId);
       if (this.#workflowsById.has(key)) {
-        this.#recordChildWorkflowMapItemFailure(map, ordinal, {
-          errorType: "durust.child_workflow_id_conflict",
-          message: `child workflow id already exists: ${childWorkflowId}`,
-          nonRetryable: true
+        queue.push({
+          kind: "ItemCompleted",
+          ordinal,
+          outcome: {
+            kind: "Failed",
+            failure: {
+              errorType: "durust.child_workflow_id_conflict",
+              message: `child workflow id already exists: ${childWorkflowId}`,
+              nonRetryable: true
+            }
+          },
+          alreadyRecorded: false,
+          parentTerminal: PARENT_TERMINAL_UNGUARDED
         });
         continue;
       }
@@ -1198,23 +1481,9 @@ export class MemoryBackend implements DurableBackend {
           parentClosePolicy: map.task.parentClosePolicy
         }
       };
-      map.inFlight.add(ordinal);
       this.#workflowsById.set(key, child);
       this.#workflowsByRun.set(childRunId, child);
     }
-  }
-
-  #recordChildWorkflowMapItemFailure(
-    map: ChildWorkflowMapState,
-    ordinal: number,
-    failure: DurableFailure
-  ): void {
-    if (map.task.failureMode === "FailFast") {
-      this.#failChildWorkflowMap(map, failure);
-      return;
-    }
-    map.outcomes[ordinal] = { kind: "Failed", failure };
-    this.#completeChildWorkflowMapIfDone(map);
   }
 
   #completeChildWorkflowMapItem(
@@ -1225,63 +1494,38 @@ export class MemoryBackend implements DurableBackend {
     if (!map || map.terminal) {
       return;
     }
-    map.inFlight.delete(parentLink.itemOrdinal);
-
-    if (terminal.kind === "Completed") {
-      map.outcomes[parentLink.itemOrdinal] = {
-        kind: "Succeeded",
-        result: terminal.result
-      };
-    } else if (map.task.failureMode === "FailFast") {
-      this.#failChildWorkflowMap(
-        map,
-        terminal.kind === "Failed"
-          ? terminal.failure
-          : {
-              errorType: "durust.child_workflow_cancelled",
-              message: terminal.reason,
-              nonRetryable: true
-            }
-      );
-      return;
-    } else if (terminal.kind === "Failed") {
-      map.outcomes[parentLink.itemOrdinal] = {
-        kind: "Failed",
-        failure: terminal.failure
-      };
-    } else {
-      map.outcomes[parentLink.itemOrdinal] = {
-        kind: "Cancelled",
-        reason: terminal.reason
-      };
-    }
-
-    this.#materializeChildWorkflowMapItems(map);
-    this.#completeChildWorkflowMapIfDone(map);
+    this.#stepChildWorkflowMap(map, {
+      kind: "ItemCompleted",
+      ordinal: parentLink.itemOrdinal,
+      outcome: childWorkflowMapItemOutcome(terminal),
+      alreadyRecorded: (map.outcomes[parentLink.itemOrdinal] ?? null) !== null,
+      parentTerminal: PARENT_TERMINAL_UNGUARDED
+    });
   }
 
-  #completeChildWorkflowMapIfDone(map: ChildWorkflowMapState): EventId {
-    if (map.terminal) {
-      return tailEventId(map.workflow);
-    }
-    if (map.outcomes.some((outcome) => outcome === null)) {
-      return tailEventId(map.workflow);
-    }
-    map.terminal = true;
-    const outcomes = map.outcomes as ChildWorkflowMapItemOutcome<unknown>[];
-    const resultManifest = encodeChildWorkflowMapResultManifest(
-      map.task.resultManifestName,
-      outcomes
+  /**
+   * `CompleteMap`: assemble the outcome manifest in ascending ordinal order,
+   * append the terminal success fact to the parent, and wake it.
+   */
+  #appendChildWorkflowMapCompleted(map: ChildWorkflowMapState, itemCount: number): EventId {
+    const outcomes = completeMapItems(
+      "child workflow map result manifest",
+      itemCount,
+      map.outcomes
     );
+    const counts = outcomeCounts(outcomes);
     const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
       kind: "ChildWorkflowMapCompleted",
       completed: {
         commandId: map.task.mapCommandId,
-        resultManifest,
-        itemCount: outcomes.length,
-        successCount: outcomes.filter((outcome) => outcome.kind === "Succeeded").length,
-        failureCount: outcomes.filter((outcome) => outcome.kind === "Failed").length,
-        cancellationCount: outcomes.filter((outcome) => outcome.kind === "Cancelled").length
+        resultManifest: encodeChildWorkflowMapResultManifest(
+          map.task.resultManifestName,
+          outcomes
+        ),
+        itemCount,
+        successCount: counts.successCount,
+        failureCount: counts.failureCount,
+        cancellationCount: counts.cancellationCount
       }
     });
     map.workflow.history.push(event);
@@ -1289,12 +1533,11 @@ export class MemoryBackend implements DurableBackend {
     return event.eventId;
   }
 
-  #failChildWorkflowMap(map: ChildWorkflowMapState, failure: DurableFailure): EventId {
-    if (map.terminal) {
-      return tailEventId(map.workflow);
-    }
-    map.terminal = true;
-    map.inFlight.clear();
+  /** `FailMap`: append the terminal failure fact to the parent and wake it. */
+  #appendChildWorkflowMapFailed(
+    map: ChildWorkflowMapState,
+    failure: DurableFailure
+  ): EventId {
     const event = makeHistoryEvent(eventId(Number(tailEventId(map.workflow)) + 1), {
       kind: "ChildWorkflowMapFailed",
       failed: {
@@ -1304,11 +1547,14 @@ export class MemoryBackend implements DurableBackend {
     });
     map.workflow.history.push(event);
     markWorkflowReady(map.workflow, "ChildWorkflowMapFailed");
-    this.#cancelRunningChildWorkflowMapItems(map);
     return event.eventId;
   }
 
-  #cancelRunningChildWorkflowMapItems(map: ChildWorkflowMapState): void {
+  /**
+   * `CancelChildren`: cancel every already-running, not-yet-terminal child of
+   * this map with the engine's reason.
+   */
+  #cancelRunningChildWorkflowMapItems(map: ChildWorkflowMapState, reason: string): void {
     for (const child of this.#workflowsByRun.values()) {
       if (
         child.parent?.kind !== "ChildWorkflowMap" ||
@@ -1320,7 +1566,7 @@ export class MemoryBackend implements DurableBackend {
       }
       child.history.push(makeHistoryEvent(eventId(Number(tailEventId(child)) + 1), {
         kind: "WorkflowCancelled",
-        reason: `child workflow map failed: ${map.task.mapCommandId.runId}:${map.task.mapCommandId.seq}`
+        reason
       }));
       child.terminal = true;
       child.readyReason = null;
@@ -1490,6 +1736,38 @@ function workflowTypeKey(workflowType: WorkflowType): string {
 }
 
 
+/**
+ * The `parentTerminal` every TypeScript map path reports for an item's
+ * terminal outcome.
+ *
+ * No TypeScript provider has a terminal-parent guard on any map path: history
+ * continues past a run's terminal event and a closed run keeps materializing
+ * items, which is tracked as its own plan row. Reporting the run's real
+ * terminal flag here would *add* that guard — an activity map would reject the
+ * completion and a child map would drop the parent notification — so the
+ * engine is fed the value that reproduces today's behaviour, and closing the
+ * gap stays one deliberate change rather than a side effect of the wiring.
+ */
+const PARENT_TERMINAL_UNGUARDED = false;
+
+/** The generated activity id of one materialized activity-map item. */
+function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
+  return `${mapCommandId.runId}:map:${mapCommandId.seq}:${ordinal}`;
+}
+
+/** A child run's terminal fact as the map engine's item outcome. */
+function childWorkflowMapItemOutcome(
+  terminal: ChildTerminalUpdate
+): ChildWorkflowMapItemOutcome<unknown> {
+  if (terminal.kind === "Completed") {
+    return { kind: "Succeeded", result: terminal.result };
+  }
+  if (terminal.kind === "Failed") {
+    return { kind: "Failed", failure: terminal.failure };
+  }
+  return { kind: "Cancelled", reason: terminal.reason };
+}
+
 function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
@@ -1597,66 +1875,32 @@ function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
 }
 
 function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {
-  const manifest = decodePayload<ActivityMapInputManifest<object>>(
-    inputManifest as PayloadRef<ActivityMapInputManifest<object>>
+  return readMapManifestItems<ActivityMapInputPage<object>, PayloadRef>(
+    inputManifest as PayloadRef<ActivityMapInputManifest<object>>,
+    (page) => page.items,
+    "activity map manifest"
   );
-  const items: PayloadRef[] = [];
-  for (const pageRef of manifest.pages) {
-    const page = decodePayload<ActivityMapInputPage<object>>(
-      pageRef as PayloadRef<ActivityMapInputPage<object>>
-    );
-    items.push(...page.items);
-  }
-  if (items.length !== manifest.itemCount) {
-    throw new Error(
-      `activity map manifest item count mismatch: expected ${manifest.itemCount}, got ${items.length}`
-    );
-  }
-  const pageItemCount = manifest.pageLengths.reduce((sum, count) => sum + count, 0);
-  if (pageItemCount !== manifest.itemCount) {
-    throw new Error(
-      `activity map manifest page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
-    );
-  }
-  return items;
 }
 
 function encodeActivityMapResultManifest(
   name: string,
   results: readonly PayloadRef[]
 ): PayloadRef<ActivityMapResultManifest<unknown>> {
-  const pages =
-    results.length === 0
-      ? []
-      : [
-          encodePayload<ActivityMapResultPage<unknown>>({
-            results
-          })
-        ];
-  return encodePayload<ActivityMapResultManifest<unknown>>({
+  return writeMapManifest<PayloadRef, ActivityMapResultPage<unknown>>(
     name,
-    itemCount: results.length,
-    pageLengths: results.length === 0 ? [] : [results.length],
-    pages
-  });
+    results,
+    (pageResults) => ({ results: pageResults })
+  ) as PayloadRef<ActivityMapResultManifest<unknown>>;
 }
 
 function encodeChildWorkflowMapResultManifest(
   name: string,
   outcomes: readonly ChildWorkflowMapItemOutcome<unknown>[]
 ): PayloadRef<ChildWorkflowMapResultManifest<unknown>> {
-  const pages =
-    outcomes.length === 0
-      ? []
-      : [
-          encodePayload<ChildWorkflowMapResultPage<unknown>>({
-            outcomes
-          })
-        ];
-  return encodePayload<ChildWorkflowMapResultManifest<unknown>>({
-    name,
-    itemCount: outcomes.length,
-    pageLengths: outcomes.length === 0 ? [] : [outcomes.length],
-    pages
-  });
+  return writeMapManifest<
+    ChildWorkflowMapItemOutcome<unknown>,
+    ChildWorkflowMapResultPage<unknown>
+  >(name, outcomes, (pageOutcomes) => ({ outcomes: pageOutcomes })) as PayloadRef<
+    ChildWorkflowMapResultManifest<unknown>
+  >;
 }

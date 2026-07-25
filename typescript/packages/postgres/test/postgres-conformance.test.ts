@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Pool } from "pg";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   Client,
   type ActivityTask,
@@ -61,6 +61,19 @@ const describePostgres = postgresUrl === undefined ? describe.skip : describe;
 const managedBackends: PostgresBackend[] = [];
 const roots: string[] = [];
 let tableCounter = 0;
+
+// Every tracked backend owns its own single-connection pool, and each test
+// builds at least one. Draining only in `afterAll` therefore holds one server
+// connection per test for the whole file, which runs into `max_connections`
+// as the suite grows — the failure surfaces as `sorry, too many clients
+// already` in whichever tests happen to run last, not in the one that added a
+// backend. Releasing per test keeps the live connection count proportional to
+// concurrency instead of to the number of cases.
+afterEach(async () => {
+  for (const backend of managedBackends.splice(0)) {
+    await backend.destroy().catch(() => undefined);
+  }
+});
 
 afterAll(async () => {
   for (const backend of managedBackends.splice(0)) {
@@ -2213,7 +2226,10 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 2,
       terminal: false
     });
-    expect(revivePostgresJson<number[]>(activityMap?.in_flight)).toEqual([0, 1]);
+    // The descriptor column holds the engine's taken-slot count. Which
+    // ordinals hold those slots stays derivable from the item rows below, so
+    // the count is not a lossy summary of a set that used to be stored here.
+    expect(revivePostgresJson<number>(activityMap?.in_flight)).toBe(2);
     expect(revivePostgresJson<unknown[]>(activityMap?.results)).toEqual([null, null, null]);
     expect(revivePostgresJson<{ readonly activityName: string; readonly maxInFlight: number }>(
       activityMap?.task
@@ -2272,7 +2288,7 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 2,
       terminal: false
     });
-    expect(revivePostgresJson<number[]>(childMap?.in_flight)).toEqual([0, 1]);
+    expect(revivePostgresJson<number>(childMap?.in_flight)).toBe(2);
     expect(revivePostgresJson<unknown[]>(childMap?.outcomes)).toEqual([null, null, null]);
     expect(revivePostgresJson<{
       readonly workflowIdPrefix: string;
@@ -2358,7 +2374,13 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 3,
       terminal: false
     });
-    expect(revivePostgresJson<number[]>(activityMapAfterTwo?.in_flight)).toEqual([2]);
+    // Two of the three items landed and the third was admitted in their
+    // place, so every slot the bound allows is still accounted for. The count
+    // is the engine's admission accounting, which is only ever revised when it
+    // admits: it is conservative — never below the true number in flight — so
+    // it can delay an admission but can never let one past `maxInFlight`. The
+    // truthful per-item view is the item rows asserted just below.
+    expect(revivePostgresJson<number>(activityMapAfterTwo?.in_flight)).toBe(2);
     const activityResultsAfterTwo = revivePostgresJson<unknown[]>(
       activityMapAfterTwo?.results
     );
@@ -2398,7 +2420,7 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 3,
       terminal: true
     });
-    expect(revivePostgresJson<number[]>(completedActivityMap?.in_flight)).toEqual([]);
+    expect(revivePostgresJson<number>(completedActivityMap?.in_flight)).toBe(0);
     expect(
       revivePostgresJson<unknown[]>(completedActivityMap?.results).map((result) =>
         decodePayload(result)
@@ -2433,7 +2455,7 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 3,
       terminal: false
     });
-    expect(revivePostgresJson<number[]>(childMapAfterTwo?.in_flight)).toEqual([2]);
+    expect(revivePostgresJson<number>(childMapAfterTwo?.in_flight)).toBe(2);
     expect(
       revivePostgresJson<Array<{ readonly kind?: string; readonly result?: unknown } | null>>(
         childMapAfterTwo?.outcomes
@@ -2480,7 +2502,7 @@ describePostgres("PostgresBackend normalized history", () => {
       next_ordinal: 3,
       terminal: true
     });
-    expect(revivePostgresJson<number[]>(completedChildMap?.in_flight)).toEqual([]);
+    expect(revivePostgresJson<number>(completedChildMap?.in_flight)).toBe(0);
     expect(
       revivePostgresJson<Array<{ readonly kind: string; readonly result: unknown }>>(
         completedChildMap?.outcomes

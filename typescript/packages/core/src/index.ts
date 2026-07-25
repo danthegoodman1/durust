@@ -3,6 +3,8 @@ export * from "./backend.js";
 export * from "./fingerprint.js";
 export * from "./history.js";
 export * from "./manifest.js";
+export * from "./map-engine.js";
+export * from "./map-manifest.js";
 export * from "./options.js";
 export * from "./payload.js";
 export * from "./registry.js";

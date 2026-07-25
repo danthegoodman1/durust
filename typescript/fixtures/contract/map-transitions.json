@@ -1,0 +1,689 @@
+{
+  "note": [
+    "The shared map-fanout transition table. One artefact, two runners, so the",
+    "Rust and TypeScript map engines cannot drift apart silently.",
+    "",
+    "`transitions` are single-step engine cases: descriptor state plus one",
+    "event in, an ordered effect list or a rejection out. The TypeScript runner",
+    "(packages/core/test/map-engine.test.ts) drives them straight through",
+    "map-engine.ts's `step`. The Rust engine is a private module (`mod",
+    "map_engine;` in src/lib.rs, `pub(crate)` items), so an integration test in",
+    "tests/ cannot call `step` at all; the Rust runner therefore asserts the",
+    "`fanouts` section instead. See `rustRunnerBlocker` below.",
+    "",
+    "`fanouts` are scripted whole-fanout cases expressed only in terms of the",
+    "public provider API — claim an item, complete it, fail it, read the",
+    "parent's history. Both runtimes execute every one of them against their",
+    "own providers, so this section is the part that is genuinely asserted on",
+    "both sides today."
+  ],
+  "rustRunnerBlocker": {
+    "what": "tests/map_transitions.rs cannot assert the `transitions` section.",
+    "why": "src/map_engine.rs is a private module with pub(crate) items, and a Cargo integration test only sees the crate's public API.",
+    "unblock": "Expose the engine to tests — `#[cfg(test)] pub use map_engine::...` or a `pub mod map_engine` behind a test-only feature in src/lib.rs — after which the Rust runner is the same table walk the TypeScript one already performs."
+  },
+  "exclusions": [
+    {
+      "what": "ScheduleItemRetry.visibleAtMs and .timeoutAtMs values",
+      "why": "The two runtimes have different retry-policy models — RetryBackoff::{None,Exponential} over a fixed base in Rust, initialIntervalMs/maxIntervalMs/backoffCoefficient in TypeScript — that share no encoding, so numeric parity is impossible. Only the shape is normative and is asserted: `visibleAtMs === null` means immediately claimable, and a timed-out attempt always yields null. Cases carry `visibleAtMs` as \"Null\" or \"Deferred\" and `timeoutAtMs` as \"Null\" or \"Present\" rather than as numbers."
+    },
+    {
+      "what": "Every DescriptorCreated case where recordedOutcomes >= itemCount, including but not limited to the empty manifest",
+      "why": "TypeScript completes such a map at descriptor creation; Rust stalls, because all three Rust providers stall. The runtimes are knowingly divergent until the plan row that converges Rust lands. The exclusion is the whole predicate, not just itemCount === 0: where nextOrdinal < itemCount the TypeScript engine emits MaterializeItems and CompleteMap in one list and Rust emits only the materialization."
+    },
+    {
+      "what": "The ParentCancelled event",
+      "why": "It has no TypeScript producer: WorkflowTaskCommit has no cancelCommands field in TypeScript at all, so no provider can raise it. Rust drives it from WorkflowTaskCommit::cancel_commands. Each engine's own unit tests cover the transition; a shared table would be asserting behaviour one runtime cannot reach."
+    }
+  ],
+  "transitions": [
+    {
+      "name": "descriptor creation admits one contiguous batch bounded by maxInFlight",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 5,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 2 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 2, "inFlight": 2 }
+        ]
+      }
+    },
+    {
+      "name": "a bound larger than the manifest admits the whole manifest and no more",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 2,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 9,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 2 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 2, "inFlight": 2 }
+        ]
+      }
+    },
+    {
+      "name": "a zero bound is read as one slot so a degenerate descriptor cannot stall",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 0,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 1 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 1, "inFlight": 1 }
+        ]
+      }
+    },
+    {
+      "name": "a saturated descriptor admits nothing",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "an item completion releases exactly one slot and spends it on the next unadmitted ordinal",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 0,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+        ]
+      }
+    },
+    {
+      "name": "a child map records a per-item outcome row before admitting the replacement",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Succeeded" } },
+          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+        ]
+      }
+    },
+    {
+      "name": "the last item completes the map and marks the descriptor terminal",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 3,
+        "inFlight": 1,
+        "maxInFlight": 2,
+        "recordedOutcomes": 2,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 2,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "CompleteMap", "itemCount": 3 },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "the second-to-last item completes nothing",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 3,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "a duplicate terminal outcome records nothing and releases no slot",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 4,
+        "nextOrdinal": 3,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 0,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": true,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "a fail-fast child map stops on the first non-success, cancels its children, and abandons the rest",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "FailFast",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 0,
+        "outcome": { "kind": "Failed" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "RecordItemOutcome", "ordinal": 0, "outcome": { "kind": "Failed" } },
+          { "kind": "FailMap" },
+          { "kind": "AbandonPendingItems" },
+          { "kind": "CancelChildren" },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "a collect-all child map keeps going after a failed item",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 0,
+        "outcome": { "kind": "Failed" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "RecordItemOutcome", "ordinal": 0, "outcome": { "kind": "Failed" } },
+          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
+          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+        ]
+      }
+    },
+    {
+      "name": "a collect-all child map completes once every item is terminal, however it ended",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 1,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Cancelled" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Cancelled" } },
+          { "kind": "CompleteMap", "itemCount": 2 },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "an activity map is fail-fast whatever its failure mode field says",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "CollectAll",
+        "itemCount": 4,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Failed" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "FailMap" },
+          { "kind": "AbandonPendingItems" },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "a retryable attempt reschedules the item and keeps its slot",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemAttemptFailed",
+        "ordinal": 0,
+        "attemptFailure": "Failed",
+        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "failedAttempt": 1,
+        "retryBackoff": "Deferred",
+        "startToCloseTimeout": "Present",
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          {
+            "kind": "ScheduleItemRetry",
+            "ordinal": 0,
+            "nextAttempt": 2,
+            "visibleAtMs": "Deferred",
+            "timeoutAtMs": "Present"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a timed-out attempt is immediately claimable however the policy is paced",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemAttemptFailed",
+        "ordinal": 1,
+        "attemptFailure": "TimedOut",
+        "decision": { "kind": "Retry", "nextAttempt": 3 },
+        "failedAttempt": 2,
+        "retryBackoff": "Deferred",
+        "startToCloseTimeout": "Null",
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          {
+            "kind": "ScheduleItemRetry",
+            "ordinal": 1,
+            "nextAttempt": 3,
+            "visibleAtMs": "Null",
+            "timeoutAtMs": "Null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "a zero-delay policy leaves the retry immediately claimable",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemAttemptFailed",
+        "ordinal": 0,
+        "attemptFailure": "Failed",
+        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "failedAttempt": 1,
+        "retryBackoff": "Immediate",
+        "startToCloseTimeout": "Null",
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          {
+            "kind": "ScheduleItemRetry",
+            "ordinal": 0,
+            "nextAttempt": 2,
+            "visibleAtMs": "Null",
+            "timeoutAtMs": "Null"
+          }
+        ]
+      }
+    },
+    {
+      "name": "an exhausted attempt fails the map instead of rescheduling",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemAttemptFailed",
+        "ordinal": 0,
+        "attemptFailure": "Failed",
+        "decision": { "kind": "Exhausted" },
+        "failedAttempt": 3,
+        "retryBackoff": "Deferred",
+        "startToCloseTimeout": "Present",
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "FailMap" },
+          { "kind": "AbandonPendingItems" },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "terminal is absorbing: a completion after the map ended does nothing",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 3,
+        "nextOrdinal": 3,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": true
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 2,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "terminal is absorbing even for an out-of-bounds ordinal",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "FailFast",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": true
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 7,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "an ordinal outside the input manifest rejects the whole transition",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 2,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Reject", "reject": { "kind": "OutOfBounds", "ordinal": 2 } }
+    },
+    {
+      "name": "an out-of-bounds attempt failure rejects before the retry verdict is read",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 2,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemAttemptFailed",
+        "ordinal": 5,
+        "attemptFailure": "Failed",
+        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "failedAttempt": 1,
+        "retryBackoff": "Deferred",
+        "startToCloseTimeout": "Null",
+        "alreadyRecorded": false,
+        "parentTerminal": false
+      },
+      "expect": { "kind": "Reject", "reject": { "kind": "OutOfBounds", "ordinal": 5 } }
+    },
+    {
+      "name": "an activity map rejects a completion whose parent run is already closed",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 1,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": true
+      },
+      "expect": { "kind": "Reject", "reject": { "kind": "TerminalParent" } }
+    },
+    {
+      "name": "a child map keeps the outcome row and drops the notification when the parent is closed",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 2,
+        "nextOrdinal": 2,
+        "inFlight": 1,
+        "maxInFlight": 2,
+        "recordedOutcomes": 1,
+        "completed": false
+      },
+      "event": {
+        "kind": "ItemCompleted",
+        "ordinal": 1,
+        "outcome": { "kind": "Succeeded" },
+        "alreadyRecorded": false,
+        "parentTerminal": true
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Succeeded" } }
+        ]
+      }
+    }
+  ],
+  "fanouts": [
+    {
+      "name": "a bound of two admits one replacement per completion",
+      "itemCount": 3,
+      "maxInFlight": 2,
+      "steps": [
+        { "action": "claim", "ordinal": 0 },
+        { "action": "claim", "ordinal": 1 },
+        { "action": "claim", "ordinal": null },
+        { "action": "complete", "ordinal": 0 },
+        { "action": "claim", "ordinal": 2 },
+        { "action": "claim", "ordinal": null },
+        { "action": "complete", "ordinal": 1 },
+        { "action": "complete", "ordinal": 2 }
+      ],
+      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+    },
+    {
+      "name": "a bound of one is strictly sequential",
+      "itemCount": 2,
+      "maxInFlight": 1,
+      "steps": [
+        { "action": "claim", "ordinal": 0 },
+        { "action": "claim", "ordinal": null },
+        { "action": "complete", "ordinal": 0 },
+        { "action": "claim", "ordinal": 1 },
+        { "action": "complete", "ordinal": 1 }
+      ],
+      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+    },
+    {
+      "name": "a bound larger than the manifest admits every item at once and no more",
+      "itemCount": 2,
+      "maxInFlight": 5,
+      "steps": [
+        { "action": "claim", "ordinal": 0 },
+        { "action": "claim", "ordinal": 1 },
+        { "action": "claim", "ordinal": null },
+        { "action": "complete", "ordinal": 0 },
+        { "action": "complete", "ordinal": 1 }
+      ],
+      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+    },
+    {
+      "name": "an exhausted item fails the map, abandons its siblings, and admits nothing further",
+      "itemCount": 3,
+      "maxInFlight": 2,
+      "steps": [
+        { "action": "claim", "ordinal": 0 },
+        { "action": "claim", "ordinal": 1 },
+        { "action": "fail", "ordinal": 0 },
+        { "action": "completeAbandoned", "ordinal": 1 },
+        { "action": "claim", "ordinal": null }
+      ],
+      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapFailed"]
+    }
+  ]
+}

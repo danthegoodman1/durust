@@ -1,5 +1,6 @@
 import type {
   ClaimedWorkflowTask,
+  CommandId,
   DurableBackend,
   HistoryEvent,
   PrepareWorkflowTaskOptions,
@@ -77,6 +78,56 @@ export interface ProviderConformanceCase {
   readonly name: string;
   run(factory: () => DurableBackend): Promise<void>;
 }
+
+/**
+ * The two strings a fail-fast child workflow map writes into durable history:
+ * the parent's `ChildWorkflowMapFailed.failure.message` when the item that
+ * stopped the map was *cancelled*, and the `reason` on every sibling child's
+ * `WorkflowCancelled`.
+ *
+ * Nothing in the TypeScript suite asserted either one before this table, so
+ * "map conformance passes unchanged" was vacuous for exactly the two
+ * behaviours the shared map engine converges (plan decisions D3/D4).
+ * TypeScript was a *fourth* variant on both — a bare child cancellation reason
+ * and a `child workflow map failed: {runId}:{seq}` sibling reason — so the
+ * table was added against the unconverged strings first and the convergence
+ * shows up here as a diff instead of as a silent change to persisted history.
+ *
+ * One table, not three: unlike Rust, all three TypeScript providers already
+ * agreed byte-for-byte, because `PostgresBackend` and `SqliteBackend` copied
+ * `MemoryBackend`'s formatting verbatim.
+ */
+export interface FailFastHistoryStrings {
+  /** `(item ordinal, child cancellation reason) -> parent-visible message`. */
+  readonly cancelledItemMessage: (ordinal: number, reason: string) => string;
+  /** `map command id -> sibling WorkflowCancelled.reason`. */
+  readonly siblingCancellationReason: (mapCommandId: CommandId) => string;
+}
+
+/**
+ * The converged forms, produced once by `map-engine.ts`'s `failFastFailure`
+ * and `childCancellationReason` and pinned there byte for byte; asserted here
+ * against the durable history all three providers actually write. Both match
+ * the Rust engine, which converged onto the same two strings.
+ *
+ * Before the convergence the message was the child's raw cancellation reason
+ * with no item attribution at all, and the sibling reason named the command
+ * without quoting the run:
+ *
+ *     cancelledItemMessage: (_ordinal, reason) => reason,
+ *     siblingCancellationReason: (id) =>
+ *       `child workflow map failed: ${id.runId}:${id.seq}`
+ *
+ * Replaying an old history is unaffected: neither string is part of a command
+ * fingerprint, and the runtime matches a map failure on the command id without
+ * inspecting the message.
+ */
+export const FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = {
+  cancelledItemMessage: (ordinal, reason) =>
+    `child workflow map item ${ordinal} was cancelled: ${reason}`,
+  siblingCancellationReason: (mapCommandId) =>
+    `child workflow map \`${mapCommandId.runId}\`:${mapCommandId.seq} failed`
+};
 
 export function basicProviderConformanceCases(): readonly ProviderConformanceCase[] {
   return [
@@ -1616,6 +1667,272 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
+      // The engine ends a failed map with `AbandonPendingItems`, so a sibling
+      // that was still in flight is tombstoned rather than left claimable and
+      // completable against a map whose result manifest will never be
+      // assembled. Before the shared engine every provider left the sibling
+      // alone and answered its late completion with `Completed`, reporting
+      // success for an item whose result is discarded.
+      name: "a failed activity map tombstones the siblings it left in flight",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest(
+          [{ value: 1 }, { value: 2 }, { value: 3 }],
+          3
+        );
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.map-abandon",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "map-abandon",
+          maxInFlight: 2,
+          fingerprint: activityMapFingerprint(
+            "conformance.map-abandon",
+            payloadDigest(inputManifest),
+            "map-abandon",
+            2,
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+
+        const claimOptions = {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-abandon"],
+          leaseDurationMs: 30_000
+        };
+        const doomed = await backend.claimActivityTask("map-abandon-1", claimOptions);
+        const sibling = await backend.claimActivityTask("map-abandon-2", claimOptions);
+        assert(doomed !== null && sibling !== null, "both bounded items should be claimable");
+
+        const failed = await backend.failActivity({
+          claim: doomed.claim,
+          failure: {
+            errorType: "test.map.fatal",
+            message: "fatal map item",
+            nonRetryable: true
+          }
+        });
+        assert(failed.kind === "Failed", "an exhausted map item should fail the map");
+
+        // The sibling is over even though it holds a live-looking claim: its
+        // work has nowhere to land.
+        const lateFailure = await backend.failActivity({
+          claim: sibling.claim,
+          failure: {
+            errorType: "test.map.late",
+            message: "late sibling failure",
+            nonRetryable: true
+          }
+        });
+        assert(
+          lateFailure.kind === "AlreadyCompleted",
+          `abandoned sibling should reject a late failure, got ${lateFailure.kind}`
+        );
+        const lateCompletion = await backend.completeActivity({
+          claim: sibling.claim,
+          result: encodePayload({ value: 99 }, { codec: "Json" })
+        });
+        assert(
+          lateCompletion.kind === "AlreadyCompleted",
+          `abandoned sibling should reject a late completion, got ${lateCompletion.kind}`
+        );
+
+        const resurrected = await backend.claimActivityTask("map-abandon-3", claimOptions);
+        assert(resurrected === null, "no item of a failed map should be claimable");
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
+          "an abandoned sibling must not append a second terminal map fact"
+        );
+      }
+    },
+    {
+      // Materialization is batch-shaped: the engine admits a contiguous range
+      // and the provider starts every child in it, so an id collision at one
+      // ordinal is that item's terminal outcome rather than a reason to skip
+      // its batch-mates. Before the shared engine the collision ended the map
+      // from inside the admission loop and the remaining ordinals of the same
+      // batch were never started at all.
+      name: "a fail-fast child map with a colliding item id cancels the siblings it started",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const prefix = "wf/child-map-collide";
+        const childType = workflowType("conformance.child-map-collide", 1);
+        await backend.startWorkflow({
+          namespace: namespace(),
+          workflowId: workflowId(`${prefix}/0`),
+          workflowType: childType,
+          taskQueue: taskQueue("child-workflows"),
+          input: encodePayload({ value: "squatter" }, { codec: "Json" })
+        });
+
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const mapCommandId = commandId(claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommandId,
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "child-collide",
+          workflowIdPrefix: prefix,
+          maxInFlight: 2,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "FailFast" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "child-collide",
+            prefix,
+            2,
+            "child-workflows",
+            "Cancel",
+            "FailFast"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              workflowType: scheduled.workflowType,
+              taskQueue: scheduled.taskQueue,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              workflowIdPrefix: scheduled.workflowIdPrefix,
+              maxInFlight: scheduled.maxInFlight,
+              parentClosePolicy: scheduled.parentClosePolicy,
+              failureMode: scheduled.failureMode
+            }
+          ]
+        });
+
+        // The parent's `ChildWorkflowMapFailed` is deliberately not asserted
+        // here. The collision is at ordinal 0 of the *initial* admission
+        // batch, so the map's terminal fact is produced inside the parent's
+        // own `commitWorkflowTask`, and SQLite loses every map terminal fact
+        // written there to the commit's outer workflow save — a lost update
+        // tracked as its own plan row and out of scope for this wiring. The
+        // fail-fast case above covers the parent fact on all three providers
+        // by ending the map from a child's commit instead. What is asserted
+        // here is the part this change moved: the collision's batch-mate.
+
+        // Ordinal 1 shared the collision's admission batch, so it was started
+        // before the map ended and must be cancelled rather than orphaned.
+        const sibling = await backend.startWorkflow({
+          namespace: namespace(),
+          workflowId: workflowId(`${prefix}/1`),
+          workflowType: childType,
+          taskQueue: taskQueue("child-workflows"),
+          input: encodePayload({ value: "probe" }, { codec: "Json" })
+        });
+        assert(
+          sibling.kind === "AlreadyStarted",
+          "the collision's batch-mate should already exist"
+        );
+        const siblingHistory = await backend.streamHistory({
+          runId: sibling.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          siblingHistory.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,WorkflowCancelled",
+          `the collision's batch-mate should be cancelled, got ${siblingHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const cancelled = siblingHistory.events.at(-1)?.data;
+        assert(cancelled?.kind === "WorkflowCancelled", "expected WorkflowCancelled");
+        assert(
+          cancelled.reason ===
+            FAIL_FAST_HISTORY_STRINGS.siblingCancellationReason(mapCommandId),
+          `unpinned sibling cancellation reason: ${cancelled.reason}`
+        );
+      }
+    },
+    {
+      // The engine clamps a non-positive bound so an already-persisted
+      // degenerate descriptor cannot stall forever, but the provider rejects
+      // one at the scheduling boundary: silently reinterpreting `0` as `1`
+      // turns a caller typo into a throughput collapse that only shows up in
+      // production. The clamp is the recovery path, not the policy.
+      name: "scheduling a map with a non-positive maxInFlight is rejected, not clamped",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([{ value: 1 }], 1);
+        const mapCommandId = commandId(claim.runId, 1);
+        let rejected: unknown = null;
+        try {
+          await backend.commitWorkflowTask(claim, {
+            expectedTailEventId: eventId(1),
+            scheduleActivityMaps: [
+              {
+                mapCommandId,
+                activityName: "conformance.map-zero-bound",
+                taskQueue: "activities",
+                retryPolicy: RetryPolicy.none(),
+                startToCloseTimeoutMs: null,
+                heartbeatTimeoutMs: null,
+                inputManifest,
+                resultManifestName: "map-zero-bound",
+                maxInFlight: 0
+              }
+            ]
+          });
+        } catch (error) {
+          rejected = error;
+        }
+        assert(rejected !== null, "a zero maxInFlight must be rejected at the boundary");
+        assert(
+          String((rejected as Error).message).includes(
+            "maxInFlight must be a positive integer"
+          ),
+          `unexpected rejection: ${String((rejected as Error).message)}`
+        );
+
+        const claimed = await backend.claimActivityTask("map-zero-bound-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-zero-bound"],
+          leaseDurationMs: 30_000
+        });
+        assert(claimed === null, "a rejected map must not materialize an item");
+      }
+    },
+    {
       name: "timer waits fire only when due and wake the workflow",
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
@@ -2455,6 +2772,133 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           siblingHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,WorkflowCancelled",
           "fail-fast should cancel running child-map siblings"
+        );
+      }
+    },
+    {
+      // Drives a fail-fast child map through a *cancelled* item, because the
+      // cancelled arm is the only place a provider synthesizes the
+      // parent-visible failure message itself. Asserts the two persisted
+      // strings against `FAIL_FAST_HISTORY_STRINGS`, so converging them onto
+      // the shared engine's forms is a visible diff in that table rather than
+      // a silent rewrite of durable history.
+      name: "child workflow map fail-fast persists pinned item and sibling cancellation strings",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const childType = workflowType("conformance.child-map-strings", 1);
+        const mapCommandId = commandId(claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommandId,
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "child-strings",
+          workflowIdPrefix: "wf/child-map-strings",
+          maxInFlight: 2,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "FailFast" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "child-strings",
+            "wf/child-map-strings",
+            2,
+            "child-workflows",
+            "Cancel",
+            "FailFast"
+          )
+        };
+
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              workflowType: scheduled.workflowType,
+              taskQueue: scheduled.taskQueue,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              workflowIdPrefix: scheduled.workflowIdPrefix,
+              maxInFlight: scheduled.maxInFlight,
+              parentClosePolicy: scheduled.parentClosePolicy,
+              failureMode: scheduled.failureMode
+            }
+          ]
+        });
+
+        const first = await backend.claimWorkflowTask("child-map-strings-1", {
+          namespace: namespace(),
+          taskQueue: taskQueue("child-workflows"),
+          registeredWorkflowTypes: [childType],
+          leaseDurationMs: 30_000
+        });
+        const second = await backend.claimWorkflowTask("child-map-strings-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("child-workflows"),
+          registeredWorkflowTypes: [childType],
+          leaseDurationMs: 30_000
+        });
+        assert(first !== null && second !== null, "fail-fast should materialize both children");
+
+        const cancelledOrdinal = Number(
+          String(first.workflowId).slice(`${scheduled.workflowIdPrefix}/`.length)
+        );
+        assert(
+          Number.isInteger(cancelledOrdinal),
+          "map child ids are `{prefix}/{ordinal}`"
+        );
+
+        await backend.commitWorkflowTask(first.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "WorkflowCancelled", reason: "child stopped" } }]
+        });
+
+        const parentReady = await backend.claimWorkflowTask("child-map-strings-parent", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          parentReady?.reason === "ChildWorkflowMapFailed",
+          "cancelled fail-fast item should wake the parent as failed"
+        );
+
+        const parentHistory = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        const failed = parentHistory.events.at(-1)?.data;
+        assert(failed?.kind === "ChildWorkflowMapFailed", "expected ChildWorkflowMapFailed");
+        assert(
+          failed.failed.failure.errorType === "durust.child_workflow_cancelled",
+          "cancelled fail-fast item should be reported as a cancellation failure"
+        );
+        assert(failed.failed.failure.nonRetryable, "cancellation failure is non-retryable");
+        assert(
+          failed.failed.failure.message ===
+            FAIL_FAST_HISTORY_STRINGS.cancelledItemMessage(cancelledOrdinal, "child stopped"),
+          `unpinned fail-fast item message: ${failed.failed.failure.message}`
+        );
+
+        const siblingHistory = await backend.streamHistory({
+          runId: second.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        const cancelled = siblingHistory.events.at(-1)?.data;
+        assert(cancelled?.kind === "WorkflowCancelled", "sibling should be cancelled");
+        assert(
+          cancelled.reason ===
+            FAIL_FAST_HISTORY_STRINGS.siblingCancellationReason(mapCommandId),
+          `unpinned sibling cancellation reason: ${cancelled.reason}`
         );
       }
     }

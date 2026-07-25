@@ -1,8 +1,12 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   MemoryBackend,
   RetryPolicy,
   activityFingerprint,
+  activityMapFingerprint,
+  activityMapManifest,
   activityTaskFromScheduled,
   commandId,
   encodePayload,
@@ -13,6 +17,7 @@ import {
   taskQueue,
   workflowId,
   workflowType,
+  type ActivityTaskClaim,
   type ChildWorkflowMapItemOutcome,
   type DurableFailure
 } from "@durust/core";
@@ -976,4 +981,351 @@ describe("map engine: shared tallies and persisted strings", () => {
     expect(mapOrdinalInBounds(state, -1)).toBe(false);
     expect(mapOrdinalInBounds(activityMap(0, 2), 0)).toBe(false);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The shared transition table (`typescript/fixtures/contract/map-transitions.json`).
+//
+// One checked-in artefact, read by this runner and by `tests/map_transitions.rs`,
+// so the Rust and TypeScript map engines cannot drift apart silently. The file
+// itself documents which behaviours are deliberately excluded because the two
+// runtimes are knowingly divergent there, and why the Rust runner asserts the
+// `fanouts` section rather than the `transitions` one.
+// ---------------------------------------------------------------------------
+
+interface TransitionTable {
+  readonly exclusions: readonly { readonly what: string; readonly why: string }[];
+  readonly transitions: readonly TransitionCase[];
+  readonly fanouts: readonly FanoutCase[];
+}
+
+interface TransitionCase {
+  readonly name: string;
+  readonly state: {
+    readonly kind: MapState["kind"];
+    readonly failureMode: MapState["failureMode"];
+    readonly itemCount: number;
+    readonly nextOrdinal: number;
+    readonly inFlight: number;
+    readonly maxInFlight: number;
+    readonly recordedOutcomes: number;
+    readonly completed: boolean;
+  };
+  readonly event: Record<string, unknown> & { readonly kind: MapEvent["kind"] };
+  readonly expect:
+    | { readonly kind: "Effects"; readonly effects: readonly Record<string, unknown>[] }
+    | { readonly kind: "Reject"; readonly reject: Record<string, unknown> };
+}
+
+interface FanoutCase {
+  readonly name: string;
+  readonly itemCount: number;
+  readonly maxInFlight: number;
+  readonly steps: readonly {
+    readonly action: "claim" | "complete" | "fail" | "completeAbandoned";
+    readonly ordinal: number | null;
+  }[];
+  readonly parentHistory: readonly string[];
+}
+
+const TRANSITION_TABLE = JSON.parse(
+  readFileSync(
+    fileURLToPath(new URL("../../../fixtures/contract/map-transitions.json", import.meta.url)),
+    "utf8"
+  )
+) as TransitionTable;
+
+/**
+ * Backoff whose first retry is genuinely deferred, used wherever the table says
+ * `"Deferred"`. The table never asserts the delay itself — the two runtimes
+ * have different policy models — only that a deferred retry lands in the
+ * future and an immediate one lands at `null`.
+ */
+const TABLE_DEFERRED_BACKOFF = RetryPolicy.exponential({
+  initialIntervalMs: 5_000,
+  maxIntervalMs: 60_000,
+  maxAttempts: 9,
+  backoffCoefficient: 2
+});
+const TABLE_IMMEDIATE_BACKOFF = RetryPolicy.exponential({
+  initialIntervalMs: 0,
+  maxIntervalMs: 0,
+  maxAttempts: 9,
+  backoffCoefficient: 1
+});
+const TABLE_NOW_MS = 1_700_000_000_000;
+const TABLE_START_TO_CLOSE_MS = 30_000;
+
+function tableState(testCase: TransitionCase): MapState {
+  return { mapCommandId: MAP_COMMAND_ID, ...testCase.state };
+}
+
+function tableEvent(event: TransitionCase["event"]): MapEvent {
+  if (event.kind === "DescriptorCreated") {
+    return { kind: "DescriptorCreated", parentTerminal: event.parentTerminal as boolean };
+  }
+  if (event.kind === "ItemCompleted") {
+    return {
+      kind: "ItemCompleted",
+      ordinal: event.ordinal as number,
+      outcome: tableOutcome(event.outcome as { readonly kind: string }),
+      alreadyRecorded: event.alreadyRecorded as boolean,
+      parentTerminal: event.parentTerminal as boolean
+    };
+  }
+  if (event.kind === "ItemAttemptFailed") {
+    return {
+      kind: "ItemAttemptFailed",
+      ordinal: event.ordinal as number,
+      failure: ITEM_FAILURE,
+      attemptFailure: event.attemptFailure as ItemAttemptFailureKind,
+      decision: event.decision as ItemRetryDecision,
+      failedAttempt: event.failedAttempt as number,
+      retryPolicy:
+        event.retryBackoff === "Immediate" ? TABLE_IMMEDIATE_BACKOFF : TABLE_DEFERRED_BACKOFF,
+      startToCloseTimeoutMs:
+        event.startToCloseTimeout === "Present" ? TABLE_START_TO_CLOSE_MS : null,
+      nowMs: TABLE_NOW_MS,
+      alreadyRecorded: event.alreadyRecorded as boolean,
+      parentTerminal: event.parentTerminal as boolean
+    };
+  }
+  throw new Error(`the shared table excludes the ${event.kind} event`);
+}
+
+function tableOutcome(outcome: { readonly kind: string }): ChildWorkflowMapItemOutcome<unknown> {
+  if (outcome.kind === "Succeeded") {
+    return success();
+  }
+  return outcome.kind === "Failed" ? itemFailure() : itemCancelled();
+}
+
+/**
+ * Project one effect onto the fields the table asserts. Payloads, failures and
+ * reasons are dropped — they are language-local values, and the engines' own
+ * unit tests pin them — and the two retry instants are reduced to the shape the
+ * table declares normative.
+ */
+function tableEffect(effect: MapEffect): Record<string, unknown> {
+  switch (effect.kind) {
+    case "RecordItemOutcome":
+      return { kind: effect.kind, ordinal: effect.ordinal, outcome: { kind: effect.outcome.kind } };
+    case "MaterializeItems":
+      return { kind: effect.kind, firstOrdinal: effect.firstOrdinal, count: effect.count };
+    case "AdvanceDescriptor":
+      return { kind: effect.kind, nextOrdinal: effect.nextOrdinal, inFlight: effect.inFlight };
+    case "ScheduleItemRetry":
+      return {
+        kind: effect.kind,
+        ordinal: effect.ordinal,
+        nextAttempt: effect.nextAttempt,
+        visibleAtMs: effect.visibleAtMs === null ? "Null" : "Deferred",
+        timeoutAtMs: effect.timeoutAtMs === null ? "Null" : "Present"
+      };
+    case "CompleteMap":
+      return { kind: effect.kind, itemCount: effect.itemCount };
+    case "FailMap":
+    case "AbandonPendingItems":
+    case "CancelChildren":
+    case "MarkDescriptorTerminal":
+      return { kind: effect.kind };
+  }
+}
+
+describe("map engine: shared transition table", () => {
+  it("declares its cross-runtime exclusions", () => {
+    // A table that quietly loses an exclusion would start asserting a
+    // behaviour one runtime cannot match, and the failure would look like a
+    // regression rather than an out-of-date exclusion list.
+    expect(TRANSITION_TABLE.exclusions.map((exclusion) => exclusion.what)).toEqual([
+      "ScheduleItemRetry.visibleAtMs and .timeoutAtMs values",
+      "Every DescriptorCreated case where recordedOutcomes >= itemCount, including but not limited to the empty manifest",
+      "The ParentCancelled event"
+    ]);
+    for (const exclusion of TRANSITION_TABLE.exclusions) {
+      expect(exclusion.why.length).toBeGreaterThan(80);
+    }
+  });
+
+  it("covers every effect the engine can emit except the excluded ones", () => {
+    const emitted = new Set<string>();
+    for (const testCase of TRANSITION_TABLE.transitions) {
+      if (testCase.expect.kind !== "Effects") {
+        continue;
+      }
+      for (const effect of testCase.expect.effects) {
+        emitted.add(effect.kind as string);
+      }
+    }
+    // Every `MapEffect` variant but the one only `ParentCancelled` can reach
+    // on its own, which the table excludes.
+    expect([...emitted].sort()).toEqual([
+      "AbandonPendingItems",
+      "AdvanceDescriptor",
+      "CancelChildren",
+      "CompleteMap",
+      "FailMap",
+      "MarkDescriptorTerminal",
+      "MaterializeItems",
+      "RecordItemOutcome",
+      "ScheduleItemRetry"
+    ]);
+    const rejected = new Set(
+      TRANSITION_TABLE.transitions
+        .filter((testCase) => testCase.expect.kind === "Reject")
+        .map((testCase) =>
+          testCase.expect.kind === "Reject" ? (testCase.expect.reject.kind as string) : ""
+        )
+    );
+    expect([...rejected].sort()).toEqual(["OutOfBounds", "TerminalParent"]);
+  });
+
+  it("never asserts a DescriptorCreated case the two runtimes disagree on", () => {
+    for (const testCase of TRANSITION_TABLE.transitions) {
+      if (testCase.event.kind !== "DescriptorCreated") {
+        continue;
+      }
+      expect(
+        testCase.state.recordedOutcomes < testCase.state.itemCount,
+        `${testCase.name} is inside the excluded DescriptorCreated predicate`
+      ).toBe(true);
+    }
+    expect(
+      TRANSITION_TABLE.transitions.some((testCase) => testCase.event.kind === "ParentCancelled")
+    ).toBe(false);
+  });
+
+  for (const testCase of TRANSITION_TABLE.transitions) {
+    it(`table: ${testCase.name}`, () => {
+      const transition = step(tableState(testCase), tableEvent(testCase.event));
+      if (testCase.expect.kind === "Reject") {
+        expect(transition.kind).toBe("Reject");
+        if (transition.kind !== "Reject") {
+          return;
+        }
+        expect({ ...transition.reject }).toEqual(testCase.expect.reject);
+        return;
+      }
+      expect(transition.kind).toBe("Effects");
+      if (transition.kind !== "Effects") {
+        return;
+      }
+      expect(transition.effects.map(tableEffect)).toEqual(testCase.expect.effects);
+    });
+  }
+});
+
+describe("map engine: shared transition table fanouts", () => {
+  for (const fanout of TRANSITION_TABLE.fanouts) {
+    it(`fanout: ${fanout.name}`, async () => {
+      const backend = new MemoryBackend();
+      await backend.startWorkflow({
+        namespace: namespace(),
+        workflowId: workflowId("wf/map-table-fanout"),
+        workflowType: workflowType("map-table.workflow", 1),
+        taskQueue: taskQueue("workflows"),
+        input: encodePayload({ value: 1 }, { codec: "Json" })
+      });
+      const claimed = await backend.claimWorkflowTask("fanout-scheduler", {
+        namespace: namespace(),
+        taskQueue: taskQueue("workflows"),
+        registeredWorkflowTypes: [workflowType("map-table.workflow", 1)],
+        leaseDurationMs: 30_000
+      });
+      if (claimed === null) {
+        throw new Error("expected workflow claim");
+      }
+      const items = Array.from({ length: fanout.itemCount }, (_, index) => ({ value: index }));
+      const inputManifest = activityMapManifest(items, 2);
+      const scheduled = {
+        commandId: commandId(claimed.runId, 1),
+        activityName: "map-table.item",
+        taskQueue: "activities",
+        retryPolicy: RetryPolicy.none(),
+        startToCloseTimeoutMs: null,
+        heartbeatTimeoutMs: null,
+        inputManifest,
+        resultManifestName: "mapped",
+        maxInFlight: fanout.maxInFlight,
+        fingerprint: activityMapFingerprint(
+          "map-table.item",
+          payloadDigest(inputManifest),
+          "mapped",
+          fanout.maxInFlight,
+          "sha256:map-table"
+        )
+      };
+      await backend.commitWorkflowTask(claimed.claim, {
+        expectedTailEventId: eventId(1),
+        appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+        scheduleActivityMaps: [
+          {
+            mapCommandId: scheduled.commandId,
+            activityName: scheduled.activityName,
+            taskQueue: scheduled.taskQueue,
+            retryPolicy: scheduled.retryPolicy,
+            startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+            heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+            inputManifest: scheduled.inputManifest,
+            resultManifestName: scheduled.resultManifestName,
+            maxInFlight: scheduled.maxInFlight
+          }
+        ]
+      });
+
+      const claims = new Map<number, ActivityTaskClaim>();
+      for (const [index, stepCase] of fanout.steps.entries()) {
+        const where = `${fanout.name} step ${index} (${stepCase.action})`;
+        if (stepCase.action === "claim") {
+          const task = await backend.claimActivityTask(`fanout-worker-${index}`, {
+            namespace: namespace(),
+            taskQueue: taskQueue("activities"),
+            registeredActivityNames: ["map-table.item"],
+            leaseDurationMs: 30_000
+          });
+          expect(task?.task.mapItem?.itemOrdinal ?? null, where).toBe(stepCase.ordinal);
+          if (task !== null) {
+            claims.set(task.task.mapItem?.itemOrdinal ?? -1, task.claim);
+          }
+          continue;
+        }
+        const claim = claims.get(stepCase.ordinal as number);
+        if (claim === undefined) {
+          throw new Error(`${where}: ordinal was never claimed`);
+        }
+        if (stepCase.action === "complete") {
+          const outcome = await backend.completeActivity({
+            claim,
+            result: encodePayload({ value: stepCase.ordinal }, { codec: "Json" })
+          });
+          expect(outcome.kind, where).toBe("Completed");
+          continue;
+        }
+        if (stepCase.action === "completeAbandoned") {
+          const outcome = await backend.completeActivity({
+            claim,
+            result: encodePayload({ value: stepCase.ordinal }, { codec: "Json" })
+          });
+          expect(outcome.kind, where).toBe("AlreadyCompleted");
+          continue;
+        }
+        const outcome = await backend.failActivity({
+          claim,
+          failure: { errorType: "map-table.fatal", message: "fatal", nonRetryable: true }
+        });
+        expect(outcome.kind, where).toBe("Failed");
+      }
+
+      const history = await backend.streamHistory({
+        runId: claimed.runId,
+        afterEventId: eventId(0),
+        upToEventId: eventId(50),
+        maxEvents: 50,
+        maxBytes: Number.MAX_SAFE_INTEGER
+      });
+      expect(history.events.map((event) => event.eventType), fanout.name).toEqual(
+        fanout.parentHistory
+      );
+    });
+  }
 });

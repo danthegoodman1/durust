@@ -19,6 +19,7 @@ import type {
 } from "./options.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { assertDurableInputValue } from "./internal.js";
+import { readMapManifestItems } from "./map-manifest.js";
 import {
   createActivityDurablePromise,
   createActivityMapHandle,
@@ -493,43 +494,10 @@ export interface ActivityMapResultPage<Output> {
   readonly results: readonly PayloadRef<Output>[];
 }
 
-interface PagedManifest<Page> {
-  readonly itemCount: number;
-  readonly pageLengths: readonly number[];
-  readonly pages: readonly PayloadRef<Page>[];
-}
-
-// Single paged-manifest reader for the activity-map and child-workflow-map result
-// manifests: walk pages, flatten items, and enforce the item-count and page-length
-// invariants once instead of in each decoder.
-function decodePagedManifestItems<Page, Item>(
-  manifestRef: PayloadRef<PagedManifest<Page>>,
-  pageItems: (page: Page) => readonly Item[],
-  label: string
-): readonly Item[] {
-  const manifest = decodePayload<PagedManifest<Page>>(manifestRef);
-  const items: Item[] = [];
-  for (const pageRef of manifest.pages) {
-    items.push(...pageItems(decodePayload<Page>(pageRef)));
-  }
-  if (items.length !== manifest.itemCount) {
-    throw new Error(
-      `${label} item count mismatch: expected ${manifest.itemCount}, got ${items.length}`
-    );
-  }
-  const pageItemCount = manifest.pageLengths.reduce((sum, count) => sum + count, 0);
-  if (pageItemCount !== manifest.itemCount) {
-    throw new Error(
-      `${label} page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
-    );
-  }
-  return items;
-}
-
 function decodeActivityMapResultRefs<Output>(
   manifestRef: PayloadRef<ActivityMapResultManifest<Output>>
 ): readonly PayloadRef<Output>[] {
-  return decodePagedManifestItems(
+  return readMapManifestItems(
     manifestRef,
     (page: ActivityMapResultPage<Output>) => page.results,
     "activity map result manifest"
@@ -627,7 +595,7 @@ export interface ChildWorkflowMapResultPage<Output> {
 export function decodeChildWorkflowMapOutcomes<Output>(
   manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>
 ): readonly ChildWorkflowMapItemOutcome<Output>[] {
-  return decodePagedManifestItems(
+  return readMapManifestItems(
     manifestRef,
     (page: ChildWorkflowMapResultPage<Output>) => page.outcomes,
     "child workflow map result manifest"
