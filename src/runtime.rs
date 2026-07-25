@@ -24,6 +24,81 @@ thread_local! {
     static CURRENT_ACTIVITY_CONTEXT: Cell<*const ActivityRuntimeContext> = const { Cell::new(std::ptr::null()) };
 }
 
+/// Address parked in a context slot while `with_context` /
+/// `with_activity_context` holds the context borrow. It is never dereferenced.
+/// It exists so a nested durable API call is reported as re-entrancy rather
+/// than as "no context installed", which a plain null could not distinguish.
+const BORROWED_CONTEXT_ADDR: usize = 1;
+
+/// Lowest address a live context pointer can hold. Both context types are
+/// pointer-aligned, so no live context can collide with the borrow sentinel and
+/// one `addr() < LIVE_CONTEXT_ADDR` comparison rejects both unusable states for
+/// the same single branch the previous null check cost.
+const LIVE_CONTEXT_ADDR: usize = BORROWED_CONTEXT_ADDR + 1;
+
+const _: () = assert!(std::mem::align_of::<RuntimeContext>() >= LIVE_CONTEXT_ADDR);
+const _: () = assert!(std::mem::align_of::<ActivityRuntimeContext>() >= LIVE_CONTEXT_ADDR);
+
+/// Restores a thread-local context slot when dropped, including when the
+/// guarded call unwinds. Restoring sequentially after the call would leave a
+/// freed context installed for the next task scheduled on this thread.
+///
+/// `P: Copy` is load-bearing, not a convenience. This `Drop` runs while an
+/// unwind is in flight, and a panic raised during an unwind aborts the process,
+/// so it must be structurally incapable of panicking. `Copy` and `Drop` are
+/// mutually exclusive in Rust, so no instantiation of `P` can run a user
+/// destructor here. Do not relax the bound to `Clone`.
+struct ContextRestore<'slot, P: Copy> {
+    slot: &'slot Cell<P>,
+    previous: P,
+}
+
+impl<'slot, P: Copy> ContextRestore<'slot, P> {
+    fn install(slot: &'slot Cell<P>, next: P) -> Self {
+        let previous = slot.replace(next);
+        Self { slot, previous }
+    }
+}
+
+impl<P: Copy> Drop for ContextRestore<'_, P> {
+    fn drop(&mut self) {
+        self.slot.set(self.previous);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn workflow_context_unavailable(installed: *mut RuntimeContext) -> ! {
+    if installed.addr() == BORROWED_CONTEXT_ADDR {
+        // Name the shapes of user code that can be running inside the borrow
+        // rather than asserting one of them. The caller is not always a
+        // `side_effect` closure: a `Serialize` impl encoded by a durable API
+        // reaches here too, and so does any other callback a durable API
+        // invokes. Naming the re-entered API instead would point at the wrong
+        // end of the call.
+        panic!(
+            "durust durable APIs are not re-entrant: this call ran while another durable API held \
+             the workflow context. The caller is user code executing inside that borrow — most \
+             often a `side_effect` closure, but also a `Serialize` impl on a value a durable API \
+             is encoding, or any other callback a durable API invokes. Compute the value first \
+             and call the durable API outside the callback."
+        );
+    }
+    panic!("durust durable APIs must be polled inside a workflow task");
+}
+
+#[cold]
+#[inline(never)]
+fn activity_context_unavailable(installed: *const ActivityRuntimeContext) -> ! {
+    if installed.addr() == BORROWED_CONTEXT_ADDR {
+        panic!(
+            "durust activity APIs are not re-entrant: this call ran inside another activity API's \
+             callback"
+        );
+    }
+    panic!("durust activity APIs must be polled inside an activity task");
+}
+
 pub(crate) fn poll_with_runtime_context<F, T>(
     context: &mut RuntimeContext,
     poll: F,
@@ -32,22 +107,34 @@ where
     F: FnOnce() -> Poll<Result<T>>,
 {
     CURRENT_CONTEXT.with(|slot| {
-        let previous = slot.replace(context as *mut RuntimeContext);
-        let result = poll();
-        slot.set(previous);
-        result
+        // The guard restores the previous pointer even if `poll` unwinds. A
+        // sequential restore would leak a dangling `*mut RuntimeContext` into
+        // this thread's slot, which the next workflow task would dereference.
+        let _restore = ContextRestore::install(slot, context as *mut RuntimeContext);
+        poll()
     })
 }
 
 fn with_context<T>(f: impl FnOnce(&mut RuntimeContext) -> T) -> T {
     CURRENT_CONTEXT.with(|slot| {
         let ptr = slot.get();
-        assert!(
-            !ptr.is_null(),
-            "durust durable APIs must be polled inside a workflow task"
+        if ptr.addr() < LIVE_CONTEXT_ADDR {
+            workflow_context_unavailable(ptr);
+        }
+        // Take the pointer out of the slot for the duration of `f`. A durable
+        // API called from inside `f` — a `side_effect` closure is the reachable
+        // case — would otherwise produce a second live `&mut RuntimeContext`,
+        // which is aliasing UB, and would allocate its command seq and push its
+        // marker ahead of the outer command's, poisoning replay permanently.
+        // The guard also restores the pointer when `f` unwinds.
+        let _restore = ContextRestore::install(
+            slot,
+            std::ptr::without_provenance_mut(BORROWED_CONTEXT_ADDR),
         );
-        // The worker installs the pointer only for the duration of one poll and
-        // does not move the RuntimeContext during that scope.
+        // SAFETY: the slot holds the pointer installed by
+        // `poll_with_runtime_context`, which borrows the context for the whole
+        // poll and does not move it. The guard above makes this the only live
+        // `&mut RuntimeContext` for the duration of `f`.
         unsafe { f(&mut *ptr) }
     })
 }
@@ -78,21 +165,25 @@ where
     F: FnOnce() -> Poll<Result<T>>,
 {
     CURRENT_ACTIVITY_CONTEXT.with(|slot| {
-        let previous = slot.replace(context as *const ActivityRuntimeContext);
-        let result = poll();
-        slot.set(previous);
-        result
+        // As in `poll_with_runtime_context`: restore on unwind, not after.
+        let _restore = ContextRestore::install(slot, context as *const ActivityRuntimeContext);
+        poll()
     })
 }
 
 fn with_activity_context<T>(f: impl FnOnce(&ActivityRuntimeContext) -> T) -> T {
     CURRENT_ACTIVITY_CONTEXT.with(|slot| {
         let ptr = slot.get();
-        assert!(
-            !ptr.is_null(),
-            "durust activity APIs must be polled inside an activity task"
-        );
-        // The worker installs this pointer only while polling one activity task.
+        if ptr.addr() < LIVE_CONTEXT_ADDR {
+            activity_context_unavailable(ptr);
+        }
+        // Taken out for the duration of `f` for the same reason as
+        // `with_context`, and restored by the guard even if `f` unwinds.
+        let _restore =
+            ContextRestore::install(slot, std::ptr::without_provenance(BORROWED_CONTEXT_ADDR));
+        // SAFETY: the slot holds the pointer installed by
+        // `poll_with_activity_context`, which borrows the context for the whole
+        // poll and does not move it.
         unsafe { f(&*ptr) }
     })
 }
@@ -2158,17 +2249,22 @@ pub fn activity_map_manifest<T>(items: impl IntoIterator<Item = T>) -> Result<Pa
 where
     T: serde::Serialize,
 {
-    with_context(|runtime| {
-        let items = items
-            .into_iter()
-            .map(|item| runtime.encode_payload(&item))
-            .collect::<Result<Vec<_>>>()?;
-        crate::encode_activity_map_input_manifest_with_codec(
-            items,
-            crate::ACTIVITY_MAP_MANIFEST_PAGE_SIZE,
-            runtime.payload_codec,
-        )
-    })
+    // The codec is the only thing this needs from the context, so read it and
+    // release the borrow before touching caller-supplied code. Draining the
+    // iterator inside the borrow would run the caller's adapter closures — and
+    // each item's `Serialize` impl — while the context is checked out, which
+    // the re-entrancy guard rejects. One collect, not two: encoding happens in
+    // the same pass now that it no longer needs the context.
+    let codec = with_context(|runtime| runtime.payload_codec);
+    let items = items
+        .into_iter()
+        .map(|item| crate::encode_payload_with_codec(&item, codec))
+        .collect::<Result<Vec<_>>>()?;
+    crate::encode_activity_map_input_manifest_with_codec(
+        items,
+        crate::ACTIVITY_MAP_MANIFEST_PAGE_SIZE,
+        codec,
+    )
 }
 
 pub struct ActivityMapBuilder<A>
@@ -2433,17 +2529,18 @@ pub fn child_workflow_map_manifest<T>(items: impl IntoIterator<Item = T>) -> Res
 where
     T: serde::Serialize,
 {
-    with_context(|runtime| {
-        let items = items
-            .into_iter()
-            .map(|item| runtime.encode_payload(&item))
-            .collect::<Result<Vec<_>>>()?;
-        crate::encode_activity_map_input_manifest_with_codec(
-            items,
-            crate::CHILD_WORKFLOW_MAP_MANIFEST_PAGE_SIZE,
-            runtime.payload_codec,
-        )
-    })
+    // Same shape as `activity_map_manifest`: borrow the context only for the
+    // codec, then run caller-supplied iterator and `Serialize` code outside it.
+    let codec = with_context(|runtime| runtime.payload_codec);
+    let items = items
+        .into_iter()
+        .map(|item| crate::encode_payload_with_codec(&item, codec))
+        .collect::<Result<Vec<_>>>()?;
+    crate::encode_activity_map_input_manifest_with_codec(
+        items,
+        crate::CHILD_WORKFLOW_MAP_MANIFEST_PAGE_SIZE,
+        codec,
+    )
 }
 
 pub struct ChildWorkflowMapBuilder<W>
@@ -3430,6 +3527,355 @@ mod tests {
         ChildWorkflowMapFailed, ChildWorkflowStarted, CodecId, DurableFailure, EventId,
         HistoryEventType, TimerStarted,
     };
+
+    #[test]
+    fn durable_api_inside_a_real_side_effect_closure_records_no_marker_pair() {
+        // Drives the reachable hazard through the real `SideEffectFuture`
+        // rather than synthesising it with a bare nested `with_context`, so a
+        // later restructuring of `SideEffectFuture::poll` — running `effect()`
+        // outside the borrow, or threading `&mut RuntimeContext` through the
+        // way `poll_init`/`poll_waiting` do — cannot silently change the
+        // property this row establishes while the test still passes.
+        let mut context = workflow_context("run/side-effect-reentrancy");
+        let outcome = poll_with_runtime_context::<_, ()>(&mut context, || {
+            let mut effect = side_effect("make-id", || patched("v2").unwrap_or(false));
+            let mut poll_context = Context::from_waker(std::task::Waker::noop());
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Pin::new(&mut effect).poll(&mut poll_context)
+            }));
+            let payload =
+                panicked.expect_err("a durable API called from a side effect closure must panic");
+            let message = panic_message(payload.as_ref());
+            assert!(
+                message.contains("durable APIs are not re-entrant"),
+                "side effect re-entrancy must be reported as re-entrancy, found: {message}"
+            );
+            assert!(
+                message.contains("side_effect"),
+                "the message must name the reachable cause, found: {message}"
+            );
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+
+        // The invariant this row exists for: no out-of-order marker pair. The
+        // nested `patched` never pushed its `VersionMarker`, and the side
+        // effect never reached its `SideEffectMarker`, so history stays empty
+        // and replay of this side effect is not poisoned.
+        assert!(
+            context.append_events.is_empty(),
+            "a rejected re-entrant call must append nothing, found {:?}",
+            context
+                .append_events
+                .iter()
+                .map(|event| event.data.event_type())
+                .collect::<Vec<_>>()
+        );
+        assert!(context.change_markers.is_empty());
+        // The side effect allocated command seq 1 before invoking the closure.
+        // That allocation dies with the context because the task never commits,
+        // so the burned seq is never observable in history.
+        assert_eq!(context.next_command_seq, 1);
+    }
+
+    #[test]
+    fn nested_durable_api_call_is_rejected_instead_of_aliasing_the_context() {
+        // `side_effect` runs the user closure inside the `with_context` borrow.
+        // A durable API called from that closure must fail loudly: two live
+        // `&mut RuntimeContext` is aliasing UB, and the nested call would also
+        // allocate the next command seq and push its marker ahead of the outer
+        // command's, poisoning every future replay of that side effect.
+        let mut context = workflow_context("run/nested-durable-api");
+        let outcome = poll_with_runtime_context::<_, ()>(&mut context, || {
+            with_context(|runtime| {
+                let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_context(|_| ());
+                }));
+                let payload = nested.expect_err("nested durable API call must panic");
+                let message = panic_message(payload.as_ref());
+                assert!(
+                    message.contains("durable APIs are not re-entrant"),
+                    "nested call must report re-entrancy, found: {message}"
+                );
+                assert!(
+                    message.contains("side_effect"),
+                    "re-entrancy message must name the reachable cause, found: {message}"
+                );
+                // The outer borrow must still be usable: rejecting the nested
+                // call is what keeps it valid.
+                assert_eq!(runtime.next_command_seq, 0);
+            });
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn manifest_builders_run_caller_iterators_outside_the_context_borrow() {
+        // A lazy adapter passed to a manifest builder is user code, and a
+        // workflow author can plausibly call a durable API from it. The
+        // builders read the codec and drop the borrow before draining the
+        // iterator, so this stays a legal, deterministic call rather than
+        // tripping the re-entrancy guard: the `VersionMarker` is appended
+        // before the map command allocates its own seq, in record and replay
+        // alike.
+        let mut context = workflow_context("run/manifest-iterator");
+        let outcome = poll_with_runtime_context::<_, ()>(&mut context, || {
+            let manifest = activity_map_manifest((0..3_u64).map(|index| {
+                // The durable call is caller code running inside the adapter,
+                // which is exactly what the borrow hoist makes legal.
+                let legacy = index == 0 && patched("v2").expect("patched inside a map adapter");
+                (index, legacy)
+            }))
+            .expect("manifest built from a lazy adapter calling a durable API");
+            assert!(matches!(manifest, PayloadRef::Inline { .. }));
+
+            let manifest = child_workflow_map_manifest((0..2_u64).map(|index| {
+                let legacy = index == 0 && patched("v3").expect("patched inside a map adapter");
+                (index, legacy)
+            }))
+            .expect("child manifest built from a lazy adapter calling a durable API");
+            assert!(matches!(manifest, PayloadRef::Inline { .. }));
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+
+        // One marker per change id, allocated in call order, appended before
+        // any map command exists.
+        let markers = context
+            .append_events
+            .iter()
+            .filter_map(|event| match &event.data {
+                HistoryEventData::VersionMarker(marker) => {
+                    Some((marker.change_id.clone(), marker.command_id.seq.0))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            markers,
+            vec![("v2".to_owned(), 1), ("v3".to_owned(), 2)],
+            "durable calls from the adapters must allocate seqs in call order"
+        );
+        assert_eq!(context.append_events.len(), 2);
+    }
+
+    #[test]
+    fn nested_activity_api_call_is_rejected_instead_of_aliasing_the_context() {
+        let context = activity_context();
+        let outcome = poll_with_activity_context::<_, ()>(&context, || {
+            with_activity_context(|_| {
+                let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_activity_context(|_| ());
+                }));
+                let payload = nested.expect_err("nested activity API call must panic");
+                let message = panic_message(payload.as_ref());
+                assert!(
+                    message.contains("activity APIs are not re-entrant"),
+                    "nested call must report re-entrancy, found: {message}"
+                );
+            });
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+    }
+
+    #[test]
+    fn panicking_workflow_poll_leaves_no_dangling_context_for_the_next_task() {
+        // Phase 1D wraps this poll in `catch_unwind`, so an unwind must not be
+        // allowed to leave a freed `RuntimeContext` installed on this thread.
+        let mut context = workflow_context("run/panicking-poll");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_with_runtime_context::<_, ()>(&mut context, || panic!("workflow poll panic"))
+        }));
+        assert!(panicked.is_err(), "the poll panic must propagate");
+        drop(context);
+
+        // The slot must be null rather than dangling: a durable API outside any
+        // install reports "no workflow task" instead of dereferencing freed
+        // memory.
+        let outside = std::panic::catch_unwind(|| with_context(|_| ()));
+        let payload = outside.expect_err("durable APIs outside a workflow task must panic");
+        let message = panic_message(payload.as_ref());
+        assert!(
+            message.contains("must be polled inside a workflow task"),
+            "restored slot must report a missing context, found: {message}"
+        );
+    }
+
+    #[test]
+    fn panicking_activity_poll_leaves_no_dangling_context_for_the_next_task() {
+        let context = activity_context();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_with_activity_context::<_, ()>(&context, || panic!("activity poll panic"))
+        }));
+        assert!(panicked.is_err(), "the poll panic must propagate");
+        drop(context);
+
+        let outside = std::panic::catch_unwind(|| with_activity_context(|_| ()));
+        let payload = outside.expect_err("activity APIs outside an activity task must panic");
+        let message = panic_message(payload.as_ref());
+        assert!(
+            message.contains("must be polled inside an activity task"),
+            "restored slot must report a missing context, found: {message}"
+        );
+    }
+
+    #[test]
+    fn context_installs_restore_their_slot_on_normal_and_unwinding_paths() {
+        for unwinds in [false, true] {
+            assert_workflow_poll_restores_slot(unwinds);
+            assert_workflow_borrow_restores_slot(unwinds);
+            assert_activity_poll_restores_slot(unwinds);
+            assert_activity_borrow_restores_slot(unwinds);
+        }
+    }
+
+    fn assert_workflow_poll_restores_slot(unwinds: bool) {
+        assert!(
+            current_workflow_context().is_null(),
+            "workflow slot must start clear"
+        );
+        let mut context = workflow_context("run/workflow-poll-restore");
+        let installed = std::ptr::from_mut(&mut context).addr();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_with_runtime_context::<_, ()>(&mut context, || {
+                assert_eq!(
+                    current_workflow_context().addr(),
+                    installed,
+                    "poll must install the context"
+                );
+                if unwinds {
+                    panic!("workflow poll panic");
+                }
+                Poll::Ready(Ok(()))
+            })
+        }));
+        assert_eq!(outcome.is_err(), unwinds);
+        assert!(
+            current_workflow_context().is_null(),
+            "poll must restore the slot (unwinds={unwinds})"
+        );
+    }
+
+    fn assert_workflow_borrow_restores_slot(unwinds: bool) {
+        let mut context = workflow_context("run/workflow-borrow-restore");
+        let installed = std::ptr::from_mut(&mut context).addr();
+        let outcome = poll_with_runtime_context::<_, ()>(&mut context, || {
+            let borrow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_context(|_| {
+                    assert_eq!(
+                        current_workflow_context().addr(),
+                        BORROWED_CONTEXT_ADDR,
+                        "the context pointer must be out of the slot while a durable API holds it"
+                    );
+                    if unwinds {
+                        panic!("durable api panic");
+                    }
+                });
+            }));
+            assert_eq!(borrow.is_err(), unwinds);
+            assert_eq!(
+                current_workflow_context().addr(),
+                installed,
+                "the borrow guard must restore the context pointer (unwinds={unwinds})"
+            );
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+        assert!(
+            current_workflow_context().is_null(),
+            "poll must restore the slot (unwinds={unwinds})"
+        );
+    }
+
+    fn assert_activity_poll_restores_slot(unwinds: bool) {
+        assert!(
+            current_activity_context().is_null(),
+            "activity slot must start clear"
+        );
+        let context = activity_context();
+        let installed = std::ptr::from_ref(&context).addr();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            poll_with_activity_context::<_, ()>(&context, || {
+                assert_eq!(
+                    current_activity_context().addr(),
+                    installed,
+                    "poll must install the activity context"
+                );
+                if unwinds {
+                    panic!("activity poll panic");
+                }
+                Poll::Ready(Ok(()))
+            })
+        }));
+        assert_eq!(outcome.is_err(), unwinds);
+        assert!(
+            current_activity_context().is_null(),
+            "poll must restore the slot (unwinds={unwinds})"
+        );
+    }
+
+    fn assert_activity_borrow_restores_slot(unwinds: bool) {
+        let context = activity_context();
+        let installed = std::ptr::from_ref(&context).addr();
+        let outcome = poll_with_activity_context::<_, ()>(&context, || {
+            let borrow = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_activity_context(|_| {
+                    assert_eq!(
+                        current_activity_context().addr(),
+                        BORROWED_CONTEXT_ADDR,
+                        "the context pointer must be out of the slot while an activity API holds it"
+                    );
+                    if unwinds {
+                        panic!("activity api panic");
+                    }
+                });
+            }));
+            assert_eq!(borrow.is_err(), unwinds);
+            assert_eq!(
+                current_activity_context().addr(),
+                installed,
+                "the borrow guard must restore the context pointer (unwinds={unwinds})"
+            );
+            Poll::Ready(Ok(()))
+        });
+        assert!(matches!(outcome, Poll::Ready(Ok(()))));
+        assert!(
+            current_activity_context().is_null(),
+            "poll must restore the slot (unwinds={unwinds})"
+        );
+    }
+
+    fn current_workflow_context() -> *mut RuntimeContext {
+        CURRENT_CONTEXT.with(|slot| slot.get())
+    }
+
+    fn current_activity_context() -> *const ActivityRuntimeContext {
+        CURRENT_ACTIVITY_CONTEXT.with(|slot| slot.get())
+    }
+
+    fn workflow_context(run_id: &str) -> RuntimeContext {
+        runtime_with_history(RunId::new(run_id), Vec::new())
+    }
+
+    fn activity_context() -> ActivityRuntimeContext {
+        ActivityRuntimeContext::new(|| {
+            Box::pin(std::future::ready(Ok(
+                crate::ActivityHeartbeatOutcome::Recorded,
+            )))
+        })
+    }
+
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            (*message).to_owned()
+        } else if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else {
+            "<non-string panic payload>".to_owned()
+        }
+    }
 
     #[test]
     fn indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor() {

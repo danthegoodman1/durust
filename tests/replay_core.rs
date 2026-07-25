@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
+static PANICKING_ACTIVITY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 
 #[cfg(feature = "postgres")]
 fn postgres_url_from_env() -> Option<String> {
@@ -131,6 +132,17 @@ async fn non_retryable_activity(_: UnitInput) -> durust::Result<u64> {
         "tests.validation",
         "validation failed",
     ))
+}
+
+// Panics on every attempt. The panic sits in a branch so the handler body is
+// not `!`-typed, matching how a real bug reaches this state.
+#[durust::activity(name = "tests.panicking")]
+async fn panicking_activity(input: NumberInput) -> durust::Result<u64> {
+    *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap() += 1;
+    if input.value == 0 {
+        panic!("activity panicked on purpose");
+    }
+    Ok(input.value)
 }
 
 #[durust::activity(name = "tests.flaky")]
@@ -394,6 +406,44 @@ async fn oversized_side_effect_workflow(_: UnitInput) -> durust::Result<()> {
     })
     .await?;
     Ok(())
+}
+
+// Emits a side-effect marker, an activity schedule, and a timer wait, then
+// panics. Every one of those commands is still uncommitted in the runtime
+// context when the panic unwinds, so none of them may reach history.
+#[durust::workflow(name = "tests.commands-then-panic", version = 1)]
+async fn commands_then_panic_workflow(input: NumberInput) -> durust::Result<u64> {
+    let tag: u64 = durust::side_effect("pre-panic-marker", || 7).await?;
+    let _handle = durust::call_activity!(double(NumberInput { value: tag }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    if input.value == 0 {
+        panic!("workflow panicked after emitting commands");
+    }
+    Ok(tag)
+}
+
+// The re-entrancy regression: a durable API called from inside a `side_effect`
+// closure. `with_context` parks a borrow sentinel for the duration of the
+// closure, so the nested `patched` panics instead of allocating the next
+// command seq and pushing its `VersionMarker` ahead of the outer
+// `SideEffectMarker`.
+#[durust::workflow(name = "tests.durable-api-inside-side-effect", version = 1)]
+async fn durable_api_inside_side_effect_workflow(_: UnitInput) -> durust::Result<bool> {
+    let flag: bool = durust::side_effect("nested-durable-call", || {
+        durust::patched("nested-change").unwrap_or(false)
+    })
+    .await?;
+    Ok(flag)
+}
+
+#[durust::workflow(name = "tests.panicking-activity", version = 1)]
+async fn panicking_activity_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::call_activity!(panicking_activity(number(0)))
+        .task_queue("activities")
+        .retry(durust::RetryPolicy::none().max_attempts(2))
+        .await
 }
 
 #[durust::workflow(name = "tests.select-all-activity-handles", version = 1)]
@@ -1718,6 +1768,176 @@ fn oversized_side_effect_fails_without_recording_marker() {
         };
         assert_eq!(failure.error_type, "durust.payload_encode");
         assert!(failure.message.contains("side effect payload"));
+    });
+}
+
+// No partial commit: a workflow that emits a side-effect marker, an activity
+// schedule, and a timer wait and *then* panics must commit none of them. The
+// caught panic returns before `prepare_workflow_poll` reads the context, so the
+// whole in-progress attempt is dropped and history is byte-for-byte unchanged.
+#[test]
+fn panicking_workflow_commits_nothing_from_the_failed_attempt() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<commands_then_panic_workflow>(
+                "wf/commands-then-panic",
+                "workflows",
+                number(0),
+            )
+            .await
+            .unwrap();
+        let before = stream_all(&backend, &run_id).await;
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("commands-then-panic-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(commands_then_panic_workflow)
+            .register_activity(double)
+            .build();
+
+        let err = worker.run_workflow_once().await.unwrap_err();
+        let durust::Error::Nondeterminism(message) = &err else {
+            panic!("a workflow panic must fail the task, got {err:?}");
+        };
+        assert!(
+            message.contains("workflow task panicked")
+                && message.contains("workflow panicked after emitting commands"),
+            "{message}"
+        );
+
+        // History is unchanged: no marker, no schedule, no terminal event.
+        let after = stream_all(&backend, &run_id).await;
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 1);
+        assert!(matches!(
+            after[0].data,
+            HistoryEventData::WorkflowStarted { .. }
+        ));
+        // The activity the panicking attempt spawned was never scheduled, so
+        // no worker can claim it.
+        assert!(!worker.run_activity_once().await.unwrap());
+        // The future is in an unknown state after the unwind, so the cache
+        // must not hold it; the next attempt cold-replays from history.
+        assert_eq!(worker.cached_workflow_count(), 0);
+    });
+}
+
+// Phase 1 re-entrancy regression: a durable API called from inside a
+// `side_effect` closure fails the task and records nothing. Before the
+// `with_context` borrow guard this committed the out-of-order pair
+// `[VersionMarker(seq N+1), SideEffectMarker(seq N)]`, which poisons replay of
+// the side effect forever; before the workflow-poll `catch_unwind` the guard's
+// panic killed `Worker::run` instead of failing the task.
+#[test]
+fn durable_api_inside_side_effect_fails_the_task_without_recording_markers() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<durable_api_inside_side_effect_workflow>(
+                "wf/nested-durable-call",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let before = stream_all(&backend, &run_id).await;
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("nested-durable-call-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(durable_api_inside_side_effect_workflow)
+            .build();
+
+        let err = worker.run_workflow_once().await.unwrap_err();
+        let durust::Error::Nondeterminism(message) = &err else {
+            panic!("a nested durable API call must fail the task, got {err:?}");
+        };
+        assert!(
+            message.contains("workflow task panicked")
+                && message.contains("durable APIs are not re-entrant"),
+            "{message}"
+        );
+
+        let after = stream_all(&backend, &run_id).await;
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 1);
+        // Neither half of the out-of-order pair reached history.
+        assert!(!after.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::VersionMarker(_) | HistoryEventData::SideEffectMarker(_)
+        )));
+        assert!(
+            backend
+                .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                    namespace: Namespace::default(),
+                    workflow_id: None,
+                    run_id: Some(run_id),
+                    change_id: Some("nested-change".to_owned()),
+                })
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert_eq!(worker.cached_workflow_count(), 0);
+    });
+}
+
+// A panicking activity fails that attempt with a retryable failure, so the
+// stored retry policy decides the outcome: two attempts, then one terminal
+// `ActivityFailed` carrying the panic message for the operator.
+#[test]
+fn panicking_activity_exhausts_its_retry_policy_and_records_the_panic_message() {
+    block_on(async {
+        *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap() = 0;
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<panicking_activity_workflow>(
+                "wf/panicking-activity",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("panicking-activity-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(panicking_activity_workflow)
+            .register_activity(panicking_activity)
+            .build();
+
+        worker.run_until_idle().await.unwrap();
+
+        assert_eq!(
+            *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap(),
+            2,
+            "the panic must consume exactly the policy's attempt budget"
+        );
+        let history = stream_all(&backend, &run_id).await;
+        let failed = history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ActivityFailed(failed) => Some(failed),
+                _ => None,
+            })
+            .expect("the exhausted activity must record one failure");
+        assert_eq!(failed.failure.error_type, "durust.activity_panic");
+        assert!(
+            failed
+                .failure
+                .message
+                .contains("activity panicked on purpose"),
+            "{}",
+            failed.failure.message
+        );
+        let HistoryEventData::WorkflowFailed { failure } = &history[history.len() - 1].data else {
+            panic!("the workflow must observe the failed activity: {history:?}");
+        };
+        assert!(failure.message.contains("activity panicked on purpose"));
     });
 }
 

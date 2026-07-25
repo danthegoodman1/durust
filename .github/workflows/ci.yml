@@ -66,3 +66,34 @@ jobs:
 
       - name: Build benchmarks
         run: cargo bench --locked --no-run
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+
+      # Gates one invariant: `with_context` / `with_activity_context` never
+      # produce two live borrows of a runtime context, and always restore the
+      # thread-local slot, including when the guarded call unwinds. Aliasing
+      # there is unobservable without Miri and the crate's most safety-critical
+      # unsafe block depends on it. This job does not claim the rest of the
+      # crate is free of undefined behavior.
+      #
+      # The scope is deliberate, not a placeholder:
+      #   - `--no-default-features` drops `sqlite`, because rusqlite is C FFI
+      #     and Miri cannot execute foreign functions.
+      #   - The filter stays on `runtime::tests` because the whole lib test
+      #     binary does not finish. Under Miri's default isolation it aborts in
+      #     `payload_backend::tests`, which reaches `SystemTime::now()` through
+      #     `provider_util::unix_epoch_millis` (`src/provider_util.rs:312`) —
+      #     an unsupported `clock_gettime` operation, not undefined behavior.
+      #     With `-Zmiri-disable-isolation` it clears that and then spends
+      #     unbounded time interpreting the many-seed `sim::tests` scenarios
+      #     (still running after 25 minutes locally).
+      - name: Run Miri over the runtime context-borrow tests
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +nightly miri test --locked --lib --no-default-features -- runtime::tests

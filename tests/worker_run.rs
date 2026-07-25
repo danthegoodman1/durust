@@ -9,6 +9,7 @@ use durust::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,6 +72,56 @@ async fn parked_activity(_: UnitInput) -> durust::Result<u64> {
 async fn parked_workflow(_: UnitInput) -> durust::Result<u64> {
     durust::call_activity!(parked_activity(UnitInput {}))
         .task_queue("activities")
+        .await
+}
+
+// Counts how many times the panicking workflow's body ran, so the test can
+// prove the panic actually happened rather than inferring it from an empty
+// history.
+static PANICKING_WORKFLOW_POLLS: AtomicU64 = AtomicU64::new(0);
+
+// A workflow whose user code panics. The panic is inside a branch so the
+// handler body is not `!`-typed, matching how a real bug reaches this state.
+#[durust::workflow(name = "worker-run.panicking", version = 1)]
+async fn wr_panicking(input: NumberInput) -> durust::Result<u64> {
+    if input.value == 0 {
+        PANICKING_WORKFLOW_POLLS.fetch_add(1, Ordering::SeqCst);
+        panic!("worker-run workflow panicked on purpose");
+    }
+    Ok(input.value)
+}
+
+// A second panicking workflow for the batched case. It carries no counter of
+// its own so it cannot race `PANICKING_WORKFLOW_POLLS` with the across-passes
+// test, which runs concurrently in this binary.
+#[durust::workflow(name = "worker-run.panicking-batched", version = 1)]
+async fn wr_panicking_batched(input: NumberInput) -> durust::Result<u64> {
+    if input.value == 0 {
+        panic!("worker-run batched workflow panicked on purpose");
+    }
+    Ok(input.value)
+}
+
+// Counts activity attempts across retries so the test can assert the retry
+// policy ran the activity again after the panicking attempt.
+static PANIC_ONCE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+#[durust::activity(name = "worker-run.panic-once")]
+async fn panic_once_activity(_: UnitInput) -> durust::Result<u64> {
+    let attempt = PANIC_ONCE_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
+    if attempt == 1 {
+        panic!("worker-run activity panicked on attempt 1");
+    }
+    Ok(attempt)
+}
+
+#[durust::workflow(name = "worker-run.panic-once-activity", version = 1)]
+async fn panic_once_workflow(_: UnitInput) -> durust::Result<u64> {
+    // `RetryPolicy::none().max_attempts(2)` retries without a backoff delay,
+    // so the retry is visible on the memory backend's virtual clock.
+    durust::call_activity!(panic_once_activity(UnitInput {}))
+        .task_queue("activities")
+        .retry(durust::RetryPolicy::none().max_attempts(2))
         .await
 }
 
@@ -307,6 +358,229 @@ fn memory_wait_for_ready_wakes_parked_run_on_new_workflow() {
         .await;
 
         run_result.unwrap();
+    });
+}
+
+// A panicking workflow must fail its own task, not the worker: without the
+// `catch_unwind` in `poll_cached` the panic unwinds through `Worker::run` and
+// the process loses every other run. The proof is the *second* run's committed
+// result — the worker claimed, polled, and committed it after the panic. The
+// panicking run's claim is released with the 60 s nondeterminism backoff and
+// the memory backend's clock is virtual, so it panics exactly once and commits
+// nothing.
+#[test]
+fn panicking_workflow_fails_its_task_and_the_worker_keeps_serving() {
+    block_on_tokio(async {
+        PANICKING_WORKFLOW_POLLS.store(0, Ordering::SeqCst);
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking>("wf/panicking", "workflows", NumberInput { value: 0 })
+            .await
+            .unwrap();
+        let healthy_run = client
+            .start_workflow::<wr_no_activity>(
+                "wf/after-panic",
+                "workflows",
+                NumberInput { value: 41 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("panic-workflow-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking)
+            .register_workflow(wr_no_activity)
+            .idle_wait(Duration::from_millis(5))
+            .build();
+        let shutdown = worker.shutdown_handle();
+
+        let (run_result, ()) = futures::future::join(worker.run(), async {
+            wait_until(|| async { completed_result(&backend, &healthy_run).await.is_some() }).await;
+            shutdown.shutdown();
+        })
+        .await;
+
+        run_result.unwrap();
+        assert_eq!(
+            PANICKING_WORKFLOW_POLLS.load(Ordering::SeqCst),
+            1,
+            "the panicking workflow must run once and be released with backoff"
+        );
+        assert_eq!(
+            completed_result(&backend, &healthy_run).await,
+            Some(42),
+            "the worker must keep serving other runs after a workflow panic"
+        );
+        // The failed attempt committed nothing: only the start event exists,
+        // and the run is neither completed nor failed, so a fixed redeploy can
+        // still replay it.
+        let panicking_history = history(&backend, &panicking_run).await;
+        assert_eq!(panicking_history.len(), 1, "{panicking_history:?}");
+        assert!(matches!(
+            panicking_history[0].data,
+            HistoryEventData::WorkflowStarted { .. }
+        ));
+        assert!(
+            !has_event(&backend, &panicking_run, |data| matches!(
+                data,
+                HistoryEventData::WorkflowFailed { .. }
+                    | HistoryEventData::WorkflowCompleted { .. }
+            ))
+            .await
+        );
+    });
+}
+
+// The production pass claims a *batch*, so a panicking task and a healthy task
+// can land in the same `run_workflow_batch_once` call. The batch loop commits
+// every prepared task before it checks `first_error`, so the healthy
+// neighbour's commit lands even though the pass then reports the panic as its
+// error. Both halves of that observed behaviour are pinned here: the commit
+// that lands, which is what "the worker keeps serving" means for a batch, and
+// the `Err` the pass still returns despite that progress — asserted rather
+// than papered over, so a change in either direction is caught. Reporting a
+// pass with committed work as failed also skips that pass's local activities,
+// maintenance, and activity execution; that is loop shape, owned by Phase 2
+// row 2H, not by this row.
+#[test]
+fn panicking_workflow_batched_with_a_healthy_task_still_commits_its_neighbor() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<wr_panicking_batched>(
+                "wf/batched-panicking",
+                "workflows",
+                NumberInput { value: 0 },
+            )
+            .await
+            .unwrap();
+        let healthy_run = client
+            .start_workflow::<wr_no_activity>(
+                "wf/batched-healthy",
+                "workflows",
+                NumberInput { value: 7 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("batched-panic-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_panicking_batched)
+            .register_workflow(wr_no_activity)
+            // Above one on both knobs so a single claim RPC takes both tasks
+            // into one batch, the shape `run_pass_once` uses in production.
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .build();
+
+        // One batched pass over both tasks. It reports the panic...
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        let durust::Error::Nondeterminism(message) = &err else {
+            panic!("a batched workflow panic must fail the task, got {err:?}");
+        };
+        assert!(
+            message.contains("workflow task panicked")
+                && message.contains("worker-run batched workflow panicked on purpose"),
+            "{message}"
+        );
+
+        // ...and the healthy neighbour claimed into that same batch still
+        // committed its result, which no later pass could have produced.
+        assert_eq!(
+            completed_result(&backend, &healthy_run).await,
+            Some(8),
+            "a batched neighbour's commit must survive the panicking task"
+        );
+        // The panicking task committed nothing and left no cache entry.
+        let panicking_history = history(&backend, &panicking_run).await;
+        assert_eq!(panicking_history.len(), 1, "{panicking_history:?}");
+        assert!(matches!(
+            panicking_history[0].data,
+            HistoryEventData::WorkflowStarted { .. }
+        ));
+        assert_eq!(worker.cached_workflow_count(), 0);
+
+        // The worker is still usable: the panicking claim was released with the
+        // 60 s backoff and the memory backend's clock is virtual, so the next
+        // pass finds no claimable work and succeeds.
+        let stats = worker.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 0);
+    });
+}
+
+// A panicking activity must fail its own attempt and let the retry policy
+// decide: attempt 1 panics, the caught panic becomes a retryable activity
+// failure, and attempt 2 completes the run. Concurrency is above one so the
+// execution runs in the `FuturesUnordered` batch path, where an uncaught panic
+// would also drop the concurrently claimed activities.
+#[test]
+fn panicking_activity_fails_its_task_and_the_retry_policy_completes_the_run() {
+    block_on_tokio(async {
+        PANIC_ONCE_ATTEMPTS.store(0, Ordering::SeqCst);
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+        let panicking_run = client
+            .start_workflow::<panic_once_workflow>("wf/panic-activity", "workflows", UnitInput {})
+            .await
+            .unwrap();
+        let healthy_run = client
+            .start_workflow::<wr_double_plus_one>(
+                "wf/activity-after-panic",
+                "workflows",
+                NumberInput { value: 10 },
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("panic-activity-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(panic_once_workflow)
+            .register_workflow(wr_double_plus_one)
+            .register_activity(panic_once_activity)
+            .register_activity(wr_double)
+            .max_concurrent_workflow_tasks(4)
+            .workflow_task_prefetch_limit(4)
+            .max_concurrent_activities(4)
+            .idle_wait(Duration::from_millis(5))
+            .build();
+        let shutdown = worker.shutdown_handle();
+
+        let (run_result, ()) = futures::future::join(worker.run(), async {
+            wait_until(|| async {
+                completed_result(&backend, &panicking_run).await.is_some()
+                    && completed_result(&backend, &healthy_run).await.is_some()
+            })
+            .await;
+            shutdown.shutdown();
+        })
+        .await;
+
+        run_result.unwrap();
+        assert_eq!(
+            PANIC_ONCE_ATTEMPTS.load(Ordering::SeqCst),
+            2,
+            "the retry policy must run the activity again after the panicking attempt"
+        );
+        assert_eq!(completed_result(&backend, &panicking_run).await, Some(2));
+        assert_eq!(
+            completed_result(&backend, &healthy_run).await,
+            Some(21),
+            "the worker must keep serving other runs after an activity panic"
+        );
+        // A retried attempt is not a workflow-visible failure.
+        assert!(
+            !has_event(&backend, &panicking_run, |data| matches!(
+                data,
+                HistoryEventData::ActivityFailed(_)
+            ))
+            .await
+        );
     });
 }
 

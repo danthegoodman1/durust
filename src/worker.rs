@@ -990,7 +990,31 @@ where
         let claim = claimed.claim;
         Ok(async move {
             let result = std::future::poll_fn(|cx| {
-                poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
+                // A panic in activity code must fail that activity, not the
+                // worker: uncaught it unwinds through
+                // `execute_claimed_activities`, dropping every concurrently
+                // claimed activity's execution with it and stranding their
+                // claims until the leases expire. The panic maps to the
+                // ordinary activity failure path with a retryable
+                // `DurableFailure`, so the activity's retry policy decides
+                // whether it runs again.
+                //
+                // `AssertUnwindSafe` asserts only that nothing the closure
+                // touches is read again after a caught unwind: `future` is a
+                // possibly poisoned state machine that `poll_fn` never polls
+                // again once it returns `Ready`, and `activity_context` is
+                // immutable (`&`) and only supplies the heartbeat callback.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    poll_with_activity_context(&activity_context, || future.as_mut().poll(cx))
+                })) {
+                    Ok(poll) => poll,
+                    Err(payload) => {
+                        Poll::Ready(Err(Error::Application(crate::DurableFailure::new(
+                            "durust.activity_panic",
+                            format!("activity panicked: {}", panic_message(payload.as_ref())),
+                        ))))
+                    }
+                }
             })
             .await;
             match result {
@@ -1275,7 +1299,10 @@ where
         mut recovery_budget: Option<&mut RecoveryReplayBudget>,
     ) -> Result<WorkflowPollOutcome> {
         loop {
-            let poll = poll_cached(future, context);
+            // `?` on a caught panic: returning here drops the in-progress
+            // context untouched, so nothing this attempt accumulated is read
+            // or committed.
+            let poll = poll_cached(future, context)?;
             let signal_requests = context.take_signal_requests();
             if !signal_requests.is_empty() {
                 let inbox_requests = signal_requests
@@ -1643,13 +1670,55 @@ where
     }
 }
 
+// A panic in workflow code must fail its own task, not the worker: without the
+// catch, an `unwrap()` in one workflow unwinds out of `Worker::run` and takes
+// every other cached run in the process with it.
+//
+// The panic becomes `Error::Nondeterminism`, this worker's existing fatal
+// workflow-task error: nothing is committed, `release_failed_workflow_task`
+// re-releases the claim with `nondeterminism_retry_backoff`, and the next
+// attempt replays from durable history, so a fixed redeploy recovers the run.
+// Committing `WorkflowFailed` instead would make a panic raised while replaying
+// an already-progressed run permanently unrecoverable, and a panic carries no
+// evidence that the run's recorded progress was wrong.
+//
+// `AssertUnwindSafe` asserts only that nothing the closure touches is read
+// again after a caught unwind, which the `Err` return enforces rather than
+// assumes. `context` may hold half-appended events, scheduled activities, and
+// hydration requests from this attempt; the error propagates out of
+// `poll_until_history_blocked_or_ready` before any of that is read, and the
+// context is dropped, so a partial attempt cannot reach a commit. `future` may
+// be a poisoned state machine; its caller holds the only handle, drops it
+// without polling again, and cannot re-cache it because the cache entry is
+// removed at claim time and reinserted only after a successful commit.
 fn poll_cached(
     future: &mut Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
     context: &mut crate::runtime::RuntimeContext,
-) -> Poll<Result<crate::PayloadRef>> {
+) -> Result<Poll<Result<crate::PayloadRef>>> {
     let waker = futures::task::noop_waker();
     let mut task_context = std::task::Context::from_waker(&waker);
-    poll_with_runtime_context(context, || future.as_mut().poll(&mut task_context))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        poll_with_runtime_context(context, || future.as_mut().poll(&mut task_context))
+    }))
+    .map_err(|payload| {
+        Error::Nondeterminism(format!(
+            "workflow task panicked: {}",
+            panic_message(payload.as_ref())
+        ))
+    })
+}
+
+// Recovers the operator-facing message from a caught panic payload: `panic!`
+// with a literal produces `&'static str`, any formatted `panic!` produces
+// `String`, and `panic_any` carries no message to recover.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message
+    } else {
+        "<non-string panic payload>"
+    }
 }
 
 fn prefetched_claim_history_chunk(
