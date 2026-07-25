@@ -8093,6 +8093,193 @@ async fn fail_child_run<B>(
         .unwrap();
 }
 
+async fn cancel_child_run<B>(backend: &B, child: durust::ClaimedWorkflowTask, reason: &str)
+where
+    B: DurableBackend,
+{
+    backend
+        .commit_workflow_task(
+            child.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: child.replay_target_event_id,
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCancelled {
+                        reason: reason.to_owned(),
+                    },
+                )],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// The two strings a fail-fast child workflow map writes into durable history:
+/// the parent's `ChildWorkflowMapFailed.failure.message` when the item that
+/// stopped the map was *cancelled*, and the `reason` on every sibling child's
+/// `WorkflowCancelled`.
+///
+/// Both are byte-for-byte different across the providers today and nothing
+/// else in either language's suite asserts them, so "conformance passes
+/// unchanged" is vacuous for exactly the two behaviours Phase 6's shared map
+/// engine converges (Decisions D3/D4). Pinning today's per-provider forms
+/// first makes that convergence show up as a diff here instead of as a silent
+/// change to persisted history.
+struct FailFastHistoryStrings {
+    /// `(item ordinal, child cancellation reason) -> parent-visible message`.
+    cancelled_item_message: fn(u64, &str) -> String,
+    /// `map command id -> sibling WorkflowCancelled.reason`.
+    sibling_cancellation_reason: fn(&durust::CommandId) -> String,
+}
+
+/// In-memory provider: the bare child reason, and a cancellation reason
+/// carrying only the command sequence (`memory.rs:2133-2136`, `:2324`).
+const MEMORY_FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = FailFastHistoryStrings {
+    cancelled_item_message: |_ordinal, reason| reason.to_owned(),
+    sibling_cancellation_reason: |command_id| {
+        format!("child workflow map `{}` failed", command_id.seq.0)
+    },
+};
+
+/// SQL providers: the message names the item ordinal and the cancellation
+/// reason qualifies the command with its run (`sqlite.rs:4549-4557`, `:4737-4740`;
+/// `postgres.rs:7385-7393`, `:7644-7647`).
+const SQL_FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = FailFastHistoryStrings {
+    cancelled_item_message: |ordinal, reason| {
+        format!("child workflow map item {ordinal} was cancelled: {reason}")
+    },
+    sibling_cancellation_reason: |command_id| {
+        format!(
+            "child workflow map `{}`:{} failed",
+            command_id.run_id, command_id.seq.0
+        )
+    },
+};
+
+async fn child_workflow_map_fail_fast_history_strings<B>(
+    backend: B,
+    expected: &FailFastHistoryStrings,
+) where
+    B: DurableBackend,
+{
+    let workflow_id_prefix = "wf/child-map-fail-fast-strings/item";
+    let (run_id, command_id, parent_opts, child_opts) = schedule_child_workflow_map(
+        backend.clone(),
+        "wf/child-map-fail-fast-strings",
+        "child-map-fail-fast-strings-parent",
+        "child-map-fail-fast-strings-children",
+        workflow_id_prefix,
+        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::ParentClosePolicy::Cancel,
+        2,
+    )
+    .await;
+
+    dispatch_child_map_starts(&backend).await;
+    let first = backend
+        .claim_workflow_task(
+            WorkerId::new("child-map-fail-fast-strings-0"),
+            child_opts.clone(),
+        )
+        .await
+        .unwrap()
+        .expect("first child map item");
+    let second = backend
+        .claim_workflow_task(WorkerId::new("child-map-fail-fast-strings-1"), child_opts)
+        .await
+        .unwrap()
+        .expect("second child map item");
+    let cancelled_ordinal: u64 = first
+        .workflow_id
+        .0
+        .strip_prefix(&format!("{workflow_id_prefix}/"))
+        .expect("map child ids are `{prefix}/{ordinal}`")
+        .parse()
+        .expect("map child ordinal is numeric");
+    let sibling_run_id = second.run_id.clone();
+
+    // A *cancelled* item, not a failed one: the cancelled arm is the only
+    // place a provider synthesizes the parent-visible failure itself.
+    cancel_child_run(&backend, first, "child stopped").await;
+
+    let ready = backend
+        .claim_workflow_task(
+            WorkerId::new("child-map-fail-fast-strings-parent"),
+            parent_opts,
+        )
+        .await
+        .unwrap()
+        .expect("parent ready after the map failed fast");
+    assert_eq!(
+        ready.reason,
+        durust::WorkflowTaskReason::ChildWorkflowMapFailed
+    );
+
+    let history = stream_history(&backend, run_id).await;
+    let failed = history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowMapFailed(failed) => Some(failed),
+            _ => None,
+        })
+        .expect("child workflow map failed event");
+    assert_eq!(failed.failure.error_type, "durust.child_workflow_cancelled");
+    assert!(failed.failure.non_retryable);
+    assert_eq!(
+        failed.failure.message,
+        (expected.cancelled_item_message)(cancelled_ordinal, "child stopped"),
+    );
+
+    let sibling_history = stream_history(&backend, sibling_run_id).await;
+    let sibling_reason = sibling_history
+        .iter()
+        .find_map(|event| match &event.data {
+            HistoryEventData::WorkflowCancelled { reason } => Some(reason.clone()),
+            _ => None,
+        })
+        .expect("sibling child cancelled by the fail-fast map");
+    assert_eq!(
+        sibling_reason,
+        (expected.sibling_cancellation_reason)(&command_id),
+    );
+}
+
+#[test]
+fn memory_child_workflow_map_fail_fast_history_strings_are_pinned() {
+    block_on(child_workflow_map_fail_fast_history_strings(
+        MemoryBackend::new(),
+        &MEMORY_FAIL_FAST_HISTORY_STRINGS,
+    ));
+}
+
+#[test]
+fn sqlite_child_workflow_map_fail_fast_history_strings_are_pinned() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("fail-fast-strings.sqlite3")).unwrap();
+        child_workflow_map_fail_fast_history_strings(backend, &SQL_FAIL_FAST_HISTORY_STRINGS).await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_child_workflow_map_fail_fast_history_strings_are_pinned_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres fail-fast history strings; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("failfaststrings");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        child_workflow_map_fail_fast_history_strings(backend, &SQL_FAIL_FAST_HISTORY_STRINGS).await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
 fn assert_compact_child_workflow_map_parent_history(history: &[durust::HistoryEvent]) {
     assert!(
         history

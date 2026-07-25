@@ -5,6 +5,7 @@ mod error;
 mod history;
 mod ids;
 mod manifest;
+mod map_engine;
 mod memory;
 mod options;
 mod payload;

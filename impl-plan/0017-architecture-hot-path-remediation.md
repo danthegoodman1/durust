@@ -331,18 +331,18 @@ Criterion suite already measures, and collapse the five duplicated
 command-scheduling bodies into one matcher so the fix lands once.
 
 Scope:
-- Single command matcher. `poll_activity_schedule` (`src/runtime.rs:2062`),
-  `ActivityMapSpawnFuture::poll_init` (`:2290`),
-  `ChildWorkflowMapSpawnFuture::poll_init` (`:2574`),
-  `ChildWorkflowSpawnFuture::poll_init` (`:2845`), and `TimerFuture::poll_init`
-  (`:3071`) each re-implement the same protocol: block if history is unloaded,
+- Single command matcher. `poll_activity_schedule` (`src/runtime.rs:2153`),
+  `ActivityMapSpawnFuture::poll_init` (`:2386`),
+  `ChildWorkflowMapSpawnFuture::poll_init` (`:2671`),
+  `ChildWorkflowSpawnFuture::poll_init` (`:2942`), and `TimerFuture::poll_init`
+  (`:3168`) each re-implement the same protocol: block if history is unloaded,
   allocate the command seq, compute the fingerprint, then match the peeked
   event's variant/seq/fingerprint or append the command plus its side effect.
   0015 Phase 1 consolidated the `take_*` and `collect_*` sides; the schedule side
   was never consolidated and is where the remaining drift risk lives.
 - Match without cloning. All nine `peek_replay_command_event().cloned()` sites
-  (`src/runtime.rs:944`, `:1012`, `:1243`, `:1753`, `:2098`, `:2326`, `:2607`,
-  `:2874`, `:3080`) deep-clone the whole `HistoryEvent` — including
+  (`src/runtime.rs:1035`, `:1103`, `:1334`, `:1844`, `:2189`, `:2422`, `:2704`,
+  `:2971`, `:3177`) deep-clone the whole `HistoryEvent` — including
   `ActivityScheduled.input`, `SideEffectMarker.value`, and
   `ChildWorkflowStartRequested.input` — to read a seq and a fingerprint. 0015
   Phase 6F explicitly limited its clone-laziness work to `take_indexed`; this is
@@ -372,7 +372,7 @@ Scope:
   record vector and rebuilds a `BTreeMap` over all records on every cached task
   (`src/worker.rs:745`); keep the deduplicated map on `CachedWorkflow`.
 - Consider collapsing `ReadyEventIndexes`' twelve per-kind `BTreeMap`s
-  (`src/runtime.rs:143`) into one `BTreeMap<CommandSeq, CommandReadyState>`.
+  (`src/runtime.rs:235`) into one `BTreeMap<CommandSeq, CommandReadyState>`.
   Benchmark first; record a Decision either way.
 
 Out of scope:
@@ -397,8 +397,8 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Incomplete | Work | 3A: single `match_or_append_command` helper | Missing: helper plus removal of the five bodies at `src/runtime.rs:2062`, `:2290`, `:2574`, `:2845`, `:3071`. |
-| Incomplete | Work | 3B: command matching without cloning events | Missing: borrow-based comparison at the nine `.cloned()` sites, benchmarked on a large-inline-payload history. |
+| Incomplete | Work | 3A: single `match_or_append_command` helper | Missing: helper plus removal of the five bodies at `src/runtime.rs:2153`, `:2386`, `:2671`, `:2942`, `:3168`. Line numbers re-verified after Phase 1; the plan's original anchors were pre-Phase-1. |
+| Incomplete | Work | 3B: command matching without cloning events | Missing: borrow-based comparison at the nine `.cloned()` sites (`src/runtime.rs:1035`, `:1103`, `:1334`, `:1844`, `:2189`, `:2422`, `:2704`, `:2971`, `:3177`), benchmarked on a large-inline-payload history. |
 | Incomplete | Work | 3C: `split_start_event` takes the chunk by value | Missing: signature change at `src/worker.rs:1734` and recovery benchmark delta. |
 | Incomplete | Work | 3D: batch commit moves instead of cloning | Missing: `std::mem::take` at `src/worker.rs:526` and benchmark delta. |
 | Incomplete | Work | 3E: prefetch validates before cloning | Missing: reference-first validation at `src/worker.rs:1655`. |
@@ -631,7 +631,33 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Incomplete | Scope | One fanout state machine per language | Missing: `src/map_engine.rs`, `packages/core/src/map-engine.ts`, and removal of the six implementations. |
-| Incomplete | Work | 6A: Rust pure engine with effect list | Missing: module, effect enum, table-driven unit tests. |
+| Complete | Work | 6A: Rust pure engine with effect list | `src/map_engine.rs`: pure `step(state, event) -> Result<Vec<MapEffect>, MapReject>`, 25 table-driven tests. Reviewer independently killed 13 mutations with precise failure messages; purity, `provider_util` retry delegation (no second copy of the backoff math), and zero attributable clippy warnings all verified by running code. Approved after the five required changes below. F1 (the D5×D9 commit-rollback side effect) is now *structurally* impossible, not merely absent: `DescriptorCreated` returns `Ok(materialize(..))` where a reject is not representable on that arm, confirmed by an exhaustive 2,592-state probe plus a re-run of the real-backend commit probe on all three providers. |
+
+The six provider bugs 6A's drift analysis uncovered are tracked as their own rows
+below rather than folded into the extraction, so each lands with its own
+per-provider regression test and its own commit. Phase 6's "no change to map
+semantics" boundary holds: **the engine preserves every behaviour, including the
+defective ones**, and each row fixes one deliberately.
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
+| Incomplete | Work | 6G: empty input manifest stalls the parent forever, all three providers | User-reachable through the ordinary DSL: `activity_map_manifest(std::iter::empty())` → `encode_activity_map_input_manifest_with_codec` (`src/history.rs:633`) has no rejection and yields `item_count: 0`; `ActivityMapSpawnFuture::poll_init` (`src/runtime.rs:2386`) checks only for a *missing* manifest, never an empty one. Reviewer probe on memory, SQLite, and Postgres: commit succeeds (`Ok(Committed)`), descriptor inserted, nothing materialized, no terminal fact ever appended, parent never woken — `result_manifest()` blocks forever. Not a hang or an error; a silent permanent stall. Missing: the fix plus a per-provider regression test for both map kinds. |
+| Incomplete | Work | 6H: Postgres inline child start under-counts `in_flight` on an id conflict | **Most serious of the six.** Reachable through the public `Client::start_workflow` API by starting a workflow whose id collides with a map child's generated id. `src/postgres.rs:7252` advances `next_ordinal` before the match; `InlineChildStartOutcome::Failed` takes no slot (`:7258`); `complete_child_workflow_map_item_tx` then releases one (`:7371`). Reviewer probe read the tables directly: descriptor `in_flight=1` with two children genuinely running. Permanent, and compounds per conflicting ordinal, so real concurrency exceeds `max_in_flight` by the conflict count. Missing: fix plus regression test. |
+| Incomplete | Work | 6I: memory provider mutates before its terminal-parent check, two sites | `src/memory.rs:2364-2368` (`complete_map_item`) and `src/memory.rs:2436-2441` (`fail_map_item`) both set `completed`, write the result, and decrement `in_flight` before the `run.terminal` check returns `Err(Error::TerminalWorkflow)`. Memory has no transaction, so the writes stick; SQLite (`:4897`) and Postgres (`:7850`) reach the same error and roll back. **Reachability unproven** — memory holds one global lock, so `run.terminal` implies cleanup already ran, and all three providers answer `AlreadyCompleted` on the ordinary route. Record as latent; fix is cheap. |
+| Incomplete | Work | 6J: memory activity-map `max_in_flight` is read without `.max(1)` | `src/memory.rs:1500`. `max_in_flight = 0` stalls memory forever while SQLite (`:4356`) and Postgres (`:7073`) admit one; memory's own child-map path clamps at `:2047`. Not reachable from the DSL (`src/runtime.rs:2316` and `:2413` both clamp) but reachable from any direct `commit_workflow_task` with a hand-built `ActivityMapTask` — which the conformance suite itself does. |
+| Incomplete | Work | 6K: memory silently discards child-terminal routing errors | `src/memory.rs:1895` — `let _ = complete_child_workflow_map_item(...)`. SQLite (`:3798`) and Postgres (`:6011`) propagate. A decode/normalize failure leaves the item permanently unrecorded and the map permanently incomplete with no error surfaced. Note `notify_parent_of_child_terminal` returns `()`, so the `let _` is forced by the signature; the fix is a signature change plus every caller, larger than it looks. |
+| Incomplete | Work | 6L: `postgres.rs:7257` `Skipped` strands an ordinal | Advances `next_ordinal`, takes no slot, records no outcome, so `outcome_count` can never reach `item_count`. Requires a concurrent delete between two statements of the same transaction (`src/postgres.rs:6946`) — effectively unreachable, but unguarded, and the failure mode is an unrecoverable hang. |
+| Partial | Test | Pin the two persisted map failure strings before changing them | Rust half **done**: `tests/provider_conformance.rs` +187/-0 adds per-provider expectation tables and three tests driving a real fail-fast child map through a cancelled item, asserting both `ChildWorkflowMapFailed.failure.message` and the sibling's `WorkflowCancelled.reason`. Reviewer independently re-ran three provider mutations; the middle one (reason mutated, message untouched) confirms the reason half is genuinely not masked by the message assertion. Conformance 47 → 50. Missing: the TypeScript half — TS is a **fourth** variant on both strings and nothing pins it. |
+| Complete | Decision | D9 (complete empty maps at descriptor creation) is reverted | Proposed by 6A, rejected on review. Two reasons. (a) Out of scope — Phase 6 states "no change to map semantics," and the gate cannot detect the change. (b) It silently carried a second change: reviewer probe H showed a single commit that both schedules a map and closes the run is accepted today by all three providers, but under D5+D9 `DescriptorCreated { parent_terminal: true, item_count: 0 }` routes to `AbortTerminalParent`, rolling back the **whole workflow-task commit**. Non-empty maps were unaffected, so the rollback was purely a D9 side effect. Fix moves to row 6G. |
+| Complete | Decision | D3/D4 adopt the SQLite/Postgres persisted-string forms | Replay-safe: fingerprints (`src/history.rs:523-610`) cover command inputs only, and `take_map_failure` (`src/runtime.rs:944`) matches on `command_id.seq` and never inspects the message, so old histories replay unchanged. Justification is *not* majority-of-three: the SQLite/Postgres forms are strictly more informative, and memory's bare `map_command_id.seq` is ambiguous across runs. TypeScript is a **fourth** variant on both strings and must converge — see Phase 7. |
+| Complete | Decision | D1, D2, D5–D8, D10 stand as recorded by 6A | Reviewer spot-checked each on the merits rather than by vote and found no wrong pick. D5's activity/child asymmetry is defensible — an activity map has no per-item durable row, so aborting is the only way not to lose the result, whereas a child map's outcome row is worth keeping. |
+| Complete | Decision | Memory's skip-forward admission cursor is dropped as provably dead | Ninth behaviour, missed by 6A's first pass. Memory (`src/memory.rs:2050-2052`) advanced `next_ordinal` past ordinals that already had an outcome; SQLite (`:4452`), Postgres (`:7225`), and the engine's contiguous-cursor assumption do not. Dropped rather than tolerated, because a third copy of a rule that can never fire would *hide* real corruption if a provider ever broke the invariant. `MapState::next_ordinal` now carries the precondition as a documented contract. |
+| Complete | Work | `MapEffect::ScheduleItemRetry` carries the start-to-close restart | Now carries `timeout_at_ms` alongside `visible_at_ms`, restarting the clock at the **visibility** instant to match `src/memory.rs:1258-1262`, `src/sqlite.rs:1409-1424`, and `src/postgres.rs:4053-4070`. Cross-checked against `provider_util::activity_timeout_at_ms_from` over a 3×3 grid, because that helper is `#[cfg]`-gated to the SQL providers and `map_engine` compiles unconditionally. |
+| Incomplete | Risk | The `next_ordinal` invariant rests on `.insert()` being a *reset* | Found on re-review; the stronger half of the proof, and it is not written down. `src/memory.rs:739` (and `:721`) reset `next_ordinal: 0` **and** `outcomes: BTreeMap::new()` in the same expression, so cursor and outcome set are only ever created together at zero or advanced together under one mutex. A plausible future "idempotency" refactor to `.entry().or_insert()` — keeping outcomes while the cursor stays put — would break it and make the engine silently re-admit completed ordinals. Missing: this sentence in the `next_ordinal` contract doc at `src/map_engine.rs:91-99`. |
+| Incomplete | Risk | 6B: `MaterializeItems` on memory's activity map is an overwrite, not an upsert | The module doc's "applying a prefix and crashing is safe" claim overstates it for that provider: a prefix-crash could reset `completed`/`claim` on an already in-flight item. Pre-existing, transactional providers unaffected. Missing: either an idempotent apply in 6B or a narrowed claim in the doc. |
+
+| Status | Type | Item | Evidence / Gap |
+| --- | --- | --- | --- |
 | Incomplete | Work | 6B: Rust providers apply engine effects | Missing: `memory.rs`, `sqlite.rs`, `postgres.rs` map functions replaced. |
 | Incomplete | Work | 6C: TS pure engine with effect list | Missing: module and unit tests. |
 | Incomplete | Work | 6D: TS providers apply engine effects | Missing: `core/backend.ts`, `sqlite`, `postgres` map functions replaced. |
