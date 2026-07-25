@@ -1,3 +1,7 @@
+use crate::map_engine::{
+    ItemAttemptFailureKind, ItemRetryDecision, MapEffect, MapEvent, MapKind, MapReject, MapState,
+    activity_outcome_counts, outcome_counts,
+};
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
     activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_attribution,
@@ -729,9 +733,16 @@ impl DurableBackend for MemoryBackend {
                     completed: false,
                 },
             );
-            if let Err(err) =
-                materialize_activity_map_items(&mut state, &config, &map_task.map_command_id)
-            {
+            let Some(map_state) = activity_map_state(&state, &map_task.map_command_id) else {
+                continue;
+            };
+            let parent_terminal = next_event_id.1;
+            if let Err(err) = step_map(
+                &mut state,
+                &config,
+                map_state,
+                MapEvent::DescriptorCreated { parent_terminal },
+            ) {
                 return Box::pin(ready(Err(err)));
             }
         }
@@ -747,9 +758,16 @@ impl DurableBackend for MemoryBackend {
                     completed: false,
                 },
             );
-            if let Err(err) =
-                materialize_child_workflow_map_items(&mut state, &config, &map_task.map_command_id)
-            {
+            let Some(map_state) = child_workflow_map_state(&state, &map_task.map_command_id) else {
+                continue;
+            };
+            let parent_terminal = next_event_id.1;
+            if let Err(err) = step_map(
+                &mut state,
+                &config,
+                map_state,
+                MapEvent::DescriptorCreated { parent_terminal },
+            ) {
                 return Box::pin(ready(Err(err)));
             }
         }
@@ -775,7 +793,9 @@ impl DurableBackend for MemoryBackend {
             state.waits.remove(&wait_id);
         }
         for command_id in cancel_commands {
-            cancel_command_operational_state(&mut state, &command_id);
+            if let Err(err) = cancel_command_operational_state(&mut state, &config, &command_id) {
+                return Box::pin(ready(Err(err)));
+            }
         }
         if next_event_id.1 {
             let cleanup = terminal_event
@@ -1011,9 +1031,10 @@ impl DurableBackend for MemoryBackend {
             .map(|(activity_id, _)| activity_id.clone())
             .collect::<Vec<_>>();
 
+        let config = self.payload_config.clone();
         let mut timed_out = 0usize;
         for activity_id in due {
-            match timeout_activity(&mut state, &activity_id, req.now) {
+            match timeout_activity(&mut state, &config, &activity_id, req.now) {
                 Ok(true) => timed_out += 1,
                 Ok(false) => {}
                 Err(err) => return Box::pin(ready(Err(err))),
@@ -1241,9 +1262,48 @@ impl DurableBackend for MemoryBackend {
             }
             record.task.clone()
         };
-        if let ActivityFailureDecision::Retry { next_attempt } =
-            activity_failure_decision(&task, req.failure.non_retryable)
-        {
+        let decision = activity_failure_decision(&task, req.failure.non_retryable);
+
+        // Map items take the engine route for *both* verdicts: a retry of an
+        // item whose map already ended must not reschedule anything, and only
+        // the engine knows whether the map ended.
+        let config = self.payload_config.clone();
+        if let Some(map_item) = task.map_item.clone() {
+            let decision = ItemRetryDecision::from(decision);
+            // Only an exhausting attempt persists its failure, so a retried
+            // attempt never offloads a payload the map will discard.
+            let failure = if matches!(decision, ItemRetryDecision::Exhausted) {
+                match normalize_failure_for_storage(&mut state, &config, req.failure) {
+                    Ok(failure) => failure,
+                    Err(err) => return Box::pin(ready(Err(err))),
+                }
+            } else {
+                req.failure
+            };
+            let outcome = match fail_map_item(
+                &mut state,
+                &config,
+                task,
+                map_item,
+                failure,
+                ItemAttemptFailureKind::Failed,
+                decision,
+                now,
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => return Box::pin(ready(Err(err))),
+            };
+            if !matches!(outcome, FailActivityOutcome::RetryScheduled { .. })
+                && let Some(record) = state.activities.get_mut(&req.claim.activity_id)
+            {
+                record.completed = true;
+            }
+            drop(state);
+            self.notify_work();
+            return Box::pin(ready(Ok(outcome)));
+        }
+
+        if let ActivityFailureDecision::Retry { next_attempt } = decision {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
                 return Box::pin(ready(Err(Error::Backend(format!(
                     "activity `{}` not found",
@@ -1269,23 +1329,6 @@ impl DurableBackend for MemoryBackend {
             })));
         }
 
-        let config = self.payload_config.clone();
-        if let Some(map_item) = task.map_item.clone() {
-            let failure = match normalize_failure_for_storage(&mut state, &config, req.failure) {
-                Ok(failure) => failure,
-                Err(err) => return Box::pin(ready(Err(err))),
-            };
-            let outcome = match fail_map_item(&mut state, task, map_item, failure) {
-                Ok(outcome) => outcome,
-                Err(err) => return Box::pin(ready(Err(err))),
-            };
-            if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
-                record.completed = true;
-            }
-            drop(state);
-            self.notify_work();
-            return Box::pin(ready(Ok(outcome)));
-        }
         // Validate the run before touching the record or payload store so a
         // rejected failure leaves the record retryable and every retry returns
         // the same error, matching the SQL providers' transactional rollback.
@@ -1482,30 +1525,27 @@ impl DurableBackend for MemoryBackend {
     }
 }
 
-fn materialize_activity_map_items(
+/// Storage primitive behind [`MapEffect::MaterializeItems`] for an activity
+/// map: read the manifest entries for `[first_ordinal, first_ordinal + count)`
+/// and insert one item activity task per ordinal. *How many* ordinals to admit
+/// and *from where* is [`crate::map_engine`]'s decision, never this function's.
+fn insert_activity_map_item_batch(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     map_command_id: &crate::CommandId,
+    first_ordinal: u64,
+    count: u64,
 ) -> Result<()> {
     let now = state.now;
     let mut tasks = Vec::new();
     {
-        let Some(map) = state.activity_maps.get_mut(map_command_id) else {
+        let Some(map) = state.activity_maps.get(map_command_id) else {
             return Ok(());
         };
-        if map.completed {
-            return Ok(());
-        }
-
-        while map.in_flight < map.task.max_in_flight
-            && (map.next_ordinal as usize) < map.input_manifest.item_count
-        {
-            let item_ordinal = map.next_ordinal;
+        for item_ordinal in first_ordinal..first_ordinal.saturating_add(count) {
             let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
             let activity_id = ActivityId::map_item(map_command_id, item_ordinal);
             let timeout_at = activity_timeout_at(now, map.task.start_to_close_timeout);
-            map.next_ordinal += 1;
-            map.in_flight += 1;
             tasks.push((
                 activity_id.clone(),
                 timeout_at,
@@ -1531,9 +1571,16 @@ fn materialize_activity_map_items(
 
     for (activity_id, timeout_at, task) in tasks {
         let task = normalize_activity_task_for_storage(state, config, task)?;
-        state.activities.insert(
-            activity_id,
-            ActivityRecord {
+        // `or_insert`, never `insert`. This provider has no transaction, so a
+        // materialization batch that fails part-way leaves its prefix applied
+        // and a later event re-drives the same range; overwriting would reset
+        // `completed` and the claim of an item that is already in flight. That
+        // is what makes the engine's "applying a prefix and crashing is safe"
+        // claim true here and not merely true of the SQL providers.
+        state
+            .activities
+            .entry(activity_id)
+            .or_insert(ActivityRecord {
                 task,
                 claim: None,
                 completed: false,
@@ -1541,10 +1588,229 @@ fn materialize_activity_map_items(
                 heartbeat_deadline_at: None,
                 implicit_heartbeat_ms: None,
                 visible_at: None,
-            },
-        );
+            });
     }
     Ok(())
+}
+
+/// The activity-map descriptor as [`crate::map_engine`] sees it. `None` when
+/// the descriptor is gone, which means the run's terminal cleanup deleted it.
+fn activity_map_state(state: &MemoryState, map_command_id: &crate::CommandId) -> Option<MapState> {
+    let map = state.activity_maps.get(map_command_id)?;
+    Some(MapState {
+        map_command_id: map_command_id.clone(),
+        kind: MapKind::Activity,
+        // An activity map is always fail-fast; the field is inert for it.
+        failure_mode: ChildWorkflowMapFailureMode::FailFast,
+        item_count: map.input_manifest.item_count as u64,
+        next_ordinal: map.next_ordinal,
+        in_flight: map.in_flight as u64,
+        max_in_flight: map.task.max_in_flight,
+        recorded_outcomes: map.results.len() as u64,
+        completed: map.completed,
+    })
+}
+
+/// The child-workflow-map descriptor as [`crate::map_engine`] sees it.
+fn child_workflow_map_state(
+    state: &MemoryState,
+    map_command_id: &crate::CommandId,
+) -> Option<MapState> {
+    let map = state.child_workflow_maps.get(map_command_id)?;
+    Some(MapState {
+        map_command_id: map_command_id.clone(),
+        kind: MapKind::ChildWorkflow,
+        failure_mode: map.task.failure_mode,
+        item_count: map.input_manifest.item_count as u64,
+        next_ordinal: map.next_ordinal,
+        in_flight: map.in_flight as u64,
+        max_in_flight: map.task.max_in_flight,
+        recorded_outcomes: map.outcomes.len() as u64,
+        completed: map.completed,
+    })
+}
+
+/// A rejected transition never reaches the storage layer: the caller returns
+/// this error, and because every map path validates before it mutates, the
+/// descriptor and the parent history are untouched.
+fn map_reject_error(kind: MapKind, reject: MapReject) -> Error {
+    match reject {
+        MapReject::OutOfBounds { ordinal } => match kind {
+            MapKind::Activity => {
+                Error::Backend(format!("activity map item ordinal {ordinal} out of bounds"))
+            }
+            MapKind::ChildWorkflow => Error::Backend(format!(
+                "child workflow map item ordinal {ordinal} out of bounds"
+            )),
+        },
+        MapReject::TerminalParent => Error::TerminalWorkflow,
+    }
+}
+
+/// Run one map transition: project the descriptor, ask the engine, apply the
+/// effects it returns. Returns the parent event the transition appended, if
+/// any. Every map path in this provider goes through here.
+fn step_map(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_state: MapState,
+    event: MapEvent,
+) -> Result<Option<EventId>> {
+    let kind = map_state.kind;
+    let map_command_id = map_state.map_command_id.clone();
+    let effects = crate::map_engine::step(&map_state, event)
+        .map_err(|reject| map_reject_error(kind, reject))?;
+    apply_map_effects(state, config, &map_command_id, kind, effects)
+}
+
+/// Apply an engine effect list in order. Each arm is one storage primitive;
+/// no arm decides anything the engine already decided.
+fn apply_map_effects(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_command_id: &crate::CommandId,
+    kind: MapKind,
+    effects: Vec<MapEffect>,
+) -> Result<Option<EventId>> {
+    let mut appended = None;
+    for effect in effects {
+        match effect {
+            MapEffect::RecordItemOutcome { ordinal, outcome } => {
+                if let Some(map) = state.child_workflow_maps.get_mut(map_command_id) {
+                    map.outcomes.insert(ordinal, outcome);
+                }
+            }
+            MapEffect::MaterializeItems {
+                first_ordinal,
+                count,
+            } => match kind {
+                MapKind::Activity => insert_activity_map_item_batch(
+                    state,
+                    config,
+                    map_command_id,
+                    first_ordinal,
+                    count,
+                )?,
+                MapKind::ChildWorkflow => insert_child_workflow_map_item_batch(
+                    state,
+                    config,
+                    map_command_id,
+                    first_ordinal,
+                    count,
+                )?,
+            },
+            MapEffect::AdvanceDescriptor {
+                next_ordinal,
+                in_flight,
+            } => {
+                let in_flight = usize::try_from(in_flight).unwrap_or(usize::MAX);
+                match kind {
+                    MapKind::Activity => {
+                        if let Some(map) = state.activity_maps.get_mut(map_command_id) {
+                            map.next_ordinal = next_ordinal;
+                            map.in_flight = in_flight;
+                        }
+                    }
+                    MapKind::ChildWorkflow => {
+                        if let Some(map) = state.child_workflow_maps.get_mut(map_command_id) {
+                            map.next_ordinal = next_ordinal;
+                            map.in_flight = in_flight;
+                        }
+                    }
+                }
+            }
+            MapEffect::ScheduleItemRetry {
+                ordinal,
+                next_attempt,
+                visible_at_ms,
+                timeout_at_ms,
+            } => {
+                let activity_id = ActivityId::map_item(map_command_id, ordinal);
+                if let Some(record) = state.activities.get_mut(&activity_id) {
+                    record.task.attempt = next_attempt;
+                    record.claim = None;
+                    record.visible_at = visible_at_ms.map(TimestampMs);
+                    record.timeout_at = timeout_at_ms.map(TimestampMs);
+                    record.heartbeat_deadline_at = None;
+                    record.implicit_heartbeat_ms = None;
+                }
+            }
+            MapEffect::CompleteMap { item_count } => {
+                appended = Some(complete_map(
+                    state,
+                    config,
+                    map_command_id,
+                    kind,
+                    item_count,
+                )?);
+            }
+            MapEffect::FailMap { failure } => {
+                appended = Some(fail_map(state, config, map_command_id, kind, failure)?);
+            }
+            MapEffect::AbandonPendingItems => {
+                abandon_pending_map_items(state, map_command_id, kind);
+            }
+            MapEffect::CancelChildren { reason } => {
+                cancel_child_workflow_map_children(state, map_command_id, &reason);
+            }
+            MapEffect::MarkDescriptorTerminal => match kind {
+                MapKind::Activity => {
+                    if let Some(map) = state.activity_maps.get_mut(map_command_id) {
+                        map.completed = true;
+                        map.in_flight = 0;
+                    }
+                }
+                MapKind::ChildWorkflow => {
+                    if let Some(map) = state.child_workflow_maps.get_mut(map_command_id) {
+                        map.completed = true;
+                        map.in_flight = 0;
+                    }
+                }
+            },
+        }
+    }
+    Ok(appended)
+}
+
+/// [`MapEffect::AbandonPendingItems`]: tombstone every not-yet-terminal item
+/// task and every undispatched item start of a map that is over, so neither
+/// the claim path nor the timeout scanner can resurrect one. The claim-time
+/// guard that skips items of a completed map stays as well: a claim already in
+/// flight when the map ended must not change the answer.
+fn abandon_pending_map_items(
+    state: &mut MemoryState,
+    map_command_id: &crate::CommandId,
+    kind: MapKind,
+) {
+    match kind {
+        MapKind::Activity => {
+            for record in state.activities.values_mut() {
+                let is_item = record
+                    .task
+                    .map_item
+                    .as_ref()
+                    .is_some_and(|item| item.map_command_id == *map_command_id);
+                if is_item && !record.completed {
+                    record.completed = true;
+                    record.claim = None;
+                    record.heartbeat_deadline_at = None;
+                    record.implicit_heartbeat_ms = None;
+                }
+            }
+        }
+        MapKind::ChildWorkflow => {
+            for record in state.child_outbox.values_mut() {
+                let is_item = record
+                    .message
+                    .child_map_item
+                    .as_ref()
+                    .is_some_and(|item| item.map_command_id == *map_command_id);
+                if is_item && record.child_run_id.is_none() {
+                    record.dispatched = true;
+                }
+            }
+        }
+    }
 }
 
 fn change_version_record_for_run(
@@ -1978,37 +2244,33 @@ fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
     }
 }
 
-fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate::CommandId) {
+fn cancel_command_operational_state(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    command_id: &crate::CommandId,
+) -> Result<()> {
     for record in state.activities.values_mut() {
-        let matches_activity = record.task.command_id == *command_id;
-        let matches_map_item = record
-            .task
-            .map_item
-            .as_ref()
-            .is_some_and(|item| item.map_command_id == *command_id);
-        if matches_activity || matches_map_item {
+        if record.task.command_id == *command_id && record.task.map_item.is_none() {
             record.completed = true;
             record.claim = None;
             record.heartbeat_deadline_at = None;
             record.implicit_heartbeat_ms = None;
         }
     }
-    if let Some(map) = state.activity_maps.get_mut(command_id) {
-        map.completed = true;
-        map.in_flight = 0;
-    }
-    if let Some(map) = state.child_workflow_maps.get_mut(command_id) {
-        map.completed = true;
-        map.in_flight = 0;
+    // A cancelled map is a terminal map: the engine's `ParentCancelled`
+    // transition tombstones its pending work and closes the descriptor, so
+    // this path cannot drift from the fail-fast one.
+    for map_state in [
+        activity_map_state(state, command_id),
+        child_workflow_map_state(state, command_id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        step_map(state, config, map_state, MapEvent::ParentCancelled)?;
     }
     for record in state.child_outbox.values_mut() {
-        let matches_command = record.message.command_id == *command_id;
-        let matches_child_map = record
-            .message
-            .child_map_item
-            .as_ref()
-            .is_some_and(|item| item.map_command_id == *command_id);
-        if matches_command || matches_child_map {
+        if record.message.command_id == *command_id && record.message.child_map_item.is_none() {
             record.dispatched = true;
         }
     }
@@ -2018,6 +2280,7 @@ fn cancel_command_operational_state(state: &mut MemoryState, command_id: &crate:
     {
         record.dispatched = true;
     }
+    Ok(())
 }
 
 fn child_outbox_id(message: &ChildStartOutboxMessage) -> String {
@@ -2034,36 +2297,25 @@ fn child_outbox_id_for_command(command_id: &crate::CommandId) -> String {
     format!("{}:{}:child-start", command_id.run_id, command_id.seq.0)
 }
 
-fn materialize_child_workflow_map_items(
+/// Storage primitive behind [`MapEffect::MaterializeItems`] for a child map:
+/// enqueue one child-start outbox entry per ordinal in
+/// `[first_ordinal, first_ordinal + count)`.
+fn insert_child_workflow_map_item_batch(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     map_command_id: &crate::CommandId,
+    first_ordinal: u64,
+    count: u64,
 ) -> Result<()> {
-    loop {
-        let Some((item_ordinal, task, input)) = ({
-            let Some(map) = state.child_workflow_maps.get_mut(map_command_id) else {
+    for item_ordinal in first_ordinal..first_ordinal.saturating_add(count) {
+        let Some((task, input)) = ({
+            let Some(map) = state.child_workflow_maps.get(map_command_id) else {
                 return Ok(());
             };
-            if map.completed || map.in_flight >= map.task.max_in_flight.max(1) {
-                return Ok(());
-            }
-            while map.outcomes.contains_key(&map.next_ordinal) {
-                map.next_ordinal = map.next_ordinal.saturating_add(1);
-            }
-            if usize::try_from(map.next_ordinal).unwrap_or(usize::MAX)
-                >= map.input_manifest.item_count
-            {
-                return Ok(());
-            }
-            let item_ordinal = map.next_ordinal;
             let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
-            Some((item_ordinal, map.task.clone(), input))
+            Some((map.task.clone(), input))
         }) else {
             return Ok(());
-        };
-        let child_map_item = ChildWorkflowMapItem {
-            map_command_id: map_command_id.clone(),
-            item_ordinal,
         };
         let message = ChildStartOutboxMessage {
             command_id: map_command_id.clone(),
@@ -2075,27 +2327,24 @@ fn materialize_child_workflow_map_items(
             task_queue: task.task_queue.clone(),
             input,
             parent_close_policy: task.parent_close_policy,
-            child_map_item: Some(child_map_item),
+            child_map_item: Some(ChildWorkflowMapItem {
+                map_command_id: map_command_id.clone(),
+                item_ordinal,
+            }),
         };
         let message = crate::payload::map_child_start_payloads(message, &mut |payload| {
             normalize_payload_for_storage(state, config, payload)
         })?;
-        let outbox_id = child_outbox_id(&message);
         state
             .child_outbox
-            .entry(outbox_id)
+            .entry(child_outbox_id(&message))
             .or_insert(ChildOutboxRecord {
                 message,
                 dispatched: false,
                 child_run_id: None,
             });
-        if let Some(map) = state.child_workflow_maps.get_mut(map_command_id) {
-            if map.next_ordinal == item_ordinal {
-                map.next_ordinal = map.next_ordinal.saturating_add(1);
-                map.in_flight = map.in_flight.saturating_add(1);
-            }
-        }
     }
+    Ok(())
 }
 
 fn complete_child_workflow_map_item(
@@ -2104,168 +2353,181 @@ fn complete_child_workflow_map_item(
     map_item: ChildWorkflowMapItem,
     outcome: ChildWorkflowMapItemOutcome,
 ) -> Result<()> {
-    let mut fail_fast_failure = None;
-    let mut completed_map = None;
-    {
-        let Some(map) = state.child_workflow_maps.get_mut(&map_item.map_command_id) else {
-            return Err(Error::Backend(format!(
-                "child workflow map `{}`:{} not found",
-                map_item.map_command_id.run_id, map_item.map_command_id.seq.0
-            )));
-        };
-        if map.completed {
-            return Ok(());
-        }
-        let index = usize::try_from(map_item.item_ordinal).unwrap_or(usize::MAX);
-        if index >= map.input_manifest.item_count {
-            return Err(Error::Backend(format!(
-                "child workflow map item ordinal {} out of bounds",
-                map_item.item_ordinal
-            )));
-        }
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            map.outcomes.entry(map_item.item_ordinal)
-        {
-            let is_failure = !matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. });
-            let failure = match &outcome {
-                ChildWorkflowMapItemOutcome::Failed { failure } => Some(failure.clone()),
-                ChildWorkflowMapItemOutcome::Cancelled { reason } => {
-                    Some(crate::DurableFailure::non_retryable(
-                        "durust.child_workflow_cancelled",
-                        reason.clone(),
-                    ))
-                }
-                ChildWorkflowMapItemOutcome::Succeeded { .. } => None,
-            };
-            entry.insert(outcome);
-            map.in_flight = map.in_flight.saturating_sub(1);
-            if is_failure && map.task.failure_mode == ChildWorkflowMapFailureMode::FailFast {
-                map.completed = true;
-                fail_fast_failure = failure;
-            } else if map.outcomes.len() == map.input_manifest.item_count {
-                map.completed = true;
-                let outcomes = (0..map.input_manifest.item_count)
-                    .map(|ordinal| {
-                        map.outcomes.get(&(ordinal as u64)).cloned().ok_or_else(|| {
-                            Error::Backend(format!(
-                                "missing child workflow map outcome for item {ordinal}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let success_count = outcomes
-                    .iter()
-                    .filter(|outcome| {
-                        matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. })
-                    })
-                    .count();
-                let failure_count = outcomes
-                    .iter()
-                    .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Failed { .. }))
-                    .count();
-                let cancellation_count = outcomes
-                    .iter()
-                    .filter(|outcome| {
-                        matches!(outcome, ChildWorkflowMapItemOutcome::Cancelled { .. })
-                    })
-                    .count();
-                let result_manifest = encode_child_workflow_map_result_manifest_with_codec(
-                    map.task.result_manifest_name.clone(),
-                    outcomes,
-                    &map.input_manifest.page_lengths,
-                    config.codec,
-                )?;
-                completed_map = Some((
-                    result_manifest,
-                    map.input_manifest.item_count,
-                    success_count,
-                    failure_count,
-                    cancellation_count,
-                ));
-            }
-        }
-    }
-
-    if let Some(failure) = fail_fast_failure {
-        append_child_workflow_map_failed(state, config, &map_item.map_command_id, failure)?;
-        cancel_child_workflow_map_children(state, &map_item.map_command_id);
-    } else if let Some((
-        result_manifest,
-        item_count,
-        success_count,
-        failure_count,
-        cancellation_count,
-    )) = completed_map
-    {
-        let result_manifest = normalize_child_workflow_map_result_manifest_for_storage(
-            state,
-            config,
-            result_manifest,
-        )?;
-        append_child_workflow_map_completed(
-            state,
-            &map_item.map_command_id,
-            result_manifest,
-            item_count,
-            success_count,
-            failure_count,
-            cancellation_count,
-        )?;
-    } else {
-        materialize_child_workflow_map_items(state, config, &map_item.map_command_id)?;
-    }
-    Ok(())
-}
-
-fn append_child_workflow_map_completed(
-    state: &mut MemoryState,
-    map_command_id: &crate::CommandId,
-    result_manifest: PayloadRef,
-    item_count: usize,
-    success_count: usize,
-    failure_count: usize,
-    cancellation_count: usize,
-) -> Result<()> {
-    let Some(parent) = state.runs.get_mut(&map_command_id.run_id) else {
-        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    let Some(map_state) = child_workflow_map_state(state, &map_item.map_command_id) else {
+        return Err(Error::Backend(format!(
+            "child workflow map `{}`:{} not found",
+            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
+        )));
     };
-    if parent.terminal {
-        return Ok(());
-    }
-    let event_id = parent
-        .history
-        .last()
-        .map(|event| event.event_id.next())
-        .unwrap_or(EventId(1));
-    parent.push_history(HistoryEvent {
-        event_id,
-        event_type: crate::HistoryEventType::ChildWorkflowMapCompleted,
-        data: HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
-            command_id: map_command_id.clone(),
-            result_manifest,
-            item_count,
-            success_count,
-            failure_count,
-            cancellation_count,
-        }),
-    });
-    parent.ready = Some(WorkflowTaskReason::ChildWorkflowMapCompleted);
-    parent.ready_at = None;
+    let already_recorded = state
+        .child_workflow_maps
+        .get(&map_item.map_command_id)
+        .is_some_and(|map| map.outcomes.contains_key(&map_item.item_ordinal));
+    let parent_terminal = parent_run_terminal(state, &map_item.map_command_id.run_id)?;
+    step_map(
+        state,
+        config,
+        map_state,
+        MapEvent::ItemCompleted {
+            ordinal: map_item.item_ordinal,
+            outcome,
+            already_recorded,
+            parent_terminal,
+        },
+    )?;
     Ok(())
 }
 
-fn append_child_workflow_map_failed(
+/// Whether the map's parent run is already closed. A missing run is an error
+/// rather than "closed": the descriptor exists, so the run should too.
+fn parent_run_terminal(state: &MemoryState, run_id: &RunId) -> Result<bool> {
+    state
+        .runs
+        .get(run_id)
+        .map(|run| run.terminal)
+        .ok_or_else(|| Error::RunNotFound(run_id.clone()))
+}
+
+/// [`MapEffect::CompleteMap`]: assemble the result manifest in ascending
+/// ordinal order over the input manifest's page boundaries, append the
+/// terminal success fact to the parent, and wake it.
+fn complete_map(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     map_command_id: &crate::CommandId,
+    kind: MapKind,
+    item_count: u64,
+) -> Result<EventId> {
+    let item_count = usize::try_from(item_count).unwrap_or(usize::MAX);
+    let (result_manifest, counts) = match kind {
+        MapKind::Activity => {
+            let Some(map) = state.activity_maps.get(map_command_id) else {
+                return Err(Error::Backend(format!(
+                    "activity map `{}`:{} not found",
+                    map_command_id.run_id, map_command_id.seq.0
+                )));
+            };
+            let results = (0..item_count)
+                .map(|ordinal| {
+                    map.results
+                        .get(&(ordinal as u64))
+                        .cloned()
+                        .ok_or_else(|| Error::Backend(format!("missing result for item {ordinal}")))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let manifest = encode_activity_map_result_manifest_with_codec(
+                map.task.result_manifest_name.clone(),
+                results,
+                &map.input_manifest.page_lengths,
+                config.codec,
+            )?;
+            let manifest =
+                normalize_activity_map_result_manifest_for_storage(state, config, manifest)?;
+            (manifest, activity_outcome_counts(item_count))
+        }
+        MapKind::ChildWorkflow => {
+            let Some(map) = state.child_workflow_maps.get(map_command_id) else {
+                return Err(Error::Backend(format!(
+                    "child workflow map `{}`:{} not found",
+                    map_command_id.run_id, map_command_id.seq.0
+                )));
+            };
+            let outcomes = (0..item_count)
+                .map(|ordinal| {
+                    map.outcomes.get(&(ordinal as u64)).cloned().ok_or_else(|| {
+                        Error::Backend(format!(
+                            "missing child workflow map outcome for item {ordinal}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let counts = outcome_counts(&outcomes);
+            let manifest = encode_child_workflow_map_result_manifest_with_codec(
+                map.task.result_manifest_name.clone(),
+                outcomes,
+                &map.input_manifest.page_lengths,
+                config.codec,
+            )?;
+            let manifest =
+                normalize_child_workflow_map_result_manifest_for_storage(state, config, manifest)?;
+            (manifest, counts)
+        }
+    };
+
+    let (event_type, data, reason) = match kind {
+        MapKind::Activity => (
+            crate::HistoryEventType::ActivityMapCompleted,
+            HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
+                command_id: map_command_id.clone(),
+                result_manifest,
+                item_count,
+                success_count: counts.success_count,
+                failure_count: counts.failure_count,
+            }),
+            WorkflowTaskReason::ActivityMapCompleted,
+        ),
+        MapKind::ChildWorkflow => (
+            crate::HistoryEventType::ChildWorkflowMapCompleted,
+            HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
+                command_id: map_command_id.clone(),
+                result_manifest,
+                item_count,
+                success_count: counts.success_count,
+                failure_count: counts.failure_count,
+                cancellation_count: counts.cancellation_count,
+            }),
+            WorkflowTaskReason::ChildWorkflowMapCompleted,
+        ),
+    };
+    append_map_terminal_event(state, &map_command_id.run_id, event_type, data, reason)
+}
+
+/// [`MapEffect::FailMap`]: append the terminal failure fact to the parent and
+/// wake it.
+fn fail_map(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    map_command_id: &crate::CommandId,
+    kind: MapKind,
     failure: crate::DurableFailure,
-) -> Result<()> {
+) -> Result<EventId> {
     let failure = normalize_failure_for_storage(state, config, failure)?;
-    let Some(parent) = state.runs.get_mut(&map_command_id.run_id) else {
-        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
+    let (event_type, data, reason) = match kind {
+        MapKind::Activity => (
+            crate::HistoryEventType::ActivityMapFailed,
+            HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
+                command_id: map_command_id.clone(),
+                failure,
+            }),
+            WorkflowTaskReason::ActivityMapFailed,
+        ),
+        MapKind::ChildWorkflow => (
+            crate::HistoryEventType::ChildWorkflowMapFailed,
+            HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
+                command_id: map_command_id.clone(),
+                failure,
+            }),
+            WorkflowTaskReason::ChildWorkflowMapFailed,
+        ),
+    };
+    append_map_terminal_event(state, &map_command_id.run_id, event_type, data, reason)
+}
+
+/// Append a terminal map fact to the parent and mark it ready. The engine has
+/// already rejected the closed-parent case, so reaching here with a terminal
+/// run would be an engine/provider disagreement, not a routine race.
+fn append_map_terminal_event(
+    state: &mut MemoryState,
+    run_id: &RunId,
+    event_type: crate::HistoryEventType,
+    data: HistoryEventData,
+    reason: WorkflowTaskReason,
+) -> Result<EventId> {
+    let Some(parent) = state.runs.get_mut(run_id) else {
+        return Err(Error::RunNotFound(run_id.clone()));
     };
     if parent.terminal {
-        return Ok(());
+        return Err(Error::TerminalWorkflow);
     }
     let event_id = parent
         .history
@@ -2274,30 +2536,23 @@ fn append_child_workflow_map_failed(
         .unwrap_or(EventId(1));
     parent.push_history(HistoryEvent {
         event_id,
-        event_type: crate::HistoryEventType::ChildWorkflowMapFailed,
-        data: HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
-            command_id: map_command_id.clone(),
-            failure,
-        }),
+        event_type,
+        data,
     });
-    parent.ready = Some(WorkflowTaskReason::ChildWorkflowMapFailed);
+    parent.ready = Some(reason);
     parent.ready_at = None;
-    Ok(())
+    Ok(event_id)
 }
 
-fn cancel_child_workflow_map_children(state: &mut MemoryState, map_command_id: &crate::CommandId) {
-    for record in state.child_outbox.values_mut() {
-        if record
-            .message
-            .child_map_item
-            .as_ref()
-            .is_some_and(|item| item.map_command_id == *map_command_id)
-            && record.child_run_id.is_none()
-        {
-            record.dispatched = true;
-        }
-    }
-
+/// [`MapEffect::CancelChildren`]: cancel every already-running, not-yet-
+/// terminal child of this map with the engine's reason. Undispatched starts
+/// are tombstoned by [`MapEffect::AbandonPendingItems`], which the engine
+/// always emits first.
+fn cancel_child_workflow_map_children(
+    state: &mut MemoryState,
+    map_command_id: &crate::CommandId,
+    reason: &str,
+) {
     let children = state
         .runs
         .iter()
@@ -2321,7 +2576,7 @@ fn cancel_child_workflow_map_children(state: &mut MemoryState, map_command_id: &
                 event_id,
                 event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: HistoryEventData::WorkflowCancelled {
-                    reason: format!("child workflow map `{}` failed", map_command_id.seq.0),
+                    reason: reason.to_owned(),
                 },
             });
             child.terminal = true;
@@ -2340,132 +2595,124 @@ fn complete_map_item(
     map_item: ActivityMapItem,
     result: crate::PayloadRef,
 ) -> Result<CompleteActivityOutcome> {
-    let mut completed_map = None;
-    {
-        let Some(map) = state.activity_maps.get_mut(&map_item.map_command_id) else {
-            return Err(Error::Backend(format!(
-                "activity map `{}`:{} not found",
-                map_item.map_command_id.run_id, map_item.map_command_id.seq.0
-            )));
-        };
-        if map.completed {
-            return Ok(CompleteActivityOutcome::AlreadyCompleted);
-        }
-        let index = usize::try_from(map_item.item_ordinal).unwrap_or(usize::MAX);
-        if index >= map.input_manifest.item_count {
-            return Err(Error::Backend(format!(
-                "activity map item ordinal {} out of bounds",
-                map_item.item_ordinal
-            )));
-        }
-        if let std::collections::btree_map::Entry::Vacant(entry) =
-            map.results.entry(map_item.item_ordinal)
-        {
-            entry.insert(result);
-            map.in_flight = map.in_flight.saturating_sub(1);
-        }
-        if map.results.len() == map.input_manifest.item_count {
-            map.completed = true;
-            let results = (0..map.input_manifest.item_count)
-                .map(|ordinal| {
-                    map.results
-                        .get(&(ordinal as u64))
-                        .cloned()
-                        .ok_or_else(|| Error::Backend(format!("missing result for item {ordinal}")))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let result_manifest = encode_activity_map_result_manifest_with_codec(
-                map.task.result_manifest_name.clone(),
-                results,
-                &map.input_manifest.page_lengths,
-                config.codec,
-            )?;
-            completed_map = Some((result_manifest, map.input_manifest.item_count));
-        }
+    let Some(map_state) = activity_map_state(state, &map_item.map_command_id) else {
+        return Err(Error::Backend(format!(
+            "activity map `{}`:{} not found",
+            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
+        )));
+    };
+    if map_state.completed {
+        return Ok(CompleteActivityOutcome::AlreadyCompleted);
     }
-
-    if completed_map.is_none() {
-        materialize_activity_map_items(state, config, &map_item.map_command_id)?;
+    if !map_state.ordinal_in_bounds(map_item.item_ordinal) {
+        return Err(map_reject_error(
+            MapKind::Activity,
+            MapReject::OutOfBounds {
+                ordinal: map_item.item_ordinal,
+            },
+        ));
     }
+    let already_recorded = state
+        .activity_maps
+        .get(&map_item.map_command_id)
+        .is_some_and(|map| map.results.contains_key(&map_item.item_ordinal));
+    let parent_terminal = parent_run_terminal(state, &task.run_id)?;
 
-    let event_id = if let Some((result_manifest, item_count)) = completed_map {
-        let result_manifest =
-            normalize_activity_map_result_manifest_for_storage(state, config, result_manifest)?;
-        let Some(run) = state.runs.get_mut(&task.run_id) else {
-            return Err(Error::RunNotFound(task.run_id));
-        };
-        if run.terminal {
-            return Err(Error::TerminalWorkflow);
-        }
-        let event_id = run
-            .history
-            .last()
-            .map(|event| event.event_id.next())
-            .unwrap_or(EventId(1));
-        run.push_history(HistoryEvent {
-            event_id,
-            event_type: crate::HistoryEventType::ActivityMapCompleted,
-            data: HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
-                command_id: map_item.map_command_id,
-                result_manifest,
-                item_count,
-                success_count: item_count,
-                failure_count: 0,
-            }),
-        });
-        run.ready = Some(WorkflowTaskReason::ActivityMapCompleted);
-        run.ready_at = None;
-        event_id
-    } else {
+    // Ask before writing. An activity map's result row is its own storage
+    // primitive rather than an effect, so it must not be written for a
+    // transition the engine rejects — this provider has no transaction to roll
+    // the write back.
+    let effects = crate::map_engine::step(
+        &map_state,
+        MapEvent::ItemCompleted {
+            ordinal: map_item.item_ordinal,
+            // The result payload rides the result table, not the outcome; the
+            // engine only needs to know this was a success.
+            outcome: ChildWorkflowMapItemOutcome::Succeeded {
+                result: result.clone(),
+            },
+            already_recorded,
+            parent_terminal,
+        },
+    )
+    .map_err(|reject| map_reject_error(MapKind::Activity, reject))?;
+    if !already_recorded && let Some(map) = state.activity_maps.get_mut(&map_item.map_command_id) {
+        map.results.insert(map_item.item_ordinal, result);
+    }
+    let appended = apply_map_effects(
+        state,
+        config,
+        &map_item.map_command_id,
+        MapKind::Activity,
+        effects,
+    )?;
+
+    let event_id = appended.unwrap_or_else(|| {
         state
             .runs
             .get(&task.run_id)
             .and_then(|run| run.history.last().map(|event| event.event_id))
             .unwrap_or(EventId::ZERO)
-    };
-
+    });
     Ok(CompleteActivityOutcome::Completed { event_id })
 }
 
+/// One activity-map item attempt ended. `decision` is the shared activity
+/// retry verdict; the engine turns it into either a rescheduled attempt or the
+/// map's terminal failure.
+#[allow(clippy::too_many_arguments)]
 fn fail_map_item(
     state: &mut MemoryState,
+    config: &PayloadStorageConfig,
     task: ActivityTask,
     map_item: ActivityMapItem,
     failure: crate::DurableFailure,
+    kind: ItemAttemptFailureKind,
+    decision: ItemRetryDecision,
+    now: TimestampMs,
 ) -> Result<FailActivityOutcome> {
-    if let Some(map) = state.activity_maps.get_mut(&map_item.map_command_id) {
-        if map.completed {
-            return Ok(FailActivityOutcome::AlreadyCompleted);
-        }
-        map.completed = true;
-        map.in_flight = map.in_flight.saturating_sub(1);
-    }
-    let Some(run) = state.runs.get_mut(&task.run_id) else {
-        return Err(Error::RunNotFound(task.run_id));
+    let Some(map_state) = activity_map_state(state, &map_item.map_command_id) else {
+        return Ok(FailActivityOutcome::AlreadyCompleted);
     };
-    if run.terminal {
-        return Err(Error::TerminalWorkflow);
+    if map_state.completed {
+        return Ok(FailActivityOutcome::AlreadyCompleted);
     }
-    let event_id = run
-        .history
-        .last()
-        .map(|event| event.event_id.next())
-        .unwrap_or(EventId(1));
-    run.push_history(HistoryEvent {
-        event_id,
-        event_type: crate::HistoryEventType::ActivityMapFailed,
-        data: HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
-            command_id: map_item.map_command_id,
+    let already_recorded = state
+        .activity_maps
+        .get(&map_item.map_command_id)
+        .is_some_and(|map| map.results.contains_key(&map_item.item_ordinal));
+    let parent_terminal = parent_run_terminal(state, &task.run_id)?;
+    let appended = step_map(
+        state,
+        config,
+        map_state,
+        MapEvent::ItemAttemptFailed {
+            ordinal: map_item.item_ordinal,
             failure,
-        }),
-    });
-    run.ready = Some(WorkflowTaskReason::ActivityMapFailed);
-    run.ready_at = None;
-    Ok(FailActivityOutcome::Failed { event_id })
+            kind,
+            decision,
+            failed_attempt: task.attempt,
+            retry_policy: task.retry_policy.clone(),
+            start_to_close_timeout: task.start_to_close_timeout,
+            now,
+            already_recorded,
+            parent_terminal,
+        },
+    )?;
+    match (decision, appended) {
+        (ItemRetryDecision::Retry { next_attempt }, _) => {
+            Ok(FailActivityOutcome::RetryScheduled { next_attempt })
+        }
+        (ItemRetryDecision::Exhausted, Some(event_id)) => {
+            Ok(FailActivityOutcome::Failed { event_id })
+        }
+        (ItemRetryDecision::Exhausted, None) => Ok(FailActivityOutcome::AlreadyCompleted),
+    }
 }
 
 fn timeout_activity(
     state: &mut MemoryState,
+    config: &PayloadStorageConfig,
     activity_id: &ActivityId,
     now: TimestampMs,
 ) -> Result<bool> {
@@ -2489,34 +2736,48 @@ fn timeout_activity(
         );
 
         let task = record.task.clone();
-        if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
-            // Timeout retries carry no backoff: the expired deadline already
-            // paced this attempt, and delaying crash recovery further would
-            // only add latency.
-            record.task.attempt = next_attempt;
-            record.claim = None;
-            record.visible_at = None;
-            record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
-            record.heartbeat_deadline_at = None;
-            record.implicit_heartbeat_ms = None;
-            return Ok(true);
+        let decision = activity_timeout_decision(&task);
+        // A map item's lapsed deadline is an engine event, not a local
+        // reschedule: the engine owns both the retry and the map's terminal
+        // failure, and it is the only thing that knows whether the map is over.
+        if task.map_item.is_none() {
+            if let ActivityFailureDecision::Retry { next_attempt } = decision {
+                // Timeout retries carry no backoff: the expired deadline already
+                // paced this attempt, and delaying crash recovery further would
+                // only add latency.
+                record.task.attempt = next_attempt;
+                record.claim = None;
+                record.visible_at = None;
+                record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
+                record.heartbeat_deadline_at = None;
+                record.implicit_heartbeat_ms = None;
+                return Ok(true);
+            }
+            record.completed = true;
         }
-
-        record.completed = true;
-        (task, attribution)
+        (task, attribution, decision)
     };
 
-    let (timed_out_task, attribution) = timed_out_task;
+    let (timed_out_task, attribution, decision) = timed_out_task;
     if let Some(map_item) = timed_out_task.map_item.clone() {
-        fail_map_item(
+        let outcome = fail_map_item(
             state,
+            config,
             timed_out_task.clone(),
             map_item,
             crate::DurableFailure::new(
                 "durust.activity_timed_out",
                 timeout_message(activity_id, timed_out_task.attempt, attribution),
             ),
+            ItemAttemptFailureKind::TimedOut,
+            ItemRetryDecision::from(decision),
+            now,
         )?;
+        if !matches!(outcome, FailActivityOutcome::RetryScheduled { .. })
+            && let Some(record) = state.activities.get_mut(activity_id)
+        {
+            record.completed = true;
+        }
         return Ok(true);
     }
 

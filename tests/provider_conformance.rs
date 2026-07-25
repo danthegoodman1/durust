@@ -8119,12 +8119,20 @@ where
 /// stopped the map was *cancelled*, and the `reason` on every sibling child's
 /// `WorkflowCancelled`.
 ///
-/// Both are byte-for-byte different across the providers today and nothing
-/// else in either language's suite asserts them, so "conformance passes
-/// unchanged" is vacuous for exactly the two behaviours Phase 6's shared map
-/// engine converges (Decisions D3/D4). Pinning today's per-provider forms
-/// first makes that convergence show up as a diff here instead of as a silent
-/// change to persisted history.
+/// Both were byte-for-byte different across the providers before row 6B, and
+/// nothing else in either language's suite asserted them, so "conformance
+/// passes unchanged" was vacuous for exactly the two behaviours Phase 6's
+/// shared map engine converges (Decisions D3/D4). The per-provider tables were
+/// added first so the convergence would show up as a diff here instead of as a
+/// silent change to persisted history. **This is that diff.**
+///
+/// One table now, because all three providers read these strings out of
+/// `map_engine::fail_fast_failure` and `map_engine::child_cancellation_reason`
+/// instead of formatting their own. Both converged forms are the SQL
+/// providers': the message names the item ordinal, and the cancellation reason
+/// qualifies the command with its run so it is unambiguous across runs. The
+/// in-memory provider's bare child reason and seq-only cancellation reason are
+/// gone.
 struct FailFastHistoryStrings {
     /// `(item ordinal, child cancellation reason) -> parent-visible message`.
     cancelled_item_message: fn(u64, &str) -> String,
@@ -8132,19 +8140,10 @@ struct FailFastHistoryStrings {
     sibling_cancellation_reason: fn(&durust::CommandId) -> String,
 }
 
-/// In-memory provider: the bare child reason, and a cancellation reason
-/// carrying only the command sequence (`memory.rs:2133-2136`, `:2324`).
-const MEMORY_FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = FailFastHistoryStrings {
-    cancelled_item_message: |_ordinal, reason| reason.to_owned(),
-    sibling_cancellation_reason: |command_id| {
-        format!("child workflow map `{}` failed", command_id.seq.0)
-    },
-};
-
-/// SQL providers: the message names the item ordinal and the cancellation
-/// reason qualifies the command with its run (`sqlite.rs:4549-4557`, `:4737-4740`;
-/// `postgres.rs:7385-7393`, `:7644-7647`).
-const SQL_FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = FailFastHistoryStrings {
+/// The converged forms. Produced once by `src/map_engine.rs` and pinned there
+/// byte-for-byte by `parent_visible_failure_strings_are_pinned`; asserted here
+/// against the durable history all three providers actually write.
+const FAIL_FAST_HISTORY_STRINGS: FailFastHistoryStrings = FailFastHistoryStrings {
     cancelled_item_message: |ordinal, reason| {
         format!("child workflow map item {ordinal} was cancelled: {reason}")
     },
@@ -8248,7 +8247,7 @@ async fn child_workflow_map_fail_fast_history_strings<B>(
 fn memory_child_workflow_map_fail_fast_history_strings_are_pinned() {
     block_on(child_workflow_map_fail_fast_history_strings(
         MemoryBackend::new(),
-        &MEMORY_FAIL_FAST_HISTORY_STRINGS,
+        &FAIL_FAST_HISTORY_STRINGS,
     ));
 }
 
@@ -8257,7 +8256,7 @@ fn sqlite_child_workflow_map_fail_fast_history_strings_are_pinned() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let backend = SqliteBackend::open(dir.path().join("fail-fast-strings.sqlite3")).unwrap();
-        child_workflow_map_fail_fast_history_strings(backend, &SQL_FAIL_FAST_HISTORY_STRINGS).await;
+        child_workflow_map_fail_fast_history_strings(backend, &FAIL_FAST_HISTORY_STRINGS).await;
     });
 }
 
@@ -8275,7 +8274,7 @@ fn postgres_child_workflow_map_fail_fast_history_strings_are_pinned_when_configu
         )
         .await
         .unwrap();
-        child_workflow_map_fail_fast_history_strings(backend, &SQL_FAIL_FAST_HISTORY_STRINGS).await;
+        child_workflow_map_fail_fast_history_strings(backend, &FAIL_FAST_HISTORY_STRINGS).await;
         drop_postgres_schema(&url, &schema).await;
     });
 }
@@ -9505,4 +9504,630 @@ fn assert_map_item(task: &durust::ActivityTask, item_ordinal: u64, expected_inpu
         durust::decode_payload::<Input>(&task.input).unwrap().value,
         expected_input
     );
+}
+
+// ---------------------------------------------------------------------------
+// Row 6B: behaviours that changed when the three providers started applying
+// `src/map_engine.rs`'s effect list instead of each running its own copy of
+// the fanout state machine. Every case below is driven through the public
+// `DurableBackend` surface on all three providers, because the point of the
+// extraction is that they now answer identically.
+// ---------------------------------------------------------------------------
+
+/// Schedule an activity map with a caller-chosen `max_in_flight` and item
+/// count and return the map command id plus the activity claim options its
+/// items are claimable with.
+async fn schedule_activity_map<B>(
+    backend: &B,
+    workflow_id: &str,
+    workflow_queue: &str,
+    activity_queue: &str,
+    item_count: u64,
+    max_in_flight: usize,
+    retry_policy: durust::RetryPolicy,
+    start_to_close_timeout: Option<Duration>,
+) -> (durust::RunId, durust::CommandId, ClaimActivityOptions)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<workflow>(workflow_id, workflow_queue, input(1))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{workflow_id}-map-scheduler")),
+            workflow_claim_opts(workflow_queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&run_id, 1);
+    let input_manifest = durust::encode_activity_map_input_manifest(
+        (0..item_count)
+            .map(|value| durust::encode_payload(&Input { value }).unwrap())
+            .collect(),
+        2,
+    )
+    .unwrap();
+    let activity_name = ActivityName::new("conformance.echo");
+    let task_queue = TaskQueue::new(activity_queue);
+    let map_task = ActivityMapTask {
+        map_command_id: command_id.clone(),
+        activity_name: activity_name.clone(),
+        task_queue: task_queue.clone(),
+        retry_policy: retry_policy.clone(),
+        start_to_close_timeout,
+        heartbeat_timeout: None,
+        input_manifest: input_manifest.clone(),
+        result_manifest_name: "mapped".to_owned(),
+        max_in_flight,
+    };
+    let fingerprint = durust::activity_map_fingerprint(
+        activity_name.clone(),
+        durust::payload_digest(&input_manifest),
+        "mapped".to_owned(),
+        max_in_flight,
+        "sha256:test-options".to_owned(),
+    );
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
+                        command_id: command_id.clone(),
+                        activity_name: activity_name.clone(),
+                        task_queue: task_queue.clone(),
+                        retry_policy,
+                        start_to_close_timeout,
+                        heartbeat_timeout: None,
+                        input_manifest,
+                        result_manifest_name: "mapped".to_owned(),
+                        max_in_flight,
+                        fingerprint,
+                    }),
+                )],
+                schedule_activity_maps: vec![map_task],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    (
+        run_id,
+        command_id,
+        ClaimActivityOptions {
+            namespace: Namespace::default(),
+            task_queue,
+            registered_activity_names: vec![activity_name],
+            lease_duration: Duration::from_secs(30),
+        },
+    )
+}
+
+/// Behaviour change 6J: `max_in_flight: 0` admits one item instead of stalling.
+///
+/// The in-memory provider read `max_in_flight` without `.max(1)`
+/// (`memory.rs:1500`), so a zero bound materialized nothing and the map never
+/// progressed — while SQLite and Postgres both admitted one item, and memory's
+/// *own* child-map path clamped. `MapState::slot_limit` clamps once for
+/// everyone, so all three now admit exactly one.
+async fn activity_map_zero_max_in_flight_admits_one_item<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (_run_id, _command_id, activity_opts) = schedule_activity_map(
+        &backend,
+        "wf/map-zero-bound",
+        "map-zero-bound-workflows",
+        "map-zero-bound-activities",
+        3,
+        0,
+        durust::RetryPolicy::none(),
+        None,
+    )
+    .await;
+
+    let first = backend
+        .claim_activity_task(WorkerId::new("zero-bound-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("a zero bound is read as one slot, not as a stall");
+    assert_eq!(first.task.map_item.as_ref().unwrap().item_ordinal, 0);
+    assert!(
+        backend
+            .claim_activity_task(WorkerId::new("zero-bound-2"), activity_opts.clone())
+            .await
+            .unwrap()
+            .is_none(),
+        "the clamped bound is one slot, not unbounded"
+    );
+
+    // And the clamp keeps the map moving: completing the one admitted item
+    // admits the next.
+    backend
+        .complete_activity(CompleteActivityRequest {
+            claim: first.claim,
+            result: durust::encode_payload(&0_u64).unwrap(),
+        })
+        .await
+        .unwrap();
+    let second = backend
+        .claim_activity_task(WorkerId::new("zero-bound-3"), activity_opts)
+        .await
+        .unwrap()
+        .expect("the released slot admits the next ordinal");
+    assert_eq!(second.task.map_item.as_ref().unwrap().item_ordinal, 1);
+}
+
+#[test]
+fn memory_activity_map_zero_max_in_flight_admits_one_item() {
+    block_on(activity_map_zero_max_in_flight_admits_one_item(
+        MemoryBackend::new(),
+    ));
+}
+
+#[test]
+fn sqlite_activity_map_zero_max_in_flight_admits_one_item() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map-zero-bound.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        activity_map_zero_max_in_flight_admits_one_item(backend).await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_activity_map_zero_max_in_flight_admits_one_item_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres zero-bound map conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("mapzerobound");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        activity_map_zero_max_in_flight_admits_one_item(backend).await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+/// Behaviour change: a failed activity map tombstones its still-pending
+/// sibling items (`MapEffect::AbandonPendingItems`).
+///
+/// Postgres already bulk-tombstoned on failure (`postgres.rs:7891`); the
+/// in-memory and SQLite providers did not and relied on the claim-time guard
+/// alone, so a sibling item stayed claimable-shaped in storage and the timeout
+/// scanner could still *retry* it — rescheduling work for a map that was over.
+/// The engine emits `AbandonPendingItems` on every terminal failure, so all
+/// three now tombstone. The claim-time guard stays: it still has to answer for
+/// an item claimed before the map ended.
+async fn activity_map_failure_tombstones_pending_sibling_items<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let (_run_id, _command_id, activity_opts) = schedule_activity_map(
+        &backend,
+        "wf/map-abandon",
+        "map-abandon-workflows",
+        "map-abandon-activities",
+        4,
+        2,
+        // A policy that *would* retry and a deadline that *would* fire: under
+        // the pre-6B in-memory and SQLite providers the sibling below stayed
+        // live after the map failed, so its next failure rescheduled it and
+        // the timeout scanner rescheduled it again.
+        durust::RetryPolicy {
+            backoff: durust::RetryBackoff::None,
+            max_attempts: 5,
+        },
+        Some(Duration::from_secs(1)),
+    )
+    .await;
+
+    let first = backend
+        .claim_activity_task(WorkerId::new("abandon-1"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("first map item");
+    let sibling = backend
+        .claim_activity_task(WorkerId::new("abandon-2"), activity_opts.clone())
+        .await
+        .unwrap()
+        .expect("second map item");
+
+    // Fail the first item non-retryably: the map is fail-fast, so it ends.
+    let outcome = backend
+        .fail_activity(FailActivityRequest {
+            claim: first.claim,
+            failure: durust::DurableFailure::non_retryable("boom", "item 0 failed"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        durust::FailActivityOutcome::Failed { .. }
+    ));
+
+    // The sibling is tombstoned, so its own terminal call is a no-op rather
+    // than a second slot release or a reschedule onto a dead map.
+    assert_eq!(
+        backend
+            .fail_activity(FailActivityRequest {
+                claim: sibling.claim.clone(),
+                failure: durust::DurableFailure::new("retryable", "would have rescheduled"),
+            })
+            .await
+            .unwrap(),
+        durust::FailActivityOutcome::AlreadyCompleted,
+        "a retryable failure on a map that is over must not reschedule the item",
+    );
+    assert_eq!(
+        backend
+            .complete_activity(CompleteActivityRequest {
+                claim: sibling.claim,
+                result: durust::encode_payload(&1_u64).unwrap(),
+            })
+            .await
+            .unwrap(),
+        durust::CompleteActivityOutcome::AlreadyCompleted,
+    );
+
+    // Nothing of this map is claimable any more, and the timeout scanner has
+    // nothing left to resurrect.
+    assert!(
+        backend
+            .claim_activity_task(WorkerId::new("abandon-3"), activity_opts)
+            .await
+            .unwrap()
+            .is_none(),
+    );
+    assert_eq!(
+        backend
+            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                namespace: Namespace::default(),
+                now: durust::TimestampMs(i64::MAX / 2),
+                limit: 32,
+            })
+            .await
+            .unwrap()
+            .timed_out,
+        0,
+        "no item of a finished map may time out and reschedule",
+    );
+}
+
+#[test]
+fn memory_activity_map_failure_tombstones_pending_sibling_items() {
+    block_on(activity_map_failure_tombstones_pending_sibling_items(
+        MemoryBackend::new(),
+    ));
+}
+
+#[test]
+fn sqlite_activity_map_failure_tombstones_pending_sibling_items() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("map-abandon.sqlite3");
+        {
+            let backend = SqliteBackend::open(&path).unwrap();
+            activity_map_failure_tombstones_pending_sibling_items(backend).await;
+        }
+        // Close and reopen: the tombstones must be durable, not in-process
+        // state.
+        let reopened = SqliteBackend::open(&path).unwrap();
+        assert!(
+            reopened
+                .claim_activity_task(
+                    WorkerId::new("abandon-reopened"),
+                    ClaimActivityOptions {
+                        namespace: Namespace::default(),
+                        task_queue: TaskQueue::new("map-abandon-activities"),
+                        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .is_none(),
+        );
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_activity_map_failure_tombstones_pending_sibling_items_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres map abandon conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("mapabandon");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        activity_map_failure_tombstones_pending_sibling_items(backend).await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+/// Behaviour change 6H: a child-map item whose generated workflow id is
+/// already taken takes its `max_in_flight` slot like every other admitted
+/// ordinal, so real concurrency never exceeds the bound.
+///
+/// Postgres starts map children inline. `materialize_child_workflow_map_items_tx`
+/// advanced `next_ordinal` before the match and `InlineChildStartOutcome::Failed`
+/// took no slot (`postgres.rs:7252`, `:7258`), but the failure was then routed
+/// through `complete_child_workflow_map_item_tx`, which *released* one
+/// (`:7371`). Net −1 slot per conflicting ordinal, permanently, compounding.
+/// The engine's D7 rule is that materialization always takes the slot and
+/// exactly one terminal outcome releases it, so the conflict is now routed
+/// back as an ordinary failed item after the batch is applied.
+///
+/// The collision is reachable through the public `Client::start_workflow`
+/// API: any caller that starts a workflow named `{prefix}/{ordinal}` before
+/// the map materializes that ordinal produces it.
+async fn child_workflow_map_id_collision_holds_the_in_flight_bound<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let prefix = "wf/child-map-collision/item";
+    let parent_queue = "child-map-collision-parent";
+    let child_queue = "child-map-collision-children";
+    let client = Client::new(backend.clone());
+
+    // The squatter: a workflow started through the ordinary public API whose
+    // id happens to be the one ordinal 1 will want. It lives on its own task
+    // queue so it never shows up as a map child below.
+    client
+        .start_workflow::<workflow>(
+            &format!("{prefix}/1"),
+            "child-map-collision-squatter",
+            input(99),
+        )
+        .await
+        .unwrap();
+
+    let parent_run_id = client
+        .start_workflow::<workflow>("wf/child-map-collision", parent_queue, input(1))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new("child-map-collision-scheduler"),
+            workflow_claim_opts(parent_queue),
+        )
+        .await
+        .unwrap()
+        .expect("parent workflow task");
+    let command_id = durust::command_id(&parent_run_id, 1);
+    let input_manifest = durust::encode_activity_map_input_manifest(
+        (0..4_u64)
+            .map(|value| durust::encode_payload(&value).unwrap())
+            .collect(),
+        2,
+    )
+    .unwrap();
+    let workflow_type = WorkflowType::new("conformance.workflow", 1);
+    let task_queue = TaskQueue::new(child_queue);
+    let max_in_flight = 2;
+    let map_task = ChildWorkflowMapTask {
+        map_command_id: command_id.clone(),
+        workflow_type: workflow_type.clone(),
+        task_queue: task_queue.clone(),
+        input_manifest: input_manifest.clone(),
+        result_manifest_name: "collision-results".to_owned(),
+        workflow_id_prefix: prefix.to_owned(),
+        max_in_flight,
+        parent_close_policy: durust::ParentClosePolicy::Abandon,
+        // CollectAll, so the conflicting ordinal is recorded as a failed item
+        // and the map keeps materializing instead of stopping at the first
+        // non-success.
+        failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+    };
+    backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowMapScheduled(
+                        durust::ChildWorkflowMapScheduled {
+                            command_id: command_id.clone(),
+                            workflow_type: workflow_type.clone(),
+                            task_queue: task_queue.clone(),
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "collision-results".to_owned(),
+                            workflow_id_prefix: prefix.to_owned(),
+                            max_in_flight,
+                            parent_close_policy: durust::ParentClosePolicy::Abandon,
+                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+                            fingerprint: durust::child_workflow_map_fingerprint(
+                                workflow_type,
+                                durust::payload_digest(&input_manifest),
+                                "collision-results".to_owned(),
+                                prefix.to_owned(),
+                                max_in_flight,
+                                task_queue,
+                                durust::ParentClosePolicy::Abandon,
+                                durust::ChildWorkflowMapFailureMode::CollectAll,
+                            ),
+                        },
+                    ),
+                )],
+                schedule_child_workflow_maps: vec![map_task],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    dispatch_child_map_starts(&backend).await;
+
+    // Every map child that actually exists right now. The bound is two, and
+    // the conflicting ordinal must have consumed one of them and then given it
+    // back exactly once — never given back a slot it never took.
+    let mut started = BTreeSet::new();
+    for index in 0..8 {
+        let Some(child) = backend
+            .claim_workflow_task(
+                WorkerId::new(format!("child-map-collision-{index}")),
+                workflow_claim_opts(child_queue),
+            )
+            .await
+            .unwrap()
+        else {
+            break;
+        };
+        started.insert(child.workflow_id.0.clone());
+    }
+    assert_eq!(
+        started,
+        BTreeSet::from([format!("{prefix}/0"), format!("{prefix}/2")]),
+        "an id collision must not admit an extra child past `max_in_flight`",
+    );
+}
+
+#[test]
+fn memory_child_workflow_map_id_collision_holds_the_in_flight_bound() {
+    block_on(child_workflow_map_id_collision_holds_the_in_flight_bound(
+        MemoryBackend::new(),
+    ));
+}
+
+#[test]
+fn sqlite_child_workflow_map_id_collision_holds_the_in_flight_bound() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("child-map-collision.sqlite3")).unwrap();
+        child_workflow_map_id_collision_holds_the_in_flight_bound(backend).await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_child_workflow_map_id_collision_holds_the_in_flight_bound_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres child map collision conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("childmapcollision");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        child_workflow_map_id_collision_holds_the_in_flight_bound(backend).await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+/// The materialization effect is a contiguous *range*, and Postgres turns each
+/// range into exactly one set-based statement rather than `count` round trips.
+///
+/// `map_engine::materialization_is_one_range_effect_per_batch` pins the engine
+/// half (a 10,000-item batch is still one `MaterializeItems`); this pins the
+/// provider half end to end at a size where a per-item loop would be obvious.
+/// Postgres issues
+///
+/// ```sql
+/// insert into <schema>.activity_tasks (...)
+/// select item.activity_id, $1, $2, $3, $4, item.task, null, false, $5, null
+/// from unnest($6::text[], $7::bytea[]) as item(activity_id, task)
+/// on conflict(activity_id) do nothing
+/// ```
+///
+/// once for the whole range, because every column except `activity_id` and
+/// `task` is identical across one map's items.
+async fn activity_map_materializes_a_large_batch_in_one_statement<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    const ITEMS: u64 = 400;
+    let (_run_id, _command_id, activity_opts) = schedule_activity_map(
+        &backend,
+        "wf/map-batch",
+        "map-batch-workflows",
+        "map-batch-activities",
+        ITEMS,
+        ITEMS as usize,
+        durust::RetryPolicy::none(),
+        None,
+    )
+    .await;
+
+    let mut ordinals = BTreeSet::new();
+    for index in 0..ITEMS + 1 {
+        let Some(task) = backend
+            .claim_activity_task(
+                WorkerId::new(format!("batch-{index}")),
+                activity_opts.clone(),
+            )
+            .await
+            .unwrap()
+        else {
+            break;
+        };
+        let map_item = task.task.map_item.as_ref().expect("map item metadata");
+        assert_eq!(
+            durust::decode_payload::<Input>(&task.task.input)
+                .unwrap()
+                .value,
+            map_item.item_ordinal,
+            "each row of the batch carries its own manifest input",
+        );
+        assert!(
+            ordinals.insert(map_item.item_ordinal),
+            "the batch must admit each ordinal exactly once",
+        );
+    }
+    assert_eq!(
+        ordinals,
+        (0..ITEMS).collect::<BTreeSet<_>>(),
+        "one batch admits the whole contiguous range",
+    );
+}
+
+#[test]
+fn memory_activity_map_materializes_a_large_batch_in_one_statement() {
+    block_on(activity_map_materializes_a_large_batch_in_one_statement(
+        MemoryBackend::new(),
+    ));
+}
+
+#[test]
+fn sqlite_activity_map_materializes_a_large_batch_in_one_statement() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SqliteBackend::open(dir.path().join("map-batch.sqlite3")).unwrap();
+        activity_map_materializes_a_large_batch_in_one_statement(backend).await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_activity_map_materializes_a_large_batch_in_one_statement_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_from_env() else {
+            eprintln!("skipping Postgres map batch conformance; set DURUST_POSTGRES_URL");
+            return;
+        };
+        let schema = postgres_test_schema("mapbatch");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        activity_map_materializes_a_large_batch_in_one_statement(backend).await;
+        drop_postgres_schema(&url, &schema).await;
+    });
 }

@@ -96,6 +96,19 @@ pub(crate) struct MapState {
     /// admitted-item high-water mark. The engine re-admits from it
     /// unconditionally; a descriptor whose cursor sits at or behind a recorded
     /// outcome would have that ordinal admitted twice.
+    ///
+    /// What preserves that invariant is that descriptor creation is a *reset*,
+    /// not an upsert: `src/memory.rs` inserts each map record with
+    /// `next_ordinal: 0` **and** an empty outcome map in the same expression,
+    /// and the SQL providers' descriptor insert is equally all-or-nothing, so
+    /// cursor and outcome set are only ever created together at zero or
+    /// advanced together inside one transaction. A future "make descriptor
+    /// creation idempotent" refactor to `.entry().or_insert()` — retaining the
+    /// outcomes of a previous incarnation while the cursor snaps back to zero —
+    /// would break the precondition silently: the engine would re-admit every
+    /// already-completed ordinal, and nothing in it can detect that, because it
+    /// deliberately never scans `recorded_outcomes` to decide *which* ordinals
+    /// to admit. Keep the reset.
     pub next_ordinal: u64,
     pub in_flight: u64,
     pub max_in_flight: usize,
@@ -859,6 +872,100 @@ mod tests {
             step(&state, completed(2, success())),
             Ok(vec![
                 MapEffect::CompleteMap { item_count: 3 },
+                MapEffect::MarkDescriptorTerminal,
+            ]),
+        );
+    }
+
+    /// The completion boundary from the *early* side: the second-to-last
+    /// outcome must not complete the map.
+    ///
+    /// `last_item_completes_the_map` pins "no later than the last item"; on its
+    /// own that leaves the off-by-one in the other direction unobserved, and
+    /// completing early is the more damaging half. `CompleteMap` assembles the
+    /// result manifest from the outcomes recorded *so far*, so an early
+    /// completion emits a short manifest and silently discards the in-flight
+    /// item's result — data loss, not a stall. This drives the transition at
+    /// `recorded_outcomes == item_count - 2` and asserts it materializes the
+    /// next ordinal instead, so both `recorded_after >= item_count` and the
+    /// `recorded_outcomes + 1` that feeds it are pinned exactly.
+    #[test]
+    fn second_to_last_outcome_materializes_and_never_completes_the_map() {
+        // item_count 5, ordinals 0..=3 admitted, three outcomes already
+        // recorded: this completion is the fourth of five.
+        let activity = MapState {
+            next_ordinal: 4,
+            in_flight: 2,
+            recorded_outcomes: 3,
+            ..activity_map(5, 2)
+        };
+        let effects = step(&activity, completed(3, success())).unwrap();
+        assert_eq!(
+            effects,
+            vec![
+                MapEffect::MaterializeItems {
+                    first_ordinal: 4,
+                    count: 1
+                },
+                MapEffect::AdvanceDescriptor {
+                    next_ordinal: 5,
+                    in_flight: 2
+                },
+            ],
+            "the second-to-last outcome must admit ordinal 4, not complete the map",
+        );
+
+        let child = MapState {
+            next_ordinal: 4,
+            in_flight: 2,
+            recorded_outcomes: 3,
+            ..child_map(5, 2, ChildWorkflowMapFailureMode::CollectAll)
+        };
+        let effects = step(&child, completed(3, success())).unwrap();
+        assert_eq!(
+            effects,
+            vec![
+                MapEffect::RecordItemOutcome {
+                    ordinal: 3,
+                    outcome: success()
+                },
+                MapEffect::MaterializeItems {
+                    first_ordinal: 4,
+                    count: 1
+                },
+                MapEffect::AdvanceDescriptor {
+                    next_ordinal: 5,
+                    in_flight: 2
+                },
+            ],
+        );
+
+        // The same boundary held from a saturated map, where materialization
+        // produces nothing and an early completion would be the *only* effect.
+        // This is the shape that would otherwise hide behind an empty list.
+        let saturated = MapState {
+            next_ordinal: 5,
+            in_flight: 2,
+            recorded_outcomes: 3,
+            ..activity_map(5, 2)
+        };
+        assert_eq!(
+            step(&saturated, completed(3, success())),
+            Ok(Vec::new()),
+            "a fully admitted map with one item still in flight is not terminal",
+        );
+
+        // And the far side of the same boundary: the last outcome does
+        // complete, so the pin is a boundary and not a blanket "never
+        // completes".
+        let last = MapState {
+            recorded_outcomes: 4,
+            ..saturated
+        };
+        assert_eq!(
+            step(&last, completed(4, success())),
+            Ok(vec![
+                MapEffect::CompleteMap { item_count: 5 },
                 MapEffect::MarkDescriptorTerminal,
             ]),
         );
