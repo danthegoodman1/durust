@@ -5348,3 +5348,66 @@ fn postgres_transaction_abort_retry_classifier_matches_only_abort_sqlstates() {
     )));
     assert!(!is_retryable_postgres_transaction_abort(&Error::StaleLease));
 }
+
+/// `InlineChildStartOutcome::Vanished` must be an error at every site, and the
+/// two child shapes must name themselves differently.
+///
+/// This is the shared raise point for all three producers — the scalar commit
+/// path, the batched commit path, and child-map materialization — so pinning it
+/// here covers the batch path, which no integration test drives into this
+/// state. Before the variant was split out it shared a name with "this child
+/// event already exists" and both were dropped by one arm, leaving a plain
+/// child start with no `ChildWorkflowStarted`, no `ChildWorkflowFailed` and no
+/// outbox fallback: the parent waited forever.
+#[test]
+fn a_vanished_child_start_is_an_error_naming_the_child() {
+    let command_id = CommandId {
+        run_id: RunId::new("run-7"),
+        seq: crate::CommandSeq(3),
+    };
+    let plain = ChildStartOutboxMessage {
+        command_id: command_id.clone(),
+        workflow_type: WorkflowType::new("tests.child", 1),
+        workflow_id: crate::WorkflowId::new("wf/child"),
+        task_queue: crate::TaskQueue::new("children"),
+        input: crate::encode_payload(&1_u64).unwrap(),
+        parent_close_policy: ParentClosePolicy::Cancel,
+        child_map_item: None,
+    };
+    let map_item = ChildStartOutboxMessage {
+        child_map_item: Some(ChildWorkflowMapItem {
+            map_command_id: command_id,
+            item_ordinal: 4,
+        }),
+        workflow_id: crate::WorkflowId::new("wf/child/4"),
+        ..plain.clone()
+    };
+
+    for (message, expected) in [
+        (
+            &plain,
+            "child workflow `run-7`:3 could not be started: \
+             workflow instance `wf/child` was deleted mid-transaction",
+        ),
+        (
+            &map_item,
+            "child workflow map `run-7`:3 item 4 could not be started: \
+             workflow instance `wf/child/4` was deleted mid-transaction",
+        ),
+    ] {
+        match child_start_outcome_event_and_reason(message, InlineChildStartOutcome::Vanished) {
+            Err(Error::Backend(actual)) => assert_eq!(actual, expected),
+            other => panic!("a vanished child start must raise, got {other:?}"),
+        }
+    }
+
+    // The ordinary outcomes still produce their events, so the arm above is a
+    // guard rather than a blanket rejection.
+    assert!(matches!(
+        child_start_outcome_event_and_reason(
+            &plain,
+            InlineChildStartOutcome::Started(RunId::new("run-8"))
+        ),
+        Ok((HistoryEventData::ChildWorkflowStarted(_), _))
+    ));
+}

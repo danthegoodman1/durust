@@ -1019,6 +1019,84 @@ async fn rejected_builder_then_activity(input: NumberInput) -> durust::Result<u6
     Ok(if rejected.is_err() { doubled } else { 0 })
 }
 
+/// Row 6G's user-reachable stall, driven through the ordinary DSL: an activity
+/// map and a child-workflow map over `std::iter::empty()`. Both awaits used to
+/// block forever, because nothing was materialized and so nothing could ever
+/// reach the completion check.
+#[durust::workflow(name = "tests.empty-map-manifests", version = 1)]
+async fn empty_map_manifests(_: UnitInput) -> durust::Result<u64> {
+    let mapped = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .input_manifest(durust::activity_map_manifest(std::iter::empty::<
+            NumberInput,
+        >())?)
+        .max_in_flight(2)
+        .result_manifest("doubled")
+        .spawn()
+        .await?;
+    let result_refs = durust::decode_activity_map_result_refs(&mapped.result_manifest().await?)?;
+    let child_mapped = durust::child_workflow_map::<double_plus_one>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/empty-map/item")
+        .input_manifest(durust::child_workflow_map_manifest(std::iter::empty::<
+            NumberInput,
+        >())?)
+        .max_in_flight(2)
+        .result_manifest("child-doubled")
+        .spawn()
+        .await?;
+    let outcomes =
+        durust::decode_child_workflow_map_outcomes(&child_mapped.result_manifest().await?)?;
+    Ok((result_refs.len() + outcomes.len()) as u64)
+}
+
+/// Both map builders with `max_in_flight(0)`, which the scheduling boundary
+/// rejects instead of clamping to one, then an ordinary activity so the test
+/// can see which command seq the rejections left behind.
+#[durust::workflow(name = "tests.zero-bound-map-rejections", version = 1)]
+async fn zero_bound_map_rejections(_: UnitInput) -> durust::Result<String> {
+    let activity_map_error = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .input_manifest(durust::activity_map_manifest([NumberInput { value: 1 }])?)
+        .max_in_flight(0)
+        .result_manifest("doubled")
+        .spawn()
+        .await
+        .expect_err("a zero activity-map bound must be rejected, not clamped");
+    let child_map_error = durust::child_workflow_map::<double_plus_one>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/zero-bound/item")
+        .input_manifest(durust::child_workflow_map_manifest([NumberInput {
+            value: 1,
+        }])?)
+        .max_in_flight(0)
+        .result_manifest("child-doubled")
+        .spawn()
+        .await
+        .expect_err("a zero child-map bound must be rejected, not clamped");
+    let doubled = durust::call_activity!(double(NumberInput { value: 21 }))
+        .task_queue("activities")
+        .await?;
+    Ok(format!(
+        "{}|{}|{doubled}",
+        rejection_shape(activity_map_error),
+        rejection_shape(child_map_error)
+    ))
+}
+
+/// Renders the structured failure rather than `Display`, so the test pins the
+/// machine-readable `error_type` and the non-retryable flag a caller would
+/// actually match on, not a rendering.
+fn rejection_shape(err: durust::Error) -> String {
+    match err {
+        durust::Error::Application(failure) => format!(
+            "{}/{}/{}",
+            failure.error_type, failure.message, failure.non_retryable
+        ),
+        other => format!("unexpected error kind: {other:?}"),
+    }
+}
+
 #[durust::workflow(name = "tests.activity-map-sum", version = 1)]
 async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
     let input_manifest =
@@ -7545,6 +7623,126 @@ fn a_rejected_command_builder_burns_its_seq_and_replays_identically() {
             durust::decode_payload::<u64>(result).unwrap(),
             42,
             "the run must complete through the rejected-builder branch"
+        );
+    });
+}
+
+// Row 6G: an empty input manifest is a normal, user-reachable DSL call, and
+// awaiting its result must finish rather than block forever.
+//
+// `activity_map_manifest(std::iter::empty())` yields `item_count: 0`, nothing
+// is materialized, and before this fix no later event could reach the
+// completion check on any provider: the commit succeeded, the descriptor was
+// inserted, no terminal fact was ever appended, and the parent was never woken
+// again. Silent and permanent. `DescriptorCreated` now completes such a map,
+// which is what TypeScript already did.
+//
+// Driven through the real `Worker` on both map kinds, because the conformance
+// case builds its map task by hand and this is the path a user actually takes.
+#[test]
+fn an_empty_map_manifest_completes_instead_of_stalling_the_parent() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<empty_map_manifests>("wf/empty-maps", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(empty_map_manifests)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.event_type)
+                .collect::<Vec<_>>(),
+            vec![
+                durust::HistoryEventType::WorkflowStarted,
+                durust::HistoryEventType::ActivityMapScheduled,
+                durust::HistoryEventType::ActivityMapCompleted,
+                durust::HistoryEventType::ChildWorkflowMapScheduled,
+                durust::HistoryEventType::ChildWorkflowMapCompleted,
+                durust::HistoryEventType::WorkflowCompleted,
+            ],
+            "both empty maps must complete and the run must finish"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the empty-map run did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 0);
+    });
+}
+
+// Row 6J: `max_in_flight(0)` is rejected at the scheduling boundary rather
+// than silently clamped to one.
+//
+// Clamping made a caller typo cost three to four orders of magnitude of
+// throughput while the map still produced correct results, so nothing ever
+// reported it. TypeScript rejects at both DSL entry points; Rust is the runtime
+// that moved. The providers deliberately keep clamping
+// (`MapState::slot_limit`, pinned by
+// `*_activity_map_zero_max_in_flight_admits_one_item`) so a descriptor already
+// persisted with a zero bound cannot stall — the rejection belongs where the
+// value is still the caller's.
+//
+// The rejection runs *before* the command seq is allocated, unlike the
+// input-manifest rejection pinned by
+// `a_rejected_command_builder_burns_its_seq_and_replays_identically`: nothing
+// committed depends on this one, and running it before allocation is the order
+// TypeScript's `assertMapOptions` uses. Both halves are asserted, because "is
+// rejected" and "is rejected without disturbing the command numbering" are
+// different claims.
+#[test]
+fn a_zero_max_in_flight_map_bound_is_rejected_at_the_scheduling_boundary() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<zero_bound_map_rejections>("wf/zero-bound", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(zero_bound_map_rejections)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("the activity after the rejected map builders was not scheduled");
+        };
+        assert_eq!(
+            scheduled.command_id.seq.0, 1,
+            "a bound rejected before the seq is allocated must not renumber later commands"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the zero-bound run did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "durust.invalid_map_options/activity_map max_in_flight must be a positive integer/true|\
+             durust.invalid_map_options/child_workflow_map max_in_flight must be a positive integer/true|42",
+        );
+        assert!(
+            !history.iter().any(|event| matches!(
+                event.data,
+                HistoryEventData::ActivityMapScheduled(_)
+                    | HistoryEventData::ChildWorkflowMapScheduled(_)
+            )),
+            "a rejected bound must schedule no map at all"
         );
     });
 }

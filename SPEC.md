@@ -1400,6 +1400,9 @@ Semantics:
 one durable command schedules one manifest-backed map operation
 the map command increments command_seq once
 the map fingerprint includes activity name, input_manifest digest/ref, result_manifest config, max_in_flight, and options digest
+max_in_flight must be at least 1; the scheduling boundary rejects a zero bound rather than clamping it, while providers read a persisted zero bound as 1 so an existing descriptor cannot stall
+an empty input manifest (item_count == 0) is terminal at descriptor creation: the provider writes an empty result manifest and appends the terminal map fact in the same commit that schedules the map
+the engine's descriptor-creation transition never rejects a commit: when that same commit also closes the run, the descriptor is closed with no result manifest and no terminal map fact, because the run's terminal cleanup deletes the descriptor and a map fact behind the run's own terminal event would corrupt its history
 workflow history records ActivityMapScheduled and terminal ActivityMapCompleted/Failed facts
 workflow history does not record one ActivityScheduled or ActivityCompleted fact per item
 the provider pages through the input manifest and materializes item tasks up to max_in_flight
@@ -1490,6 +1493,11 @@ Semantics:
 one durable command schedules one manifest-backed child workflow map
 the map command increments command_seq once
 the map fingerprint includes workflow type, input manifest digest/ref, result manifest config, workflow_id_prefix, task queue, max_in_flight, parent_close_policy, failure_mode, and options digest
+max_in_flight must be at least 1; the scheduling boundary rejects a zero bound rather than clamping it, while providers read a persisted zero bound as 1 so an existing descriptor cannot stall
+an empty input manifest (item_count == 0) is terminal at descriptor creation: the provider writes an empty result manifest and appends the terminal map fact in the same commit that schedules the map
+the engine's descriptor-creation transition never rejects a commit: when that same commit also closes the run, the descriptor is closed with no result manifest and no terminal map fact, because the run's terminal cleanup deletes the descriptor and a map fact behind the run's own terminal event would corrupt its history
+cancelling a live map command cancels the children it already started; a map whose parent run reaches a terminal event leaves its children to parent_close_policy
+a child of a closed parent's map answers a missing map descriptor as already handled, so an abandoned child can still reach a terminal state
 workflow history records ChildWorkflowMapScheduled and terminal ChildWorkflowMapCompleted/Failed facts
 workflow history does not record ChildWorkflowStarted, ChildWorkflowCompleted, ChildWorkflowFailed, or ChildWorkflowCancelled facts per map item
 the provider pages through the input manifest and materializes child starts up to max_in_flight

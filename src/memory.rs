@@ -1,6 +1,7 @@
 use crate::map_engine::{
-    ItemAttemptFailureKind, ItemRetryDecision, MapEffect, MapEvent, MapKind, MapReject, MapState,
-    activity_outcome_counts, outcome_counts,
+    ACTIVITY_MAP_LABEL, CHILD_WORKFLOW_MAP_LABEL, ItemAttemptFailureKind, ItemRetryDecision,
+    MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
+    map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
@@ -344,7 +345,19 @@ impl DurableBackend for MemoryBackend {
         };
         cleanup_run_operational_state(&mut state, &run_id, TerminalCleanup::Closed);
         let config = self.payload_config.clone();
-        handle_terminal_run(&mut state, &config, &run_id, &terminal_event);
+        // The cancellation itself is already durable and this provider has no
+        // transaction to undo it, so a routing failure must not be reported as
+        // if nothing happened: the SQL providers roll back, where an error
+        // truthfully means the run was *not* cancelled, and a bare error here
+        // would mean the opposite on the same API. The message says which,
+        // because the outcome type cannot. A retry answers `AlreadyTerminal`,
+        // which is then consistent with it rather than contradicting it.
+        if let Err(err) = handle_terminal_run(&mut state, &config, &run_id, &terminal_event) {
+            return Box::pin(ready(Err(Error::Backend(format!(
+                "workflow run `{run_id}` was cancelled, but routing its terminal \
+                 outcome to its parent failed: {err}"
+            )))));
+        }
 
         drop(state);
         self.notify_work();
@@ -569,6 +582,56 @@ impl DurableBackend for MemoryBackend {
             }
         }
 
+        // Validated before this commit touches anything. The SQL providers reject
+        // the same commits inside their descriptor-insert primitive and roll
+        // back, but this provider has no transaction, so a rejection raised any
+        // later than here would leave `ActivityMapScheduled` already appended to
+        // a run whose map was never created.
+        //
+        // Two checks, both of which the SQL providers make at the same point. A
+        // zero `max_in_flight` is a caller typo the boundary rejects rather than
+        // clamps. A descriptor that already exists is an invariant violation:
+        // SQLite raises on its unique index and Postgres on its
+        // `on conflict do nothing` row count, while this provider's
+        // `BTreeMap::insert` would *replace* it and re-step
+        // `DescriptorCreated` — appending a second terminal fact for the same
+        // command id when the map is empty. The insert must stay a replace, not
+        // an upsert, because `MapState::next_ordinal`'s contract depends on the
+        // cursor and the outcome set being created together at zero; so the
+        // duplicate is rejected here instead.
+        let mut scheduled_map_command_ids = BTreeSet::new();
+        for (label, map_command_id, max_in_flight, exists) in batch
+            .schedule_activity_maps
+            .iter()
+            .map(|task| {
+                (
+                    ACTIVITY_MAP_LABEL,
+                    &task.map_command_id,
+                    task.max_in_flight,
+                    state.activity_maps.contains_key(&task.map_command_id),
+                )
+            })
+            .chain(batch.schedule_child_workflow_maps.iter().map(|task| {
+                (
+                    CHILD_WORKFLOW_MAP_LABEL,
+                    &task.map_command_id,
+                    task.max_in_flight,
+                    state.child_workflow_maps.contains_key(&task.map_command_id),
+                )
+            }))
+        {
+            if let Err(err) = validate_map_slot_bound(label, max_in_flight) {
+                return Box::pin(ready(Err(err)));
+            }
+            if exists || !scheduled_map_command_ids.insert(map_command_id.clone()) {
+                return Box::pin(ready(Err(Error::Backend(format!(
+                    "map descriptor `{}`:{} already exists: a workflow task commit re-scheduled \
+                     a map whose descriptor was never deleted",
+                    map_command_id.run_id, map_command_id.seq.0
+                )))));
+            }
+        }
+
         let config = self.payload_config.clone();
         let append_events =
             match normalize_history_events_for_storage(&mut state, &config, batch.append_events) {
@@ -705,6 +768,13 @@ impl DurableBackend for MemoryBackend {
 
             (next_event_id, terminal)
         };
+        // A map scheduled with an empty input manifest is terminal at
+        // descriptor creation, so its terminal fact is appended by this very
+        // commit. The commit's tail and its post-commit ready reason have to
+        // account for it, or the caller's cached tail is one behind and the
+        // parent is never woken.
+        let mut map_tail_event_id = None;
+        let mut map_ready_reason = None;
 
         for task in scheduled {
             let timeout_at = activity_timeout_at(state.now, task.start_to_close_timeout);
@@ -737,13 +807,18 @@ impl DurableBackend for MemoryBackend {
                 continue;
             };
             let parent_terminal = next_event_id.1;
-            if let Err(err) = step_map(
+            match step_map(
                 &mut state,
                 &config,
                 map_state,
                 MapEvent::DescriptorCreated { parent_terminal },
             ) {
-                return Box::pin(ready(Err(err)));
+                Ok(Some(event_id)) => {
+                    map_tail_event_id = Some(event_id);
+                    map_ready_reason = Some(WorkflowTaskReason::ActivityMapCompleted);
+                }
+                Ok(None) => {}
+                Err(err) => return Box::pin(ready(Err(err))),
             }
         }
         for (map_task, manifest) in decoded_child_maps {
@@ -762,13 +837,18 @@ impl DurableBackend for MemoryBackend {
                 continue;
             };
             let parent_terminal = next_event_id.1;
-            if let Err(err) = step_map(
+            match step_map(
                 &mut state,
                 &config,
                 map_state,
                 MapEvent::DescriptorCreated { parent_terminal },
             ) {
-                return Box::pin(ready(Err(err)));
+                Ok(Some(event_id)) => {
+                    map_tail_event_id = Some(event_id);
+                    map_ready_reason = Some(WorkflowTaskReason::ChildWorkflowMapCompleted);
+                }
+                Ok(None) => {}
+                Err(err) => return Box::pin(ready(Err(err))),
             }
         }
         for message in start_child_workflows {
@@ -806,8 +886,10 @@ impl DurableBackend for MemoryBackend {
             if let Some(event) = terminal_event {
                 if matches!(event, HistoryEventData::WorkflowContinuedAsNew { .. }) {
                     continue_run_as_new(&mut state, &claim.run_id, event);
-                } else {
-                    handle_terminal_run(&mut state, &config, &claim.run_id, &event);
+                } else if let Err(err) =
+                    handle_terminal_run(&mut state, &config, &claim.run_id, &event)
+                {
+                    return Box::pin(ready(Err(err)));
                 }
             }
         }
@@ -822,9 +904,11 @@ impl DurableBackend for MemoryBackend {
         });
         let terminal_after_commit = state.runs.get(&claim.run_id).is_none_or(|run| run.terminal);
         // Memory applies child starts through the outbox, so no same-commit
-        // child reason exists; only the signal recheck can re-mark the run.
+        // child reason exists; an empty map completed at descriptor creation
+        // is the one same-commit reason this provider can produce, and only
+        // the signal recheck can otherwise re-mark the run.
         if let Some(reason) =
-            post_commit_ready_reason(terminal_after_commit, None, signal_wait_ready)
+            post_commit_ready_reason(terminal_after_commit, map_ready_reason, signal_wait_ready)
         {
             if let Some(run) = state.runs.get_mut(&claim.run_id) {
                 run.ready = Some(reason);
@@ -845,7 +929,7 @@ impl DurableBackend for MemoryBackend {
         drop(state);
         self.notify_work();
         Box::pin(ready(Ok(CommitOutcome::Committed {
-            new_tail_event_id: next_event_id.0,
+            new_tail_event_id: map_tail_event_id.unwrap_or(next_event_id.0),
         })))
     }
 
@@ -2087,14 +2171,29 @@ fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> boo
         .is_some_and(|run| run.child_event_seqs.contains(&command_id.seq.0))
 }
 
+/// Both halves of closing a run: route its terminal outcome to its parent, and
+/// close out its own children.
+///
+/// The two are independent obligations and **both always run**. Short-circuiting
+/// on the routing error with `?` looked natural and was wrong: this provider has
+/// no transaction, so the run is already terminal by the time either half is
+/// reached, and abandoning the second half left the closed run's children still
+/// executing with nothing waiting for them — work that previously always
+/// happened, because the routing result used to be discarded entirely.
+///
+/// The routing error is reported after the cancellation, never instead of it.
+/// Every error still reachable here is an invariant violation rather than a
+/// race — a missing descriptor is answered as already-handled by
+/// [`complete_child_workflow_map_item`] — so it must stay loud.
 fn handle_terminal_run(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     run_id: &RunId,
     terminal_event: &HistoryEventData,
-) {
-    notify_parent_of_child_terminal(state, config, run_id, terminal_event);
+) -> Result<()> {
+    let routed = notify_parent_of_child_terminal(state, config, run_id, terminal_event);
     cancel_children_for_parent(state, run_id);
+    routed
 }
 
 fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: HistoryEventData) {
@@ -2141,34 +2240,39 @@ fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: Histo
     );
 }
 
+/// Route a child's terminal event to its parent. Errors propagate: this
+/// provider used to discard the map branch's result with `let _ =`, which was
+/// the only reason a routing failure here did not wedge the child the way it
+/// did on the SQL providers. Discarding it also hid the failure, so the
+/// missing-descriptor case is answered explicitly in
+/// [`complete_child_workflow_map_item`] and everything else is reported.
 fn notify_parent_of_child_terminal(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     child_run_id: &RunId,
     terminal_event: &HistoryEventData,
-) {
+) -> Result<()> {
     let Some(parent) = state
         .runs
         .get(child_run_id)
         .and_then(|run| run.parent.clone())
     else {
-        return;
+        return Ok(());
     };
     if let Some(map_item) = parent.child_map_item.clone() {
         let Some(outcome) = child_terminal_map_item_outcome(terminal_event) else {
-            return;
+            return Ok(());
         };
-        let _ = complete_child_workflow_map_item(state, config, map_item, outcome);
-        return;
+        return complete_child_workflow_map_item(state, config, map_item, outcome);
     }
     if child_terminal_event_exists(state, &parent.command_id) {
-        return;
+        return Ok(());
     }
     let Some(parent_run) = state.runs.get_mut(&parent.parent_run_id) else {
-        return;
+        return Ok(());
     };
     if parent_run.terminal {
-        return;
+        return Ok(());
     }
     let event_id = parent_run
         .history
@@ -2178,7 +2282,7 @@ fn notify_parent_of_child_terminal(
     let Some((data, reason)) =
         child_terminal_event_data_and_reason(parent.command_id, terminal_event)
     else {
-        return;
+        return Ok(());
     };
     parent_run.push_history(HistoryEvent {
         event_id,
@@ -2187,6 +2291,7 @@ fn notify_parent_of_child_terminal(
     });
     parent_run.ready = Some(reason);
     parent_run.ready_at = None;
+    Ok(())
 }
 
 fn child_terminal_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> bool {
@@ -2260,13 +2365,28 @@ fn cancel_command_operational_state(
     // A cancelled map is a terminal map: the engine's `ParentCancelled`
     // transition tombstones its pending work and closes the descriptor, so
     // this path cannot drift from the fail-fast one.
-    for map_state in [
-        activity_map_state(state, command_id),
-        child_workflow_map_state(state, command_id),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    if let Some(map_state) = activity_map_state(state, command_id) {
+        step_map(state, config, map_state, MapEvent::ParentCancelled)?;
+    }
+    if let Some(map_state) = child_workflow_map_state(state, command_id) {
+        if !map_state.completed {
+            // Withdrawing the command on a still-live run means the
+            // `ParentClosePolicy` path never runs, so without this the children
+            // the map already started keep running with nothing waiting for
+            // them. The engine cannot emit this: `ParentCancelled`'s other
+            // producer is a run reaching a terminal event, where the children
+            // belong to the close policy, which is free to abandon them.
+            //
+            // Children first, descriptor last, matching the fail-fast effect
+            // order. That is a consistency choice, not a constraint: child
+            // cancellation reads the child's parent link and terminal flag and
+            // never the descriptor's state.
+            cancel_child_workflow_map_children(
+                state,
+                command_id,
+                &map_command_cancelled_reason(command_id),
+            );
+        }
         step_map(state, config, map_state, MapEvent::ParentCancelled)?;
     }
     for record in state.child_outbox.values_mut() {
@@ -2354,10 +2474,15 @@ fn complete_child_workflow_map_item(
     outcome: ChildWorkflowMapItemOutcome,
 ) -> Result<()> {
     let Some(map_state) = child_workflow_map_state(state, &map_item.map_command_id) else {
-        return Err(Error::Backend(format!(
-            "child workflow map `{}`:{} not found",
-            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
-        )));
+        // Missing descriptor means the parent run's terminal cleanup deleted
+        // it, exactly as a missing activity record does on `complete_activity`
+        // and `fail_activity`, and as a missing activity-map descriptor does on
+        // `fail_map_item`. It is not an error: under
+        // `ParentClosePolicy::Abandon` a child of a closed parent's map keeps
+        // running by design and still has to be able to *finish*. Raising here
+        // rolled the child's own terminal commit back, and every retry hit the
+        // same missing descriptor, so the child could never terminate.
+        return Ok(());
     };
     let already_recorded = state
         .child_workflow_maps
@@ -2595,6 +2720,17 @@ fn complete_map_item(
     map_item: ActivityMapItem,
     result: crate::PayloadRef,
 ) -> Result<CompleteActivityOutcome> {
+    // Unlike `fail_map_item` and `complete_child_workflow_map_item`, a missing
+    // descriptor stays a hard error here, and the asymmetry is deliberate.
+    // Those two answer "already handled" because the state is reachable: a
+    // child run outlives its parent's cleanup under
+    // `ParentClosePolicy::Abandon`, and an item task can outlive its
+    // descriptor. An activity-map item cannot: the run's terminal cleanup
+    // deletes the item's own activity record and the descriptor together, and
+    // this path already returned `AlreadyCompleted` when that record was gone.
+    // So reaching here means a live item task with no descriptor — corruption,
+    // not a race — and this completion carries a *result* that answering
+    // "already handled" would silently discard.
     let Some(map_state) = activity_map_state(state, &map_item.map_command_id) else {
         return Err(Error::Backend(format!(
             "activity map `{}`:{} not found",
@@ -3817,6 +3953,187 @@ mod tests {
     fn force_terminal(backend: &MemoryBackend, run_id: &RunId) {
         let mut state = backend.state.lock().unwrap();
         state.runs.get_mut(run_id).unwrap().terminal = true;
+    }
+
+    /// A routing failure while closing a run must not abandon the rest of the
+    /// close, and must not read as "nothing happened".
+    ///
+    /// Removing `notify_parent_of_child_terminal`'s `let _ =` swallow was
+    /// right, but propagating it with `?` from `handle_terminal_run` made the
+    /// close *partial*: this provider has no transaction, so the run was
+    /// already terminal, and skipping `cancel_children_for_parent` left the
+    /// closed run's own children executing forever — work that always happened
+    /// while the error was being discarded.
+    ///
+    /// Driven by corrupting the parent map's outcome table, because every
+    /// routing error still reachable is an invariant violation rather than a
+    /// race: a bogus out-of-range outcome makes the descriptor's recorded count
+    /// reach `item_count` while ordinal 1 has no outcome, so assembling the
+    /// result manifest fails inside `CompleteMap`.
+    #[test]
+    fn a_routing_failure_while_closing_a_run_still_closes_its_children() {
+        block_on(async {
+            let backend = MemoryBackend::new();
+            let parent = start_and_claim(&backend, "wf/route-fail", "route-fail-q").await;
+            let map_command_id = crate::CommandId {
+                run_id: parent.run_id.clone(),
+                seq: crate::CommandSeq(1),
+            };
+            let input_manifest = crate::encode_activity_map_input_manifest(
+                (0..2_u64)
+                    .map(|value| crate::encode_payload(&value).unwrap())
+                    .collect(),
+                2,
+            )
+            .unwrap();
+            let map_task = crate::ChildWorkflowMapTask {
+                map_command_id: map_command_id.clone(),
+                workflow_type: crate::WorkflowType::new("tests.memory-terminal-guard", 1),
+                task_queue: crate::TaskQueue::new("route-fail-children"),
+                input_manifest,
+                result_manifest_name: "results".to_owned(),
+                workflow_id_prefix: "wf/route-fail/item".to_owned(),
+                max_in_flight: 2,
+                parent_close_policy: ParentClosePolicy::Cancel,
+                failure_mode: crate::ChildWorkflowMapFailureMode::CollectAll,
+            };
+            backend
+                .commit_workflow_task(
+                    parent.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        schedule_child_workflow_maps: vec![map_task],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
+                    namespace: Namespace::default(),
+                    limit: 16,
+                })
+                .await
+                .unwrap();
+
+            // Item 0 starts a child of its own, so the close has real work to
+            // abandon if it short-circuits.
+            let item0 = backend
+                .claim_workflow_task(
+                    crate::WorkerId::new("route-fail-item-0"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: Namespace::default(),
+                        task_queue: crate::TaskQueue::new("route-fail-children"),
+                        registered_workflow_types: vec![crate::WorkflowType::new(
+                            "tests.memory-terminal-guard",
+                            1,
+                        )],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("first child map item");
+            let item0_run_id = item0.run_id.clone();
+            backend
+                .commit_workflow_task(
+                    item0.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        start_child_workflows: vec![ChildStartOutboxMessage {
+                            command_id: crate::CommandId {
+                                run_id: item0_run_id.clone(),
+                                seq: crate::CommandSeq(1),
+                            },
+                            workflow_type: crate::WorkflowType::new(
+                                "tests.memory-terminal-guard",
+                                1,
+                            ),
+                            workflow_id: WorkflowId::new("wf/route-fail/grandchild"),
+                            task_queue: crate::TaskQueue::new("route-fail-grandchildren"),
+                            input: crate::encode_payload(&0_u64).unwrap(),
+                            parent_close_policy: ParentClosePolicy::Cancel,
+                            child_map_item: None,
+                        }],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+            backend
+                .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
+                    namespace: Namespace::default(),
+                    limit: 16,
+                })
+                .await
+                .unwrap();
+            let grandchild_run_id = {
+                let state = backend.state.lock().unwrap();
+                state
+                    .workflow_ids
+                    .get(&(
+                        Namespace::default(),
+                        WorkflowId::new("wf/route-fail/grandchild"),
+                    ))
+                    .cloned()
+                    .expect("the grandchild was started")
+            };
+
+            // Corrupt the descriptor: an outcome at an ordinal the manifest does
+            // not have, so the recorded count reaches `item_count` while ordinal
+            // 1 stays missing.
+            {
+                let mut state = backend.state.lock().unwrap();
+                state
+                    .child_workflow_maps
+                    .get_mut(&map_command_id)
+                    .expect("child map descriptor")
+                    .outcomes
+                    .insert(
+                        99,
+                        crate::ChildWorkflowMapItemOutcome::Succeeded {
+                            result: crate::encode_payload(&0_u64).unwrap(),
+                        },
+                    );
+            }
+
+            let err = backend
+                .cancel_workflow(crate::CancelWorkflowRequest {
+                    namespace: Namespace::default(),
+                    workflow_id: WorkflowId::new("wf/route-fail/item/0"),
+                    reason: "operator".to_owned(),
+                })
+                .await
+                .expect_err("the corrupted descriptor must make routing fail");
+            let Error::Backend(message) = &err else {
+                panic!("expected a backend error, got {err:?}");
+            };
+            assert!(
+                message.contains("was cancelled, but routing its terminal outcome")
+                    && message.contains("missing child workflow map outcome for item 1"),
+                "the error must say the cancellation happened and why routing failed, got \
+                 `{message}`"
+            );
+
+            let state = backend.state.lock().unwrap();
+            // The cancellation itself is complete...
+            let item0 = state.runs.get(&item0_run_id).expect("item 0 run");
+            assert!(item0.terminal);
+            assert!(matches!(
+                item0.history.last().map(|event| event.event_type),
+                Some(crate::HistoryEventType::WorkflowCancelled)
+            ));
+            // ...and so is the half that used to be skipped.
+            let grandchild = state.runs.get(&grandchild_run_id).expect("grandchild run");
+            assert!(
+                grandchild.terminal,
+                "a routing failure must not leave the closed run's own children running"
+            );
+            assert!(matches!(
+                grandchild.history.last().map(|event| event.event_type),
+                Some(crate::HistoryEventType::WorkflowCancelled)
+            ));
+        });
     }
 
     #[test]

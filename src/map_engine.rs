@@ -31,18 +31,17 @@
 //!   produces effects, so a map can never go completed -> failed or
 //!   failed -> completed under any interleaving.
 //!
-//! Known defect this module deliberately preserves: a map scheduled with an
-//! empty input manifest (`item_count == 0`) materializes nothing and never
-//! appends a terminal fact, so the parent blocks on `result_manifest()`
-//! forever. Every provider behaves that way today and Phase 6 is explicitly
-//! barred from changing map semantics, so the stall is reproduced here rather
-//! than fixed; the fix lands as its own plan row with per-provider regression
-//! tests. `empty_manifest_materializes_nothing_and_never_completes` pins the
-//! preserved behaviour so the eventual fix is a visible diff.
+//! - **`DescriptorCreated` can never reject.** It is the only event applied
+//!   inside the workflow-task commit that schedules the map, so a reject there
+//!   would roll that whole commit back. The arm is written so a reject is not
+//!   representable, and `parent_terminal` narrows *which* effects it emits
+//!   rather than whether it succeeds.
 //!
-//! Row 6B of `impl-plan/0017-architecture-hot-path-remediation.md` replaces the
-//! six hand-written copies with calls into this module; until then the crate's
-//! only callers are the tests below.
+//! A map scheduled with an empty input manifest (`item_count == 0`) is terminal
+//! the moment its descriptor exists: there is nothing to admit and nothing
+//! outstanding, so no later event could ever reach the completion check and the
+//! parent would block on `result_manifest()` forever. `DescriptorCreated`
+//! completes it, matching `packages/core/src/map-engine.ts`.
 #![allow(dead_code)]
 
 use crate::provider_util::{ActivityFailureDecision, duration_millis_i64, retry_visible_at_ms};
@@ -117,9 +116,47 @@ pub(crate) struct MapState {
     pub completed: bool,
 }
 
+/// Reject a map scheduled with a non-positive `max_in_flight`, at the two
+/// boundaries where the value is still the caller's: the DSL builders and every
+/// provider's descriptor-creation primitive.
+///
+/// Rejecting beats clamping. Clamping turns a caller typo into a 10,000x
+/// throughput loss that only shows up in production, and the map still produces
+/// correct results, so nothing ever reports it. The provider half matters
+/// independently of the DSL half: a hand-built [`crate::ActivityMapTask`] from a
+/// non-DSL caller — another language's client, a test harness, a custom runtime
+/// — reaches `commit_workflow_task` without passing the builders at all.
+///
+/// [`MapState::slot_limit`] still clamps, and the two are not in tension: this
+/// runs only at descriptor *creation*, so it can never fire against an existing
+/// descriptor, while the clamp exists precisely so a descriptor persisted
+/// before this check landed runs at one slot instead of stalling forever.
+pub(crate) fn validate_map_slot_bound(label: &str, max_in_flight: usize) -> crate::Result<()> {
+    if max_in_flight == 0 {
+        return Err(crate::Error::non_retryable(
+            "durust.invalid_map_options",
+            format!("{label} max_in_flight must be a positive integer"),
+        ));
+    }
+    Ok(())
+}
+
+/// Builder and event name of the activity-map path, for
+/// [`validate_map_slot_bound`].
+pub(crate) const ACTIVITY_MAP_LABEL: &str = "activity_map";
+
+/// Builder and event name of the child-workflow-map path, for
+/// [`validate_map_slot_bound`].
+pub(crate) const CHILD_WORKFLOW_MAP_LABEL: &str = "child_workflow_map";
+
 impl MapState {
     /// `max_in_flight` clamped to at least one slot. A zero bound would admit
     /// nothing and stall the map forever, so it is read as one.
+    ///
+    /// [`validate_map_slot_bound`] rejects a zero bound at descriptor creation,
+    /// so on any descriptor written since that landed this clamp is a no-op.
+    /// It stays for the ones written before it: an existing degenerate
+    /// descriptor must run at one slot, not stall.
     pub(crate) fn slot_limit(&self) -> u64 {
         u64::try_from(self.max_in_flight.max(1)).unwrap_or(u64::MAX)
     }
@@ -203,6 +240,13 @@ pub(crate) enum MapEvent {
         parent_terminal: bool,
     },
     /// The parent cancelled this map command (`WorkflowTaskCommit::cancel_commands`).
+    ///
+    /// Deliberately produces no [`MapEffect::CancelChildren`]: the other
+    /// producer of this event is a run reaching a terminal state, where the
+    /// map's children belong to `ParentClosePolicy`, which is free to abandon
+    /// them. Cancelling a *withdrawn* command's already-started children is
+    /// therefore the provider's job at the `cancel_commands` call site
+    /// specifically; see [`map_command_cancelled_reason`].
     ParentCancelled,
 }
 
@@ -329,6 +373,23 @@ pub(crate) fn child_cancellation_reason(map_command_id: &CommandId) -> String {
     )
 }
 
+/// Reason stamped on the `WorkflowCancelled` event of every child cancelled
+/// because the parent *withdrew* the map command
+/// ([`crate::WorkflowTaskCommit::cancel_commands`]).
+///
+/// Distinct from [`child_cancellation_reason`], which names a map that failed:
+/// a withdrawn command is not a failure and the two must stay
+/// distinguishable in a child's history. This is not produced by an effect,
+/// because [`MapEvent::ParentCancelled`] deliberately carries no
+/// [`MapEffect::CancelChildren`] — see the note on that variant — so the
+/// provider stamps it at the `cancel_commands` call site.
+pub(crate) fn map_command_cancelled_reason(map_command_id: &CommandId) -> String {
+    format!(
+        "child workflow map `{}`:{} cancelled",
+        map_command_id.run_id, map_command_id.seq.0
+    )
+}
+
 /// The whole machine: descriptor state plus one event in, ordered effects out.
 pub(crate) fn step(state: &MapState, event: MapEvent) -> Result<Vec<MapEffect>, MapReject> {
     // Terminal is absorbing. Every later event — a duplicate completion, a
@@ -339,10 +400,41 @@ pub(crate) fn step(state: &MapState, event: MapEvent) -> Result<Vec<MapEffect>, 
     }
 
     match event {
-        // An empty manifest materializes nothing and appends no terminal fact.
-        // That is a known permanent stall shared by all three providers; see
-        // the module docs for why Phase 6 preserves it rather than fixing it.
-        MapEvent::DescriptorCreated { .. } => Ok(materialize(state, state.in_flight)),
+        MapEvent::DescriptorCreated { parent_terminal } => {
+            let mut effects = materialize(state, state.in_flight);
+            if state.recorded_outcomes < state.item_count {
+                return Ok(effects);
+            }
+            // Nothing to admit and nothing outstanding — an empty input
+            // manifest — so the map is terminal the moment its descriptor
+            // exists. Without this the parent blocks on `result_manifest()`
+            // forever: no item is ever materialized, so no later event can
+            // reach the completion check.
+            //
+            // This arm deliberately does **not** route through
+            // `terminal_success`. That path rejects an activity map whose
+            // parent is closed, and the commit that creates this descriptor
+            // can be the commit that closes the run — a workflow that spawns a
+            // map and returns without awaiting it. Rejecting would roll that
+            // whole workflow-task commit back, turning a commit every provider
+            // accepts today into a hard failure, so `DescriptorCreated` can
+            // never reject.
+            //
+            // What a closed parent *does* change is that there is nobody to
+            // notify: the run's terminal cleanup deletes this descriptor in
+            // the same commit, and appending a map fact behind the run's own
+            // terminal event would corrupt the history every replay and audit
+            // reads. So the descriptor is closed and the notification dropped
+            // — the same answer `terminal_parent` gives a child map, reached
+            // without the reject an activity map would otherwise take.
+            if !parent_terminal {
+                effects.push(MapEffect::CompleteMap {
+                    item_count: state.item_count,
+                });
+            }
+            effects.push(MapEffect::MarkDescriptorTerminal);
+            Ok(effects)
+        }
 
         MapEvent::ItemCompleted {
             ordinal,
@@ -780,25 +872,84 @@ mod tests {
         );
     }
 
-    /// An empty input manifest materializes nothing and appends no terminal
-    /// fact, so the parent blocks forever. That is a real defect, shared by
-    /// all three providers, that Phase 6 is barred from fixing (it would be a
-    /// map-semantics change under a "conformance passes unchanged" gate, and
-    /// it would drag a second change with it: an empty map scheduled by a
-    /// commit that also closes the run would start rejecting that whole
-    /// commit). The stall is pinned here so the eventual fix is a visible
-    /// diff, not a silent side effect of this extraction.
+    /// An empty input manifest completes at descriptor creation, for both map
+    /// kinds. Nothing is admitted and nothing is outstanding, so no later
+    /// event could ever reach the completion check; without this the parent
+    /// blocks on `result_manifest()` forever.
     #[test]
-    fn empty_manifest_materializes_nothing_and_never_completes() {
+    fn empty_manifest_completes_at_descriptor_creation() {
         for state in [
             activity_map(0, 4),
             child_map(0, 4, ChildWorkflowMapFailureMode::CollectAll),
         ] {
+            assert_eq!(
+                step(
+                    &state,
+                    MapEvent::DescriptorCreated {
+                        parent_terminal: false
+                    }
+                ),
+                Ok(vec![
+                    MapEffect::CompleteMap { item_count: 0 },
+                    MapEffect::MarkDescriptorTerminal,
+                ]),
+                "{:?}",
+                state.kind,
+            );
+        }
+    }
+
+    /// `DescriptorCreated` never rejects, and a closed parent narrows the
+    /// effects rather than failing the transition.
+    ///
+    /// The commit that creates a map descriptor can be the commit that closes
+    /// the run — a workflow that spawns a map and returns without awaiting it.
+    /// Routing an empty map's completion through the ordinary terminal path
+    /// would answer `MapReject::TerminalParent` for an activity map and roll
+    /// that whole workflow-task commit back, turning an accepted commit into a
+    /// hard failure. The notification is dropped instead, and the descriptor —
+    /// which the run's terminal cleanup deletes in the same commit — is closed.
+    ///
+    /// The non-empty half is the guard against the completion firing one item
+    /// early *and* against a closed parent starting to reject an ordinary map
+    /// schedule.
+    #[test]
+    fn descriptor_creation_never_rejects_a_closed_parent() {
+        for state in [
+            activity_map(0, 4),
+            child_map(0, 4, ChildWorkflowMapFailureMode::CollectAll),
+        ] {
+            assert_eq!(
+                step(
+                    &state,
+                    MapEvent::DescriptorCreated {
+                        parent_terminal: true
+                    }
+                ),
+                Ok(vec![MapEffect::MarkDescriptorTerminal]),
+                "a closed parent drops the notification, it does not reject: {:?}",
+                state.kind,
+            );
+        }
+        for state in [
+            activity_map(2, 4),
+            child_map(2, 4, ChildWorkflowMapFailureMode::CollectAll),
+        ] {
             for parent_terminal in [false, true] {
                 assert_eq!(
                     step(&state, MapEvent::DescriptorCreated { parent_terminal }),
-                    Ok(Vec::new()),
-                    "an empty manifest must produce no effects at all",
+                    Ok(vec![
+                        MapEffect::MaterializeItems {
+                            first_ordinal: 0,
+                            count: 2
+                        },
+                        MapEffect::AdvanceDescriptor {
+                            next_ordinal: 2,
+                            in_flight: 2
+                        },
+                    ]),
+                    "{:?} parent_terminal={parent_terminal}",
+                    state.kind,
                 );
             }
         }

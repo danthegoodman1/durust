@@ -2519,8 +2519,10 @@ where
         self
     }
 
+    /// Zero is rejected, not clamped, when the map is scheduled. See
+    /// [`ActivityMapSpawnFuture::poll_init`].
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = max_in_flight.max(1);
+        self.max_in_flight = max_in_flight;
         self
     }
 
@@ -2591,7 +2593,22 @@ where
     A: Activity,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ActivityMapHandle>> {
-        let max_in_flight = self.max_in_flight.max(1);
+        // A zero bound is rejected rather than clamped to one; see
+        // `map_engine::validate_map_slot_bound` for why, and for why the
+        // engine's clamp is not in tension with it. Every provider repeats the
+        // check at descriptor creation, because a hand-built `ActivityMapTask`
+        // never passes through this builder.
+        //
+        // Checked before the command seq is allocated, so a caught rejection
+        // does not renumber the commands that follow it, matching TypeScript's
+        // `assertMapOptions`.
+        if let Err(err) = crate::map_engine::validate_map_slot_bound(
+            crate::map_engine::ACTIVITY_MAP_LABEL,
+            self.max_in_flight,
+        ) {
+            return Poll::Ready(Err(err));
+        }
+        let max_in_flight = self.max_in_flight;
         let Poll::Ready((command_id, _)) = runtime.match_or_append_command(
             CommandEventKind::ActivityMap,
             |runtime| {
@@ -2786,8 +2803,10 @@ where
         self
     }
 
+    /// Zero is rejected, not clamped, when the map is scheduled. See
+    /// [`ChildWorkflowMapSpawnFuture::poll_init`].
     pub fn max_in_flight(mut self, max_in_flight: usize) -> Self {
-        self.max_in_flight = max_in_flight.max(1);
+        self.max_in_flight = max_in_flight;
         self
     }
 
@@ -2874,7 +2893,14 @@ where
     W: Workflow,
 {
     fn poll_init(&mut self, runtime: &mut RuntimeContext) -> Poll<Result<ChildWorkflowMapHandle>> {
-        let max_in_flight = self.max_in_flight.max(1);
+        // Rejected, not clamped; see `ActivityMapSpawnFuture::poll_init`.
+        if let Err(err) = crate::map_engine::validate_map_slot_bound(
+            crate::map_engine::CHILD_WORKFLOW_MAP_LABEL,
+            self.max_in_flight,
+        ) {
+            return Poll::Ready(Err(err));
+        }
+        let max_in_flight = self.max_in_flight;
         let parent_close_policy = self.parent_close_policy;
         let failure_mode = self.failure_mode;
         let Poll::Ready((command_id, _)) = runtime.match_or_append_command(

@@ -1,6 +1,7 @@
 use crate::map_engine::{
-    ItemAttemptFailureKind, ItemRetryDecision, MapEffect, MapEvent, MapKind, MapReject, MapState,
-    activity_outcome_counts, outcome_counts,
+    ACTIVITY_MAP_LABEL, CHILD_WORKFLOW_MAP_LABEL, ItemAttemptFailureKind, ItemRetryDecision,
+    MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
+    map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
@@ -48,6 +49,61 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::time::Duration;
 use tokio_postgres::{NoTls, Transaction};
+
+/// One descriptor's worth of `PostgresBackend::repair_stalled_empty_maps`. Every
+/// failure it can produce is the caller's to swallow, which is why it is a
+/// separate function rather than an inline block.
+async fn repair_one_stalled_empty_map_tx(
+    backend: &PostgresBackend,
+    tx: &Transaction<'_>,
+    schema: &str,
+    kind: MapKind,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    // Re-read under the write transaction, which locks the descriptor row
+    // `for update`: another process may have repaired the same one between the
+    // probe and here, and the engine's terminal-absorbing rule then makes this
+    // a no-op.
+    let stepped = match kind {
+        MapKind::Activity => activity_map_state_tx(tx, schema, map_command_id)
+            .await?
+            .map(|(state, namespace, task)| (state, namespace, MapTask::Activity(task))),
+        MapKind::ChildWorkflow => child_workflow_map_state_tx(tx, schema, map_command_id)
+            .await?
+            .map(|(state, namespace, task)| (state, namespace, MapTask::ChildWorkflow(task))),
+    };
+    let Some((state, namespace, task)) = stepped else {
+        return Ok(());
+    };
+    // A descriptor whose run row is gone is skipped, not raised; see
+    // `SqliteBackend::repair_stalled_empty_maps`.
+    let Some((_, parent_terminal)) =
+        parent_tail_and_terminal_tx(tx, schema, &map_command_id.run_id).await?
+    else {
+        return Ok(());
+    };
+    step_map_tx(
+        backend,
+        tx,
+        schema,
+        &state,
+        &namespace,
+        &task,
+        MapEvent::DescriptorCreated { parent_terminal },
+    )
+    .await?;
+    Ok(())
+}
+
+/// `meta` key recording that the empty-map upgrade repair has already run
+/// against this database. Both SQL providers use the same key so the two
+/// repairs stay recognisably one mechanism.
+const EMPTY_MAP_REPAIR_MARKER: &str = "empty_map_repair_done";
+
+/// `meta` key counting descriptors the empty-map upgrade repair could not act
+/// on. The pass records itself either way, so it will not revisit them; the
+/// count is where an operator finds out that it did not.
+const EMPTY_MAP_REPAIR_SKIPPED: &str = "empty_map_repair_skipped";
 
 const POSTGRES_SCHEMA_VERSION: i64 = 6;
 const DEFAULT_SCHEMA: &str = "durust";
@@ -235,8 +291,123 @@ impl PostgresBackend {
             statement_timeout: config.statement_timeout,
             lock_timeout: config.lock_timeout,
         };
-        backend.migrate().await?;
+        let empty_map_repair_done = backend.migrate().await?;
+        if !empty_map_repair_done {
+            backend.repair_stalled_empty_maps().await?;
+        }
         Ok(backend)
+    }
+
+    /// Upgrade repair: complete maps that a database written before empty input
+    /// manifests completed at descriptor creation left permanently stalled.
+    /// See `SqliteBackend::repair_stalled_empty_maps` for the full rationale,
+    /// including why every per-descriptor failure is skipped rather than raised
+    /// and why the skips are counted into `meta` instead of discarded.
+    ///
+    /// One-shot: `migrate()` reads the `meta` marker in the query it already
+    /// issues for `schema_version`, so a database that has been repaired pays
+    /// **no** round trip here — this function is not called at all. That
+    /// matters because the probe's predicate has no index behind it and the
+    /// tables it scans are sized by the number of concurrently open maps.
+    ///
+    /// The probe is ordered, and that is load-bearing rather than tidiness: the
+    /// loop takes `for update` on each descriptor in probe order, and
+    /// `synchronize_seqscans` (on by default) deliberately starts concurrent
+    /// sequential scans at different positions once a table passes roughly a
+    /// quarter of `shared_buffers`. Two processes connecting for the first time
+    /// could otherwise lock in opposite orders, and one would take
+    /// `deadlock detected` — on the connect path, where it fails construction.
+    /// SQLite is immune to this because `BEGIN IMMEDIATE` serialises writers.
+    ///
+    /// This runs straight after `migrate()` inside `connect_with_config`, not
+    /// inside a readiness chain, so it cannot await the future it is
+    /// resolving — the deadlock the equivalent TypeScript repair had to fix.
+    async fn repair_stalled_empty_maps(&self) -> Result<()> {
+        let schema = self.schema_sql();
+        // One statement, not one per table: this sits on the connect path, and
+        // every round trip here lengthens the window a caller sees before the
+        // backend is usable.
+        let rows = {
+            let client = self.client().await?;
+            client
+                .query(
+                    &format!(
+                        "select false as is_child, run_id, command_seq from {schema}.activity_maps
+                          where item_count = 0 and completed = false
+                         union all
+                         select true, run_id, command_seq from {schema}.child_workflow_maps
+                          where item_count = 0 and completed = false
+                         order by 1, 2, 3"
+                    ),
+                    &[],
+                )
+                .await
+                .map_err(postgres_error)?
+        };
+        let stalled = rows
+            .into_iter()
+            .map(|row| {
+                let kind = if row.get::<_, bool>(0) {
+                    MapKind::ChildWorkflow
+                } else {
+                    MapKind::Activity
+                };
+                (
+                    kind,
+                    CommandId {
+                        run_id: RunId::new(row.get::<_, String>(1)),
+                        seq: CommandSeq(u64::try_from(row.get::<_, i64>(2)).unwrap_or(u64::MAX)),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut client = self.client().await?;
+        let mut skipped = 0_u64;
+        for (kind, map_command_id) in stalled {
+            // One transaction per descriptor, so a skip is a rollback of that
+            // descriptor alone; see the SQLite half.
+            let tx = client.transaction().await.map_err(postgres_error)?;
+            let repaired =
+                match repair_one_stalled_empty_map_tx(self, &tx, &schema, kind, &map_command_id)
+                    .await
+                {
+                    Ok(()) => tx.commit().await.map_err(postgres_error),
+                    Err(err) => {
+                        // Rolled back explicitly rather than by drop, so the
+                        // rollback's own failure is observed here too.
+                        let _ = tx.rollback().await;
+                        Err(err)
+                    }
+                };
+            if repaired.is_err() {
+                skipped += 1;
+            }
+        }
+
+        let tx = client.transaction().await.map_err(postgres_error)?;
+        tx.execute(
+            &format!(
+                "insert into {schema}.meta(key, value) values ('{EMPTY_MAP_REPAIR_MARKER}', 1)
+                 on conflict(key) do update set value = excluded.value"
+            ),
+            &[],
+        )
+        .await
+        .map_err(postgres_error)?;
+        if skipped > 0 {
+            tx.execute(
+                &format!(
+                    "insert into {schema}.meta(key, value)
+                     values ('{EMPTY_MAP_REPAIR_SKIPPED}', $1)
+                     on conflict(key) do update set value = excluded.value"
+                ),
+                &[&i64::try_from(skipped).unwrap_or(i64::MAX)],
+            )
+            .await
+            .map_err(postgres_error)?;
+        }
+        tx.commit().await.map_err(postgres_error)
     }
 
     pub fn schema(&self) -> &str {
@@ -276,7 +447,9 @@ impl PostgresBackend {
         })
     }
 
-    async fn migrate(&self) -> Result<()> {
+    /// Runs the schema migration and reports whether the empty-map upgrade
+    /// repair still has to run against this database.
+    async fn migrate(&self) -> Result<bool> {
         let schema = quote_ident(&self.schema);
         let client = self.client().await?;
         client
@@ -293,14 +466,26 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?;
 
-        let existing = client
-            .query_opt(
-                &format!("select value from {schema}.meta where key = 'schema_version'"),
+        // One statement for both keys: `schema_version` gates the migration and
+        // `empty_map_repair_done` gates the upgrade repair, so a steady-state
+        // connect pays no round trip for the repair at all.
+        let meta = client
+            .query(
+                &format!(
+                    "select key, value from {schema}.meta
+                     where key in ('schema_version', '{EMPTY_MAP_REPAIR_MARKER}')"
+                ),
                 &[],
             )
             .await
-            .map_err(postgres_error)?
-            .map(|row| row.get::<_, i64>(0));
+            .map_err(postgres_error)?;
+        let meta_value = |wanted: &str| {
+            meta.iter()
+                .find(|row| row.get::<_, String>(0) == wanted)
+                .map(|row| row.get::<_, i64>(1))
+        };
+        let empty_map_repair_done = meta_value(EMPTY_MAP_REPAIR_MARKER).unwrap_or(0) > 0;
+        let existing = meta_value("schema_version");
         if let Some(version) = existing {
             if version != POSTGRES_SCHEMA_VERSION {
                 return Err(Error::Backend(format!(
@@ -551,7 +736,8 @@ impl PostgresBackend {
             .map_err(postgres_error)?;
 
         self.validate_or_insert_provider_metadata(&client).await?;
-        self.ensure_shard_leases(&client).await
+        self.ensure_shard_leases(&client).await?;
+        Ok(empty_map_repair_done)
     }
 
     async fn validate_or_insert_provider_metadata(
@@ -2226,13 +2412,10 @@ impl PostgresBackend {
                     ))
                 }
             } else {
-                InlineChildStartOutcome::Skipped
+                InlineChildStartOutcome::Vanished
             };
-            let Some((event_data, reason)) =
-                child_start_outcome_event_and_reason(&start.message, outcome)
-            else {
-                continue;
-            };
+            let (event_data, reason) =
+                child_start_outcome_event_and_reason(&start.message, outcome)?;
             let commit = &mut commits[start.commit_index];
             commit.next_event_id = commit.next_event_id.next();
             commit
@@ -2685,41 +2868,26 @@ impl PostgresBackend {
             {
                 continue;
             }
-            let child_start = if child_event_exists_tx(&tx, &schema, &message.command_id).await? {
-                InlineChildStartOutcome::Skipped
-            } else {
-                let child_shard_id = i32::try_from(
-                    self.shard_for_workflow(
-                        &Namespace::new(namespace.clone()),
-                        &message.workflow_id,
-                    )
+            // "This child event already exists" short-circuits here rather than
+            // borrowing an `InlineChildStartOutcome`. It used to reuse the
+            // variant that also means "the row vanished mid-transaction", and
+            // the two were then dropped by the same arm — so the unreachable
+            // one was silent.
+            if child_event_exists_tx(&tx, &schema, &message.command_id).await? {
+                continue;
+            }
+            let child_shard_id = i32::try_from(
+                self.shard_for_workflow(&Namespace::new(namespace.clone()), &message.workflow_id)
                     .0,
-                )
-                .unwrap_or(i32::MAX);
+            )
+            .unwrap_or(i32::MAX);
+            let child_start =
                 start_child_workflow_inline_tx(&tx, &schema, &namespace, child_shard_id, &message)
-                    .await?
-            };
+                    .await?;
             if terminal || became_terminal {
                 continue;
             }
-            let (event_data, reason) = match child_start {
-                InlineChildStartOutcome::Started(child_run_id) => (
-                    HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
-                        command_id: message.command_id.clone(),
-                        workflow_id: message.workflow_id.clone(),
-                        run_id: child_run_id,
-                    }),
-                    WorkflowTaskReason::ChildWorkflowStarted,
-                ),
-                InlineChildStartOutcome::Failed(failure) => (
-                    HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
-                        command_id: message.command_id.clone(),
-                        failure,
-                    }),
-                    WorkflowTaskReason::ChildWorkflowFailed,
-                ),
-                InlineChildStartOutcome::Skipped => continue,
-            };
+            let (event_data, reason) = child_start_outcome_event_and_reason(&message, child_start)?;
             next_event_id = next_event_id.next();
             insert_history_event(tx, schema, &claim.run_id, next_event_id, event_data).await?;
             ready_after_commit = Some(reason);
@@ -2749,12 +2917,29 @@ impl PostgresBackend {
             .map_err(postgres_error)?;
         }
 
+        // The query projection records the history point the workflow task
+        // itself observed, so it keeps the tail reached before the map loops
+        // even when a map completed during this commit appends past it. Memory
+        // has no separate cursor to drift, so capturing this is what keeps the
+        // three providers stamping the same event id.
+        let projection_event_id = next_event_id;
+        let mut commit_tail_published = false;
+
         for map_task in schedule_activity_maps {
             insert_activity_map_tx(self, &tx, &schema, &namespace, &map_task).await?;
             if let Some((state, map_namespace, task)) =
                 activity_map_state_tx(tx, schema, &map_task.map_command_id).await?
             {
-                step_map_tx(
+                publish_commit_tail_before_map_append_tx(
+                    tx,
+                    schema,
+                    &claim.run_id,
+                    next_event_id,
+                    &state,
+                    &mut commit_tail_published,
+                )
+                .await?;
+                if let Some(event_id) = step_map_tx(
                     self,
                     &tx,
                     &schema,
@@ -2765,7 +2950,11 @@ impl PostgresBackend {
                         parent_terminal: became_terminal,
                     },
                 )
-                .await?;
+                .await?
+                {
+                    next_event_id = event_id;
+                    ready_after_commit = Some(WorkflowTaskReason::ActivityMapCompleted);
+                }
             }
         }
 
@@ -2779,7 +2968,16 @@ impl PostgresBackend {
                 } else {
                     map_namespace
                 };
-                step_map_tx(
+                publish_commit_tail_before_map_append_tx(
+                    tx,
+                    schema,
+                    &claim.run_id,
+                    next_event_id,
+                    &state,
+                    &mut commit_tail_published,
+                )
+                .await?;
+                if let Some(event_id) = step_map_tx(
                     self,
                     &tx,
                     &schema,
@@ -2790,7 +2988,11 @@ impl PostgresBackend {
                         parent_terminal: became_terminal,
                     },
                 )
-                .await?;
+                .await?
+                {
+                    next_event_id = event_id;
+                    ready_after_commit = Some(WorkflowTaskReason::ChildWorkflowMapCompleted);
+                }
             }
         }
 
@@ -2861,7 +3063,7 @@ impl PostgresBackend {
                     &namespace,
                     &workflow_id,
                     &claim.run_id.0,
-                    &i64::try_from(next_event_id.0).unwrap_or(i64::MAX),
+                    &i64::try_from(projection_event_id.0).unwrap_or(i64::MAX),
                     &payload_blob,
                 ],
             )
@@ -6347,6 +6549,26 @@ async fn cancel_command_operational_state_tx(
     if let Some((state, namespace, task)) =
         child_workflow_map_state_tx(tx, schema, command_id).await?
     {
+        if !state.completed {
+            // Withdrawing the command on a still-live run means the
+            // `ParentClosePolicy` path never runs, so without this the children
+            // the map already started keep running with nothing waiting for
+            // them. The engine cannot emit this: `ParentCancelled`'s other
+            // producer is a run reaching a terminal event, where the children
+            // belong to the close policy, which is free to abandon them.
+            //
+            // Children first, descriptor last, matching the fail-fast effect
+            // order. That is a consistency choice, not a constraint: child
+            // cancellation reads the child's parent link and terminal flag and
+            // never the descriptor's state.
+            cancel_child_workflow_map_children_tx(
+                tx,
+                schema,
+                command_id,
+                &map_command_cancelled_reason(command_id),
+            )
+            .await?;
+        }
         step_map_tx(
             backend,
             tx,
@@ -6358,6 +6580,34 @@ async fn cancel_command_operational_state_tx(
         )
         .await?;
     }
+    Ok(())
+}
+
+/// Postgres half of `sqlite::publish_commit_tail_before_map_append`; see there
+/// for why this is conditional on the engine's completion predicate rather than
+/// on a map merely being scheduled.
+async fn publish_commit_tail_before_map_append_tx(
+    tx: &Transaction<'_>,
+    schema: &str,
+    run_id: &RunId,
+    tail: EventId,
+    state: &MapState,
+    published: &mut bool,
+) -> Result<()> {
+    if *published || state.recorded_outcomes < state.item_count {
+        return Ok(());
+    }
+    tx.execute(
+        &format!(
+            "update {schema}.workflow_instances
+             set current_event_id = $1
+             where run_id = $2"
+        ),
+        &[&i64::try_from(tail.0).unwrap_or(i64::MAX), &run_id.0],
+    )
+    .await
+    .map_err(postgres_error)?;
+    *published = true;
     Ok(())
 }
 
@@ -6813,7 +7063,42 @@ async fn upsert_query_projection_rows_for_simple_commits_tx(
 enum InlineChildStartOutcome {
     Started(RunId),
     Failed(DurableFailure),
-    Skipped,
+    /// The `workflow_instances` insert conflicted and the follow-up re-read
+    /// found nothing: something deleted that row, and committed, between two
+    /// statements of this transaction.
+    ///
+    /// Named for what it *is*, not "skipped", because the previous name was
+    /// shared with the ordinary "this child event already exists" case and the
+    /// two were then handled together — silently. Nothing in this crate deletes
+    /// a `workflow_instances` row, so this is unreachable without an external
+    /// writer, but every caller must raise it rather than continue: the child
+    /// was not started and no outcome was recorded, so a plain child start
+    /// leaves its parent waiting forever and a map item strands its ordinal.
+    Vanished,
+}
+
+/// The error every `InlineChildStartOutcome::Vanished` site raises, written
+/// once so the three call sites cannot drift or quietly stop raising.
+///
+/// Failing the transaction is also the recovery: the commit rolls back and its
+/// retry re-runs the insert, which now finds no conflicting row and starts the
+/// child properly.
+fn vanished_child_start_error(message: &ChildStartOutboxMessage) -> Error {
+    match &message.child_map_item {
+        Some(item) => Error::Backend(format!(
+            "child workflow map `{}`:{} item {} could not be started: \
+             workflow instance `{}` was deleted mid-transaction",
+            item.map_command_id.run_id,
+            item.map_command_id.seq.0,
+            item.item_ordinal,
+            message.workflow_id
+        )),
+        None => Error::Backend(format!(
+            "child workflow `{}`:{} could not be started: \
+             workflow instance `{}` was deleted mid-transaction",
+            message.command_id.run_id, message.command_id.seq.0, message.workflow_id
+        )),
+    }
 }
 
 struct ExistingChildWorkflowRow {
@@ -6826,9 +7111,9 @@ struct ExistingChildWorkflowRow {
 fn child_start_outcome_event_and_reason(
     message: &ChildStartOutboxMessage,
     outcome: InlineChildStartOutcome,
-) -> Option<(HistoryEventData, WorkflowTaskReason)> {
+) -> Result<(HistoryEventData, WorkflowTaskReason)> {
     match outcome {
-        InlineChildStartOutcome::Started(child_run_id) => Some((
+        InlineChildStartOutcome::Started(child_run_id) => Ok((
             HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
                 command_id: message.command_id.clone(),
                 workflow_id: message.workflow_id.clone(),
@@ -6836,14 +7121,14 @@ fn child_start_outcome_event_and_reason(
             }),
             WorkflowTaskReason::ChildWorkflowStarted,
         )),
-        InlineChildStartOutcome::Failed(failure) => Some((
+        InlineChildStartOutcome::Failed(failure) => Ok((
             HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
                 command_id: message.command_id.clone(),
                 failure,
             }),
             WorkflowTaskReason::ChildWorkflowFailed,
         )),
-        InlineChildStartOutcome::Skipped => None,
+        InlineChildStartOutcome::Vanished => Err(vanished_child_start_error(message)),
     }
 }
 
@@ -7016,7 +7301,7 @@ async fn start_child_workflow_inline_tx(
         .await
         .map_err(postgres_error)?
     else {
-        return Ok(InlineChildStartOutcome::Skipped);
+        return Ok(InlineChildStartOutcome::Vanished);
     };
     let existing_run_id = RunId::new(row.get::<_, String>(0));
     let parent_run_id: Option<String> = row.get(1);
@@ -7081,31 +7366,48 @@ async fn insert_activity_map_tx(
     namespace: &str,
     map_task: &ActivityMapTask,
 ) -> Result<()> {
+    validate_map_slot_bound(ACTIVITY_MAP_LABEL, map_task.max_in_flight)?;
     let manifest_payload = backend
         .hydrate_activity_map_input_manifest_from_storage_tx(tx, map_task.input_manifest.clone())
         .await?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     let task_blob =
         rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
-    tx.execute(
-        &format!(
-            "insert into {schema}.activity_maps
+    let inserted = tx
+        .execute(
+            &format!(
+                "insert into {schema}.activity_maps
              (map_command_id, namespace, run_id, command_seq, task, item_count,
               next_ordinal, in_flight, completed)
              values ($1, $2, $3, $4, $5, $6, 0, 0, false)
              on conflict(map_command_id) do nothing"
-        ),
-        &[
-            &map_command_key(&map_task.map_command_id),
-            &namespace,
-            &map_task.map_command_id.run_id.0,
-            &i64::try_from(map_task.map_command_id.seq.0).unwrap_or(i64::MAX),
-            &task_blob,
-            &i64::try_from(manifest.item_count).unwrap_or(i64::MAX),
-        ],
-    )
-    .await
-    .map_err(postgres_error)?;
+            ),
+            &[
+                &map_command_key(&map_task.map_command_id),
+                &namespace,
+                &map_task.map_command_id.run_id.0,
+                &i64::try_from(map_task.map_command_id.seq.0).unwrap_or(i64::MAX),
+                &task_blob,
+                &i64::try_from(manifest.item_count).unwrap_or(i64::MAX),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    // `do nothing` makes the insert genuinely idempotent, which is the right
+    // defensive choice — but it also means a conflicting row would leave this
+    // function reporting success against a descriptor it did not write. That
+    // became consequential when `DescriptorCreated` gained the ability to append
+    // a history fact: Postgres would step a *stale* descriptor where SQLite's
+    // plain insert raises. Unreachable behind `expected_tail_event_id`, which
+    // fences a replayed commit before it gets here, so this is a tripwire for an
+    // invariant violation rather than a race to be handled.
+    if inserted != 1 {
+        return Err(Error::Backend(format!(
+            "map descriptor `{}`:{} already exists: a workflow task commit re-scheduled a map \
+             whose descriptor was never deleted",
+            map_task.map_command_id.run_id, map_task.map_command_id.seq.0
+        )));
+    }
     Ok(())
 }
 
@@ -7532,9 +7834,18 @@ async fn insert_map_item_batch_tx(
                     start_child_workflow_inline_tx(tx, schema, namespace, child_shard_id, &message)
                         .await?;
                 match start {
-                    InlineChildStartOutcome::Started(_) | InlineChildStartOutcome::Skipped => {}
+                    InlineChildStartOutcome::Started(_) => {}
                     InlineChildStartOutcome::Failed(failure) => {
                         conflicts.push((item_ordinal, failure));
+                    }
+                    // Materialization has already taken this ordinal's slot
+                    // (D7), so ignoring the outcome would leave an ordinal with
+                    // no child, no outcome and no slot release: `outcome_count`
+                    // could never reach `item_count` and the map would hang
+                    // forever with nothing to observe. See
+                    // `InlineChildStartOutcome::Vanished`.
+                    InlineChildStartOutcome::Vanished => {
+                        return Err(vanished_child_start_error(&message));
                     }
                 }
             }
@@ -7629,31 +7940,48 @@ async fn insert_child_workflow_map_tx(
     namespace: &str,
     map_task: &ChildWorkflowMapTask,
 ) -> Result<()> {
+    validate_map_slot_bound(CHILD_WORKFLOW_MAP_LABEL, map_task.max_in_flight)?;
     let manifest_payload = backend
         .hydrate_activity_map_input_manifest_from_storage_tx(tx, map_task.input_manifest.clone())
         .await?;
     let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
     let task_blob =
         rmp_serde::to_vec_named(map_task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
-    tx.execute(
-        &format!(
-            "insert into {schema}.child_workflow_maps
+    let inserted = tx
+        .execute(
+            &format!(
+                "insert into {schema}.child_workflow_maps
              (map_command_id, namespace, run_id, command_seq, task, item_count,
               next_ordinal, in_flight, completed)
              values ($1, $2, $3, $4, $5, $6, 0, 0, false)
              on conflict(map_command_id) do nothing"
-        ),
-        &[
-            &map_command_key(&map_task.map_command_id),
-            &namespace,
-            &map_task.map_command_id.run_id.0,
-            &i64::try_from(map_task.map_command_id.seq.0).unwrap_or(i64::MAX),
-            &task_blob,
-            &i64::try_from(manifest.item_count).unwrap_or(i64::MAX),
-        ],
-    )
-    .await
-    .map_err(postgres_error)?;
+            ),
+            &[
+                &map_command_key(&map_task.map_command_id),
+                &namespace,
+                &map_task.map_command_id.run_id.0,
+                &i64::try_from(map_task.map_command_id.seq.0).unwrap_or(i64::MAX),
+                &task_blob,
+                &i64::try_from(manifest.item_count).unwrap_or(i64::MAX),
+            ],
+        )
+        .await
+        .map_err(postgres_error)?;
+    // `do nothing` makes the insert genuinely idempotent, which is the right
+    // defensive choice — but it also means a conflicting row would leave this
+    // function reporting success against a descriptor it did not write. That
+    // became consequential when `DescriptorCreated` gained the ability to append
+    // a history fact: Postgres would step a *stale* descriptor where SQLite's
+    // plain insert raises. Unreachable behind `expected_tail_event_id`, which
+    // fences a replayed commit before it gets here, so this is a tripwire for an
+    // invariant violation rather than a race to be handled.
+    if inserted != 1 {
+        return Err(Error::Backend(format!(
+            "map descriptor `{}`:{} already exists: a workflow task commit re-scheduled a map \
+             whose descriptor was never deleted",
+            map_task.map_command_id.run_id, map_task.map_command_id.seq.0
+        )));
+    }
     Ok(())
 }
 
@@ -7667,10 +7995,15 @@ async fn complete_child_workflow_map_item_tx(
     let Some((state, namespace, map_task)) =
         child_workflow_map_state_tx(tx, schema, &map_item.map_command_id).await?
     else {
-        return Err(Error::Backend(format!(
-            "child workflow map `{}`:{} not found",
-            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
-        )));
+        // Missing descriptor means the parent run's terminal cleanup deleted
+        // it, exactly as a missing activity record does on `complete_activity`
+        // and `fail_activity`, and as a missing activity-map descriptor does on
+        // `fail_map_item`. It is not an error: under
+        // `ParentClosePolicy::Abandon` a child of a closed parent's map keeps
+        // running by design and still has to be able to *finish*. Raising here
+        // rolled the child's own terminal commit back, and every retry hit the
+        // same missing descriptor, so the child could never terminate.
+        return Ok(());
     };
     let already_recorded = tx
         .query_opt(
@@ -8007,6 +8340,17 @@ async fn complete_map_item_tx(
     .map_err(postgres_error)?;
 
     let key = map_command_key(&map_item.map_command_id);
+    // Unlike `fail_map_item` and `complete_child_workflow_map_item`, a missing
+    // descriptor stays a hard error here, and the asymmetry is deliberate.
+    // Those two answer "already handled" because the state is reachable: a
+    // child run outlives its parent's cleanup under
+    // `ParentClosePolicy::Abandon`, and an item task can outlive its
+    // descriptor. An activity-map item cannot: the run's terminal cleanup
+    // deletes the item's own activity record and the descriptor together, and
+    // this path already returned `AlreadyCompleted` when that record was gone.
+    // So reaching here means a live item task with no descriptor — corruption,
+    // not a race — and this completion carries a *result* that answering
+    // "already handled" would silently discard.
     let Some((state, namespace, map_task)) =
         activity_map_state_tx(tx, schema, &map_item.map_command_id).await?
     else {
