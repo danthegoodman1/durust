@@ -4,8 +4,7 @@ use crate::{
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
     Namespace, NewHistoryEvent, ReadSignalInboxRequest, ReadSignalInboxesRequest, Registry, Result,
     RunDueMaintenanceRequest, RunId, ShardId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, TimestampMs, WaitForReadyRequest, WorkerId, Workflow,
-    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
+    TimeoutDueActivitiesRequest, WaitForReadyRequest, WorkerId, Workflow, WorkflowChangeMarkerKind,
     WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
     WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
@@ -503,6 +502,18 @@ where
     workflow_task_queue: TaskQueue,
     activity_task_queue: TaskQueue,
     registry: Registry,
+    // The claim RPCs' registered-name filters, materialised once at `build()`.
+    // The registry is immutable after that, so walking its two `BTreeMap`s on
+    // every claim only ever reproduces the same lists.
+    //
+    // This saves the key walk and nothing else. `ClaimWorkflowTaskOptions`
+    // takes the list by value, so a claim still allocates one `Vec` plus one
+    // `String` per registered name — the same allocation count as the
+    // `keys().cloned().collect()` it replaced. Removing that would mean
+    // changing `ClaimWorkflowTaskOptions::registered_workflow_types` to a
+    // shared slice, a public API break across all three providers.
+    registered_workflow_types: Vec<crate::WorkflowType>,
+    registered_activity_names: Vec<crate::ActivityName>,
     history_chunk_events: usize,
     history_chunk_bytes: usize,
     payload_codec: crate::CodecId,
@@ -529,6 +540,25 @@ where
 #[derive(Default)]
 struct WorkflowState {
     cache: BTreeMap<RunId, CachedWorkflow>,
+    // The cache's runs in least-recently-inserted order, keyed by the same
+    // monotonic stamp the entry carries in `last_accessed_seq`. This is the
+    // Rust shape of the TypeScript worker's insertion-ordered `Map` idiom
+    // (`delete` then re-`set`, evict `keys().next()`): the victim is the
+    // first key rather than the minimum of a scan.
+    //
+    // Not literally constant-time, and not literally independent of
+    // `max_cached_workflows` — `BTreeMap` is O(log n) and the cache's own map
+    // gets deeper as the bound rises. What goes away is the linear scan:
+    // measured across a hundredfold rise in the bound, an evicting insert
+    // moves 14.2 µs to 669 µs with the scan and stays flat with this index.
+    //
+    // `None` until the cache first overflows, because a worker below its
+    // bound never evicts and must not pay to maintain an index it will never
+    // read. Once built it is maintained for the worker's life; the invariant
+    // from then on is exactly one entry per cached run, which is why every
+    // cache insertion and removal goes through `insert_cached_workflow` and
+    // `remove_cached_workflow` rather than touching `cache` directly.
+    cache_order: Option<BTreeMap<u64, RunId>>,
     cache_access_seq: u64,
     completed_local_activity_tasks: usize,
 }
@@ -549,7 +579,10 @@ struct CachedWorkflow {
     last_event_id: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
-    change_versions: Vec<WorkflowChangeVersionRecord>,
+    // The run's change markers, shared with every task that replayed them.
+    // Held as the deduplicated index the runtime actually reads, so a task
+    // whose chunk adds no marker hands the same allocation straight back.
+    change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
     // Ready events the committed task left unconsumed (for example a spawned
     // handle's completion the workflow has not awaited yet). They seed the
     // next task's context so the run stays cached; the next chunk starts
@@ -674,7 +707,7 @@ struct PreparedWorkflowTask {
     runtime_appended_tail: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
-    change_versions: Vec<WorkflowChangeVersionRecord>,
+    change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
     appended_change_marker: bool,
     unconsumed_indexes: crate::runtime::ReadyEventIndexes,
     terminal: bool,
@@ -1250,7 +1283,7 @@ where
         let unconsumed_indexes = prepared.unconsumed_indexes;
         let next_command_seq = prepared.next_command_seq;
         let default_activity_options = prepared.default_activity_options.clone();
-        let change_versions = prepared.change_versions.clone();
+        let change_markers = Arc::clone(&prepared.change_markers);
         let future = prepared.future;
         // Moved, not cloned: the run id is only needed for accounting, and
         // cloning one per committed task would put an allocation on the commit
@@ -1281,7 +1314,7 @@ where
             last_event_id,
             next_command_seq,
             default_activity_options,
-            change_versions,
+            change_markers,
             unconsumed_indexes,
             last_accessed_seq: 0,
         }))
@@ -1331,7 +1364,7 @@ where
                 ClaimActivityOptions {
                     namespace: self.namespace.clone(),
                     task_queue: self.activity_task_queue.clone(),
-                    registered_activity_names: self.registry.activity_names(),
+                    registered_activity_names: self.registered_activity_names.clone(),
                     lease_duration: self.activity_task_lease_duration,
                 },
             )
@@ -1365,7 +1398,7 @@ where
                         claim: ClaimActivityOptions {
                             namespace: self.namespace.clone(),
                             task_queue: self.activity_task_queue.clone(),
-                            registered_activity_names: self.registry.activity_names(),
+                            registered_activity_names: self.registered_activity_names.clone(),
                             lease_duration: self.activity_task_lease_duration,
                         },
                         limit: want,
@@ -1892,14 +1925,19 @@ where
         Ok(payload)
     }
 
-    async fn change_versions_for_loaded_history(
+    // The run's change markers for this task, merged into whatever the last
+    // task left cached instead of rebuilt from a cloned record vector.
+    //
+    // The `has_more` arm cannot merge: markers past the loaded window exist
+    // only in the provider, so the whole set is re-read and re-indexed there.
+    async fn change_markers_for_loaded_history(
         &self,
         claimed: &crate::ClaimedWorkflowTask,
         chunk: &crate::HistoryChunk,
-        cached: Option<Vec<WorkflowChangeVersionRecord>>,
-    ) -> Result<Vec<WorkflowChangeVersionRecord>> {
+        cached: Option<Arc<crate::runtime::ChangeMarkerIndex>>,
+    ) -> Result<Arc<crate::runtime::ChangeMarkerIndex>> {
         if chunk.has_more {
-            return Ok(self
+            let records = self
                 .backend
                 .workflow_change_versions(WorkflowChangeVersionsRequest {
                     namespace: self.namespace.clone(),
@@ -1908,22 +1946,15 @@ where
                     change_id: None,
                 })
                 .await?
-                .records);
+                .records;
+            return Ok(Arc::new(
+                crate::runtime::RuntimeChangeMarker::index_from_records(records),
+            ));
         }
 
-        let mut records = cached.unwrap_or_default();
-        records.extend(change_versions_from_history(
-            &self.namespace,
-            &claimed.workflow_id,
-            &claimed.workflow_type,
-            &claimed.run_id,
-            &chunk.events,
-        ));
-        let mut by_change_id = BTreeMap::new();
-        for record in records {
-            by_change_id.insert(record.change_id.clone(), record);
-        }
-        Ok(by_change_id.into_values().collect())
+        let mut markers = cached.unwrap_or_default();
+        merge_change_markers_from_history(&claimed.run_id, &chunk.events, &mut markers);
+        Ok(markers)
     }
 
     async fn prepare_workflow_poll(
@@ -1932,7 +1963,7 @@ where
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         mut context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
-        change_versions: Vec<WorkflowChangeVersionRecord>,
+        change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
     ) -> Result<PreparedWorkflowTask> {
         let poll_reached_terminal_state = match &poll {
             Poll::Pending => false,
@@ -2007,7 +2038,7 @@ where
             runtime_appended_tail,
             next_command_seq,
             default_activity_options,
-            change_versions,
+            change_markers,
             appended_change_marker,
             unconsumed_indexes,
             terminal,
@@ -2072,7 +2103,7 @@ where
                 ClaimWorkflowTaskOptions {
                     namespace: self.shared.namespace.clone(),
                     task_queue: self.shared.workflow_task_queue.clone(),
-                    registered_workflow_types: self.shared.registry.workflow_types(),
+                    registered_workflow_types: self.shared.registered_workflow_types.clone(),
                     lease_duration: self.shared.workflow_task_lease_duration,
                 },
             )
@@ -2138,7 +2169,7 @@ where
                     claim: ClaimWorkflowTaskOptions {
                         namespace: self.shared.namespace.clone(),
                         task_queue: self.shared.workflow_task_queue.clone(),
-                        registered_workflow_types: self.shared.registry.workflow_types(),
+                        registered_workflow_types: self.shared.registered_workflow_types.clone(),
                         lease_duration: self.shared.workflow_task_lease_duration,
                     },
                     limit,
@@ -2180,11 +2211,20 @@ where
         let mut start = 0usize;
         while start < prepared.len() {
             let end = (start + chunk_size).min(prepared.len());
+            // The commit moves into the batch instead of being deep-copied
+            // into it: every append event, activity input, and child start
+            // payload this task produced would otherwise be cloned and the
+            // original dropped unread. Nothing after the RPC reads
+            // `task.commit` — the wholesale-failure path and the per-task
+            // result loop below both only need `task.claim` — so the emptied
+            // slot is never observed. The claim is still cloned; it is a few
+            // ids and a lease token, and both release paths need it after the
+            // batch is built.
             let commits = prepared[start..end]
-                .iter()
+                .iter_mut()
                 .map(|task| crate::WorkflowTaskCommitInput {
                     claim: task.claim.clone(),
-                    commit: task.commit.clone(),
+                    commit: std::mem::take(&mut task.commit),
                 })
                 .collect::<Vec<_>>();
             let results = match self
@@ -2251,7 +2291,7 @@ where
                     last_event_id,
                     next_command_seq: task.next_command_seq,
                     default_activity_options: task.default_activity_options.clone(),
-                    change_versions: task.change_versions.clone(),
+                    change_markers: Arc::clone(&task.change_markers),
                     unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
                     last_accessed_seq: 0,
                 };
@@ -2336,7 +2376,7 @@ where
         &mut self,
         claimed: crate::ClaimedWorkflowTask,
     ) -> Result<PreparedWorkflowTaskOutcome> {
-        let cached = self.state.cache.remove(&claimed.run_id);
+        let cached = self.remove_cached_workflow(&claimed.run_id);
         let now = self.shared.backend.current_time().await?;
 
         if let Some(mut cached) = cached {
@@ -2344,13 +2384,9 @@ where
                 .shared
                 .claim_history_chunk(&claimed, cached.last_event_id)
                 .await?;
-            let change_versions = self
+            let change_markers = self
                 .shared
-                .change_versions_for_loaded_history(
-                    &claimed,
-                    &chunk,
-                    Some(cached.change_versions.clone()),
-                )
+                .change_markers_for_loaded_history(&claimed, &chunk, Some(cached.change_markers))
                 .await?;
             let mut context = crate::runtime::RuntimeContext::new(
                 claimed.run_id.clone(),
@@ -2363,7 +2399,7 @@ where
                 cached.next_command_seq,
                 chunk.last_event_id,
                 claimed.replay_target_event_id,
-                change_versions.clone(),
+                Arc::clone(&change_markers),
                 cached.unconsumed_indexes,
             );
             let poll = self
@@ -2380,7 +2416,7 @@ where
             return match poll {
                 WorkflowPollOutcome::Ready(poll) => self
                     .shared
-                    .prepare_workflow_poll(claimed, cached.future, context, poll, change_versions)
+                    .prepare_workflow_poll(claimed, cached.future, context, poll, change_markers)
                     .await
                     .map(PreparedWorkflowTaskOutcome::Prepared),
                 WorkflowPollOutcome::Deferred => {
@@ -2434,11 +2470,11 @@ where
             return Ok(PreparedWorkflowTaskOutcome::Deferred);
         };
         let last_loaded_event_id = first_chunk.last_event_id;
-        let change_versions = self
+        let change_markers = self
             .shared
-            .change_versions_for_loaded_history(&claimed, &first_chunk, None)
+            .change_markers_for_loaded_history(&claimed, &first_chunk, None)
             .await?;
-        let (input, replay_events) = split_start_event(&first_chunk.events)?;
+        let (input, replay_events) = split_start_event(first_chunk.events)?;
         let input = self.shared.hydrate_payload_for_decode(input).await?;
         let Some(registration) = self.shared.registry.workflow(&claimed.workflow_type) else {
             return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
@@ -2455,7 +2491,7 @@ where
             0,
             last_loaded_event_id,
             claimed.replay_target_event_id,
-            change_versions.clone(),
+            Arc::clone(&change_markers),
             crate::runtime::ReadyEventIndexes::default(),
         );
         let poll = self
@@ -2472,7 +2508,7 @@ where
         match poll {
             WorkflowPollOutcome::Ready(poll) => self
                 .shared
-                .prepare_workflow_poll(claimed, future, context, poll, change_versions)
+                .prepare_workflow_poll(claimed, future, context, poll, change_markers)
                 .await
                 .map(PreparedWorkflowTaskOutcome::Prepared),
             WorkflowPollOutcome::Deferred => {
@@ -2516,27 +2552,98 @@ where
     }
 
     // Single insertion point for the workflow cache: stamps the access
-    // sequence and enforces `max_cached_workflows` by dropping the
-    // least-recently-inserted entry. Eviction is a plain drop; the next task
-    // for an evicted run cold-replays from history. The O(n) min scan is
-    // fine because the map is bounded and eviction only runs at the bound;
-    // no extra index or dependency is warranted.
+    // sequence, files the run in `cache_order` when that index is live, and
+    // enforces `max_cached_workflows` by dropping the least-recently-inserted
+    // entry. Eviction is a plain drop; the next task for an evicted run
+    // cold-replays from history.
+    //
+    // "Eviction only runs at the bound" is true and is not a reason to scan:
+    // at the bound is the steady state for a busy worker, so the scan this
+    // replaced ran on every committed task and cost `max_cached_workflows`
+    // (default 10,000) comparisons each time. Taking the front of
+    // `cache_order` instead puts eviction in the same cost class as the
+    // `cache` insert it accompanies rather than adding a linear pass on top.
+    //
+    // It is equally not a reason to keep an index below the bound, where
+    // eviction never runs at all — see `activate_cache_order`.
     fn insert_cached_workflow(&mut self, run_id: RunId, mut entry: CachedWorkflow) {
         self.state.cache_access_seq += 1;
         entry.last_accessed_seq = self.state.cache_access_seq;
-        self.state.cache.insert(run_id, entry);
-        while self.state.cache.len() > self.shared.max_cached_workflows {
-            let Some(evict) = self
-                .state
+        if let Some(order) = self.state.cache_order.as_mut() {
+            order.insert(entry.last_accessed_seq, run_id.clone());
+        }
+        if let Some(replaced) = self.state.cache.insert(run_id, entry) {
+            // Re-inserting a run that was still cached retires its previous
+            // stamp; without this the order map would outgrow the cache and
+            // eviction would start taking already-dead keys.
+            if let Some(order) = self.state.cache_order.as_mut() {
+                order.remove(&replaced.last_accessed_seq);
+            }
+        }
+        if self.state.cache.len() > self.shared.max_cached_workflows {
+            self.activate_cache_order();
+            while self.state.cache.len() > self.shared.max_cached_workflows {
+                let Some(order) = self.state.cache_order.as_mut() else {
+                    break;
+                };
+                let Some((_, evicted)) = order.pop_first() else {
+                    break;
+                };
+                self.state.cache.remove(&evicted);
+            }
+        }
+        self.debug_assert_cache_order_in_step();
+    }
+
+    // Single removal point, and the other half of the `cache_order`
+    // invariant: a run taken out of the cache to be replayed must not leave
+    // its stamp behind, or eviction would later pop a key with no entry and
+    // the loop would stop reclaiming.
+    fn remove_cached_workflow(&mut self, run_id: &RunId) -> Option<CachedWorkflow> {
+        let entry = self.state.cache.remove(run_id)?;
+        if let Some(order) = self.state.cache_order.as_mut() {
+            order.remove(&entry.last_accessed_seq);
+        }
+        self.debug_assert_cache_order_in_step();
+        Some(entry)
+    }
+
+    // Builds the eviction order from the stamps the cache entries already
+    // carry, the first time the cache overflows.
+    //
+    // Deferring it is not an optimisation detail, it is what keeps the index
+    // free for workers that never reach their bound: below the bound nothing
+    // is ever evicted, so an index maintained there is pure overhead on every
+    // committed task — one `RunId` clone and one index node per commit, which
+    // the first version of this row did unconditionally.
+    //
+    // The build is not free and is not cheaper than the scan it replaces:
+    // O(n log n) with an owned `RunId` per entry, measured at 10.3 ms for a
+    // 100,000-entry cache against 0.67 ms for one victim scan, so roughly
+    // fifteen scans' worth. It is paid **once** per worker, and every eviction
+    // after it is a `pop_first` — 1.2 µs at that bound against the scan's
+    // 669 µs. See `cache_eviction_cost_does_not_track_the_cache_bound`.
+    fn activate_cache_order(&mut self) {
+        if self.state.cache_order.is_some() {
+            return;
+        }
+        self.state.cache_order = Some(
+            self.state
                 .cache
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed_seq)
-                .map(|(run_id, _)| run_id.clone())
-            else {
-                break;
-            };
-            self.state.cache.remove(&evict);
-        }
+                .map(|(run_id, entry)| (entry.last_accessed_seq, run_id.clone()))
+                .collect(),
+        );
+    }
+
+    fn debug_assert_cache_order_in_step(&self) {
+        debug_assert!(
+            self.state
+                .cache_order
+                .as_ref()
+                .is_none_or(|order| order.len() == self.state.cache.len()),
+            "an active workflow cache order index must hold the same runs as the cache"
+        );
     }
 }
 
@@ -2638,28 +2745,30 @@ fn prefetched_claim_history_chunk(
         });
     }
 
-    let events = claimed
-        .prefetched_history
-        .iter()
-        .filter(|event| {
+    // Validation runs over borrowed events and allocates nothing, so a
+    // prefetch that does not cover the window contiguously costs a scan
+    // instead of a deep copy of every candidate event — payloads included —
+    // that is then thrown away. Only a chunk that will be returned is cloned.
+    let selected = || {
+        claimed.prefetched_history.iter().filter(|event| {
             event.event_id > after_event_id && event.event_id <= claimed.replay_target_event_id
         })
-        .cloned()
-        .collect::<Vec<_>>();
-    let first = events.first()?;
-    let last = events.last()?;
-    if first.event_id != after_event_id.next() || last.event_id != claimed.replay_target_event_id {
+    };
+    let mut expected_event_id = after_event_id.next();
+    let mut last_event_id = None;
+    for event in selected() {
+        if event.event_id != expected_event_id {
+            return None;
+        }
+        expected_event_id = event.event_id.next();
+        last_event_id = Some(event.event_id);
+    }
+    let last_event_id = last_event_id?;
+    if last_event_id != claimed.replay_target_event_id {
         return None;
     }
-    if events
-        .windows(2)
-        .any(|pair| pair[1].event_id != pair[0].event_id.next())
-    {
-        return None;
-    }
-    let last_event_id = last.event_id;
     Some(crate::HistoryChunk {
-        events,
+        events: selected().cloned().collect(),
         last_event_id,
         has_more: false,
     })
@@ -2705,59 +2814,68 @@ fn prefetched_claim_history_chunk_bounded(
     })
 }
 
-fn split_start_event(events: &[HistoryEvent]) -> Result<(crate::PayloadRef, Vec<HistoryEvent>)> {
-    let Some(first) = events.first() else {
+// Splits a cold-replay chunk into the run's input and the events the runtime
+// replays, by value. The chunk is dead the moment it is split — the caller has
+// already taken `last_event_id` and folded the change markers — so the tail
+// moves out of the caller's `Vec` rather than being deep-cloned into a second
+// one. Removing the head is a single in-place shift of `HistoryEvent` structs;
+// the payloads, run ids, and type names they own are never copied.
+fn split_start_event(
+    mut events: Vec<HistoryEvent>,
+) -> Result<(crate::PayloadRef, Vec<HistoryEvent>)> {
+    if events.is_empty() {
         return Err(Error::Backend(
             "claimed workflow task without WorkflowStarted event".to_owned(),
         ));
-    };
-    let HistoryEventData::WorkflowStarted { input, .. } = &first.data else {
+    }
+    let HistoryEventData::WorkflowStarted { input, .. } = events.remove(0).data else {
         return Err(Error::Backend(
             "first workflow history event was not WorkflowStarted".to_owned(),
         ));
     };
-    Ok((input.clone(), events.iter().skip(1).cloned().collect()))
+    Ok((input, events))
 }
 
-fn change_versions_from_history(
-    namespace: &Namespace,
-    workflow_id: &WorkflowId,
-    workflow_type: &crate::WorkflowType,
+// Folds the change markers a freshly loaded chunk carries into the run's
+// shared marker index.
+//
+// Incremental by construction: a chunk with no marker event touches nothing,
+// so the overwhelmingly common task keeps the previous task's `Arc` and copies
+// no records at all. `Arc::make_mut` copies the index exactly once, on the
+// first marker in a chunk that has one — and a task that appends a marker is
+// already forced to cold-replay next time (`appended_change_marker`), so this
+// path is only reached by a chunk replaying markers another task recorded.
+//
+// Later markers win over earlier ones for the same change id, and a marker in
+// the chunk wins over the carried index, which is the order the rebuilt
+// `BTreeMap` this replaced produced.
+fn merge_change_markers_from_history(
     run_id: &RunId,
     events: &[HistoryEvent],
-) -> Vec<WorkflowChangeVersionRecord> {
-    events
-        .iter()
-        .filter_map(|event| match &event.data {
-            HistoryEventData::VersionMarker(marker) => Some(WorkflowChangeVersionRecord {
-                namespace: namespace.clone(),
-                workflow_id: workflow_id.clone(),
-                workflow_type: workflow_type.clone(),
-                run_id: run_id.clone(),
+    markers: &mut Arc<crate::runtime::ChangeMarkerIndex>,
+) {
+    for event in events {
+        let marker = match &event.data {
+            HistoryEventData::VersionMarker(marker) => crate::runtime::RuntimeChangeMarker {
+                command_id: crate::command_id(run_id, marker.command_id.seq.0),
                 change_id: marker.change_id.clone(),
                 version: marker.version,
                 marker_kind: WorkflowChangeMarkerKind::Version,
-                status: WorkflowChangeVersionStatus::Open,
-                command_seq: marker.command_id.seq,
-                first_event_id: event.event_id,
-                last_seen_at: TimestampMs(0),
-            }),
-            HistoryEventData::DeprecatedPatchMarker(marker) => Some(WorkflowChangeVersionRecord {
-                namespace: namespace.clone(),
-                workflow_id: workflow_id.clone(),
-                workflow_type: workflow_type.clone(),
-                run_id: run_id.clone(),
-                change_id: marker.patch_id.clone(),
-                version: 1,
-                marker_kind: WorkflowChangeMarkerKind::DeprecatedPatch,
-                status: WorkflowChangeVersionStatus::Open,
-                command_seq: marker.command_id.seq,
-                first_event_id: event.event_id,
-                last_seen_at: TimestampMs(0),
-            }),
-            _ => None,
-        })
-        .collect()
+                event_id: event.event_id,
+            },
+            HistoryEventData::DeprecatedPatchMarker(marker) => {
+                crate::runtime::RuntimeChangeMarker {
+                    command_id: crate::command_id(run_id, marker.command_id.seq.0),
+                    change_id: marker.patch_id.clone(),
+                    version: 1,
+                    marker_kind: WorkflowChangeMarkerKind::DeprecatedPatch,
+                    event_id: event.event_id,
+                }
+            }
+            _ => continue,
+        };
+        Arc::make_mut(markers).insert(marker.change_id.clone(), marker);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3249,6 +3367,8 @@ where
                 worker_id: self.worker_id,
                 workflow_task_queue: self.workflow_task_queue,
                 activity_task_queue: self.activity_task_queue,
+                registered_workflow_types: self.registry.workflow_types(),
+                registered_activity_names: self.registry.activity_names(),
                 registry: self.registry,
                 history_chunk_events: self.history_chunk_events,
                 history_chunk_bytes: self.history_chunk_bytes,
@@ -3351,6 +3471,357 @@ mod tests {
         assert!(prefetched_claim_history_chunk(&claimed, EventId(1)).is_none());
     }
 
+    // The shape a real cached wake hits: providers prefetch a bounded tail
+    // (`MemoryBackend` keeps the last sixteen events), so a run whose cached
+    // task is further behind than that asks for a window the prefetch starts
+    // after. Rejecting it is the whole reason the validation runs over
+    // borrowed events — this is the case that used to deep-copy every
+    // candidate, payloads included, and then discard all of them.
+    #[test]
+    fn prefetched_claim_history_chunk_rejects_a_tail_that_starts_after_the_window() {
+        let claimed = claimed(vec![event(8), event(9), event(10)], 10);
+
+        assert!(prefetched_claim_history_chunk(&claimed, EventId(1)).is_none());
+    }
+
+    #[test]
+    fn split_start_event_moves_the_tail_and_reports_a_missing_or_wrong_head() {
+        let started = HistoryEvent {
+            event_id: EventId(1),
+            event_type: HistoryEventType::WorkflowStarted,
+            data: HistoryEventData::WorkflowStarted {
+                workflow_type: crate::WorkflowType::new("test.workflow", 1),
+                input: crate::PayloadRef::inline_messagepack(&7u64).unwrap(),
+            },
+        };
+
+        let (input, tail) =
+            split_start_event(vec![started.clone(), event(2), event(3)]).expect("split");
+        assert!(matches!(input, crate::PayloadRef::Inline { .. }));
+        assert_eq!(
+            tail.iter().map(|event| event.event_id).collect::<Vec<_>>(),
+            vec![EventId(2), EventId(3)]
+        );
+
+        let empty = split_start_event(Vec::new()).unwrap_err();
+        assert_eq!(
+            empty.to_string(),
+            Error::Backend("claimed workflow task without WorkflowStarted event".to_owned())
+                .to_string()
+        );
+
+        let headless = split_start_event(vec![event(2)]).unwrap_err();
+        assert_eq!(
+            headless.to_string(),
+            Error::Backend("first workflow history event was not WorkflowStarted".to_owned())
+                .to_string()
+        );
+    }
+
+    fn cached_entry() -> CachedWorkflow {
+        CachedWorkflow {
+            future: Box::pin(std::future::pending()),
+            last_event_id: EventId(1),
+            next_command_seq: 0,
+            default_activity_options: crate::ActivityOptions::default(),
+            change_markers: Arc::default(),
+            unconsumed_indexes: crate::runtime::ReadyEventIndexes::default(),
+            last_accessed_seq: 0,
+        }
+    }
+
+    fn cache_worker(max_cached_workflows: usize) -> Worker<crate::MemoryBackend> {
+        Worker::builder(crate::MemoryBackend::new())
+            .max_cached_workflows(max_cached_workflows)
+            .build()
+    }
+
+    // The victim must be the least *recently inserted* run, not the smallest
+    // run id. The run ids here are deliberately reverse-ordered against the
+    // insertion order, so an eviction that took the cache map's first key
+    // would drop the newest entry and keep the oldest.
+    #[test]
+    fn cache_eviction_drops_the_least_recently_inserted_run() {
+        let mut worker = cache_worker(2);
+        let mut workflow = worker.workflow_worker();
+
+        for run_id in ["run-c", "run-b", "run-a"] {
+            workflow.insert_cached_workflow(RunId::new(run_id), cached_entry());
+        }
+
+        assert_eq!(workflow.state.cache.len(), 2);
+        assert!(!workflow.state.cache.contains_key(&RunId::new("run-c")));
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-b")));
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-a")));
+    }
+
+    // Re-inserting a run moves it to the back of the eviction order, which is
+    // what makes the cache least-recently-*used* for a busy worker: every
+    // cached run re-enters through insert after every committed task.
+    //
+    // The index must already be live when the re-insert happens, or this test
+    // does not reach the branch it exists for. An earlier version of it used a
+    // bound of two and re-inserted while `cache_order` was still `None`, so
+    // deleting the stale-stamp retirement outright left the whole suite green.
+    // The three inserts below activate the index first; the re-insert then
+    // takes the branch, and a survivor is chosen so the retirement has a stamp
+    // to retire.
+    #[test]
+    fn reinserting_a_cached_run_renews_its_place_in_the_eviction_order() {
+        let mut worker = cache_worker(2);
+        let mut workflow = worker.workflow_worker();
+
+        // Activates the index and leaves run-b and run-c cached.
+        for run_id in ["run-a", "run-b", "run-c"] {
+            workflow.insert_cached_workflow(RunId::new(run_id), cached_entry());
+        }
+        assert!(
+            workflow.state.cache_order.is_some(),
+            "the re-insert below must run against a live index or it proves nothing"
+        );
+
+        // Without removing it first, mirroring a commit that re-caches a run
+        // the claim path did not take out. run-b was the oldest survivor, so
+        // renewing it must make run-c the next victim instead.
+        workflow.insert_cached_workflow(RunId::new("run-b"), cached_entry());
+        assert_eq!(
+            workflow.state.cache_order.as_ref().map(BTreeMap::len),
+            Some(2),
+            "a re-inserted run must retire its previous stamp"
+        );
+
+        workflow.insert_cached_workflow(RunId::new("run-d"), cached_entry());
+
+        assert_eq!(workflow.state.cache.len(), 2);
+        assert!(
+            !workflow.state.cache.contains_key(&RunId::new("run-c")),
+            "renewing run-b must leave run-c as the oldest, and so the victim"
+        );
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-b")));
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-d")));
+    }
+
+    // The cache-bound microbenchmark the plan asks for, at 1,000 and 100,000.
+    //
+    // Ignored by default: it builds a 100,000-entry cache, which is seconds of
+    // work and tens of megabytes, and it asserts on wall-clock time. Run it
+    // with `cargo test --release -- --ignored eviction_cost`.
+    //
+    // It asserts the *ratio*, not a duration, so it means the same thing on
+    // any machine. The scan this replaced grows with the bound; taking the
+    // front of the order index does not.
+    //
+    // The first evicting insert is deliberately excluded from the timed
+    // region, because it also builds the index. That build is O(n log n) with
+    // an owned `RunId` per entry — measured at ~10 ms for a 100,000 bound,
+    // which is more than one victim scan, not less — and it happens once per
+    // worker. Amortising it over a short measurement is what makes a correct
+    // implementation read as a 41x rise; the first version of this test did
+    // exactly that and failed against its own subject.
+    #[test]
+    #[ignore = "builds a 100,000-entry cache and asserts on wall-clock time"]
+    fn cache_eviction_cost_does_not_track_the_cache_bound() {
+        const MAX_SCALING: f64 = 10.0;
+        const EVICTING_INSERTS: usize = 200;
+
+        struct EvictionCost {
+            steady_state_nanos: f64,
+            activation_nanos: f64,
+        }
+
+        fn measure(bound: usize) -> EvictionCost {
+            let mut worker = cache_worker(bound);
+            let mut workflow = worker.workflow_worker();
+            // One shared marker index: a separate `Arc::default()` per entry
+            // would measure the setup, not the eviction.
+            let markers: Arc<crate::runtime::ChangeMarkerIndex> = Arc::default();
+            let entry = || CachedWorkflow {
+                future: Box::pin(std::future::pending()),
+                last_event_id: EventId(1),
+                next_command_seq: 0,
+                default_activity_options: crate::ActivityOptions::default(),
+                change_markers: Arc::clone(&markers),
+                unconsumed_indexes: crate::runtime::ReadyEventIndexes::default(),
+                last_accessed_seq: 0,
+            };
+            for index in 0..bound {
+                workflow.insert_cached_workflow(RunId::new(format!("fill-{index}")), entry());
+            }
+            assert_eq!(workflow.state.cache.len(), bound);
+
+            // Every insert past this point is for a run the cache does not
+            // hold, so each one pushes it over the bound and evicts. The first
+            // one also activates the index.
+            let activation = std::time::Instant::now();
+            workflow.insert_cached_workflow(RunId::new("activate"), entry());
+            let activation_nanos = activation.elapsed().as_nanos() as f64;
+
+            let started = std::time::Instant::now();
+            for index in 0..EVICTING_INSERTS {
+                workflow.insert_cached_workflow(RunId::new(format!("evict-{index}")), entry());
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(workflow.state.cache.len(), bound);
+            EvictionCost {
+                steady_state_nanos: elapsed.as_nanos() as f64 / EVICTING_INSERTS as f64,
+                activation_nanos,
+            }
+        }
+
+        let small = measure(1_000);
+        let large = measure(100_000);
+        let scaling = large.steady_state_nanos / small.steady_state_nanos;
+        assert!(
+            scaling < MAX_SCALING,
+            "a steady-state evicting insert cost {:.0} ns at a 1,000 bound and {:.0} ns at \
+             100,000, a {scaling:.1}x rise against a ceiling of {MAX_SCALING}x. Eviction must \
+             not scan the cache for its victim.\n\
+             one-time index activation: {:.0} ns at 1,000, {:.0} ns at 100,000",
+            small.steady_state_nanos,
+            large.steady_state_nanos,
+            small.activation_nanos,
+            large.activation_nanos,
+        );
+    }
+
+    // Once the index is live, the cache and the index must hold the same runs
+    // after every removal, or eviction starts popping stamps with no entry
+    // behind them and stops reclaiming. The first three inserts are what make
+    // the index live — below the bound there is no index to keep in step.
+    #[test]
+    fn removing_a_cached_run_keeps_a_live_eviction_order_in_step() {
+        let mut worker = cache_worker(2);
+        let mut workflow = worker.workflow_worker();
+
+        for run_id in ["run-a", "run-b", "run-c"] {
+            workflow.insert_cached_workflow(RunId::new(run_id), cached_entry());
+        }
+        assert_eq!(
+            workflow.state.cache_order.as_ref().map(BTreeMap::len),
+            Some(2),
+            "the first overflow must build the index from the surviving entries"
+        );
+
+        assert!(
+            workflow
+                .remove_cached_workflow(&RunId::new("run-b"))
+                .is_some()
+        );
+        assert!(
+            workflow
+                .remove_cached_workflow(&RunId::new("run-b"))
+                .is_none()
+        );
+        assert_eq!(
+            workflow.state.cache_order.as_ref().map(BTreeMap::len),
+            Some(1),
+            "a claimed run must not leave its stamp in the eviction order"
+        );
+
+        // Two more inserts against a bound of two: the cache must settle at
+        // the bound, evicting the oldest survivor rather than a dead key.
+        workflow.insert_cached_workflow(RunId::new("run-d"), cached_entry());
+        workflow.insert_cached_workflow(RunId::new("run-e"), cached_entry());
+
+        assert_eq!(workflow.state.cache.len(), 2);
+        assert_eq!(
+            workflow.state.cache_order.as_ref().map(BTreeMap::len),
+            Some(2)
+        );
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-d")));
+        assert!(workflow.state.cache.contains_key(&RunId::new("run-e")));
+    }
+
+    // A worker that never fills its cache never evicts, so it must not pay to
+    // maintain an eviction index. This is the property that keeps the warm
+    // cached-wake path free; maintaining the index unconditionally measured
+    // +5.6% on `workflow_cached_wake_poll_memory`.
+    #[test]
+    fn the_eviction_order_stays_unbuilt_until_the_cache_overflows() {
+        let mut worker = cache_worker(4);
+        let mut workflow = worker.workflow_worker();
+
+        for run_id in ["run-a", "run-b", "run-c", "run-d"] {
+            workflow.insert_cached_workflow(RunId::new(run_id), cached_entry());
+        }
+        assert!(
+            workflow.state.cache_order.is_none(),
+            "a cache that has never overflowed must carry no eviction index"
+        );
+
+        workflow.insert_cached_workflow(RunId::new("run-e"), cached_entry());
+
+        assert_eq!(workflow.state.cache.len(), 4);
+        assert!(!workflow.state.cache.contains_key(&RunId::new("run-a")));
+        assert_eq!(
+            workflow.state.cache_order.as_ref().map(BTreeMap::len),
+            Some(4),
+            "the index must exist and match the cache once eviction has run"
+        );
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct ProbeWorkflow;
+
+    impl Workflow for ProbeWorkflow {
+        type Input = u64;
+        type Output = u64;
+        type QueryState = ();
+
+        const NAME: &'static str = "worker.probe-workflow";
+        const VERSION: u32 = 1;
+        const RUST_PATH: &'static str = "durust::worker::tests::ProbeWorkflow";
+
+        fn run(self, input: Self::Input) -> crate::BoxWorkflowFuture<Self::Output> {
+            Box::pin(std::future::ready(Ok(input)))
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct ProbeActivity;
+
+    impl crate::Activity for ProbeActivity {
+        type Input = u64;
+        type Output = u64;
+
+        const NAME: &'static str = "worker.probe-activity";
+        const RUST_PATH: &'static str = "durust::worker::tests::ProbeActivity";
+
+        fn run(self, input: Self::Input) -> crate::BoxActivityFuture<Self::Output> {
+            Box::pin(std::future::ready(Ok(input)))
+        }
+    }
+
+    // The claim RPCs' registered-name filters are materialised at `build()`.
+    // If they ever drift from the registry, a worker silently stops claiming
+    // work for a registered type, which no other test would notice. The
+    // registry is deliberately non-empty: an empty one matches an empty cached
+    // list for the wrong reason.
+    #[test]
+    fn cached_registry_name_lists_match_the_registry() {
+        let worker = Worker::builder(crate::MemoryBackend::new())
+            .register_workflow(ProbeWorkflow)
+            .register_activity(ProbeActivity)
+            .build();
+
+        assert_eq!(
+            worker.shared.registered_workflow_types,
+            vec![crate::WorkflowType::new("worker.probe-workflow", 1)]
+        );
+        assert_eq!(
+            worker.shared.registered_activity_names,
+            vec![crate::ActivityName::new("worker.probe-activity")]
+        );
+        assert_eq!(
+            worker.shared.registered_workflow_types,
+            worker.shared.registry.workflow_types()
+        );
+        assert_eq!(
+            worker.shared.registered_activity_names,
+            worker.shared.registry.activity_names()
+        );
+    }
+
     fn jitter_schedule(worker_id: &str, interval: Duration, delays: usize) -> Vec<Duration> {
         let mut jitter = MaintenanceJitter::new(&WorkerId::new(worker_id));
         (0..delays).map(|_| jitter.next_delay(interval)).collect()
@@ -3360,6 +3831,19 @@ mod tests {
     // in lockstep, and it must not need a global RNG to avoid it. Two ids
     // diverge from their *first* delay, because the first delay is the phase
     // offset that breaks up startup load.
+    #[test]
+    fn maintenance_jitter_gives_two_worker_ids_different_phases() {
+        let interval = Duration::from_millis(250);
+        let first = jitter_schedule("worker-a", interval, 8);
+        let second = jitter_schedule("worker-b", interval, 8);
+
+        assert_ne!(
+            first[0], second[0],
+            "two worker ids must not share a startup phase: {first:?} vs {second:?}"
+        );
+        assert_ne!(first, second);
+    }
+
     /// The Rust half of the shared behavioural corpus's `workerStartJitter`
     /// table; `typescript/packages/core/test/behavioral-corpus.test.ts` asserts
     /// the same rows against `maintenanceJitterSource`.
@@ -3418,18 +3902,6 @@ mod tests {
             "the table must keep an astral worker id: it is the only row a \
              UTF-8-byte hash would fail"
         );
-    }
-    #[test]
-    fn maintenance_jitter_gives_two_worker_ids_different_phases() {
-        let interval = Duration::from_millis(250);
-        let first = jitter_schedule("worker-a", interval, 8);
-        let second = jitter_schedule("worker-b", interval, 8);
-
-        assert_ne!(
-            first[0], second[0],
-            "two worker ids must not share a startup phase: {first:?} vs {second:?}"
-        );
-        assert_ne!(first, second);
     }
 
     // Deterministic from the id alone: the same worker reproduces its schedule

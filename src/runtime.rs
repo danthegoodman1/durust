@@ -16,6 +16,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -208,7 +209,7 @@ pub(crate) struct RuntimeContext {
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
     hydrated_payloads: BTreeMap<String, PayloadRef>,
-    change_markers: BTreeMap<String, RuntimeChangeMarker>,
+    change_markers: Arc<ChangeMarkerIndex>,
     preconsumed_change_markers: BTreeMap<CommandSeq, RuntimeChangeMarker>,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
@@ -420,6 +421,15 @@ pub(crate) struct RuntimeChangeMarker {
     pub event_id: crate::EventId,
 }
 
+/// Every change marker this run has recorded, keyed by change id.
+///
+/// Built once per cached run rather than once per task: the context only ever
+/// reads it, so tasks share one `Arc` and a task whose chunk carries no new
+/// marker copies nothing. The worker holds the same `Arc` on `CachedWorkflow`
+/// and folds new markers in with `Arc::make_mut`, so the copy happens exactly
+/// when the set actually changes.
+pub(crate) type ChangeMarkerIndex = BTreeMap<String, RuntimeChangeMarker>;
+
 impl RuntimeChangeMarker {
     fn from_record(record: WorkflowChangeVersionRecord) -> Self {
         Self {
@@ -429,6 +439,20 @@ impl RuntimeChangeMarker {
             marker_kind: record.marker_kind,
             event_id: record.first_event_id,
         }
+    }
+
+    /// The provider's full record set, folded into the shared index. Used on
+    /// the one path that cannot merge incrementally: a partially loaded
+    /// history, where the markers ahead of the loaded window are only
+    /// knowable from the provider.
+    pub(crate) fn index_from_records(
+        records: Vec<WorkflowChangeVersionRecord>,
+    ) -> ChangeMarkerIndex {
+        records
+            .into_iter()
+            .map(Self::from_record)
+            .map(|marker| (marker.change_id.clone(), marker))
+            .collect()
     }
 }
 
@@ -533,7 +557,7 @@ impl RuntimeContext {
         next_command_seq: u64,
         last_loaded_event_id: crate::EventId,
         replay_target_event_id: crate::EventId,
-        change_versions: Vec<WorkflowChangeVersionRecord>,
+        change_markers: Arc<ChangeMarkerIndex>,
         carried_indexes: ReadyEventIndexes,
     ) -> Self {
         // Carried entries all precede this task's chunk (their events were
@@ -541,11 +565,6 @@ impl RuntimeContext {
         // on top cannot collide with them.
         let mut indexes = carried_indexes;
         indexes.index_events(&replay_events);
-        let change_markers = change_versions
-            .into_iter()
-            .map(RuntimeChangeMarker::from_record)
-            .map(|marker| (marker.change_id.clone(), marker))
-            .collect();
 
         Self {
             run_id,
@@ -4281,7 +4300,7 @@ mod tests {
             0,
             EventId(1),
             EventId(3),
-            Vec::new(),
+            Arc::default(),
             ReadyEventIndexes::default(),
         );
         runtime.append_replay_events(
@@ -4394,7 +4413,7 @@ mod tests {
             0,
             EventId(3),
             EventId(3),
-            Vec::new(),
+            Arc::default(),
             ReadyEventIndexes::default(),
         )
     }

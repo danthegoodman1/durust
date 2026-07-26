@@ -998,6 +998,27 @@ async fn await_signal(_: UnitInput) -> durust::Result<String> {
     durust::signal::<String>("ready").await
 }
 
+/// Builds an activity map without its input manifest, catches the rejection,
+/// and then schedules an ordinary activity.
+///
+/// The rejected builder still allocates a command seq — the seq is allocated
+/// before the per-kind work that fails — so the activity that follows is
+/// recorded at seq 2, not seq 1. That is a property of every history already
+/// committed, which is why it is pinned here rather than changed.
+#[durust::workflow(name = "tests.rejected-builder-then-activity", version = 1)]
+async fn rejected_builder_then_activity(input: NumberInput) -> durust::Result<u64> {
+    let rejected = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .max_in_flight(2)
+        .result_manifest("doubled")
+        .spawn()
+        .await;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    Ok(if rejected.is_err() { doubled } else { 0 })
+}
+
 #[durust::workflow(name = "tests.activity-map-sum", version = 1)]
 async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
     let input_manifest =
@@ -7450,6 +7471,81 @@ fn worker_drops_cache_and_retries_after_workflow_task_commit_conflict() {
             panic!("workflow did not complete after retry");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 23);
+    });
+}
+
+// A command builder that is rejected after its seq is allocated leaves a gap
+// in the run's command seqs, and that gap is part of the recorded history: the
+// activity scheduled after the rejection carries seq 2.
+//
+// The gap is deliberate and is preserved, not fixed. It is deterministic —
+// every replay re-executes the same builder, fails it in the same place, and
+// burns the same seq — and moving the allocation after the fallible per-kind
+// work would renumber every command that follows a caught builder error,
+// which no history already committed could replay. This test pins both
+// halves: the recorded seq, and that a **cold** replay with no cached future
+// reproduces it exactly.
+#[test]
+fn a_rejected_command_builder_burns_its_seq_and_replays_identically() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<rejected_builder_then_activity>(
+                "wf/rejected-builder",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(rejected_builder_then_activity)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+
+        // First task: the map builder is rejected, its seq is gone, and the
+        // activity that follows takes the next one.
+        assert!(worker.run_workflow_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("the activity after the rejected builder was not scheduled");
+        };
+        assert_eq!(
+            scheduled.command_id.seq.0, 2,
+            "the rejected builder consumed command seq 1, so the activity must be recorded at 2"
+        );
+
+        assert_eq!(worker.run_activity_batch_once().await.unwrap(), 1);
+
+        // Drop the worker so nothing is cached, then finish the run from
+        // durable history alone: the replay re-executes the rejected builder,
+        // burns the same seq, and must match the recorded seq 2.
+        drop(worker);
+        let mut cold = Worker::builder(backend.clone())
+            .worker_id("cold-replay-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(rejected_builder_then_activity)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        let stats = cold.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the cold replay did not complete the run");
+        };
+        assert_eq!(
+            durust::decode_payload::<u64>(result).unwrap(),
+            42,
+            "the run must complete through the rejected-builder branch"
+        );
     });
 }
 
