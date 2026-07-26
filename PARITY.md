@@ -1,0 +1,375 @@
+# Cross-Runtime Parity
+
+Durust has two implementations, Rust and TypeScript. `SPEC.md` §1.2 states what
+they must agree on: the committed history and the provider contract. This file
+records how that agreement is *proved* — for each cross-cutting invariant, the
+named test in each language that asserts it — and which invariants are proved in
+only one language.
+
+**Baseline.** Every status, test name, and source line below is as of commit
+`240d603`. Rows that depend on work not yet committed at that point say so
+explicitly and name what is missing; nothing here silently describes a working
+tree.
+
+## How to read this
+
+- **Both** means a named test exists in each language and asserts that
+  invariant.
+- **Revert-verified** means more, and is the bar that matters: the invariant was
+  actually broken in a scratch worktree and the named test *failed*. A test that
+  passes both before and after the fix it supposedly guards pins nothing, and
+  reading it is not enough to tell — three of the reverts below were caught by a
+  different test than the row named, and three were caught by none.
+  §1's revert table gives every revert and its outcome. **Do not upgrade a row
+  to revert-verified without running the revert**, and do not describe a row as
+  proved when only its neighbour's test moved.
+- **Gap** means one column has no test. A gap is a finding, not a footnote: an
+  invariant proved on one side only is an invariant that can regress silently on
+  the other. A gap row names what is missing and says why the invariant is
+  believed to hold anyway, but "believed" is the operative word.
+- Test names are verbatim, so they can be run. Do not paraphrase them when
+  editing this file, and do not add a row for a test that has not been run.
+
+Running a named test:
+
+```bash
+# Rust, crate unit tests (paths shown as `src/runtime.rs::runtime::tests::NAME`)
+cargo test --lib -- --exact runtime::tests::NAME
+
+# Rust, integration tests (paths shown as `tests/FILE.rs::NAME`)
+cargo test --test FILE -- --exact NAME
+
+# TypeScript, from ./typescript
+npx vitest run --config vitest.config.ts packages/core/test/FILE.test.ts -t "NAME"
+```
+
+---
+
+## 1. Invariant parity ledger
+
+| # | Invariant | Rust test | TypeScript test | Status |
+| --- | --- | --- | --- | --- |
+| 1 | A durable API called from inside a side-effect callback fails the task and appends nothing | `tests/replay_core.rs::durable_api_inside_side_effect_fails_the_task_without_recording_markers`; `src/runtime.rs::runtime::tests::durable_api_inside_a_real_side_effect_closure_records_no_marker_pair` | `runtime.test.ts` — `rejects each durable API called from inside a sideEffect callback`; `fails the workflow task when a durable API is called inside a sideEffect callback` | **Both** |
+| 2 | A durable API called from user conversion code run inside a command builder fails the task and appends no inverted marker pair | — **gap**, see note 2 | `runtime.test.ts` — `rejects a durable API re-entered while a durable command converts its values` | **Gap (Rust)** |
+| 3 | A durable API called from a map-manifest builder's iterator adapter or item conversion is legal | `src/runtime.rs::runtime::tests::manifest_builders_run_caller_iterators_outside_the_context_borrow` — legality only. It builds both manifests and asserts the markers, but **never schedules a map command**, so the "markers land ahead of the map command" half of the §16 claim is inferred from seq allocation rather than asserted. | `runtime.test.ts` — `allows a durable API called from a map-manifest item conversion` — legality **and** ordering: it schedules the map and asserts `[VersionMarker#1, VersionMarker#2, ActivityMapScheduled#3]` | **Both** for legality; **gap (Rust)** for the ordering clause |
+| 4 | A durable API called from the workflow output's conversion is rejected, appending no marker ahead of the terminal event | — **gap, and Rust permits the call and completes the run**, see note 4 | `runtime.test.ts` — `appends no marker when the workflow output encoding re-enters a durable API`. Note the outcome: TypeScript commits a **terminal `WorkflowFailed`** and the run is permanently dead — not the release-and-retry that `SPEC.md` §4.2 calls "failing the task" | **Gap (Rust) + divergence** |
+| 5 | A fault in workflow handler code is caught by the worker: the worker keeps serving, and runs claimed in the same batch still commit | `tests/worker_run.rs::panicking_workflow_fails_its_task_and_the_worker_keeps_serving`; `tests/worker_run.rs::panicking_workflow_batched_with_a_healthy_task_still_commits_its_neighbor` | `worker.test.ts` — `persists uncaught workflow handler errors as workflow failures`; `drains a claimed workflow batch when an earlier task fails` | **Both**, but see note 5 — the *disposition of the run* diverges |
+| 6 | A fault in activity handler code fails the activity through its retry policy, not the worker | `tests/worker_run.rs::panicking_activity_fails_its_task_and_the_retry_policy_completes_the_run`; `tests/replay_core.rs::panicking_activity_exhausts_its_retry_policy_and_records_the_panic_message` | `worker.test.ts` — `persists activity handler failures and replays them into workflow code` | **Both** |
+| 7 | Reaching a terminal state with a recorded command left unconsumed is nondeterminism, including when the leftover sits in an unloaded chunk | `tests/replay_core.rs::terminal_with_leftover_command_events_is_nondeterminism`; `tests/replay_core.rs::terminal_with_leftover_command_events_in_unloaded_chunks_is_nondeterminism` | `runtime.test.ts` — `rejects terminal completion with leftover recorded timer commands`; `rejects terminal app failure with leftover recorded timer commands without hanging`; `rejects continue-as-new with leftover recorded timer commands` | **Both** |
+| 8 | Exactly-once ready-event consumption. Two facets: **(a)** a consumed ready event is *removed* from its index and cannot be consumed twice, and **(b)** an unconsumed ready event at the cursor head does not block command matching. Both Rust facets are pinned by the same single test — see note 8. | **(a) and (b)** `src/runtime.rs::runtime::tests::peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them`. Its closing `…is_none()` assertion is the only thing in the Rust suite that fails when removal reverts to a read, and its opening peek is the only thing that fails when the ready-event skip is removed. `indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor` is supporting coverage, **not a detector for either facet** (note 8). | **(a)** `worker.test.ts` — `holds replay memory proportional to historyFetchMaxEvents, not to history length`; `runtime.test.ts` — `retains no measurable memory per completed hot activity`. **(b)** `runtime.test.ts` — `serves a second sequential read of one activity handle from the handle itself`; `settles a joinAll whose branches complete in separate tasks` | **Both**, revert-verified |
+| 9 | No unbounded in-workflow collections: a hot run's retained memory does not grow with the number of ready events it has consumed | — **gap**, see note 9 | `runtime.test.ts` — `retains no measurable memory per completed hot activity` | **Gap (Rust)** |
+| 10 | Replay memory is bounded by chunk size, not by history length | — **gap**, see note 10 | `worker.test.ts` — `holds replay memory proportional to historyFetchMaxEvents, not to history length` | **Gap (Rust)** |
+| 11 | Chunked replay commits the same history as unchunked replay, payload bytes included | `tests/replay_core.rs::out_of_order_completion_before_new_activity_command_cold_multi_chunk`; `tests/replay_core.rs::large_inline_command_payloads_replay_cold_multi_chunk` | `worker.test.ts` — `commits the same events whether history arrives in one chunk or many` | **Both** |
+| 12 | An abandoned workflow execution is disposed deterministically rather than left parked forever | — **gap**, see note 12 | `worker.test.ts` — `disposes a parked hot workflow execution after a commit conflict`; `disposes a parked hot workflow execution after a failed workflow task`; `disposes a parked hot workflow execution evicted from a full execution cache`; `disposes a parked hot workflow execution when the execution cache is disabled`; `disposes a hot workflow execution superseded by a cold replay`. `runtime.test.ts` — `settles parked durable-API waiters when a hot execution is disposed`; `disposes idempotently and never produces a commit afterwards` | **Gap (Rust)** |
+| 13 | A slow activity in flight does not block workflow progress on the same worker | `tests/worker_run.rs::workflow_task_commits_while_a_multi_second_activity_is_in_flight` | `worker.test.ts` — `commits a workflow task while a multi-second activity is in flight on the same worker` | **Both** |
+| 14 | A failing workflow stage does not suppress activity completions | `tests/worker_run.rs::injected_workflow_claim_failure_still_lets_an_activity_complete` | `worker.test.ts` — `completes an activity while every workflow claim fails` | **Both** |
+| 15 | Maintenance load is bounded by elapsed time, not by the workflow task rate | `tests/worker_run.rs::maintenance_scans_track_elapsed_time_not_the_workflow_task_rate` | `worker.test.ts` — `paces maintenance by elapsed time rather than by workflow task count` | **Both** |
+| 16 | A poisoned workflow task is counted, and counted apart from genuine history divergence | `tests/worker_run.rs::workflow_panics_and_re_entrancy_are_counted_apart_from_divergence`; `tests/worker_run.rs::repeated_nondeterministic_replays_are_counted_and_never_confused_with_panics` | — **gap**, see note 16 | **Gap (TypeScript)** |
+| 17 | Nondeterministic host state is rejected in workflow code | `tests/compile_fail.rs::workflow_determinism_lints_compile_fail` | `determinism-guards.test.ts` — `rejects Date.now() in workflow code`; `rejects Math.random() in workflow code`; `rejects setTimeout and Promise.race in workflow code` | **Both**, by different mechanisms — see note 17 |
+| 18 | Map fanout follows one shared transition table in both engines: admission bounded by `maxInFlight`, one replacement per released slot, a failed map abandons its siblings | `tests/map_transitions.rs::memory_replays_every_shared_table_fanout`; `tests/map_transitions.rs::sqlite_replays_every_shared_table_fanout` | `map-engine.test.ts` — `map engine: shared transition table fanouts > fanout: <case>` (four cases, generated from the table) | **Both** |
+| 19 | A worker crash between claim and commit completes the run exactly once | `tests/sim_worker.rs::real_worker_crash_between_claim_and_commit_completes_exactly_once` | `simulation.test.ts` — `recovers a workflow task after a worker crashes with an uncommitted claim` | **Both** |
+| 20 | Cache eviction mid-run does not change the committed outcome | `tests/sim_worker.rs::real_worker_cache_eviction_storm_matches_fault_free_control` | `simulation.test.ts` — `survives a cache-eviction replay soak across concurrent mixed workflows` | **Both** |
+
+Six of twenty rows are gaps: 2, 4, 9, 10, 12 (Rust), and 16 (TypeScript).
+
+### Revert verification
+
+Every **Both** row's invariant was broken in a scratch worktree and its cited
+tests re-run. A row is *revert-verified* only where the cited test failed.
+
+| Row | Revert applied (both languages unless noted) | Rust | TypeScript |
+| --- | --- | --- | --- |
+| 1 | Rust: `with_context` keeps the live pointer during `f` instead of parking the sentinel. TS: the durable-API gate ignores the user-code frame. | **caught** (2/2) | **caught** (2/2) |
+| 3 | Rust: both manifest builders drain the caller iterator *inside* the borrow. | **caught** | **not run** — no localized revert exists; TS legality is structural (`activityMapManifest` is a free function holding no frame), so there is nothing to switch off |
+| 5 | Rust: remove `catch_unwind` from `poll_cached`. TS: (a) handler rejection not converted to `WorkflowFailed`, (b) first failing task aborts its batch. | **caught** (2/2) | **caught** (2/2) |
+| 6 | Remove the activity poll's `catch_unwind` / `catch`. | **caught** (2/2) | **caught** |
+| 7 | Accept the unreplayed command event at a terminal state. | **caught** (2/2) | **caught** (3/3) |
+| 8 | Removal-on-consume reverted to a read; separately, each of the two Rust skip paths removed. | **caught** | **caught** (2/2) |
+| 11 | Rust: an unloaded replay window is read as the replay tail. TS: the replay gate never parks for more history. | **caught** (2/2) | **survived** — `commits the same events whether history arrives in one chunk or many` stayed green; only row 10's memory test caught it |
+| 13, 14 | Run the three worker loops sequentially instead of concurrently. | **caught** (2/2) | **caught** (2/2) |
+| 15 | Maintenance never paces; it re-scans immediately forever. | **caught** | **caught** |
+| 17 | Rust: the `#[workflow]` macro's nondeterminism lint never fires. TS: the guarded globals never throw. | **caught** | **caught** (3/3) |
+| 18 | Over-admit the map by one slot (`slot_limit` / `mapSlotLimit` + 1). | **caught** (2/2) | **caught** (2 of 4 table cases; the other two are bound-insensitive by construction) |
+| 19, 20 | The memory provider stops fencing stale commits (`expected_tail_event_id` / `expectedTailEventId` check disabled). | **survived** | **survived** |
+
+**Ten of the fourteen `Both` rows are revert-verified in both languages.** Three
+results are worth carrying rather than burying:
+
+- **Row 11, TypeScript.** The test named for "chunked replay commits the same
+  history as unchunked" does not detect a replay gate that never parks. Its two
+  runs still agree, because that history is delivered before the workflow needs
+  it either way. The defect was caught only by row 10's memory test. The row's
+  TypeScript column is therefore weaker than its wording implies.
+- **Rows 19 and 20.** Disabling stale-commit fencing in both memory providers was
+  detected by **neither** simulation. That is one revert, not a proof that the
+  sims pin nothing — but it is the revert those rows most obviously ought to
+  catch, and they did not. Treat both rows as asserting that the scenarios *run
+  clean*, not that they would notice this class of regression.
+- **Row 3, Rust.** See the row: the legality clause is verified, the ordering
+  clause is not asserted at all.
+
+### Notes
+
+**Note 2 — Rust has the guard but not the test.** Rust's command builders encode
+their payloads *inside* the context borrow: `match_or_append_command`
+(`src/runtime.rs:853`) allocates the command id and then calls the per-kind
+`prepare` closure, which runs `runtime.encode_payload(...)` (for example
+`src/runtime.rs:2386` on the activity path). A durable API called from a user
+`Serialize` impl during that encode re-enters `with_context` and hits the
+re-entrancy sentinel, so the task fails with no half-appended command. The
+mechanism is real, and `src/runtime.rs::runtime::tests::nested_durable_api_call_is_rejected_instead_of_aliasing_the_context`
+proves the sentinel works — but it drives a synthetic nested `with_context`, not
+a `Serialize` impl that calls a durable API. No Rust test exercises the
+conversion window. If a future change hoisted encoding above the borrow, the
+synthetic test would stay green.
+
+**Note 4 — this is a live divergence, not only a missing test.** Rust encodes the
+workflow output at `src/registry.rs:99-102`, inside the workflow future: the
+context is installed by the worker's poll, but no borrow is parked. A durable API
+called from the output's `Serialize` therefore *succeeds* in Rust, appending a
+well-ordered marker ahead of `WorkflowCompleted` that replays cleanly.
+TypeScript **kills the run**: it commits a terminal `WorkflowFailed`, and the
+cited test asserts exactly `["WorkflowStarted", "WorkflowFailed"]` with
+`taskError` null. This is not the "fails the task" of §4.2 — that phrase is
+defined there as aborting *without* appending `WorkflowFailed`, releasing the
+claim and replaying on the next attempt. Nothing retries here; the run is
+permanently dead. So the divergence is not "Rust appends a marker, TypeScript
+retries" but **Rust completes the run successfully, TypeScript destroys it** —
+which is what makes the convergence decision urgent rather than cosmetic. The
+rejection is also **not the re-entrancy guard**. A completion guard frame exists
+(`typescript/packages/core/src/runtime.ts:2607`) and never fires on this path:
+`completeWorkflow` runs in a continuation attached *outside*
+`runtimeStorage.run`, so the output's `toJSON` has no `AsyncLocalStorage` store
+and cannot reach a context at all. The asserted failure is `durust durable APIs
+must be awaited inside a workflow task` — context-unavailable, not
+re-entrancy — and the cited test's own leading comment says so. It pins the
+observable contract, which holds whichever mechanism enforces it. What is
+missing is any test asserting Rust's behaviour; only TypeScript's rejection is
+pinned. `SPEC.md` §16 documents the divergence, so a reader of the spec is
+warned; a reader of only the code is not. Which runtime moves is an open
+decision.
+
+**Note 5 — the worker survives in both; the run's fate does not match.** Rust
+routes a caught panic through `Error::TaskPanic`: nothing is committed, the claim
+is released with the nondeterminism backoff, and the next claim replays the run,
+so a redeploy recovers it. TypeScript routes an uncaught handler throw to a
+terminal `WorkflowFailed`. JavaScript cannot distinguish an unintended throw from
+an intended one and Rust can, so the divergence has a cause — but it is not
+forced, and it is not pinned by any cross-language case. `SPEC.md` §4.2 states
+it.
+
+**Note 8 — which test kills which revert, measured.** Both facets were checked by
+reverting the behaviour in a scratch worktree and re-running, because the two
+sets of tests are not interchangeable and the obvious pairing is wrong.
+
+Reverting removal-on-consume — re-inserting the entry after a successful hydrate
+in `RuntimeContext::take_indexed` (`src/runtime.rs:960`), and deleting
+`index.delete(key)` from `#takeReadyEvent`
+(`typescript/packages/core/src/runtime.ts:1461`) — leaves facet (b)'s tests
+**green in both languages**: `indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor`
+passes, and so do `serves a second sequential read of one activity handle from
+the handle itself` and `settles a joinAll whose branches complete in separate
+tasks`. They assert cursor skipping and handle-owned re-reads, neither of which
+depends on the index shrinking.
+
+What fails is facet (a): Rust
+`peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them`
+at `skipped completion must be consumable exactly once`, and TypeScript both
+memory tests — `expected 98966.6425 to be less than 2048` per completed activity
+(one retained 96 KiB payload each) and `expected 7827680 to be less than 1638400`
+on the replay window. So exactly-once *removal* is pinned only by one Rust unit
+test and by the two memory tests, and a row citing facet (b)'s tests for it
+would have pinned nothing.
+
+**Facet (b) has the same problem, and the first fix reproduced it.** Rust skips a
+ready event at the cursor head through *two* independent paths: the
+`is_index_consumable_ready_event` test in `peek_replay_command_event`, and
+`skip_consumed_replay_events` for events already consumed. Measured, one at a
+time: removing the first fails
+`peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them`
+and leaves `indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor`
+**green**; making the second a no-op leaves **both** green. The event that second
+test consumes is skippable by either mechanism, so it dies only if both go at
+once — it is doubly redundant and detects neither path on its own. Both Rust
+facets are therefore pinned by the single peek test, and this file said otherwise
+until the revert was actually run.
+
+**Note 9 — the removal is pinned; the memory bound is not.** Removal-on-consume
+itself is asserted: `peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them`
+fails when it reverts (note 8). `RuntimeContext::take_indexed`
+(`src/runtime.rs:960`) removes before hydrating and `CachedWorkflow` carries only
+`unconsumed_indexes` forward, so the retained set is bounded by construction. The
+gap is narrower than "nothing asserts it" and is still real: **nothing in Rust
+measures retained bytes**, so any accumulation that preserves consumption
+semantics — a side list, a debug buffer, a second index written but never read —
+passes the whole Rust suite. TypeScript's row-9 test catches that class directly,
+dying at a one-in-ten retention leak.
+
+**Note 10 — Rust's chunked replay is proved behaviourally, not by memory.** Rust
+streams chunks into the poll loop and drains matched events, and the
+`*_cold_multi_chunk` family proves a chunked replay commits what an unchunked one
+does. There is no Rust assertion that retained or peak memory tracks
+`history_chunk_events`. `tests/replay_clone_budget.rs::replaying_a_command_event_does_not_copy_its_payload`
+is adjacent but different: it budgets *allocations per replayed command event*,
+which would not catch a change that accumulated the whole history in one buffer.
+
+**Note 12 — Rust gets disposal from ownership, and ownership is untested by
+construction.** The worker removes a cache entry at claim time and reinserts it
+only after a committed task, so an abandoned `Pin<Box<dyn Future>>` is dropped
+when its owner goes out of scope; there is no waiter to settle because a Rust
+durable call that never completes is simply a future nobody polls again.
+`tests/replay_core.rs::cache_bound_of_one_forces_cold_replays_for_interleaved_runs`
+proves the *replacement* half — an evicted run cold-replays and completes — but
+nothing asserts that the abandoned execution was released. This row is a gap in
+the ledger's sense (no test in one column) even though the language makes the
+leak unrepresentable, and it is recorded that way rather than excused, because
+"the type system covers it" is exactly the claim that stops being true when
+someone stores the future somewhere else.
+
+**Note 16 — TypeScript has no failed-workflow-task metric at all.**
+`WorkerMetricsSnapshot` (`typescript/packages/core/src/worker.ts:200`) carries
+claims, commits, conflicts, cache counters, stream counters, `timersFired`,
+`loopErrors`, `idleSleeps`, and `eventSinkErrors` — and no counter for a workflow
+task that failed. Rust's `WorkerMetrics` separates `workflow_tasks_panicked`,
+`workflow_tasks_nondeterministic`, and `workflow_tasks_unsupported_version`.
+TypeScript classifies a released task by string-matching
+the `nondeterminism:` message prefix (`isNondeterminismError`,
+`typescript/packages/core/src/worker.ts:1993`) and counts nothing, so a
+permanently poisoned TypeScript run is invisible in metrics. The convergence
+direction is TypeScript gaining a discriminator, not Rust dropping to
+prefix-sniffing.
+
+**Note 17 — both reject, at different times, with the same blind spot.** Rust's
+`#[durust::workflow]` macro scans the handler body and refuses to compile
+`Instant::now()`, `SystemTime::now()`, `rand::random()`, `tokio::spawn`,
+`tokio::time::sleep`, and `tokio::select!` (`tests/ui/*.rs`). TypeScript rejects
+at runtime, by patching the guarded globals, and additionally ships a static
+ESLint rule. Both mechanisms see only the code they are pointed at: a
+nondeterministic call in a helper function in another module is caught by
+neither. Rust has no runtime backstop, which is a recorded open decision, and
+TypeScript's runtime guard is off by default in production.
+
+---
+
+## 2. Forced divergences
+
+These cannot be closed. Neither runtime can adopt the other's answer.
+
+**Execution mechanism.** Rust polls: each workflow task builds a fresh
+`RuntimeContext` — once on the cached path and once on the cold path, both in
+`Worker::prepare_claimed_workflow_task_inner` (`src/worker.rs`) — and polls a
+`Pin<Box<dyn Future>>` until it blocks. TypeScript keeps a hot promise chain:
+`HotWorkflowExecution` builds one `WorkflowRuntimeContext`
+(`typescript/packages/core/src/runtime.ts:456`), runs the handler once inside an
+`AsyncLocalStorage` scope (`:55`, `:463`), and mutates that context in place on
+every later task (`advanceHotClaim`, `:1613`). Rust cannot resume a future
+without polling it; JavaScript cannot poll a promise. Both produce the same
+committed history. `SPEC.md` §1.2 and §4.2 state this.
+
+**Retry delay values.** Rust's `RetryBackoff::{None, Exponential}` over a fixed
+base and TypeScript's `initialIntervalMs`/`maxIntervalMs`/`backoffCoefficient`
+are different policy models; numeric parity is impossible. Only the shape is
+normative: `visibleAtMs === null` if and only if the item is immediately
+claimable, and a timed-out item is always `null`. A shared corpus must not assert
+retry delay values.
+
+**Async side-effect callbacks.** TypeScript must detect and reject a `sideEffect`
+callback that returns a thenable (`runtime.test.ts` — `rejects a sideEffect
+callback that returns a promise`, `does not emit unhandled rejections when a
+sideEffect callback returns a rejecting promise`). Rust's
+`side_effect(FnOnce() -> T)` cannot be async, so the failure mode does not exist
+and there is nothing to test.
+
+## 3. Open divergences
+
+These are defects or undecided questions, not forced facts. Each should converge.
+
+- Workflow-output conversion re-entrancy (ledger row 4, note 4).
+- The disposition of a generic workflow-code bug (ledger row 5, note 5).
+- Runtime determinism enforcement in Rust (ledger row 17, note 17).
+- A failed-workflow-task metric in TypeScript (ledger row 16, note 16).
+
+---
+
+## 4. Adopt-the-better-answer list
+
+Each runtime takes the other's better answer rather than inventing a third
+design. This section tracks that list to completion. Every status below is from
+reading the code and running the named test, not from the plan's prose: an item
+whose implementation is present but whose behaviour nothing asserts is recorded
+as open, because an unprotected adoption reverts silently.
+
+### Rust adopts TypeScript's answer
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Worker metrics and event sink | **Landed** | `WorkerMetrics`, `Worker::metrics()`, `WorkerBuilder::on_event`, `WorkerEvent` (all `src/worker.rs`). Rust overshot its source: it separates `workflow_tasks_panicked`, `workflow_tasks_nondeterministic`, and `workflow_tasks_unsupported_version`, which TypeScript has no equivalent of (ledger row 16). Pinned by `tests/worker_run.rs::workflow_panics_and_re_entrancy_are_counted_apart_from_divergence`. |
+| Exponential idle and error backoff | **Landed** | `WorkerBuilder::idle_wait`/`max_idle_wait` doubling through `next_backoff`, with a separate error budget per loop. The old flat `idle_wait` plus 16-consecutive-failure counter is gone: `MAX_CONSECUTIVE_RUN_PASS_FAILURES` no longer appears anywhere in `src/`, so a run of failing passes no longer exits `Worker::run`. Unit test `src/worker.rs::worker::tests::next_backoff_doubles_to_the_ceiling_and_leaves_zero_alone`. |
+| Maintenance opt-out | **Landed, deliberately narrower than the item as written** | See "The maintenance opt-out correction" below. |
+| O(1) LRU eviction | **Not landed at the baseline** | At `240d603`, `Worker::insert_cached_workflow` still selects its victim with `self.state.cache.iter().min_by_key(...)`, there is no order index, and `git log -S "cache_order" -- src/worker.rs` returns nothing. At the bound — the steady state for a busy worker — every committed task therefore scans up to `max_cached_workflows` (default 10,000) entries. An implementation exists in an uncommitted working tree, adding a `cache_order` index evicted with `pop_first()` and a matching `remove_cached_workflow`, which is TypeScript's insertion-ordered idiom in Rust shape; this row must not be marked landed on the strength of it. **Two things close the row, not one:** the index committed, *and* evidence that would fail on the scan. A correctness test cannot supply the second — both policies evict the same victim, so the suite is green either way — so it has to be a cost measurement at two cache bounds, 1,000 and 100,000, showing per-task eviction cost independent of `max_cached_workflows`. |
+| Ready-event filtering at ingest | **Not landed, and not yet evaluated** | Rust still filters consumed ready events at every peek rather than removing them from the replay list at ingest. That arrangement is what `src/runtime.rs::runtime::tests::indexed_ready_events_are_skipped_when_consumed_before_the_replay_cursor` and `peek_replay_command_event_skips_unconsumed_ready_events_without_consuming_them` assert, so adopting the TypeScript shape is a behaviour-preserving change those two tests would have to be rewritten against. No decision is recorded either way. |
+
+### TypeScript adopts Rust's answer
+
+| Item | Status | Evidence |
+| --- | --- | --- |
+| Chunked replay streaming | **Landed** | `ReplayHistoryLoader` / `loadReplayHistory` (`typescript/packages/core/src/runtime.ts:141`) with a park-and-retry `replayHistoryGate(required)` (`:1350`) at every thenable durable API, and a `nextCommit()` pump that pulls one chunk per quiescence. Pinned by `worker.test.ts` — `holds replay memory proportional to historyFetchMaxEvents, not to history length` and `commits the same events whether history arrives in one chunk or many` (ledger rows 10, 11). |
+| Exactly-once ready-event consumption | **Landed** | `WorkflowRuntimeContext.#takeReadyEvent` (`typescript/packages/core/src/runtime.ts:1461`) is the single removal path for all eleven ingest indexes and deletes on read, mirroring Rust's `take_indexed`, with `consume: false` for probing callers (`spawn()` allocates a command and discards the resolution) and handle-owned resolutions for legitimate re-reads. Pinned by ledger rows 8 and 9. |
+| Deterministic execution disposal | **Landed, at more sites than the item named** | `HotWorkflowExecution.dispose(reason)` is called from six sites in `typescript/packages/core/src/worker.ts` — `:752` (task failed before commit), `:776` (commit conflict), `:983` (superseded by cold replay), `:1021` (replay window reserve exhausted), `:1315` (execution cache disabled), `:1466` (cache eviction). The item named three; the two supersession sites and the cache-disabled site were found while implementing it, and the cache-disabled one is the highest-volume instance. Pinned by ledger row 12. |
+
+Both open items are on the Rust side, and neither is closed at the baseline:
+ready-event ingest filtering is unadopted and unevaluated, and O(1) eviction is
+uncommitted and would still need a cost measurement to protect it. TypeScript's
+list is closed: all three items landed, and disposal landed at twice the sites it
+named.
+
+### The maintenance opt-out correction
+
+The item was written as a general maintenance opt-out, mirroring TypeScript's
+`runTimerMaintenance`. It shipped as **`WorkerBuilder::run_timer_maintenance(bool)`**
+— narrower on purpose, and the narrowing is the point.
+
+A Rust worker's maintenance loop does two unrelated jobs: it scans for due timers
+and expired activity deadlines, and it drains the child-workflow start outbox
+(`Worker::run_maintenance_scan_once`). Only the first is optional.
+`SPEC.md` §11 makes due-timer delivery a timer service's obligation and a
+worker's scan a convenience; it says nothing of the kind about the child-start
+outbox, and **nothing else in a deployment drains that outbox**. A general
+`run_maintenance(bool)` that suppressed both would silently stop every child
+workflow in the fleet, forever, in exchange for a knob whose stated purpose was
+reducing provider load.
+
+So the loop always runs; only the timer-and-deadline half is skippable.
+
+**Pinning it takes two tests, because there are two dispatch sites.**
+`run_pass_once` drains the outbox for the deterministic driver `run_until_idle`,
+and `run_maintenance_scan_once` drains it for the interval loop, which is the
+only site `Worker::run` reaches. A test that drives `run_until_idle` says nothing
+about production. Both are covered:
+
+- `tests/worker_run.rs::disabled_timer_maintenance_still_dispatches_child_workflow_starts`
+  — the pass driver.
+- `tests/worker_run.rs::disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop`
+  — the interval loop. It drains `run_until_idle` against an empty queue
+  *before* starting the parent it measures, so the pass driver cannot have
+  dispatched the outbox row, and then completes the parent under `Worker::run`
+  alone.
+
+Verified by reverting the incident rather than by inspection: gating the child
+drain in `run_maintenance_scan_once` on `run_timer_maintenance` leaves the
+pass-driver test **green** and fails only the interval-loop one, with `the parent
+never completed under 'run' alone`. Before the second test existed, that revert
+passed the entire suite.
+
+This has no TypeScript counterpart and needs none:
+`typescript/packages/core/src/worker.ts` never calls
+`dispatchChildWorkflowStarts` at all — TypeScript providers start child
+workflows inline during commit — so `runTimerMaintenance: false` there suppresses
+timers and activity-timeout scans and nothing else. The two options have the same
+name and the same effect; they are not the same knob, and a future change that
+gives TypeScript an outbox must revisit this.
+
+The general lesson, recorded because it generalizes past this option: a worker
+knob may change *when* durable work happens. It may not change *whether* durable
+work that nothing else performs happens at all. `SPEC.md` §1.2 states this as a
+rule.

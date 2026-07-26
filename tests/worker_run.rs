@@ -278,6 +278,24 @@ async fn wr_optout_parent(input: NumberInput) -> durust::Result<u64> {
     child.result().await
 }
 
+// The same shape again, for the *interval loop's* half of the opt-out
+// guarantee. It needs its own workflow types and its own child workflow id
+// because the pass-driver test above runs concurrently in this binary and both
+// would otherwise contend for one child id.
+#[durust::workflow(name = "worker-run.optout-loop-child", version = 1)]
+async fn wr_optout_loop_child(input: NumberInput) -> durust::Result<u64> {
+    Ok(input.value + 200)
+}
+
+#[durust::workflow(name = "worker-run.optout-loop-parent", version = 1)]
+async fn wr_optout_loop_parent(input: NumberInput) -> durust::Result<u64> {
+    let child = durust::child!(wr_optout_loop_child(NumberInput { value: input.value }))
+        .workflow_id("wf/maintenance-optout-loop-child")
+        .spawn()
+        .await?;
+    child.result().await
+}
+
 // A durable API called from inside a `side_effect` closure. The re-entrancy
 // guard reports by panicking, so this is a workflow *bug* even though its
 // message says nothing about a panic in user code.
@@ -1955,6 +1973,92 @@ fn disabled_timer_maintenance_still_dispatches_child_workflow_starts() {
         );
         assert_eq!(completed_result(&backend, &sleeper_run).await, Some(6));
         assert!(enabled.metrics().timers_fired >= 1);
+    });
+}
+
+// The other half of the same guarantee, and the half a deployment actually
+// depends on.
+//
+// There are two child-start dispatch sites, not one: `run_pass_once`, which
+// only the deterministic driver `run_until_idle` reaches, and
+// `run_maintenance_scan_once`, which is the sole site under `Worker::run`.
+// A test that drives `run_until_idle` covers the first and says nothing about
+// the second, so gating the drain inside `run_maintenance_scan_once` on
+// `run_timer_maintenance` — exactly the change that once stopped every child
+// workflow forever — passes the sibling test above and still strands every
+// child in production.
+//
+// So this case never lets the pass driver near the parent it measures: it
+// drains `run_until_idle` first, with nothing queued, and only then starts the
+// parent, which can therefore reach its child through the interval loop alone.
+#[test]
+fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
+    block_on_tokio(async {
+        let backend = MemoryBackend::new();
+        let client = durust::Client::new(backend.clone());
+
+        let mut disabled = Worker::builder(backend.clone())
+            .worker_id("maintenance-disabled-loop-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(wr_optout_loop_parent)
+            .register_workflow(wr_optout_loop_child)
+            .run_timer_maintenance(false)
+            .idle_wait(Duration::from_millis(5))
+            .maintenance_interval(Duration::from_millis(5))
+            .max_maintenance_interval(Duration::from_millis(5))
+            .build();
+
+        // Drains to idle against an empty queue. Everything this test asserts
+        // happens after this line, so no outbox row it measures can have been
+        // dispatched by the pass driver's maintenance stage.
+        disabled.run_until_idle().await.unwrap();
+
+        let parent_run = client
+            .start_workflow::<wr_optout_loop_parent>(
+                "wf/maintenance-optout-loop-parent",
+                "workflows",
+                NumberInput { value: 2 },
+            )
+            .await
+            .unwrap();
+
+        let shutdown = disabled.shutdown_handle();
+        let (run_result, completed) = futures::future::join(disabled.run(), async {
+            // Bounded well inside the harness timeout, so a worker that stops
+            // draining the outbox fails on the assertion naming the property
+            // rather than by hanging.
+            let completed = tokio::time::timeout(
+                PROGRESS_TIMEOUT,
+                wait_until(|| async { completed_result(&backend, &parent_run).await.is_some() }),
+            )
+            .await;
+            shutdown.shutdown();
+            completed
+        })
+        .await;
+        run_result.unwrap();
+
+        assert!(
+            completed.is_ok(),
+            "the parent never completed under `run` alone: with timer maintenance disabled the \
+             interval loop stopped dispatching child workflow starts, so every child workflow in \
+             a deployment would be stranded forever"
+        );
+        assert_eq!(
+            completed_result(&backend, &parent_run).await,
+            Some(202),
+            "the child ran but reported the wrong result to its parent"
+        );
+        assert!(
+            disabled.metrics().child_workflow_starts_dispatched >= 1,
+            "no child start was dispatched from the interval loop: {:?}",
+            disabled.metrics()
+        );
+        assert_eq!(
+            disabled.metrics().maintenance_scans,
+            0,
+            "the timer and activity-deadline scan must stay disabled while child dispatch runs"
+        );
     });
 }
 

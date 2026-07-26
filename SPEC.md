@@ -70,6 +70,100 @@ Audit log
 
 The replay history is authoritative. The in-memory workflow future is only a cache, but it is an important performance cache: a running workflow should normally stay alive on the worker until it completes, fails, or is cancelled.
 
+## 1.2 What is normative, and what is language-local
+
+Durust has two implementations, Rust and TypeScript, and this specification is
+the contract between them. Exactly two things in it are normative.
+
+1. **The committed history.** Every field of the workflow task commit in §8.2:
+   the events it appends and their order; their command sequence numbers,
+   fingerprints, and payload encoding; the waits it upserts and deletes; the
+   activities, activity maps, child workflow maps, and child workflows it
+   schedules; the signals it consumes; the commands it cancels; the query
+   projection it publishes; and its visibility patch. Given the same workflow
+   program, the same input history, the same live signals, and the same
+   deterministic clock, both runtimes must produce the same commit. Where one
+   runtime has no representation for a field §8.2 lists, that absence is a gap
+   in that runtime, not a narrowing of this list.
+2. **The provider contract.** Section 8's backend surface: the operations, their
+   arguments, their outcomes, their atomicity, and the durable state each one is
+   obliged to leave behind.
+
+Everything else is *language-local mechanism*: how a runtime schedules the
+workflow's own code, where it holds the workflow's locals between tasks, how it
+represents a suspended durable call, and how it installs the workflow context.
+Rust polls futures; TypeScript keeps a promise chain alive. Section 4.2 records
+that divergence concretely. Neither implementation is obliged to imitate the
+other's mechanism, and neither may be changed to imitate it if doing so would
+change a commit.
+
+**The boundary is drawn by observability, not by module.** A difference is
+language-local only if it cannot be observed in the committed history or in the
+provider contract — neither in what a commit contains, nor in *whether it
+happens at all*. If it reaches either — a different event, a different order, a
+different fingerprint, a different wait, a different scheduled task, a different
+consumed signal, a different durable row, or the same rows never written — it is
+normative, and the divergence is a defect no matter which layer produced it.
+Three corollaries, each of which has been got wrong at least once:
+
+- **Living inside the execution machinery does not make a behavior local.** The
+  execution machinery is where commits are produced. "It is only how we run the
+  workflow" is not an argument; the question is whether the commit moves, **or
+  stops happening**. A change that leaves every commit it produces byte-identical
+  while producing fewer of them has not passed this test.
+- **Being a performance or memory change does not make a behavior local.** A
+  change that bounds replay memory is language-local exactly as long as the
+  commits it produces stay byte-identical to the unbounded one's, and it stops
+  being language-local the moment they do not.
+- **Being configuration does not make a behavior local.** A worker option may
+  change *when* durable work happens — its cadence, its batching. It may not
+  change *whether* durable work that some component is obliged to perform
+  happens at all. An opt-out is legitimate only when three things hold at once:
+  this specification names another component as the owner of **that specific
+  obligation** — not merely mentions a component that performs some adjacent
+  mechanism, and not a component whose scope this specification defines
+  narrowly elsewhere; the option's **safe state is its default**, so a
+  deployment that never reads this section still discharges the obligation; and
+  the option reaches only the work that other owner takes on, not whatever
+  happens to sit beside it in the same
+  loop. Section 11 is the model on all three counts — a timer service owns due
+  timers, a worker "may also scan for due timers, **and by default it does**",
+  and the opt-out covers the timer and activity-deadline scan and nothing
+  adjacent. An option whose legitimacy rests on a deployment fact this
+  specification does not state, and that the library cannot check, is a defect
+  in the option rather than an exercise of this section.
+
+**Two divergences are specified rather than merely tolerated.** The rule above
+makes a commit difference a defect. Two are written into this specification
+instead, because they are known, measured, and tracked rather than accidental:
+the workflow-output conversion difference in §16, where Rust commits the nested
+marker ahead of `WorkflowCompleted` and **completes the run** while TypeScript
+commits a terminal `WorkflowFailed` and **destroys it**; and the generic
+workflow-bug disposition difference in §4.2, where Rust releases the task for
+retry and TypeScript commits `WorkflowFailed`. Neither is a difference in
+*timing* or *mechanism*: in both, the same program leaves one runtime with a
+completed run and the other with a dead one. Both are recorded in `PARITY.md` §3
+with the direction each should converge. They are exceptions to the rule, not
+applications of it: a *new* commit divergence is a defect, and neither of these
+may be cited as precedent for one.
+
+This list may not grow by paragraph. A third entry requires an explicit recorded
+decision — the same bar as a breaking history-format change — stating what
+diverges, which runtime is expected to move, and why convergence was rejected for
+now. Text added here without that decision is not a carve-out; it is an
+undocumented defect.
+
+This section grants no permission to skip durable work, to drop a durable
+obligation, to weaken a guarantee that a caller can observe, or to let the two
+runtimes settle on different committed histories for the same program. It states
+only that the *mechanism* of execution is unspecified. Nothing here may be cited
+as authority for a behavioral change; a behavioral change needs its own
+justification and its own test in both runtimes.
+
+`PARITY.md` records, for each cross-cutting invariant, the named test in each
+language that proves it, names the invariants proved in only one language, and
+lists the divergences the host languages force.
+
 ---
 
 # 2. Public DX Target
@@ -573,7 +667,16 @@ version, a re-entrant durable API call, a `sideEffect` callback returning a
 thenable, and a panic in Rust workflow code. These abort the task without
 appending `WorkflowFailed`. The worker releases the run with a worker-configured
 retry backoff, and the next claim replays it from durable history, so a redeploy
-that fixes the defect recovers the run. A panic in particular can be raised while
+that fixes the defect recovers the run.
+
+One case that reads as if it belongs to that list does not: a durable API reached
+from a workflow's **output** conversion. TypeScript commits a terminal
+`WorkflowFailed` there — the run is over, and no redeploy recovers it — and Rust
+permits the call outright and completes the run. Do not combine this paragraph
+with §16 and conclude that the output case retries; it does not. §16 records the
+divergence and §1.2 lists it as a tracked exception.
+
+A panic in particular can be raised while
 replaying a run that has already made durable progress; appending a terminal
 failure there would discard recorded progress — in-flight activities, pending
 timers, consumed signals — on the evidence of a defect that says nothing about
@@ -585,7 +688,11 @@ out of the handler. That is the path that appends `WorkflowFailed`. JavaScript
 cannot distinguish an unintended throw from an intended one, so a TypeScript
 workflow whose own code throws — a `TypeError`, a failed assertion — takes that
 terminal path too. Rust keeps the distinction, because a panic is not a returned
-`Err`.
+`Err`. This asymmetry is a **tracked divergence, not a settled design**: the two
+runtimes commit different histories for the same defective program. §1.2 records
+it as one of two specified exceptions to commit parity, and `PARITY.md` §3
+carries it with the direction it should converge — TypeScript adopting Rust's
+retry, since terminating a run on a replay-time bug is unrecoverable.
 
 Panic isolation depends on unwinding, which is a deployment consideration for
 Rust binaries. A profile built with `panic = "abort"` gives `catch_unwind`
@@ -593,6 +700,45 @@ nothing to catch, so a workflow or activity panic aborts the process and takes
 every cached run with it. This repository sets no `panic` profile key, so every
 profile here unwinds; a downstream crate that sets `panic = "abort"` is choosing
 process abort as its workflow-panic behavior.
+
+### The execution mechanism is language-local
+
+Step 5 above says "poll the workflow future". The two runtimes reach the same
+place by different means, and neither can adopt the other's. This is the
+concrete case §1.2 is about.
+
+**Rust polls.** A workflow is a `Pin<Box<dyn Future>>` held in the workflow
+cache. Every workflow task builds a *fresh* runtime context from the claim, the
+newly loaded history chunk, and the cursor state carried forward from the cached
+entry — the next command sequence number, the change-version map, and the ready
+events the previous task left unconsumed — installs it, polls the future until
+it blocks, and drops the context. A durable call that is still waiting returns
+`Pending`. The worker learns the task is over because the poll returned.
+
+**TypeScript keeps the chain hot.** A hot workflow execution constructs its
+runtime context once and invokes the handler once, inside an `AsyncLocalStorage`
+scope; the handler's promise chain then stays parked across workflow tasks, and
+the workflow's locals live in that parked chain. Every later task *mutates that
+same context in place* — new claim, new clock, new live signals, newly ingested
+events — and resolves the parked waiters. A durable call that is still waiting
+is a promise nobody has resolved yet. The worker learns the task is over because
+the execution reports quiescence.
+
+The host languages force this. Rust cannot resume a future without polling it,
+and JavaScript cannot poll a promise: a promise's continuation runs when it is
+resolved, and no caller can ask it to make progress. Rebuilding the TypeScript
+context per task would discard the workflow's locals, which exist only in the
+parked closure chain; parking a Rust future the way TypeScript parks a promise
+would require a scheduler the runtime does not own. Neither is a defect and
+neither will be converged.
+
+The divergence is invisible in the commit, which is the only reason it is
+allowed. Both mechanisms consume the same recorded facts in the same order,
+allocate the same command sequence numbers, and append the same events. Where a
+behavior *is* observable in the commit — command ordering, fingerprints, wait
+upserts and deletes, signal consumption, terminal detection — §1.2 applies and
+the two runtimes must agree, including when the disagreement originates inside
+this machinery.
 
 ## 4.3 Replay stream backpressure
 
@@ -2008,6 +2154,15 @@ bounded by the scan interval and not by how busy any worker is, and provider
 load from scanning is bounded by fleet size rather than by throughput. The same
 holds for reaping activities past their start-to-close deadline.
 
+This opt-out covers the due-timer and activity-deadline scan, and nothing else.
+It is legitimate only because a timer service discharges the obligation instead;
+it is not a general licence to disable maintenance. A worker's maintenance loop
+may carry other work that nothing else in a deployment performs — the Rust
+worker also drains the child-workflow start outbox, and no timer service touches
+that outbox — and such work is not optional. §1.2 states the general rule: an
+option may change *when* durable work happens, never *whether* work that nothing
+else discharges happens at all.
+
 For wall-clock schedules, require explicit timezone ambiguity policies:
 
 ```rust
@@ -2427,10 +2582,28 @@ appended before the map command that consumes the manifest exists, in record and
 replay alike.
 
 Converting a workflow's returned output is not a durable API call, and the
-runtimes differ on it. TypeScript guards that conversion and rejects a durable
-API called from the output's `toJSON()` or schema `encode()`. Rust permits it:
-the call allocates its command sequence number and appends its event ahead of
-`WorkflowCompleted`, and the handler re-runs it in the same position on replay.
+runtimes differ on it — sharply, and in the run's final outcome rather than in
+timing.
+
+TypeScript rejects a durable API called from the output's `toJSON()` or schema
+`encode()`, appends no marker, and **commits a terminal `WorkflowFailed`**. Note
+what that is not: this is *not* "failing the task" in the sense §4.2 defines,
+where nothing terminal is appended and the next claim replays the run. The run
+is over and cannot be recovered by a redeploy. The mechanism is also not the
+re-entrancy guard — output conversion runs in a continuation attached outside
+the workflow's `AsyncLocalStorage` scope, so the call finds no workflow context
+at all and fails as an unawaited durable call — but the observable contract this
+section fixes is the absence of a marker ahead of the terminal event, and that
+holds whichever mechanism enforces it.
+
+Rust permits the same call: it allocates its command sequence number, appends
+its event ahead of `WorkflowCompleted`, **completes the run successfully**, and
+re-runs the conversion in the same position on replay.
+
+So one runtime completes the run and the other destroys it. This is a **tracked
+divergence, not a settled design**; §1.2 records it as one of two specified
+exceptions to commit parity, and `PARITY.md` §3 carries the open question of
+which runtime moves.
 
 Rejection everywhere else is forced by command order. A durable API allocates its
 command sequence number before it runs user code and appends its command event

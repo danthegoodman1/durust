@@ -1861,7 +1861,15 @@ function throwFirstRejection(results: readonly PromiseSettledResult<unknown>[]):
  * global RNG would break both properties, and `Math.random` in particular is one
  * of the globals the determinism guard replaces.
  */
-function maintenanceJitterSource(workerId: string): () => number {
+/**
+ * Exported for the shared behavioural corpus's `workerStartJitter` table
+ * (`typescript/packages/core/test/behavioral-corpus.test.ts`), whose Rust half
+ * lives in `src/worker.rs`'s unit tests. Not re-exported from the package
+ * index: the stream is an implementation detail of the maintenance cadence,
+ * but it is one the two runtimes have to agree on bit for bit, and nothing
+ * pinned it before.
+ */
+export function maintenanceJitterSource(workerId: string): () => number {
   let state = fnv1a32(workerId);
   return () => {
     state = (state + 0x6d2b79f5) >>> 0;
@@ -1872,7 +1880,8 @@ function maintenanceJitterSource(workerId: string): () => number {
   };
 }
 
-function fnv1a32(value: string): number {
+/** Seeds {@link maintenanceJitterSource}; exported for the same corpus table. */
+export function fnv1a32(value: string): number {
   let hash = 0x811c9dc5;
   for (let index = 0; index < value.length; index += 1) {
     hash ^= value.charCodeAt(index);

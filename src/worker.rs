@@ -3360,6 +3360,65 @@ mod tests {
     // in lockstep, and it must not need a global RNG to avoid it. Two ids
     // diverge from their *first* delay, because the first delay is the phase
     // offset that breaks up startup load.
+    /// The Rust half of the shared behavioural corpus's `workerStartJitter`
+    /// table; `typescript/packages/core/test/behavioral-corpus.test.ts` asserts
+    /// the same rows against `maintenanceJitterSource`.
+    ///
+    /// The jitter stream is bit-for-bit identical across the two runtimes by
+    /// construction — FNV-1a-32 over UTF-16 code units seeding mulberry32 —
+    /// and until this table nothing in either CI job said so. It lives here
+    /// rather than in `tests/` because `MaintenanceJitter` is private to this
+    /// module and a Cargo integration test cannot name it.
+    ///
+    /// Exact equality, not a tolerance. The table stores the raw 32-bit
+    /// mulberry32 outputs rather than the `[0, 1)` doubles, because the final
+    /// division by `2^32` is exact in both runtimes while decimal text is not
+    /// portable: `serde_json` parses `0.09126776782795787` to a double one ULP
+    /// away from `f64::from_str`, which would have made a decimal table fail
+    /// here for a reason that has nothing to do with jitter.
+    #[test]
+    fn maintenance_jitter_matches_the_shared_corpus_table() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/typescript/fixtures/contract/behavioral-corpus.json"
+        )))
+        .expect("behavioural corpus is valid JSON");
+        let cases = corpus["workerStartJitter"]["cases"]
+            .as_array()
+            .expect("workerStartJitter cases");
+        assert_eq!(cases.len(), 7, "the jitter table lost a worker id");
+        let mut saw_astral = false;
+        for case in cases {
+            let worker_id = case["workerId"].as_str().expect("workerId");
+            saw_astral |= worker_id.chars().any(|c| c as u32 > 0xFFFF);
+            assert_eq!(
+                u64::from(fnv1a32(worker_id)),
+                case["seed"].as_u64().expect("seed"),
+                "seed for `{worker_id}`"
+            );
+            let mut jitter = MaintenanceJitter::new(&WorkerId::new(worker_id));
+            let expected: Vec<u64> = case["unitsScaled"]
+                .as_array()
+                .expect("unitsScaled")
+                .iter()
+                .map(|unit| unit.as_u64().expect("unit"))
+                .collect();
+            assert_eq!(expected.len(), 6, "units for `{worker_id}`");
+            let actual: Vec<u64> = (0..expected.len())
+                .map(|_| {
+                    let unit = jitter.next_unit();
+                    assert!((0.0..1.0).contains(&unit), "unit out of range: {unit}");
+                    (unit * 4_294_967_296.0) as u64
+                })
+                .collect();
+            assert_eq!(actual, expected, "jitter stream for `{worker_id}`");
+        }
+        assert!(
+            saw_astral,
+            "the table must keep an astral worker id: it is the only row a \
+             UTF-8-byte hash would fail"
+        );
+    }
     #[test]
     fn maintenance_jitter_gives_two_worker_ids_different_phases() {
         let interval = Duration::from_millis(250);

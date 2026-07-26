@@ -39,6 +39,23 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-features
 
+      # The Rust half of every shared contract fixture, named so a failure
+      # points at the cross-language contract rather than at "some test".
+      # `cargo test --workspace` above already covers these; running them
+      # again here costs seconds and means the corpus is gated by a step whose
+      # name says what it gates.
+      - name: Run shared contract fixtures (Rust)
+        run: |
+          cargo test --locked --test contract_fixtures
+          cargo test --locked --test map_transitions
+          cargo test --locked --test behavioral_corpus
+          cargo test --locked --lib worker::tests::maintenance_jitter_matches_the_shared_corpus_table
+
+      # `npm run check` includes `check:fixtures`, which runs both halves of
+      # every shared fixture: the TypeScript runners and, through `cargo`, the
+      # Rust ones. Before Phase 7 `check:fixtures` existed but was invoked by
+      # nothing — not by `npm run check`, not by this workflow — so the shared
+      # corpus was ungated in CI.
       - name: Run TypeScript checks
         run: npm run check --prefix typescript
 
