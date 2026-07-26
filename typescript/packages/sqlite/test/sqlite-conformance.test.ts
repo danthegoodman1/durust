@@ -41,8 +41,13 @@ import {
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend, collectPayloadRefs } from "@durust/payload";
 import {
+  assertTerminalRunLeftoversArePoisoned,
+  assertTerminalRunLeftoversAreRepaired,
+  assertTerminalRunPlainLeftoverIsRepaired,
   basicProviderConformanceCases,
   prepareWorkflowTaskCommit,
+  scheduleTerminalRunLeftovers,
+  scheduleTerminalRunPlainLeftover,
   workflowVisibleMutationCommitCases
 } from "@durust/testing";
 import { SqliteBackend } from "@durust/sqlite";
@@ -1693,5 +1698,96 @@ describe("SqliteBackend persistence", () => {
     );
     expect(values).toEqual([10, 20, 30]);
     reopenedAgain.close();
+  });
+});
+
+describe("SqliteBackend upgrade repair", () => {
+  // The one state the terminal-parent guard makes unrecoverable, and the only
+  // way to reach it: durable data written before every run-closing transition
+  // abandoned that run's work. No code path produces it any more, so it is
+  // forged the way a pre-upgrade database holds it — the run row terminal, the
+  // descriptor row and the plain activity row still live — by writing the
+  // workflow row directly. The assertions are `@durust/testing`'s, shared with
+  // the Postgres test, so the two providers' repairs cannot drift.
+  function closeRunWithoutAbandoning(path: string, runIdValue: string): void {
+    const db = new DatabaseSync(path);
+    try {
+      db.prepare("update workflows set terminal = 1, ready_reason = null where run_id = ?")
+        .run(runIdValue);
+      const maps = db.prepare("select terminal from activity_maps").all() as unknown as {
+        readonly terminal: number;
+      }[];
+      expect(maps.map((row) => row.terminal)).toEqual([0]);
+    } finally {
+      db.close();
+    }
+  }
+
+  it("a closed run's leftover work poisons every item path, and reopening repairs it", async () => {
+    const path = tempSqlitePath("upgrade-repair");
+    const live = new SqliteBackend({ path });
+    const leftovers = await scheduleTerminalRunLeftovers(live, "sqlite");
+
+    // Poisoned *under* an already-open backend, which is what an upgraded
+    // process inheriting the state sees: the repair only runs at open.
+    closeRunWithoutAbandoning(path, String(leftovers.runId));
+    await assertTerminalRunLeftoversArePoisoned(live, leftovers);
+    live.close();
+
+    const repaired = new SqliteBackend({ path });
+    try {
+      await assertTerminalRunLeftoversAreRepaired(repaired, leftovers);
+    } finally {
+      repaired.close();
+    }
+  });
+
+  it("repairs a closed run whose only leftover is a plain activity", async () => {
+    const path = tempSqlitePath("upgrade-repair-plain");
+    const live = new SqliteBackend({ path });
+    const leftover = await scheduleTerminalRunPlainLeftover(live, "sqlite");
+    live.close();
+
+    const db = new DatabaseSync(path);
+    db.prepare("update workflows set terminal = 1, ready_reason = null where run_id = ?")
+      .run(String(leftover.runId));
+    db.close();
+
+    const repaired = new SqliteBackend({ path });
+    try {
+      await assertTerminalRunPlainLeftoverIsRepaired(repaired, leftover);
+    } finally {
+      repaired.close();
+    }
+  });
+
+  it("opens without taking a write lock when there is nothing to repair", async () => {
+    // The repair used to open `BEGIN IMMEDIATE` unconditionally, so a
+    // constructor — which has no retry hook — threw `database is locked`
+    // whenever another writer held one. Probing first keeps the common path
+    // read-only.
+    const path = tempSqlitePath("upgrade-repair-lock");
+    const first = new SqliteBackend({ path });
+    await first.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/repair-lock"),
+      workflowType: workflowType("sqlite.repair-lock", 1),
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ value: 1 }, { codec: "Json" })
+    });
+    first.close();
+
+    const writer = new DatabaseSync(path);
+    writer.exec("BEGIN IMMEDIATE");
+    try {
+      const startedAt = Date.now();
+      const opened = new SqliteBackend({ path, busyTimeoutMs: 700 });
+      const elapsed = Date.now() - startedAt;
+      opened.close();
+      expect(elapsed).toBeLessThan(400);
+    } finally {
+      writer.exec("ROLLBACK");
+      writer.close();
+    }
   });
 });

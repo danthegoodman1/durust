@@ -574,8 +574,27 @@ export class PayloadBackend implements DurableBackend {
     });
   }
 
+  /**
+   * Rewrite only the commit fields that carry payloads, and forward the rest
+   * unchanged.
+   *
+   * The starting point is the commit itself rather than a fresh object built
+   * field by field. That rebuild was a silent-drop hazard: a field added to
+   * `WorkflowTaskCommit` and applied by every provider still went missing here,
+   * with no type error, and the symptom was the operation quietly having no
+   * effect. It was found by conformance the first time a field was added
+   * (`cancelCommands`), which is one time too late to keep relying on.
+   *
+   * **This narrows the hazard rather than closing it.** A new field is now
+   * forwarded by default, so a non-payload field is safe; a new field that
+   * *carries payloads* is forwarded un-offloaded instead, which is still
+   * silent and still has no type error. Closing it needs an assertion that the
+   * key set of `commit` is exactly the one handled here, which no
+   * `Partial`-shaped rewrite gives for free.
+   */
   async #offloadWorkflowTaskCommit(commit: WorkflowTaskCommit): Promise<WorkflowTaskCommit> {
     const transformed: Mutable<Partial<WorkflowTaskCommit>> & Pick<WorkflowTaskCommit, "expectedTailEventId"> = {
+      ...commit,
       expectedTailEventId: commit.expectedTailEventId
     };
     if (commit.appendEvents !== undefined) {

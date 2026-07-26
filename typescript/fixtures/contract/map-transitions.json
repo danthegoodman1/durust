@@ -33,7 +33,7 @@
     },
     {
       "what": "The ParentCancelled event",
-      "why": "It has no TypeScript producer: WorkflowTaskCommit has no cancelCommands field in TypeScript at all, so no provider can raise it. Rust drives it from WorkflowTaskCommit::cancel_commands. Each engine's own unit tests cover the transition; a shared table would be asserting behaviour one runtime cannot reach."
+      "why": "Both runtimes now drive it from WorkflowTaskCommit::cancel_commands / cancelCommands, and both emit the same two effects, so the exclusion is no longer about reachability. It stays because the transition is only half the behaviour: cancelling a child map must also cancel the children it already started, and that is deliberately not a step effect — the other producer, a run reaching a terminal event, must leave its children to the parentClosePolicy path, which is free to abandon them. Each provider therefore pairs ParentCancelled with its own child cancellation, and a table that asserted only the effect list would pin the half that agrees and say nothing about the half that matters. Each engine's own unit tests cover the transition."
     }
   ],
   "transitions": [

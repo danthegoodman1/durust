@@ -20,10 +20,12 @@ import {
   activityOutcomeCounts,
   itemRetryDecision,
   itemRetryDelayMs,
+  mapCommandCancelledReason,
   mapRejectMessage,
   outcomeCounts,
   recordedOutcomeCount,
   step as stepMap,
+  type ItemAttemptFailureKind,
   type ItemRetryDecision,
   type MapEffect,
   type MapEvent,
@@ -176,6 +178,20 @@ export interface WorkflowTaskCommit {
   readonly scheduleActivityMaps?: readonly ActivityMapTask[];
   readonly startChildWorkflows?: readonly ChildWorkflowStartRequested[];
   readonly scheduleChildWorkflowMaps?: readonly ChildWorkflowMapTask[];
+  /**
+   * Commands whose operational state this commit withdraws: a scheduled
+   * activity that no longer has a waiter, or a map whose fanout the workflow
+   * has stopped caring about.
+   *
+   * `SPEC.md` §8.2 lists this field and §1.2 makes every §8.2 field normative,
+   * so its absence here was a gap in TypeScript rather than a narrowing of the
+   * contract — and it was the reason `map-engine.ts`'s `ParentCancelled`
+   * transition had no producer at all. Cancelling a map command tombstones its
+   * pending items and closes its descriptor; no parent fact is appended,
+   * because the commit that carries the cancellation is already the record of
+   * it.
+   */
+  readonly cancelCommands?: readonly CommandId[];
   readonly queryProjection?: PayloadRef;
 }
 
@@ -199,6 +215,7 @@ export function workflowTaskCommitHasWorkflowVisibleMutations(
     (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
     (commit.startChildWorkflows?.length ?? 0) > 0 ||
     (commit.scheduleChildWorkflowMaps?.length ?? 0) > 0 ||
+    (commit.cancelCommands?.length ?? 0) > 0 ||
     commit.queryProjection !== undefined
   );
 }
@@ -594,6 +611,9 @@ export class MemoryBackend implements DurableBackend {
         signal.consumed = true;
       }
     }
+    for (const cancelled of commit.cancelCommands ?? []) {
+      this.#cancelCommandOperationalState(cancelled);
+    }
     for (const task of commit.scheduleActivities ?? []) {
       const activityState: ActivityState = {
         namespace: state.namespace,
@@ -627,6 +647,7 @@ export class MemoryBackend implements DurableBackend {
       this.#notifyParentOfChildTerminal(state.parent, childTerminal);
     }
     if (state.terminal) {
+      this.#abandonWorkForClosedRun(state);
       this.#cancelChildrenForClosedParent(state);
     }
     return { kind: "Committed", newTailEventId: tailEventId(state) };
@@ -882,42 +903,53 @@ export class MemoryBackend implements DurableBackend {
     const due = [...this.#activitiesById.values()]
       .filter(
         (activity) =>
-            activity.namespace === String(req.namespace) &&
-            activityTimeoutDeadline(activity).deadline <= Number(req.now)
-        )
-        .sort((left, right) =>
-          activityTimeoutDeadline(left).deadline - activityTimeoutDeadline(right).deadline ||
-          left.task.activityId.localeCompare(right.task.activityId)
-        )
+          activity.namespace === String(req.namespace) &&
+          activityTimeoutDeadline(activity).deadline <= Number(req.now)
+      )
+      .sort((left, right) =>
+        activityTimeoutDeadline(left).deadline - activityTimeoutDeadline(right).deadline ||
+        left.task.activityId.localeCompare(right.task.activityId)
+      )
       .slice(0, Math.max(1, req.limit));
     let timedOut = 0;
     for (const activity of due) {
-      if (
-        activity.claim === null ||
-        activity.terminalEventId !== null ||
-          activity.task.mapItem !== null
-        ) {
-          continue;
+      if (activity.claim === null || activity.terminalEventId !== null) {
+        continue;
+      }
+      const timeout = activityTimeoutDeadline(activity);
+      if (timeout.deadline > Number(req.now)) {
+        continue;
+      }
+      // A map item's lapsed deadline is an engine event, not a local
+      // reschedule: only the engine knows whether the map is still running,
+      // and it owns both the retried attempt and the map's terminal failure.
+      if (activity.task.mapItem !== null) {
+        this.#failActivityMapItem(
+          activity,
+          activityTimeoutFailure(activity, timeout.kind),
+          // A lapsed deadline is not the attempt's own verdict, so the policy's
+          // non-retryable rules do not apply to it.
+          itemRetryDecision(activity.task.attempt, activity.task.retryPolicy, null),
+          "TimedOut"
+        );
+        timedOut += 1;
+        continue;
+      }
+      const retry = retryActivityAfterTimeout(activity, Number(req.now));
+      if (retry !== null) {
+        activity.task = retry.task;
+        activity.availableAtMs = retry.readyAtMs;
+        activity.claim = null;
+        timedOut += 1;
+        continue;
+      }
+      const event = makeHistoryEvent(eventId(Number(tailEventId(activity.workflow)) + 1), {
+        kind: "ActivityTimedOut",
+        timedOut: {
+          commandId: activity.task.commandId,
+          message: activityTimeoutMessage(activity, timeout.kind)
         }
-        const timeout = activityTimeoutDeadline(activity);
-        if (timeout.deadline > Number(req.now)) {
-          continue;
-        }
-        const retry = retryActivityAfterTimeout(activity, Number(req.now));
-        if (retry !== null) {
-          activity.task = retry.task;
-          activity.availableAtMs = retry.readyAtMs;
-          activity.claim = null;
-          timedOut += 1;
-          continue;
-        }
-        const event = makeHistoryEvent(eventId(Number(tailEventId(activity.workflow)) + 1), {
-          kind: "ActivityTimedOut",
-          timedOut: {
-            commandId: activity.task.commandId,
-            message: activityTimeoutMessage(activity, timeout.kind)
-          }
-        });
+      });
       activity.workflow.history.push(event);
       markWorkflowReady(activity.workflow, "ActivityTimedOut");
       activity.terminalEventId = event.eventId;
@@ -1023,6 +1055,91 @@ export class MemoryBackend implements DurableBackend {
   // left here is storage: insert item tasks, start item children, write the
   // descriptor cursor, append a parent event, tombstone leftovers.
   // ---------------------------------------------------------------------
+
+  /**
+   * `WorkflowTaskCommit.cancelCommands`: withdraw one command's operational
+   * state. A plain activity is tombstoned; a map is handed to the engine as
+   * `ParentCancelled`, which tombstones its pending work and closes the
+   * descriptor. Routing the map through the engine rather than deleting the
+   * descriptor here is what keeps the cancellation path from drifting away
+   * from the fail-fast one.
+   */
+  #cancelCommandOperationalState(cancelled: CommandId): void {
+    for (const activity of this.#activitiesById.values()) {
+      if (
+        activity.task.mapItem === null &&
+        sameCommandId(activity.task.commandId, cancelled) &&
+        activity.terminalEventId === null
+      ) {
+        activity.terminalEventId = tailEventId(activity.workflow);
+        activity.claim = null;
+      }
+    }
+    const activityMap = this.#activityMapsByCommand.get(commandKey(cancelled));
+    if (activityMap !== undefined) {
+      this.#stepActivityMap(activityMap, { kind: "ParentCancelled" });
+    }
+    const childMap = this.#childWorkflowMapsByCommand.get(commandKey(cancelled));
+    if (childMap !== undefined && !childMap.terminal) {
+      // Withdrawing the command on a *live* run means the `parentClosePolicy`
+      // path never runs, so without this the children the map already started
+      // keep running with nothing waiting for them.
+      //
+      // Children first, descriptor last, matching the fail-fast effect order.
+      // That is a consistency choice and not a constraint: the reverse order
+      // was measured green across the whole memory and SQLite conformance
+      // suite, because child cancellation filters on the child's parent link
+      // and its own terminal flag and never reads the descriptor's.
+      this.#cancelRunningChildWorkflowMapItems(
+        childMap,
+        mapCommandCancelledReason(childMap.task.mapCommandId)
+      );
+      this.#stepChildWorkflowMap(childMap, { kind: "ParentCancelled" });
+    }
+  }
+
+  /**
+   * Abandon-on-close: a run that has just reached a terminal event owns no
+   * live work any more. Every map of that run is handed to the engine as
+   * `ParentCancelled`, and every plain activity of it is tombstoned.
+   *
+   * Without this a closed workflow keeps spawning and appending: completing an
+   * item of its map materialized the next ordinal, and both a map's terminal
+   * fact and a plain activity's `ActivityCompleted` were appended to the run's
+   * history *after* its terminal event — the exact thing the terminal-commit
+   * guard exists to prevent. Rust reaches the same end by deleting the run's
+   * activities and descriptors during terminal cleanup.
+   *
+   * Children are deliberately left alone here. `ParentCancelled` emits only
+   * `AbandonPendingItems` and `MarkDescriptorTerminal` — in both runtimes — so
+   * this cannot cascade, and a closed run's children belong to the
+   * `parentClosePolicy` path, which must stay free to *abandon* them rather
+   * than cancel them. The other `ParentCancelled` producer, a withdrawn
+   * command on a still-live run, has no such path and cancels the map's
+   * children itself; see `#cancelCommandOperationalState`.
+   */
+  #abandonWorkForClosedRun(state: WorkflowState): void {
+    for (const activity of this.#activitiesById.values()) {
+      if (
+        activity.task.mapItem === null &&
+        activity.workflow.runId === state.runId &&
+        activity.terminalEventId === null
+      ) {
+        activity.terminalEventId = tailEventId(state);
+        activity.claim = null;
+      }
+    }
+    for (const map of this.#activityMapsByCommand.values()) {
+      if (map.workflow.runId === state.runId && !map.terminal) {
+        this.#stepActivityMap(map, { kind: "ParentCancelled" });
+      }
+    }
+    for (const map of this.#childWorkflowMapsByCommand.values()) {
+      if (map.workflow.runId === state.runId && !map.terminal) {
+        this.#stepChildWorkflowMap(map, { kind: "ParentCancelled" });
+      }
+    }
+  }
 
   #createActivityMap(workflow: WorkflowState, task: ActivityMapTask): void {
     // Validation runs before the engine is consulted. The engine clamps a
@@ -1252,7 +1369,7 @@ export class MemoryBackend implements DurableBackend {
       // outcome; the engine only needs to know this was a success.
       outcome: { kind: "Succeeded", result },
       alreadyRecorded,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
     if (transition.kind === "Reject") {
       throw new Error(mapRejectMessage("Activity", transition.reject));
@@ -1274,7 +1391,8 @@ export class MemoryBackend implements DurableBackend {
   #failActivityMapItem(
     activity: ActivityState,
     failure: DurableFailure,
-    decision: ItemRetryDecision
+    decision: ItemRetryDecision,
+    attemptFailure: ItemAttemptFailureKind = "Failed"
   ): FailActivityOutcome {
     const map = this.#activityMapForTask(activity.task);
     if (!map || activity.task.mapItem === null) {
@@ -1290,14 +1408,14 @@ export class MemoryBackend implements DurableBackend {
       kind: "ItemAttemptFailed",
       ordinal,
       failure,
-      attemptFailure: "Failed",
+      attemptFailure,
       decision,
       failedAttempt: activity.task.attempt,
       retryPolicy: activity.task.retryPolicy,
       startToCloseTimeoutMs: activity.task.startToCloseTimeoutMs,
       nowMs: this.#nowMs(),
       alreadyRecorded: (map.results[ordinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
     if (decision.kind === "Retry") {
       return {
@@ -1449,7 +1567,7 @@ export class MemoryBackend implements DurableBackend {
             }
           },
           alreadyRecorded: false,
-          parentTerminal: PARENT_TERMINAL_UNGUARDED
+          parentTerminal: map.workflow.terminal
         });
         continue;
       }
@@ -1499,7 +1617,7 @@ export class MemoryBackend implements DurableBackend {
       ordinal: parentLink.itemOrdinal,
       outcome: childWorkflowMapItemOutcome(terminal),
       alreadyRecorded: (map.outcomes[parentLink.itemOrdinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
   }
 
@@ -1572,6 +1690,7 @@ export class MemoryBackend implements DurableBackend {
       child.readyReason = null;
       child.readyAtMs = 0;
       child.claim = null;
+      this.#abandonWorkForClosedRun(child);
     }
   }
 
@@ -1718,6 +1837,7 @@ export class MemoryBackend implements DurableBackend {
       child.readyReason = null;
       child.readyAtMs = 0;
       child.claim = null;
+      this.#abandonWorkForClosedRun(child);
     }
   }
 }
@@ -1735,20 +1855,6 @@ function workflowTypeKey(workflowType: WorkflowType): string {
   return `${workflowType.name}@${workflowType.version}`;
 }
 
-
-/**
- * The `parentTerminal` every TypeScript map path reports for an item's
- * terminal outcome.
- *
- * No TypeScript provider has a terminal-parent guard on any map path: history
- * continues past a run's terminal event and a closed run keeps materializing
- * items, which is tracked as its own plan row. Reporting the run's real
- * terminal flag here would *add* that guard — an activity map would reject the
- * completion and a child map would drop the parent notification — so the
- * engine is fed the value that reproduces today's behaviour, and closing the
- * gap stays one deliberate change rather than a side effect of the wiring.
- */
-const PARENT_TERMINAL_UNGUARDED = false;
 
 /** The generated activity id of one materialized activity-map item. */
 function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
@@ -1837,14 +1943,23 @@ function activityHeartbeatDeadlineAt(
   return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
 }
 
+/**
+ * When the timeout scanner should reclaim this attempt, and which deadline
+ * lapsed.
+ *
+ * Map items are covered on the same terms as any other activity. They used to
+ * be exempt — the scanner skipped every task with a `mapItem`, so a hung item
+ * was never recovered even though `ActivityMapTask` carries
+ * `startToCloseTimeoutMs`/`heartbeatTimeoutMs` and every materialized item
+ * copies them. Stored and never enforced is worse than not stored: with no
+ * explicit timeout an item still gets the implicit lease-length heartbeat
+ * deadline, so a worker that dies mid-item left the item to be re-offered by
+ * lease expiry forever instead of failing its map.
+ */
 function activityTimeoutDeadline(
   activity: ActivityState
 ): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
-  if (
-    activity.claim === null ||
-    activity.terminalEventId !== null ||
-    activity.task.mapItem !== null
-  ) {
+  if (activity.claim === null || activity.terminalEventId !== null) {
     return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
   }
   const startToCloseDeadline =
@@ -1864,6 +1979,22 @@ function activityTimeoutMessage(
   return kind === "Heartbeat"
     ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
     : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
+}
+
+/**
+ * A lapsed activity deadline as the parent-visible failure a map item carries.
+ * A plain activity records the same text in its `ActivityTimedOut` event; a map
+ * item has no per-item history, so the text rides the failure instead.
+ */
+function activityTimeoutFailure(
+  activity: ActivityState,
+  kind: "StartToClose" | "Heartbeat"
+): DurableFailure {
+  return {
+    errorType: "durust.activity_timed_out",
+    message: activityTimeoutMessage(activity, kind),
+    nonRetryable: false
+  };
 }
 
 function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {

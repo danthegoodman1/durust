@@ -409,6 +409,26 @@ export function childCancellationReason(mapCommandId: CommandId): string {
 }
 
 /**
+ * Reason stamped on the `WorkflowCancelled` event of every child cancelled
+ * because its map's *command* was withdrawn by
+ * `WorkflowTaskCommit.cancelCommands`.
+ *
+ * Distinct from `childCancellationReason`: nothing failed, the parent stopped
+ * wanting the results. Cancelling those children is not a `step` effect — the
+ * engine's `ParentCancelled` emits only `AbandonPendingItems` and
+ * `MarkDescriptorTerminal`, in both runtimes — because the two call sites want
+ * different things. When a *run* closes, its children belong to the
+ * `parentClosePolicy` path, which must be free to abandon them; when a
+ * *command* is withdrawn on a live run, that path never runs and the children
+ * would be orphaned. So the cancellation is the provider's, like
+ * `cancelChildrenForClosedParent` already is, and only the string lives here so
+ * the three providers cannot drift on it.
+ */
+export function mapCommandCancelledReason(mapCommandId: CommandId): string {
+  return `child workflow map \`${mapCommandId.runId}\`:${mapCommandId.seq} cancelled`;
+}
+
+/**
  * Backoff for the next attempt of a map item whose attempt `failedAttempt` just
  * failed. Identical to the delay the plain activity retry path applies, so a map
  * item and a standalone activity with the same policy are paced the same way.

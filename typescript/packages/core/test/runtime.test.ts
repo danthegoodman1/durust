@@ -13,6 +13,7 @@ import {
   UnsupportedWorkflowVersionError,
   activity,
   activityMap,
+  activityMapFingerprint,
   activityMapManifest,
   callActivity,
   childWorkflow,
@@ -29,6 +30,7 @@ import {
   joinAll,
   patched,
   namespace,
+  payloadDigest,
   publish,
   runId,
   select,
@@ -43,9 +45,11 @@ import {
   workflowId,
   workflowType,
   type ActivityHandle,
+  type ActivityMapInputManifest,
   type ChildWorkflowHandle,
   type ClaimedWorkflowTask,
   type HistoryEvent,
+  type PayloadRef,
   type RunId,
   type SchemaAdapter,
   type WorkflowTaskCommit
@@ -5219,6 +5223,282 @@ describe("minimal workflow runtime", () => {
     // and one in four ~24 KiB. Flat costs a rounding error.
     expect(bytesPerActivity).toBeLessThan(2 * 1024);
   }, 120_000);
+});
+
+describe("map input manifest validation", () => {
+  // What a map fans out over is declared by three fields that have to agree,
+  // and the DSL takes any encoded object of the manifest's shape, so a
+  // disagreeing one was user-reachable. It used to be found only inside the
+  // provider's `commitWorkflowTask`, which fails the *task* rather than the
+  // workflow and is therefore retried forever.
+  async function firstCommit(
+    definition: Parameters<typeof prepareWorkflowTaskCommit>[0],
+    label: string
+  ): Promise<WorkflowTaskCommit> {
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId(`wf/${label}`),
+      workflowType: definition.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [definition.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+    return prepareWorkflowTaskCommit(definition, {}, claim, { payloadCodec: "Json" });
+  }
+
+  it("accepts an empty manifest and completes the map with no items", async () => {
+    // Mapping over an empty list is a degenerate case, not an error: the map is
+    // terminal the moment its descriptor exists. Pinned here at the DSL so the
+    // answer is deliberate rather than an accident of the completion predicate.
+    const emptyMapWorkflow = workflow({
+      name: "tests.empty-activity-map",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const mapped = activityMap(priceQuote, {
+          inputManifest: activityMapManifest([]),
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 4
+        });
+        return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/empty-activity-map"),
+      workflowType: emptyMapWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [emptyMapWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+    const hot = new HotWorkflowExecution(emptyMapWorkflow, {}, claim, { payloadCodec: "Json" });
+    const scheduleCommit = await hot.nextCommit();
+    expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityMapScheduled"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(claim.claim, scheduleCommit))
+    );
+
+    // The provider completed the map inside that same commit, so the parent is
+    // ready with no item ever having been scheduled.
+    const noItem = await backend.claimActivityTask("map-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("payments"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    expect(noItem).toBeNull();
+
+    const completedClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [emptyMapWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!completedClaim) {
+      throw new Error("an empty map must wake its parent");
+    }
+    expect(completedClaim.reason).toBe("ActivityMapCompleted");
+    const finalCommit = await hot.advance(completedClaim);
+    expect(finalCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    const completed = finalCommit.appendEvents?.[0]?.data;
+    if (completed?.kind !== "WorkflowCompleted") {
+      throw new Error("expected WorkflowCompleted");
+    }
+    expect(decodePayload<number>(completed.result)).toBe(0);
+  });
+
+  it("gives an activity map item the same command fingerprint when no options are supplied", async () => {
+    // `retry`, `startToCloseTimeoutMs` and `heartbeatTimeoutMs` became
+    // caller-supplied on `ActivityMapOptions`, matching Rust's `activity_map`
+    // builder, which carries a full `ActivityOptions`. They feed the command
+    // fingerprint, so the defaults have to be exactly the values that were
+    // hardcoded before, or every existing workflow's map command stops
+    // replaying. Two runs of the same program, one before and one after, are
+    // not comparable here; the durable fingerprint is, so it is pinned.
+    const defaultsWorkflow = workflow({
+      name: "tests.map-options-defaults",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const mapped = activityMap(priceQuote, {
+          inputManifest: activityMapManifest([{ sku: "a" }], 1),
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 2
+        });
+        return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
+      }
+    });
+    const commit = await firstCommit(defaultsWorkflow, "map-options-defaults");
+    const scheduled = commit.appendEvents?.[0]?.data;
+    if (scheduled?.kind !== "ActivityMapScheduled") {
+      throw new Error("expected ActivityMapScheduled");
+    }
+    expect(scheduled.scheduled.retryPolicy.maxAttempts).toBe(1);
+    expect(scheduled.scheduled.startToCloseTimeoutMs).toBeNull();
+    expect(scheduled.scheduled.heartbeatTimeoutMs).toBeNull();
+    // Pinned as a literal, not recomputed from the event, so a change to any
+    // default moves it. `activityOptionsDigest` hashes exactly the four values
+    // the map builder now takes from the caller.
+    expect(scheduled.scheduled.fingerprint.optionsDigest).toBe(
+      "sha256:595b2213c1b2fc84911306d9c5f32ad68fdc4f26fa6c00ae9fc55b72c96341ff" +
+        ":result=quotes:max=2"
+    );
+    expect(scheduled.scheduled.fingerprint).toEqual(
+      activityMapFingerprint(
+        "payments.price-quote",
+        payloadDigest(scheduled.scheduled.inputManifest),
+        "quotes",
+        2,
+        "sha256:595b2213c1b2fc84911306d9c5f32ad68fdc4f26fa6c00ae9fc55b72c96341ff"
+      )
+    );
+    expect(commit.scheduleActivityMaps?.[0]?.retryPolicy.maxAttempts).toBe(1);
+  });
+
+  it("carries an activity map's retry policy and deadlines onto every item", async () => {
+    // The defect this closes: the DSL hardcoded one attempt and no deadlines,
+    // and a map item still gets the implicit lease-length heartbeat deadline
+    // every claimed activity gets. Once map items stopped being exempt from the
+    // timeout scanner, a worker that died holding an item — or an item that
+    // merely outran its lease — exhausted its only attempt and failed the whole
+    // map, with no way for the caller to say otherwise.
+    const configuredWorkflow = workflow({
+      name: "tests.map-options-configured",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const mapped = activityMap(priceQuote, {
+          inputManifest: activityMapManifest([{ sku: "a" }], 1),
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 2,
+          retry: RetryPolicy.exponential({ maxAttempts: 5, initialIntervalMs: 250 }),
+          startToCloseTimeoutMs: 30_000,
+          heartbeatTimeoutMs: 5_000
+        });
+        return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
+      }
+    });
+    const commit = await firstCommit(configuredWorkflow, "map-options-configured");
+    const task = commit.scheduleActivityMaps?.[0];
+    expect(task?.retryPolicy.maxAttempts).toBe(5);
+    expect(task?.retryPolicy.initialIntervalMs).toBe(250);
+    expect(task?.startToCloseTimeoutMs).toBe(30_000);
+    expect(task?.heartbeatTimeoutMs).toBe(5_000);
+
+    // The configured options must move the fingerprint, or a workflow could
+    // change its map's retry policy and replay against the old history.
+    const defaultsCommit = await firstCommit(
+      workflow({
+        name: "tests.map-options-configured",
+        version: 1,
+        handler: async (_input: TestNoInput): Promise<number> => {
+          const mapped = activityMap(priceQuote, {
+            inputManifest: activityMapManifest([{ sku: "a" }], 1),
+            resultManifest: "quotes",
+            taskQueue: "payments",
+            maxInFlight: 2
+          });
+          return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
+        }
+      }),
+      "map-options-configured-defaults"
+    );
+    const configuredEvent = commit.appendEvents?.[0]?.data;
+    const defaultEvent = defaultsCommit.appendEvents?.[0]?.data;
+    if (
+      configuredEvent?.kind !== "ActivityMapScheduled" ||
+      defaultEvent?.kind !== "ActivityMapScheduled"
+    ) {
+      throw new Error("expected ActivityMapScheduled");
+    }
+    expect(configuredEvent.scheduled.fingerprint.optionsDigest).not.toEqual(
+      defaultEvent.scheduled.fingerprint.optionsDigest
+    );
+  });
+
+  it("rejects an activity map manifest whose pages do not cover its item count", async () => {
+    const brokenWorkflow = workflow({
+      name: "tests.broken-activity-map-manifest",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const mapped = activityMap(priceQuote, {
+          inputManifest: encodePayload({
+            itemCount: 3,
+            pageLengths: [1],
+            pages: [encodePayload({ items: [encodePayload({ sku: "a" }, { codec: "Json" })] }, { codec: "Json" })]
+          }, { codec: "Json" }) as PayloadRef<ActivityMapInputManifest<QuoteInput>>,
+          resultManifest: "quotes",
+          taskQueue: "payments",
+          maxInFlight: 2
+        });
+        return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
+      }
+    });
+    const commit = await firstCommit(brokenWorkflow, "broken-activity-map-manifest");
+    const failed = commit.appendEvents?.[0]?.data;
+    expect(failed?.kind).toBe("WorkflowFailed");
+    if (failed?.kind !== "WorkflowFailed") {
+      throw new Error("expected WorkflowFailed");
+    }
+    expect(failed.failure.message).toBe(
+      "activityMap inputManifest pages cover 1 items, expected 3"
+    );
+    // Rejected before the command id is allocated, so nothing was scheduled.
+    expect(commit.scheduleActivityMaps ?? []).toHaveLength(0);
+  });
+
+  it("rejects a child workflow map manifest with a zero-length page", async () => {
+    const brokenWorkflow = workflow({
+      name: "tests.broken-child-map-manifest",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<number> => {
+        const mapped = childWorkflowMap(childEchoWorkflow, {
+          inputManifest: encodePayload({
+            itemCount: 0,
+            pageLengths: [0],
+            pages: [encodePayload({ items: [] }, { codec: "Json" })]
+          }, { codec: "Json" }) as PayloadRef<ActivityMapInputManifest<{ readonly value: string }>>,
+          resultManifest: "echoes",
+          workflowIdPrefix: "wf/broken-child-map",
+          taskQueue: "workflows",
+          maxInFlight: 2
+        });
+        return decodeChildWorkflowMapSuccesses(await mapped.resultManifest()).length;
+      }
+    });
+    const commit = await firstCommit(brokenWorkflow, "broken-child-map-manifest");
+    const failed = commit.appendEvents?.[0]?.data;
+    expect(failed?.kind).toBe("WorkflowFailed");
+    if (failed?.kind !== "WorkflowFailed") {
+      throw new Error("expected WorkflowFailed");
+    }
+    expect(failed.failure.message).toBe(
+      "childWorkflowMap inputManifest page 0 must hold at least one item, got 0"
+    );
+    expect(commit.scheduleChildWorkflowMaps ?? []).toHaveLength(0);
+  });
 });
 
 // Builds a claim without a provider so a memory test measures the runtime and

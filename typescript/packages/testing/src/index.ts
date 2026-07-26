@@ -1,7 +1,9 @@
 import type {
+  ActivityTaskClaim,
   ClaimedWorkflowTask,
   CommandId,
   DurableBackend,
+  RunId,
   HistoryEvent,
   PrepareWorkflowTaskOptions,
   WorkflowDefinition,
@@ -24,6 +26,7 @@ import {
   encodePayload,
   eventId,
   historyEventType,
+  mapCommandCancelledReason,
   namespace,
   payloadDigest,
   runId,
@@ -1837,15 +1840,51 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
 
-        // The parent's `ChildWorkflowMapFailed` is deliberately not asserted
-        // here. The collision is at ordinal 0 of the *initial* admission
-        // batch, so the map's terminal fact is produced inside the parent's
-        // own `commitWorkflowTask`, and SQLite loses every map terminal fact
-        // written there to the commit's outer workflow save — a lost update
-        // tracked as its own plan row and out of scope for this wiring. The
-        // fail-fast case above covers the parent fact on all three providers
-        // by ending the map from a child's commit instead. What is asserted
-        // here is the part this change moved: the collision's batch-mate.
+        // The collision is at ordinal 0 of the *initial* admission batch, so
+        // the map's terminal fact is produced inside the parent's own
+        // `commitWorkflowTask`. That is where SQLite used to lose it: the map
+        // helper re-read the run, pushed `ChildWorkflowMapFailed` onto that
+        // second copy and saved it, and the commit's closing workflow save
+        // then overwrote the row from the copy it had been appending to. The
+        // map ended durably terminal with the parent never notified and never
+        // woken, so this assertion is the regression test for that lost
+        // update.
+        const parentHistory = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          parentHistory.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapFailed",
+          `a map that fails inside its scheduling commit must still notify the parent, got ${parentHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const parentFailure = parentHistory.events.at(-1)?.data;
+        assert(
+          parentFailure?.kind === "ChildWorkflowMapFailed",
+          "expected ChildWorkflowMapFailed"
+        );
+        assert(
+          parentFailure.failed.failure.message ===
+            `child workflow id already exists: ${prefix}/0`,
+          `unexpected map failure message: ${parentFailure.failed.failure.message}`
+        );
+        const wokenParent = await backend.claimWorkflowTask("map-collide-parent-ready", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          wokenParent?.reason === "ChildWorkflowMapFailed",
+          `a map that failed in its scheduling commit must wake its parent, got ${String(
+            wokenParent?.reason ?? null
+          )}`
+        );
 
         // Ordinal 1 shared the collision's admission batch, so it was started
         // before the map ended and must be cancelled rather than orphaned.
@@ -1881,6 +1920,809 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             FAIL_FAST_HISTORY_STRINGS.siblingCancellationReason(mapCommandId),
           `unpinned sibling cancellation reason: ${cancelled.reason}`
         );
+      }
+    },
+    {
+      // Mapping over an empty list is an ordinary degenerate case, not a
+      // caller error: the map has nothing to admit and nothing outstanding, so
+      // it is terminal the instant its descriptor exists. Pinning it here makes
+      // the answer deliberate. It is also the shortest reachable route to a map
+      // terminal fact produced *inside* the scheduling commit, which is where
+      // SQLite used to lose one.
+      name: "an empty activity map completes at descriptor creation",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([], 2);
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          activityName: "conformance.empty-map",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "empty-mapped",
+          maxInFlight: 2,
+          fingerprint: activityMapFingerprint(
+            "conformance.empty-map",
+            payloadDigest(inputManifest),
+            "empty-mapped",
+            2,
+            "sha256:test-options"
+          )
+        };
+        const outcome = await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+        assert(outcome.kind === "Committed", "an empty map must commit");
+        assert(
+          Number(outcome.newTailEventId) === 3,
+          `an empty map's terminal fact must be part of the commit's tail, got ${String(
+            outcome.newTailEventId
+          )}`
+        );
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,ActivityMapCompleted",
+          `an empty map must complete at descriptor creation, got ${history.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const completed = history.events.at(-1)?.data;
+        assert(completed?.kind === "ActivityMapCompleted", "expected ActivityMapCompleted");
+        assert(
+          completed.completed.itemCount === 0 && completed.completed.successCount === 0,
+          "an empty map reports no items"
+        );
+        const resultManifest = decodePayload<ActivityMapResultManifest<unknown>>(
+          completed.completed.resultManifest as PayloadRef<ActivityMapResultManifest<unknown>>
+        );
+        assert(
+          resultManifest.itemCount === 0 && resultManifest.pages.length === 0,
+          "an empty map's result manifest carries no page at all"
+        );
+
+        const ready = await backend.claimWorkflowTask("empty-map-ready", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          ready?.reason === "ActivityMapCompleted",
+          `an empty map must wake its parent, got ${String(ready?.reason ?? null)}`
+        );
+      }
+    },
+    {
+      name: "an empty child workflow map completes at descriptor creation",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const childType = workflowType("conformance.empty-child-map", 1);
+        const inputManifest = activityMapManifest([], 2);
+        const scheduled = {
+          commandId: commandId(claim.runId, 1),
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "empty-child-mapped",
+          workflowIdPrefix: "wf/empty-child-map",
+          maxInFlight: 2,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "FailFast" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "empty-child-mapped",
+            "wf/empty-child-map",
+            2,
+            "child-workflows",
+            "Cancel",
+            "FailFast"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              workflowType: scheduled.workflowType,
+              taskQueue: scheduled.taskQueue,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              workflowIdPrefix: scheduled.workflowIdPrefix,
+              maxInFlight: scheduled.maxInFlight,
+              parentClosePolicy: scheduled.parentClosePolicy,
+              failureMode: scheduled.failureMode
+            }
+          ]
+        });
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapCompleted",
+          `an empty child map must complete at descriptor creation, got ${history.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const completed = history.events.at(-1)?.data;
+        assert(completed?.kind === "ChildWorkflowMapCompleted", "expected ChildWorkflowMapCompleted");
+        assert(
+          completed.completed.itemCount === 0,
+          "an empty child map reports no items"
+        );
+        const ready = await backend.claimWorkflowTask("empty-child-map-ready", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          ready?.reason === "ChildWorkflowMapCompleted",
+          `an empty child map must wake its parent, got ${String(ready?.reason ?? null)}`
+        );
+      }
+    },
+    {
+      // A run that has reached a terminal event owns no live fanout any more.
+      // Without an abandon-on-close step a closed workflow kept spawning work:
+      // completing one item materialized the next, and the map's own terminal
+      // fact was appended to the run's history *after* the run's terminal
+      // event — exactly what the terminal-commit guard exists to prevent.
+      name: "a closed run abandons its map fanout and appends nothing past its terminal event",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const childType = workflowType("conformance.map-owner", 1);
+        const childCommand = commandId(claim.runId, 1);
+        const childInput = encodePayload({ value: "owner" }, { codec: "Json" });
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          startChildWorkflows: [
+            {
+              commandId: childCommand,
+              workflowType: childType,
+              workflowId: workflowId("wf/map-owner"),
+              taskQueue: "child-workflows",
+              input: childInput,
+              parentClosePolicy: "Cancel",
+              fingerprint: childWorkflowFingerprint(
+                childType,
+                workflowId("wf/map-owner"),
+                payloadDigest(childInput),
+                "child-workflows",
+                "Cancel"
+              )
+            }
+          ]
+        });
+
+        const owner = await backend.claimWorkflowTask("map-owner-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("child-workflows"),
+          registeredWorkflowTypes: [childType],
+          leaseDurationMs: 30_000
+        });
+        assert(owner !== null, "the map owner should be claimable");
+        const inputManifest = activityMapManifest(
+          [{ value: 1 }, { value: 2 }, { value: 3 }, { value: 4 }],
+          4
+        );
+        const mapCommandId = commandId(owner.claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommandId,
+          activityName: "conformance.abandon-map",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "abandoned",
+          maxInFlight: 2,
+          fingerprint: activityMapFingerprint(
+            "conformance.abandon-map",
+            payloadDigest(inputManifest),
+            "abandoned",
+            2,
+            "sha256:test-options"
+          )
+        };
+        // A plain activity of the same run rides along: it is the same defect
+        // class as the map's leftover items — a closed run's leftover work
+        // appending past its own terminal event — and the same close hook
+        // covers both.
+        const plainInput = encodePayload({ value: "plain" }, { codec: "Json" });
+        const plainScheduled = {
+          commandId: commandId(owner.claim.runId, 2),
+          activityName: "conformance.abandon-plain",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          input: plainInput,
+          fingerprint: activityFingerprint(
+            "conformance.abandon-plain",
+            payloadDigest(plainInput),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(owner.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            { data: { kind: "ActivityMapScheduled", scheduled } },
+            { data: { kind: "ActivityScheduled", scheduled: plainScheduled } }
+          ],
+          scheduleActivities: [activityTaskFromScheduled(plainScheduled)],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+
+        const plain = await backend.claimActivityTask("abandon-plain-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.abandon-plain"],
+          leaseDurationMs: 30_000
+        });
+        assert(plain !== null, "the plain activity should be claimable before the run closes");
+
+        const inFlight = await backend.claimActivityTask("abandon-map-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.abandon-map"],
+          leaseDurationMs: 30_000
+        });
+        assert(inFlight !== null, "the map should materialize an item before the run closes");
+
+        // Close the grandparent, which cancels the map's owner mid-fanout.
+        const grandparent = await backend.claimWorkflowTask("map-grandparent-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(grandparent !== null, "the grandparent should be claimable");
+        await backend.commitWorkflowTask(grandparent.claim, {
+          expectedTailEventId: grandparent.replayTargetEventId,
+          appendEvents: [
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ ok: true }, { codec: "Json" })
+              }
+            }
+          ]
+        });
+
+        const afterClose = await backend.claimActivityTask("abandon-map-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.abandon-map"],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          afterClose === null,
+          `a closed run must not keep materializing map items, got ordinal ${String(
+            afterClose?.task.mapItem?.itemOrdinal ?? null
+          )}`
+        );
+
+        const late = await backend.completeActivity({
+          claim: inFlight.claim,
+          result: encodePayload({ value: 10 }, { codec: "Json" })
+        });
+        assert(
+          late.kind === "AlreadyCompleted",
+          `an item of an abandoned map must be fenced, got ${late.kind}`
+        );
+        const latePlain = await backend.completeActivity({
+          claim: plain.claim,
+          result: encodePayload({ value: "plain" }, { codec: "Json" })
+        });
+        assert(
+          latePlain.kind === "AlreadyCompleted",
+          `a plain activity of a closed run must be fenced, got ${latePlain.kind}`
+        );
+
+        const ownerHistory = await backend.streamHistory({
+          runId: owner.claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(20),
+          maxEvents: 20,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          ownerHistory.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,ActivityScheduled,WorkflowCancelled",
+          // Scoped to a non-empty map on purpose. One commit that both
+          // schedules an *empty* map and closes its run still yields
+          // `…,WorkflowCompleted,ActivityMapCompleted`: `DescriptorCreated`
+          // ignores `parentTerminal` by design, because routing it through the
+          // terminal path would roll the whole commit back. That carve-out is
+          // documented in `map-engine.ts` and is not what this case pins.
+          `a non-empty map of a closed run may append nothing past its terminal event, got ${ownerHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+      }
+    },
+    {
+      // `cancelCommands` is a `SPEC.md` §8.2 field TypeScript had no
+      // representation for at all, which is why the map engine's
+      // `ParentCancelled` transition had no producer. Cancelling a map command
+      // tombstones its pending items and closes its descriptor without
+      // appending a parent fact: the commit that carries the cancellation is
+      // already the record of it.
+      name: "cancelling a command withdraws its activity and closes its map descriptor",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const activityInput = encodePayload({ value: "cancelled" }, { codec: "Json" });
+        const activityCommand = commandId(claim.runId, 1);
+        const scheduledActivity = {
+          commandId: activityCommand,
+          activityName: "conformance.cancel-activity",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          input: activityInput,
+          fingerprint: activityFingerprint(
+            "conformance.cancel-activity",
+            payloadDigest(activityInput),
+            "sha256:test-options"
+          )
+        };
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const mapCommandId = commandId(claim.runId, 2);
+        const scheduledMap = {
+          commandId: mapCommandId,
+          activityName: "conformance.cancel-map",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "cancelled-map",
+          maxInFlight: 1,
+          fingerprint: activityMapFingerprint(
+            "conformance.cancel-map",
+            payloadDigest(inputManifest),
+            "cancelled-map",
+            1,
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            { data: { kind: "ActivityScheduled", scheduled: scheduledActivity } },
+            { data: { kind: "ActivityMapScheduled", scheduled: scheduledMap } }
+          ],
+          scheduleActivities: [activityTaskFromScheduled(scheduledActivity)],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduledMap.commandId,
+              activityName: scheduledMap.activityName,
+              taskQueue: scheduledMap.taskQueue,
+              retryPolicy: scheduledMap.retryPolicy,
+              startToCloseTimeoutMs: scheduledMap.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduledMap.heartbeatTimeoutMs,
+              inputManifest: scheduledMap.inputManifest,
+              resultManifestName: scheduledMap.resultManifestName,
+              maxInFlight: scheduledMap.maxInFlight
+            }
+          ],
+          upsertWaits: [
+            {
+              waitId: waitId(`${claim.runId}:cancel-wake`),
+              runId: claim.runId,
+              commandId: commandId(claim.runId, 3),
+              kind: "Timer",
+              key: "cancel-wake",
+              readyAt: timestampMs(0)
+            }
+          ]
+        });
+
+        const beforeCancel = await backend.claimActivityTask("cancel-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.cancel-activity", "conformance.cancel-map"],
+          leaseDurationMs: 30_000
+        });
+        assert(beforeCancel !== null, "the commands should have claimable work before cancelling");
+
+        // The run needs a second workflow task to carry the cancellation, so
+        // the first commit also armed a due timer to wake it.
+        const fired = await backend.fireDueTimers({
+          namespace: namespace(),
+          now: timestampMs(1_000),
+          limit: 8
+        });
+        assert(fired.fired === 1, "the arming timer should fire");
+        const waker = await backend.claimWorkflowTask("cancel-committer", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(waker !== null, "the fired timer should wake the run");
+
+        await backend.commitWorkflowTask(waker.claim, {
+          expectedTailEventId: waker.replayTargetEventId,
+          cancelCommands: [activityCommand, mapCommandId]
+        });
+
+        const afterCancel = await backend.claimActivityTask("cancel-worker-3", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.cancel-activity", "conformance.cancel-map"],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          afterCancel === null,
+          `cancelling both commands must leave no claimable work, got ${afterCancel?.task.activityId}`
+        );
+
+        const historyAfter = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(20),
+          maxEvents: 20,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          !historyAfter.events.some(
+            (event) =>
+              event.eventType === "ActivityMapCompleted" ||
+              event.eventType === "ActivityMapFailed"
+          ),
+          `a cancelled map appends no parent fact, got ${historyAfter.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+      }
+    },
+    {
+      // The other half of `cancelCommands`, and the half an activity map
+      // cannot reach. `ParentCancelled` emits only `AbandonPendingItems` and
+      // `MarkDescriptorTerminal`, and every provider implements
+      // `AbandonPendingItems` for a child map as a no-op that delegates to
+      // `CancelChildren` — which this event does not emit. Closing the
+      // descriptor and stopping there left the children the map had already
+      // started running with nothing waiting for them. This is the path
+      // losing-branch `select` cancellation will take.
+      name: "cancelling a child workflow map command cancels the children it started",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const prefix = "wf/cancel-child-map";
+        const childType = workflowType("conformance.cancel-child-map", 1);
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const mapCommandId = commandId(claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommandId,
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "cancel-child-map",
+          workflowIdPrefix: prefix,
+          maxInFlight: 2,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "CollectAll" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "cancel-child-map",
+            prefix,
+            2,
+            "child-workflows",
+            "Cancel",
+            "CollectAll"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              workflowType: scheduled.workflowType,
+              taskQueue: scheduled.taskQueue,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              workflowIdPrefix: scheduled.workflowIdPrefix,
+              maxInFlight: scheduled.maxInFlight,
+              parentClosePolicy: scheduled.parentClosePolicy,
+              failureMode: scheduled.failureMode
+            }
+          ],
+          upsertWaits: [
+            {
+              waitId: waitId(`${claim.runId}:cancel-child-map-wake`),
+              runId: claim.runId,
+              commandId: commandId(claim.runId, 2),
+              kind: "Timer",
+              key: "cancel-child-map-wake",
+              readyAt: timestampMs(0)
+            }
+          ]
+        });
+
+        const childRunIds: RunId[] = [];
+        for (const ordinal of [0, 1]) {
+          const started = await backend.startWorkflow({
+            namespace: namespace(),
+            workflowId: workflowId(`${prefix}/${ordinal}`),
+            workflowType: childType,
+            taskQueue: taskQueue("child-workflows"),
+            input: encodePayload({ value: "probe" }, { codec: "Json" })
+          });
+          assert(
+            started.kind === "AlreadyStarted",
+            `the map should have started ordinal ${ordinal}`
+          );
+          childRunIds.push(started.runId);
+        }
+
+        const fired = await backend.fireDueTimers({
+          namespace: namespace(),
+          now: timestampMs(1_000),
+          limit: 8
+        });
+        assert(fired.fired === 1, "the arming timer should fire");
+        const waker = await backend.claimWorkflowTask("cancel-child-map-committer", {
+          namespace: namespace(),
+          taskQueue: taskQueue("workflows"),
+          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
+          leaseDurationMs: 30_000
+        });
+        assert(waker !== null, "the fired timer should wake the run");
+        await backend.commitWorkflowTask(waker.claim, {
+          expectedTailEventId: waker.replayTargetEventId,
+          cancelCommands: [mapCommandId]
+        });
+
+        for (const [ordinal, childRunId] of childRunIds.entries()) {
+          const history = await backend.streamHistory({
+            runId: childRunId,
+            afterEventId: eventId(0),
+            upToEventId: eventId(10),
+            maxEvents: 10,
+            maxBytes: Number.MAX_SAFE_INTEGER
+          });
+          assert(
+            history.events.map((event) => event.eventType).join(",") ===
+              "WorkflowStarted,WorkflowCancelled",
+            `child ${ordinal} of a cancelled map must not be orphaned, got ${history.events
+              .map((event) => event.eventType)
+              .join(",")}`
+          );
+          const cancelled = history.events.at(-1)?.data;
+          assert(cancelled?.kind === "WorkflowCancelled", "expected WorkflowCancelled");
+          assert(
+            cancelled.reason === mapCommandCancelledReason(mapCommandId),
+            `unpinned map-cancellation reason: ${cancelled.reason}`
+          );
+        }
+
+        const parentHistory = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(20),
+          maxEvents: 20,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          !parentHistory.events.some(
+            (event) =>
+              event.eventType === "ChildWorkflowMapCompleted" ||
+              event.eventType === "ChildWorkflowMapFailed"
+          ),
+          `a cancelled child map appends no parent fact, got ${parentHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+      }
+    },
+    {
+      // Map items used to be exempt from the timeout scanner entirely, in all
+      // three providers: `activityTimeoutDeadline` returned `+Infinity` for any
+      // task with a `mapItem`, so a hung item was never recovered even though
+      // the descriptor carries start-to-close and heartbeat timeouts and every
+      // materialized item copies them. A lapsed deadline is an engine event,
+      // not a local reschedule, so it routes through the map engine and ends
+      // the map exactly as an exhausted explicit failure does.
+      name: "a map item that misses its start-to-close deadline times out and fails its map",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
+        const mapCommandId = commandId(claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommandId,
+          activityName: "conformance.map-timeout",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.exponential({
+            initialIntervalMs: 0,
+            maxIntervalMs: 0,
+            maxAttempts: 2
+          }),
+          startToCloseTimeoutMs: 0,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "map-timeout",
+          maxInFlight: 1,
+          fingerprint: activityMapFingerprint(
+            "conformance.map-timeout",
+            payloadDigest(inputManifest),
+            "map-timeout",
+            1,
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+
+        const item = await backend.claimActivityTask("map-timeout-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-timeout"],
+          leaseDurationMs: 30_000
+        });
+        assert(item !== null, "the first map item should be claimable");
+        assert(item.task.mapItem?.itemOrdinal === 0, "expected the first ordinal");
+
+        const early = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: 0,
+          limit: 8
+        });
+        assert(early.timedOut === 0, "a map item must not time out before its deadline");
+
+        const firstTimeout = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Number.MAX_SAFE_INTEGER,
+          limit: 8
+        });
+        assert(
+          firstTimeout.timedOut === 1,
+          `a hung map item must be reclaimed by the timeout scanner, got ${firstTimeout.timedOut}`
+        );
+
+        // A lapsed deadline has already paced this attempt, so the retry the
+        // engine schedules is immediately claimable rather than delayed by the
+        // policy backoff, and the map is still running.
+        const midHistory = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          midHistory.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled",
+          `a retryable timeout must not end the map, got ${midHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const retried = await backend.claimActivityTask("map-timeout-worker-retry", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-timeout"],
+          leaseDurationMs: 30_000
+        });
+        assert(retried !== null, "a timed-out map item must be immediately reclaimable");
+        assert(
+          retried.task.mapItem?.itemOrdinal === 0 && retried.task.attempt === 2,
+          `the retry must be ordinal 0 attempt 2, got ordinal ${String(
+            retried.task.mapItem?.itemOrdinal ?? null
+          )} attempt ${retried.task.attempt}`
+        );
+
+        const due = await backend.timeoutDueActivities({
+          namespace: namespace(),
+          now: Number.MAX_SAFE_INTEGER,
+          limit: 8
+        });
+        assert(
+          due.timedOut === 1,
+          `the exhausting timeout must also be reclaimed, got ${due.timedOut}`
+        );
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
+          `a timed-out map item must fail its map, got ${history.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+        const failed = history.events.at(-1)?.data;
+        assert(failed?.kind === "ActivityMapFailed", "expected ActivityMapFailed");
+        assert(
+          failed.failed.failure.errorType === "durust.activity_timed_out",
+          `unexpected map timeout error type: ${failed.failed.failure.errorType}`
+        );
+        assert(
+          failed.failed.failure.message.includes("start-to-close timed out"),
+          `unexpected map timeout message: ${failed.failed.failure.message}`
+        );
+
+        const late = await backend.completeActivity({
+          claim: retried.claim,
+          result: encodePayload({ value: 10 }, { codec: "Json" })
+        });
+        assert(
+          late.kind === "AlreadyCompleted",
+          `a timed-out map item must be fenced, got ${late.kind}`
+        );
+        const nextItem = await backend.claimActivityTask("map-timeout-worker-2", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.map-timeout"],
+          leaseDurationMs: 30_000
+        });
+        assert(nextItem === null, "a failed map must not admit its remaining ordinals");
       }
     },
     {
@@ -2905,6 +3747,286 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
   ];
 }
 
+/**
+ * The leftover work a pre-upgrade database can hold under a closed run: one
+ * live map descriptor with a claimed item, and one claimed plain activity of
+ * the same run.
+ */
+export interface TerminalRunLeftovers {
+  readonly runId: RunId;
+  readonly itemClaim: ActivityTaskClaim;
+  readonly plainClaim: ActivityTaskClaim;
+}
+
+/**
+ * Schedule and claim that leftover work, stopping short of closing the run —
+ * which no provider will do without also abandoning the work, and which each
+ * repair test therefore forges with its own raw SQL.
+ *
+ * A one-item map on purpose: the engine consults `parentTerminal` only on a
+ * transition that ends the map, so a two-item map's first completion never
+ * reaches the guard at all.
+ */
+export async function scheduleTerminalRunLeftovers(
+  backend: DurableBackend,
+  label: string
+): Promise<TerminalRunLeftovers> {
+  const type = workflowType(`${label}.upgrade-repair`, 1);
+  await backend.startWorkflow({
+    namespace: namespace(),
+    workflowId: workflowId(`wf/${label}-upgrade-repair`),
+    workflowType: type,
+    taskQueue: taskQueue("workflows"),
+    input: encodePayload({ value: 1 }, { codec: "Json" })
+  });
+  const claimed = await backend.claimWorkflowTask("repair-worker", {
+    namespace: namespace(),
+    taskQueue: taskQueue("workflows"),
+    registeredWorkflowTypes: [type],
+    leaseDurationMs: 30_000
+  });
+  assert(claimed !== null, "expected a workflow claim");
+
+  const inputManifest = activityMapManifest([{ value: 1 }], 1);
+  const mapTask = {
+    mapCommandId: commandId(claimed.claim.runId, 1),
+    activityName: `${label}.repair-item`,
+    taskQueue: "activities",
+    retryPolicy: RetryPolicy.none(),
+    startToCloseTimeoutMs: null,
+    heartbeatTimeoutMs: null,
+    inputManifest,
+    resultManifestName: "repaired",
+    maxInFlight: 1
+  };
+  const plainInput = encodePayload({ value: "plain" }, { codec: "Json" });
+  const plainScheduled = {
+    commandId: commandId(claimed.claim.runId, 2),
+    activityName: `${label}.repair-plain`,
+    taskQueue: "activities",
+    retryPolicy: RetryPolicy.none(),
+    startToCloseTimeoutMs: null,
+    heartbeatTimeoutMs: null,
+    input: plainInput,
+    fingerprint: activityFingerprint(
+      `${label}.repair-plain`,
+      payloadDigest(plainInput),
+      "sha256:test-options"
+    )
+  };
+  await backend.commitWorkflowTask(claimed.claim, {
+    expectedTailEventId: eventId(1),
+    appendEvents: [
+      {
+        data: {
+          kind: "ActivityMapScheduled",
+          scheduled: {
+            ...mapTask,
+            commandId: mapTask.mapCommandId,
+            fingerprint: activityMapFingerprint(
+              mapTask.activityName,
+              payloadDigest(inputManifest),
+              "repaired",
+              1,
+              "sha256:test-options"
+            )
+          }
+        }
+      },
+      { data: { kind: "ActivityScheduled", scheduled: plainScheduled } }
+    ],
+    scheduleActivities: [activityTaskFromScheduled(plainScheduled)],
+    scheduleActivityMaps: [mapTask]
+  });
+
+  const claims = new Map<string, ActivityTaskClaim>();
+  for (const worker of ["repair-item-worker", "repair-plain-worker"]) {
+    const claimedActivity = await backend.claimActivityTask(worker, {
+      namespace: namespace(),
+      taskQueue: taskQueue("activities"),
+      registeredActivityNames: [mapTask.activityName, plainScheduled.activityName],
+      leaseDurationMs: 30_000
+    });
+    assert(claimedActivity !== null, "expected both activities to be claimable");
+    claims.set(
+      claimedActivity.task.mapItem === null ? "plain" : "item",
+      claimedActivity.claim
+    );
+  }
+  const itemClaim = claims.get("item");
+  const plainClaim = claims.get("plain");
+  assert(
+    itemClaim !== undefined && plainClaim !== undefined,
+    "expected one map item and one plain activity"
+  );
+  return { runId: claimed.claim.runId, itemClaim, plainClaim };
+}
+
+/**
+ * What a live map descriptor under a closed run does before the repair, and
+ * why the state is unrecoverable rather than merely wrong.
+ *
+ * Asserted identically on every provider so the two repairs cannot drift: a
+ * fix applied at more than one call site needs a test per site, and one
+ * passing test is evidence about one path.
+ */
+export async function assertTerminalRunLeftoversArePoisoned(
+  backend: DurableBackend,
+  leftovers: TerminalRunLeftovers
+): Promise<void> {
+  await assertRejects(
+    () =>
+      backend.completeActivity({
+        claim: leftovers.itemClaim,
+        result: encodePayload({ value: 10 }, { codec: "Json" })
+      }),
+    "terminal workflow rejects workflow-visible mutations"
+  );
+  // The scanner runs its batch as one unit, so the same reject takes down
+  // every activity in the namespace rather than just this map's item.
+  await assertRejects(
+    () =>
+      backend.timeoutDueActivities({
+        namespace: namespace(),
+        now: Number.MAX_SAFE_INTEGER,
+        limit: 8
+      }),
+    "terminal workflow rejects workflow-visible mutations"
+  );
+}
+
+/**
+ * What the repair must leave behind, identically on every provider: the map's
+ * item fenced, the scanner working again, and — the half the two repairs used
+ * to disagree on — the run's pending *plain* activity fenced too, so it cannot
+ * append `ActivityCompleted` past the run's terminal event.
+ */
+export async function assertTerminalRunLeftoversAreRepaired(
+  backend: DurableBackend,
+  leftovers: TerminalRunLeftovers
+): Promise<void> {
+  const item = await backend.completeActivity({
+    claim: leftovers.itemClaim,
+    result: encodePayload({ value: 10 }, { codec: "Json" })
+  });
+  assert(
+    item.kind === "AlreadyCompleted",
+    `a repaired map item must be fenced, got ${item.kind}`
+  );
+  const plain = await backend.completeActivity({
+    claim: leftovers.plainClaim,
+    result: encodePayload({ value: "plain" }, { codec: "Json" })
+  });
+  assert(
+    plain.kind === "AlreadyCompleted",
+    `a repaired plain activity must be fenced, got ${plain.kind}`
+  );
+  const scanned = await backend.timeoutDueActivities({
+    namespace: namespace(),
+    now: Number.MAX_SAFE_INTEGER,
+    limit: 8
+  });
+  assert(
+    scanned.timedOut === 0,
+    `a repaired namespace must scan cleanly, got ${scanned.timedOut}`
+  );
+}
+
+/** A closed run whose only leftover is a pending plain activity. */
+export interface TerminalRunPlainLeftover {
+  readonly runId: RunId;
+  readonly plainClaim: ActivityTaskClaim;
+}
+
+/**
+ * Schedule and claim a plain activity with **no map anywhere on the run**.
+ *
+ * The scenario exists to isolate one clause of the repair's probe. With a live
+ * map descriptor present the run is selected by the descriptor clause and its
+ * plain activities get abandoned as a side effect, so narrowing the probe to
+ * descriptors only changes nothing and the plain-activity clause is dead
+ * weight no test can distinguish from a working one.
+ */
+export async function scheduleTerminalRunPlainLeftover(
+  backend: DurableBackend,
+  label: string
+): Promise<TerminalRunPlainLeftover> {
+  const type = workflowType(`${label}.plain-repair`, 1);
+  await backend.startWorkflow({
+    namespace: namespace(),
+    workflowId: workflowId(`wf/${label}-plain-repair`),
+    workflowType: type,
+    taskQueue: taskQueue("workflows"),
+    input: encodePayload({ value: 1 }, { codec: "Json" })
+  });
+  const claimed = await backend.claimWorkflowTask("plain-repair-worker", {
+    namespace: namespace(),
+    taskQueue: taskQueue("workflows"),
+    registeredWorkflowTypes: [type],
+    leaseDurationMs: 30_000
+  });
+  assert(claimed !== null, "expected a workflow claim");
+  const input = encodePayload({ value: "plain" }, { codec: "Json" });
+  const scheduled = {
+    commandId: commandId(claimed.claim.runId, 1),
+    activityName: `${label}.plain-repair-activity`,
+    taskQueue: "activities",
+    retryPolicy: RetryPolicy.none(),
+    startToCloseTimeoutMs: null,
+    heartbeatTimeoutMs: null,
+    input,
+    fingerprint: activityFingerprint(
+      `${label}.plain-repair-activity`,
+      payloadDigest(input),
+      "sha256:test-options"
+    )
+  };
+  await backend.commitWorkflowTask(claimed.claim, {
+    expectedTailEventId: eventId(1),
+    appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+    scheduleActivities: [activityTaskFromScheduled(scheduled)]
+  });
+  const activity = await backend.claimActivityTask("plain-repair-activity-worker", {
+    namespace: namespace(),
+    taskQueue: taskQueue("activities"),
+    registeredActivityNames: [scheduled.activityName],
+    leaseDurationMs: 30_000
+  });
+  assert(activity !== null, "expected the plain activity to be claimable");
+  return { runId: claimed.claim.runId, plainClaim: activity.claim };
+}
+
+/**
+ * The repair must fence a closed run's pending plain activity even when the run
+ * owns no map at all, and must leave nothing appended past its terminal event.
+ */
+export async function assertTerminalRunPlainLeftoverIsRepaired(
+  backend: DurableBackend,
+  leftover: TerminalRunPlainLeftover
+): Promise<void> {
+  const completed = await backend.completeActivity({
+    claim: leftover.plainClaim,
+    result: encodePayload({ value: "plain" }, { codec: "Json" })
+  });
+  assert(
+    completed.kind === "AlreadyCompleted",
+    `a repaired plain activity must be fenced with no map present, got ${completed.kind}`
+  );
+  const history = await backend.streamHistory({
+    runId: leftover.runId,
+    afterEventId: eventId(0),
+    upToEventId: eventId(20),
+    maxEvents: 20,
+    maxBytes: Number.MAX_SAFE_INTEGER
+  });
+  assert(
+    !history.events.some((event) => event.eventType === "ActivityCompleted"),
+    `nothing may be appended past the terminal event, got ${history.events
+      .map((event) => event.eventType)
+      .join(",")}`
+  );
+}
+
 async function startedAndClaimed(
   factory: () => DurableBackend
 ): Promise<{ backend: DurableBackend; claim: WorkflowTaskClaim }> {
@@ -3057,6 +4179,13 @@ export function workflowVisibleMutationCommitCases(
             failureMode: "CollectAll"
           }
         ]
+      }
+    },
+    {
+      name: "cancelCommands",
+      commit: {
+        expectedTailEventId,
+        cancelCommands: [activityCommand]
       }
     },
     {

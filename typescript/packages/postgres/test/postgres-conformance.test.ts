@@ -51,8 +51,13 @@ import {
 } from "@durust/payload";
 import { PostgresBackend } from "@durust/postgres";
 import {
+  assertTerminalRunLeftoversArePoisoned,
+  assertTerminalRunLeftoversAreRepaired,
+  assertTerminalRunPlainLeftoverIsRepaired,
   basicProviderConformanceCases,
   prepareWorkflowTaskCommit,
+  scheduleTerminalRunLeftovers,
+  scheduleTerminalRunPlainLeftover,
   workflowVisibleMutationCommitCases
 } from "@durust/testing";
 
@@ -61,6 +66,7 @@ const describePostgres = postgresUrl === undefined ? describe.skip : describe;
 const managedBackends: PostgresBackend[] = [];
 const roots: string[] = [];
 let tableCounter = 0;
+const managedTableNames: string[] = [];
 
 // Every tracked backend owns its own single-connection pool, and each test
 // builds at least one. Draining only in `afterAll` therefore holds one server
@@ -73,6 +79,19 @@ afterEach(async () => {
   for (const backend of managedBackends.splice(0)) {
     await backend.destroy().catch(() => undefined);
   }
+  const tableNames = managedTableNames.splice(0);
+  if (tableNames.length === 0 || postgresUrl === undefined) {
+    return;
+  }
+  await withPostgresPool(async (pool) => {
+    for (const tableName of tableNames) {
+      for (const suffix of POSTGRES_TABLE_SUFFIXES) {
+        await pool
+          .query(`drop table if exists ${derivedQuoteIdentifier(tableName, suffix)} cascade`)
+          .catch(() => undefined);
+      }
+    }
+  }).catch(() => undefined);
 });
 
 afterAll(async () => {
@@ -236,6 +255,109 @@ describePostgres("PostgresBackend normalized schema", () => {
     const reopenedDefinitions = await readIndexDefinitions(expectedIndexNames);
     expect([...reopenedDefinitions.keys()].sort()).toEqual([...expectedIndexNames].sort());
     assertNormalizedProjectionIndexDefinitions(tableName, reopenedDefinitions);
+
+  });
+
+  // The timeout index had to be renamed, not edited: its old predicate excluded
+  // map items and `create index if not exists` cannot widen a partial index.
+  // Asserting the new name exists on a table this suite *built with the new
+  // code* proves nothing about the migration, so this case stands up the
+  // pre-upgrade schema first — the old index, under the old name, with the old
+  // predicate — and then opens a backend over it.
+  it("migrates a pre-upgrade timeout index additively", async () => {
+    const tableName = nextTableName("timeout_index_migration");
+    const first = new PostgresBackend({ url: requirePostgresUrl(), tableName, poolSize: 1 });
+    await first.statsSnapshot();
+    await first.close();
+
+    const oldName = derivedIdentifier(tableName, "activity_tasks_timeout_due_idx");
+    const newName = derivedIdentifier(tableName, "activity_tasks_timeout_due_all_idx");
+    await withPostgresPool(async (pool) => {
+      await pool.query(`drop index if exists ${newName}`);
+      await pool.query(`
+        create index ${oldName}
+        on ${derivedIdentifier(tableName, "activity_tasks")}(
+          namespace,
+          timeout_deadline_at_ms,
+          activity_id
+        )
+        where terminal_event_id is null
+          and claim_token is not null
+          and map_command_key is null
+          and timeout_deadline_at_ms is not null
+      `);
+    });
+    const before = await readIndexDefinitions([oldName, newName]);
+    expect([...before.keys()]).toEqual([oldName]);
+
+    const reopened = trackedPostgresBackendWithTable(tableName);
+    await reopened.statsSnapshot();
+
+    const after = await readIndexDefinitions([oldName, newName]);
+    // The widened index is created...
+    expect(after.get(newName) ?? "").toContain("timeout_deadline_at_ms");
+    expect(after.get(newName) ?? "").not.toContain("map_command_key");
+    // ...and the superseded one is left alone, so a rolling deploy cannot make
+    // the two versions fight over it. Dropping it here would have old pods
+    // recreate it on every restart, each rebuild locking the hottest table in
+    // the schema.
+    expect(after.get(oldName) ?? "").toContain("map_command_key");
+  });
+});
+
+describePostgres("PostgresBackend upgrade repair", () => {
+  // The Postgres half of the same repair. It exists because the fix has two
+  // call sites and the SQLite test is evidence about one of them: neutering
+  // both repairs used to fail one SQLite test and leave all 116 Postgres tests
+  // green. The assertions are `@durust/testing`'s, byte-for-byte the ones the
+  // SQLite test runs, so the two repairs cannot drift apart again.
+  async function closeRunWithoutAbandoning(
+    tableName: string,
+    runIdValue: string
+  ): Promise<void> {
+    await withPostgresPool(async (pool) => {
+      await pool.query(
+        `update ${derivedQuoteIdentifier(tableName, "workflow_runs")}
+         set terminal = true, ready_reason = null
+         where run_id = $1`,
+        [runIdValue]
+      );
+      const maps = await pool.query<{ readonly terminal: boolean }>(
+        `select terminal from ${derivedQuoteIdentifier(tableName, "activity_maps")}`
+      );
+      expect(maps.rows.map((row) => row.terminal)).toEqual([false]);
+    });
+  }
+
+  it("a closed run's leftover work poisons every item path, and reopening repairs it", async () => {
+    const tableName = nextTableName("upgrade_repair");
+    const live = trackedPostgresBackendWithTable(tableName);
+    const leftovers = await scheduleTerminalRunLeftovers(live, "postgres");
+
+    // Poisoned *under* an already-open backend: the repair runs once, on the
+    // first operation that awaits `#ensureReady`.
+    await closeRunWithoutAbandoning(tableName, String(leftovers.runId));
+    await assertTerminalRunLeftoversArePoisoned(live, leftovers);
+
+    const repaired = trackedPostgresBackendWithTable(tableName);
+    await assertTerminalRunLeftoversAreRepaired(repaired, leftovers);
+  });
+
+  it("repairs a closed run whose only leftover is a plain activity", async () => {
+    const tableName = nextTableName("upgrade_repair_plain");
+    const live = trackedPostgresBackendWithTable(tableName);
+    const leftover = await scheduleTerminalRunPlainLeftover(live, "postgres");
+    await withPostgresPool(async (pool) => {
+      await pool.query(
+        `update ${derivedQuoteIdentifier(tableName, "workflow_runs")}
+         set terminal = true, ready_reason = null
+         where run_id = $1`,
+        [String(leftover.runId)]
+      );
+    });
+
+    const repaired = trackedPostgresBackendWithTable(tableName);
+    await assertTerminalRunPlainLeftoverIsRepaired(repaired, leftover);
   });
 });
 
@@ -2747,9 +2869,38 @@ async function forgedTerminalPostgresClaim(
   return { backend, claim: claimed.claim };
 }
 
+// Every derived table a `PostgresBackend` owns, in drop order. Kept beside
+// `nextTableName` so a schema addition that is not cleaned up shows up here.
+const POSTGRES_TABLE_SUFFIXES = [
+  "child_workflow_map_items",
+  "child_workflow_maps",
+  "activity_map_items",
+  "activity_maps",
+  "activity_tasks",
+  "signals",
+  "waits",
+  "query_projections",
+  "workflow_ids",
+  "workflow_runs",
+  "history_events",
+  "counters"
+] as const;
+
+/**
+ * Allocate a table name and record it for teardown.
+ *
+ * `afterEach` destroying tracked *backends* is not enough: a test that throws
+ * before it constructs its tracked backend — which is exactly what every
+ * mutation run does — leaves a full schema behind. Recording the name at
+ * allocation covers the failing path too, and teardown drops each derived
+ * table by its exact name rather than by pattern, so it can never reach a
+ * table this file did not create.
+ */
 function nextTableName(label: string): string {
   const safeLabel = label.replace(/[^a-z0-9_]/giu, "_").toLowerCase();
-  return `durust_ts_${safeLabel}_${process.pid}_${tableCounter++}`;
+  const tableName = `durust_ts_${safeLabel}_${process.pid}_${tableCounter++}`;
+  managedTableNames.push(tableName);
+  return tableName;
 }
 
 function tempRoot(label: string): string {
@@ -3269,7 +3420,7 @@ function normalizedProjectionIndexNames(tableName: string): readonly string[] {
     "signals_unconsumed_inbox_idx",
     "activity_tasks_unclaimed_claim_idx",
     "activity_tasks_expired_claim_idx",
-    "activity_tasks_timeout_due_idx"
+    "activity_tasks_timeout_due_all_idx"
   ].map((suffix) => derivedIdentifier(tableName, suffix));
 }
 
@@ -3310,13 +3461,26 @@ function assertNormalizedProjectionIndexDefinitions(
     "claim_token is not null",
     "claim_expires_at_ms is not null"
   ]);
-  expectIndexDefinition(definitions, derivedIdentifier(tableName, "activity_tasks_timeout_due_idx"), [
-    "where",
-    "terminal_event_id is null",
-    "claim_token is not null",
-    "map_command_key is null",
-    "timeout_deadline_at_ms is not null"
-  ]);
+  // Map items are no longer exempt from the timeout scanner, so this index
+  // must *not* exclude them. A partial index's predicate cannot be altered in
+  // place, so the narrower `activity_tasks_timeout_due_idx` was renamed rather
+  // than edited. It is deliberately left behind rather than dropped; the
+  // migration is asserted on a genuine pre-upgrade schema by
+  // `migrates a pre-upgrade timeout index additively`.
+  expectIndexDefinition(
+    definitions,
+    derivedIdentifier(tableName, "activity_tasks_timeout_due_all_idx"),
+    [
+      "where",
+      "terminal_event_id is null",
+      "claim_token is not null",
+      "timeout_deadline_at_ms is not null"
+    ]
+  );
+  expect(
+    definitions.get(derivedIdentifier(tableName, "activity_tasks_timeout_due_all_idx")) ?? "",
+    "the timeout index must cover map items"
+  ).not.toContain("map_command_key");
 }
 
 function expectIndexDefinition(

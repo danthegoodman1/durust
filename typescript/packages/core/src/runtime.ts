@@ -47,6 +47,7 @@ import {
   type TimerStarted
 } from "./history.js";
 import type { HistoryEvent } from "./history.js";
+import { assertMapInputManifest } from "./map-manifest.js";
 import { RetryPolicy, type ActivityCallOptions, type ChildWorkflowOptions } from "./options.js";
 import { decodePayload, digestBytes, encodePayload, payloadDigest, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { commandId, eventId, timestampMs, waitId, type CommandId, type DurableInput, type EventId, type RunId, type WaitId, type WorkflowId } from "./types.js";
@@ -2775,6 +2776,9 @@ class WorkflowRuntimeContext {
     activityDefinition: A,
     options: ActivityMapOptions<ActivityInput<A>>
   ): ActivityMapScheduled {
+    // Before the command id, so a rejected manifest does not burn a command
+    // sequence number and leave the next command renumbered on retry.
+    assertMapInputManifest("activityMap inputManifest", options.inputManifest);
     const id = this.#nextCommandId();
     // The manifest arrives already encoded, so this builder runs less user code
     // than the others. It is guarded on the same terms anyway: the hazard is the
@@ -2782,9 +2786,14 @@ class WorkflowRuntimeContext {
     this.#beginUserCodeFrame("activityMap", activityDefinition.name);
     try {
       const taskQueue = options.taskQueue ?? this.#defaultActivityTaskQueue;
-      const retryPolicy = RetryPolicy.none();
-      const startToCloseTimeoutMs = null;
-      const heartbeatTimeoutMs = null;
+      // Item retry and deadlines are caller-supplied, matching Rust's
+      // `activity_map` builder, which carries a full `ActivityOptions`. The
+      // defaults are the values that were hardcoded here before they were
+      // configurable, so a workflow that supplies none of the three produces a
+      // byte-identical `activityOptionsDigest` and replays unchanged.
+      const retryPolicy = options.retry ?? RetryPolicy.none();
+      const startToCloseTimeoutMs = options.startToCloseTimeoutMs ?? null;
+      const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? null;
       const fingerprint = activityMapFingerprint(
         activityDefinition.name,
         payloadDigest(options.inputManifest),
@@ -2824,6 +2833,7 @@ class WorkflowRuntimeContext {
     if (options.workflowIdPrefix.length === 0) {
       throw new Error("childWorkflowMap workflowIdPrefix must not be empty");
     }
+    assertMapInputManifest("childWorkflowMap inputManifest", options.inputManifest);
     const id = this.#nextCommandId();
     this.#beginUserCodeFrame("childWorkflowMap", workflowDefinition.workflowType.name);
     try {

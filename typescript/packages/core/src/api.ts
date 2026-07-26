@@ -15,7 +15,8 @@ import type {
   ActivityCallOptions,
   ChildWorkflowMapFailureMode,
   ChildWorkflowOptions,
-  ParentClosePolicy
+  ParentClosePolicy,
+  RetryPolicy
 } from "./options.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { assertDurableInputValue } from "./internal.js";
@@ -518,6 +519,25 @@ export interface ActivityMapOptions<Input extends DurableInputObject> {
   readonly resultManifest: string;
   readonly taskQueue?: string;
   readonly maxInFlight: number;
+  /**
+   * Retry policy for each item attempt. Defaults to `RetryPolicy.none()` — one
+   * attempt — which is the same default a map item has always had, and the same
+   * one Rust's `activity_map` builder gets from `ActivityOptions::default()`.
+   *
+   * **Set this if items can be slow or workers can die mid-item.** With one
+   * attempt and no explicit timeout below, an item still carries the implicit
+   * lease-length heartbeat deadline every claimed activity gets, so a worker
+   * that dies holding an item — or an item that simply outruns the lease
+   * without heartbeating — exhausts its only attempt and fails the whole map.
+   * That is what a plain `callActivity` with default options does too; map
+   * items were the anomaly in being exempt from the deadline scanner entirely,
+   * which meant a dead worker's item was silently re-offered forever instead.
+   */
+  readonly retry?: RetryPolicy;
+  /** Per-item start-to-close timeout. `undefined` means no explicit deadline. */
+  readonly startToCloseTimeoutMs?: number;
+  /** Per-item heartbeat timeout. `undefined` means no explicit deadline. */
+  readonly heartbeatTimeoutMs?: number;
 }
 
 export interface ActivityMapHandle<Output> {

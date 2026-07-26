@@ -7,6 +7,7 @@ import {
   historyEventType,
   itemRetryDecision,
   itemRetryDelayMs,
+  mapCommandCancelledReason,
   mapRejectMessage,
   outcomeCounts,
   readMapManifestItems,
@@ -15,6 +16,7 @@ import {
   step as stepMap,
   workflowTaskCommitHasWorkflowVisibleMutations,
   writeMapManifest,
+  type ItemAttemptFailureKind,
   type ItemRetryDecision,
   type MapEffect,
   type MapEvent,
@@ -883,6 +885,9 @@ export class PostgresBackend implements DurableBackend {
         }
       }
     }
+    for (const cancelled of commit.cancelCommands ?? []) {
+      this.#cancelCommandOperationalState(cancelled);
+    }
     for (const task of commit.scheduleActivities ?? []) {
       const activityState: ActivityState = {
         namespace: state.namespace,
@@ -919,6 +924,7 @@ export class PostgresBackend implements DurableBackend {
       this.#notifyParentOfChildTerminal(state.parent, childTerminal);
     }
     if (state.terminal) {
+      this.#abandonWorkForClosedRun(state);
       this.#cancelChildrenForClosedParent(state);
     }
     if (targetedProjectionUpdates) {
@@ -1047,6 +1053,9 @@ export class PostgresBackend implements DurableBackend {
         parentLink === null &&
         await this.#hasCancelableOpenChildren(client, claim.runId)
       ) {
+        return null;
+      }
+      if (terminal && await this.#hasOpenMapDescriptors(client, claim.runId)) {
         return null;
       }
 
@@ -1935,6 +1944,7 @@ export class PostgresBackend implements DurableBackend {
   }
 
   async timeoutDueActivities(req: TimeoutDueActivitiesRequest): Promise<TimeoutDueActivitiesOutcome> {
+    let rewriteScope = activityTimeoutRewriteScope;
     return this.#withState(async (client) => {
       const due = await this.#selectTimedOutActivityIds(client, req);
       let timedOut = 0;
@@ -1944,13 +1954,30 @@ export class PostgresBackend implements DurableBackend {
           activity === undefined ||
           activity.namespace !== String(req.namespace) ||
           activity.claim === null ||
-          activity.terminalEventId !== null ||
-          activity.task.mapItem !== null
+          activity.terminalEventId !== null
         ) {
           continue;
         }
         const timeout = activityTimeoutDeadline(activity);
         if (timeout.deadline > Number(req.now)) {
+          continue;
+        }
+        // A map item's lapsed deadline is an engine event, not a local
+        // reschedule: only the engine knows whether the map is still running,
+        // and it owns both the retried attempt and the map's terminal failure.
+        // Its effects reach descriptor and item rows, which the narrow timeout
+        // rewrite scope does not cover, so the scope widens for this commit.
+        if (activity.task.mapItem !== null) {
+          rewriteScope = fullNormalizedRewriteScope;
+          this.#failActivityMapItem(
+            activity,
+            activityTimeoutFailure(activity, timeout.kind),
+            // A lapsed deadline is not the attempt's own verdict, so the
+            // policy's non-retryable rules do not apply to it.
+            itemRetryDecision(activity.task.attempt, activity.task.retryPolicy, null),
+            "TimedOut"
+          );
+          timedOut += 1;
           continue;
         }
         const retry = retryActivityAfterTimeout(activity, Number(req.now));
@@ -1975,7 +2002,7 @@ export class PostgresBackend implements DurableBackend {
         timedOut += 1;
       }
       return { timedOut };
-    }, activityTimeoutRewriteScope);
+    }, () => rewriteScope);
   }
 
   async signalWorkflow(req: SignalWorkflowRequest): Promise<SignalWorkflowOutcome> {
@@ -2441,8 +2468,23 @@ export class PostgresBackend implements DurableBackend {
         and claim_token is not null
         and claim_expires_at_ms is not null
     `);
+    // The timeout scanner used to skip map items, so its index excluded them
+    // too (`... and map_command_key is null`). Now that a map item's lapsed
+    // deadline is an engine event the predicate has to cover them, and a
+    // partial index's predicate cannot be altered in place — `create index if
+    // not exists` under the old name would silently keep the narrower one and
+    // leave the scan unindexed. So the index is *renamed*.
+    //
+    // The superseded index is deliberately **not dropped**. Dropping it makes
+    // the migration destructive under a rolling deploy: old pods still run
+    // `create index if not exists <old name>` while new pods drop it, so the
+    // index flaps, and every recreation takes a build-length lock on the
+    // hottest table in the schema. Additive is the only shape that is safe to
+    // run concurrently with the previous version. What is left behind is one
+    // redundant partial index costing write maintenance; an operator can drop
+    // it out of band once no old pod remains.
     await this.#pool.query(`
-      create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "activity_tasks_timeout_due_idx")}
+      create index if not exists ${derivedSqlIdentifier(this.#rawTableName, "activity_tasks_timeout_due_all_idx")}
       on ${this.#activityTasksTableName}(
         namespace,
         timeout_deadline_at_ms,
@@ -2450,7 +2492,6 @@ export class PostgresBackend implements DurableBackend {
       )
       where terminal_event_id is null
         and claim_token is not null
-        and map_command_key is null
         and timeout_deadline_at_ms is not null
     `);
     await this.#pool.query(`
@@ -2546,8 +2587,67 @@ export class PostgresBackend implements DurableBackend {
   }
 
   async #ensureReady(): Promise<void> {
-    this.#ready ??= this.#initialize();
+    this.#ready ??= this.#initialize().then(() => this.#repairWorkOfTerminalRuns());
     await this.#ready;
+  }
+
+  /**
+   * One-time upgrade repair: abandon every scrap of live work still attached to
+   * a run that is already closed — a map descriptor that never went terminal,
+   * and any pending plain activity of the same run.
+   *
+   * No code path can create that state any more; every transition that closes a
+   * run abandons its work in the same transaction. But a database written
+   * before that landed can hold it, and for a map descriptor it is
+   * *unrecoverable*: every item-terminal path asks the engine, gets
+   * `TerminalParent`, and raises, so `completeActivity`, `failActivity` and
+   * `timeoutDueActivities` all fail permanently for that map. The scanner is
+   * the damaging one — it processes a batch as one unit, so a single poisoned
+   * map item stops *every* activity in the namespace from ever timing out
+   * again. Before the guard the same call appended past the run's terminal
+   * event, which was wrong but at least made progress.
+   *
+   * The probe is read-only and runs first, so a database with nothing to repair
+   * never pays for the full-state load `#withState` performs. Nothing can add
+   * to the probe's answer between the two statements, and the repair is
+   * idempotent regardless.
+   */
+  async #repairWorkOfTerminalRuns(): Promise<void> {
+    const orphaned = await this.#pool.query<{ readonly run_id: string }>(
+      `
+        select runs.run_id as run_id
+        from ${this.#workflowRunsTableName} runs
+        where runs.terminal = true
+          and (
+            exists (
+              select 1 from ${this.#activityMapsTableName} m
+              where m.run_id = runs.run_id and m.terminal = false
+            )
+            or exists (
+              select 1 from ${this.#childWorkflowMapsTableName} m
+              where m.run_id = runs.run_id and m.terminal = false
+            )
+            or exists (
+              select 1 from ${this.#activityTasksTableName} a
+              where a.run_id = runs.run_id
+                and a.map_command_key is null
+                and a.terminal_event_id is null
+            )
+          )
+      `
+    );
+    if (orphaned.rows.length === 0) {
+      return;
+    }
+    const runIds = new Set(orphaned.rows.map((row) => row.run_id));
+    await this.#withLoadedState(() => {
+      for (const runIdValue of runIds) {
+        const state = this.#workflowsByRun.get(runIdValue);
+        if (state !== undefined) {
+          this.#abandonWorkForClosedRun(state);
+        }
+      }
+    });
   }
 
   async #withSqlTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -2595,6 +2695,24 @@ export class PostgresBackend implements DurableBackend {
     rewriteScope: NormalizedRewriteScopeSelector<T> = fullNormalizedRewriteScope
   ): Promise<T> {
     await this.#ensureReady();
+    return this.#withLoadedState(fn, rewriteScope);
+  }
+
+  /**
+   * `#withState` without the readiness await, for the one caller that runs
+   * *inside* the readiness chain.
+   *
+   * The upgrade repair is part of `#ready`, so calling `#withState` from it
+   * awaits the promise it is itself resolving and deadlocks — silently, because
+   * nothing rejects. That is not hypothetical: the split exists because the
+   * Postgres repair shipped with the deadlock in it and no test reached the
+   * path, which is the whole reason the repair now has a test per provider
+   * rather than one.
+   */
+  async #withLoadedState<T>(
+    fn: (client: PoolClient) => T | Promise<T>,
+    rewriteScope: NormalizedRewriteScopeSelector<T> = fullNormalizedRewriteScope
+  ): Promise<T> {
     const client = await this.#pool.connect();
     try {
       await client.query("begin");
@@ -3082,6 +3200,35 @@ export class PostgresBackend implements DurableBackend {
     return result.rows[0]?.exists ?? false;
   }
 
+  /**
+   * Whether the run still owns a map descriptor that has not ended.
+   *
+   * A commit that closes a run has to abandon that run's live fanout, which
+   * means stepping each descriptor through the map engine and rewriting its
+   * item rows. The SQL-native fast path cannot express that, so it hands the
+   * commit back to the general path rather than closing the run and leaving
+   * the map spawning items behind it.
+   */
+  async #hasOpenMapDescriptors(client: PoolClient, runIdValue: RunId): Promise<boolean> {
+    const result = await client.query<{ readonly exists: boolean }>(
+      `
+        select
+          exists(
+            select 1 from ${this.#activityMapsTableName}
+            where run_id = $1 and terminal = false
+            limit 1
+          )
+          or exists(
+            select 1 from ${this.#childWorkflowMapsTableName}
+            where run_id = $1 and terminal = false
+            limit 1
+          ) as exists
+      `,
+      [String(runIdValue)]
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
   async #hasReadySignalWait(client: PoolClient, runIdValue: RunId): Promise<boolean> {
     const result = await client.query<{ readonly exists: boolean }>(
       `
@@ -3463,7 +3610,6 @@ export class PostgresBackend implements DurableBackend {
         where namespace = $1
           and terminal_event_id is null
           and claim_token is not null
-          and map_command_key is null
           and timeout_deadline_at_ms is not null
           and timeout_deadline_at_ms <= $2::bigint
         order by timeout_deadline_at_ms asc, activity_id asc
@@ -4184,6 +4330,91 @@ export class PostgresBackend implements DurableBackend {
   // rewrite scope, which every map path already widens to `full`.
   // ---------------------------------------------------------------------
 
+  /**
+   * `WorkflowTaskCommit.cancelCommands`: withdraw one command's operational
+   * state. A plain activity is tombstoned; a map is handed to the engine as
+   * `ParentCancelled`, which tombstones its pending work and closes the
+   * descriptor. Routing the map through the engine rather than deleting the
+   * descriptor here is what keeps the cancellation path from drifting away
+   * from the fail-fast one.
+   */
+  #cancelCommandOperationalState(cancelled: CommandId): void {
+    for (const activity of this.#activitiesById.values()) {
+      if (
+        activity.task.mapItem === null &&
+        sameCommandId(activity.task.commandId, cancelled) &&
+        activity.terminalEventId === null
+      ) {
+        activity.terminalEventId = tailEventId(activity.workflow);
+        activity.claim = null;
+      }
+    }
+    const activityMap = this.#activityMapsByCommand.get(commandKey(cancelled));
+    if (activityMap !== undefined) {
+      this.#stepActivityMap(activityMap, { kind: "ParentCancelled" });
+    }
+    const childMap = this.#childWorkflowMapsByCommand.get(commandKey(cancelled));
+    if (childMap !== undefined && !childMap.terminal) {
+      // Withdrawing the command on a *live* run means the `parentClosePolicy`
+      // path never runs, so without this the children the map already started
+      // keep running with nothing waiting for them.
+      //
+      // Children first, descriptor last, matching the fail-fast effect order.
+      // That is a consistency choice and not a constraint: the reverse order
+      // was measured green across the whole memory and SQLite conformance
+      // suite, because child cancellation filters on the child's parent link
+      // and its own terminal flag and never reads the descriptor's.
+      this.#cancelRunningChildWorkflowMapItems(
+        childMap,
+        mapCommandCancelledReason(childMap.task.mapCommandId)
+      );
+      this.#stepChildWorkflowMap(childMap, { kind: "ParentCancelled" });
+    }
+  }
+
+  /**
+   * Abandon-on-close: a run that has just reached a terminal event owns no
+   * live work any more. Every map of that run is handed to the engine as
+   * `ParentCancelled`, and every plain activity of it is tombstoned.
+   *
+   * Without this a closed workflow keeps spawning and appending: completing an
+   * item of its map materialized the next ordinal, and both a map's terminal
+   * fact and a plain activity's `ActivityCompleted` were appended to the run's
+   * history *after* its terminal event — the exact thing the terminal-commit
+   * guard exists to prevent. Rust reaches the same end by deleting the run's
+   * activities and descriptors during terminal cleanup.
+   *
+   * Children are deliberately left alone here. `ParentCancelled` emits only
+   * `AbandonPendingItems` and `MarkDescriptorTerminal` — in both runtimes — so
+   * this cannot cascade, and a closed run's children belong to the
+   * `parentClosePolicy` path, which must stay free to *abandon* them rather
+   * than cancel them. The other `ParentCancelled` producer, a withdrawn
+   * command on a still-live run, has no such path and cancels the map's
+   * children itself; see `#cancelCommandOperationalState`.
+   */
+  #abandonWorkForClosedRun(state: WorkflowState): void {
+    for (const activity of this.#activitiesById.values()) {
+      if (
+        activity.task.mapItem === null &&
+        activity.workflow.runId === state.runId &&
+        activity.terminalEventId === null
+      ) {
+        activity.terminalEventId = tailEventId(state);
+        activity.claim = null;
+      }
+    }
+    for (const map of this.#activityMapsByCommand.values()) {
+      if (map.workflow.runId === state.runId && !map.terminal) {
+        this.#stepActivityMap(map, { kind: "ParentCancelled" });
+      }
+    }
+    for (const map of this.#childWorkflowMapsByCommand.values()) {
+      if (map.workflow.runId === state.runId && !map.terminal) {
+        this.#stepChildWorkflowMap(map, { kind: "ParentCancelled" });
+      }
+    }
+  }
+
   #createActivityMap(workflow: WorkflowState, task: ActivityMapTask): void {
     // Validation runs before the engine is consulted. The engine clamps a
     // degenerate bound so an already-persisted descriptor cannot stall, but a
@@ -4412,7 +4643,7 @@ export class PostgresBackend implements DurableBackend {
       // outcome; the engine only needs to know this was a success.
       outcome: { kind: "Succeeded", result },
       alreadyRecorded,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
     if (transition.kind === "Reject") {
       throw new Error(mapRejectMessage("Activity", transition.reject));
@@ -4434,7 +4665,8 @@ export class PostgresBackend implements DurableBackend {
   #failActivityMapItem(
     activity: ActivityState,
     failure: DurableFailure,
-    decision: ItemRetryDecision
+    decision: ItemRetryDecision,
+    attemptFailure: ItemAttemptFailureKind = "Failed"
   ): FailActivityOutcome {
     const map = this.#activityMapForTask(activity.task);
     if (!map || activity.task.mapItem === null) {
@@ -4450,14 +4682,14 @@ export class PostgresBackend implements DurableBackend {
       kind: "ItemAttemptFailed",
       ordinal,
       failure,
-      attemptFailure: "Failed",
+      attemptFailure,
       decision,
       failedAttempt: activity.task.attempt,
       retryPolicy: activity.task.retryPolicy,
       startToCloseTimeoutMs: activity.task.startToCloseTimeoutMs,
       nowMs: this.#nowMs(),
       alreadyRecorded: (map.results[ordinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
     if (decision.kind === "Retry") {
       return {
@@ -4609,7 +4841,7 @@ export class PostgresBackend implements DurableBackend {
             }
           },
           alreadyRecorded: false,
-          parentTerminal: PARENT_TERMINAL_UNGUARDED
+          parentTerminal: map.workflow.terminal
         });
         continue;
       }
@@ -4659,7 +4891,7 @@ export class PostgresBackend implements DurableBackend {
       ordinal: parentLink.itemOrdinal,
       outcome: childWorkflowMapItemOutcome(terminal),
       alreadyRecorded: (map.outcomes[parentLink.itemOrdinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: map.workflow.terminal
     });
   }
 
@@ -4732,6 +4964,7 @@ export class PostgresBackend implements DurableBackend {
       child.readyReason = null;
       child.readyAtMs = 0;
       child.claim = null;
+      this.#abandonWorkForClosedRun(child);
     }
   }
 
@@ -4878,6 +5111,7 @@ export class PostgresBackend implements DurableBackend {
       child.readyReason = null;
       child.readyAtMs = 0;
       child.claim = null;
+      this.#abandonWorkForClosedRun(child);
     }
   }
 }
@@ -5158,6 +5392,9 @@ function sameCommandId(left: CommandId, right: CommandId): boolean {
 
 function canUseTargetedWorkflowCommitProjectionUpdates(commit: WorkflowTaskCommit): boolean {
   if (
+    // A cancelled command rewrites activity task rows and map descriptor rows,
+    // neither of which the targeted projection covers.
+    (commit.cancelCommands?.length ?? 0) > 0 ||
     (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
     (commit.startChildWorkflows?.length ?? 0) > 0 ||
     (commit.scheduleChildWorkflowMaps?.length ?? 0) > 0 ||
@@ -5172,6 +5409,9 @@ function canUseTargetedWorkflowCommitProjectionUpdates(commit: WorkflowTaskCommi
 
 function canUseSqlNativeWorkflowCommit(commit: WorkflowTaskCommit): boolean {
   if (
+    // Cancelling a command tombstones activity rows and steps a map descriptor
+    // through the engine; neither is expressible as one statement here.
+    (commit.cancelCommands?.length ?? 0) > 0 ||
     (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
     (commit.scheduleChildWorkflowMaps?.length ?? 0) > 0 ||
     (commit.scheduleActivities ?? []).some((task) => task.mapItem !== null)
@@ -5295,19 +5535,6 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
-/**
- * The `parentTerminal` every TypeScript map path reports for an item's
- * terminal outcome.
- *
- * No TypeScript provider has a terminal-parent guard on any map path: history
- * continues past a run's terminal event and a closed run keeps materializing
- * items, which is tracked as its own plan row. Reporting the run's real
- * terminal flag here would *add* that guard, so the engine is fed the value
- * that reproduces today's behaviour and closing the gap stays one deliberate
- * change rather than a side effect of the wiring.
- */
-const PARENT_TERMINAL_UNGUARDED = false;
-
 /** The generated activity id of one materialized activity-map item. */
 function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
   return `${mapCommandId.runId}:map:${mapCommandId.seq}:${ordinal}`;
@@ -5362,14 +5589,16 @@ function activityLeaseMatches(lease: ActivityLease, claim: ActivityTaskClaim): b
   return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
 }
 
+/**
+ * When the timeout scanner should reclaim this attempt, and which deadline
+ * lapsed. Map items are covered on the same terms as any other activity; the
+ * exemption that skipped every task with a `mapItem` meant a hung item was
+ * never recovered, only re-offered by lease expiry.
+ */
 function activityTimeoutDeadline(
   activity: ActivityState
 ): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
-  if (
-    activity.claim === null ||
-    activity.terminalEventId !== null ||
-    activity.task.mapItem !== null
-  ) {
+  if (activity.claim === null || activity.terminalEventId !== null) {
     return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
   }
   const startToCloseDeadline =
@@ -5462,6 +5691,22 @@ function activityTimeoutMessage(
   return kind === "Heartbeat"
     ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
     : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
+}
+
+/**
+ * A lapsed activity deadline as the parent-visible failure a map item carries.
+ * A plain activity records the same text in its `ActivityTimedOut` event; a map
+ * item has no per-item history, so the text rides the failure instead.
+ */
+function activityTimeoutFailure(
+  activity: ActivityState,
+  kind: "StartToClose" | "Heartbeat"
+): DurableFailure {
+  return {
+    errorType: "durust.activity_timed_out",
+    message: activityTimeoutMessage(activity, kind),
+    nonRetryable: false
+  };
 }
 
 function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {

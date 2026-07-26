@@ -2514,7 +2514,7 @@
     {
       "kind": "Assertion",
       "what": "WorkflowTaskCommit.cancelCommands and the ParentCancelled event",
-      "why": "Rust's WorkflowTaskCommit carries cancel_commands and its providers raise ParentCancelled from it. TypeScript's WorkflowTaskCommit has no such field at all, so no TypeScript provider can produce the event and no shared case could assert it. Rather than omit it silently, the Rust runner asserts that every corpus commit leaves cancel_commands empty: a case that started producing them would fail loudly instead of quietly asserting only half a commit."
+      "why": "Both runtimes now carry the field — cancel_commands in Rust, cancelCommands in TypeScript — and both raise ParentCancelled from it, so this is no longer about one runtime being unable to produce the event. It stays excluded because no corpus case reaches it: nothing in either runtime writes the field yet, since its producer is losing-branch select cancellation, which TypeScript does not implement. Both runners now assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
     },
     {
       "kind": "Scope",

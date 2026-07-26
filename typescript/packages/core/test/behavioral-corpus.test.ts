@@ -549,6 +549,15 @@ function commitJson(commit: WorkflowTaskCommit): Json {
   if ((commit.scheduleChildWorkflowMaps?.length ?? 0) > 0) {
     throw new Error("no corpus case schedules a child workflow map yet");
   }
+  // Mirrors the Rust runner's `cancel_commands.is_empty()` panic, and makes the
+  // `WorkflowTaskCommit.cancelCommands` exclusion an assertion on *both* sides.
+  // Until `cancelCommands` existed in TypeScript at all this side had nothing to
+  // check, so the exclusion was declared as an assertion that only one runner
+  // made. If a case ever starts cancelling a command the corpus must gain a
+  // projection for it rather than silently dropping the field.
+  if ((commit.cancelCommands?.length ?? 0) > 0) {
+    throw new Error("no corpus case cancels a command yet");
+  }
   return {
     expectedTailEventId: Number(commit.expectedTailEventId),
     appendEvents: (commit.appendEvents ?? []).map((event: NewHistoryEvent) => eventJson(event.data)),

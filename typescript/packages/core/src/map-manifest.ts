@@ -63,6 +63,60 @@ export function readMapManifestItems<Page, Item>(
 }
 
 /**
+ * Check a map's *input* manifest at the scheduling boundary, before the
+ * command is allocated.
+ *
+ * Everything a map fans out over is declared by three fields that have to
+ * agree, and nothing checked that they did. A manifest is user-supplied — the
+ * DSL takes a `PayloadRef<ActivityMapInputManifest<…>>`, so any encoded object
+ * of that shape is accepted — and a disagreeing one was found only later,
+ * inside the provider's `commitWorkflowTask`, where it fails the workflow task
+ * rather than the workflow, and is therefore retried forever.
+ *
+ * **`itemCount === 0` is legal, and deliberately so.** Mapping over an empty
+ * list is an ordinary degenerate case, not a caller error: the map has nothing
+ * to admit and nothing outstanding, so it completes at descriptor creation with
+ * an empty result manifest and the parent proceeds. Every TypeScript provider
+ * does that, it is asserted by conformance on all three, and `map-engine.ts`'s
+ * `DescriptorCreated` owns the rule. Rust stalls forever on the same input and
+ * is the runtime that moves; converging TypeScript onto the stall would trade a
+ * validated answer for a silent hang.
+ *
+ * What this rejects is a manifest that is *inconsistent*, which can only ever
+ * fan out over the wrong number of items.
+ */
+export function assertMapInputManifest<Page>(
+  label: string,
+  manifestRef: PayloadRef<PagedManifest<Page>>
+): void {
+  const manifest = decodePayload<PagedManifest<Page>>(manifestRef);
+  const { itemCount, pageLengths, pages } = manifest;
+  if (!Number.isSafeInteger(itemCount) || itemCount < 0) {
+    throw new Error(`${label} itemCount must be a non-negative integer, got ${String(itemCount)}`);
+  }
+  if (!Array.isArray(pageLengths) || !Array.isArray(pages)) {
+    throw new Error(`${label} must carry pageLengths and pages arrays`);
+  }
+  if (pageLengths.length !== pages.length) {
+    throw new Error(
+      `${label} declares ${pageLengths.length} page lengths for ${pages.length} pages`
+    );
+  }
+  let declared = 0;
+  for (const [index, length] of pageLengths.entries()) {
+    if (!Number.isSafeInteger(length) || length <= 0) {
+      // A zero-length page would make the empty manifest ambiguous — no pages
+      // versus one empty page — and both encoders emit no page at all for it.
+      throw new Error(`${label} page ${index} must hold at least one item, got ${String(length)}`);
+    }
+    declared += length;
+  }
+  if (declared !== itemCount) {
+    throw new Error(`${label} pages cover ${declared} items, expected ${itemCount}`);
+  }
+}
+
+/**
  * The item outcomes a terminal map's result manifest is assembled from,
  * checked against the count the engine says the map has.
  *

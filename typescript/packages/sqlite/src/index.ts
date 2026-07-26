@@ -66,10 +66,12 @@ import {
   activityOutcomeCounts,
   itemRetryDecision,
   itemRetryDelayMs,
+  mapCommandCancelledReason,
   mapRejectMessage,
   outcomeCounts,
   recordedOutcomeCount,
   step as stepMap,
+  type ItemAttemptFailureKind,
   type ItemRetryDecision,
   type MapEffect,
   type MapEvent,
@@ -290,6 +292,26 @@ export class SqliteBackend implements DurableBackend {
   readonly #db: DatabaseSync;
   readonly #nowMs: () => number;
   #closed = false;
+  /**
+   * Transaction-scoped identity map from run id to the mutable `WorkflowState`
+   * this transaction is working on.
+   *
+   * Every read of a workflow inside one transaction must hand back the *same*
+   * object, because a `WorkflowState` is a read-modify-write unit: the whole
+   * row, history included, is rewritten by `#saveWorkflow`. Two independent
+   * copies of one run in flight at the same time means the later save silently
+   * discards everything the earlier one appended.
+   *
+   * That is not hypothetical. `commitWorkflowTask` holds a `state` it appends
+   * the task's own events to, and the map helpers it calls — completing an
+   * empty map, failing a child map on an id conflict — used to re-read the
+   * same run through `#stateForRun`, push their terminal fact onto that second
+   * copy, and save it, after which the commit's closing `#saveWorkflow(state)`
+   * overwrote the row from the first copy. The map's parent fact was written
+   * and then lost, so the map ended durably `terminal = 1` with the parent
+   * never notified and never woken.
+   */
+  #workflowScope: Map<string, WorkflowState> | null = null;
 
   constructor(options: SqliteBackendOptions) {
     this.#nowMs = options.nowMs ?? Date.now;
@@ -300,6 +322,66 @@ export class SqliteBackend implements DurableBackend {
     this.#db.exec("PRAGMA synchronous = FULL");
     this.#db.exec("PRAGMA foreign_keys = ON");
     this.#initializeSchema();
+    this.#repairWorkOfTerminalRuns();
+  }
+
+  /**
+   * One-time upgrade repair: abandon every scrap of live work still attached to
+   * a run that is already closed — a map descriptor that never went terminal,
+   * and any pending plain activity of the same run.
+   *
+   * No code path can create that state any more; every transition that closes a
+   * run abandons its work in the same transaction. But a database written
+   * before that landed can hold it, and for a map descriptor it is
+   * *unrecoverable*: every item-terminal path asks the engine, gets
+   * `TerminalParent`, and raises, so `completeActivity`, `failActivity` and
+   * `timeoutDueActivities` all fail permanently for that map. The scanner is
+   * the damaging one — it processes a batch as one unit, so a single poisoned
+   * map item stops *every* activity in the namespace from ever timing out
+   * again. Before the guard the same call appended past the run's terminal
+   * event, which was wrong but at least made progress.
+   *
+   * The probe is read-only and runs first, so a database with nothing to repair
+   * — every database that never ran the old code, which is to say every one
+   * after the first open — never opens a write transaction at all. That matters
+   * because the caller is a constructor with no retry hook: taking a write lock
+   * unconditionally made `new SqliteBackend(...)` throw `database is locked`
+   * whenever another writer held one. Nothing can add to the probe's answer
+   * between the two statements, and the repair is idempotent regardless.
+   */
+  #repairWorkOfTerminalRuns(): void {
+    const orphaned = this.#db.prepare(`
+      select runs.run_id as run_id
+      from workflows runs
+      where runs.terminal = 1
+        and (
+          exists (
+            select 1 from activity_maps m
+            where m.run_id = runs.run_id and m.terminal = 0
+          )
+          or exists (
+            select 1 from child_workflow_maps m
+            where m.run_id = runs.run_id and m.terminal = 0
+          )
+          or exists (
+            select 1 from activities a
+            where a.run_id = runs.run_id
+              and a.map_command_key is null
+              and a.terminal_event_id is null
+          )
+        )
+    `).all() as unknown as { readonly run_id: string }[];
+    if (orphaned.length === 0) {
+      return;
+    }
+    this.#transaction(() => {
+      for (const row of orphaned) {
+        const state = this.#stateForRunOrNull(runId(row.run_id));
+        if (state !== null) {
+          this.#abandonWorkForClosedRun(state);
+        }
+      }
+    });
   }
 
   close(): void {
@@ -499,6 +581,9 @@ export class SqliteBackend implements DurableBackend {
           String(signalIdValue)
         );
       }
+      for (const cancelled of commit.cancelCommands ?? []) {
+        this.#cancelCommandOperationalState(state, cancelled);
+      }
       for (const task of commit.scheduleActivities ?? []) {
         this.#insertActivity({
           namespace: state.namespace,
@@ -531,6 +616,7 @@ export class SqliteBackend implements DurableBackend {
         this.#notifyParentOfChildTerminal(state.parent, childTerminal);
       }
       if (state.terminal) {
+        this.#abandonWorkForClosedRun(state);
         this.#cancelChildrenForClosedParent(state);
       }
       return { kind: "Committed", newTailEventId: tailEventId(state) };
@@ -810,15 +896,26 @@ export class SqliteBackend implements DurableBackend {
         .slice(0, Math.max(1, req.limit));
       let timedOut = 0;
       for (const activity of activities) {
-        if (
-          activity.claim === null ||
-          activity.terminalEventId !== null ||
-          activity.task.mapItem !== null
-        ) {
+        if (activity.claim === null || activity.terminalEventId !== null) {
           continue;
         }
         const timeout = activityTimeoutDeadline(activity);
         if (timeout.deadline > Number(req.now)) {
+          continue;
+        }
+        // A map item's lapsed deadline is an engine event, not a local
+        // reschedule: only the engine knows whether the map is still running,
+        // and it owns both the retried attempt and the map's terminal failure.
+        if (activity.task.mapItem !== null) {
+          this.#failActivityMapItem(
+            activity,
+            activityTimeoutFailure(activity, timeout.kind),
+            // A lapsed deadline is not the attempt's own verdict, so the
+            // policy's non-retryable rules do not apply to it.
+            itemRetryDecision(activity.task.attempt, activity.task.retryPolicy, null),
+            "TimedOut"
+          );
+          timedOut += 1;
           continue;
         }
         const retry = retryActivityAfterTimeout(activity, Number(req.now));
@@ -1167,6 +1264,10 @@ export class SqliteBackend implements DurableBackend {
 
   #transaction<T>(fn: () => T): T {
     this.#db.exec("BEGIN IMMEDIATE");
+    // The identity map lives exactly as long as the transaction: outside one,
+    // every read is a fresh load, which is what the read-only paths want.
+    const outerScope = this.#workflowScope;
+    this.#workflowScope = new Map();
     try {
       const result = fn();
       this.#db.exec("COMMIT");
@@ -1174,7 +1275,38 @@ export class SqliteBackend implements DurableBackend {
     } catch (error) {
       this.#db.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.#workflowScope = outerScope;
     }
+  }
+
+  /**
+   * The transaction's copy of `state`'s run, registering it if this is the
+   * first time the run has been seen. Callers that build a `WorkflowState`
+   * from a row they selected themselves route it through here so a run that
+   * some other path already loaded keeps a single mutable copy.
+   */
+  #scopedWorkflow(state: WorkflowState): WorkflowState {
+    if (this.#workflowScope === null) {
+      return state;
+    }
+    const key = String(state.runId);
+    const existing = this.#workflowScope.get(key);
+    if (existing !== undefined) {
+      if (existing !== state) {
+        // Unreachable tripwire, not a guard: every `WorkflowState` for an
+        // existing run is built by `#workflowStateFromRow`, which consults the
+        // scope first, and all four `#insertWorkflow` callers allocate a fresh
+        // run id. Nothing can present a second copy today and no test covers
+        // this line. It is here so that a future path which builds a state
+        // some other way fails on the spot instead of writing a row that
+        // silently drops the other copy's history.
+        throw new Error(`workflow run ${key} has two live states in one transaction`);
+      }
+      return existing;
+    }
+    this.#workflowScope.set(key, state);
+    return state;
   }
 
   #nextCounter(key: string): number {
@@ -1207,6 +1339,10 @@ export class SqliteBackend implements DurableBackend {
   }
 
   #stateForRunOrNull(id: RunId): WorkflowState | null {
+    const scoped = this.#workflowScope?.get(String(id));
+    if (scoped !== undefined) {
+      return scoped;
+    }
     const row = this.#db.prepare("select * from workflows where run_id = ?").get(String(id)) as
       | WorkflowRow
       | undefined;
@@ -1247,6 +1383,7 @@ export class SqliteBackend implements DurableBackend {
         on conflict(namespace, workflow_id) do update set run_id = excluded.run_id
       `).run(state.namespace, state.workflowId, String(state.runId));
     }
+    this.#scopedWorkflow(state);
   }
 
   #saveWorkflow(state: WorkflowState): void {
@@ -1286,15 +1423,20 @@ export class SqliteBackend implements DurableBackend {
     );
     this.#insertHistoryEvents(state.runId, state.history);
     this.#syncQueryProjection(state);
+    this.#scopedWorkflow(state);
   }
 
   #workflowStateFromRow(row: WorkflowRow): WorkflowState {
     const rowRunId = runId(row.run_id);
+    const scoped = this.#workflowScope?.get(String(rowRunId));
+    if (scoped !== undefined) {
+      return scoped;
+    }
     const history = this.#historyEventsForRun(rowRunId);
     if (history.length === 0) {
       throw new Error(`workflow history not found: ${rowRunId}`);
     }
-    return workflowStateFromRowWithHistory(row, history);
+    return this.#scopedWorkflow(workflowStateFromRowWithHistory(row, history));
   }
 
   #historyEventsForRun(id: RunId): HistoryEvent[] {
@@ -1476,6 +1618,102 @@ export class SqliteBackend implements DurableBackend {
   // left here is SQLite: insert item rows, start item children, write the
   // descriptor row, append a parent event, tombstone leftovers.
   // ---------------------------------------------------------------------
+
+  /**
+   * Whether the run that owns a map descriptor is already closed. A run that
+   * no longer exists counts as closed: its terminal fact has nowhere to go
+   * either way.
+   */
+  #runTerminal(id: RunId): boolean {
+    return this.#stateForRunOrNull(id)?.terminal ?? true;
+  }
+
+  /**
+   * `WorkflowTaskCommit.cancelCommands`: withdraw one command's operational
+   * state. A plain activity is tombstoned; a map is handed to the engine as
+   * `ParentCancelled`, which tombstones its pending work and closes the
+   * descriptor. Routing the map through the engine rather than deleting the
+   * descriptor here is what keeps the cancellation path from drifting away
+   * from the fail-fast one.
+   */
+  #cancelCommandOperationalState(workflow: WorkflowState, cancelled: CommandId): void {
+    const rows = this.#db.prepare(`
+      select * from activities
+      where command_key = ? and map_command_key is null and terminal_event_id is null
+    `).all(commandKey(cancelled)) as unknown as ActivityRow[];
+    for (const row of rows) {
+      const activity = activityStateFromRow(row);
+      activity.terminalEventId = tailEventId(workflow);
+      activity.claim = null;
+      this.#insertActivity(activity);
+    }
+    const activityMap = this.#activityMapForCommand(cancelled);
+    if (activityMap !== undefined) {
+      this.#stepActivityMap(activityMap, { kind: "ParentCancelled" });
+    }
+    const childMap = this.#childWorkflowMapForCommand(cancelled);
+    if (childMap !== undefined && !childMap.terminal) {
+      // Withdrawing the command on a *live* run means the `parentClosePolicy`
+      // path never runs, so without this the children the map already started
+      // keep running with nothing waiting for them.
+      //
+      // Children first, descriptor last, matching the fail-fast effect order.
+      // That is a consistency choice and not a constraint: the reverse order
+      // was measured green across the whole memory and SQLite conformance
+      // suite, because child cancellation filters on the child's parent link
+      // and its own terminal flag and never reads the descriptor's.
+      this.#cancelRunningChildWorkflowMapItems(
+        childMap,
+        mapCommandCancelledReason(childMap.task.mapCommandId)
+      );
+      this.#stepChildWorkflowMap(childMap, { kind: "ParentCancelled" });
+    }
+  }
+
+  /**
+   * Abandon-on-close: a run that has just reached a terminal event owns no
+   * live work any more. Every map of that run is handed to the engine as
+   * `ParentCancelled`, and every plain activity of it is tombstoned.
+   *
+   * Without this a closed workflow keeps spawning and appending: completing an
+   * item of its map materialized the next ordinal, and both a map's terminal
+   * fact and a plain activity's `ActivityCompleted` were appended to the run's
+   * history *after* its terminal event — the exact thing the terminal-commit
+   * guard exists to prevent. Rust reaches the same end by deleting the run's
+   * activities and descriptors during terminal cleanup.
+   *
+   * Children are deliberately left alone here. `ParentCancelled` emits only
+   * `AbandonPendingItems` and `MarkDescriptorTerminal` — in both runtimes — so
+   * this cannot cascade, and a closed run's children belong to the
+   * `parentClosePolicy` path, which must stay free to *abandon* them rather
+   * than cancel them. The other `ParentCancelled` producer, a withdrawn
+   * command on a still-live run, has no such path and cancels the map's
+   * children itself; see `#cancelCommandOperationalState`.
+   */
+  #abandonWorkForClosedRun(state: WorkflowState): void {
+    const pending = this.#db.prepare(`
+      select * from activities
+      where run_id = ? and map_command_key is null and terminal_event_id is null
+    `).all(String(state.runId)) as unknown as ActivityRow[];
+    for (const row of pending) {
+      const activity = activityStateFromRow(row);
+      activity.terminalEventId = tailEventId(state);
+      activity.claim = null;
+      this.#insertActivity(activity);
+    }
+    const activityMaps = this.#db.prepare(
+      "select * from activity_maps where run_id = ? and terminal = 0"
+    ).all(String(state.runId)) as unknown as ActivityMapRow[];
+    for (const row of activityMaps) {
+      this.#stepActivityMap(activityMapStateFromRow(row), { kind: "ParentCancelled" });
+    }
+    const childMaps = this.#db.prepare(
+      "select * from child_workflow_maps where run_id = ? and terminal = 0"
+    ).all(String(state.runId)) as unknown as ChildWorkflowMapRow[];
+    for (const row of childMaps) {
+      this.#stepChildWorkflowMap(childWorkflowMapStateFromRow(row), { kind: "ParentCancelled" });
+    }
+  }
 
   #createActivityMap(workflow: WorkflowState, task: ActivityMapTask): void {
     // Validation runs before the engine is consulted. The engine clamps a
@@ -1768,7 +2006,7 @@ export class SqliteBackend implements DurableBackend {
       // outcome; the engine only needs to know this was a success.
       outcome: { kind: "Succeeded", result },
       alreadyRecorded,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: this.#runTerminal(map.runId)
     });
     if (transition.kind === "Reject") {
       throw new Error(mapRejectMessage("Activity", transition.reject));
@@ -1794,7 +2032,8 @@ export class SqliteBackend implements DurableBackend {
   #failActivityMapItem(
     activity: ActivityState,
     failure: DurableFailure,
-    decision: ItemRetryDecision
+    decision: ItemRetryDecision,
+    attemptFailure: ItemAttemptFailureKind = "Failed"
   ): FailActivityOutcome {
     const map = this.#activityMapForTask(activity.task);
     if (!map || activity.task.mapItem === null) {
@@ -1811,14 +2050,14 @@ export class SqliteBackend implements DurableBackend {
       kind: "ItemAttemptFailed",
       ordinal,
       failure,
-      attemptFailure: "Failed",
+      attemptFailure,
       decision,
       failedAttempt: activity.task.attempt,
       retryPolicy: activity.task.retryPolicy,
       startToCloseTimeoutMs: activity.task.startToCloseTimeoutMs,
       nowMs: this.#nowMs(),
       alreadyRecorded: (map.results[ordinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: this.#runTerminal(map.runId)
     });
     if (decision.kind === "Retry") {
       const retried = this.#activityForIdOrNull(activity.task.activityId);
@@ -2092,7 +2331,7 @@ export class SqliteBackend implements DurableBackend {
             }
           },
           alreadyRecorded: false,
-          parentTerminal: PARENT_TERMINAL_UNGUARDED
+          parentTerminal: this.#runTerminal(map.runId)
         });
         continue;
       }
@@ -2186,7 +2425,7 @@ export class SqliteBackend implements DurableBackend {
       ordinal: parentLink.itemOrdinal,
       outcome: childWorkflowMapItemOutcome(terminal),
       alreadyRecorded: (map.outcomes[parentLink.itemOrdinal] ?? null) !== null,
-      parentTerminal: PARENT_TERMINAL_UNGUARDED
+      parentTerminal: this.#runTerminal(map.runId)
     });
   }
 
@@ -2253,7 +2492,8 @@ export class SqliteBackend implements DurableBackend {
       if (
         child.parent?.kind !== "ChildWorkflowMap" ||
         child.parent.parentRunId !== map.runId ||
-        !sameCommandId(child.parent.mapCommandId, map.task.mapCommandId)
+        !sameCommandId(child.parent.mapCommandId, map.task.mapCommandId) ||
+        child.terminal
       ) {
         continue;
       }
@@ -2266,6 +2506,7 @@ export class SqliteBackend implements DurableBackend {
       child.readyAtMs = 0;
       child.claim = null;
       this.#saveWorkflow(child);
+      this.#abandonWorkForClosedRun(child);
     }
   }
 
@@ -2276,7 +2517,8 @@ export class SqliteBackend implements DurableBackend {
       const child = this.#workflowStateFromRow(row);
       if (
         child.parent?.parentRunId !== parent.runId ||
-        child.parent.parentClosePolicy !== "Cancel"
+        child.parent.parentClosePolicy !== "Cancel" ||
+        child.terminal
       ) {
         continue;
       }
@@ -2289,6 +2531,7 @@ export class SqliteBackend implements DurableBackend {
       child.readyAtMs = 0;
       child.claim = null;
       this.#saveWorkflow(child);
+      this.#abandonWorkForClosedRun(child);
     }
   }
 }
@@ -2393,14 +2636,16 @@ function activityRootFromRow(row: ActivityRow): {
   };
 }
 
+/**
+ * When the timeout scanner should reclaim this attempt, and which deadline
+ * lapsed. Map items are covered on the same terms as any other activity; the
+ * exemption that skipped every task with a `mapItem` meant a hung item was
+ * never recovered, only re-offered by lease expiry.
+ */
 function activityTimeoutDeadline(
   activity: ActivityState
 ): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
-  if (
-    activity.claim === null ||
-    activity.terminalEventId !== null ||
-    activity.task.mapItem !== null
-  ) {
+  if (activity.claim === null || activity.terminalEventId !== null) {
     return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
   }
   const startToCloseDeadline =
@@ -2542,19 +2787,6 @@ function tailEventId(state: WorkflowState): EventId {
   return state.history.at(-1)?.eventId ?? eventId(0);
 }
 
-/**
- * The `parentTerminal` every TypeScript map path reports for an item's
- * terminal outcome.
- *
- * No TypeScript provider has a terminal-parent guard on any map path: history
- * continues past a run's terminal event and a closed run keeps materializing
- * items, which is tracked as its own plan row. Reporting the run's real
- * terminal flag here would *add* that guard, so the engine is fed the value
- * that reproduces today's behaviour and closing the gap stays one deliberate
- * change rather than a side effect of the wiring.
- */
-const PARENT_TERMINAL_UNGUARDED = false;
-
 /** The generated activity id of one materialized activity-map item. */
 function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
   return `${mapCommandId.runId}:map:${mapCommandId.seq}:${ordinal}`;
@@ -2665,6 +2897,22 @@ function activityTimeoutMessage(
   return kind === "Heartbeat"
     ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
     : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
+}
+
+/**
+ * A lapsed activity deadline as the parent-visible failure a map item carries.
+ * A plain activity records the same text in its `ActivityTimedOut` event; a map
+ * item has no per-item history, so the text rides the failure instead.
+ */
+function activityTimeoutFailure(
+  activity: ActivityState,
+  kind: "StartToClose" | "Heartbeat"
+): DurableFailure {
+  return {
+    errorType: "durust.activity_timed_out",
+    message: activityTimeoutMessage(activity, kind),
+    nonRetryable: false
+  };
 }
 
 function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
