@@ -4643,6 +4643,335 @@ describe("minimal workflow runtime", () => {
     ).rejects.toThrow("nondeterminism: select winner branch changed");
   });
 
+  // The three tests below are one defect: TypeScript had no counterpart to
+  // Rust's `DurableSelectBranch::__durust_cancel_branch`, so every branch that
+  // lost a select kept its operational state — a wait the provider would still
+  // fire, or an activity that would still run. Each branch kind is covered
+  // separately because each withdraws a different thing.
+  it("cancels a losing timer branch's wait and never fires it past the terminal event", async () => {
+    const racingWorkflow = workflow({
+      name: "orders.select-cancel-timer",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly branch: string }> => {
+        const winner = await select({
+          approval: signal<ApprovalSignal>("approved"),
+          deadline: sleepUntil(1_000)
+        });
+        return { branch: winner.branch };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-timer"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, {}, firstClaim, {
+      payloadCodec: "Json"
+    });
+    const waitCommit = await hot.nextCommit();
+    expect(waitCommit.upsertWaits?.map((wait) => String(wait.waitId))).toEqual([
+      "run-1:signal:1",
+      "run-1:timer:2"
+    ]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
+
+    await backend.signalWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-timer"),
+      signalId: signalId("sig-select"),
+      signalName: "approved",
+      payload: encodePayload<ApprovalSignal>({ approvalId: "a-1" }, { codec: "Json" })
+    });
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const liveSignal = await backend.readSignalInbox({
+      runId: secondClaim.runId,
+      signalName: "approved"
+    });
+    if (!liveSignal) {
+      throw new Error("expected live signal");
+    }
+    const completionCommit = await hot.advance(secondClaim, { liveSignals: [liveSignal] });
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "SignalConsumed",
+      "SelectWinner",
+      "WorkflowCompleted"
+    ]);
+    // The signal wait is deleted by the consumption path; the timer wait is
+    // deleted only because the losing branch is cancelled. Rust's commit for
+    // this same program carries both.
+    expect(completionCommit.deleteWaits?.map(String)).toEqual([
+      "run-1:signal:1",
+      "run-1:timer:2"
+    ]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+
+    // The observable consequence, asserted end to end. It holds because of the
+    // cancellation above *and* because the provider refuses to fire against a
+    // closed run; the shared conformance case
+    // `a stray timer wait never fires against a closed run` pins the second
+    // half on its own.
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: 10_000, limit: 16 })
+    ).resolves.toEqual({ fired: 0 });
+    const history = await backend.streamHistory({
+      runId: secondClaim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(20),
+      maxEvents: 20,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map((event) => String(event.eventType))).toEqual([
+      "WorkflowStarted",
+      "TimerStarted",
+      "SignalConsumed",
+      "SelectWinner",
+      "WorkflowCompleted"
+    ]);
+  });
+
+  it("cancels a losing signal branch's wait when the timer wins the select", async () => {
+    const racingWorkflow = workflow({
+      name: "orders.select-cancel-signal",
+      version: 1,
+      handler: async (_input: TestNoInput): Promise<{ readonly branch: string }> => {
+        const winner = await select({
+          approval: signal<ApprovalSignal>("approved"),
+          deadline: sleepUntil(1_000)
+        });
+        return { branch: winner.branch };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-signal"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({}, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, {}, firstClaim, {
+      payloadCodec: "Json"
+    });
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, await hot.nextCommit()))
+    );
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 })
+    ).resolves.toEqual({ fired: 1 });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await hot.advance(secondClaim);
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "SelectWinner",
+      "WorkflowCompleted"
+    ]);
+    expect(completionCommit.deleteWaits?.map(String)).toEqual(["run-1:signal:1"]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
+    );
+  });
+
+  it("withdraws a losing activity branch registered in the same task the select settles", async () => {
+    // The first-pass settle, which is a different code path from the two tests
+    // around it: `SelectDurablePromise.then` registers the branches and
+    // resolves the winner inside one task, so the commit carries the losing
+    // activity in `scheduleActivities` *and* in `cancelCommands` at once.
+    //
+    // That is the shape the provider's apply order got wrong. Cancelling
+    // before scheduling found no row, did nothing, and the schedule loop then
+    // inserted the task live — so the branch the workflow raced away from
+    // still ran its handler, performed whatever external side effect
+    // `callActivity` exists to perform, and appended `ActivityCompleted`. One
+    // orphan per loop iteration, invisible because the run still completes and
+    // still cold-replays cleanly.
+    const racingWorkflow = workflow({
+      name: "orders.select-cancel-activity-same-task",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly branch: string }> => {
+        const winner = await select({
+          quote: callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          approval: signal<ApprovalSignal>("approved")
+        });
+        // Keeps the run open, so the provider's close hook cannot be what
+        // withdraws the activity.
+        await signal<ApprovalSignal>("second");
+        return { branch: winner.branch };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-activity-same-task"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    // The signal is already in the inbox when the first task runs, so the
+    // signal branch is Ready on registration and the select never parks.
+    await backend.signalWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-activity-same-task"),
+      signalId: signalId("sig-first-pass"),
+      signalName: "approved",
+      payload: encodePayload<ApprovalSignal>({ approvalId: "a-1" }, { codec: "Json" })
+    });
+    const claim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!claim) {
+      throw new Error("expected claim");
+    }
+    const liveSignal = await backend.readSignalInbox({
+      runId: claim.runId,
+      signalName: "approved"
+    });
+    if (!liveSignal) {
+      throw new Error("expected live signal");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, claim, {
+      payloadCodec: "Json",
+      liveSignals: [liveSignal]
+    });
+    const commit = await hot.nextCommit();
+    expect(commit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "ActivityScheduled",
+      "SignalConsumed",
+      "SelectWinner"
+    ]);
+    // Both, in the same commit. This is what the provider has to get right.
+    expect(commit.scheduleActivities?.map((task) => task.commandId)).toEqual([
+      { runId: runId("run-1"), seq: 1 }
+    ]);
+    expect(commit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 1 }]);
+    hot.markCommitted(committedTail(await backend.commitWorkflowTask(claim.claim, commit)));
+
+    // The run is open and the activity was never claimed, so the cancel is the
+    // only thing that can have taken it out of the queue.
+    await expect(
+      backend.claimActivityTask("activity-worker", {
+        namespace: namespace(),
+        taskQueue: taskQueue("payments"),
+        registeredActivityNames: ["payments.price-quote"],
+        leaseDurationMs: 30_000
+      })
+    ).resolves.toBeNull();
+  });
+
+  it("cancels a losing activity branch's command and the provider withdraws the task", async () => {
+    // The run deliberately stays open after the select, because a closed run
+    // has its leftover activities tombstoned by the provider's own close hook
+    // and that would mask the cancellation this test is about.
+    const racingWorkflow = workflow({
+      name: "orders.select-cancel-activity",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly branch: string }> => {
+        const winner = await select({
+          quote: callActivity(priceQuote, { sku: input.sku }, { taskQueue: "payments" }),
+          deadline: sleepUntil(1_000)
+        });
+        await signal<ApprovalSignal>("approved");
+        return { branch: winner.branch };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/select-cancel-activity"),
+      workflowType: racingWorkflow.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
+      payloadCodec: "Json"
+    });
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(firstClaim.claim, await hot.nextCommit()))
+    );
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 })
+    ).resolves.toEqual({ fired: 1 });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [racingWorkflow.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const selectCommit = await hot.advance(secondClaim);
+    expect(selectCommit.appendEvents?.map((event) => event.data.kind)).toEqual(["SelectWinner"]);
+    // An activity branch has no wait; Rust withdraws it through
+    // `RuntimeContext::cancel_command`, and so does this.
+    expect(selectCommit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 1 }]);
+    hot.markCommitted(
+      committedTail(await backend.commitWorkflowTask(secondClaim.claim, selectCommit))
+    );
+
+    // The run is still open, so nothing but the cancellation can have taken the
+    // activity out of the queue.
+    await expect(
+      backend.claimActivityTask("activity-worker", {
+        namespace: namespace(),
+        taskQueue: taskQueue("payments"),
+        registeredActivityNames: ["payments.price-quote"],
+        leaseDurationMs: 30_000
+      })
+    ).resolves.toBeNull();
+  });
+
   it("settles parked durable-API waiters when a hot execution is disposed", async () => {
     const trace: string[] = [];
     const unhandledRejections: unknown[] = [];

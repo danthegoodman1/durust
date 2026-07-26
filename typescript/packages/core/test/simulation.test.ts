@@ -878,9 +878,18 @@ class SimulationDriver {
       this.record(`${step}: activity ${outcome.kind}`);
       return;
     }
+    // Anchored to the provider's clock, because that is the clock the runtime
+    // now records timer deadlines against: a worker takes `now` from
+    // `backend.currentTime()` and `sleep(d)` records `now + d`. A fixed scan
+    // instant agreed with that only while every deadline was measured from the
+    // epoch — the defect this anchoring outlived. The offset keeps the
+    // property the fixed instant had, that every scheduled timer is already
+    // due when the driver scans, and keeps it marching forward per step.
     const fired = await this.backend.fireDueTimers({
       namespace: "default",
-      now: timestampMs(1_000_000 + this.seed * 1_000 + step * 100),
+      now: timestampMs(
+        Number(await this.backend.currentTime()) + 1_000_000 + this.seed * 1_000 + step * 100
+      ),
       limit: 16
     });
     this.record(`${step}: timers ${fired.fired}`);

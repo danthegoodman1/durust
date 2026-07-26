@@ -51,6 +51,7 @@ import {
 } from "@durust/payload";
 import { PostgresBackend } from "@durust/postgres";
 import {
+  assertCurrentTimeFollowsInjectedClock,
   assertTerminalRunLeftoversArePoisoned,
   assertTerminalRunLeftoversAreRepaired,
   assertTerminalRunPlainLeftoverIsRepaired,
@@ -109,6 +110,22 @@ describePostgres("PostgresBackend provider conformance", () => {
       await conformanceCase.run(() => trackedPostgresBackend("conformance"));
     });
   }
+});
+
+describePostgres("PostgresBackend clock", () => {
+  it("reports its configured clock from currentTime and scans against it", async () => {
+    let now = 0;
+    const backend = new PostgresBackend({
+      url: requirePostgresUrl(),
+      tableName: nextTableName("current_time_clock"),
+      poolSize: 1,
+      nowMs: () => now
+    });
+    managedBackends.push(backend);
+    await assertCurrentTimeFollowsInjectedClock(backend, (ms) => {
+      now = ms;
+    });
+  });
 });
 
 describePostgres("PostgresBackend blob-backed provider conformance", () => {
@@ -529,6 +546,12 @@ describePostgres("PostgresBackend persistence", () => {
       });
       await scheduleTimer.close();
 
+      // The scan instant is the timer's exact deadline, so a deadline that is
+      // off by one millisecond in either direction fails here. `sleep(10)` is
+      // scheduled while this provider's `nowMs` reads 0, and the runtime takes
+      // `now` from `currentTime()`, which is that same clock — so the recorded
+      // deadline is exactly 10. Advancing the provider's clock alongside the
+      // scan keeps the two agreeing about what "now" means across the reopen.
       now = 10;
       const fireTimer = open();
       await expect(

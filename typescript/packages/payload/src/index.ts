@@ -41,6 +41,7 @@ import {
   type StreamHistoryRequest,
   type TimeoutDueActivitiesOutcome,
   type TimeoutDueActivitiesRequest,
+  type TimestampMs,
   type WorkflowTaskClaim,
   type WorkflowTaskCommit
 } from "@durust/core";
@@ -441,6 +442,10 @@ export class PayloadBackend implements DurableBackend {
     this.#backend = options.backend;
     this.#blobStore = options.blobStore;
     this.#inlineThresholdBytes = options.inlineThresholdBytes;
+  }
+
+  async currentTime(): Promise<TimestampMs> {
+    return this.#backend.currentTime();
   }
 
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {

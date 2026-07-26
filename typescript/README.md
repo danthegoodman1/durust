@@ -418,6 +418,22 @@ also accept an optional output schema for schema-transformed result refs.
 
 ## Providers
 
+Every provider implements `currentTime()`, and it must report the same clock
+that provider's leases, deadlines and due scans read — not `Date.now()`. A
+worker takes the instant it hands the runtime from there, so a provider whose
+`currentTime()` disagreed with its own `fireDueTimers` would record timer
+deadlines its own scan never reaches. `MemoryBackend`, `SqliteBackend` and
+`PostgresBackend` all accept a `nowMs` option and report it.
+
+**Open question, tracked cross-runtime.** The task queue an activity resolves
+to is part of its command `optionsDigest`, and that resolution includes the
+scheduling worker's `activityTaskQueue` fallback. So two workflow workers
+configured with different activity queues fingerprint the same unqueued
+`callActivity()` differently, and a run scheduled by one fails replay on the
+other. Rust has carried the same hazard since `with_task_queue_fallback` was
+written. Until it is settled, name `taskQueue` explicitly on any
+`callActivity()` in a fleet whose workers do not all share one activity queue.
+
 `MemoryBackend` is for fast tests and local simulations. It is not durable
 across process restart.
 
@@ -600,6 +616,86 @@ DURUST_POSTGRES_URL='postgresql://durable:durable@127.0.0.1:55432/durable' \
 That command fails fast without `DURUST_POSTGRES_URL`, then runs the Postgres
 provider conformance suite plus the benchmark threshold gate that includes the
 Postgres mixed smoke baseline and the 1000-workflow accepted Postgres profile.
+
+## Upgrading
+
+There is no changelog yet, so breaking changes are recorded here, newest first.
+A change is listed if it can break a deployment that is working today — either
+its code will not compile, or its in-flight runs stop replaying.
+
+### `callActivity()` with no `taskQueue` now uses the worker's activity queue
+
+**Who is affected.** A deployment whose workflow workers set
+`activityTaskQueue` *and* whose workflows call `callActivity()` without naming
+a queue, where some other worker polls `"default"` and runs those activities.
+That shape works today, because the runtime ignored `WorkerOptions.activityTaskQueue`
+entirely and scheduled every unqueued activity onto the literal queue
+`"default"`.
+
+**What changes.** The runtime now falls back to the scheduling worker's own
+`activityTaskQueue`, matching Rust's `ActivityOptions::with_task_queue_fallback`.
+This is a fix — the far more common outcome of the old behaviour was a run that
+hung forever with no error, because the worker scheduled onto a queue nothing
+polled — but the resolved queue is part of the activity command's
+`optionsDigest`, so **the fingerprint of an unqueued activity changes**.
+
+**The consequence.** In-flight runs of the affected shape fail their next
+replay with `nondeterminism: activity command fingerprint changed`, and the
+exception escapes `runWorkflowTaskOnce`. **This is recoverable by
+configuration** — see the repair below. Do not drain or abandon affected runs
+on the assumption that it is not.
+
+**The repair: set the scheduling worker's `activityTaskQueue` to `"default"`.**
+The fallback then resolves to `"default"` again, the fingerprint matches what
+the run recorded, and it replays and completes. It works fleet-wide rather than
+run by run, because the old behaviour was uniform: every unqueued activity
+fingerprinted with the literal `"default"` no matter how its worker was
+configured. Keep the setting until affected runs have drained, then move it
+back. Two operational details, both measured rather than assumed:
+
+- **Affected runs resume on their next retry, not immediately.** The failed
+  replay released its claim under the nondeterminism backoff
+  (`WorkerOptions.nondeterminismRetryBackoffMs`, 60 s by default), so a repaired
+  worker sees the run only after that lapses.
+- **`activityTaskQueue` also decides which queue that worker *claims* from.**
+  If the worker you repoint was the one serving activities that *do* name a
+  queue explicitly, it stops claiming them. Leave another worker on the
+  original queue, or the explicitly-queued work stalls while the repair is in
+  place.
+
+**Before upgrading**, do one of: keep the repair above ready to apply; drain
+runs that have an unqueued `callActivity()` in flight; or give those calls an
+explicit `taskQueue`, which fingerprints identically before and after.
+
+**This break is expected to be retracted.** It exists only because the *fallback*
+queue is folded into `activityOptionsDigest`; see the open question under
+Providers above. If the digest is narrowed to hash the caller-supplied option
+rather than the resolved one, an unqueued call fingerprints identically before
+and after and this entry no longer applies.
+
+### `DurableBackend.currentTime()` is required
+
+**Who is affected.** Anyone with a hand-written `DurableBackend`, and any
+wrapper that forwards by explicit delegation rather than by `Proxy` — a
+delegating wrapper does not inherit a new method, it just stops compiling.
+`PayloadBackend` and `MeasuredBackend` are both of that kind and both gained a
+one-line delegate in this change. A wrapper that forwards through a `Proxy`
+trap needs nothing.
+
+**What changes.** `DurableBackend` gained `currentTime(): Promise<TimestampMs>`,
+which `SPEC.md` §8.1 has always listed on the backend contract and which Rust
+has always had. A worker reads it once per prepared workflow task and hands it
+to the runtime, so `sleep(d)` records `now + d`. Without it every timer deadline
+was measured from the Unix epoch and only worked because a provider scan then
+treated every timer as already due.
+
+**Why it is required rather than optional.** An optional method with a
+`Date.now()` fallback would silently give a provider that runs its own clock —
+every simulation, every virtual-time test, any provider deriving time from the
+database — a deadline it never scans past, and the symptom is a workflow that
+stops without an error. A required method turns that into a compile error at
+the one file that can fix it. Implement it by returning the same clock your
+leases and due scans already use, not `Date.now()`.
 
 ## Migration Checklist
 

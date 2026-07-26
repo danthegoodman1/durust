@@ -418,6 +418,125 @@ describe("Worker", () => {
     await expect(worker.runWorkflowTaskOnce()).resolves.toEqual({ kind: "NoTask" });
   });
 
+  it("schedules an unqueued activity onto the worker's own activity task queue", async () => {
+    // `callActivity` with no `taskQueue`. The runtime's fallback used to be the
+    // literal "default" no matter how the worker was configured, because
+    // `WorkerOptions.activityTaskQueue` reached the claim loops and nothing
+    // else — so the scheduling worker put the task on a queue it never polled
+    // and the run hung with no error anywhere. Rust's runtime falls back to the
+    // worker's configured activity queue
+    // (`ActivityOptions::with_task_queue_fallback`).
+    const unqueuedWorkflow = workflow({
+      name: "worker.unqueued-activity",
+      version: 1,
+      handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> =>
+        await callActivity(quoteActivity, { sku: input.sku })
+    });
+    const backend = new MemoryBackend();
+    const registry = new Registry()
+      .registerWorkflow(unqueuedWorkflow)
+      .registerActivity(quoteActivity);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "unqueued-activity-worker",
+      workflowTaskQueue: "workflows",
+      activityTaskQueue: "worker-activities",
+      payloadCodec: "Json"
+    });
+    const handle = await client.startWorkflow(
+      unqueuedWorkflow,
+      workflowId("wf/worker-unqueued-activity"),
+      "workflows",
+      { sku: "sku-1" }
+    );
+
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    const scheduled = await backend.streamHistory({
+      runId: handle.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    const activityScheduled = scheduled.events.find(
+      (event) => event.data.kind === "ActivityScheduled"
+    );
+    if (activityScheduled?.data.kind !== "ActivityScheduled") {
+      throw new Error("expected ActivityScheduled");
+    }
+    expect(activityScheduled.data.scheduled.taskQueue).toBe("worker-activities");
+
+    // The half that matters operationally: the worker that scheduled the task
+    // can claim it. Against the literal "default" this is `NoTask` and the run
+    // never finishes.
+    await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(handle.result()).resolves.toEqual({ cents: 5 });
+  });
+
+  it("records a timer deadline against the provider's clock rather than the epoch", async () => {
+    // `HotWorkflowExecution.#nowMs` defaulted to 0 and the worker never set it,
+    // so `sleep(d)` recorded `fireAt = d` — an absolute deadline measured from
+    // 1970 — and only survived because a provider scan then treated every timer
+    // as already due. Rust's worker takes `now` from `backend.current_time()`
+    // once per prepared workflow task.
+    let now = 5_000;
+    const backend = new MemoryBackend({ nowMs: () => now });
+    const sleeper = workflow({
+      name: "worker.clock-relative-timer",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly slept: true }> => {
+        await sleep(1_000);
+        return { slept: true };
+      }
+    });
+    const registry = new Registry().registerWorkflow(sleeper);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = new Worker({
+      backend,
+      registry,
+      namespace: namespace(),
+      workerId: "clock-relative-timer-worker",
+      workflowTaskQueue: "workflows",
+      payloadCodec: "Json"
+    });
+    const handle = await client.startWorkflow(
+      sleeper,
+      workflowId("wf/worker-clock-relative-timer"),
+      "workflows",
+      {}
+    );
+
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    const history = await backend.streamHistory({
+      runId: handle.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    const started = history.events.find((event) => event.data.kind === "TimerStarted");
+    if (started?.data.kind !== "TimerStarted") {
+      throw new Error("expected TimerStarted");
+    }
+    expect(Number(started.data.started.fireAt)).toBe(6_000);
+
+    // The wait carries the same instant, so the provider's own due scan agrees
+    // with the recorded deadline instead of firing a timer 5 seconds early.
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: 5_999, limit: 16 })
+    ).resolves.toEqual({ fired: 0 });
+    now = 6_000;
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: 6_000, limit: 16 })
+    ).resolves.toEqual({ fired: 1 });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(handle.result()).resolves.toEqual({ slept: true });
+  });
+
   it("runs workflow and activity polling in a stoppable loop", async () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
@@ -4156,7 +4275,11 @@ describe("Worker run loops", () => {
 
     await expect(worker.runActivityTimeoutMaintenanceOnce()).resolves.toEqual({ timedOut: 0 });
 
-    expect(calls).toEqual(["timeoutDueActivities"]);
+    // `currentTime` is the scan instant, read from the provider rather than
+    // from `Date.now()` so a provider driving a virtual clock decides which
+    // deadlines have lapsed. The claim of this test is the *one* scan, and it
+    // still holds.
+    expect(calls).toEqual(["currentTime", "timeoutDueActivities"]);
   });
 });
 

@@ -41,6 +41,7 @@ import {
 } from "@durust/core";
 import { LocalDirectoryBlobStore, PayloadBackend, collectPayloadRefs } from "@durust/payload";
 import {
+  assertCurrentTimeFollowsInjectedClock,
   assertTerminalRunLeftoversArePoisoned,
   assertTerminalRunLeftoversAreRepaired,
   assertTerminalRunPlainLeftoverIsRepaired,
@@ -124,6 +125,23 @@ describe("SqliteBackend provider conformance", () => {
       }));
     });
   }
+});
+
+describe("SqliteBackend clock", () => {
+  it("reports its configured clock from currentTime and scans against it", async () => {
+    let now = 0;
+    const backend = new SqliteBackend({
+      path: tempSqlitePath("current-time-clock"),
+      nowMs: () => now
+    });
+    try {
+      await assertCurrentTimeFollowsInjectedClock(backend, (ms) => {
+        now = ms;
+      });
+    } finally {
+      backend.close();
+    }
+  });
 });
 
 describe("SqliteBackend blob-backed provider conformance", () => {
@@ -816,7 +834,13 @@ describe("SqliteBackend persistence", () => {
         payloadCodec: "Json"
       });
 
-    const first = new SqliteBackend({ path });
+    // Every reopen shares one injected clock, so the timer's recorded deadline
+    // and the scan instant below are the same provider's notion of "now"
+    // across process boundaries.
+    let now = 0;
+    const open = (): SqliteBackend => new SqliteBackend({ path, nowMs: () => now });
+
+    const first = open();
     const firstClient = new Client(first, { namespace: namespace(), payloadCodec: "Json" });
     const handle = await firstClient.startWorkflow(
       mixed,
@@ -826,21 +850,21 @@ describe("SqliteBackend persistence", () => {
     );
     first.close();
 
-    const scheduleFirstActivity = new SqliteBackend({ path });
+    const scheduleFirstActivity = open();
     await expect(worker(scheduleFirstActivity, "sqlite-mixed-worker-1").runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
     scheduleFirstActivity.close();
 
-    const completeFirstActivity = new SqliteBackend({ path });
+    const completeFirstActivity = open();
     await expect(worker(completeFirstActivity, "sqlite-mixed-worker-2").runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
     completeFirstActivity.close();
 
-    const sendApproval = new SqliteBackend({ path });
+    const sendApproval = open();
     await new Client(sendApproval, { namespace: namespace(), payloadCodec: "Json" }).sendSignal({
       workflowId: workflowId("wf/sqlite-mixed-reopen"),
       signal: approvalSignal,
@@ -849,38 +873,44 @@ describe("SqliteBackend persistence", () => {
     });
     sendApproval.close();
 
-    const scheduleTimer = new SqliteBackend({ path });
+    const scheduleTimer = open();
     await expect(worker(scheduleTimer, "sqlite-mixed-worker-3").runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
     scheduleTimer.close();
 
-    const fireTimer = new SqliteBackend({ path });
+    // The scan instant is the timer's exact deadline, so a deadline that is off
+    // by one millisecond in either direction fails here. `sleep(10)` is
+    // scheduled while this provider's `nowMs` reads 0 and the runtime takes
+    // `now` from `currentTime()`, which is that same clock — so the recorded
+    // deadline is exactly 10.
+    now = 10;
+    const fireTimer = open();
     await expect(
       fireTimer.fireDueTimers({
         namespace: namespace(),
-        now: timestampMs(10),
+        now: timestampMs(now),
         limit: 10
       })
     ).resolves.toEqual({ fired: 1 });
     fireTimer.close();
 
-    const scheduleSecondActivity = new SqliteBackend({ path });
+    const scheduleSecondActivity = open();
     await expect(worker(scheduleSecondActivity, "sqlite-mixed-worker-4").runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
     scheduleSecondActivity.close();
 
-    const completeSecondActivity = new SqliteBackend({ path });
+    const completeSecondActivity = open();
     await expect(worker(completeSecondActivity, "sqlite-mixed-worker-5").runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
     completeSecondActivity.close();
 
-    const completeWorkflow = new SqliteBackend({ path });
+    const completeWorkflow = open();
     await expect(worker(completeWorkflow, "sqlite-mixed-worker-6").runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
       outcome: { kind: "Committed" }

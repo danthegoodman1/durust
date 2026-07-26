@@ -2286,6 +2286,59 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
+      // The apply order inside one commit, which is not the same claim as the
+      // case below: that one cancels in a *later* task, where the rows already
+      // exist and any order works. Here the commit both schedules and
+      // withdraws the same command, which is what a `select` settling on its
+      // first pass produces — the losing branch's activity is registered and
+      // the winner resolved inside one task.
+      //
+      // Applying `cancelCommands` before `scheduleActivities` makes the cancel
+      // a no-op against a row that does not exist yet, and the schedule loop
+      // then inserts the task live. The workflow raced away from that branch;
+      // the provider ran it anyway, side effect and all, and appended its
+      // `ActivityCompleted` to the run. Rust has always applied the two in the
+      // other order (`src/memory.rs` inserts activities, then applies
+      // `cancel_commands`); all three TypeScript providers had it inverted.
+      name: "a command scheduled and cancelled in one commit leaves no claimable work",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const activityCommand = commandId(claim.runId, 1);
+        const activityInput = encodePayload({ value: "same-commit" }, { codec: "Json" });
+        const scheduled = {
+          commandId: activityCommand,
+          activityName: "conformance.same-commit-cancel",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          input: activityInput,
+          fingerprint: activityFingerprint(
+            "conformance.same-commit-cancel",
+            payloadDigest(activityInput),
+            "sha256:test-options"
+          )
+        };
+        await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
+          scheduleActivities: [activityTaskFromScheduled(scheduled)],
+          cancelCommands: [activityCommand]
+        });
+
+        const claimed = await backend.claimActivityTask("same-commit-cancel-worker", {
+          namespace: namespace(),
+          taskQueue: taskQueue("activities"),
+          registeredActivityNames: ["conformance.same-commit-cancel"],
+          leaseDurationMs: 30_000
+        });
+        assert(
+          claimed === null,
+          `an activity cancelled by the commit that scheduled it must not be claimable, got ${claimed?.task.activityId}`
+        );
+      }
+    },
+    {
       // `cancelCommands` is a `SPEC.md` §8.2 field TypeScript had no
       // representation for at all, which is why the map engine's
       // `ParentCancelled` transition had no producer. Cancelling a map command
@@ -2835,6 +2888,85 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(workflowWake !== null, "timer fire should wake workflow");
         assert(workflowWake.reason === "TimerFired", "timer wake should preserve reason");
         assert(workflowWake.replayTargetEventId === eventId(3), "timer fire should append event");
+      }
+    },
+    {
+      // Defence in depth behind the runtime, which now cancels a losing
+      // `select` branch's wait so this state should never arise through the
+      // DSL. The provider must refuse it anyway: a `TimerFired` appended after
+      // the terminal event corrupts a history every replay, audit and
+      // terminal-cleanup path assumes is finished, and the run is not even
+      // resurrected by it — the next claim still refuses a closed run, so the
+      // only outcome is the corruption.
+      //
+      // The wait is left live by committing it in the same task that closes
+      // the run, which every provider accepts: the terminal guard tests the
+      // state *before* the commit. That is the one construction that does not
+      // rely on the defect this guards against.
+      name: "a stray timer wait never fires against a closed run",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const timerCommand = commandId(claim.runId, 1);
+        const committed = await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            {
+              data: {
+                kind: "TimerStarted",
+                started: {
+                  commandId: timerCommand,
+                  fireAt: timestampMs(1_000),
+                  fingerprint: timerFingerprint("sleep_until", timestampMs(1_000))
+                }
+              }
+            },
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ value: "closed" }, { codec: "Json" })
+              }
+            }
+          ],
+          upsertWaits: [
+            {
+              waitId: waitId(`${claim.runId}:timer:1`),
+              runId: claim.runId,
+              commandId: timerCommand,
+              kind: "Timer",
+              key: "timer",
+              readyAt: timestampMs(1_000)
+            }
+          ]
+        });
+        assert(
+          committed.kind === "Committed" && committed.newTailEventId === eventId(3),
+          "a commit that both starts a timer and closes the run should be accepted"
+        );
+
+        const fired = await backend.fireDueTimers({
+          namespace: namespace(),
+          now: timestampMs(10_000),
+          limit: 16
+        });
+        assert(
+          fired.fired === 0,
+          `a closed run's timer wait must not fire, fired ${fired.fired}`
+        );
+
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => String(event.eventType)).join(",") ===
+            "WorkflowStarted,TimerStarted,WorkflowCompleted",
+          `nothing may be appended past the terminal event, got ${history.events
+            .map((event) => String(event.eventType))
+            .join(",")}`
+        );
       }
     },
     {
@@ -4024,6 +4156,84 @@ export async function assertTerminalRunPlainLeftoverIsRepaired(
     `nothing may be appended past the terminal event, got ${history.events
       .map((event) => event.eventType)
       .join(",")}`
+  );
+}
+
+/**
+ * `DurableBackend.currentTime()` reports the clock this provider actually
+ * decides with, and reports it per call.
+ *
+ * A provider that answered from `Date.now()` while its leases, deadlines and
+ * due scans ran on a configured clock would hand the runtime an instant it
+ * does not itself believe in — `sleep(d)` would record a deadline the
+ * provider's own `fireDueTimers` never reaches. So the check is not "the
+ * getter returns the number": it schedules a wait one tick ahead and requires
+ * the scan driven *by `currentTime()`* to agree with it in both directions.
+ *
+ * The caller owns the backend's lifetime, because the SQL providers need
+ * closing and a temp path or table name that only they know.
+ */
+export async function assertCurrentTimeFollowsInjectedClock(
+  backend: DurableBackend,
+  setNowMs: (ms: number) => void
+): Promise<void> {
+  setNowMs(1_000);
+  assert(
+    Number(await backend.currentTime()) === 1_000,
+    `currentTime should report the configured clock, got ${Number(await backend.currentTime())}`
+  );
+  setNowMs(2_500);
+  assert(
+    Number(await backend.currentTime()) === 2_500,
+    "currentTime should be read per call, not captured at construction"
+  );
+
+  const { claim } = await startedAndClaimed(() => backend);
+  const timerCommand = commandId(claim.runId, 1);
+  await backend.commitWorkflowTask(claim, {
+    expectedTailEventId: eventId(1),
+    appendEvents: [
+      {
+        data: {
+          kind: "TimerStarted",
+          started: {
+            commandId: timerCommand,
+            fireAt: timestampMs(2_510),
+            fingerprint: timerFingerprint("sleep_until", timestampMs(2_510))
+          }
+        }
+      }
+    ],
+    upsertWaits: [
+      {
+        waitId: waitId(`${claim.runId}:timer:1`),
+        runId: claim.runId,
+        commandId: timerCommand,
+        kind: "Timer",
+        key: "timer",
+        readyAt: timestampMs(2_510)
+      }
+    ]
+  });
+
+  const early = await backend.fireDueTimers({
+    namespace: namespace(),
+    now: await backend.currentTime(),
+    limit: 16
+  });
+  assert(
+    early.fired === 0,
+    `a scan at currentTime() must not reach a later deadline, fired ${early.fired}`
+  );
+  setNowMs(2_510);
+  const due = await backend.fireDueTimers({
+    namespace: namespace(),
+    now: await backend.currentTime(),
+    limit: 16
+  });
+  assert(
+    due.fired === 1,
+    `a scan at currentTime() must reach a deadline the clock has arrived at, fired ${due.fired}`
   );
 }
 

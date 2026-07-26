@@ -54,6 +54,7 @@ import {
   type StreamHistoryRequest,
   type TimeoutDueActivitiesOutcome,
   type TimeoutDueActivitiesRequest,
+  type TimestampMs,
   type WaitRecord,
   type WorkflowTaskClaim,
   type WorkflowTaskCommit,
@@ -391,6 +392,20 @@ export class SqliteBackend implements DurableBackend {
     }
   }
 
+  /**
+   * This provider's clock — the same `#nowMs` every lease, deadline and
+   * due-scan in this file reads, not `Date.now()`.
+   *
+   * It has to be the same one. `SqliteBackendOptions.nowMs` already decides
+   * when a lease has expired and when an activity has missed its deadline, so
+   * a `currentTime()` that answered from the process clock would hand the
+   * runtime an instant this provider does not believe in: `sleep(d)` would
+   * record a deadline the provider's own `fireDueTimers` scan never reaches.
+   */
+  async currentTime(): Promise<TimestampMs> {
+    return timestampMs(this.#nowMs());
+  }
+
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
     return this.#transaction(() => {
       const existing = this.#currentRunId(req.namespace, req.workflowId);
@@ -581,9 +596,6 @@ export class SqliteBackend implements DurableBackend {
           String(signalIdValue)
         );
       }
-      for (const cancelled of commit.cancelCommands ?? []) {
-        this.#cancelCommandOperationalState(state, cancelled);
-      }
       for (const task of commit.scheduleActivities ?? []) {
         this.#insertActivity({
           namespace: state.namespace,
@@ -601,6 +613,14 @@ export class SqliteBackend implements DurableBackend {
       }
       for (const task of commit.scheduleChildWorkflowMaps ?? []) {
         this.#createChildWorkflowMap(state, task);
+      }
+      // After every schedule loop; see `MemoryBackend.commitWorkflowTask` for
+      // why, and Rust's `src/memory.rs` for the order all four providers now
+      // share. A commit that both schedules and withdraws one command — a
+      // `select` settling on its first pass — cancelled nothing and then
+      // inserted the task live.
+      for (const cancelled of commit.cancelCommands ?? []) {
+        this.#cancelCommandOperationalState(state, cancelled);
       }
       if (commit.queryProjection !== undefined) {
         state.queryProjection = commit.queryProjection;
@@ -860,6 +880,12 @@ export class SqliteBackend implements DurableBackend {
         const state = this.#stateForRunOrNull(runId(row.run_id));
         if (!state) {
           this.#db.prepare("delete from waits where wait_id = ?").run(row.wait_id);
+          continue;
+        }
+        // Same guard, same reason, as `MemoryBackend.fireDueTimers`: a stray
+        // wait must not append `TimerFired` past a closed run's terminal
+        // event. Skipped rather than deleted, matching Rust's memory provider.
+        if (state.terminal) {
           continue;
         }
         const event = makeHistoryEvent(eventId(Number(tailEventId(state)) + 1), {

@@ -51,6 +51,7 @@ import {
   type StreamHistoryRequest,
   type TimeoutDueActivitiesOutcome,
   type TimeoutDueActivitiesRequest,
+  type TimestampMs,
   type PayloadRef,
   type WorkflowHandle,
   type WorkflowTaskClaim,
@@ -530,6 +531,10 @@ class MeasuredBackend implements DurableBackend {
         }
       };
     }
+  }
+
+  async currentTime(): Promise<TimestampMs> {
+    return this.inner.currentTime();
   }
 
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {

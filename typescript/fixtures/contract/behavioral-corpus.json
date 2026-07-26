@@ -577,7 +577,7 @@
       "input": {
         "value": 60000
       },
-      "name": "a signal that arrives first wins the select; only Rust cancels the losing timer wait",
+      "name": "a signal that arrives first wins the select, and the losing timer wait is cancelled",
       "program": "corpus.select-signal-or-timer",
       "steps": [
         {
@@ -585,7 +585,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].commandId.seq",
                   "upsertWaits[0].commandId.seq",
@@ -699,16 +699,12 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].commandId.seq",
-                  "appendEvents[1].selectCommandId.seq"
-                ]
-              },
-              {
-                "what": "TypeScript never cancels a losing select branch's WAIT. This is a live TypeScript defect, not a numbering artefact and not a convergence choice, and it is what the differing `deleteWaits` length records. Rust's select calls __durust_cancel_branch() on every non-winning branch, which pushes the branch's wait id onto delete_waits — src/runtime.rs pushes the timer wait and the signal wait from the two branch types. In TypeScript, timerWaitId appears at exactly two sites, its definition and the wait UPSERT, and never at a delete; both #deleteWaits.push calls are signalWaitId. So a losing timer branch's wait outlives the select in TypeScript and a losing signal branch's wait is deleted only because the signal path happens to delete it for its own reasons. The consequence is observable: run the signal-wins program to completion, then call fireDueTimers past the abandoned timer's deadline, and the provider fires it and appends TimerFired AFTER the terminal WorkflowCompleted, because MemoryBackend.fireDueTimers checks that the run exists and the namespace matches but never that the run is terminal. Re-claiming returns NoTask, so the run is not resurrected; the damage is corrupted history. Fixing it is tracked as its own plan row, not here.",
-                "paths": [
-                  "deleteWaits"
+                  "appendEvents[1].selectCommandId.seq",
+                  "deleteWaits[0].commandId.seq",
+                  "deleteWaits[1].commandId.seq"
                 ]
               }
             ],
@@ -837,6 +833,13 @@
                     "runId": "run-1",
                     "seq": 1
                   }
+                },
+                {
+                  "kind": "Timer",
+                  "commandId": {
+                    "runId": "run-1",
+                    "seq": 2
+                  }
                 }
               ],
               "consumeSignals": [
@@ -860,7 +863,7 @@
       "input": {
         "value": 1000
       },
-      "name": "a timer that fires first wins the select; only Rust cancels the losing signal wait",
+      "name": "a timer that fires first wins the select, and the losing signal wait is cancelled",
       "program": "corpus.select-signal-or-timer",
       "steps": [
         {
@@ -868,7 +871,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].commandId.seq",
                   "upsertWaits[0].commandId.seq",
@@ -984,15 +987,10 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
-                  "appendEvents[0].selectCommandId.seq"
-                ]
-              },
-              {
-                "what": "TypeScript never cancels a losing select branch's WAIT. This is a live TypeScript defect, not a numbering artefact and not a convergence choice, and it is what the differing `deleteWaits` length records. Rust's select calls __durust_cancel_branch() on every non-winning branch, which pushes the branch's wait id onto delete_waits — src/runtime.rs pushes the timer wait and the signal wait from the two branch types. In TypeScript, timerWaitId appears at exactly two sites, its definition and the wait UPSERT, and never at a delete; both #deleteWaits.push calls are signalWaitId. So a losing timer branch's wait outlives the select in TypeScript and a losing signal branch's wait is deleted only because the signal path happens to delete it for its own reasons. The consequence is observable: run the signal-wins program to completion, then call fireDueTimers past the abandoned timer's deadline, and the provider fires it and appends TimerFired AFTER the terminal WorkflowCompleted, because MemoryBackend.fireDueTimers checks that the run exists and the namespace matches but never that the run is terminal. Re-claiming returns NoTask, so the run is not resurrected; the damage is corrupted history. Fixing it is tracked as its own plan row, not here.",
-                "paths": [
-                  "deleteWaits"
+                  "appendEvents[0].selectCommandId.seq",
+                  "deleteWaits[0].commandId.seq"
                 ]
               }
             ],
@@ -1061,7 +1059,15 @@
                 }
               ],
               "upsertWaits": [],
-              "deleteWaits": [],
+              "deleteWaits": [
+                {
+                  "kind": "Signal",
+                  "commandId": {
+                    "runId": "run-1",
+                    "seq": 1
+                  }
+                }
+              ],
               "consumeSignals": [],
               "scheduleActivities": [],
               "scheduleActivityMaps": [],
@@ -1090,7 +1096,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].commandId.seq",
                   "appendEvents[1].commandId.seq",
@@ -1297,7 +1303,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].selectCommandId.seq"
                 ]
@@ -1391,7 +1397,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].commandId.seq",
                   "appendEvents[1].commandId.seq",
@@ -1598,7 +1604,7 @@
           "divergence": {
             "differences": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference.",
+                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
                 "paths": [
                   "appendEvents[0].selectCommandId.seq"
                 ]
@@ -2210,7 +2216,7 @@
       "input": {
         "value": 1000
       },
-      "name": "a timer scheduled after the clock has moved diverges on its recorded deadline",
+      "name": "a timer scheduled after the clock has moved records its deadline relative to now",
       "program": "corpus.sleep-after-signal",
       "steps": [
         {
@@ -2252,152 +2258,73 @@
         },
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The instant a timer records when it is scheduled after the clock has moved. The TypeScript worker never supplies PrepareWorkflowTaskOptions.nowMs, so HotWorkflowExecution's #nowMs stays at its default of 0 for the life of the execution and every sleep(d) records fireAt = d — an absolute deadline measured from the epoch. The Rust worker takes now from the provider's current_time, so the same call records fireAt = now + d. The two agree exactly while the virtual clock is still at zero, which is why every other timer in this corpus matches, and diverge the moment a timer is scheduled in a later task. This is a live TypeScript defect rather than a language-forced difference: a real TypeScript worker records every timer deadline relative to 1970, and only survives because the provider's due-timer scan then treats it as already due. Recorded from both sides so the difference is visible in data; fixing it is not in scope here.",
-                "paths": [
-                  "appendEvents[1].fireAtMs",
-                  "upsertWaits[0].readyAtMs"
-                ]
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-3",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 6000,
+                "type": "TimerStarted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Signal",
-                    "name": "corpus.approve",
-                    "optionsDigest": "sha256:default"
-                  },
-                  "payload": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "who": "ada"
-                    }
-                  },
-                  "signalId": "corpus-signal-3",
-                  "signalName": "corpus.approve",
-                  "type": "SignalConsumed"
+            "consumeSignals": [
+              "corpus-signal-3"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
                 },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "optionsDigest": "timestamp-ms:1000"
-                  },
-                  "fireAtMs": 6000,
-                  "type": "TimerStarted"
-                }
-              ],
-              "consumeSignals": [
-                "corpus-signal-3"
-              ],
-              "deleteWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "kind": "Signal"
-                }
-              ],
-              "expectedTailEventId": 1,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "kind": "Timer",
-                  "readyAtMs": 6000
-                }
-              ]
-            },
-            "typescript": {
-              "expectedTailEventId": 1,
-              "appendEvents": [
-                {
-                  "type": "SignalConsumed",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "signalId": "corpus-signal-3",
-                  "signalName": "corpus.approve",
-                  "payload": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "who": "ada"
-                    }
-                  },
-                  "fingerprint": {
-                    "kind": "Signal",
-                    "name": "corpus.approve",
-                    "inputDigest": null,
-                    "optionsDigest": "sha256:default"
-                  }
+                "kind": "Signal"
+              }
+            ],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
                 },
-                {
-                  "type": "TimerStarted",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fireAtMs": 1000,
-                  "fingerprint": {
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "inputDigest": null,
-                    "optionsDigest": "timestamp-ms:1000"
-                  }
-                }
-              ],
-              "upsertWaits": [
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "readyAtMs": 1000
-                }
-              ],
-              "deleteWaits": [
-                {
-                  "kind": "Signal",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  }
-                }
-              ],
-              "consumeSignals": [
-                "corpus-signal-3"
-              ],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 6000
+              }
+            ]
           },
           "historyBefore": [
             "WorkflowStarted"
@@ -2514,7 +2441,7 @@
     {
       "kind": "Assertion",
       "what": "WorkflowTaskCommit.cancelCommands and the ParentCancelled event",
-      "why": "Both runtimes now carry the field — cancel_commands in Rust, cancelCommands in TypeScript — and both raise ParentCancelled from it, so this is no longer about one runtime being unable to produce the event. It stays excluded because no corpus case reaches it: nothing in either runtime writes the field yet, since its producer is losing-branch select cancellation, which TypeScript does not implement. Both runners now assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
+      "why": "Both runtimes carry the field — cancel_commands in Rust, cancelCommands in TypeScript — both raise ParentCancelled from it, and both now write it from the same producer: a select branch that loses while still holding a scheduled activity, which Rust withdraws in ActivityFuture::__durust_cancel_branch and TypeScript in cancelActivityBranch. It stays excluded because no corpus case reaches that state — every select here races a timer against a signal, or races branches that have both already produced a value — and not because either runtime is unable to produce it. Both runners assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
     },
     {
       "kind": "Scope",
@@ -2593,34 +2520,47 @@
     "",
     "FOUND WHILE BUILDING THIS",
     "",
-    "  Three differences turned up that nothing had recorded before.",
+    "  Four differences turned up that nothing had recorded before. Three have",
+    "  since been closed by moving TypeScript onto Rust's answer, and each entry",
+    "  below keeps what the corpus saw as well as where it landed, because a",
+    "  finding that leaves no trace once it is fixed cannot be audited.",
     "",
-    "  1. TypeScript never cancels a losing select branch's WAIT. Recorded as a",
-    "     `divergence` on the two select-resolution steps whose `deleteWaits`",
-    "     lengths differ; the reason there has the detail and the observable",
-    "     consequence (a TimerFired appended after the terminal event). It is a",
-    "     live TypeScript defect and is tracked as its own plan row.",
+    "  1. TypeScript never cancelled a losing select branch's operational state.",
+    "     CLOSED. It was recorded as a `divergence` on the two select-resolution",
+    "     steps whose `deleteWaits` lengths differed, with the observable",
+    "     consequence being a TimerFired appended after the terminal event.",
+    "     TypeScript now cancels every branch that loses without producing a",
+    "     value, so both runtimes delete the same waits, and those two steps",
+    "     differ only by (2) below. The corpus reaches the timer and signal branch",
+    "     kinds; the activity branch — which Rust withdraws through",
+    "     `cancel_commands` rather than a wait — is not reached by any case here",
+    "     and is covered by the `WorkflowTaskCommit.cancelCommands` exclusion.",
     "  2. A `select` allocates its own command sequence number before polling its",
     "     branches in Rust and after resolving a winner in TypeScript, which",
-    "     shifts every branch's command seq by one. Recorded as a `divergence` on",
-    "     every step of every select case.",
-    "  3. The TypeScript worker never supplies",
-    "     PrepareWorkflowTaskOptions.nowMs, so a timer scheduled after the clock",
-    "     has moved records a deadline measured from the epoch. Recorded as a",
-    "     `divergence` on `a timer scheduled after the clock has moved`. This was",
-    "     an exclusion in the first draft, which was wrong: `fireAt` is perfectly",
-    "     comparable, the runtimes simply differ, and an exclusion would have",
-    "     hidden that behind a projection the runners do not perform.",
-    "",
-    "  A fourth could not be expressed as a case at all:",
-    "  WorkerOptions.activityTaskQueue in TypeScript is used only for CLAIMING",
-    "  activity tasks — the worker never passes defaultActivityTaskQueue into",
-    "  HotWorkflowExecution — so a callActivity() with no explicit taskQueue",
-    "  schedules onto the literal queue \"default\" and the worker that scheduled",
-    "  it will never claim it. Rust's worker uses its configured activity task",
-    "  queue as the fallback. Every program in this corpus names its task queue",
-    "  explicitly, which is why the corpus runs green either way; the gap is real",
-    "  and is not fixed here."
+    "     shifts every branch's command seq by one. OPEN, and now the only",
+    "     divergence this corpus records: it is a convergence decision about which",
+    "     runtime moves, and until it is taken neither runtime can replay the",
+    "     other's history across a select. Recorded as a `divergence` on every",
+    "     step of every select case.",
+    "  3. The TypeScript worker never supplied PrepareWorkflowTaskOptions.nowMs,",
+    "     so a timer scheduled after the clock had moved recorded a deadline",
+    "     measured from the epoch. CLOSED. `DurableBackend.currentTime()` now",
+    "     exists in TypeScript as it always has in Rust, the worker reads it once",
+    "     per prepared workflow task, and `a timer scheduled after the clock has",
+    "     moved` is a shared expectation with both runtimes recording 6000. This",
+    "     was an exclusion in the first draft, which was wrong: `fireAt` is",
+    "     perfectly comparable, the runtimes simply differed, and an exclusion",
+    "     would have hidden that behind a projection the runners do not perform.",
+    "  4. WorkerOptions.activityTaskQueue in TypeScript was used only for CLAIMING",
+    "     activity tasks — the worker never passed defaultActivityTaskQueue into",
+    "     HotWorkflowExecution — so a callActivity() with no explicit taskQueue",
+    "     scheduled onto the literal queue \"default\" and the worker that scheduled",
+    "     it would never claim it. CLOSED, by giving the runtime the worker's",
+    "     configured queue as its fallback exactly as Rust does. It could not be",
+    "     expressed as a case at all: every program in this corpus names its task",
+    "     queue explicitly, which is why the corpus ran green either way, and a",
+    "     case that omitted the queue would be asserting a worker configuration",
+    "     rather than a workflow behaviour."
   ],
   "workerStartJitter": {
     "cases": [

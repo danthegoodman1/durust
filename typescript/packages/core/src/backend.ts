@@ -55,6 +55,22 @@ import type {
 
 export interface DurableBackend {
   startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome>;
+  /**
+   * The provider's clock, and the only clock a workflow task may be prepared
+   * against.
+   *
+   * `SPEC.md` §8.1 lists this on the backend trait; Rust has had it since the
+   * trait existed and its worker reads it once per prepared workflow task.
+   * TypeScript had no equivalent, so `HotWorkflowExecution` was constructed
+   * with `nowMs` left at its default of `0` and every `sleep(d)` recorded an
+   * absolute deadline of `d` — measured from the epoch, not from now.
+   *
+   * A worker must not substitute `Date.now()` for this. The deterministic
+   * clock a workflow sees is part of the commit §1.2 makes normative, and a
+   * provider driving a virtual clock — every simulation and the behavioural
+   * corpus — is entitled to have the runtime observe it.
+   */
+  currentTime(): Promise<TimestampMs>;
   claimWorkflowTask(
     workerId: WorkerId | string,
     opts: ClaimWorkflowTaskOptions
@@ -458,6 +474,10 @@ export class MemoryBackend implements DurableBackend {
     this.#nowMs = options.nowMs ?? Date.now;
   }
 
+  async currentTime(): Promise<TimestampMs> {
+    return this.#nowMs() as TimestampMs;
+  }
+
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
     const key = workflowKey(req.namespace, req.workflowId);
     const existing = this.#workflowsById.get(key);
@@ -611,9 +631,6 @@ export class MemoryBackend implements DurableBackend {
         signal.consumed = true;
       }
     }
-    for (const cancelled of commit.cancelCommands ?? []) {
-      this.#cancelCommandOperationalState(cancelled);
-    }
     for (const task of commit.scheduleActivities ?? []) {
       const activityState: ActivityState = {
         namespace: state.namespace,
@@ -633,6 +650,19 @@ export class MemoryBackend implements DurableBackend {
     }
     for (const task of commit.scheduleChildWorkflowMaps ?? []) {
       this.#createChildWorkflowMap(state, task);
+    }
+    // After every schedule loop, never before one, matching Rust
+    // (`src/memory.rs` inserts activities and descriptors, then applies
+    // `cancel_commands`). A commit may schedule and withdraw the *same*
+    // command: a `select` that settles on its first pass registers the losing
+    // branch's activity and cancels it in one task. Cancelling first found no
+    // row, did nothing, and the schedule loop then inserted the task live —
+    // so the branch the workflow raced away from still ran, performed its
+    // external side effect, and appended `ActivityCompleted` to the run. The
+    // same inversion applied to a map descriptor scheduled and cancelled in
+    // one commit.
+    for (const cancelled of commit.cancelCommands ?? []) {
+      this.#cancelCommandOperationalState(cancelled);
     }
     if (commit.queryProjection !== undefined) {
       state.queryProjection = commit.queryProjection;
@@ -882,6 +912,18 @@ export class MemoryBackend implements DurableBackend {
       const state = this.#workflowsByRun.get(wait.runId);
       if (!state || state.namespace !== String(req.namespace)) {
         this.#waitsById.delete(String(wait.waitId));
+        continue;
+      }
+      // A closed run's history is finished. Firing a stray wait against it
+      // appends `TimerFired` *after* the terminal event, which every replay,
+      // audit and terminal-cleanup assumption in the system rests on not
+      // happening — and it is not even a resurrection, because the next claim
+      // still refuses the run, so the only outcome is corrupted history.
+      // Rust's memory provider tests the same condition in the same place
+      // (`src/memory.rs`: `if run.namespace != req.namespace || run.terminal`)
+      // and skips without deleting, so a wait the terminal cleanup should have
+      // removed stays visible rather than being quietly swallowed here.
+      if (state.terminal) {
         continue;
       }
       const event = makeHistoryEvent(eventId(Number(tailEventId(state)) + 1), {

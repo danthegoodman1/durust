@@ -1219,6 +1219,12 @@ class WorkflowRuntimeContext {
   readonly #appendEvents: NewHistoryEvent[] = [];
   readonly #upsertWaits: WaitRecord[] = [];
   readonly #deleteWaits: WaitId[] = [];
+  // Commands whose operational state this task withdraws. The only producer is
+  // a losing `select` branch that registered an activity: its wait-less
+  // counterpart is `#deleteWaits`, and the provider applies both from the same
+  // commit. Mirrors Rust's `RuntimeContext::cancel_commands`, which
+  // `ActivityFuture::__durust_cancel_branch` writes to.
+  readonly #cancelCommands: CommandId[] = [];
   readonly #consumeSignals: string[] = [];
   readonly #scheduleActivities: ActivityTask[] = [];
   readonly #scheduleActivityMaps: ActivityMapTask[] = [];
@@ -1664,6 +1670,7 @@ class WorkflowRuntimeContext {
     this.#appendEvents.length = 0;
     this.#upsertWaits.length = 0;
     this.#deleteWaits.length = 0;
+    this.#cancelCommands.length = 0;
     this.#consumeSignals.length = 0;
     this.#scheduleActivities.length = 0;
     this.#scheduleActivityMaps.length = 0;
@@ -2595,6 +2602,65 @@ class WorkflowRuntimeContext {
     return winner;
   }
 
+  /**
+   * Withdraws a losing `select` branch's timer.
+   *
+   * The three `cancel*Branch` methods together are TypeScript's
+   * `DurableSelectBranch::__durust_cancel_branch`, which Rust's `select!`
+   * calls on every branch that neither won nor produced a value. Without them
+   * a losing branch's operational state outlives the select: the wait sits in
+   * the provider until something fires it, and a timer fired against a run
+   * that has since closed appends `TimerFired` *after* the terminal event.
+   *
+   * Deleting a wait the provider no longer holds is a no-op in all three
+   * providers, which is what makes this safe to emit on replay as well as on
+   * the first pass — Rust emits it from the same `Waiting` branch state
+   * whether the command was appended or matched.
+   */
+  cancelTimerBranch(id: CommandId): void {
+    this.#deleteWaits.push(timerWaitId(id));
+  }
+
+  /**
+   * Withdraws a losing `select` branch's signal wait. See `cancelTimerBranch`.
+   *
+   * Rust's `SignalFuture::__durust_cancel_branch` does one more thing here:
+   * `abandon_live_signal`, which un-reserves the live signal its context had
+   * bound to this command. That half is deliberately absent rather than
+   * missed. Rust reserves a live signal to a command id and releases it on
+   * cancel; TypeScript's `#takeLiveSignal` splices the record out of
+   * `#liveSignals` at the moment it is consumed and reserves nothing before
+   * then, so a branch still pending has bound no signal and there is nothing
+   * to give back. If signal delivery ever gains a reservation step, this is
+   * the site that has to gain the release.
+   */
+  cancelSignalBranch(id: CommandId): void {
+    this.#deleteWaits.push(signalWaitId(id));
+  }
+
+  /**
+   * Withdraws a losing `select` branch's activity.
+   *
+   * An activity has no wait to delete; its operational state is the scheduled
+   * task, so the provider is told to tombstone it through `cancelCommands` —
+   * exactly what Rust's `ActivityFuture::__durust_cancel_branch` does through
+   * `RuntimeContext::cancel_command`. Left uncancelled the orphaned activity
+   * keeps running, keeps retrying, and appends its `ActivityCompleted` to a
+   * run that stopped caring about it.
+   *
+   * The dedup mirrors `RuntimeContext::cancel_command` and is defensive
+   * rather than load-bearing: cancellation runs once, on the pass that settles
+   * the select, so no branch reaches here twice today. It costs a linear scan
+   * of a list that is empty on every commit but this one, and it means a
+   * future second caller cannot make a provider tombstone the same command
+   * twice.
+   */
+  cancelActivityBranch(id: CommandId): void {
+    if (!this.#cancelCommands.some((existing) => sameCommandId(existing, id))) {
+      this.#cancelCommands.push(id);
+    }
+  }
+
   completeWorkflow<Output>(
     output: Output,
     workflowDefinition: WorkflowDefinition<any, Output, any, string>
@@ -2720,6 +2786,7 @@ class WorkflowRuntimeContext {
       appendEvents: [...this.#appendEvents],
       upsertWaits: [...this.#upsertWaits],
       deleteWaits: [...this.#deleteWaits],
+      cancelCommands: [...this.#cancelCommands],
       consumeSignals: [...this.#consumeSignals],
       scheduleActivities: [...this.#scheduleActivities],
       scheduleActivityMaps: [...this.#scheduleActivityMaps],
@@ -3165,7 +3232,8 @@ class ActivityDurablePromise<A extends ActivityDefinition<any, any, string>>
     return {
       kind: "Pending",
       key: commandKey(resolution.commandId),
-      resolve: () => context.resolveHotActivityBranch(this.#activityDefinition, resolution.commandId)
+      resolve: () => context.resolveHotActivityBranch(this.#activityDefinition, resolution.commandId),
+      cancel: () => context.cancelActivityBranch(resolution.commandId)
     };
   }
 
@@ -3643,7 +3711,8 @@ class TimerDurablePromise implements DurableBranch<void> {
       : {
           kind: "Pending",
           key: commandKey(resolution.commandId),
-          resolve: () => context.resolveHotTimerBranch(resolution.commandId)
+          resolve: () => context.resolveHotTimerBranch(resolution.commandId),
+          cancel: () => context.cancelTimerBranch(resolution.commandId)
         };
   }
 }
@@ -3706,7 +3775,8 @@ class SignalDurablePromise<Payload extends object, const Name extends string = s
             this.name,
             resolution.commandId,
             this.payloadSchema
-          )
+          ),
+          cancel: () => context.cancelSignalBranch(resolution.commandId)
         };
   }
 }
@@ -3900,6 +3970,10 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
     }
 
     const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+    // Every branch still in `pending` lost without producing a value: nothing
+    // resolves here, so this list is exactly Rust's `outputs[i].is_none()`
+    // losers.
+    cancelLosingSelectBranches(pending);
     const result = { branch: winner.key, value: winner.value };
     return Promise.resolve(onfulfilled ? onfulfilled(result) : (result as TResult1));
   }
@@ -3975,6 +4049,7 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
 
     const keys = this.#branches.map((_, index) => String(index));
     const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+    cancelLosingSelectBranches(pending);
     const result = { index: Number(winner.key), value: winner.value };
     return Promise.resolve(onfulfilled ? onfulfilled(result) : (result as TResult1));
   }
@@ -4027,6 +4102,15 @@ interface PendingJoinBranch<T> {
   readonly kind: "Pending";
   readonly key: string;
   resolve(): HotSuspendResolution<ReadyJoinBranch<T>>;
+  /**
+   * Withdraws whatever this branch registered with the provider — a wait, or
+   * a scheduled activity.
+   *
+   * Called by `select` and `selectAll` on every branch that lost without
+   * producing a value, and by nothing else: `join` and `joinAll` wait for
+   * every branch, so no branch of theirs is ever abandoned.
+   */
+  cancel(): void;
 }
 
 interface ReadyJoinBranch<T> {
@@ -4061,6 +4145,9 @@ function memoizeJoinBranch<T>(branch: PendingJoinBranch<T>): PendingJoinBranch<T
   return {
     kind: "Pending",
     key: branch.key,
+    cancel: () => {
+      branch.cancel();
+    },
     resolve: () => {
       if (settled.value !== null) {
         return settled.value;
@@ -4137,6 +4224,11 @@ function resolveHotSelect(
   pending: readonly PendingJoinBranch<unknown>[]
 ): HotSuspendResolution<SelectRuntimeResult> {
   const ready = [...initialReady];
+  // The branches that are still pending on the pass that settles the select.
+  // A branch that resolved is not cancelled even when it loses: it already
+  // consumed its ready event, so there is nothing left with the provider to
+  // withdraw. Rust draws the same line with `outputs[i].is_none()`.
+  const unresolved: PendingJoinBranch<unknown>[] = [];
   for (const branch of pending) {
     const resolution = branch.resolve();
     if (resolution.kind === "Rejected") {
@@ -4144,13 +4236,30 @@ function resolveHotSelect(
     }
     if (resolution.kind === "Resolved") {
       ready.push(resolution.value.value as SelectReadyBranch);
+    } else {
+      unresolved.push(branch);
     }
   }
   if (ready.length === 0) {
     return { kind: "Pending" };
   }
   const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+  cancelLosingSelectBranches(unresolved);
   return { kind: "Resolved", value: { branch: winner.key, value: winner.value } };
+}
+
+/**
+ * Withdraws every branch that lost a `select` without producing a value.
+ *
+ * Runs *after* the winner is recorded, never before, so a select that fails
+ * its nondeterminism check leaves the losing branches alone — the same order
+ * Rust's macro uses, where the cancel loop sits inside the `Ok(())` arm of
+ * `__durust_select_record_winner`.
+ */
+function cancelLosingSelectBranches(losers: readonly PendingJoinBranch<unknown>[]): void {
+  for (const loser of losers) {
+    loser.cancel();
+  }
 }
 
 function resolveHotSelectAll(

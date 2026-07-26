@@ -41,6 +41,17 @@ export interface WorkerOptions {
   readonly namespace?: Namespace | string;
   readonly workerId: WorkerId | string;
   readonly workflowTaskQueue: TaskQueue | string;
+  /**
+   * The queue this worker claims activity tasks from, and the queue a
+   * `callActivity()` that names none is scheduled onto.
+   *
+   * The second half is a **breaking change for existing histories** in one
+   * deployment shape; see "Upgrading" in `typescript/README.md`. Before, the
+   * runtime ignored this option and fell back to the literal `"default"`, so a
+   * fleet with a second activity worker on `"default"` worked and now
+   * re-fingerprints. Leaving this undefined keeps the `"default"` fallback,
+   * which is also Rust's `TaskQueue::default()`.
+   */
   readonly activityTaskQueue?: TaskQueue | string;
   readonly registeredSignalNames?: readonly (SignalName | string)[];
   readonly leaseDurationMs?: number;
@@ -609,9 +620,14 @@ export class Worker {
     config: ResolvedRunConfig
   ): Promise<boolean> {
     let scanned = false;
+    // The provider's clock, not the process's. `Worker::run_timers_once` in
+    // Rust reads `backend.current_time()` here for the same reason the
+    // workflow-task path does: a worker that scanned against `Date.now()`
+    // while the provider ran a virtual clock would fire timers the provider
+    // does not consider due, or miss ones it does.
     const timers = await this.#backend.fireDueTimers({
       namespace: this.#namespace,
-      now: Date.now(),
+      now: await this.#backend.currentTime(),
       limit: config.timerMaintenanceLimit
     });
     if (timers.fired > 0) {
@@ -911,8 +927,11 @@ export class Worker {
     limit = 64
   ): Promise<Awaited<ReturnType<DurableBackend["timeoutDueActivities"]>>> {
     const outcome = await this.#backend.timeoutDueActivities({
+      // As in `#runMaintenanceScanOnce`, and as in Rust's
+      // `Worker::run_activity_timeouts_once`: one clock per deployment, and it
+      // is the provider's.
       namespace: this.#namespace,
-      now: Date.now(),
+      now: await this.#backend.currentTime(),
       limit: Math.max(1, Math.trunc(limit))
     });
     if (outcome.timedOut > 0) {
@@ -946,6 +965,13 @@ export class Worker {
     liveSignals: readonly SignalInboxRecord[]
   ): Promise<PreparedWorkflowExecution> {
     const cacheKey = String(claimed.runId);
+    // Read once per prepared task, before either path builds or advances an
+    // execution, mirroring `Worker::prepare_claimed_workflow_task_inner` in
+    // Rust. It has to come from the provider rather than from `Date.now()`:
+    // the clock a workflow sees is part of the commit `SPEC.md` §1.2 makes
+    // normative, and a provider driving a virtual clock is entitled to have
+    // the runtime observe it.
+    const nowMs = Number(await this.#backend.currentTime());
     const cached = this.#workflowExecutionCache.get(cacheKey);
     if (
       cached !== undefined &&
@@ -957,7 +983,7 @@ export class Worker {
       const hotClaim = await this.#claimWithHotWakeHistory(cached, claimed);
       if (hotClaim.prefetchedHistory.every(isHotWorkflowWakeEvent)) {
         this.#metrics.workflowExecutionCacheHits += 1;
-        const commit = await cached.execution.advance(hotClaim, { liveSignals });
+        const commit = await cached.execution.advance(hotClaim, { liveSignals, nowMs });
         return {
           cacheKey,
           execution: cached.execution,
@@ -989,7 +1015,7 @@ export class Worker {
       workflowStartedInput(replayClaim.prefetchedHistory) as PayloadRef<unknown>,
       definition.inputSchema
     );
-    let execution = this.#buildColdExecution(definition, input, replayClaim, liveSignals);
+    let execution = this.#buildColdExecution(definition, input, replayClaim, liveSignals, nowMs);
     // Everything past this point needs the claim's identity, never its events.
     const preparedClaim = claimWithoutHistory(replayClaim);
     // Released as soon as the execution has ingested it. That array now carries
@@ -1032,6 +1058,7 @@ export class Worker {
         input,
         repairClaim,
         liveSignals,
+        nowMs,
         Number.POSITIVE_INFINITY
       );
       commit = await execution.nextCommit();
@@ -1090,6 +1117,7 @@ export class Worker {
     input: unknown,
     replayClaim: ClaimedWorkflowTask,
     liveSignals: readonly SignalInboxRecord[],
+    nowMs: number,
     replayWindowLookaheadEvents?: number
   ): HotWorkflowExecution {
     // The loader closes over ids, not over the claim: the claim holds the
@@ -1100,6 +1128,21 @@ export class Worker {
     return new HotWorkflowExecution(definition, input as object, replayClaim, {
       payloadCodec: this.#payloadCodec,
       defaultWorkflowTaskQueue: String(this.#workflowTaskQueue),
+      // A `callActivity()` with no explicit `taskQueue` must land on the queue
+      // this worker actually claims from. Rust's runtime applies the same
+      // fallback (`RuntimeContext::effective_activity_options` ->
+      // `ActivityOptions::with_task_queue_fallback`) from the worker's
+      // configured activity task queue, and its unconfigured default is
+      // `TaskQueue::default()` — the literal "default" the runtime falls back
+      // to when this is left out, so an activity-less worker is unaffected.
+      ...(this.#activityTaskQueue === null
+        ? {}
+        : { defaultActivityTaskQueue: String(this.#activityTaskQueue) }),
+      // Rust's worker reads `backend.current_time()` once per prepared
+      // workflow task and hands it to the runtime as `now`. Without it every
+      // `sleep(d)` here recorded `fireAt = d`, an absolute deadline measured
+      // from the epoch rather than from now.
+      nowMs,
       liveSignals,
       // The pull side of chunked replay. The runtime calls this when its replay
       // window runs low, so the whole history is never in memory at once, and

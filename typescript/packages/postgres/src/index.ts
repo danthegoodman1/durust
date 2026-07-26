@@ -448,6 +448,20 @@ export class PostgresBackend implements DurableBackend {
     }
   }
 
+  /**
+   * This provider's clock — the same `#nowMs` every lease, deadline and
+   * due-scan in this file reads, not `Date.now()`.
+   *
+   * It has to be the same one. `PostgresBackendOptions.nowMs` already decides
+   * when a lease has expired and when an activity has missed its deadline, so
+   * a `currentTime()` that answered from the process clock would hand the
+   * runtime an instant this provider does not believe in: `sleep(d)` would
+   * record a deadline the provider's own `fireDueTimers` scan never reaches.
+   */
+  async currentTime(): Promise<TimestampMs> {
+    return this.#nowMs() as TimestampMs;
+  }
+
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
     return this.#withSqlTransaction(async (client) => {
       const existing = await this.#selectCurrentWorkflowRunId(
@@ -885,9 +899,6 @@ export class PostgresBackend implements DurableBackend {
         }
       }
     }
-    for (const cancelled of commit.cancelCommands ?? []) {
-      this.#cancelCommandOperationalState(cancelled);
-    }
     for (const task of commit.scheduleActivities ?? []) {
       const activityState: ActivityState = {
         namespace: state.namespace,
@@ -910,6 +921,25 @@ export class PostgresBackend implements DurableBackend {
     }
     for (const task of commit.scheduleChildWorkflowMaps ?? []) {
       this.#createChildWorkflowMap(state, task);
+    }
+    // After every schedule loop; see `MemoryBackend.commitWorkflowTask` for
+    // why, and Rust's `src/memory.rs` for the order all four providers now
+    // share. A commit that both schedules and withdraws one command — a
+    // `select` settling on its first pass — cancelled nothing and then
+    // inserted the task live.
+    //
+    // Note what makes this safe under `targetedProjectionUpdates`, because it
+    // is not what it looks like: `#cancelCommandOperationalState` is
+    // synchronous and writes **no** normalized rows of its own — no `await`,
+    // no `client.query`, no `#upsertNormalized…`. It mutates in-memory state
+    // and relies entirely on the closing full rewrite to persist it. The only
+    // reason that is correct is that
+    // `canUseTargetedWorkflowCommitProjectionUpdates` refuses any commit with
+    // a non-empty `cancelCommands`, so this loop never runs under the targeted
+    // scope. **Narrowing that predicate without first giving this path its own
+    // row writes would silently drop the cancellation.**
+    for (const cancelled of commit.cancelCommands ?? []) {
+      this.#cancelCommandOperationalState(cancelled);
     }
     if (commit.queryProjection !== undefined) {
       state.queryProjection = commit.queryProjection;
@@ -1898,6 +1928,14 @@ export class PostgresBackend implements DurableBackend {
             and waits.kind = 'Timer'
             and waits.ready_at_ms is not null
             and waits.ready_at_ms <= $2::bigint
+            -- A closed run's history is finished. Firing a stray wait against
+            -- it appends TimerFired past the terminal event, which every
+            -- replay, audit and terminal-cleanup assumption rests on not
+            -- happening. Expressed as a predicate rather than as a per-row
+            -- skip so the row is never selected, and therefore never included
+            -- in the delete below: Rust's memory provider likewise skips a
+            -- terminal run's wait without removing it.
+            and runs.terminal = false
           order by waits.ready_at_ms asc, waits.wait_id asc
           limit $3::bigint
           for update of waits, runs skip locked
@@ -5394,6 +5432,17 @@ function canUseTargetedWorkflowCommitProjectionUpdates(commit: WorkflowTaskCommi
   if (
     // A cancelled command rewrites activity task rows and map descriptor rows,
     // neither of which the targeted projection covers.
+    //
+    // This is no longer hypothetical: losing-branch `select` cancellation gives
+    // `cancelCommands` a runtime producer, so a workflow that races an activity
+    // in a `select` drops off this path once per settle, and again on each cold
+    // replay of that task. Measured on the fallback: 9.5x slower at 10 runs in
+    // the table and 42x at 200, because `#loadNormalizedState` reads and
+    // rewrites whole tables — the fast path is flat as the database grows and
+    // this one is not. Narrowing it to admit plain-activity cancels needs a
+    // state lookup (the commit alone cannot tell an activity id from a map
+    // descriptor id) and row writes in `#cancelCommandOperationalState`; it is
+    // tracked separately, not oversight.
     (commit.cancelCommands?.length ?? 0) > 0 ||
     (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
     (commit.startChildWorkflows?.length ?? 0) > 0 ||
@@ -5411,6 +5460,9 @@ function canUseSqlNativeWorkflowCommit(commit: WorkflowTaskCommit): boolean {
   if (
     // Cancelling a command tombstones activity rows and steps a map descriptor
     // through the engine; neither is expressible as one statement here.
+    // Losing-branch `select` cancellation now produces this field, so the cost
+    // of the bail is real rather than theoretical — see the measurement on
+    // `canUseTargetedWorkflowCommitProjectionUpdates` above.
     (commit.cancelCommands?.length ?? 0) > 0 ||
     (commit.scheduleActivityMaps?.length ?? 0) > 0 ||
     (commit.scheduleChildWorkflowMaps?.length ?? 0) > 0 ||

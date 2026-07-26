@@ -13,7 +13,10 @@ import {
   workflowId,
   workflowType
 } from "@durust/core";
-import { basicProviderConformanceCases } from "@durust/testing";
+import {
+  assertCurrentTimeFollowsInjectedClock,
+  basicProviderConformanceCases
+} from "@durust/testing";
 
 describe("MemoryBackend basic provider conformance", () => {
   for (const conformanceCase of basicProviderConformanceCases()) {
@@ -21,6 +24,16 @@ describe("MemoryBackend basic provider conformance", () => {
       await conformanceCase.run(() => new MemoryBackend());
     });
   }
+});
+
+describe("MemoryBackend clock", () => {
+  it("reports its configured clock from currentTime and scans against it", async () => {
+    let now = 0;
+    const backend = new MemoryBackend({ nowMs: () => now });
+    await assertCurrentTimeFollowsInjectedClock(backend, (ms) => {
+      now = ms;
+    });
+  });
 });
 
 describe("MemoryBackend retry timing", () => {
