@@ -11,7 +11,6 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(feature = "postgres")]
-use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "postgres")]
@@ -21,9 +20,46 @@ static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
 static PANICKING_ACTIVITY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 
+/// The URL of the Postgres test database, or `None` when this run is not
+/// expected to have one.
+///
+/// Every Postgres test here is environment-gated, and libtest **captures**
+/// `eprintln!` on a passing test, so with `DURUST_POSTGRES_URL` unset the whole
+/// Postgres suite reports `ok` and its skip notices are invisible unless the
+/// run also passes `--nocapture`. That is how these tests ran vacuously in CI.
+///
+/// `DURUST_REQUIRE_POSTGRES` closes the hole: when it is set, a missing URL is
+/// a panic instead of a skip, so a run that is *supposed* to exercise Postgres
+/// fails loudly if the database or the variable goes away. CI sets it next to
+/// its service container; a developer with no database leaves it unset and
+/// still gets the skip.
 #[cfg(feature = "postgres")]
-fn postgres_url_from_env() -> Option<String> {
-    env::var("DURUST_POSTGRES_URL").ok()
+fn postgres_url_or_skip(what: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
+        if !url.trim().is_empty() {
+            return Some(url);
+        }
+    }
+    assert!(
+        !postgres_is_required(),
+        "DURUST_REQUIRE_POSTGRES is set, so `{what}` must run, \
+         but DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping {what}; set DURUST_POSTGRES_URL");
+    None
+}
+
+/// `DURUST_REQUIRE_POSTGRES` is on for any value except empty, `0` and
+/// `false`, so `=1` reads the obvious way and `=0` is a usable off switch.
+#[cfg(feature = "postgres")]
+fn postgres_is_required() -> bool {
+    match std::env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -2139,8 +2175,7 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
 #[test]
 fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres inline child cache regression; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres inline child cache regression") else {
             return;
         };
         let schema = postgres_test_schema("inline_child_cache");

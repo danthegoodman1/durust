@@ -10,6 +10,41 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Both runtimes' Postgres suites are environment-gated, and before this
+    # container neither of them ran here: Rust's 55 gated tests executed and
+    # skipped (libtest captures the skip notice, so they reported plain `ok`),
+    # and TypeScript's 123 never executed at all, because the only script that
+    # invokes them — `check:postgres` — hangs off `check:release`, which no
+    # workflow calls. The container plus `DURUST_REQUIRE_POSTGRES` below turns
+    # "no database" from a silent pass into a failure.
+    #
+    # The image tracks the local development container so a CI-only Postgres
+    # version difference cannot be the reason a test disagrees with a laptop.
+    # The port is the in-container default; only the local fixture uses 5433.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: durust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d durust"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    # `DURUST_POSTGRES_URL` is deliberately set per step rather than for the
+    # whole job. `vitest.config.ts` includes `packages/*/test/**/*.test.ts`, so
+    # a job-level variable would also switch on the env-gated Postgres cases in
+    # `packages/benchmark/test/thresholds.test.ts` inside `npm run check` — and
+    # those are throughput comparisons against baselines recorded on one
+    # developer machine, plus a hard `statementStats` assertion that needs
+    # `pg_stat_statements` preloaded. See the benchmark-threshold note below.
+
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +71,14 @@ jobs:
           cargo check --locked --no-default-features
           cargo check --locked --features postgres,s3
 
+      # `DURUST_REQUIRE_POSTGRES` turns every Postgres skip site in the Rust
+      # suite into a panic, so this step fails if the service container, the
+      # URL, or the database goes away. Without it the same command reports
+      # `ok` for 55 tests that never touched a database.
       - name: Run tests
+        env:
+          DURUST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/durust
+          DURUST_REQUIRE_POSTGRES: "1"
         run: cargo test --locked --workspace --all-features
 
       # The Rust half of every shared contract fixture, named so a failure
@@ -58,6 +100,57 @@ jobs:
       # corpus was ungated in CI.
       - name: Run TypeScript checks
         run: npm run check --prefix typescript
+
+      # `npm run check` runs `npm run test`, which *does* collect this file —
+      # `vitest.config.ts` includes `packages/*/test/**/*.test.ts`. It reaches
+      # it and skips it, because the suite is `describe.skip` without
+      # `DURUST_POSTGRES_URL`, and a fully skipped file still exits 0. So the
+      # cases were never executed in CI, and the only script that would have
+      # executed them, `check:postgres`, hangs off `check:release`, which no
+      # workflow invokes. Same for the hot-cache soak below.
+      #
+      # This runs the conformance file directly rather than `npm run
+      # check:postgres`, because that script also runs
+      # `test:benchmark-thresholds` — see the note below it.
+      #
+      # `DURUST_REQUIRE_POSTGRES` is the same flag the Rust suite uses, and is
+      # set here so the TypeScript side can fail rather than skip once it
+      # honours it. Until then the `test -n` guard is the whole protection, and
+      # it is weaker than it looks: it checks a value set two lines above it,
+      # so it fires only if a future edit deletes that `env:` block. It does
+      # *not* catch the case that matters — a file whose cases are all skipped
+      # reports success — which needs an executed-count assertion on the
+      # TypeScript side.
+      - name: Run TypeScript Postgres conformance
+        env:
+          DURUST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/durust
+          DURUST_REQUIRE_POSTGRES: "1"
+        run: |
+          test -n "$DURUST_POSTGRES_URL" || {
+            echo "DURUST_POSTGRES_URL must be set: without it every case in this file is skipped and the step still passes"
+            exit 1
+          }
+          npm run test --prefix typescript -- packages/postgres/test/postgres-conformance.test.ts
+
+      # `DURUST_LONG_SOAK=1` adds exactly one case to the simulation suite
+      # (16 tests instead of 15 passed + 1 skipped) and costs ~90 ms of the
+      # run's 0.6 s wall clock, measured. There is no reason for something that
+      # cheap to live outside CI.
+      - name: Run TypeScript hot execution cache soak
+        run: npm run test:soak --prefix typescript
+
+      # Deliberately **not** run here, and this is the decision rather than an
+      # omission: `npm run test:benchmark-thresholds` compares measured
+      # throughput and latency against baselines recorded on one developer
+      # machine, and its accepted-baseline case additionally asserts
+      # `postgres_stats.statementStats` is non-null, which requires the server
+      # to have been started with `shared_preload_libraries=pg_stat_statements`
+      # — a setting a GitHub service container cannot supply, since `services:`
+      # cannot override the image's command. Run against a stock container it
+      # fails with `expected null not to be null`, which is a fact about the
+      # container rather than about the change under test. Performance
+      # baselines belong on a controlled machine; they stay in
+      # `npm run check:postgres` for that use.
 
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d

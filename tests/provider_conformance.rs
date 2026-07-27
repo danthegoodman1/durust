@@ -30,9 +30,73 @@ fn input(value: u64) -> Input {
     Input { value }
 }
 
+/// The URL of the Postgres test database, or `None` when this run is not
+/// expected to have one.
+///
+/// Every Postgres test here is environment-gated, and libtest **captures**
+/// `eprintln!` on a passing test, so with `DURUST_POSTGRES_URL` unset the whole
+/// Postgres suite reports `ok` and its skip notices are invisible unless the
+/// run also passes `--nocapture`. That is how these tests ran vacuously in CI.
+///
+/// `DURUST_REQUIRE_POSTGRES` closes the hole: when it is set, a missing URL is
+/// a panic instead of a skip, so a run that is *supposed* to exercise Postgres
+/// fails loudly if the database or the variable goes away. CI sets it next to
+/// its service container; a developer with no database leaves it unset and
+/// still gets the skip.
 #[cfg(feature = "postgres")]
-fn postgres_url_from_env() -> Option<String> {
-    env::var("DURUST_POSTGRES_URL").ok()
+fn postgres_url_or_skip(what: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
+        if !url.trim().is_empty() {
+            return Some(url);
+        }
+    }
+    assert!(
+        !postgres_is_required(),
+        "DURUST_REQUIRE_POSTGRES is set, so `{what}` must run, \
+         but DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping {what}; set DURUST_POSTGRES_URL");
+    None
+}
+
+/// `DURUST_REQUIRE_POSTGRES` can only fail a Postgres test that was compiled.
+///
+/// Every Postgres test in this workspace sits behind `#[cfg(feature =
+/// "postgres")]`, so a run that drops the feature contains no Postgres tests at
+/// all and the require flag has nothing to fire on — the same vacuous pass the
+/// flag exists to abolish, one level up. This test is outside the `cfg`, so it
+/// is the one Postgres assertion that survives the feature being switched off.
+///
+/// Two honest limits on what it covers. It lives in an **integration** target,
+/// so it cannot fire for a `--lib`-only invocation; it protects
+/// `--workspace` and `--test provider_conformance` runs, which is what CI uses.
+/// And `cargo test --workspace` without `--all-features` still enables
+/// `postgres` on the lib anyway, through feature unification with
+/// `benchtools`, whose dependency on `durust` names that feature — so the
+/// scenario this guards is narrower than "someone forgot `--all-features`".
+#[test]
+fn postgres_feature_is_enabled_when_postgres_is_required() {
+    if !postgres_is_required() {
+        return;
+    }
+    assert!(
+        cfg!(feature = "postgres"),
+        "DURUST_REQUIRE_POSTGRES is set, but this binary was built without the `postgres` \
+         feature, so every Postgres test was compiled out and the run proves nothing. Add \
+         `--features postgres` or `--all-features`."
+    );
+}
+
+/// Deliberately outside `#[cfg(feature = "postgres")]`: the test above needs it
+/// in a build that has no Postgres support at all.
+fn postgres_is_required() -> bool {
+    match std::env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -148,8 +212,7 @@ fn sqlite_provider_passes_basic_conformance() {
 #[test]
 fn postgres_provider_passes_basic_conformance_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres provider conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres provider conformance") else {
             return;
         };
         let schema = postgres_test_schema("conformance");
@@ -267,8 +330,7 @@ fn sqlite_workflow_lease_expiry_reclaims_and_fences_stale_holder_across_reopen()
 #[test]
 fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres lease expiry conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres lease expiry conformance") else {
             return;
         };
         let schema = postgres_test_schema("lease_expiry");
@@ -326,8 +388,7 @@ fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
 #[test]
 fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres delayed release conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres delayed release conformance") else {
             return;
         };
         let schema = postgres_test_schema("delayed_release");
@@ -446,8 +507,7 @@ fn sqlite_activity_retry_backoff_persists_across_reopen() {
 #[test]
 fn postgres_activity_retry_backoff_delays_reclaim_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres retry backoff conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres retry backoff conformance") else {
             return;
         };
         let schema = postgres_test_schema("retry_backoff");
@@ -1406,8 +1466,7 @@ fn inline_manifest_root_with_foreign_scheme_pages_completes_over_sqlite_provider
 #[test]
 fn inline_manifest_root_with_foreign_scheme_pages_completes_over_postgres_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres foreign-page conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres foreign-page conformance") else {
             return;
         };
         let schema = postgres_test_schema("foreign_page");
@@ -1488,8 +1547,7 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
 #[test]
 fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres custom-scheme conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres custom-scheme conformance") else {
             return;
         };
         let schema = postgres_test_schema("custom_scheme");
@@ -7402,8 +7460,7 @@ fn sqlite_heartbeating_timeoutless_activity_survives_lease_periods() {
 #[test]
 fn postgres_heartbeating_timeoutless_activity_survives_lease_periods_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres heartbeat lease conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres heartbeat lease conformance") else {
             return;
         };
         let schema = postgres_test_schema("hb_timeoutless");
@@ -8272,8 +8329,7 @@ fn sqlite_child_workflow_map_fail_fast_history_strings_are_pinned() {
 #[test]
 fn postgres_child_workflow_map_fail_fast_history_strings_are_pinned_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres fail-fast history strings; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres fail-fast history strings") else {
             return;
         };
         let schema = postgres_test_schema("failfaststrings");
@@ -10778,8 +10834,7 @@ fn sqlite_activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation() {
 #[test]
 fn postgres_activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres zero-bound map conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres zero-bound map conformance") else {
             return;
         };
         let schema = postgres_test_schema("mapzerobound");
@@ -10940,8 +10995,7 @@ fn sqlite_activity_map_failure_tombstones_pending_sibling_items() {
 #[test]
 fn postgres_activity_map_failure_tombstones_pending_sibling_items_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres map abandon conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres map abandon conformance") else {
             return;
         };
         let schema = postgres_test_schema("mapabandon");
@@ -11111,8 +11165,7 @@ fn sqlite_child_workflow_map_id_collision_holds_the_in_flight_bound() {
 #[test]
 fn postgres_child_workflow_map_id_collision_holds_the_in_flight_bound_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres child map collision conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres child map collision conformance") else {
             return;
         };
         let schema = postgres_test_schema("childmapcollision");
@@ -11213,8 +11266,7 @@ fn sqlite_activity_map_materializes_a_large_batch_in_one_statement() {
 #[test]
 fn postgres_activity_map_materializes_a_large_batch_in_one_statement_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres map batch conformance; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres map batch conformance") else {
             return;
         };
         let schema = postgres_test_schema("mapbatch");
@@ -11258,8 +11310,7 @@ fn postgres_activity_map_materializes_a_large_batch_in_one_statement_when_config
 #[test]
 fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres vanishing child map item test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres vanishing child map item test") else {
             return;
         };
         let schema = postgres_test_schema("mapvanish");
@@ -11429,8 +11480,7 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
 #[test]
 fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres vanishing child start test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres vanishing child start test") else {
             return;
         };
         let schema = postgres_test_schema("childvanish");
@@ -11571,8 +11621,7 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
 #[test]
 fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres empty-map upgrade repair test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres empty-map upgrade repair test") else {
             return;
         };
         let schema = postgres_test_schema("maprepair");
@@ -11698,8 +11747,7 @@ fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
 #[test]
 fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres undecodable map repair test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres undecodable map repair test") else {
             return;
         };
         let schema = postgres_test_schema("mapundec");
@@ -11799,8 +11847,7 @@ fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
 #[test]
 fn postgres_orphaned_stalled_map_does_not_refuse_to_start_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres orphaned map repair test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres orphaned map repair test") else {
             return;
         };
         let schema = postgres_test_schema("maporphan");
@@ -11904,8 +11951,7 @@ async fn postgres_scalar(database_url: &str, sql: &str) -> Option<i64> {
 #[test]
 fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres same-commit ready reason test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres same-commit ready reason test") else {
             return;
         };
         let schema = postgres_test_schema("mapreadyreason");
@@ -12055,8 +12101,7 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
 #[test]
 fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres stale map descriptor test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres stale map descriptor test") else {
             return;
         };
         let schema = postgres_test_schema("stalemapdesc");

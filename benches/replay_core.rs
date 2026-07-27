@@ -2881,9 +2881,35 @@ struct PostgresBenchFixture {
     backend: PostgresBackend,
 }
 
+/// Mirrors `postgres_url_or_skip` in the test suites; see there for why an
+/// unset variable must be able to fail rather than only skip.
+///
+/// This file has no `#[test]`, so a silent skip here cannot produce a green
+/// run of zero coverage the way it could in the suites — and CI only builds
+/// benchmarks (`cargo bench --no-run`), so nothing here executes there today.
+/// It honours the flag anyway so that one variable governs every Postgres
+/// entry point in the workspace, rather than most of them.
 #[cfg(feature = "postgres")]
 fn postgres_benchmark_url() -> Option<String> {
-    env::var("DURUST_POSTGRES_URL").ok()
+    if let Ok(url) = env::var("DURUST_POSTGRES_URL") {
+        if !url.trim().is_empty() {
+            return Some(url);
+        }
+    }
+    let required = match env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    };
+    assert!(
+        !required,
+        "DURUST_REQUIRE_POSTGRES is set, so the Postgres benchmarks must run, but \
+         DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping Postgres provider benchmarks; set DURUST_POSTGRES_URL");
+    None
 }
 
 #[cfg(feature = "postgres")]

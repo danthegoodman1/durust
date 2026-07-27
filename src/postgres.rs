@@ -667,6 +667,44 @@ impl PostgresBackend {
                     where ready_reason is not null
                       and terminal = false;
 
+                -- Serves `cancel_child_workflow_map_children_tx`, which finds a
+                -- map's children by parent link. Without it that query is a
+                -- sequential scan of every workflow instance, and it runs on
+                -- two hot paths: cancelling a command and applying a fail-fast
+                -- map effect. Measured on a table shaped like this one, 20
+                -- matching children throughout: 0.246 ms at 1k rows, 1.210 ms
+                -- at 10k, 8.637 ms at 100k, with `Rows Removed by Filter`
+                -- tracking the row count. With this index, 0.140 ms at 1k and
+                -- 0.193 ms at 100k — the growth is gone.
+                --
+                -- The predicate and the key deliberately name only columns that
+                -- never change after insert. `parent_run_id` and
+                -- `parent_command_seq` are written once by `start_workflow` and
+                -- updated by none of the 20 `update workflow_instances`
+                -- statements in this file, so an ordinary instance update —
+                -- claim token, `current_event_id`, `ready_reason`, `terminal` —
+                -- changes no indexed column and stays eligible for a HOT
+                -- update, paying nothing for this index. Measured against the
+                -- counterfactual: as shipped it costs 0 non-HOT updates, and
+                -- adding `terminal = false` to the predicate — which looks
+                -- tighter — costs all 3,023 of them, because the terminal
+                -- transition would move the row out of the index.
+                --
+                -- The residual write cost is one 2-column btree insert per
+                -- child workflow. That has **not** been measured, and the
+                -- honest reason is that it is below what the harness can
+                -- resolve: an interleaved A/B of the `mixed` profile at n=24,
+                -- in which 400 of 800 inserted instances carried a parent so
+                -- the index was genuinely populated, bounds the effect at
+                -- [-1.14%, +2.03%] — while the expected effect is ~400 btree
+                -- inserts across a ~570 ms run, a few tenths of a percent.
+                -- Resolving that needs n on the order of 900. What the
+                -- experiment establishes is a bound, not a null: no regression
+                -- above ~2%.
+                create index if not exists idx_workflow_instances_parent
+                    on {schema}.workflow_instances(parent_run_id, parent_command_seq)
+                    where parent_run_id is not null;
+
                 create table if not exists {schema}.signals (
                     signal_id text primary key,
                     namespace text not null,
@@ -6813,6 +6851,56 @@ async fn insert_history_event_rows(
     Ok(())
 }
 
+/// Which commits the set-based batch path can take, and — for `cancel_commands`
+/// specifically — why the bail is left as it is.
+///
+/// **The decision is to leave it. The first version of this comment justified
+/// that with a claim that was false, and the correction is the useful part.**
+///
+/// The claim was that Rust has no cost that grows with database size on this
+/// path, every statement being a primary-key lookup, unlike TypeScript's
+/// `canUseSqlNativeWorkflowCommit`, whose fallback rebuilds normalized state
+/// over whole tables (9.5x at 10 runs, 42x at 200, recorded at
+/// `packages/postgres/src/index.ts:5467`). Two statements *are* primary-key
+/// lookups — `activity_map_state_tx` and `child_workflow_map_state_tx` both key
+/// on `map_command_id`, a `primary key` column. But when the cancelled command
+/// **is** a live child-workflow map, they return `Some` and
+/// `cancel_child_workflow_map_children_tx` runs, and that query finds children
+/// by `parent_run_id`/`parent_command_seq`. Until `idx_workflow_instances_parent`
+/// was added next to the other indexes above, no index covered those columns
+/// and it was a sequential scan of every workflow instance: measured 0.246 ms
+/// at 1k rows, 1.210 ms at 10k, 8.637 ms at 100k, `Rows Removed by Filter`
+/// tracking the table. Linear, on a hot path, and shared with the fail-fast map
+/// effect applier — so it was never specific to cancellation.
+///
+/// The benchmark that produced the ratios below **did not reach that branch**:
+/// its cancels named a command sequence that no map had ever used, so both
+/// descriptor lookups missed and the children query never ran. What those
+/// numbers measure is therefore the fixed cost of dropping one commit off the
+/// set-based path onto the scalar one, which is real and is the common case,
+/// but they were not evidence about scaling and the earlier version of this
+/// comment presented them as if they were. They read flat across a 3,000-row
+/// change because at that size the scan is a fraction of a millisecond against
+/// a ~1.8 ms batch — below the noise, not absent.
+///
+/// The measurement that stands, batches of 32 commits, medians of 10 timed
+/// batches after 4 warmup rounds, interleaved A/B in one process:
+///
+/// - every commit carrying a cancel: 19.0x / 20.5x / 18.7x at 0 extra runs and
+///   19.2x / 18.1x / 21.1x at 3000;
+/// - one cancel in 32, which is what a losing `select` branch produces:
+///   1.63x / 1.67x / 1.70x at 0 and 1.63x / 1.68x / 1.65x at 3000.
+///
+/// So a losing-select cancel costs about one extra scalar commit, ~1.1 ms
+/// against a ~1.8 ms batch. The bail stays for two reasons. Narrowing it to
+/// admit plain-activity cancels would not remove the children query, because
+/// that query runs whenever the cancelled command really is a map, on this path
+/// and on the fail-fast one alike — the growth was never the bail's to fix, and
+/// the index is what fixes it. And narrowing needs a lookup to tell an activity
+/// id from a map descriptor id, which the commit alone cannot do, placing it on
+/// the hottest path in the provider where a wrong answer silently skips a map
+/// cancellation. Revisit if a workload appears where most commits in a batch
+/// carry cancels; there the 19x figure applies, not the 1.65x one.
 fn postgres_simple_batch_commit_eligible(commit: &WorkflowTaskCommit) -> bool {
     let has_terminal_event = postgres_simple_batch_commit_has_terminal_event(commit);
     commit.schedule_activity_maps.is_empty()

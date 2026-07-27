@@ -26,6 +26,7 @@ const DEFAULT_MAX_ROUNDS: usize = 10_000;
 const WORKFLOW_QUEUE: &str = "workflows";
 const ACTIVITY_QUEUE: &str = "activities";
 static POSTGRES_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(0);
+static POSTGRES_DATABASE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchmarkBackend {
@@ -69,6 +70,8 @@ struct BenchmarkOptions {
     signal_batch_width: usize,
     max_rounds: usize,
     keep_db: bool,
+    list_stale: bool,
+    drop_stale: bool,
     #[serde(skip_serializing_if = "is_false")]
     sample_resources: bool,
     #[serde(skip_serializing_if = "is_false")]
@@ -177,6 +180,44 @@ struct PostgresStatsReport {
     activity_samples: Option<PostgresActivitySamplesReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     statement_stats: Option<PostgresStatementStatsReport>,
+    /// Why `statement_stats` is absent, when it is. Present only on failure.
+    ///
+    /// Without this the snapshot error was dropped by `.ok()` at all four call
+    /// sites, so the run reported `statementStats: null` and said nothing about
+    /// the extension or the server configuration that caused it. The reader
+    /// this serves is **whoever runs this binary**, from a shell or a script:
+    /// they now get the reason on stderr and in the JSON.
+    ///
+    /// It does **not** improve the `expected null not to be null` failure in
+    /// `packages/benchmark/test/thresholds.test.ts`, and an earlier version of
+    /// this comment claimed it did. That assertion runs against the TypeScript
+    /// `runBenchmark`, which computes its own `statementStats` and never reads
+    /// this struct — measured after this change, the message there is
+    /// byte-identical to before it. Fixing that needs the same treatment
+    /// applied in `packages/postgres/src/index.ts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statement_stats_unavailable: Option<String>,
+    /// Set when another database's backends were live during the run.
+    ///
+    /// Every other counter here comes from `pg_stat_database` filtered to
+    /// `current_database()`, and this binary now runs in a database of its own,
+    /// so those are exclusive by construction. `pg_stat_wal` has no database
+    /// column at all — it is cluster-wide — so the `wal_*` fields above include
+    /// writes made by anything else on the same server, and are reported rather
+    /// than nulled so a reader comparing WAL figures across runs knows when
+    /// they were shared.
+    ///
+    /// Two limits, both real. This field is only set when foreign backends are
+    /// *live at snapshot time*, so it is silent on the quiet machine where a
+    /// baseline would be recorded and loud afterwards — the wrong way round for
+    /// warning whoever records one. And no threshold key in
+    /// `packages/benchmark/src/index.ts` can reach it: that interface is
+    /// closed, lists `walBytes`…`walSyncTimeMs` with no note that they are
+    /// cluster-wide, and does not carry this field. A future gate on a `wal_*`
+    /// key would therefore be written with nothing warning its author. The
+    /// durable fix is a note on that TypeScript type, not here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wal_stats_shared_with_other_databases: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -293,6 +334,14 @@ struct BenchmarkResult {
     resource_samples: Option<ResourceSamplesReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     postgres_schema: Option<String>,
+    /// The database this run created and ran in.
+    ///
+    /// Before the per-run database, the schema named above lived in whatever
+    /// `DURUST_POSTGRES_URL` pointed at, so `--keep-db` left something the
+    /// caller could already find. It no longer does, and a kept schema inside
+    /// an unnamed database is not inspectable — so the name has to be reported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    postgres_database: Option<String>,
     db_path: Option<String>,
     db_bytes: Option<u64>,
 }
@@ -1315,6 +1364,15 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let options = parse_args(env::args().skip(1))?;
+    // Maintenance actions, not benchmarks: they need only the URL, and they
+    // must not be reachable by accident from a benchmark invocation.
+    if options.list_stale || options.drop_stale {
+        let admin_url = env::var("DURUST_POSTGRES_URL").map_err(|_| {
+            "set DURUST_POSTGRES_URL to list or drop stale benchmark databases".to_owned()
+        })?;
+        let runtime = tokio_runtime()?;
+        return sweep_stale_benchmark_databases(&runtime, &admin_url, options.drop_stale);
+    }
     let result = match options.backend {
         BenchmarkBackend::Memory => run_memory_benchmark(options.clone())?,
         BenchmarkBackend::Postgres => run_postgres_benchmark(options.clone())?,
@@ -1352,6 +1410,8 @@ fn default_options() -> BenchmarkOptions {
         signal_batch_width: 8,
         max_rounds: DEFAULT_MAX_ROUNDS,
         keep_db: false,
+        list_stale: false,
+        drop_stale: false,
         sample_resources: false,
         force_scalar_signal_reads: false,
         postgres_pool_size: None,
@@ -1449,6 +1509,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<BenchmarkOptions
                 )?);
             }
             "--keep-db" => options.keep_db = true,
+            "--list-stale" => options.list_stale = true,
+            "--drop-stale" => options.drop_stale = true,
             "--sample-resources" => options.sample_resources = true,
             "--force-scalar-signal-reads" => options.force_scalar_signal_reads = true,
             "--json" => options.json = true,
@@ -1554,7 +1616,13 @@ fn usage() -> String {
          [--batch {DEFAULT_BATCH}] [--activity-completion-batch 1] [--worker-round-passes {DEFAULT_WORKER_ROUND_PASSES}] \
          [--child-map-items 32] [--child-map-max-in-flight 8] [--signal-batch-width 8] \
          [--force-scalar-signal-reads] \
-         [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json]"
+         [--max-rounds {DEFAULT_MAX_ROUNDS}] [--keep-db] [--sample-resources] [--json] \
+         [--list-stale] [--drop-stale]\n\n\
+         --list-stale lists unused databases this program generated and left behind; \
+         --drop-stale reclaims them. Both are server-wide, not per-run: they consider every \
+         such database on the server. Neither touches one that has a backend attached, and \
+         --drop-stale never evicts a session, but an idle --keep-db database is indistinguishable \
+         from a leak and will be reclaimed. On a shared server run --list-stale first."
     )
 }
 
@@ -1598,7 +1666,7 @@ fn run_sqlite_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult
 
 fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResult, String> {
     options.sqlite_layout = None;
-    let database_url = env::var("DURUST_POSTGRES_URL")
+    let admin_url = env::var("DURUST_POSTGRES_URL")
         .map_err(|_| "set DURUST_POSTGRES_URL to run the Postgres benchmark workload".to_owned())?;
     let schema = postgres_benchmark_schema();
     let pool_size = options
@@ -1615,6 +1683,51 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
     })?;
 
     let runtime = tokio_runtime()?;
+
+    // The run gets a database of its own, not just a schema of its own.
+    //
+    // `postgres_stats_snapshot` reads `pg_stat_database where datname =
+    // current_database()` and `pg_stat_statements where dbid =
+    // current_database()`, both of which count *every* client's work on that
+    // database — while `mixed_actions`, the denominator of
+    // `transactions_per_mixed_action`, counts only this run's. Sharing a
+    // database therefore reports someone else's transactions as this run's:
+    // measured, a sustained foreign load of 60,000 transactions moved the ratio
+    // from 2.775 to 77.519, while after this change three contaminated runs
+    // read 2.503 / 2.475 / 2.471 against quiet runs of 2.433 / 2.516 / 2.914.
+    //
+    // Detecting the contamination was the alternative and is strictly worse: a
+    // stat that is exclusive by construction cannot be wrong, while a detector
+    // has to be right about who else is connected. A per-run schema does not
+    // achieve this, because no `pg_stat_*` view is per-schema — a per-run
+    // database is the smallest unit that works.
+    //
+    // **Scope, because an earlier version of this comment overstated it.** This
+    // fixes the numbers *this binary* prints. It does not fix any gate:
+    // `max_postgres_transactions_per_mixed_action_ratio: 1.2` in
+    // `postgres-mixed-accepted.json` is evaluated by
+    // `packages/benchmark/test/thresholds.test.ts` against the **TypeScript**
+    // benchmark, and nothing — not `check-postgres.mjs`, not any test — runs
+    // this program and compares its output to a baseline. That benchmark builds
+    // a per-run *table name* on the shared `DURUST_POSTGRES_URL`
+    // (`packages/benchmark/src/index.ts:1503`) and reads `from
+    // pg_stat_database where datname = current_database()`
+    // (`packages/postgres/src/index.ts:409`), so the gated path is contaminated
+    // exactly as it was before this change, and needs the same fix applied
+    // there.
+    let database = postgres_benchmark_database();
+    create_postgres_database(&runtime, &admin_url, &database)?;
+    // Named on stderr before anything can fail, so a run killed by a signal —
+    // the one exit the guard below cannot cover — leaves the operator the name.
+    eprintln!("postgres benchmark: running in database `{database}`");
+    // Declared after `runtime` so it drops before it, and after nothing else,
+    // so every early return below unwinds through it.
+    let mut database_guard =
+        BenchmarkDatabaseGuard::new(&runtime, admin_url.clone(), database.clone());
+    let database_url = postgres_url_with_database(&admin_url, &database)?;
+
+    // Dropped before the guard, so the pool's connections are gone before the
+    // database is.
     let backend = runtime
         .block_on(PostgresBackend::connect_with_config(
             PostgresBackendConfig::new(database_url.clone())
@@ -1625,26 +1738,26 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
         ))
         .map_err(|err| err.to_string())?;
 
-    if options.mode == "postgres-write-ceiling" {
-        return run_postgres_write_ceiling_benchmark(runtime, database_url, schema, options);
+    let mut result = if options.mode == "postgres-write-ceiling" {
+        run_postgres_write_ceiling_benchmark(&runtime, &database_url, &schema, options)?
+    } else {
+        run_backend_benchmark(&runtime, backend, options, None, Some(database_url.clone()))?
+    };
+    result.postgres_schema = Some(schema.clone());
+    result.postgres_database = Some(database.clone());
+    if result.options.keep_db {
+        database_guard.disarm();
+    } else {
+        // Explicit on the success path, and only then disarmed, because `Drop`
+        // cannot return a `Result`: leaving cleanup to the guard here would let
+        // a completed run exit 0 having leaked a database, reporting the
+        // failure on stderr and nowhere the exit code can see. The guard still
+        // covers what it was added for — panics and early returns — and this
+        // restores the one property the closure it replaced did have.
+        drop_postgres_database(&runtime, &admin_url, &database, DropDisposition::Owned)?;
+        database_guard.disarm();
     }
-
-    let mut result =
-        run_backend_benchmark(&runtime, backend, options, None, Some(database_url.clone()));
-    if let Ok(result) = &mut result {
-        result.postgres_schema = Some(schema.clone());
-    }
-    match result {
-        Ok(result) if result.options.keep_db => Ok(result),
-        Ok(result) => {
-            drop_postgres_schema(&runtime, &database_url, &schema)?;
-            Ok(result)
-        }
-        Err(err) => {
-            let _ = drop_postgres_schema(&runtime, &database_url, &schema);
-            Err(err)
-        }
-    }
+    Ok(result)
 }
 
 fn postgres_stats_report(
@@ -1655,6 +1768,8 @@ fn postgres_stats_report(
     mixed_actions: u64,
     activity_samples: Option<PostgresActivitySamplesReport>,
     statement_stats: Option<PostgresStatementStatsReport>,
+    statement_stats_unavailable: Option<String>,
+    wal_stats_shared_with_other_databases: Option<String>,
 ) -> PostgresStatsReport {
     let wal_bytes = after.wal_bytes.saturating_sub(before.wal_bytes);
     let xact_commit = after.xact_commit.saturating_sub(before.xact_commit);
@@ -1702,13 +1817,15 @@ fn postgres_stats_report(
         active_connections_after: after.active_connections,
         activity_samples,
         statement_stats,
+        statement_stats_unavailable,
+        wal_stats_shared_with_other_databases,
     }
 }
 
 fn run_postgres_write_ceiling_benchmark(
-    runtime: tokio::runtime::Runtime,
-    database_url: String,
-    schema: String,
+    runtime: &tokio::runtime::Runtime,
+    database_url: &str,
+    schema: &str,
     options: BenchmarkOptions,
 ) -> Result<BenchmarkResult, String> {
     let resource_sampler = options
@@ -1718,35 +1835,45 @@ fn run_postgres_write_ceiling_benchmark(
     let setup_started = Instant::now();
     let operations = postgres_write_ceiling_operations(&options)?;
     runtime.block_on(setup_postgres_write_ceiling(
-        &database_url,
-        &schema,
+        database_url,
+        schema,
         &options,
         operations,
     ))?;
     let setup_finished = Instant::now();
 
-    let postgres_stats_before = postgres_stats_snapshot(&runtime, &database_url).ok();
-    let statement_stats_before = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
+    let postgres_stats_before = postgres_stats_snapshot(runtime, database_url).ok();
+    let (statement_stats_before, statement_stats_before_unavailable) =
+        statement_stats_or_reason(postgres_statement_stats_snapshot(runtime, database_url));
+    let foreign_backends_before = postgres_foreign_backends(runtime, database_url).unwrap_or(0);
     let activity_sampler =
-        PostgresActivitySampler::start(database_url.clone(), Duration::from_millis(100));
+        PostgresActivitySampler::start(database_url.to_owned(), Duration::from_millis(100));
 
     let processing_started = Instant::now();
     runtime.block_on(run_postgres_write_ceiling_operations(
-        &database_url,
-        &schema,
+        database_url,
+        schema,
         &options,
         operations,
     ))?;
     let processing_finished = Instant::now();
 
     let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
-    let statement_stats_after = postgres_statement_stats_snapshot(&runtime, &database_url).ok();
-    let postgres_stats_after = postgres_stats_snapshot(&runtime, &database_url).ok();
+    let foreign_backends_after = postgres_foreign_backends(runtime, database_url).unwrap_or(0);
+    let (statement_stats_after, statement_stats_after_unavailable) =
+        statement_stats_or_reason(postgres_statement_stats_snapshot(runtime, database_url));
+    let postgres_stats_after = postgres_stats_snapshot(runtime, database_url).ok();
+    let statement_stats_unavailable = report_statement_stats_unavailable(
+        statement_stats_before_unavailable,
+        statement_stats_after_unavailable,
+    );
+    let wal_stats_shared =
+        wal_stats_shared_message(foreign_backends_before.max(foreign_backends_after));
 
     let verify_started = processing_finished;
     let committed = runtime.block_on(verify_postgres_write_ceiling(
-        &database_url,
-        &schema,
+        database_url,
+        schema,
         operations,
     ))?;
     let verify_finished = Instant::now();
@@ -1792,7 +1919,8 @@ fn run_postgres_write_ceiling_benchmark(
         processing_backend_metrics: BackendMetricsReport::default(),
         postgres_stats: None,
         resource_samples,
-        postgres_schema: Some(schema.clone()),
+        postgres_schema: Some(schema.to_owned()),
+        postgres_database: None,
         db_path: None,
         db_bytes: None,
     };
@@ -1819,14 +1947,11 @@ fn run_postgres_write_ceiling_benchmark(
                         result.mixed_actions,
                     )
                 }),
+            statement_stats_unavailable,
+            wal_stats_shared,
         ));
     }
-    if result.options.keep_db {
-        Ok(result)
-    } else {
-        drop_postgres_schema(&runtime, &database_url, &schema)?;
-        Ok(result)
-    }
+    Ok(result)
 }
 
 fn postgres_write_ceiling_operations(options: &BenchmarkOptions) -> Result<usize, String> {
@@ -2062,9 +2187,17 @@ where
     let postgres_stats_before = postgres_stats_database_url
         .as_deref()
         .and_then(|database_url| postgres_stats_snapshot(runtime, database_url).ok());
-    let statement_stats_before = postgres_stats_database_url
+    let (statement_stats_before, statement_stats_before_unavailable) =
+        match postgres_stats_database_url.as_deref() {
+            Some(database_url) => {
+                statement_stats_or_reason(postgres_statement_stats_snapshot(runtime, database_url))
+            }
+            None => (None, None),
+        };
+    let foreign_backends_before = postgres_stats_database_url
         .as_deref()
-        .and_then(|database_url| postgres_statement_stats_snapshot(runtime, database_url).ok());
+        .and_then(|database_url| postgres_foreign_backends(runtime, database_url).ok())
+        .unwrap_or(0);
     let activity_sampler = postgres_stats_database_url
         .clone()
         .and_then(|database_url| {
@@ -2133,9 +2266,23 @@ where
     let processing_finished = Instant::now();
     let processing_metrics = metrics.snapshot();
     let activity_samples = activity_sampler.and_then(|sampler| sampler.stop().ok());
-    let statement_stats_after = postgres_stats_database_url
+    let (statement_stats_after, statement_stats_after_unavailable) =
+        match postgres_stats_database_url.as_deref() {
+            Some(database_url) => {
+                statement_stats_or_reason(postgres_statement_stats_snapshot(runtime, database_url))
+            }
+            None => (None, None),
+        };
+    let foreign_backends_after = postgres_stats_database_url
         .as_deref()
-        .and_then(|database_url| postgres_statement_stats_snapshot(runtime, database_url).ok());
+        .and_then(|database_url| postgres_foreign_backends(runtime, database_url).ok())
+        .unwrap_or(0);
+    let statement_stats_unavailable = report_statement_stats_unavailable(
+        statement_stats_before_unavailable,
+        statement_stats_after_unavailable,
+    );
+    let wal_stats_shared =
+        wal_stats_shared_message(foreign_backends_before.max(foreign_backends_after));
     let postgres_stats_after = postgres_stats_database_url
         .as_deref()
         .and_then(|database_url| postgres_stats_snapshot(runtime, database_url).ok());
@@ -2200,6 +2347,7 @@ where
         postgres_stats: None,
         resource_samples,
         postgres_schema: None,
+        postgres_database: None,
         db_path: None,
         db_bytes,
     };
@@ -2221,6 +2369,8 @@ where
                         result.mixed_actions,
                     )
                 }),
+            statement_stats_unavailable,
+            wal_stats_shared,
         ));
     }
     Ok(result)
@@ -2802,6 +2952,470 @@ fn sqlite_store_bytes(path: &PathBuf) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// Every generated benchmark database name starts with this, and
+/// [`validate_benchmark_database_name`] refuses to create or drop anything that
+/// does not. `drop database` has unbounded blast radius; the guard exists so
+/// the only names this program can ever pass to it are ones it generated.
+const POSTGRES_BENCHMARK_DATABASE_PREFIX: &str = "durust_benchdb_";
+
+/// What to do when `pg_stat_statements` is missing. Named here once so the
+/// message a user hits and the fixture that fixes it cannot drift apart, and so
+/// the fixture is reachable by grep from the error rather than only from prose
+/// in `impl-plan/`.
+const PG_STAT_STATEMENTS_PRELOAD_HINT: &str = "pg_stat_statements has to be loaded at server start, which `create extension` cannot do on \
+     its own: run the server with `-c shared_preload_libraries=pg_stat_statements`. The \
+     checked-in fixture does exactly that — `docker compose -f tests/fixtures/postgres.compose.yml \
+     up -d --wait`, then DURUST_POSTGRES_URL=postgres://durable:durable@127.0.0.1:55432/durable";
+
+fn statement_stats_unavailable_message(reason: &str) -> String {
+    format!("pg_stat_statements snapshot failed ({reason}). {PG_STAT_STATEMENTS_PRELOAD_HINT}")
+}
+
+/// Keeps a failed statement-stats snapshot's reason instead of discarding it.
+///
+/// This replaced a bare `.ok()` at four call sites. The `.ok()` turned a
+/// diagnosis into `None`, and `None` is indistinguishable from "not requested".
+fn statement_stats_or_reason(
+    snapshot: Result<PostgresStatementStatsSnapshot, String>,
+) -> (Option<PostgresStatementStatsSnapshot>, Option<String>) {
+    match snapshot {
+        Ok(snapshot) => (Some(snapshot), None),
+        Err(reason) => (None, Some(statement_stats_unavailable_message(&reason))),
+    }
+}
+
+/// Reports the reason once, on the way past, so a run that loses its statement
+/// stats says so on stderr as well as in its JSON.
+fn report_statement_stats_unavailable(
+    before: Option<String>,
+    after: Option<String>,
+) -> Option<String> {
+    let reason = before.or(after)?;
+    eprintln!("postgres benchmark: {reason}");
+    Some(reason)
+}
+
+fn wal_stats_shared_message(foreign_backends: u64) -> Option<String> {
+    (foreign_backends > 0).then(|| {
+        format!(
+            "pg_stat_wal is cluster-wide and {foreign_backends} backend(s) on other databases \
+             were live during this run, so the wal* fields include their writes; every other \
+             counter comes from pg_stat_database filtered to this run's own database and is \
+             unaffected"
+        )
+    })
+}
+
+/// Rewrites the database component of a Postgres connection URL, keeping the
+/// scheme, credentials, host, port and query parameters.
+///
+/// Needed because the benchmark now runs in a database it creates, while
+/// `create database` and `drop database` must be issued from a connection to
+/// some *other* database — so two URLs are in play for one run.
+///
+/// The authority is taken as everything up to the first `/`, `?` or `#`, which
+/// is what RFC 3986 says and what every in-spec Postgres URL satisfies. A
+/// password containing one of those characters **unescaped** would split in the
+/// wrong place; percent-encoding it, which the URL syntax requires anyway,
+/// parses correctly.
+fn postgres_url_with_database(database_url: &str, database: &str) -> Result<String, String> {
+    let Some(scheme_end) = database_url.find("://") else {
+        return Err(format!(
+            "DURUST_POSTGRES_URL must be a `postgres://…` URL so the benchmark can run in its own \
+             database, got `{database_url}`"
+        ));
+    };
+    let authority_start = scheme_end + 3;
+    let rest = &database_url[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let tail = &rest[authority_end..];
+    let query_start = tail.find(['?', '#']).unwrap_or(tail.len());
+    Ok(format!(
+        "{}{}/{}{}",
+        &database_url[..authority_start],
+        &rest[..authority_end],
+        database,
+        &tail[query_start..]
+    ))
+}
+
+/// The one thing standing between a generated name and `drop database`.
+fn validate_benchmark_database_name(database: &str) -> Result<(), String> {
+    let shaped = database.starts_with(POSTGRES_BENCHMARK_DATABASE_PREFIX)
+        && database.len() > POSTGRES_BENCHMARK_DATABASE_PREFIX.len()
+        && database.len() <= 63
+        && database
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+    if shaped {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to create or drop database `{database}`: this program only ever touches names it \
+         generated itself, which start with `{POSTGRES_BENCHMARK_DATABASE_PREFIX}`, contain only \
+         [a-z0-9_], and fit in 63 bytes"
+    ))
+}
+
+fn postgres_benchmark_database() -> String {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let counter = POSTGRES_DATABASE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{POSTGRES_BENCHMARK_DATABASE_PREFIX}{}_{}_{}",
+        std::process::id(),
+        micros,
+        counter
+    )
+}
+
+fn postgres_admin_client(
+    database_url: String,
+) -> impl std::future::Future<Output = Result<tokio_postgres::Client, String>> {
+    async move {
+        let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+            .await
+            .map_err(|err| err.to_string())?;
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                eprintln!("postgres benchmark admin connection error: {err}");
+            }
+        });
+        Ok(client)
+    }
+}
+
+/// Drops the run's database when it goes out of scope, panic included.
+///
+/// The closure this replaced ran on the `Ok` and `Err` paths only, so a panic
+/// anywhere in the benchmark unwound straight past it and leaked a whole
+/// database. That is heavier than the leaked *schema* the pre-per-run-database
+/// code could leave, and this program has no listing or reclaim path, so it
+/// falls to a human.
+///
+/// It covers **panics and early returns**. The success path drops the database
+/// explicitly with `?` before disarming, because `Drop` cannot return a
+/// `Result` and a run that completed should not exit 0 having leaked one.
+///
+/// **Signals are deliberately still uncovered.** Nothing runs on the way out of
+/// a SIGINT, and the alternative — installing a handler — puts a global,
+/// process-wide side effect into a benchmark harness and takes over Ctrl-C from
+/// the async work it supervises. It would also still miss SIGKILL, OOM and
+/// power loss. So the answer is recovery rather than interception: the name is
+/// printed to stderr the moment the database is created, it is in the report as
+/// `postgresDatabase`, and `--drop-stale` reclaims anything that survived by
+/// any route at all.
+struct BenchmarkDatabaseGuard<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    admin_url: String,
+    database: String,
+    armed: bool,
+}
+
+impl<'a> BenchmarkDatabaseGuard<'a> {
+    fn new(runtime: &'a tokio::runtime::Runtime, admin_url: String, database: String) -> Self {
+        Self {
+            runtime,
+            admin_url,
+            database,
+            armed: true,
+        }
+    }
+
+    /// `--keep-db` is the only way a run's database should outlive it.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BenchmarkDatabaseGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(err) = drop_postgres_database(
+            self.runtime,
+            &self.admin_url,
+            &self.database,
+            DropDisposition::Owned,
+        ) {
+            eprintln!(
+                "postgres benchmark: could not drop its own database `{}` ({err}); \
+                 drop it by hand, nothing else will",
+                self.database
+            );
+        }
+    }
+}
+
+/// Quotes a Postgres identifier.
+///
+/// `create database` and `drop database` interpolate a name into SQL, and an
+/// unquoted identifier is **case-folded to lowercase** by the server. Before
+/// this, correctness of those two statements rested entirely on
+/// `validate_benchmark_database_name` happening to forbid uppercase: a name
+/// that reached `drop database` unquoted and contained a capital would fold to
+/// a different name and, with `if exists`, silently succeed having dropped
+/// nothing. That coupling was invisible and load-bearing. Quoting removes it,
+/// leaving the validator as defence in depth rather than the only thing
+/// standing between the program and the wrong database.
+fn quote_postgres_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+/// Lists databases this program may have left behind **and that nobody is
+/// using**, without dropping anything.
+///
+/// Three independent filters, and the third is the one that makes the word
+/// "stale" mean something:
+///
+/// - `like` on the generated prefix. `_` is a wildcard in `like`, so both
+///   underscores are escaped. This is a **listing** filter and nothing more; no
+///   pattern is ever handed to `drop database`, and every candidate must still
+///   pass the validator individually.
+/// - `datname <> current_database()`, so a sweep run from inside a benchmark
+///   database never lists itself. This is **redundant** given the liveness
+///   check below — the connection doing the listing is itself a backend
+///   attached to `current_database()`, so the `not exists` already excludes it,
+///   and removing this line alone leaves every test green. It is kept as a
+///   second barrier because the operation it guards is unrecoverable, and
+///   recorded as redundant so nobody mistakes it for the thing doing the work.
+///   Removing *both* does make a sweep list itself, which is what pins the
+///   property.
+/// - **`pg_stat_activity` must show no backend attached.** Without this, "stale"
+///   was inferred from a name and nothing else, so a benchmark running *right
+///   now* was listed as reclaimable — and, because the drop used `with
+///   (force)`, reclaiming it force-disconnected a live run and deleted its
+///   database out from under it. A name proves who created something; only the
+///   server can say whether it is in use.
+///
+/// The check is a snapshot, so something can still connect between here and the
+/// drop. That race is closed on the other side: the sweep drops without `with
+/// (force)`, so a connection arriving in the window makes the drop fail rather
+/// than evict.
+fn list_stale_benchmark_databases(
+    runtime: &tokio::runtime::Runtime,
+    admin_url: &str,
+) -> Result<Vec<String>, String> {
+    let admin_url = admin_url.to_owned();
+    runtime.block_on(async move {
+        let client = postgres_admin_client(admin_url).await?;
+        let rows = client
+            .query(
+                r"select datname from pg_database
+                  where datname like 'durust\_benchdb\_%'
+                    and datname <> current_database()
+                    and not exists (
+                      select 1 from pg_stat_activity a where a.datname = pg_database.datname
+                    )
+                  order by datname",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect())
+    })
+}
+
+/// Splits listed candidates into the ones this program can prove it generated
+/// and the ones it cannot.
+///
+/// Pure, so the refusal path is testable without a server. A name that matched
+/// the listing filter but fails the validator is **kept**, not dropped, and
+/// reported — `drop database` is unrecoverable and this program is the only
+/// thing in the repository that issues it.
+fn partition_stale_benchmark_databases(
+    candidates: Vec<String>,
+) -> (Vec<String>, Vec<(String, String)>) {
+    let mut droppable = Vec::new();
+    let mut refused = Vec::new();
+    for candidate in candidates {
+        match validate_benchmark_database_name(&candidate) {
+            Ok(()) => droppable.push(candidate),
+            Err(reason) => refused.push((candidate, reason)),
+        }
+    }
+    (droppable, refused)
+}
+
+/// The decision half of the sweep, over a caller-supplied candidate list.
+///
+/// Separate from the listing so it can be tested on named fixtures rather than
+/// on whatever the server happens to be holding. Every candidate is validated
+/// individually and dropped by exact name; nothing here takes a pattern.
+fn sweep_benchmark_databases(
+    runtime: &tokio::runtime::Runtime,
+    admin_url: &str,
+    candidates: Vec<String>,
+    drop_them: bool,
+) -> Result<(), String> {
+    let (droppable, refused) = partition_stale_benchmark_databases(candidates);
+    for (name, reason) in &refused {
+        eprintln!("leaving `{name}` alone: {reason}");
+    }
+    if droppable.is_empty() {
+        println!("no stale benchmark databases");
+    }
+    let mut failures = Vec::new();
+    for name in &droppable {
+        if !drop_them {
+            println!("{name}");
+            continue;
+        }
+        // One validated name at a time, by exact name, and never with `force`:
+        // see `DropDisposition::Foreign`.
+        match drop_postgres_database(runtime, admin_url, name, DropDisposition::Foreign) {
+            Ok(()) => println!("dropped {name}"),
+            Err(err) => {
+                eprintln!("could not drop `{name}`, leaving it: {err}");
+                failures.push(name.clone());
+            }
+        }
+    }
+    if !refused.is_empty() {
+        println!(
+            "{} name(s) matched the listing filter but could not be proved generated by this \
+             program; they were left in place",
+            refused.len()
+        );
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{} database(s) could not be dropped and were left in place: {}",
+        failures.len(),
+        failures.join(", ")
+    ))
+}
+
+/// `--list-stale` and `--drop-stale`.
+///
+/// Closes the leak class no `Drop` guard and no signal handler can reach —
+/// SIGKILL, OOM, power loss, and `2>/dev/null` plus an interrupt, where even
+/// the announced name is lost.
+///
+/// **This is server-wide.** It considers every database on the server whose
+/// name this program could have generated, not only this run's. It will not
+/// touch one that is in use — see `list_stale_benchmark_databases` for the
+/// liveness filter and `DropDisposition::Foreign` for the race — but an idle
+/// `--keep-db` database someone left for inspection is exactly what it is
+/// designed to reclaim, and it cannot tell that apart from a leak. On a shared
+/// server, run `--list-stale` first.
+fn sweep_stale_benchmark_databases(
+    runtime: &tokio::runtime::Runtime,
+    admin_url: &str,
+    drop_them: bool,
+) -> Result<(), String> {
+    let candidates = list_stale_benchmark_databases(runtime, admin_url)?;
+    sweep_benchmark_databases(runtime, admin_url, candidates, drop_them)
+}
+
+fn create_postgres_database(
+    runtime: &tokio::runtime::Runtime,
+    admin_url: &str,
+    database: &str,
+) -> Result<(), String> {
+    validate_benchmark_database_name(database)?;
+    let admin_url = admin_url.to_owned();
+    let database = database.to_owned();
+    runtime.block_on(async move {
+        let client = postgres_admin_client(admin_url).await?;
+        client
+            .batch_execute(&format!(
+                "create database {}",
+                quote_postgres_identifier(&database)
+            ))
+            .await
+            .map_err(|err| {
+                format!(
+                    "could not create the benchmark's own database `{database}` ({err}). The role \
+                     needs CREATEDB; without it the benchmark has to share pg_stat_database with \
+                     everything else on that database, which is what this exists to avoid"
+                )
+            })
+    })
+}
+
+/// Whether a drop may evict the sessions attached to its target.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DropDisposition {
+    /// The caller created this database in this process and is finished with
+    /// it, so any surviving session is its own pool and may be terminated.
+    Owned,
+    /// The caller did not create this database and cannot know who is using it.
+    /// A drop that would evict someone must fail instead.
+    Foreign,
+}
+
+fn drop_postgres_database(
+    runtime: &tokio::runtime::Runtime,
+    admin_url: &str,
+    database: &str,
+    disposition: DropDisposition,
+) -> Result<(), String> {
+    validate_benchmark_database_name(database)?;
+    let admin_url = admin_url.to_owned();
+    let database = database.to_owned();
+    runtime.block_on(async move {
+        let client = postgres_admin_client(admin_url).await?;
+        let quoted = quote_postgres_identifier(&database);
+        if disposition == DropDisposition::Foreign {
+            // No `with (force)`: if anything is attached, Postgres refuses with
+            // `database "..." is being accessed by other users` and the caller
+            // leaves it alone. This is what closes the listing's race — the
+            // liveness check there is a snapshot, and a session that arrives
+            // after it must survive.
+            return client
+                .batch_execute(&format!("drop database if exists {quoted}"))
+                .await
+                .map_err(|err| err.to_string());
+        }
+        // `with (force)` needs PostgreSQL 13; the plain form is the fallback,
+        // and it fails loudly if a pooled connection outlived the run.
+        if client
+            .batch_execute(&format!("drop database if exists {quoted} with (force)"))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        client
+            .batch_execute(&format!("drop database if exists {quoted}"))
+            .await
+            .map_err(|err| err.to_string())
+    })
+}
+
+/// Backends attached to databases other than this connection's own.
+///
+/// `pg_stat_database` is filtered to `current_database()` and the run owns that
+/// database, so only `pg_stat_wal` — which has no database column — can be
+/// contaminated, and only by these.
+fn postgres_foreign_backends(
+    runtime: &tokio::runtime::Runtime,
+    database_url: &str,
+) -> Result<u64, String> {
+    let database_url = database_url.to_owned();
+    runtime.block_on(async move {
+        let client = postgres_admin_client(database_url).await?;
+        let row = client
+            .query_one(
+                "select count(*) from pg_stat_activity
+                 where datname is not null and datname <> current_database()",
+                &[],
+            )
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0))
+    })
+}
+
 fn postgres_benchmark_schema() -> String {
     let micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2814,29 +3428,6 @@ fn postgres_benchmark_schema() -> String {
         micros,
         counter
     )
-}
-
-fn drop_postgres_schema(
-    runtime: &tokio::runtime::Runtime,
-    database_url: &str,
-    schema: &str,
-) -> Result<(), String> {
-    let database_url = database_url.to_owned();
-    let schema = schema.to_owned();
-    runtime.block_on(async move {
-        let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|err| err.to_string())?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                eprintln!("postgres benchmark cleanup connection error: {err}");
-            }
-        });
-        client
-            .batch_execute(&format!("drop schema if exists {schema} cascade"))
-            .await
-            .map_err(|err| err.to_string())
-    })
 }
 
 struct ResourceSampler {
@@ -3331,6 +3922,9 @@ fn print_text_result(result: &BenchmarkResult) {
         println!();
         println!("Postgres schema:");
         println!("  name: {schema}");
+        if let Some(database) = &result.postgres_database {
+            println!("  database: {database}");
+        }
         if result.options.keep_db {
             println!("  kept: true");
         }
@@ -3372,6 +3966,478 @@ fn print_backend_metrics_summary(label: &str, metrics: &BackendMetricsReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_postgres_snapshot() -> PostgresStatsSnapshot {
+        PostgresStatsSnapshot {
+            wal_records: 0,
+            wal_fpi: 0,
+            wal_bytes: 0,
+            wal_buffers_full: 0,
+            wal_write: 0,
+            wal_sync: 0,
+            wal_write_time_ms: 0.0,
+            wal_sync_time_ms: 0.0,
+            xact_commit: 0,
+            xact_rollback: 0,
+            blocks_read: 0,
+            blocks_hit: 0,
+            rows_returned: 0,
+            rows_fetched: 0,
+            rows_inserted: 0,
+            rows_updated: 0,
+            rows_deleted: 0,
+            temp_files: 0,
+            temp_bytes: 0,
+            deadlocks: 0,
+            block_read_time_ms: 0.0,
+            block_write_time_ms: 0.0,
+            session_time_ms: 0.0,
+            active_time_ms: 0.0,
+            active_connections: 0,
+        }
+    }
+
+    fn probe_postgres_url_or_skip() -> Option<String> {
+        if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
+            if !url.trim().is_empty() {
+                return Some(url);
+            }
+        }
+        let required = match std::env::var("DURUST_REQUIRE_POSTGRES") {
+            Ok(value) => {
+                let value = value.trim();
+                !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+            }
+            Err(_) => false,
+        };
+        assert!(
+            !required,
+            "DURUST_REQUIRE_POSTGRES is set, so the benchtools database-guard test must run, \
+             but DURUST_POSTGRES_URL is unset or empty"
+        );
+        eprintln!("skipping benchtools database guard test; set DURUST_POSTGRES_URL");
+        None
+    }
+
+    fn database_exists(runtime: &tokio::runtime::Runtime, admin_url: &str, database: &str) -> bool {
+        let admin_url = admin_url.to_owned();
+        let database = database.to_owned();
+        runtime.block_on(async move {
+            let client = postgres_admin_client(admin_url).await.unwrap();
+            client
+                .query_one(
+                    "select count(*) from pg_database where datname = $1",
+                    &[&database],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+                > 0
+        })
+    }
+
+    #[test]
+    fn the_stale_sweep_refuses_every_name_it_cannot_prove_it_generated() {
+        let candidates = vec![
+            postgres_benchmark_database(),
+            // All of these can reach the sweep: `like 'durust\_benchdb\_%'` is a
+            // listing filter, not a proof of origin.
+            "durust_benchdb_UPPER".to_owned(),
+            "durust_benchdb_".to_owned(),
+            "durust_benchdb_1; drop database durust".to_owned(),
+            "durust_benchdb_wgw-hyphen".to_owned(),
+            "not_durust_benchdb_1".to_owned(),
+            format!("durust_benchdb_{}", "x".repeat(64)),
+        ];
+        let (droppable, refused) = partition_stale_benchmark_databases(candidates);
+        assert_eq!(
+            droppable.len(),
+            1,
+            "only the generated name may be dropped, got {droppable:?}"
+        );
+        assert!(droppable[0].starts_with(POSTGRES_BENCHMARK_DATABASE_PREFIX));
+        assert_eq!(refused.len(), 6, "refused {refused:?}");
+        for (name, reason) in &refused {
+            assert!(
+                reason.contains("refusing to create or drop database"),
+                "`{name}` must be refused by name, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sweep_drops_a_generated_database_and_spares_a_lookalike() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let generated = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &generated).unwrap();
+
+        // Matches the listing filter, fails the validator: exactly the case the
+        // sweep must see and refuse. Created with raw SQL because
+        // `create_postgres_database` would — correctly — refuse to make it.
+        let lookalike = "durust_benchdb_NotOurs";
+        let raw = |sql: String| {
+            let url = url.clone();
+            runtime.block_on(async move {
+                postgres_admin_client(url)
+                    .await
+                    .unwrap()
+                    .batch_execute(&sql)
+                    .await
+            })
+        };
+        let _ = raw(format!(r#"drop database if exists "{lookalike}""#));
+        raw(format!(r#"create database "{lookalike}""#)).unwrap();
+
+        // Only this test's two fixtures. Calling the server-wide
+        // `sweep_stale_benchmark_databases` here made `cargo test` reclaim
+        // every idle benchmark database on the server, which on a shared box is
+        // the normal condition rather than the edge case. The decision logic is
+        // what is under test; its reach is not.
+        sweep_benchmark_databases(
+            &runtime,
+            &url,
+            vec![generated.clone(), lookalike.to_owned()],
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            !database_exists(&runtime, &url, &generated),
+            "the sweep must reclaim a database it can prove it generated: `{generated}` survived"
+        );
+        assert!(
+            database_exists(&runtime, &url, lookalike),
+            "the sweep dropped `{lookalike}`, which it cannot prove it generated; `drop \
+             database` is unrecoverable and the listing filter is not a proof of origin"
+        );
+
+        // Reclaim the fixture by its exact literal name, not by pattern.
+        raw(format!(r#"drop database "{lookalike}""#)).unwrap();
+    }
+
+    #[test]
+    fn the_sweep_refuses_to_evict_a_live_session_rather_than_forcing_it() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let database = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &database).unwrap();
+        let database_url = postgres_url_with_database(&url, &database).unwrap();
+        let live = runtime
+            .block_on(postgres_admin_client(database_url))
+            .unwrap();
+
+        // Handed straight to the decision half, bypassing the listing: this is
+        // the race the liveness filter cannot close, where a session arrives
+        // after the snapshot. The drop must fail rather than evict.
+        let outcome = sweep_benchmark_databases(&runtime, &url, vec![database.clone()], true);
+
+        assert!(
+            outcome.is_err(),
+            "dropping a foreign database with a live session must fail and be reported, not \
+             succeed quietly"
+        );
+        assert!(
+            database_exists(&runtime, &url, &database),
+            "the sweep evicted a live session and deleted `{database}`. `with (force)` belongs \
+             to the guard, which owns the database it created; on the sweep it turns reclaiming \
+             a leak into killing someone's running benchmark"
+        );
+        // The session is still usable, which is the property that matters to
+        // whoever is running that benchmark.
+        runtime
+            .block_on(live.query_one("select 1", &[]))
+            .expect("the live session must survive a refused sweep");
+
+        drop(live);
+        drop_postgres_database(&runtime, &url, &database, DropDisposition::Owned).unwrap();
+    }
+
+    #[test]
+    fn a_database_with_a_live_backend_is_never_listed_as_stale() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let database = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &database).unwrap();
+        let database_url = postgres_url_with_database(&url, &database).unwrap();
+
+        // Hold a session open against it, which is what a running benchmark
+        // looks like to the server.
+        let live = runtime
+            .block_on(postgres_admin_client(database_url))
+            .unwrap();
+        let listed = list_stale_benchmark_databases(&runtime, &url).unwrap();
+        assert!(
+            !listed.contains(&database),
+            "`{database}` has a live backend and was listed as stale. A name says who created \
+             a database, never whether someone is using it — and the sweep would have \
+             force-disconnected a running benchmark and deleted it. Listed: {listed:?}"
+        );
+
+        // Release it, and it becomes reclaimable.
+        drop(live);
+        let mut listed_after = Vec::new();
+        for _ in 0..50 {
+            listed_after = list_stale_benchmark_databases(&runtime, &url).unwrap();
+            if listed_after.contains(&database) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            listed_after.contains(&database),
+            "once nothing is attached, `{database}` must become reclaimable: {listed_after:?}"
+        );
+        drop_postgres_database(&runtime, &url, &database, DropDisposition::Owned).unwrap();
+    }
+
+    #[test]
+    fn a_sweep_run_from_inside_a_benchmark_database_does_not_list_itself() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let database = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &database).unwrap();
+        // Point the sweep at the benchmark database itself, which is the only
+        // configuration in which `datname <> current_database()` does anything.
+        let database_url = postgres_url_with_database(&url, &database).unwrap();
+        let listed = list_stale_benchmark_databases(&runtime, &database_url).unwrap();
+        assert!(
+            !listed.contains(&database),
+            "a sweep run from inside `{database}` listed itself: {listed:?}"
+        );
+        drop_postgres_database(&runtime, &url, &database, DropDisposition::Owned).unwrap();
+    }
+
+    #[test]
+    fn the_listing_filter_treats_prefix_underscores_as_literals() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        // `_` is a `like` wildcard; unescaped, this name matches the pattern.
+        let wildcard_match = "durustxbenchdby_probe";
+        let raw = |sql: String| {
+            let url = url.clone();
+            runtime.block_on(async move {
+                postgres_admin_client(url)
+                    .await
+                    .unwrap()
+                    .batch_execute(&sql)
+                    .await
+            })
+        };
+        let _ = raw(format!(r#"drop database if exists "{wildcard_match}""#));
+        raw(format!(r#"create database "{wildcard_match}""#)).unwrap();
+        let listed = list_stale_benchmark_databases(&runtime, &url).unwrap();
+        let contains = listed.contains(&wildcard_match.to_owned());
+        raw(format!(r#"drop database "{wildcard_match}""#)).unwrap();
+        assert!(
+            !contains,
+            "`{wildcard_match}` was listed: the underscores in the prefix must be escaped in \
+             the `like`, or the filter matches a whole family of unrelated names"
+        );
+    }
+
+    #[test]
+    fn a_panicking_run_still_drops_the_database_it_created() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let database = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &database).unwrap();
+        assert!(database_exists(&runtime, &url, &database));
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = BenchmarkDatabaseGuard::new(&runtime, url.clone(), database.clone());
+            panic!("benchmark exploded mid-run");
+        }));
+        assert!(panicked.is_err(), "the probe must actually panic");
+
+        assert!(
+            !database_exists(&runtime, &url, &database),
+            "a panic leaked the run's whole database: `{database}` survived. Only `--keep-db` \
+             may leave one behind, and nothing in this program can list or reclaim it"
+        );
+    }
+
+    #[test]
+    fn keeping_the_database_disarms_the_guard() {
+        let Some(url) = probe_postgres_url_or_skip() else {
+            return;
+        };
+        let runtime = tokio_runtime().unwrap();
+        let database = postgres_benchmark_database();
+        create_postgres_database(&runtime, &url, &database).unwrap();
+        {
+            let mut guard = BenchmarkDatabaseGuard::new(&runtime, url.clone(), database.clone());
+            guard.disarm();
+        }
+        let kept = database_exists(&runtime, &url, &database);
+        // Reclaim it either way: this test exists to prove `--keep-db` works,
+        // not to leave evidence of it lying around.
+        drop_postgres_database(&runtime, &url, &database, DropDisposition::Owned).unwrap();
+        assert!(
+            kept,
+            "--keep-db must leave the database in place for inspection"
+        );
+    }
+
+    #[test]
+    fn a_failed_statement_stats_snapshot_keeps_its_reason_and_names_the_preload_fixture() {
+        let (snapshot, reason) = statement_stats_or_reason(Err(
+            "pg_stat_statements extension is unavailable".to_owned(),
+        ));
+        assert!(snapshot.is_none());
+        let reason = reason.expect(
+            "a failed pg_stat_statements snapshot must report why; dropping it with `.ok()` is \
+             what made `statementStats: null` unexplainable",
+        );
+        assert!(
+            reason.contains("pg_stat_statements extension is unavailable"),
+            "the server's own error must survive, got: {reason}"
+        );
+        assert!(
+            reason.contains("shared_preload_libraries=pg_stat_statements"),
+            "the reason must name the setting that fixes it, got: {reason}"
+        );
+        assert!(
+            reason.contains("tests/fixtures/postgres.compose.yml"),
+            "the reason must name the checked-in fixture that supplies the preload, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_successful_statement_stats_snapshot_reports_no_reason() {
+        let (snapshot, reason) = statement_stats_or_reason(Ok(PostgresStatementStatsSnapshot {
+            statements: BTreeMap::new(),
+        }));
+        assert!(snapshot.is_some());
+        assert_eq!(reason, None, "a working snapshot must not carry an excuse");
+    }
+
+    #[test]
+    fn the_statement_stats_reason_reaches_the_serialised_report() {
+        let report = postgres_stats_report(
+            empty_postgres_snapshot(),
+            empty_postgres_snapshot(),
+            1.0,
+            1,
+            1,
+            None,
+            None,
+            Some("pg_stat_statements snapshot failed".to_owned()),
+            None,
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json.get("statementStatsUnavailable")
+                .and_then(serde_json::Value::as_str),
+            Some("pg_stat_statements snapshot failed"),
+            "the reason must be readable by whoever consumes the JSON, not only on stderr"
+        );
+        let quiet = postgres_stats_report(
+            empty_postgres_snapshot(),
+            empty_postgres_snapshot(),
+            1.0,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+        );
+        let quiet = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            quiet.get("statementStatsUnavailable").is_none(),
+            "a healthy run must not emit the field at all"
+        );
+    }
+
+    #[test]
+    fn wal_stats_are_flagged_only_when_another_database_was_active() {
+        assert_eq!(wal_stats_shared_message(0), None);
+        let shared = wal_stats_shared_message(3).expect(
+            "pg_stat_wal is cluster-wide, so live backends on other databases must be recorded",
+        );
+        assert!(shared.contains("3 backend(s)"), "got: {shared}");
+        assert!(shared.contains("pg_stat_wal"), "got: {shared}");
+    }
+
+    #[test]
+    fn a_benchmark_database_url_keeps_everything_but_the_database_name() {
+        assert_eq!(
+            postgres_url_with_database(
+                "postgres://postgres:postgres@localhost:5433/durust",
+                "durust_benchdb_1_2_3"
+            )
+            .unwrap(),
+            "postgres://postgres:postgres@localhost:5433/durust_benchdb_1_2_3"
+        );
+        assert_eq!(
+            postgres_url_with_database(
+                "postgres://user:pw@db.example:5432/durust?sslmode=require&connect_timeout=5",
+                "durust_benchdb_1_2_3"
+            )
+            .unwrap(),
+            "postgres://user:pw@db.example:5432/durust_benchdb_1_2_3?sslmode=require&connect_timeout=5"
+        );
+        assert_eq!(
+            postgres_url_with_database("postgres://localhost", "durust_benchdb_1_2_3").unwrap(),
+            "postgres://localhost/durust_benchdb_1_2_3"
+        );
+        assert_eq!(
+            postgres_url_with_database(
+                "postgres://localhost?sslmode=disable",
+                "durust_benchdb_1_2_3"
+            )
+            .unwrap(),
+            "postgres://localhost/durust_benchdb_1_2_3?sslmode=disable"
+        );
+        let err =
+            postgres_url_with_database("/var/run/postgresql", "durust_benchdb_1_2_3").unwrap_err();
+        assert!(err.contains("must be a `postgres://"), "got: {err}");
+    }
+
+    #[test]
+    fn only_names_this_program_generated_can_be_created_or_dropped() {
+        validate_benchmark_database_name(&postgres_benchmark_database())
+            .expect("a generated name must pass its own guard");
+        for rejected in [
+            "durust",
+            "postgres",
+            "template1",
+            "",
+            "durust_benchdb_",
+            "durust_benchdb_1; drop database durust",
+            "durust_benchdb_UPPER",
+            "bench_durust_1",
+            // Pins `starts_with` against `contains`: the prefix is embedded,
+            // not leading. Unreachable through the listing filter today, which
+            // anchors, but the validator's own error text promises "start
+            // with".
+            "not_durust_benchdb_1",
+        ] {
+            let Err(err) = validate_benchmark_database_name(rejected) else {
+                panic!(
+                    "`{rejected}` was accepted as a benchmark database name; this guard is the \
+                     only thing between a generated name and `drop database`"
+                );
+            };
+            assert!(
+                err.contains("refusing to create or drop database"),
+                "`{rejected}` must be refused by name, got: {err}"
+            );
+        }
+    }
 
     #[test]
     fn parses_default_sqlite_options() {
