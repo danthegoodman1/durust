@@ -66,11 +66,14 @@ npx vitest run --config vitest.config.ts packages/core/test/FILE.test.ts -t "NAM
 | 15 | Maintenance load is bounded by elapsed time, not by the workflow task rate | `tests/worker_run.rs::maintenance_scans_track_elapsed_time_not_the_workflow_task_rate` | `worker.test.ts` — `paces maintenance by elapsed time rather than by workflow task count` | **Both** |
 | 16 | A poisoned workflow task is counted, and counted apart from genuine history divergence | `tests/worker_run.rs::workflow_panics_and_re_entrancy_are_counted_apart_from_divergence`; `tests/worker_run.rs::repeated_nondeterministic_replays_are_counted_and_never_confused_with_panics` | — **gap**, see note 16 | **Gap (TypeScript)** |
 | 17 | Nondeterministic host state is rejected in workflow code | `tests/compile_fail.rs::workflow_determinism_lints_compile_fail` | `determinism-guards.test.ts` — `rejects Date.now() in workflow code`; `rejects Math.random() in workflow code`; `rejects setTimeout and Promise.race in workflow code` | **Both**, by different mechanisms — see note 17 |
-| 18 | Map fanout follows one shared transition table in both engines: admission bounded by `maxInFlight`, one replacement per released slot, a failed map abandons its siblings | `tests/map_transitions.rs::memory_replays_every_shared_table_fanout`; `tests/map_transitions.rs::sqlite_replays_every_shared_table_fanout` | `map-engine.test.ts` — `map engine: shared transition table fanouts > fanout: <case>` (four cases, generated from the table) | **Both** |
+| 18 | Map fanout follows one shared transition table in both engines: admission bounded by `maxInFlight`, one replacement per released slot, a failed map abandons its siblings | `tests/map_transitions.rs::memory_replays_every_shared_table_fanout`; `tests/map_transitions.rs::sqlite_replays_every_shared_table_fanout` | `map-engine.test.ts` — `map engine: shared transition table fanouts > fanout: <case>` (five cases, generated from the table) | **Both** |
 | 19 | A worker crash between claim and commit completes the run exactly once | `tests/sim_worker.rs::real_worker_crash_between_claim_and_commit_completes_exactly_once` | `simulation.test.ts` — `recovers a workflow task after a worker crashes with an uncommitted claim` | **Both** |
 | 20 | Cache eviction mid-run does not change the committed outcome | `tests/sim_worker.rs::real_worker_cache_eviction_storm_matches_fault_free_control` | `simulation.test.ts` — `survives a cache-eviction replay soak across concurrent mixed workflows` | **Both** |
+| 21 | A commit that both schedules an empty map and closes its run is accepted, and no map fact lands behind the run's own terminal event — for the activity-map arm, which `terminalParent` would have rejected, and the child-map arm, which it would have let through | `tests/provider_conformance.rs::memory_provider_passes_basic_conformance`; `tests/provider_conformance.rs::sqlite_provider_passes_basic_conformance` — the `an_empty_map_scheduled_by_a_closing_commit_is_still_accepted` section | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` / `postgres-conformance.test.ts` — `an empty map scheduled by a closing commit is accepted and appends nothing` | **Both**, revert-verified: dropping the `parentTerminal` branch in `map-engine.ts` failed the TypeScript case on all three providers with `newTailEventId: 4` |
+| 22 | A run's waits are deleted by the same transaction that closes it (`SPEC.md` §19.1), so operational storage does not grow with closed runs and maintenance scans do not pay for them | — **gap**, see note 22: `cleanup_run_operational_state` (`src/memory.rs`, `src/sqlite.rs`) does delete them, but no Rust test names the invariant and the revert was not run, so this column is unproved rather than absent | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` — `terminal cleanup deletes a closed run's waits`; `postgres-conformance.test.ts` — `deletes a closed run's normalized wait rows on both commit paths` | **Gap (Rust)**; TypeScript revert-verified — removing the cleanup failed the shared case on memory and SQLite (`fired 0`) and the Postgres row assertion on both of its commit paths |
+| 23 | A due-timer scan never appends `TimerFired` to a run that has already reached a terminal event | — **gap**, see note 23: the guard exists (`src/memory.rs`, `if run.namespace != req.namespace \|\| run.terminal`), but a grep of the Rust suite finds no test that asserts it | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` / `postgres-conformance.test.ts` — `a stray timer wait never fires against a closed run` | **Gap (Rust)**; TypeScript revert-verified — removing the guard failed the case on all three providers with `fired 1` |
 
-Six of twenty rows are gaps: 2, 4, 9, 10, 12 (Rust), and 16 (TypeScript).
+Eight of twenty-three rows are gaps: 2, 4, 9, 10, 12, 22, 23 (Rust), and 16 (TypeScript).
 
 ### Revert verification
 
@@ -248,6 +251,31 @@ ESLint rule. Both mechanisms see only the code they are pointed at: a
 nondeterministic call in a helper function in another module is caught by
 neither. Rust has no runtime backstop, which is a recorded open decision, and
 TypeScript's runtime guard is off by default in production.
+
+**Note 22 — two rows, because each detector survives the other's revert.** Row
+22's cleanup makes a stray wait impossible; row 23's guard makes one harmless if
+it happens anyway. They are separated because each was shown to stay green while
+the other's fix was reverted — removing the cleanup left `a stray timer wait
+never fires against a closed run` passing, and removing the guard left `terminal
+cleanup deletes a closed run's waits` passing. One row with one detector would
+have claimed coverage that neither test actually provides. Postgres passes row
+22's shared conformance case with or without the cleanup, because its terminal
+guard is a predicate *inside* the limited due-timer query and a leftover row is
+therefore never selected; the Postgres-specific row assertion covers it, and
+covers both of that provider's commit paths, which delete the rows in different
+places — the SQL-native path with its own `delete`, the loaded-state path
+through `#abandonWorkForClosedRun`.
+
+**Note 23 — the construction is the point, and the previous one had rotted.**
+Rust's guard is defence in depth on both sides now: every terminal transition
+cleans the waits up first, so the state it refuses is reachable only by forging.
+The TypeScript case forges it by committing a wait record naming an
+already-closed run from a second, live run — the same technique as Rust's
+`force_terminal` helper. This matters because the case's *previous*
+construction, committing the wait in the same task that closes the run, became
+vacuous the moment terminal cleanup landed: measured at `fired: 0` with the
+guard removed, it would have passed for the wrong reason. The rebuild was not
+tidying; it was the difference between a detector and a decoration.
 
 ---
 
