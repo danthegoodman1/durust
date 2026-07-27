@@ -24,10 +24,19 @@
 //! completable.
 //!
 //! Deliberately excluded, and asserted to stay excluded: retry delay *values*
-//! (the two runtimes have different policy models), every `DescriptorCreated`
-//! case where `recorded_outcomes >= item_count` (the runtimes disagree until
-//! the plan row that converges Rust lands), and `ParentCancelled` (no
-//! TypeScript producer). The fixture states each exclusion and its reason.
+//! (the two runtimes have different policy models) and `ParentCancelled`
+//! (whose transition is only half the behaviour). The fixture states each
+//! exclusion and its reason.
+//!
+//! A third exclusion — every `DescriptorCreated` case where
+//! `recorded_outcomes >= item_count` — has been **retired**. It was written
+//! when TypeScript completed such a map at descriptor creation and Rust
+//! stalled; both engines now complete it, and both drop the parent
+//! notification when the same commit closed the parent run. The table asserts
+//! the predicate instead of excluding it, and
+//! `shared_table_asserts_the_retired_descriptor_created_predicate` refuses a
+//! silent slide back: deleting the cases fails here, and re-adding the
+//! exclusion fails the list above.
 
 use durust::{
     ActivityMapTask, ActivityName, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
@@ -112,7 +121,6 @@ fn shared_table_declares_its_cross_runtime_exclusions() {
         declared,
         vec![
             "ScheduleItemRetry.visibleAtMs and .timeoutAtMs values",
-            "Every DescriptorCreated case where recordedOutcomes >= itemCount, including but not limited to the empty manifest",
             "The ParentCancelled event",
         ],
     );
@@ -138,17 +146,6 @@ fn shared_table_never_asserts_an_excluded_transition() {
             event_kind, "ParentCancelled",
             "the table excludes the ParentCancelled event"
         );
-        if event_kind == "DescriptorCreated" {
-            let recorded = case["state"]["recordedOutcomes"]
-                .as_u64()
-                .expect("recorded");
-            let item_count = case["state"]["itemCount"].as_u64().expect("itemCount");
-            assert!(
-                recorded < item_count,
-                "`{}` is inside the excluded DescriptorCreated predicate",
-                case["name"]
-            );
-        }
         // Retry instants are shape-only on both sides.
         if let Some(effects) = case["expect"]["effects"].as_array() {
             for effect in effects {
@@ -162,6 +159,45 @@ fn shared_table_never_asserts_an_excluded_transition() {
             }
         }
     }
+}
+
+/// The other half of retiring an exclusion: the table has to actually assert
+/// the predicate that used to be excluded, or the retirement is a deletion
+/// dressed up as a convergence.
+///
+/// Both parent states are required. `parentTerminal: false` is the arm both
+/// engines already agreed on once Rust stopped stalling; `parentTerminal:
+/// true` is the arm TypeScript moved on — it used to emit `CompleteMap`, which
+/// appended the map's terminal fact *behind* the run's own terminal event.
+#[test]
+fn shared_table_asserts_the_retired_descriptor_created_predicate() {
+    let table = load_table();
+    let mut seen_parent_terminal: Vec<bool> = Vec::new();
+    for case in &table.transitions {
+        if case["event"]["kind"] != "DescriptorCreated" {
+            continue;
+        }
+        let recorded = case["state"]["recordedOutcomes"]
+            .as_u64()
+            .expect("recorded");
+        let item_count = case["state"]["itemCount"].as_u64().expect("itemCount");
+        if recorded < item_count {
+            continue;
+        }
+        let parent_terminal = case["event"]["parentTerminal"]
+            .as_bool()
+            .expect("parentTerminal");
+        if !seen_parent_terminal.contains(&parent_terminal) {
+            seen_parent_terminal.push(parent_terminal);
+        }
+    }
+    seen_parent_terminal.sort_unstable();
+    assert_eq!(
+        seen_parent_terminal,
+        vec![false, true],
+        "the table must assert the DescriptorCreated predicate it stopped excluding, \
+         for a closed parent as well as an open one"
+    );
 }
 
 #[test]

@@ -50,6 +50,83 @@ import type {
   ChildWorkflowMapResultPage
 } from "@durust/core";
 
+/**
+ * `DURUST_POSTGRES_URL` as the gate should read it: `undefined` when unset
+ * **or blank**, so an empty variable skips rather than trying to connect.
+ *
+ * Rust's `postgres_url_or_skip` has always trimmed. TypeScript compared
+ * against `undefined` only, so `DURUST_POSTGRES_URL=""` — what a shell writes
+ * when an expansion produces nothing — ran every Postgres case against an
+ * empty connection string and failed on connection rather than skipping.
+ */
+export function postgresUrlFromEnv(
+  value: string | undefined = process.env.DURUST_POSTGRES_URL
+): string | undefined {
+  if (value === undefined || value.trim().length === 0) {
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * Whether this run is *obliged* to exercise Postgres.
+ *
+ * Mirrors Rust's `postgres_is_required` exactly, including the off switches:
+ * on for any value except empty, `0`, and `false` (case-insensitive), so `=1`
+ * reads the obvious way and `=0` is usable. One implementation rather than one
+ * per gated file, because two copies of a three-branch environment parse is
+ * how the two runtimes' meanings of the same variable drift apart.
+ */
+export function postgresIsRequired(
+  value: string | undefined = process.env.DURUST_REQUIRE_POSTGRES
+): boolean {
+  if (value === undefined) {
+    return false;
+  }
+  const trimmed = value.trim();
+  return !(trimmed.length === 0 || trimmed === "0" || trimmed.toLowerCase() === "false");
+}
+
+/**
+ * Fails a run that is supposed to exercise Postgres but cannot.
+ *
+ * **Call this at module scope**, not inside a hook or a test. A Vitest file
+ * whose every suite is `describe.skip` still has its module body evaluated
+ * during collection — measured — but none of its hooks run: a file-scope
+ * `afterAll` in a fully skipped file never fires, and the file reports
+ * `1 skipped` and exits 0. So a module-scope throw is the only mechanism that
+ * fires in the case this exists for, and it is why an executed-count
+ * assertion cannot replace it. A module-scope throw is reported as a failed
+ * test file and exits non-zero, also measured.
+ *
+ * What this does *not* cover: a file that is never collected at all, because
+ * it was renamed, deleted, or dropped from the Vitest `include` globs. Nothing
+ * inside a file can defend the case where the file is not in the run, and the
+ * mitigation is narrower than it first looks — measured, not assumed:
+ *
+ * - A filter naming this file exits 1 when it matches nothing
+ *   ("No test files found"), so a rename or deletion fails a CI step that
+ *   names the file. That is the shape CI uses today, and it is the whole of
+ *   the protection.
+ * - A *broadened* filter does not. With this file deleted and the run filtered
+ *   to `packages/core/test packages/sqlite/test packages/postgres/test`, the
+ *   result is `515 passed`, exit 0 — no Postgres coverage, green.
+ *
+ * So the guarantee is "CI names the file", not "Vitest fails on missing
+ * coverage". Broadening that step to a directory re-opens the hole.
+ */
+export function assertPostgresAvailableWhenRequired(
+  url: string | undefined,
+  what: string
+): void {
+  if (url === undefined && postgresIsRequired()) {
+    throw new Error(
+      `DURUST_REQUIRE_POSTGRES is set, so \`${what}\` must run, ` +
+        "but DURUST_POSTGRES_URL is unset or empty"
+    );
+  }
+}
+
 // Drives a single workflow task to its commit through the production hot
 // execution driver. Tests use this instead of reaching into runtime internals
 // so they exercise the same path the worker runs.
@@ -2094,6 +2171,166 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
+      // The convergence onto `src/map_engine.rs`, and the mutation detector for
+      // it. Before it, one program produced three histories: memory and
+      // Postgres appended `ActivityMapCompleted` *after* `WorkflowCompleted` —
+      // a fact past the terminal event — and SQLite produced the same
+      // completion and then lost it to the `#saveWorkflow` overwrite. Rust
+      // appended nothing, which is the right answer, so TypeScript moved.
+      //
+      // Two halves, because they reach the carve-out down different arms. An
+      // activity map is the kind `terminalParent` would have *rejected*, which
+      // is why `DescriptorCreated` may never route through it: the commit that
+      // creates the descriptor is the commit that closes the run, and rejecting
+      // would roll the whole workflow-task commit back. A child map is the kind
+      // `terminalParent` would have let through. Covering only one leaves the
+      // other untested. Mirrors Rust's
+      // `an_empty_map_scheduled_by_a_closing_commit_is_still_accepted`.
+      name: "an empty map scheduled by a closing commit is accepted and appends nothing",
+      async run(factory) {
+        const { backend, claim } = await startedAndClaimed(factory);
+        const inputManifest = activityMapManifest([], 2);
+        const mapCommand = commandId(claim.runId, 1);
+        const scheduled = {
+          commandId: mapCommand,
+          activityName: "conformance.empty-closing-map",
+          taskQueue: "activities",
+          retryPolicy: RetryPolicy.none(),
+          startToCloseTimeoutMs: null,
+          heartbeatTimeoutMs: null,
+          inputManifest,
+          resultManifestName: "empty-closing",
+          maxInFlight: 2,
+          fingerprint: activityMapFingerprint(
+            "conformance.empty-closing-map",
+            payloadDigest(inputManifest),
+            "empty-closing",
+            2,
+            "sha256:test-options"
+          )
+        };
+        const outcome = await backend.commitWorkflowTask(claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            { data: { kind: "ActivityMapScheduled", scheduled } },
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ value: "closed" }, { codec: "Json" })
+              }
+            }
+          ],
+          scheduleActivityMaps: [
+            {
+              mapCommandId: scheduled.commandId,
+              activityName: scheduled.activityName,
+              taskQueue: scheduled.taskQueue,
+              retryPolicy: scheduled.retryPolicy,
+              startToCloseTimeoutMs: scheduled.startToCloseTimeoutMs,
+              heartbeatTimeoutMs: scheduled.heartbeatTimeoutMs,
+              inputManifest: scheduled.inputManifest,
+              resultManifestName: scheduled.resultManifestName,
+              maxInFlight: scheduled.maxInFlight
+            }
+          ]
+        });
+        assert(
+          outcome.kind === "Committed" && Number(outcome.newTailEventId) === 3,
+          `a commit that schedules an empty map and closes its run must stay accepted, got ${JSON.stringify(
+            outcome
+          )}`
+        );
+        const history = await backend.streamHistory({
+          runId: claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(20),
+          maxEvents: 20,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ActivityMapScheduled,WorkflowCompleted",
+          `no map fact may land behind the run's own terminal event, got ${history.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+
+        // The child-map arm, on its own run.
+        const child = await startedAndClaimed(factory, {
+          backend,
+          workflowId: "wf/empty-closing-child-map"
+        });
+        const childType = workflowType("conformance.empty-closing-child", 1);
+        const childMapCommand = commandId(child.claim.runId, 1);
+        const childScheduled = {
+          commandId: childMapCommand,
+          workflowType: childType,
+          taskQueue: "child-workflows",
+          inputManifest,
+          resultManifestName: "empty-closing-child",
+          workflowIdPrefix: "wf/empty-closing-child-map/item",
+          maxInFlight: 2,
+          parentClosePolicy: "Cancel" as const,
+          failureMode: "FailFast" as const,
+          fingerprint: childWorkflowMapFingerprint(
+            childType,
+            payloadDigest(inputManifest),
+            "empty-closing-child",
+            "wf/empty-closing-child-map/item",
+            2,
+            "child-workflows",
+            "Cancel",
+            "FailFast"
+          )
+        };
+        const childOutcome = await backend.commitWorkflowTask(child.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            { data: { kind: "ChildWorkflowMapScheduled", scheduled: childScheduled } },
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ value: "closed" }, { codec: "Json" })
+              }
+            }
+          ],
+          scheduleChildWorkflowMaps: [
+            {
+              mapCommandId: childScheduled.commandId,
+              workflowType: childScheduled.workflowType,
+              taskQueue: childScheduled.taskQueue,
+              inputManifest: childScheduled.inputManifest,
+              resultManifestName: childScheduled.resultManifestName,
+              workflowIdPrefix: childScheduled.workflowIdPrefix,
+              maxInFlight: childScheduled.maxInFlight,
+              parentClosePolicy: childScheduled.parentClosePolicy,
+              failureMode: childScheduled.failureMode
+            }
+          ]
+        });
+        assert(
+          childOutcome.kind === "Committed" && Number(childOutcome.newTailEventId) === 3,
+          `a commit that schedules an empty child map and closes its run must stay accepted, got ${JSON.stringify(
+            childOutcome
+          )}`
+        );
+        const childHistory = await backend.streamHistory({
+          runId: child.claim.runId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(20),
+          maxEvents: 20,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          childHistory.events.map((event) => event.eventType).join(",") ===
+            "WorkflowStarted,ChildWorkflowMapScheduled,WorkflowCompleted",
+          `no child-map fact may land behind the run's own terminal event, got ${childHistory.events
+            .map((event) => event.eventType)
+            .join(",")}`
+        );
+      }
+    },
+    {
       // A run that has reached a terminal event owns no live fanout any more.
       // Without an abandon-on-close step a closed workflow kept spawning work:
       // completing one item materialized the next, and the map's own terminal
@@ -2273,12 +2510,11 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(
           ownerHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityScheduled,WorkflowCancelled",
-          // Scoped to a non-empty map on purpose. One commit that both
-          // schedules an *empty* map and closes its run still yields
-          // `…,WorkflowCompleted,ActivityMapCompleted`: `DescriptorCreated`
-          // ignores `parentTerminal` by design, because routing it through the
-          // terminal path would roll the whole commit back. That carve-out is
-          // documented in `map-engine.ts` and is not what this case pins.
+          // Scoped to a non-empty map on purpose. The empty map reaches the
+          // same rule down a different arm — `DescriptorCreated`, which may
+          // never reject, drops the notification instead — and is pinned by
+          // `an empty map scheduled by a closing commit is accepted and appends
+          // nothing`.
           `a non-empty map of a closed run may append nothing past its terminal event, got ${ownerHistory.events
             .map((event) => event.eventType)
             .join(",")}`
@@ -2891,30 +3127,136 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
-      // Defence in depth behind the runtime, which now cancels a losing
-      // `select` branch's wait so this state should never arise through the
-      // DSL. The provider must refuse it anyway: a `TimerFired` appended after
-      // the terminal event corrupts a history every replay, audit and
-      // terminal-cleanup path assumes is finished, and the run is not even
-      // resurrected by it — the next claim still refuses a closed run, so the
-      // only outcome is the corruption.
+      // Terminal cleanup deletes a closed run's waits, so a stray wait against
+      // a closed run is state that cleanup could not reach. This case forges
+      // exactly that state and requires the provider to refuse it: a
+      // `TimerFired` appended after the terminal event corrupts a history every
+      // replay, audit and terminal-cleanup path assumes is finished, and the
+      // run is not even resurrected by it — the next claim still refuses a
+      // closed run, so the only outcome is the corruption.
       //
-      // The wait is left live by committing it in the same task that closes
-      // the run, which every provider accepts: the terminal guard tests the
-      // state *before* the commit. That is the one construction that does not
-      // rely on the defect this guards against.
+      // **How the state is forged, and why it has to be.** The old
+      // construction — commit the wait in the same task that closes the run —
+      // stopped working the day terminal cleanup landed: the closing commit now
+      // deletes that wait, so the case passed for the wrong reason and pinned
+      // nothing. It is forged here by committing the wait from a *second, live*
+      // run after the first has closed, naming the closed run in the record.
+      // Every provider stores the record's own `runId`, so the row outlives a
+      // cleanup that already ran. This is the same move as Rust's
+      // `force_terminal` helper, which forges the terminal flag directly
+      // because every real terminal transition would have cleaned up first.
+      //
+      // The companion case `terminal cleanup deletes a closed run's waits`
+      // pins the cleanup; this one pins the guard behind it. Reverting either
+      // fix leaves the other case green, which is the point of having both.
       name: "a stray timer wait never fires against a closed run",
       async run(factory) {
-        const { backend, claim } = await startedAndClaimed(factory);
-        const timerCommand = commandId(claim.runId, 1);
-        const committed = await backend.commitWorkflowTask(claim, {
+        const closed = await startedAndClaimed(factory);
+        const backend = closed.backend;
+        const closedRunId = closed.claim.runId;
+        const committed = await backend.commitWorkflowTask(closed.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            {
+              data: {
+                kind: "WorkflowCompleted",
+                result: encodePayload({ value: "closed" }, { codec: "Json" })
+              }
+            }
+          ]
+        });
+        assert(
+          committed.kind === "Committed" && committed.newTailEventId === eventId(2),
+          "the run should close"
+        );
+
+        const injector = await startedAndClaimed(factory, {
+          backend,
+          workflowId: "wf/stray-wait-injector"
+        });
+        const strayCommand = commandId(closedRunId, 1);
+        const injected = await backend.commitWorkflowTask(injector.claim, {
+          expectedTailEventId: eventId(1),
+          upsertWaits: [
+            {
+              waitId: waitId(`${closedRunId}:timer:1`),
+              runId: closedRunId,
+              commandId: strayCommand,
+              kind: "Timer",
+              key: "timer",
+              readyAt: timestampMs(1_000)
+            }
+          ]
+        });
+        assert(
+          injected.kind === "Committed",
+          "the forging commit should be accepted; it is a live run's own commit"
+        );
+
+        const fired = await backend.fireDueTimers({
+          namespace: namespace(),
+          now: timestampMs(10_000),
+          limit: 16
+        });
+        assert(
+          fired.fired === 0,
+          `a closed run's timer wait must not fire, fired ${fired.fired}`
+        );
+
+        const history = await backend.streamHistory({
+          runId: closedRunId,
+          afterEventId: eventId(0),
+          upToEventId: eventId(10),
+          maxEvents: 10,
+          maxBytes: Number.MAX_SAFE_INTEGER
+        });
+        assert(
+          history.events.map((event) => String(event.eventType)).join(",") ===
+            "WorkflowStarted,WorkflowCompleted",
+          `nothing may be appended past the terminal event, got ${history.events
+            .map((event) => String(event.eventType))
+            .join(",")}`
+        );
+      }
+    },
+    {
+      // Terminal cleanup's wait half, which TypeScript did not have: Rust's
+      // `cleanup_run_operational_state` deletes the run's waits alongside its
+      // activities and descriptors.
+      //
+      // The observable consequence is starvation, not corruption — corruption
+      // is what the `fireDueTimers` terminal guard prevents, and it is pinned
+      // by `a stray timer wait never fires against a closed run`. A leftover
+      // wait is still selected by the due scan, still spends one of its `limit`
+      // slots, and is only then discarded against the guard, so a fleet's dead
+      // waits crowd out the timers that could actually fire. Two runs, one due
+      // wait each, `limit: 1`: with the cleanup the live run's timer fires, and
+      // without it the closed run's wait takes the only slot.
+      //
+      // The closed run's wait is the earlier deadline *and* is committed first,
+      // so it comes first under both selection orders in play — insertion order
+      // in memory, `order by ready_at_ms asc, wait_id asc` in the SQL
+      // providers.
+      //
+      // Honest scope: Postgres expresses its terminal guard as a predicate
+      // *inside* the limited query (`runs.terminal = false`), so a leftover row
+      // there is never selected and never spends a slot. This case is correct
+      // on Postgres and passes with or without the cleanup; the mutation is
+      // caught by memory and SQLite, and by the Postgres-specific row assertion
+      // in that package's own suite.
+      name: "terminal cleanup deletes a closed run's waits",
+      async run(factory) {
+        const closed = await startedAndClaimed(factory);
+        const backend = closed.backend;
+        const closedTimer = commandId(closed.claim.runId, 1);
+        const closingCommit = await backend.commitWorkflowTask(closed.claim, {
           expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
                 kind: "TimerStarted",
                 started: {
-                  commandId: timerCommand,
+                  commandId: closedTimer,
                   fireAt: timestampMs(1_000),
                   fingerprint: timerFingerprint("sleep_until", timestampMs(1_000))
                 }
@@ -2929,9 +3271,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ],
           upsertWaits: [
             {
-              waitId: waitId(`${claim.runId}:timer:1`),
-              runId: claim.runId,
-              commandId: timerCommand,
+              waitId: waitId(`${closed.claim.runId}:timer:1`),
+              runId: closed.claim.runId,
+              commandId: closedTimer,
               kind: "Timer",
               key: "timer",
               readyAt: timestampMs(1_000)
@@ -2939,31 +3281,61 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          committed.kind === "Committed" && committed.newTailEventId === eventId(3),
+          closingCommit.kind === "Committed",
           "a commit that both starts a timer and closes the run should be accepted"
         );
+
+        const live = await startedAndClaimed(factory, {
+          backend,
+          workflowId: "wf/live-timer"
+        });
+        const liveTimer = commandId(live.claim.runId, 1);
+        await backend.commitWorkflowTask(live.claim, {
+          expectedTailEventId: eventId(1),
+          appendEvents: [
+            {
+              data: {
+                kind: "TimerStarted",
+                started: {
+                  commandId: liveTimer,
+                  fireAt: timestampMs(2_000),
+                  fingerprint: timerFingerprint("sleep_until", timestampMs(2_000))
+                }
+              }
+            }
+          ],
+          upsertWaits: [
+            {
+              waitId: waitId(`${live.claim.runId}:timer:1`),
+              runId: live.claim.runId,
+              commandId: liveTimer,
+              kind: "Timer",
+              key: "timer",
+              readyAt: timestampMs(2_000)
+            }
+          ]
+        });
 
         const fired = await backend.fireDueTimers({
           namespace: namespace(),
           now: timestampMs(10_000),
-          limit: 16
+          limit: 1
         });
         assert(
-          fired.fired === 0,
-          `a closed run's timer wait must not fire, fired ${fired.fired}`
+          fired.fired === 1,
+          `a closed run's leftover wait must not spend the timer scan's budget, fired ${fired.fired}`
         );
-
-        const history = await backend.streamHistory({
-          runId: claim.runId,
+        const liveHistory = await backend.streamHistory({
+          runId: live.claim.runId,
           afterEventId: eventId(0),
           upToEventId: eventId(10),
           maxEvents: 10,
           maxBytes: Number.MAX_SAFE_INTEGER
         });
         assert(
-          history.events.map((event) => String(event.eventType)).join(",") ===
-            "WorkflowStarted,TimerStarted,WorkflowCompleted",
-          `nothing may be appended past the terminal event, got ${history.events
+          liveHistory.events.map((event) => String(event.eventType)).join(",") ===
+            "WorkflowStarted,TimerStarted,TimerFired",
+          `the live run's timer is the one that must have fired, got ${liveHistory.events
             .map((event) => String(event.eventType))
             .join(",")}`
         );
@@ -4237,13 +4609,22 @@ export async function assertCurrentTimeFollowsInjectedClock(
   );
 }
 
+/**
+ * A started, claimed run on a fresh backend.
+ *
+ * `options.backend` reuses one a case already has, and `options.workflowId`
+ * names the run, so a case needing two independent runs in one namespace — a
+ * closed run and a live one — can build the second without a second factory
+ * call, which would give it a second empty backend.
+ */
 async function startedAndClaimed(
-  factory: () => DurableBackend
+  factory: () => DurableBackend,
+  options: { readonly backend?: DurableBackend; readonly workflowId?: string } = {}
 ): Promise<{ backend: DurableBackend; claim: WorkflowTaskClaim }> {
-  const backend = factory();
+  const backend = options.backend ?? factory();
   await backend.startWorkflow({
     namespace: namespace(),
-    workflowId: workflowId("wf/commit"),
+    workflowId: workflowId(options.workflowId ?? "wf/commit"),
     workflowType: workflowType("conformance.workflow", 1),
     taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: 1 }, { codec: "Json" })

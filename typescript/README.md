@@ -425,14 +425,13 @@ worker takes the instant it hands the runtime from there, so a provider whose
 deadlines its own scan never reaches. `MemoryBackend`, `SqliteBackend` and
 `PostgresBackend` all accept a `nowMs` option and report it.
 
-**Open question, tracked cross-runtime.** The task queue an activity resolves
-to is part of its command `optionsDigest`, and that resolution includes the
-scheduling worker's `activityTaskQueue` fallback. So two workflow workers
-configured with different activity queues fingerprint the same unqueued
-`callActivity()` differently, and a run scheduled by one fails replay on the
-other. Rust has carried the same hazard since `with_task_queue_fallback` was
-written. Until it is settled, name `taskQueue` explicitly on any
-`callActivity()` in a fleet whose workers do not all share one activity queue.
+A `callActivity()` with no `taskQueue` is scheduled onto the scheduling
+worker's `activityTaskQueue`, and its command fingerprint does **not** depend on
+that resolution: the `optionsDigest` hashes the queue the caller asked for,
+defaulted to the literal `"default"`. Two workflow workers configured with
+different activity queues therefore fingerprint the same unqueued call
+identically, and a run scheduled by one replays on the other. Rust narrows its
+half the same way, against `TaskQueue::default()`.
 
 `MemoryBackend` is for fast tests and local simulations. It is not durable
 across process restart.
@@ -606,6 +605,32 @@ start/commit write overhead.
 
 Postgres benchmarks require `DURUST_POSTGRES_URL`.
 
+**Each Postgres benchmark run creates and drops its own database**, named
+`durust_tsbench_<pid>_<ms>_<counter>` on that URL's server. It has to: every
+counter the run reports except the `wal*` group comes from `pg_stat_database`
+and `pg_stat_statements` filtered to `current_database()`, so sharing a database
+with anything else — a conformance suite, a psql session, another benchmark —
+folds that traffic into the run's own numbers. Measured on the accepted profile
+under ~1.7M foreign transactions: `transactionsPerMixedAction` read **17.3**
+against a ceiling of 1.174 sharing a database, and **1.06** with its own. The
+name is printed to stderr the moment it is created.
+
+`--keep-db` keeps that database instead of dropping it, and reports its name as
+`postgres_database` in `--json` and in the human output. No signal handler is
+installed, so an interrupt leaks the database; reclaim it with:
+
+```bash
+DURUST_POSTGRES_URL=... npm run --prefix typescript -w @durust/benchmark exec -- \
+  durust-benchmark-workload --list-stale     # or --drop-stale
+```
+
+Both are server-wide, not per-run: they consider every `durust_tsbench_`
+database on that server, not just this process's. `--drop-stale` never evicts a
+live session — a database with a backend attached is not listed, and the drop
+omits `with (force)` so a session arriving in between makes the drop fail rather
+than be evicted — but an idle `--keep-db` database is indistinguishable from a
+leak and will be reclaimed. On a shared server run `--list-stale` first.
+
 Run the env-gated Postgres release checks with:
 
 ```bash
@@ -617,46 +642,54 @@ That command fails fast without `DURUST_POSTGRES_URL`, then runs the Postgres
 provider conformance suite plus the benchmark threshold gate that includes the
 Postgres mixed smoke baseline and the 1000-workflow accepted Postgres profile.
 
+`DURUST_REQUIRE_POSTGRES=1` turns every Postgres skip into a failure. Set it
+wherever a run is expected to exercise Postgres — CI does, next to its service
+container — so a missing database or a dropped variable fails instead of
+reporting a green run of zero coverage. Unset, the suites skip as before; `=0`
+and `=false` are explicit off switches, matching the Rust suite's reading of
+the same variable. A blank `DURUST_POSTGRES_URL` counts as unset, so an
+expansion that produced nothing skips rather than trying to connect to the
+empty string.
+
 ## Upgrading
 
 There is no changelog yet, so breaking changes are recorded here, newest first.
 A change is listed if it can break a deployment that is working today — either
 its code will not compile, or its in-flight runs stop replaying.
 
-### `callActivity()` with no `taskQueue` now uses the worker's activity queue
+### `callActivity()` with no `taskQueue` now runs on the worker's activity queue
 
 **Who is affected.** A deployment whose workflow workers set
 `activityTaskQueue` *and* whose workflows call `callActivity()` without naming
 a queue, where some other worker polls `"default"` and runs those activities.
-That shape works today, because the runtime ignored `WorkerOptions.activityTaskQueue`
-entirely and scheduled every unqueued activity onto the literal queue
-`"default"`.
+That shape works on 0.2.1, because the runtime ignored
+`WorkerOptions.activityTaskQueue` entirely — `worker.ts` never passed it into
+the runtime at all — and scheduled every unqueued activity onto the literal
+queue `"default"`.
 
-**What changes.** The runtime now falls back to the scheduling worker's own
-`activityTaskQueue`, matching Rust's `ActivityOptions::with_task_queue_fallback`.
-This is a fix — the far more common outcome of the old behaviour was a run that
-hung forever with no error, because the worker scheduled onto a queue nothing
-polled — but the resolved queue is part of the activity command's
-`optionsDigest`, so **the fingerprint of an unqueued activity changes**.
+**What changes.** `ActivityScheduled.taskQueue` for an unqueued call is now the
+scheduling worker's own `activityTaskQueue`, matching Rust's
+`ActivityOptions::with_task_queue_fallback`. This is a fix — the far more
+common outcome of the old behaviour was a run that hung forever with no error,
+because the worker scheduled onto a queue nothing polled — but it moves work
+between queues, so a worker that used to serve those activities on `"default"`
+stops seeing them and the run makes no progress.
 
-**The consequence.** In-flight runs of the affected shape fail their next
-replay with `nondeterminism: activity command fingerprint changed`, and the
-exception escapes `runWorkflowTaskOnce`. **This is recoverable by
-configuration** — see the repair below. Do not drain or abandon affected runs
-on the assumption that it is not.
+**The command fingerprint is *not* affected.** An earlier version of this
+change also folded the resolved queue into the activity's `optionsDigest`,
+which broke replay for in-flight runs. That half has been retracted: the digest
+hashes the queue the caller named, defaulting to the literal `"default"`, so an
+unqueued call fingerprints exactly as it did on 0.2.1 no matter how any worker
+is configured. Only the routing changed.
 
-**The repair: set the scheduling worker's `activityTaskQueue` to `"default"`.**
-The fallback then resolves to `"default"` again, the fingerprint matches what
-the run recorded, and it replays and completes. It works fleet-wide rather than
-run by run, because the old behaviour was uniform: every unqueued activity
-fingerprinted with the literal `"default"` no matter how its worker was
-configured. Keep the setting until affected runs have drained, then move it
-back. Two operational details, both measured rather than assumed:
+**The repair: set the scheduling worker's `activityTaskQueue` to `"default"`,**
+or give the affected calls an explicit `taskQueue`, or put a worker on the new
+queue with those activities registered. The first works fleet-wide, because the
+old behaviour was uniform: every unqueued activity was scheduled onto the
+literal `"default"` no matter how its worker was configured. It is also free of
+side effects now that the fingerprint no longer depends on it. One operational
+detail, measured rather than assumed:
 
-- **Affected runs resume on their next retry, not immediately.** The failed
-  replay released its claim under the nondeterminism backoff
-  (`WorkerOptions.nondeterminismRetryBackoffMs`, 60 s by default), so a repaired
-  worker sees the run only after that lapses.
 - **`activityTaskQueue` also decides which queue that worker *claims* from.**
   If the worker you repoint was the one serving activities that *do* name a
   queue explicitly, it stops claiming them. Leave another worker on the
@@ -665,13 +698,8 @@ back. Two operational details, both measured rather than assumed:
 
 **Before upgrading**, do one of: keep the repair above ready to apply; drain
 runs that have an unqueued `callActivity()` in flight; or give those calls an
-explicit `taskQueue`, which fingerprints identically before and after.
-
-**This break is expected to be retracted.** It exists only because the *fallback*
-queue is folded into `activityOptionsDigest`; see the open question under
-Providers above. If the digest is narrowed to hash the caller-supplied option
-rather than the resolved one, an unqueued call fingerprints identically before
-and after and this entry no longer applies.
+explicit `taskQueue`, which both routes and fingerprints identically before and
+after.
 
 ### `DurableBackend.currentTime()` is required
 
@@ -730,11 +758,26 @@ porting a Rust Durust workflow shape to TypeScript:
 Do not publish or operate the TypeScript packages as production infrastructure
 until all of these are true for the target release:
 
-- `DURUST_POSTGRES_URL=... npm run check:release` passes. This aggregate gate
-  runs the fast workspace check, cross-runtime contract fixture checks, the
-  hot-cache soak profile, and the env-gated Postgres release check. Use
-  `node scripts/check-release.mjs --dry-run` to inspect the command list without
-  running the gates.
+- `DURUST_POSTGRES_URL=... npm run check:release` passes. This aggregate gate is
+  a local pre-release convenience, not the gate. CI is: `.github/workflows/ci.yml`
+  runs `npm run check` (which itself runs `check:fixtures`), the Rust half of
+  every shared contract fixture, the Postgres provider conformance suite
+  against a `postgres:17-alpine` service container with
+  `DURUST_REQUIRE_POSTGRES=1`, and `test:soak`. A **push-triggered** release
+  runs only after CI on `main` concludes successfully. A **manually dispatched**
+  one does not: `release.yml`'s job condition short-circuits on
+  `workflow_dispatch`, and its `bump` input defaults to `patch`, so a dispatch
+  left at its defaults publishes an ordinary patch release with no CI-success
+  requirement and no branch restriction. Only `bump: current` is the
+  recover-a-partial-release shape the root `README.md` describes. What
+  `check:release` adds on top is
+  `test:benchmark-thresholds`, which CI deliberately leaves out: it compares
+  throughput against baselines recorded on one developer machine, and its
+  accepted-profile case asserts `pg_stat_statements` output, which needs a
+  server started with `shared_preload_libraries=pg_stat_statements`. Run it on
+  a controlled machine before a release; do not treat a green CI as having run
+  it. Use `node scripts/check-release.mjs --dry-run` to inspect the command
+  list without running the gates.
 - `npm run check` passes on a clean checkout, including build, Vitest suites,
   type-negative tests, determinism lint, and package dry-run validation.
 - `npm run check:fixtures` passes, proving the TypeScript neutral fixture tests

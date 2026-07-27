@@ -98,6 +98,14 @@ let originalWebSocket: typeof globalThis.WebSocket | undefined;
 let originalEventSource: typeof globalThis.EventSource | undefined;
 let originalXMLHttpRequest: typeof globalThis.XMLHttpRequest | undefined;
 
+/**
+ * The activity task queue a `callActivity()` with no `taskQueue` resolves to
+ * when the worker configured none, and the one an activity command's
+ * `optionsDigest` hashes whatever the worker configured. Rust's
+ * `TaskQueue::default()` is the same string.
+ */
+const DEFAULT_ACTIVITY_TASK_QUEUE = "default";
+
 export interface PrepareWorkflowTaskOptions {
   readonly defaultActivityTaskQueue?: string;
   readonly defaultWorkflowTaskQueue?: string;
@@ -1276,7 +1284,8 @@ class WorkflowRuntimeContext {
     // chunking, the entire history) for as long as the workflow is hot, which
     // is the leak the window exists to close.
     this.#claimed = withoutPrefetchedHistory(claimed);
-    this.#defaultActivityTaskQueue = options.defaultActivityTaskQueue ?? "default";
+    this.#defaultActivityTaskQueue =
+      options.defaultActivityTaskQueue ?? DEFAULT_ACTIVITY_TASK_QUEUE;
     this.#defaultWorkflowTaskQueue = options.defaultWorkflowTaskQueue ?? "default";
     this.#payloadCodec = options.payloadCodec ?? "MessagePack";
     this.#workflowInputSchema = workflowInputSchema;
@@ -2553,7 +2562,32 @@ class WorkflowRuntimeContext {
     return value;
   }
 
+  /**
+   * Reserves the `select`'s own command sequence number, before any branch
+   * registers.
+   *
+   * This is the numbering Rust's `select!` macro produces: it calls
+   * `__durust_select_ensure_command_id` at the top of every poll, so a
+   * two-branch select numbers select=1, branch=2, branch=3, and it burns the
+   * number even in a task where no branch is ready. TypeScript used to
+   * allocate inside {@link resolveSelectWinner}, which runs only once a branch
+   * *is* ready, numbering the same select branch=1, branch=2, select=3 — and
+   * nothing at all in a task that parks. The command seq is durable, so the
+   * two numberings meant neither runtime could replay the other's history
+   * across a select; every other durable command in both runtimes already
+   * allocates at initiation, and TypeScript's exception was an artefact of
+   * `SelectDurablePromise.then()` inheriting the readiness condition.
+   *
+   * Called after the replay-history gate and before branch registration, so a
+   * `then()` that parks for a longer replay window has not yet burned a
+   * number and its retry is still exact.
+   */
+  beginSelect(): CommandId {
+    return this.#nextCommandId();
+  }
+
   resolveSelectWinner(
+    selectCommandId: CommandId,
     readyBranches: readonly SelectReadyBranch[],
     branchesDigest: string
   ): SelectReadyBranch {
@@ -2561,7 +2595,6 @@ class WorkflowRuntimeContext {
       throw new Error("durust.select requires at least one ready branch");
     }
     const winner = [...readyBranches].sort(compareSelectReadyBranches)[0] as SelectReadyBranch;
-    const selectCommandId = this.#nextCommandId();
     const replayEvent = this.#peekReplayEventForUnparkableApi("select");
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind !== "SelectWinner") {
@@ -2818,7 +2851,9 @@ class WorkflowRuntimeContext {
         activityDefinition.name,
         payloadDigest(inputRef),
         activityOptionsDigest({
-          taskQueue,
+          // The caller's queue, not the resolved one. See
+          // `activityOptionsDigest`.
+          taskQueue: options.taskQueue ?? DEFAULT_ACTIVITY_TASK_QUEUE,
           retryPolicy,
           startToCloseTimeoutMs: options.startToCloseTimeoutMs ?? null,
           heartbeatTimeoutMs: options.heartbeatTimeoutMs ?? null
@@ -2867,7 +2902,9 @@ class WorkflowRuntimeContext {
         options.resultManifest,
         options.maxInFlight,
         activityOptionsDigest({
-          taskQueue,
+          // The caller's queue, not the resolved one. See
+          // `activityOptionsDigest`.
+          taskQueue: options.taskQueue ?? DEFAULT_ACTIVITY_TASK_QUEUE,
           retryPolicy,
           startToCloseTimeoutMs,
           heartbeatTimeoutMs
@@ -3923,6 +3960,9 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
         _onrejected
       );
     }
+    // Before any branch registers, matching Rust's macro. See
+    // `WorkflowRuntimeContext.beginSelect`.
+    const selectCommandId = context.beginSelect();
     const keys = Object.keys(this.#branches);
     const ready: SelectReadyBranch[] = [];
     const pending: PendingJoinBranch<unknown>[] = [];
@@ -3965,11 +4005,11 @@ class SelectDurablePromise implements PromiseLike<SelectRuntimeResult> {
     if (ready.length === 0) {
       return context.hotSuspendByKey(
         hotCompositeWaitKey("select", pending),
-        () => resolveHotSelect(context, keys, ready, pending)
+        () => resolveHotSelect(context, selectCommandId, keys, ready, pending)
       ).then(onfulfilled, _onrejected);
     }
 
-    const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+    const winner = context.resolveSelectWinner(selectCommandId, ready, selectBranchesDigest(keys));
     // Every branch still in `pending` lost without producing a value: nothing
     // resolves here, so this list is exactly Rust's `outputs[i].is_none()`
     // losers.
@@ -4002,6 +4042,9 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
         _onrejected
       );
     }
+    // Before any branch registers, matching Rust's macro. See
+    // `WorkflowRuntimeContext.beginSelect`.
+    const selectCommandId = context.beginSelect();
     const ready: SelectReadyBranch[] = [];
     const pending: PendingJoinBranch<unknown>[] = [];
     this.#branches.forEach((branch, ordinal) => {
@@ -4043,12 +4086,12 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
       const keys = this.#branches.map((_, index) => String(index));
       return context.hotSuspendByKey(
         hotCompositeWaitKey("selectAll", pending),
-        () => resolveHotSelectAll(context, keys, ready, pending)
+        () => resolveHotSelectAll(context, selectCommandId, keys, ready, pending)
       ).then(onfulfilled, _onrejected);
     }
 
     const keys = this.#branches.map((_, index) => String(index));
-    const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+    const winner = context.resolveSelectWinner(selectCommandId, ready, selectBranchesDigest(keys));
     cancelLosingSelectBranches(pending);
     const result = { index: Number(winner.key), value: winner.value };
     return Promise.resolve(onfulfilled ? onfulfilled(result) : (result as TResult1));
@@ -4219,6 +4262,7 @@ function resolveHotJoinAll(
 
 function resolveHotSelect(
   context: WorkflowRuntimeContext,
+  selectCommandId: CommandId,
   keys: readonly string[],
   initialReady: readonly SelectReadyBranch[],
   pending: readonly PendingJoinBranch<unknown>[]
@@ -4243,7 +4287,7 @@ function resolveHotSelect(
   if (ready.length === 0) {
     return { kind: "Pending" };
   }
-  const winner = context.resolveSelectWinner(ready, selectBranchesDigest(keys));
+  const winner = context.resolveSelectWinner(selectCommandId, ready, selectBranchesDigest(keys));
   cancelLosingSelectBranches(unresolved);
   return { kind: "Resolved", value: { branch: winner.key, value: winner.value } };
 }
@@ -4264,11 +4308,12 @@ function cancelLosingSelectBranches(losers: readonly PendingJoinBranch<unknown>[
 
 function resolveHotSelectAll(
   context: WorkflowRuntimeContext,
+  selectCommandId: CommandId,
   keys: readonly string[],
   initialReady: readonly SelectReadyBranch[],
   pending: readonly PendingJoinBranch<unknown>[]
 ): HotSuspendResolution<SelectAllRuntimeResult> {
-  const resolution = resolveHotSelect(context, keys, initialReady, pending);
+  const resolution = resolveHotSelect(context, selectCommandId, keys, initialReady, pending);
   if (resolution.kind !== "Resolved") {
     return resolution as HotSuspendResolution<SelectAllRuntimeResult>;
   }
@@ -4450,6 +4495,31 @@ function sameFingerprint(
   );
 }
 
+/**
+ * The digest an activity (or activity-map) command's fingerprint carries.
+ *
+ * `taskQueue` is the queue the **caller asked for**, defaulted to
+ * {@link DEFAULT_ACTIVITY_TASK_QUEUE} — never the scheduling worker's
+ * configured `activityTaskQueue`. The resolved queue still goes into
+ * `ActivityScheduled.taskQueue`; only the fingerprint is narrowed.
+ *
+ * Folding the worker's fallback in here made a command's identity depend on
+ * the configuration of whichever worker happened to schedule it: two workflow
+ * workers with different activity queues fingerprinted the same unqueued
+ * `callActivity()` differently, and a run scheduled by one failed replay on the
+ * other with `nondeterminism: activity command fingerprint changed`. Nothing
+ * about a fingerprint should be readable from worker configuration; a
+ * fingerprint answers "is this the same command the workflow issued last
+ * time", and the workflow issued the same call either way.
+ *
+ * Defaulting to the literal rather than dropping the field is what makes this
+ * a *retraction* rather than a second break. `defaultActivityTaskQueue` was
+ * never passed into the runtime before, so every unqueued activity ever
+ * recorded hashed `"default"` here; keeping the literal leaves every one of
+ * those fingerprints byte-identical, and an explicitly queued call was never
+ * affected either way. `src/runtime.rs` narrows its half the same way, against
+ * `TaskQueue::default()`, which is the same string.
+ */
 function activityOptionsDigest(options: {
   readonly taskQueue: string;
   readonly retryPolicy: RetryPolicy;

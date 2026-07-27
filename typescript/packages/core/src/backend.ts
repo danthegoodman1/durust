@@ -1142,15 +1142,35 @@ export class MemoryBackend implements DurableBackend {
 
   /**
    * Abandon-on-close: a run that has just reached a terminal event owns no
-   * live work any more. Every map of that run is handed to the engine as
-   * `ParentCancelled`, and every plain activity of it is tombstoned.
+   * live work any more. Its waits are deleted, every map of that run is handed
+   * to the engine as `ParentCancelled`, and every plain activity of it is
+   * tombstoned.
    *
    * Without this a closed workflow keeps spawning and appending: completing an
    * item of its map materialized the next ordinal, and both a map's terminal
    * fact and a plain activity's `ActivityCompleted` were appended to the run's
    * history *after* its terminal event — the exact thing the terminal-commit
-   * guard exists to prevent. Rust reaches the same end by deleting the run's
-   * activities and descriptors during terminal cleanup.
+   * guard exists to prevent. Rust reaches the same end in
+   * `cleanup_run_operational_state` (`src/memory.rs`), which deletes the run's
+   * waits, activities and descriptors together; the wait half was the piece
+   * TypeScript did not have.
+   *
+   * A leftover wait is not merely untidy. Here and in SQLite the due-timer
+   * scan selects it, spends one of its `limit` slots on it, and only then
+   * discards it against the terminal guard, so a fleet's stray waits starve
+   * the timers that could actually fire. Postgres does not pay that cost — its
+   * guard is a `runs.terminal = false` predicate *inside* the limited query,
+   * so a stray row is never selected — but it still stores and indexes rows
+   * that can never fire. The guard in `fireDueTimers` stays either way: it is
+   * what makes a wait this cleanup cannot reach harmless rather than
+   * corrupting, and it is a backstop, not the cleanup. `PARITY.md` note 22
+   * records the same split, because it decides which provider's test detects
+   * which revert.
+   *
+   * Continue-as-new is included. The new run has its own id and its own waits;
+   * the closed run's belong to nobody, which is the same conclusion Rust's
+   * `TerminalCleanup::ContinuedAsNew` reaches (it spares consumed *signals*,
+   * not waits).
    *
    * Children are deliberately left alone here. `ParentCancelled` emits only
    * `AbandonPendingItems` and `MarkDescriptorTerminal` — in both runtimes — so
@@ -1161,6 +1181,11 @@ export class MemoryBackend implements DurableBackend {
    * children itself; see `#cancelCommandOperationalState`.
    */
   #abandonWorkForClosedRun(state: WorkflowState): void {
+    for (const [waitIdValue, wait] of this.#waitsById) {
+      if (wait.runId === state.runId) {
+        this.#waitsById.delete(waitIdValue);
+      }
+    }
     for (const activity of this.#activitiesById.values()) {
       if (
         activity.task.mapItem === null &&

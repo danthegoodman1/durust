@@ -52,22 +52,50 @@ import {
 import { PostgresBackend } from "@durust/postgres";
 import {
   assertCurrentTimeFollowsInjectedClock,
+  assertPostgresAvailableWhenRequired,
   assertTerminalRunLeftoversArePoisoned,
   assertTerminalRunLeftoversAreRepaired,
   assertTerminalRunPlainLeftoverIsRepaired,
   basicProviderConformanceCases,
+  postgresIsRequired,
+  postgresUrlFromEnv,
   prepareWorkflowTaskCommit,
   scheduleTerminalRunLeftovers,
   scheduleTerminalRunPlainLeftover,
   workflowVisibleMutationCommitCases
 } from "@durust/testing";
 
-const postgresUrl = process.env.DURUST_POSTGRES_URL;
+const postgresUrl = postgresUrlFromEnv();
+
+// Module scope on purpose, and it has to be. Without `DURUST_POSTGRES_URL`
+// every suite below is `describe.skip`, which reports `123 skipped` and exits
+// **0** — a green run of zero coverage, the TypeScript twin of the Rust hole
+// `DURUST_REQUIRE_POSTGRES` was added to close. Measured on Vitest 4.1.9: a
+// file whose every suite is skipped still has its module body evaluated during
+// collection, so this throw fires; but none of its hooks run, so the
+// executed-count assertion in `afterAll` below does *not* fire in that case.
+// The two are complements, not alternatives — see
+// `assertPostgresAvailableWhenRequired`.
+assertPostgresAvailableWhenRequired(postgresUrl, "the TypeScript Postgres provider conformance suite");
+
 const describePostgres = postgresUrl === undefined ? describe.skip : describe;
 const managedBackends: PostgresBackend[] = [];
 const roots: string[] = [];
 let tableCounter = 0;
 const managedTableNames: string[] = [];
+/**
+ * Cases this file actually executed, counted by the module-scope `afterEach`
+ * below, which Vitest runs after every executed test in the file and not for a
+ * skipped one.
+ *
+ * The `afterAll` assertion on it catches the other half of the hole: a run
+ * where the database *is* reachable but the suite collapsed to nothing — the
+ * conformance loop deleted, `basicProviderConformanceCases()` returning an
+ * empty array, a `describe` accidentally narrowed. That shape also reports
+ * success today. It cannot catch "everything skipped", because then no hook
+ * runs at all; the module-scope throw above is what covers that.
+ */
+let executedCases = 0;
 
 // Every tracked backend owns its own single-connection pool, and each test
 // builds at least one. Draining only in `afterAll` therefore holds one server
@@ -77,6 +105,7 @@ const managedTableNames: string[] = [];
 // backend. Releasing per test keeps the live connection count proportional to
 // concurrency instead of to the number of cases.
 afterEach(async () => {
+  executedCases += 1;
   for (const backend of managedBackends.splice(0)) {
     await backend.destroy().catch(() => undefined);
   }
@@ -1822,6 +1851,225 @@ describePostgres("PostgresBackend normalized history", () => {
     });
   });
 
+  // Terminal cleanup's wait half, asserted at the row rather than through
+  // `fireDueTimers`. The shared conformance case `terminal cleanup deletes a
+  // closed run's waits` observes the leak as starvation of the timer scan's
+  // `limit`, which Postgres alone does not suffer: its terminal guard is a
+  // predicate *inside* the limited query (`runs.terminal = false`), so a
+  // leftover row is never selected and never spends a slot. The row is still
+  // there, still indexed, still scanned, and still growing without bound — so
+  // this package asserts its absence directly.
+  //
+  // Both commit paths, because they delete the rows in different places and a
+  // commit picks between them by shape: the SQL-native path
+  // (`#commitWorkflowTaskSqlNative`, which a plain `WorkflowCompleted` is
+  // eligible for) issues its own statement, and the loaded-state path relies on
+  // `#abandonWorkForClosedRun` plus the full normalized rewrite a terminal
+  // commit takes. Scheduling a child-workflow map is what forces the second
+  // path — `canUseSqlNativeWorkflowCommit` bails on it.
+  it("deletes a closed run's normalized wait rows on both commit paths", async () => {
+    const tableName = nextTableName("normalized_waits_terminal_cleanup");
+    const backend = trackedPostgresBackendWithTable(tableName);
+    const type = workflowType("postgres.normalized-waits.terminal-cleanup", 1);
+
+    const sqlNative = await startClaimAndScheduleTimer(
+      backend,
+      "wf/postgres-terminal-cleanup-sql-native",
+      type,
+      timestampMs(1_000),
+      1
+    );
+    const survivor = await startClaimAndScheduleTimer(
+      backend,
+      "wf/postgres-terminal-cleanup-survivor",
+      type,
+      timestampMs(9_000),
+      2
+    );
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: timestampMs(1_000), limit: 16 })
+    ).resolves.toEqual({ fired: 1 });
+    const reclaimed = await backend.claimWorkflowTask("terminal-cleanup-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [type],
+      leaseDurationMs: 30_000
+    });
+    if (!reclaimed || String(reclaimed.runId) !== sqlNative.runId) {
+      throw new Error("expected to reclaim the run whose timer fired");
+    }
+
+    // A second wait on the closing run, so the commit has something to clean up
+    // that it did not also create.
+    const strayCommand = commandId(reclaimed.runId, 5);
+    await expect(
+      backend.commitWorkflowTask(reclaimed.claim, {
+        expectedTailEventId: eventId(3),
+        upsertWaits: [
+          {
+            waitId: waitId(`${reclaimed.runId}:signal:5`),
+            runId: reclaimed.runId,
+            commandId: strayCommand,
+            kind: "Signal",
+            key: "approved",
+            readyAt: null
+          }
+        ],
+        appendEvents: [
+          {
+            data: {
+              kind: "WorkflowCompleted",
+              result: encodePayload({ value: "closed" }, { codec: "Json" })
+            }
+          }
+        ]
+      })
+    ).resolves.toEqual({ kind: "Committed", newTailEventId: eventId(4) });
+
+    const afterSqlNative = await readNormalizedWaitRows(tableName);
+    expect(
+      afterSqlNative.filter((wait) => wait.run_id === sqlNative.runId),
+      "the SQL-native commit path must leave a closed run no wait rows"
+    ).toEqual([]);
+    expect(
+      afterSqlNative.find((wait) => wait.wait_id === survivor.waitId),
+      "an unrelated live run's wait must survive"
+    ).toBeDefined();
+
+    // The loaded-state path. Scheduling a child-workflow map in the closing
+    // commit takes `canUseSqlNativeWorkflowCommit` off the fast path.
+    const childType = workflowType("postgres.terminal-cleanup.child", 1);
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/postgres-terminal-cleanup-fallback"),
+      workflowType: type,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ value: "fallback" }, { codec: "Json" })
+    });
+    const fallbackFirstClaim = await backend.claimWorkflowTask("terminal-cleanup-fallback-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [type],
+      leaseDurationMs: 30_000
+    });
+    if (!fallbackFirstClaim) {
+      throw new Error("expected to claim the fallback-path run");
+    }
+    const fallbackRunId = String(fallbackFirstClaim.runId);
+    const fallbackTimerWait = waitId(`${fallbackRunId}:timer:3`);
+    const fallbackSignalWait = waitId(`${fallbackRunId}:signal:8`);
+    await expect(
+      backend.commitWorkflowTask(fallbackFirstClaim.claim, {
+        expectedTailEventId: eventId(1),
+        appendEvents: [
+          {
+            data: {
+              kind: "TimerStarted",
+              started: {
+                commandId: commandId(fallbackFirstClaim.runId, 3),
+                fireAt: timestampMs(8_000),
+                fingerprint: timerFingerprint("sleep_until", timestampMs(8_000))
+              }
+            }
+          }
+        ],
+        upsertWaits: [
+          {
+            waitId: fallbackTimerWait,
+            runId: fallbackFirstClaim.runId,
+            commandId: commandId(fallbackFirstClaim.runId, 3),
+            kind: "Timer",
+            key: "timer",
+            readyAt: timestampMs(8_000)
+          },
+          {
+            waitId: fallbackSignalWait,
+            runId: fallbackFirstClaim.runId,
+            commandId: commandId(fallbackFirstClaim.runId, 8),
+            kind: "Signal",
+            key: "approved",
+            readyAt: null
+          }
+        ]
+      })
+    ).resolves.toEqual({ kind: "Committed", newTailEventId: eventId(2) });
+    // Firing the timer wakes the run so it can be claimed again and deletes
+    // only that wait, leaving the signal wait as one the closing commit has to
+    // clean up but did not itself create.
+    await expect(
+      backend.fireDueTimers({ namespace: namespace(), now: timestampMs(8_000), limit: 16 })
+    ).resolves.toEqual({ fired: 1 });
+    const reFallbackClaim = await backend.claimWorkflowTask("terminal-cleanup-fallback-closer", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [type],
+      leaseDurationMs: 30_000
+    });
+    if (!reFallbackClaim || String(reFallbackClaim.runId) !== fallbackRunId) {
+      throw new Error("expected to re-claim the fallback-path run");
+    }
+    const mapCommand = commandId(reFallbackClaim.runId, 9);
+    const mapManifest = activityMapManifest([], 2);
+    const mapScheduled = {
+      commandId: mapCommand,
+      workflowType: childType,
+      taskQueue: "child-workflows",
+      inputManifest: mapManifest,
+      resultManifestName: "cleanup",
+      workflowIdPrefix: "wf/postgres-terminal-cleanup-item",
+      maxInFlight: 2,
+      parentClosePolicy: "Cancel" as const,
+      failureMode: "FailFast" as const,
+      fingerprint: childWorkflowMapFingerprint(
+        childType,
+        payloadDigest(mapManifest),
+        "cleanup",
+        "wf/postgres-terminal-cleanup-item",
+        2,
+        "child-workflows",
+        "Cancel",
+        "FailFast"
+      )
+    };
+    await expect(
+      backend.commitWorkflowTask(reFallbackClaim.claim, {
+        expectedTailEventId: eventId(3),
+        appendEvents: [
+          { data: { kind: "ChildWorkflowMapScheduled", scheduled: mapScheduled } },
+          {
+            data: {
+              kind: "WorkflowCompleted",
+              result: encodePayload({ value: "closed" }, { codec: "Json" })
+            }
+          }
+        ],
+        scheduleChildWorkflowMaps: [
+          {
+            mapCommandId: mapScheduled.commandId,
+            workflowType: mapScheduled.workflowType,
+            taskQueue: mapScheduled.taskQueue,
+            inputManifest: mapScheduled.inputManifest,
+            resultManifestName: mapScheduled.resultManifestName,
+            workflowIdPrefix: mapScheduled.workflowIdPrefix,
+            maxInFlight: mapScheduled.maxInFlight,
+            parentClosePolicy: mapScheduled.parentClosePolicy,
+            failureMode: mapScheduled.failureMode
+          }
+        ]
+      })
+    ).resolves.toEqual({ kind: "Committed", newTailEventId: eventId(5) });
+
+    const afterFallback = await readNormalizedWaitRows(tableName);
+    expect(
+      afterFallback.filter((wait) => wait.run_id === fallbackRunId),
+      "the loaded-state commit path must leave a closed run no wait rows"
+    ).toEqual([]);
+    expect(
+      afterFallback.find((wait) => wait.wait_id === survivor.waitId),
+      "an unrelated live run's wait must still survive"
+    ).toBeDefined();
+  });
+
   it("targets normalized projection updates for simple workflow commits", async () => {
     const tableName = nextTableName("normalized_simple_commit_targeted_update");
     const backend = trackedPostgresBackendWithTable(tableName);
@@ -2842,6 +3090,41 @@ describePostgres("PostgresBackend stats", () => {
 
     expect(stats.statements.some((statement) => statement.calls > 0)).toBe(true);
     expect(stats.statements.some((statement) => statement.query.length > 0)).toBe(true);
+  });
+});
+
+// An always-on suite, and it has to be. The obvious home for this assertion is
+// the file-scope `afterAll` above, and it does not work: measured on Vitest
+// 4.1.9, a file whose every test is skipped runs **no hooks at all** — not
+// `afterEach`, not `afterAll` — and reports `128 skipped`, exit 0. Putting the
+// check in `afterAll` therefore misses the exact regression it exists for.
+// A plain `describe` keeps one test executing whatever happens to the gated
+// ones, which both makes this assertion run and makes the file's hooks fire.
+//
+// Declared last on purpose: Vitest runs a file's tests in declaration order
+// (nothing here sets `sequence.shuffle` or uses `.concurrent`), so every gated
+// case has already run and been counted by the time this executes.
+describe("PostgresBackend suite coverage", () => {
+  it("executed its Postgres cases rather than skipping them", () => {
+    if (postgresUrl === undefined) {
+      // Skipping without a database is the supported developer default. The
+      // case that must not be silent — a run *obliged* to reach Postgres and
+      // unable to — is caught at module scope, before any of this is reached.
+      expect(postgresIsRequired()).toBe(false);
+      return;
+    }
+    // The floor is read from the case list rather than written down, so it
+    // tracks the suite instead of going stale. The `2 *` is load-bearing and
+    // was wrong once: the shared list runs **twice** here, plain and
+    // blob-backed, and a floor of one list's length let a mutation that
+    // narrowed the blob-backed loop to a single case delete 43 of 44 and still
+    // pass at `86 passed, exit 0`. This file's own cases sit on top of the 88,
+    // so the floor is still comfortably below the real count.
+    const floor = 2 * basicProviderConformanceCases().length;
+    expect(
+      executedCases,
+      "DURUST_POSTGRES_URL is set, so this suite must exercise Postgres; the shared conformance list alone should have run this many cases. If you filtered the run with `-t`, that is the cause and the filtered cases still passed; this check exists for the unfiltered runs CI makes"
+    ).toBeGreaterThanOrEqual(floor);
   });
 });
 

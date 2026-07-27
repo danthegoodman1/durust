@@ -37,30 +37,21 @@ import type { ChildWorkflowMapFailureMode, RetryPolicy } from "./options.js";
 // Empty input manifests complete at descriptor creation. A map scheduled with
 // `itemCount === 0` has nothing to admit and nothing outstanding, so the engine
 // emits an empty result manifest, notifies the parent, and marks the descriptor
-// terminal. That is what every TypeScript provider does today, verified by
-// execution rather than by reading: `MemoryBackend` and `PostgresBackend` append
-// the terminal fact, and `SqliteBackend`'s map code produces it too —
-// `commitWorkflowTask`'s outer `#saveWorkflow(state)`
-// (`packages/sqlite/src/index.ts:508`) then overwrites the row that
-// `#completeActivityMapIfDone` wrote through its own `#stateForRun` re-read, so
-// SQLite's apparent stall is that lost update and not a design choice. The lost
-// update is tracked as its own plan row.
+// terminal — unless that same commit also closes the parent run, in which case
+// there is nobody to notify and the notification is dropped rather than
+// appended behind the run's own terminal event. `src/map_engine.rs` reaches the
+// same two answers from the same condition, so the completion condition at
+// `DescriptorCreated` — `recordedOutcomes >= itemCount`, not merely
+// `itemCount === 0` — is now shared rather than excluded. The shared transition
+// table (`typescript/fixtures/contract/map-transitions.json`) asserts it in
+// both runners; it used to carry an exclusion for the whole predicate, which
+// was retired once both engines agreed.
 //
-// `src/map_engine.rs` stalls instead, because all three Rust providers stall.
-// The two engines are knowingly divergent here until row 6G lands on the Rust
-// side and converges Rust to this behaviour. The divergence is not limited to
-// `itemCount === 0`: the completion condition at `DescriptorCreated` is
-// `recordedOutcomes >= itemCount`, so for *any* such state this engine emits
-// `CompleteMap` where Rust emits nothing, and when `nextOrdinal < itemCount` it
-// emits `MaterializeItems` and `CompleteMap` in one list. The shared
-// transition table (`typescript/fixtures/contract/map-transitions.json`)
-// therefore excludes every `DescriptorCreated` case with
-// `recordedOutcomes >= itemCount`, not merely the empty-manifest one, and both
-// runners assert that the exclusion is still declared; Phase 7's corpus must
-// carry the same exclusion until 6G lands.
-//
-// Descriptor-creation completion deliberately ignores `parentTerminal`, unlike
-// every other terminal path in this module — see `step`.
+// `DescriptorCreated` is the one transition that can never reject. The commit
+// that creates the descriptor can be the commit that closes the run, and
+// routing this through `terminalParent` would answer `TerminalWorkflow` for an
+// activity map and roll the entire workflow-task commit back — turning a commit
+// every provider accepts today into a hard failure. See `step`.
 //
 // All three TypeScript providers drive their activity-map and
 // child-workflow-map paths through `step` and apply the effect list it
@@ -460,28 +451,39 @@ export function step(state: MapState, event: MapEvent): MapTransition {
         return effects(admitted);
       }
       // An empty input manifest has nothing to admit and nothing outstanding, so
-      // the map is terminal the moment its descriptor exists.
+      // the map is terminal the moment its descriptor exists. Without this the
+      // parent blocks on `resultManifest()` forever: no item is ever
+      // materialized, so no later event can reach the completion check.
       //
-      // `parentTerminal` is deliberately ignored here, unlike every other
-      // terminal path, because Phase 6 is behaviour-preserving. Verified by
-      // execution on one commit that both schedules an empty map and closes the
-      // run: all three providers **accept** it, and memory and Postgres append
-      // the map's terminal fact *after* the run's own —
-      // `WorkflowStarted,ActivityMapScheduled,WorkflowCompleted,ActivityMapCompleted`.
-      // (SQLite produces the same completion and then loses it to the
-      // `#saveWorkflow` overwrite described above, so it stops at
-      // `…,WorkflowCompleted`.)
+      // This arm deliberately does **not** route through `terminalParent`. That
+      // path rejects an activity map whose parent is closed, and the commit that
+      // creates this descriptor can be the commit that closes the run — a
+      // workflow that spawns a map and returns without awaiting it. Rejecting
+      // would roll that whole workflow-task commit back, turning a commit every
+      // provider accepts today into a hard failure, so `DescriptorCreated` can
+      // never reject.
       //
-      // That ordering violates the terminal-commit guard and is tracked as its
-      // own plan row. The engine reproduces it rather than half-fixing it:
-      // routing this through `terminalParent` would roll the *whole commit*
-      // back instead, turning an accepted commit into a rejected one — a
-      // strictly larger change, and the one that got the equivalent Rust change
-      // reverted.
+      // What a closed parent *does* change is that there is nobody to notify:
+      // the run's terminal cleanup deletes this descriptor in the same commit,
+      // and appending a map fact behind the run's own terminal event would
+      // corrupt the history every replay and audit reads. So the descriptor is
+      // closed and the notification dropped — the same answer `terminalParent`
+      // gives a child map, reached without the reject an activity map would
+      // otherwise take. This is `src/map_engine.rs:403` line for line.
+      //
+      // Measured before the change, on one commit that both schedules an empty
+      // map and closes the run: memory and Postgres appended
+      // `WorkflowStarted,ActivityMapScheduled,WorkflowCompleted,ActivityMapCompleted`
+      // — a fact past the terminal event — and SQLite produced the same
+      // completion and then lost it to the `#saveWorkflow` overwrite, stopping
+      // at `…,WorkflowCompleted`. Three runtimes, three histories, from one
+      // program. All three now append nothing, which is what Rust has always
+      // done.
+      if (event.parentTerminal) {
+        return effects([...admitted, { kind: "MarkDescriptorTerminal" }]);
+      }
       return effects([
         ...admitted,
-        // Lands after the run's own terminal event when the closing commit
-        // schedules this map. Deliberate: see the `parentTerminal` note above.
         { kind: "CompleteMap", itemCount: state.itemCount },
         { kind: "MarkDescriptorTerminal" }
       ]);

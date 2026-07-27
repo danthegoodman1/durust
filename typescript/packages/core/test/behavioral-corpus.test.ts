@@ -614,6 +614,7 @@ interface Corpus {
     readonly kind: string;
     readonly why: string;
   }[];
+  readonly declaredDivergences: { readonly count: number; readonly why: string };
   readonly declaredGaps: readonly { readonly what: string; readonly why: string }[];
   readonly workerStartJitter: {
     readonly note: readonly string[];
@@ -672,6 +673,33 @@ const DECLARED_EXCLUSIONS: readonly (readonly [string, string])[] = [
   ["The activity-map manifest wire encoding", "Projection"],
   ["WorkflowTaskCommit.cancelCommands and the ParentCancelled event", "Assertion"],
   ["The execution mechanism", "Scope"]
+];
+
+/**
+ * Every case this corpus holds, in order, asserted by name in both runners —
+ * the same treatment {@link DECLARED_EXCLUSIONS} gets, and for the same reason.
+ *
+ * This runner had **no** case-count assertion at all, and the Rust runner had
+ * only a floor (`cases.len() >= 12` against 13 cases). Measured before this
+ * list existed: deleting cases one at a time, 8 of the 13 left the suite green
+ * in both languages, including all four `select` cases — the ones whose
+ * convergence this corpus was extended to pin. A case that can be deleted
+ * without failing anything is a case that is not protecting anything.
+ */
+const DECLARED_CASES = [
+  "an activity call commits one scheduled activity, and its completion closes the run",
+  "a later command is appended past an unconsumed completion (hot execution)",
+  "the same commits come out of a cold replay in one-event chunks",
+  "a signal that arrives first wins the select, and the losing timer wait is cancelled",
+  "a timer that fires first wins the select, and the losing signal wait is cancelled",
+  "a select resolved with two ready branches takes the earlier ready event, not the earlier branch",
+  "the same select with the activity landing first takes the activity branch",
+  "a query projection is committed with the signal wait and again with its consumption",
+  "a child workflow start is committed to the outbox and its completion closes the parent",
+  "an activity map commits one scheduled map bounded by maxInFlight",
+  "a version marker, a side effect and a deprecated patch land in one commit with the result",
+  "continue-as-new commits the next run's input and nothing else",
+  "a timer scheduled after the clock has moved records its deadline relative to now"
 ];
 
 const DECLARED_GAPS = [
@@ -911,7 +939,22 @@ describe("behavioural contract corpus", () => {
         ).toEqual([...declared].sort());
       }
     }
-    expect(count, "the corpus records no divergences at all").toBeGreaterThan(0);
+    // The count is declared in the corpus and asserted equal, not asserted
+    // non-zero. `count > 0` encoded the assumption that some divergence would
+    // always remain, which stops being true the moment the last one is
+    // converged away — and it would have had to be edited under exactly the
+    // pressure that makes a careless edit likely. Equality against a checked-in
+    // number keeps both directions loud: deleting a block fails here, adding
+    // one without declaring it fails here, and reaching zero is possible only
+    // by editing the corpus on purpose.
+    expect(
+      corpus.declaredDivergences.why.length,
+      "declaredDivergences needs a reason, not a label"
+    ).toBeGreaterThan(80);
+    expect(
+      count,
+      "the corpus records a different number of divergence blocks than it declares"
+    ).toBe(corpus.declaredDivergences.count);
   });
 
   it("declares its cross-runtime exclusions", () => {
@@ -924,6 +967,13 @@ describe("behavioural contract corpus", () => {
         `exclusion \`${exclusion.what}\` needs a reason`
       ).toBeGreaterThan(80);
     }
+  });
+
+  it("declares its cases", () => {
+    expect(
+      corpus.cases.map((corpusCase) => corpusCase.name),
+      "a case cannot be added, removed, or renamed without saying so here and in the Rust runner's DECLARED_CASES"
+    ).toEqual(DECLARED_CASES);
   });
 
   it("declares its gaps separately from its exclusions", () => {

@@ -1716,7 +1716,9 @@ export class SqliteBackend implements DurableBackend {
    * command on a still-live run, has no such path and cancels the map's
    * children itself; see `#cancelCommandOperationalState`.
    */
+  /** See `MemoryBackend.#abandonWorkForClosedRun` for why each half is here. */
   #abandonWorkForClosedRun(state: WorkflowState): void {
+    this.#db.prepare("delete from waits where run_id = ?").run(String(state.runId));
     const pending = this.#db.prepare(`
       select * from activities
       where run_id = ? and map_command_key is null and terminal_event_id is null

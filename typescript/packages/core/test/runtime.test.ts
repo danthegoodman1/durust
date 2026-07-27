@@ -218,6 +218,136 @@ describe("minimal workflow runtime", () => {
     });
   });
 
+  // The two halves of taking the worker's `activityTaskQueue` fallback out of
+  // `activityOptionsDigest`. The first pins the invariant; the second is the
+  // running counterexample — a deployment that was broken before the fix and
+  // works after it — because an invariant test alone cannot show that a break
+  // was *retracted*.
+  it("fingerprints an unqueued activity identically on workers with different activity queues", async () => {
+    const checkout = workflow({
+      name: "orders.unqueued-fingerprint",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly unreachable: true }> => {
+        // No `taskQueue`: the resolved queue comes from the worker.
+        await callActivity(priceQuote, { sku: input.sku });
+        return { unreachable: true };
+      }
+    });
+    const onQueueA = await prepareWorkflowTaskCommit(checkout, { sku: "sku-1" }, fakeClaimed, {
+      payloadCodec: "Json",
+      defaultActivityTaskQueue: "queue-a"
+    });
+    const onQueueB = await prepareWorkflowTaskCommit(checkout, { sku: "sku-1" }, fakeClaimed, {
+      payloadCodec: "Json",
+      defaultActivityTaskQueue: "queue-b"
+    });
+    const scheduledA = onQueueA.appendEvents?.[0]?.data;
+    const scheduledB = onQueueB.appendEvents?.[0]?.data;
+    if (scheduledA?.kind !== "ActivityScheduled" || scheduledB?.kind !== "ActivityScheduled") {
+      throw new Error("expected ActivityScheduled events");
+    }
+    // The resolution still happens — the activity is scheduled onto the queue
+    // its own worker claims from, which is the whole point of the fallback.
+    expect(scheduledA.scheduled.taskQueue).toBe("queue-a");
+    expect(scheduledB.scheduled.taskQueue).toBe("queue-b");
+    // Only the fingerprint is narrowed. A command's identity may not be
+    // readable from the configuration of whichever worker happened to schedule
+    // it.
+    expect(scheduledB.scheduled.fingerprint.optionsDigest).toBe(
+      scheduledA.scheduled.fingerprint.optionsDigest
+    );
+  });
+
+  it("replays a run recorded on one activity queue against a worker configured with another", async () => {
+    // The counterexample, built rather than asserted. Before the narrowing this
+    // run failed its next replay with
+    // `nondeterminism: activity command fingerprint changed`, and the exception
+    // escaped the task: an in-flight run scheduled by a worker whose activity
+    // queue was `queue-a` could not be picked up by one configured with
+    // `queue-b`, and — the shape the released 0.2.0 hits — a run recorded
+    // before `activityTaskQueue` reached the runtime at all could not be picked
+    // up by any worker that set it.
+    const checkout = workflow({
+      name: "orders.unqueued-replay",
+      version: 1,
+      handler: async (input: CheckoutInput): Promise<{ readonly cents: number }> => {
+        const quote = await callActivity(priceQuote, { sku: input.sku });
+        return { cents: quote.cents };
+      }
+    });
+    const backend = new MemoryBackend();
+    await backend.startWorkflow({
+      namespace: namespace(),
+      workflowId: workflowId("wf/unqueued-replay"),
+      workflowType: checkout.workflowType,
+      taskQueue: taskQueue("workflows"),
+      input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
+    });
+    const firstClaim = await backend.claimWorkflowTask("worker-a", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [checkout.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!firstClaim) {
+      throw new Error("expected first claim");
+    }
+    const scheduleCommit = await prepareWorkflowTaskCommit(
+      checkout,
+      { sku: "sku-1" },
+      firstClaim,
+      { payloadCodec: "Json", defaultActivityTaskQueue: "queue-a" }
+    );
+    await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit);
+
+    const activityTask = await backend.claimActivityTask("activity-worker", {
+      namespace: namespace(),
+      taskQueue: taskQueue("queue-a"),
+      registeredActivityNames: ["payments.price-quote"],
+      leaseDurationMs: 30_000
+    });
+    if (!activityTask) {
+      throw new Error("expected activity task on the queue the scheduling worker resolved");
+    }
+    await backend.completeActivity({
+      claim: activityTask.claim,
+      result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
+    });
+
+    const secondClaim = await backend.claimWorkflowTask("worker-b", {
+      namespace: namespace(),
+      taskQueue: taskQueue("workflows"),
+      registeredWorkflowTypes: [checkout.workflowType],
+      leaseDurationMs: 30_000
+    });
+    if (!secondClaim) {
+      throw new Error("expected second claim");
+    }
+    const completionCommit = await prepareWorkflowTaskCommit(
+      checkout,
+      { sku: "sku-1" },
+      secondClaim,
+      { payloadCodec: "Json", defaultActivityTaskQueue: "queue-b" }
+    );
+    expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
+      "WorkflowCompleted"
+    ]);
+    await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
+    const history = await backend.streamHistory({
+      runId: secondClaim.runId,
+      afterEventId: eventId(0),
+      upToEventId: eventId(10),
+      maxEvents: 10,
+      maxBytes: Number.MAX_SAFE_INTEGER
+    });
+    expect(history.events.map((event) => String(event.eventType))).toEqual([
+      "WorkflowStarted",
+      "ActivityScheduled",
+      "ActivityCompleted",
+      "WorkflowCompleted"
+    ]);
+  });
+
   it("commits prepared activity schedules through MemoryBackend history", async () => {
     const checkout = workflow({
       name: "orders.checkout",
@@ -2229,7 +2359,7 @@ describe("minimal workflow runtime", () => {
     if (winner?.kind !== "SelectWinner") {
       throw new Error("expected SelectWinner");
     }
-    expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 3 });
+    expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 1 });
     expect(winner.winner.branchOrdinal).toBe(0);
     expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
@@ -4412,7 +4542,7 @@ describe("minimal workflow runtime", () => {
     if (winner?.kind !== "SelectWinner") {
       throw new Error("expected SelectWinner");
     }
-    expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 3 });
+    expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 1 });
     expect(winner.winner.branchOrdinal).toBe(0);
     expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
@@ -4682,8 +4812,8 @@ describe("minimal workflow runtime", () => {
     });
     const waitCommit = await hot.nextCommit();
     expect(waitCommit.upsertWaits?.map((wait) => String(wait.waitId))).toEqual([
-      "run-1:signal:1",
-      "run-1:timer:2"
+      "run-1:signal:2",
+      "run-1:timer:3"
     ]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
 
@@ -4720,8 +4850,8 @@ describe("minimal workflow runtime", () => {
     // deleted only because the losing branch is cancelled. Rust's commit for
     // this same program carries both.
     expect(completionCommit.deleteWaits?.map(String)).toEqual([
-      "run-1:signal:1",
-      "run-1:timer:2"
+      "run-1:signal:2",
+      "run-1:timer:3"
     ]);
     hot.markCommitted(
       committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
@@ -4804,7 +4934,7 @@ describe("minimal workflow runtime", () => {
       "SelectWinner",
       "WorkflowCompleted"
     ]);
-    expect(completionCommit.deleteWaits?.map(String)).toEqual(["run-1:signal:1"]);
+    expect(completionCommit.deleteWaits?.map(String)).toEqual(["run-1:signal:2"]);
     hot.markCommitted(
       committedTail(await backend.commitWorkflowTask(secondClaim.claim, completionCommit))
     );
@@ -4882,9 +5012,9 @@ describe("minimal workflow runtime", () => {
     ]);
     // Both, in the same commit. This is what the provider has to get right.
     expect(commit.scheduleActivities?.map((task) => task.commandId)).toEqual([
-      { runId: runId("run-1"), seq: 1 }
+      { runId: runId("run-1"), seq: 2 }
     ]);
-    expect(commit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 1 }]);
+    expect(commit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 2 }]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(claim.claim, commit)));
 
     // The run is open and the activity was never claimed, so the cancel is the
@@ -4955,7 +5085,7 @@ describe("minimal workflow runtime", () => {
     expect(selectCommit.appendEvents?.map((event) => event.data.kind)).toEqual(["SelectWinner"]);
     // An activity branch has no wait; Rust withdraws it through
     // `RuntimeContext::cancel_command`, and so does this.
-    expect(selectCommit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 1 }]);
+    expect(selectCommit.cancelCommands).toEqual([{ runId: runId("run-1"), seq: 2 }]);
     hot.markCommitted(
       committedTail(await backend.commitWorkflowTask(secondClaim.claim, selectCommit))
     );

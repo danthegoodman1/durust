@@ -78,9 +78,14 @@ export function readMapManifestItems<Page, Item>(
  * to admit and nothing outstanding, so it completes at descriptor creation with
  * an empty result manifest and the parent proceeds. Every TypeScript provider
  * does that, it is asserted by conformance on all three, and `map-engine.ts`'s
- * `DescriptorCreated` owns the rule. Rust stalls forever on the same input and
- * is the runtime that moves; converging TypeScript onto the stall would trade a
- * validated answer for a silent hang.
+ * `DescriptorCreated` owns the rule. `src/map_engine.rs` now reaches the same
+ * answer — it used to stall forever on this input — and the shared transition
+ * table asserts the rule in both runners rather than excluding it.
+ *
+ * The one exception is a commit that both schedules the empty map and closes
+ * the run: there is no parent left to notify, so the descriptor is closed
+ * without a terminal map fact rather than appending one behind the run's own
+ * terminal event. Both runtimes do that too; see `map-engine.ts`'s `step`.
  *
  * What this rejects is a manifest that is *inconsistent*, which can only ever
  * fan out over the wrong number of items.

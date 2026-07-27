@@ -1254,6 +1254,20 @@ If emitted command fingerprint != recorded command fingerprint:
     raise NondeterminismError
 ```
 
+A fingerprint is a function of the workflow program and its inputs, and of
+nothing a worker is configured with. `options_digest` therefore hashes the
+options the *caller* supplied — including the in-workflow defaults §4.4 calls
+part of deterministic workflow execution — with this specification's own
+defaults filled in for the rest, and never a value resolved from the scheduling
+worker. The concrete case is the activity task queue: an activity that names no
+queue is *scheduled onto* the worker's activity task queue (§4.4), and its
+fingerprint hashes the default queue name regardless. Folding the resolved
+queue in instead makes a command's identity readable from worker configuration,
+so two workflow workers configured with different activity queues fingerprint
+the same unqueued call differently and a run scheduled by one fails replay on
+the other — a nondeterminism error caused by deployment topology rather than by
+a code change.
+
 When a workflow task raises nondeterminism, the worker must abort that task
 without appending `WorkflowFailed`. The worker releases the run with a
 worker-configured retry backoff so bad workflow code does not hot-loop. Providers
@@ -2151,6 +2165,16 @@ Replay validates `TimerStarted` and returns when `TimerFired` is reached.
 
 A pending timer is an active wait index row, not a future history row. Recovery streams `TimerStarted` and any committed `TimerFired` event at or below the claimed replay target. If the timer fires after that target while recovery is running, the timer service appends `TimerFired` as a later event; the current workflow task will catch it through a later wakeup or a commit conflict.
 
+A due-timer scan must never append `TimerFired` to a run that has reached a
+terminal event. §19.1 already requires the terminal transition to delete the
+run's waits in the same transaction, so a wait outliving its run is a defect
+rather than a state to handle; the scan checks anyway, because the failure mode
+is not a resurrected run — the next claim still refuses a closed run — but a
+history with an event past its terminal event, which every replay, audit and
+cleanup path assumes cannot exist. A wait skipped for this reason is skipped,
+not deleted: deleting it would hide the defect the cleanup is supposed to have
+prevented.
+
 Firing due timers is the timer service's obligation. A worker may also scan for
 due timers, and by default it does, but that is worker configuration rather than
 a durability guarantee: no run depends on any particular worker scanning, and a
@@ -2218,12 +2242,23 @@ future created by deterministic workflow-local spawn
 Semantics:
 
 ```text
-1. Branches are registered in lexical order.
-2. Each branch creates a deterministic command/wait.
-3. The selected winner's branch ordinal is recorded in history.
-4. Replay uses the recorded branch ordinal to evaluate the same branch body.
-5. Losing waits are cancelled or ignored according to policy.
+1. The select reserves its own command_seq before any branch registers, so a
+   two-branch select numbers select, branch, branch.
+2. The reservation happens on the select's first evaluation whether or not any
+   branch is ready, so a workflow task in which the select parks still consumes
+   the number.
+3. Branches are registered in lexical order.
+4. Each branch creates a deterministic command/wait.
+5. The selected winner's branch ordinal is recorded in history.
+6. Replay uses the recorded branch ordinal to evaluate the same branch body.
+7. Losing waits are cancelled or ignored according to policy.
 ```
+
+Rules 1 and 2 are normative rather than incidental. The command sequence is
+durable: a runtime that allocated the select's number after resolving a winner
+would number the same program's branches one lower and would burn nothing at
+all in a task that parked, so its histories and the other's could not be
+replayed across a select in either direction. Both runtimes reserve first.
 
 The value returned by `select!` is the value returned by the winning branch body. Branches should usually return an explicit enum when the caller needs to know which path won:
 

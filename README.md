@@ -87,6 +87,7 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
 - [Benchmarks](#benchmarks)
+- [Upgrading](#upgrading)
 - [Release Automation](#release-automation)
 - [Examples](#examples)
 
@@ -954,6 +955,108 @@ DURUST_POSTGRES_URL='postgres://durable:durable@127.0.0.1:55432/durable' \
   cargo bench --bench replay_core -- --baseline phase6-before \
   '^(workflow_cached_wake_poll_memory|workflow_replay_(small|large)_history_memory|held_handle_spawn_then_sleeps_memory|child_fanout_completion_(memory|sqlite)|child_start_dispatch_memory|activity_claim_complete_(memory|sqlite)|workflow_task_append_commit_(memory|sqlite)|postgres_provider_hot_paths/(workflow_task_append_commit|history_stream|history_stream_chunked_replay|activity_claim_complete|child_workflow_start_parent_wakeup)_postgres)$'
 ```
+
+## Upgrading
+
+There is no changelog yet, so breaking changes to the Rust crate are recorded
+here, newest first. A change is listed if it can break a deployment that is
+working today — either its code will not compile, or its in-flight runs stop
+replaying. `typescript/README.md` keeps the same ledger for the TypeScript
+packages; a change that breaks both is written in both, because the affected
+reader only reads one.
+
+### An unqueued activity no longer fingerprints the worker's activity queue
+
+**Who is affected.** Any deployment whose workflow workers set
+`.activity_task_queue(...)` to anything other than `"default"` *and* whose
+workflows schedule an activity without naming a queue. That means **both**
+`durust::call_activity!` and `durust::activity_map(...)`: they share one
+fingerprint helper (`activity_fingerprint_options`), so they moved together and
+must be repaired together. Auditing only `call_activity!` leaves every
+in-flight run with an unqueued `activity_map` broken. The
+[Worker Registration](#worker-registration) example above —
+`.activity_task_queue("payments")` — is exactly the affected worker shape, so
+treat this as the common case rather than the exotic one. A worker left on the
+default activity queue is unaffected, byte for byte.
+
+**What changes.** The task queue an activity resolves to used to be folded into
+the command's `options_digest`, and the resolution includes the scheduling
+worker's `activity_task_queue` fallback. So a command's identity was readable
+from the configuration of whichever worker happened to schedule it: two
+workflow workers with different activity queues fingerprinted the same call
+differently, and a run scheduled by one could not be replayed by the other. The
+digest now hashes the queue the **caller** named, defaulting to `"default"`
+when the call names none. The activity is still *scheduled onto* the worker's
+queue; only the fingerprint stopped depending on it.
+
+Measured on the two formulas, for an unqueued activity with default options.
+`src/runtime.rs` and `src/options.rs` are byte-identical at `58672bf` (0.2.0)
+and `c04b2a0` (0.2.1), so both releases recorded the left-hand column, and an
+`activity_map` moves the same way:
+
+| worker `activity_task_queue` | recorded by 0.2.0 and 0.2.1 | recorded now |
+| --- | --- | --- |
+| `default` | `sha256:619ac156…` | `sha256:619ac156…` |
+| `activities` | `sha256:6ceafc6e…` | `sha256:619ac156…` |
+| `queue-a` | `sha256:c41e6973…` | `sha256:619ac156…` |
+
+**The consequence.** In-flight runs of the affected shape fail their next
+replay. Both messages, captured from the code rather than reconstructed — grep
+your logs for either:
+
+```text
+nondeterministic replay: activity command fingerprint changed for command 1
+nondeterministic replay: activity map command fingerprint changed for command 1
+```
+
+(The trailing number is the command sequence, so it varies.) These are Rust's
+strings. TypeScript renders the same condition as
+`nondeterminism: activity command fingerprint changed`, which matches nothing
+in a Rust log.
+
+**The repair is a source change, not a configuration change.** No worker
+setting reproduces the old digest, because the old digest was a function of the
+worker's own queue. Name the queue explicitly at every unqueued site instead —
+**both kinds**:
+
+```rust
+// Was: implicit, fingerprinted with the worker's `activity_task_queue`.
+durust::call_activity!(price_quote(input)).await?;
+
+// Now: explicit, and fingerprints exactly as the old implicit form did on a
+// worker configured with `.activity_task_queue("activities")`.
+durust::call_activity!(price_quote(input))
+    .task_queue("activities")
+    .await?;
+
+// The same edit is required on unqueued maps, which are affected identically.
+durust::activity_map(map_chunk)
+    .task_queue("activities")
+    .input_manifest(manifest_ref)
+    .max_in_flight(100)
+    .result_manifest("partials")
+    .spawn()
+    .await?;
+```
+
+Verified rather than asserted: under the new code an explicit
+`.task_queue("activities")` produces `sha256:6ceafc6e…`, the same digest a
+0.2.0 or 0.2.1 worker configured with `activity_task_queue("activities")`
+recorded for the implicit call. Affected runs then replay and complete. Making
+the queue explicit is worth keeping afterwards — it is what makes the
+fingerprint independent of deployment topology.
+
+**Before upgrading**, do one of: give every unqueued `call_activity!` *and*
+`activity_map` site an explicit `.task_queue(...)` matching the worker queue it
+was scheduled onto, and deploy that together with this version; or drain runs
+with an unqueued activity of either kind in flight.
+
+**Why this is not deferred.** The behaviour it removes is not a one-time break
+but a permanent latent one: while the resolved queue sits inside the digest,
+*every future change* to a worker's activity queue silently breaks replay for
+runs in flight, and a fleet whose workers disagree can never replay one
+another's runs at all. One documented break ends an unbounded series of
+undocumented ones.
 
 ## Release Automation
 

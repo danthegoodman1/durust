@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   compareBenchmarkToBaseline,
   defaultBenchmarkOptions,
@@ -8,6 +8,43 @@ import {
   type BenchmarkBaseline,
   type BenchmarkResult
 } from "@durust/benchmark";
+import { assertPostgresAvailableWhenRequired, postgresUrlFromEnv } from "@durust/testing";
+
+const postgresUrl = postgresUrlFromEnv();
+
+// The sibling of the guard in `packages/postgres/test/postgres-conformance.test.ts`,
+// and it has to be at module scope for the same measured reason: a suite whose
+// cases are all `it.skip` reports success, and only a module-body throw runs
+// early enough to stop it.
+//
+// This file is the *weaker* of the two cases, and deliberately so rather than
+// by oversight. Nothing in CI runs it with a database — `npm run check` leaves
+// `DURUST_POSTGRES_URL` unset precisely so these throughput comparisons stay
+// out of it — and the one script that does run it, `scripts/check-postgres.mjs`
+// (also reached through `check:release`), already exits 1 on a missing or blank
+// URL before Vitest starts. So the hole this closes is only reachable by
+// invoking `npm run test:benchmark-thresholds` directly with
+// `DURUST_REQUIRE_POSTGRES` set. It is here anyway, because the *reason* it is
+// currently unreachable is a property of one npm script, and that is not a
+// thing the next person editing CI would think to check.
+assertPostgresAvailableWhenRequired(postgresUrl, "the env-gated Postgres benchmark thresholds");
+
+/** See the identical counter in the Postgres conformance suite. */
+let executedPostgresCases = 0;
+
+afterAll(() => {
+  if (postgresUrl === undefined) {
+    return;
+  }
+  if (executedPostgresCases < 2) {
+    throw new Error(
+      "DURUST_POSTGRES_URL is set, so both env-gated Postgres baselines must run, but " +
+        `${executedPostgresCases} did. If you filtered the run with \`-t\`, that is the cause and ` +
+        "the filtered cases still passed; this check exists for the unfiltered runs CI makes, " +
+        "where a silently skipped Postgres baseline would report success"
+    );
+  }
+});
 
 describe("benchmark threshold comparison", () => {
   it("passes the memory mixed smoke baseline", async () => {
@@ -129,10 +166,10 @@ describe("benchmark threshold comparison", () => {
     });
   });
 
-  const postgresUrl = process.env.DURUST_POSTGRES_URL;
   const itPostgres = postgresUrl === undefined ? it.skip : it;
 
   itPostgres("passes the env-gated Postgres mixed smoke baseline", async () => {
+    executedPostgresCases += 1;
     const baseline = loadBaseline("postgres-mixed-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
@@ -161,6 +198,7 @@ describe("benchmark threshold comparison", () => {
   itPostgres(
     "passes the env-gated Postgres mixed accepted baseline",
     async () => {
+      executedPostgresCases += 1;
       const baseline = loadBaseline("postgres-mixed-accepted.json");
       const result = await runBenchmark({
         ...defaultBenchmarkOptions(),
@@ -175,7 +213,17 @@ describe("benchmark threshold comparison", () => {
 
       expect(result.postgres_schema).toBe("normalized");
       expect(result.postgres_stats).not.toBeNull();
-      expect(result.postgres_stats?.statementStats).not.toBeNull();
+      // The reason, not just the null. A bare `.not.toBeNull()` here reported
+      // `expected null not to be null`, which names neither the cause — the
+      // server was not started with
+      // `shared_preload_libraries=pg_stat_statements` — nor the checked-in
+      // fixture that fixes it. The provider keeps the server's own error in
+      // `statementStatsUnavailable`; this is where a human reads it.
+      expect(
+        result.postgres_stats?.statementStats,
+        result.postgres_stats?.statementStatsUnavailable ??
+          "statement stats are missing and the provider recorded no reason"
+      ).not.toBeNull();
       expect(result.postgres_stats?.statementStats?.calls).toBeGreaterThan(0);
       expect(compareBenchmarkToBaseline(result, baseline)).toMatchObject({
         passed: true,

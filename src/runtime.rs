@@ -1185,11 +1185,82 @@ impl RuntimeContext {
             .retain(|request| request.command_id.seq != command_id.seq);
     }
 
-    fn effective_activity_options(&self, overrides: ActivityOptions) -> ActivityOptions {
+    /// The activity options *before* the worker's task-queue fallback.
+    ///
+    /// The fallback is applied by the callers rather than here, because the two
+    /// consumers of these options differ on exactly one field: the scheduled
+    /// task carries the resolved queue, the command fingerprint does not. See
+    /// [`Self::activity_fingerprint_options`].
+    fn merged_activity_options(&self, overrides: ActivityOptions) -> ActivityOptions {
         self.default_activity_options
             .clone()
             .merge_overrides(overrides)
-            .with_task_queue_fallback(self.worker_activity_task_queue.clone())
+    }
+
+    /// The options an activity (or activity-map) command's `options_digest`
+    /// hashes.
+    ///
+    /// Identical to the scheduled options except for the task queue: this
+    /// hashes the queue the **caller asked for**, defaulted to
+    /// `TaskQueue::default()`, never this worker's configured
+    /// `activity_task_queue`. Folding the worker's fallback in made a command's
+    /// identity readable from the configuration of whichever worker happened to
+    /// schedule it — two workflow workers with different activity queues
+    /// fingerprinted the same unqueued `call_activity!` differently, and a run
+    /// scheduled by one failed replay on the other. A fingerprint answers "is
+    /// this the same command the workflow issued last time", and the workflow
+    /// issued the same call either way.
+    ///
+    /// **This is a breaking history-format change for Rust, and it is accepted
+    /// deliberately.** It is not a retraction: 0.2.0 and 0.2.1 both shipped the
+    /// resolved queue inside the digest, so there is no earlier behaviour to
+    /// return to. Measured over the two formulas, unqueued `call_activity!`
+    /// with default options:
+    ///
+    /// | worker `activity_task_queue` | 0.2.1 digest | this digest |
+    /// | --- | --- | --- |
+    /// | `default` | `sha256:619ac156…` | `sha256:619ac156…` |
+    /// | `activities` | `sha256:6ceafc6e…` | `sha256:619ac156…` |
+    /// | `queue-a` | `sha256:c41e6973…` | `sha256:619ac156…` |
+    ///
+    /// So a worker left on the default queue is byte-identical and unaffected,
+    /// and **every worker configured with any other activity queue fails its
+    /// in-flight runs' next replay** with `nondeterministic replay: activity
+    /// command fingerprint changed for command N` — or `activity map command
+    /// fingerprint changed` from the map site below, which shares this helper
+    /// and therefore moves identically. `README.md`'s own canonical setup is
+    /// `.activity_task_queue("payments")`, so this is a common shape, not an
+    /// exotic one.
+    ///
+    /// It is taken anyway because the alternative is permanent: while the
+    /// resolved queue is in the digest, *every future change* to a worker's
+    /// activity queue silently breaks replay for runs in flight, and a fleet
+    /// whose workers disagree can never replay each other's runs at all. One
+    /// documented break ends an unbounded series of undocumented ones. The
+    /// repair is in `README.md`'s `## Upgrading` section and is a **source**
+    /// change — naming the queue explicitly at every unqueued `call_activity!`
+    /// *and* `activity_map` site — because the old digest was a function of
+    /// the worker's own queue and no worker configuration can reproduce it.
+    ///
+    /// Defaulting to `TaskQueue::default()` rather than dropping the field is
+    /// what keeps the default configuration byte-identical, and it is the same
+    /// string `typescript/packages/core/src/runtime.ts` narrows against. On the
+    /// TypeScript side the same edit *is* a pure retraction, because the worker
+    /// there never passed its queue into the runtime before the change this
+    /// one accompanies.
+    ///
+    /// `default_activity_options` deliberately stays inside the digest. It is
+    /// an explicit statement about which options activities get, not about
+    /// which queue this worker claims from, and TypeScript has no equivalent
+    /// knob, so removing it here would be a separate decision with its own
+    /// fingerprint change.
+    fn activity_fingerprint_options(&self, merged: &ActivityOptions) -> ActivityOptions {
+        ActivityOptions {
+            task_queue: Some(merged.task_queue.clone().unwrap_or_default()),
+            retry_policy: Some(merged.effective_retry_policy()),
+            start_to_close_timeout: merged.start_to_close_timeout,
+            heartbeat_timeout: merged.heartbeat_timeout,
+        }
     }
 
     fn get_version(
@@ -2387,18 +2458,15 @@ where
         runtime.match_or_append_command(
             CommandEventKind::Activity,
             |runtime| {
-                let options = runtime.effective_activity_options(options);
+                let merged = runtime.merged_activity_options(options);
+                let fingerprint_options = runtime.activity_fingerprint_options(&merged);
+                let options =
+                    merged.with_task_queue_fallback(runtime.worker_activity_task_queue.clone());
                 let task_queue = options
                     .task_queue
                     .clone()
                     .expect("effective activity options include task queue fallback");
                 let retry_policy = options.effective_retry_policy();
-                let fingerprint_options = ActivityOptions {
-                    task_queue: Some(task_queue.clone()),
-                    retry_policy: Some(retry_policy.clone()),
-                    start_to_close_timeout: options.start_to_close_timeout,
-                    heartbeat_timeout: options.heartbeat_timeout,
-                };
                 let activity_input = input
                     .as_ref()
                     .expect("activity input exists before schedule");
@@ -2618,18 +2686,15 @@ where
                     ));
                 }
                 let result_manifest_name = self.result_manifest_name.clone();
-                let options = runtime.effective_activity_options(self.options.clone());
+                let merged = runtime.merged_activity_options(self.options.clone());
+                let fingerprint_options = runtime.activity_fingerprint_options(&merged);
+                let options =
+                    merged.with_task_queue_fallback(runtime.worker_activity_task_queue.clone());
                 let task_queue = options
                     .task_queue
                     .clone()
                     .expect("effective activity options include task queue fallback");
                 let retry_policy = options.effective_retry_policy();
-                let fingerprint_options = ActivityOptions {
-                    task_queue: Some(task_queue.clone()),
-                    retry_policy: Some(retry_policy.clone()),
-                    start_to_close_timeout: options.start_to_close_timeout,
-                    heartbeat_timeout: options.heartbeat_timeout,
-                };
                 let options_digest = fingerprint_options.digest()?;
                 // Taken, not cloned, so a replayed map does not copy the
                 // manifest root it never uses. Taken only after every fallible
@@ -4425,6 +4490,87 @@ mod tests {
             next.event_type
         );
         assert_eq!(next.event_id, EventId(3));
+    }
+
+    /// The worker's `activity_task_queue` decides which queue an unqueued
+    /// `call_activity!` is *scheduled onto*, and must not decide what its
+    /// command fingerprint *is*.
+    ///
+    /// Folding the fallback into `options_digest` made a command's identity
+    /// readable from the configuration of whichever worker happened to
+    /// schedule it: two workflow workers with different activity queues
+    /// fingerprinted the same call differently, so a run scheduled by one
+    /// failed its next replay on the other with `nondeterministic replay:
+    /// activity command fingerprint changed for command N`.
+    ///
+    /// The third assertion is the compatibility bound, and it is narrower than
+    /// a retraction — on Rust this **is** a breaking change, recorded in
+    /// `README.md`'s `## Upgrading` section. What it pins is that the narrowed
+    /// digest is byte-identical to the one an explicit `"default"` produces,
+    /// which is what a *default-configured* 0.2.0 or 0.2.1 worker recorded for
+    /// an unqueued activity. Those deployments are unaffected; every other
+    /// worker queue moves.
+    #[test]
+    fn an_unqueued_activity_fingerprints_the_same_on_workers_with_different_activity_queues() {
+        let on_queue_a = runtime_with_worker_activity_queue("queue-a");
+        let on_queue_b = runtime_with_worker_activity_queue("queue-b");
+        let unqueued = ActivityOptions::new();
+
+        // The resolution still happens. An unqueued activity is scheduled onto
+        // the queue its own worker claims from, which is why the fallback
+        // exists at all.
+        let scheduled_a = on_queue_a
+            .merged_activity_options(unqueued.clone())
+            .with_task_queue_fallback(on_queue_a.worker_activity_task_queue.clone());
+        let scheduled_b = on_queue_b
+            .merged_activity_options(unqueued.clone())
+            .with_task_queue_fallback(on_queue_b.worker_activity_task_queue.clone());
+        assert_eq!(scheduled_a.task_queue, Some(TaskQueue::new("queue-a")));
+        assert_eq!(scheduled_b.task_queue, Some(TaskQueue::new("queue-b")));
+
+        let digest = |runtime: &RuntimeContext, overrides: ActivityOptions| {
+            runtime
+                .activity_fingerprint_options(&runtime.merged_activity_options(overrides))
+                .digest()
+                .expect("activity options digest")
+        };
+        let fingerprint_a = digest(&on_queue_a, unqueued.clone());
+        let fingerprint_b = digest(&on_queue_b, unqueued.clone());
+        assert_eq!(
+            fingerprint_a, fingerprint_b,
+            "an unqueued activity's fingerprint must not depend on the scheduling worker's queue"
+        );
+        assert_eq!(
+            fingerprint_a,
+            digest(&on_queue_a, ActivityOptions::new().task_queue("default")),
+            "the narrowed digest must equal the one already-recorded unqueued activities carry"
+        );
+
+        // The counterweight: an explicitly named queue is still part of the
+        // command's identity, so this narrowing cannot be read as "the task
+        // queue left the fingerprint".
+        assert_ne!(
+            fingerprint_a,
+            digest(&on_queue_a, ActivityOptions::new().task_queue("queue-a")),
+            "an explicitly named queue must still change the fingerprint"
+        );
+    }
+
+    fn runtime_with_worker_activity_queue(activity_queue: &str) -> RuntimeContext {
+        RuntimeContext::new(
+            RunId::new("run/activity-fingerprint"),
+            TaskQueue::new("workflows"),
+            TaskQueue::new(activity_queue),
+            CodecId::MessagePack,
+            TimestampMs(0),
+            Vec::new(),
+            ActivityOptions::default(),
+            0,
+            EventId(1),
+            EventId(1),
+            Arc::default(),
+            ReadyEventIndexes::default(),
+        )
     }
 
     fn runtime_with_history(run_id: RunId, events: Vec<HistoryEvent>) -> RuntimeContext {

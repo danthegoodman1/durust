@@ -28,10 +28,6 @@
       "why": "The two runtimes have different retry-policy models — RetryBackoff::{None,Exponential} over a fixed base in Rust, initialIntervalMs/maxIntervalMs/backoffCoefficient in TypeScript — that share no encoding, so numeric parity is impossible. Only the shape is normative and is asserted: `visibleAtMs === null` means immediately claimable, and a timed-out attempt always yields null. Cases carry `visibleAtMs` as \"Null\" or \"Deferred\" and `timeoutAtMs` as \"Null\" or \"Present\" rather than as numbers."
     },
     {
-      "what": "Every DescriptorCreated case where recordedOutcomes >= itemCount, including but not limited to the empty manifest",
-      "why": "TypeScript completes such a map at descriptor creation; Rust stalls, because all three Rust providers stall. The runtimes are knowingly divergent until the plan row that converges Rust lands. The exclusion is the whole predicate, not just itemCount === 0: where nextOrdinal < itemCount the TypeScript engine emits MaterializeItems and CompleteMap in one list and Rust emits only the materialization."
-    },
-    {
       "what": "The ParentCancelled event",
       "why": "Both runtimes now drive it from WorkflowTaskCommit::cancel_commands / cancelCommands, and both emit the same two effects, so the exclusion is no longer about reachability. It stays because the transition is only half the behaviour: cancelling a child map must also cancel the children it already started, and that is deliberately not a step effect — the other producer, a run reaching a terminal event, must leave its children to the parentClosePolicy path, which is free to abandon them. Each provider therefore pairs ParentCancelled with its own child cancellation, and a table that asserted only the effect list would pin the half that agrees and say nothing about the half that matters. Each engine's own unit tests cover the transition."
     }
@@ -114,6 +110,88 @@
       },
       "event": { "kind": "DescriptorCreated", "parentTerminal": false },
       "expect": { "kind": "Effects", "effects": [] }
+    },
+    {
+      "name": "an empty manifest is terminal at descriptor creation",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 0,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "CompleteMap", "itemCount": 0 },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "an empty child manifest is terminal at descriptor creation",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 0,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "CompleteMap", "itemCount": 0 },
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "an empty manifest whose parent the same commit closed is closed without notifying it",
+      "state": {
+        "kind": "Activity",
+        "failureMode": "FailFast",
+        "itemCount": 0,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": true },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
+    },
+    {
+      "name": "an empty child manifest whose parent the same commit closed is closed without notifying it",
+      "state": {
+        "kind": "ChildWorkflow",
+        "failureMode": "CollectAll",
+        "itemCount": 0,
+        "nextOrdinal": 0,
+        "inFlight": 0,
+        "maxInFlight": 2,
+        "recordedOutcomes": 0,
+        "completed": false
+      },
+      "event": { "kind": "DescriptorCreated", "parentTerminal": true },
+      "expect": {
+        "kind": "Effects",
+        "effects": [
+          { "kind": "MarkDescriptorTerminal" }
+        ]
+      }
     },
     {
       "name": "an item completion releases exactly one slot and spends it on the next unadmitted ordinal",
@@ -684,6 +762,13 @@
         { "action": "claim", "ordinal": null }
       ],
       "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapFailed"]
+    },
+    {
+      "name": "an empty manifest completes at descriptor creation and admits nothing",
+      "itemCount": 0,
+      "maxInFlight": 2,
+      "steps": [{ "action": "claim", "ordinal": null }],
+      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
     }
   ]
 }

@@ -582,107 +582,50 @@
       "steps": [
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].commandId.seq",
-                  "upsertWaits[0].commandId.seq",
-                  "upsertWaits[1].commandId.seq"
-                ]
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:60000"
+                },
+                "fireAtMs": 60000,
+                "type": "TimerStarted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "optionsDigest": "timestamp-ms:60000"
-                  },
-                  "fireAtMs": 60000,
-                  "type": "TimerStarted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 1,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "corpus.approve",
-                  "kind": "Signal",
-                  "readyAtMs": null
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
                 },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "key": "timer",
-                  "kind": "Timer",
-                  "readyAtMs": 60000
-                }
-              ]
-            },
-            "typescript": {
-              "expectedTailEventId": 1,
-              "appendEvents": [
-                {
-                  "type": "TimerStarted",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fireAtMs": 60000,
-                  "fingerprint": {
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "inputDigest": null,
-                    "optionsDigest": "timestamp-ms:60000"
-                  }
-                }
-              ],
-              "upsertWaits": [
-                {
-                  "kind": "Signal",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "key": "corpus.approve",
-                  "readyAtMs": null
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
                 },
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "readyAtMs": 60000
-                }
-              ],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 60000
+              }
+            ]
           },
           "historyBefore": [
             "WorkflowStarted"
@@ -696,160 +639,76 @@
         },
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].commandId.seq",
-                  "appendEvents[1].selectCommandId.seq",
-                  "deleteWaits[0].commandId.seq",
-                  "deleteWaits[1].commandId.seq"
-                ]
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-1",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "signal:ada"
+                  }
+                },
+                "type": "WorkflowCompleted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Signal",
-                    "name": "corpus.approve",
-                    "optionsDigest": "sha256:default"
-                  },
-                  "payload": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "who": "ada"
-                    }
-                  },
-                  "signalId": "corpus-signal-1",
-                  "signalName": "corpus.approve",
-                  "type": "SignalConsumed"
+            "consumeSignals": [
+              "corpus-signal-1"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
                 },
-                {
-                  "branchOrdinal": 0,
-                  "branchesDigest": "<select-branches-digest>",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "type": "SelectWinner",
-                  "winningEventId": 3
+                "kind": "Signal"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
                 },
-                {
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "signal:ada"
-                    }
-                  },
-                  "type": "WorkflowCompleted"
-                }
-              ],
-              "consumeSignals": [
-                "corpus-signal-1"
-              ],
-              "deleteWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "kind": "Signal"
-                },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "kind": "Timer"
-                }
-              ],
-              "expectedTailEventId": 2,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": []
-            },
-            "typescript": {
-              "expectedTailEventId": 2,
-              "appendEvents": [
-                {
-                  "type": "SignalConsumed",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "signalId": "corpus-signal-1",
-                  "signalName": "corpus.approve",
-                  "payload": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "who": "ada"
-                    }
-                  },
-                  "fingerprint": {
-                    "kind": "Signal",
-                    "name": "corpus.approve",
-                    "inputDigest": null,
-                    "optionsDigest": "sha256:default"
-                  }
-                },
-                {
-                  "type": "SelectWinner",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "branchOrdinal": 0,
-                  "winningEventId": 3,
-                  "branchesDigest": "<select-branches-digest>"
-                },
-                {
-                  "type": "WorkflowCompleted",
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "signal:ada"
-                    }
-                  }
-                }
-              ],
-              "upsertWaits": [],
-              "deleteWaits": [
-                {
-                  "kind": "Signal",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  }
-                },
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  }
-                }
-              ],
-              "consumeSignals": [
-                "corpus-signal-1"
-              ],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 2,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
           },
           "historyBefore": [
             "WorkflowStarted",
@@ -868,107 +727,50 @@
       "steps": [
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].commandId.seq",
-                  "upsertWaits[0].commandId.seq",
-                  "upsertWaits[1].commandId.seq"
-                ]
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "optionsDigest": "timestamp-ms:1000"
-                  },
-                  "fireAtMs": 1000,
-                  "type": "TimerStarted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 1,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "corpus.approve",
-                  "kind": "Signal",
-                  "readyAtMs": null
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
                 },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "key": "timer",
-                  "kind": "Timer",
-                  "readyAtMs": 1000
-                }
-              ]
-            },
-            "typescript": {
-              "expectedTailEventId": 1,
-              "appendEvents": [
-                {
-                  "type": "TimerStarted",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fireAtMs": 1000,
-                  "fingerprint": {
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "inputDigest": null,
-                    "optionsDigest": "timestamp-ms:1000"
-                  }
-                }
-              ],
-              "upsertWaits": [
-                {
-                  "kind": "Signal",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "key": "corpus.approve",
-                  "readyAtMs": null
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
                 },
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "readyAtMs": 1000
-                }
-              ],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
           },
           "historyBefore": [
             "WorkflowStarted"
@@ -984,96 +786,45 @@
         },
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].selectCommandId.seq",
-                  "deleteWaits[0].commandId.seq"
-                ]
+                "branchOrdinal": 1,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "timer"
+                  }
+                },
+                "type": "WorkflowCompleted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "branchOrdinal": 1,
-                  "branchesDigest": "<select-branches-digest>",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "type": "SelectWinner",
-                  "winningEventId": 3
+            "consumeSignals": [],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
                 },
-                {
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "timer"
-                    }
-                  },
-                  "type": "WorkflowCompleted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "kind": "Signal"
-                }
-              ],
-              "expectedTailEventId": 3,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": []
-            },
-            "typescript": {
-              "expectedTailEventId": 3,
-              "appendEvents": [
-                {
-                  "type": "SelectWinner",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "branchOrdinal": 1,
-                  "winningEventId": 3,
-                  "branchesDigest": "<select-branches-digest>"
-                },
-                {
-                  "type": "WorkflowCompleted",
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "timer"
-                    }
-                  }
-                }
-              ],
-              "upsertWaits": [],
-              "deleteWaits": [
-                {
-                  "kind": "Signal",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  }
-                }
-              ],
-              "consumeSignals": [],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                "kind": "Signal"
+              }
+            ],
+            "expectedTailEventId": 3,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
           },
           "historyBefore": [
             "WorkflowStarted",
@@ -1093,195 +844,93 @@
       "steps": [
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].commandId.seq",
-                  "appendEvents[1].commandId.seq",
-                  "scheduleActivities[0].activityId",
-                  "scheduleActivities[0].commandId.seq",
-                  "upsertWaits[0].commandId.seq"
-                ]
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "activityName": "corpus.double",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fingerprint": {
-                    "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
-                    "kind": "Activity",
-                    "name": "corpus.double",
-                    "optionsDigest": "<activity-options-digest>"
-                  },
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "taskQueue": "corpus-activities",
-                  "type": "ActivityScheduled"
-                },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "optionsDigest": "timestamp-ms:1000"
-                  },
-                  "fireAtMs": 1000,
-                  "type": "TimerStarted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 1,
-              "queryProjection": null,
-              "scheduleActivities": [
-                {
-                  "activityId": "run-1:2",
-                  "activityName": "corpus.double",
-                  "attempt": 1,
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "mapItem": null,
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
                   "runId": "run-1",
-                  "startToCloseTimeoutMs": null,
-                  "taskQueue": "corpus-activities"
-                }
-              ],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "key": "timer",
-                  "kind": "Timer",
-                  "readyAtMs": 1000
-                }
-              ]
-            },
-            "typescript": {
-              "expectedTailEventId": 1,
-              "appendEvents": [
-                {
-                  "type": "ActivityScheduled",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "activityName": "corpus.double",
-                  "taskQueue": "corpus-activities",
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "fingerprint": {
-                    "kind": "Activity",
-                    "name": "corpus.double",
-                    "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
-                    "optionsDigest": "<activity-options-digest>"
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
                   }
                 },
-                {
-                  "type": "TimerStarted",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fireAtMs": 1000,
-                  "fingerprint": {
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "inputDigest": null,
-                    "optionsDigest": "timestamp-ms:1000"
-                  }
-                }
-              ],
-              "upsertWaits": [
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "readyAtMs": 1000
-                }
-              ],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [
-                {
-                  "activityId": "run-1:1",
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
                   "runId": "run-1",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "activityName": "corpus.double",
-                  "taskQueue": "corpus-activities",
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "heartbeatTimeoutMs": null,
-                  "attempt": 1,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "mapItem": null
-                }
-              ],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
           },
           "historyBefore": [
             "WorkflowStarted"
@@ -1300,79 +949,37 @@
         },
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].selectCommandId.seq"
-                ]
+                "branchOrdinal": 1,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 4
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "timer"
+                  }
+                },
+                "type": "WorkflowCompleted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "branchOrdinal": 1,
-                  "branchesDigest": "<select-branches-digest>",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "type": "SelectWinner",
-                  "winningEventId": 4
-                },
-                {
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "timer"
-                    }
-                  },
-                  "type": "WorkflowCompleted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 5,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": []
-            },
-            "typescript": {
-              "expectedTailEventId": 5,
-              "appendEvents": [
-                {
-                  "type": "SelectWinner",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "branchOrdinal": 1,
-                  "winningEventId": 4,
-                  "branchesDigest": "<select-branches-digest>"
-                },
-                {
-                  "type": "WorkflowCompleted",
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "timer"
-                    }
-                  }
-                }
-              ],
-              "upsertWaits": [],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
           },
           "historyBefore": [
             "WorkflowStarted",
@@ -1394,195 +1001,93 @@
       "steps": [
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].commandId.seq",
-                  "appendEvents[1].commandId.seq",
-                  "scheduleActivities[0].activityId",
-                  "scheduleActivities[0].commandId.seq",
-                  "upsertWaits[0].commandId.seq"
-                ]
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "activityName": "corpus.double",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fingerprint": {
-                    "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
-                    "kind": "Activity",
-                    "name": "corpus.double",
-                    "optionsDigest": "<activity-options-digest>"
-                  },
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "taskQueue": "corpus-activities",
-                  "type": "ActivityScheduled"
-                },
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "fingerprint": {
-                    "inputDigest": null,
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "optionsDigest": "timestamp-ms:1000"
-                  },
-                  "fireAtMs": 1000,
-                  "type": "TimerStarted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 1,
-              "queryProjection": null,
-              "scheduleActivities": [
-                {
-                  "activityId": "run-1:2",
-                  "activityName": "corpus.double",
-                  "attempt": 1,
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "mapItem": null,
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
                   "runId": "run-1",
-                  "startToCloseTimeoutMs": null,
-                  "taskQueue": "corpus-activities"
-                }
-              ],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": [
-                {
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "key": "timer",
-                  "kind": "Timer",
-                  "readyAtMs": 1000
-                }
-              ]
-            },
-            "typescript": {
-              "expectedTailEventId": 1,
-              "appendEvents": [
-                {
-                  "type": "ActivityScheduled",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "activityName": "corpus.double",
-                  "taskQueue": "corpus-activities",
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "heartbeatTimeoutMs": null,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "fingerprint": {
-                    "kind": "Activity",
-                    "name": "corpus.double",
-                    "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
-                    "optionsDigest": "<activity-options-digest>"
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
                   }
                 },
-                {
-                  "type": "TimerStarted",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "fireAtMs": 1000,
-                  "fingerprint": {
-                    "kind": "Timer",
-                    "name": "sleep",
-                    "inputDigest": null,
-                    "optionsDigest": "timestamp-ms:1000"
-                  }
-                }
-              ],
-              "upsertWaits": [
-                {
-                  "kind": "Timer",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 2
-                  },
-                  "key": "timer",
-                  "readyAtMs": 1000
-                }
-              ],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [
-                {
-                  "activityId": "run-1:1",
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
                   "runId": "run-1",
-                  "commandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "activityName": "corpus.double",
-                  "taskQueue": "corpus-activities",
-                  "retryPolicy": {
-                    "maxAttempts": 1
-                  },
-                  "startToCloseTimeoutMs": null,
-                  "heartbeatTimeoutMs": null,
-                  "attempt": 1,
-                  "input": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "value": 4
-                    }
-                  },
-                  "mapItem": null
-                }
-              ],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
           },
           "historyBefore": [
             "WorkflowStarted"
@@ -1601,79 +1106,37 @@
         },
         {
           "action": "workflowTask",
-          "divergence": {
-            "differences": [
+          "expect": {
+            "appendEvents": [
               {
-                "what": "The command sequence number a `select` allocates for itself, and everything downstream of it. Rust's select! macro reserves the select's own command id BEFORE polling any branch, so a two-branch select numbers select=1, branch=2, branch=3. TypeScript's select allocates it inside resolveSelectWinner, which runs only once a branch is ready, so the same select numbers branch=1, branch=2, select=3 — and in a task where no branch is ready it allocates nothing at all. The shift moves every branch's command seq by one, which is why it also shows up in wait command ids, in the command ids of the waits a losing branch's cancellation deletes, and in the activity id, which is formatted from the command id. Both numberings are internally consistent and both replay against their own histories, but the numbering is durable: a history written by one runtime cannot be replayed by the other. Recorded from both sides rather than normalised away, because this is a convergence decision — which runtime moves — and not a language-forced difference. It is the last one left: every other divergence this corpus recorded has been closed by moving TypeScript onto Rust's answer.",
-                "paths": [
-                  "appendEvents[0].selectCommandId.seq"
-                ]
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 4
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "activity:8"
+                  }
+                },
+                "type": "WorkflowCompleted"
               }
             ],
-            "rust": {
-              "appendEvents": [
-                {
-                  "branchOrdinal": 0,
-                  "branchesDigest": "<select-branches-digest>",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 1
-                  },
-                  "type": "SelectWinner",
-                  "winningEventId": 4
-                },
-                {
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "activity:8"
-                    }
-                  },
-                  "type": "WorkflowCompleted"
-                }
-              ],
-              "consumeSignals": [],
-              "deleteWaits": [],
-              "expectedTailEventId": 5,
-              "queryProjection": null,
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "upsertWaits": []
-            },
-            "typescript": {
-              "expectedTailEventId": 5,
-              "appendEvents": [
-                {
-                  "type": "SelectWinner",
-                  "selectCommandId": {
-                    "runId": "run-1",
-                    "seq": 3
-                  },
-                  "branchOrdinal": 0,
-                  "winningEventId": 4,
-                  "branchesDigest": "<select-branches-digest>"
-                },
-                {
-                  "type": "WorkflowCompleted",
-                  "result": {
-                    "codec": "MessagePack",
-                    "schemaFingerprint": "<schema-fingerprint>",
-                    "value": {
-                      "text": "activity:8"
-                    }
-                  }
-                }
-              ],
-              "upsertWaits": [],
-              "deleteWaits": [],
-              "consumeSignals": [],
-              "scheduleActivities": [],
-              "scheduleActivityMaps": [],
-              "startChildWorkflows": [],
-              "queryProjection": null
-            }
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
           },
           "historyBefore": [
             "WorkflowStarted",
@@ -2373,6 +1836,10 @@
       "workflowId": "wf/corpus/sleep-after-signal"
     }
   ],
+  "declaredDivergences": {
+    "count": 0,
+    "why": "How many `divergence` blocks this corpus holds, asserted for EQUALITY by both runners — a count, not a floor. It replaced a `count > 0` tripwire, which encoded the assumption that the corpus would always record at least one divergence; that assumption became wrong the moment the last one was converged away, and it would have had to be edited under exactly the pressure that makes a careless edit likely. It is 0 today: every divergence this corpus ever found has been closed by moving TypeScript onto Rust's answer, and the eight blocks that held the select command-seq numbering are now shared `expect`s. Zero is a real state, not a disabled check — the next genuine divergence must raise this number in the same change that records it, or both runners fail, and a block deleted rather than converged fails them too."
+  },
   "declaredGaps": [
     {
       "what": "Double-await of a handle",
@@ -2483,6 +1950,10 @@
     "              is the point: a divergence that is normalised away stops being",
     "              visible, and one that is merely omitted stops being tracked.",
     "              Both runners refuse a divergence whose two sides are equal.",
+    "              There are none today — see `declaredDivergences` — but the",
+    "              mechanism stays, because the next one has to be recordable in",
+    "              the change that finds it rather than in the change that fixes",
+    "              it.",
     "",
     "              The two diff implementations agree on every structural shape —",
     "              nested objects, arrays of differing length, null against an",
@@ -2499,6 +1970,17 @@
     "              red, and check:fixtures and CI both run both. Unreachable",
     "              today — every number in every commit is an integer inside the",
     "              double-safe range — so it is recorded rather than fixed.",
+    "",
+    "  `declaredDivergences.count` is how many `divergence` blocks the corpus",
+    "              claims to hold, asserted for EQUALITY by both runners. It",
+    "              replaced a `count > 0` tripwire, which asserted that the",
+    "              corpus would always record at least one divergence — an",
+    "              assumption that becomes wrong the moment the last one is",
+    "              converged away. Equality is loud in both directions: delete a",
+    "              block and both runners fail, find a new divergence and forget",
+    "              to declare it and both runners fail, and 0 — the value today —",
+    "              is a real state rather than a disabled check. Zero is reachable",
+    "              only by editing this number on purpose.",
     "",
     "  `exclusions` are the projections `expect` applies before comparing, each",
     "              with the reason it cannot be compared directly. Both runners",
@@ -2520,10 +2002,10 @@
     "",
     "FOUND WHILE BUILDING THIS",
     "",
-    "  Four differences turned up that nothing had recorded before. Three have",
-    "  since been closed by moving TypeScript onto Rust's answer, and each entry",
-    "  below keeps what the corpus saw as well as where it landed, because a",
-    "  finding that leaves no trace once it is fixed cannot be audited.",
+    "  Four differences turned up that nothing had recorded before. All four are",
+    "  now closed, every one of them by moving TypeScript onto Rust's answer, and",
+    "  each entry below keeps what the corpus saw as well as where it landed,",
+    "  because a finding that leaves no trace once it is fixed cannot be audited.",
     "",
     "  1. TypeScript never cancelled a losing select branch's operational state.",
     "     CLOSED. It was recorded as a `divergence` on the two select-resolution",
@@ -2535,13 +2017,21 @@
     "     kinds; the activity branch — which Rust withdraws through",
     "     `cancel_commands` rather than a wait — is not reached by any case here",
     "     and is covered by the `WorkflowTaskCommit.cancelCommands` exclusion.",
-    "  2. A `select` allocates its own command sequence number before polling its",
+    "  2. A `select` allocated its own command sequence number before polling its",
     "     branches in Rust and after resolving a winner in TypeScript, which",
-    "     shifts every branch's command seq by one. OPEN, and now the only",
-    "     divergence this corpus records: it is a convergence decision about which",
-    "     runtime moves, and until it is taken neither runtime can replay the",
-    "     other's history across a select. Recorded as a `divergence` on every",
-    "     step of every select case.",
+    "     shifted every branch's command seq by one, so neither runtime could",
+    "     replay the other's history across a select. CLOSED, by moving",
+    "     TypeScript: `SelectDurablePromise.then` and its `selectAll` twin now",
+    "     reserve the select's command id after the replay-history gate and",
+    "     BEFORE registering any branch, and a task in which no branch is ready",
+    "     burns the number just as Rust's macro does. TypeScript moved because",
+    "     every other durable command in both runtimes already allocates at",
+    "     initiation; the exception was an artefact of `then()` inheriting the",
+    "     readiness condition, not a decision. It was recorded as a `divergence`",
+    "     on all eight steps of the four select cases, and those eight blocks are",
+    "     now shared `expect`s that both runners satisfy — which is the proof the",
+    "     convergence landed, since the recorded commits are Rust's and",
+    "     TypeScript had to reproduce them without having produced them.",
     "  3. The TypeScript worker never supplied PrepareWorkflowTaskOptions.nowMs,",
     "     so a timer scheduled after the clock had moved recorded a deadline",
     "     measured from the epoch. CLOSED. `DurableBackend.currentTime()` now",

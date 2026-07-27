@@ -59,6 +59,14 @@
 //! no regeneration path: it can satisfy the file or fail. That asymmetry is
 //! what makes the corpus a cross-implementation assertion rather than a
 //! snapshot of one implementation.
+//!
+//! The asymmetry argument only holds while a regenerate run cannot be mistaken
+//! for a passing one, which is what `is_not_a_regenerate_run` enforces:
+//! `DURUST_CORPUS_REGENERATE=1` otherwise makes this runner silently rewrite
+//! the file the *other* runner is measured against and then report `ok`, so a
+//! single environment variable turned the half with teeth into a snapshot
+//! writer that always passes. The TypeScript runner's `is not a print run` is
+//! the same guard for its own escape hatch.
 
 use durust::{
     ActivityMapInputManifest, Client, CodecId, DurableBackend, EventId, MemoryBackend, PayloadRef,
@@ -860,6 +868,48 @@ fn corpus_declares_its_gaps_separately_from_its_exclusions() {
     }
 }
 
+/// Every case this corpus holds, in order, asserted by name in both runners —
+/// the same treatment [`DECLARED_EXCLUSIONS`] gets, and for the same reason.
+///
+/// A floor (`cases.len() >= 12` against 13 cases) is not a tripwire. Measured
+/// before this list existed: deleting cases one at a time, **8 of the 13 left
+/// the suite green in both languages**, including all four `select` cases —
+/// the ones whose convergence this corpus was extended to pin. A case that can
+/// be deleted without failing anything is a case that is not protecting
+/// anything.
+const DECLARED_CASES: [&str; 13] = [
+    "an activity call commits one scheduled activity, and its completion closes the run",
+    "a later command is appended past an unconsumed completion (hot execution)",
+    "the same commits come out of a cold replay in one-event chunks",
+    "a signal that arrives first wins the select, and the losing timer wait is cancelled",
+    "a timer that fires first wins the select, and the losing signal wait is cancelled",
+    "a select resolved with two ready branches takes the earlier ready event, not the earlier branch",
+    "the same select with the activity landing first takes the activity branch",
+    "a query projection is committed with the signal wait and again with its consumption",
+    "a child workflow start is committed to the outbox and its completion closes the parent",
+    "an activity map commits one scheduled map bounded by maxInFlight",
+    "a version marker, a side effect and a deprecated patch land in one commit with the result",
+    "continue-as-new commits the next run's input and nothing else",
+    "a timer scheduled after the clock has moved records its deadline relative to now",
+];
+
+#[test]
+fn corpus_declares_its_cases() {
+    let corpus = load_corpus();
+    let declared: Vec<&str> = corpus["cases"]
+        .as_array()
+        .expect("corpus cases")
+        .iter()
+        .map(|case| case["name"].as_str().expect("case name"))
+        .collect();
+    assert_eq!(
+        declared,
+        DECLARED_CASES.to_vec(),
+        "a case cannot be added, removed, or renamed without saying so here and in the \
+         TypeScript runner's DECLARED_CASES"
+    );
+}
+
 /// A corpus whose expectations are all empty would pass in both runtimes and
 /// prove nothing. This is the floor: every case commits something, and the
 /// corpus as a whole reaches every commit field the runners can encode.
@@ -867,7 +917,11 @@ fn corpus_declares_its_gaps_separately_from_its_exclusions() {
 fn corpus_cases_assert_something() {
     let corpus = load_corpus();
     let cases = corpus["cases"].as_array().expect("corpus cases");
-    assert!(cases.len() >= 12, "the corpus is too small to be a corpus");
+    assert_eq!(
+        cases.len(),
+        DECLARED_CASES.len(),
+        "the corpus case count must match the declared list"
+    );
 
     let mut seen_fields: Vec<&str> = Vec::new();
     let mut seen_events: Vec<String> = Vec::new();
@@ -999,9 +1053,26 @@ fn corpus_divergence_reasons_account_for_every_differing_field() {
             );
         }
     }
+    // The count is declared in the corpus and asserted equal, not asserted
+    // non-zero. `count > 0` encoded the assumption that some divergence would
+    // always remain, which stops being true the moment the last one is
+    // converged away — and it would have had to be edited under exactly the
+    // pressure that makes a careless edit likely. Equality against a checked-in
+    // number keeps both directions loud: deleting a block fails here, adding
+    // one without declaring it fails here, and reaching zero is possible only
+    // by editing the corpus on purpose.
+    let declared = &corpus["declaredDivergences"];
+    let why = declared["why"].as_str().expect("declaredDivergences why");
     assert!(
-        count > 0,
-        "the corpus records no divergences at all, which would be a surprising claim"
+        why.len() > 80,
+        "declaredDivergences needs a reason, not a label"
+    );
+    assert_eq!(
+        u64::try_from(count).expect("divergence count fits u64"),
+        declared["count"]
+            .as_u64()
+            .expect("declaredDivergences count"),
+        "the corpus records a different number of divergence blocks than it declares"
     );
 }
 
@@ -1346,6 +1417,32 @@ async fn current_time(backend: &RecordingBackend) -> TimestampMs {
     backend.current_time().await.expect("current time")
 }
 
+/// The Rust twin of the TypeScript runner's `is not a print run`, and the
+/// stronger of the two: `DURUST_CORPUS_PRINT=1` only stops that runner
+/// asserting, while `DURUST_CORPUS_REGENERATE=1` makes this one *rewrite the
+/// file the other runner is measured against* and then pass. One environment
+/// variable turned the Rust half from a cross-implementation assertion into a
+/// snapshot writer that cannot fail — and the corpus's own header argues that
+/// the asymmetry between a runner that can regenerate and one that cannot is
+/// what gives the file its teeth. That argument only holds while a regenerate
+/// run is never mistaken for a passing one.
+///
+/// Demonstrated before this existed: with a case's `expect` mutated to a wrong
+/// commit, `DURUST_CORPUS_REGENERATE=1 cargo test --test behavioral_corpus`
+/// reported `ok` and silently corrected the file.
+#[test]
+fn is_not_a_regenerate_run() {
+    assert!(
+        !regenerate_requested(),
+        "DURUST_CORPUS_REGENERATE=1 rewrites the corpus instead of asserting it; this run proves \
+         nothing. Re-run without it to check the regenerated file in."
+    );
+}
+
+fn regenerate_requested() -> bool {
+    std::env::var("DURUST_CORPUS_REGENERATE").as_deref() == Ok("1")
+}
+
 #[test]
 fn every_corpus_case_reproduces_its_recorded_commits() {
     // `DURUST_CORPUS_REGENERATE=1 cargo test --test behavioral_corpus` rewrites
@@ -1353,7 +1450,7 @@ fn every_corpus_case_reproduces_its_recorded_commits() {
     // never run in CI: the corpus is only worth anything as checked-in literal
     // data that the *other* runtime has to satisfy without having produced it,
     // and the TypeScript runner has no regeneration path at all.
-    let regenerate = std::env::var("DURUST_CORPUS_REGENERATE").as_deref() == Ok("1");
+    let regenerate = regenerate_requested();
     let corpus = load_corpus();
     let cases = corpus["cases"].as_array().expect("corpus cases").clone();
     let mut regenerated = Vec::new();
@@ -1391,5 +1488,17 @@ fn every_corpus_case_reproduces_its_recorded_commits() {
             format!("{}\n", serde_json::to_string_pretty(&corpus).unwrap()),
         )
         .expect("write corpus");
+        // The test that performed the write is the test that reports it.
+        // `is_not_a_regenerate_run` already fails the run, but it is a
+        // *different* test, so this one was reporting `ok` immediately after
+        // overwriting the file the other runner is measured against. Nothing
+        // here prevents the write — the authoring workflow needs it, and an
+        // unwanted rewrite is recoverable from git, which is the real safety
+        // net — but no test that regenerated the corpus should be able to say
+        // it passed.
+        panic!(
+            "DURUST_CORPUS_REGENERATE=1 rewrote {CORPUS_PATH}; review the diff and re-run \
+             without the variable to check it in"
+        );
     }
 }

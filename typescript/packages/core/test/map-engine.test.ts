@@ -272,21 +272,35 @@ describe("map engine: materialization and maxInFlight admission", () => {
     }
   });
 
-  it("completes an empty input manifest at descriptor creation, for both kinds and both parent states", () => {
+  it("completes an empty input manifest at descriptor creation, for both kinds", () => {
     // Nothing to admit and nothing outstanding, so the map is terminal the
     // moment its descriptor exists — an empty result manifest, the parent
-    // notified, the descriptor closed. `parentTerminal` is deliberately not
-    // consulted: the commit creating this descriptor is the commit closing the
-    // run, so rejecting would roll back a commit every provider accepts today.
+    // notified, the descriptor closed.
     for (const state of [activityMap(0, 4), childMap(0, 4, "CollectAll")]) {
-      for (const parentTerminal of [false, true]) {
-        expect(
-          step(state, { kind: "DescriptorCreated", parentTerminal }),
-          `${state.kind} parentTerminal=${parentTerminal}`
-        ).toEqual(
-          ok([{ kind: "CompleteMap", itemCount: 0 }, { kind: "MarkDescriptorTerminal" }])
-        );
-      }
+      expect(
+        step(state, { kind: "DescriptorCreated", parentTerminal: false }),
+        `${state.kind}`
+      ).toEqual(
+        ok([{ kind: "CompleteMap", itemCount: 0 }, { kind: "MarkDescriptorTerminal" }])
+      );
+    }
+  });
+
+  it("closes an empty manifest without notifying a parent the same commit closed", () => {
+    // The convergence onto `src/map_engine.rs`. `DescriptorCreated` still never
+    // rejects — a workflow that spawns a map and returns produces one commit
+    // that both schedules the map and closes the run, and routing this through
+    // `terminalParent` would answer `TerminalWorkflow` for an activity map and
+    // roll that whole commit back. What a closed parent changes is that there
+    // is nobody to notify: `CompleteMap` would append `ActivityMapCompleted`
+    // *after* the run's own `WorkflowCompleted`, which is what memory and
+    // Postgres used to do while SQLite lost the fact to a later overwrite —
+    // three runtimes, three histories, one program.
+    for (const state of [activityMap(0, 4), childMap(0, 4, "CollectAll")]) {
+      expect(
+        step(state, { kind: "DescriptorCreated", parentTerminal: true }),
+        `${state.kind}`
+      ).toEqual(ok([{ kind: "MarkDescriptorTerminal" }]));
     }
   });
 
@@ -988,9 +1002,10 @@ describe("map engine: shared tallies and persisted strings", () => {
 //
 // One checked-in artefact, read by this runner and by `tests/map_transitions.rs`,
 // so the Rust and TypeScript map engines cannot drift apart silently. The file
-// itself documents which behaviours are deliberately excluded because the two
-// runtimes are knowingly divergent there, and why the Rust runner asserts the
-// `fanouts` section rather than the `transitions` one.
+// itself documents each remaining exclusion and its reason — a retry-policy
+// model the two runtimes cannot express in the same numbers, and a transition
+// whose effect list is only half the behaviour — and why the Rust runner
+// asserts the `fanouts` section rather than the `transitions` one.
 // ---------------------------------------------------------------------------
 
 interface TransitionTable {
@@ -1139,7 +1154,6 @@ describe("map engine: shared transition table", () => {
     // regression rather than an out-of-date exclusion list.
     expect(TRANSITION_TABLE.exclusions.map((exclusion) => exclusion.what)).toEqual([
       "ScheduleItemRetry.visibleAtMs and .timeoutAtMs values",
-      "Every DescriptorCreated case where recordedOutcomes >= itemCount, including but not limited to the empty manifest",
       "The ParentCancelled event"
     ]);
     for (const exclusion of TRANSITION_TABLE.exclusions) {
@@ -1180,19 +1194,37 @@ describe("map engine: shared transition table", () => {
     expect([...rejected].sort()).toEqual(["OutOfBounds", "TerminalParent"]);
   });
 
-  it("never asserts a DescriptorCreated case the two runtimes disagree on", () => {
-    for (const testCase of TRANSITION_TABLE.transitions) {
-      if (testCase.event.kind !== "DescriptorCreated") {
-        continue;
-      }
-      expect(
-        testCase.state.recordedOutcomes < testCase.state.itemCount,
-        `${testCase.name} is inside the excluded DescriptorCreated predicate`
-      ).toBe(true);
-    }
+  it("never asserts the ParentCancelled event it excludes", () => {
     expect(
       TRANSITION_TABLE.transitions.some((testCase) => testCase.event.kind === "ParentCancelled")
     ).toBe(false);
+  });
+
+  // The other half of retiring an exclusion: the table has to actually assert
+  // the predicate that used to be excluded, or the retirement is a deletion
+  // dressed up as a convergence. The exclusion was
+  // `Every DescriptorCreated case where recordedOutcomes >= itemCount`, written
+  // when TypeScript completed such a map and Rust stalled.
+  //
+  // Both parent states are required. `parentTerminal: false` is the arm both
+  // engines agreed on once Rust stopped stalling; `parentTerminal: true` is the
+  // arm TypeScript moved on — it used to emit `CompleteMap`, which appended the
+  // map's terminal fact *behind* the run's own terminal event.
+  it("asserts the retired DescriptorCreated predicate, for both parent states", () => {
+    const seen = new Set<boolean>();
+    for (const testCase of TRANSITION_TABLE.transitions) {
+      if (
+        testCase.event.kind !== "DescriptorCreated" ||
+        testCase.state.recordedOutcomes < testCase.state.itemCount
+      ) {
+        continue;
+      }
+      seen.add(testCase.event.parentTerminal as boolean);
+    }
+    expect(
+      [...seen].sort(),
+      "the table must assert the DescriptorCreated predicate it stopped excluding, for a closed parent as well as an open one"
+    ).toEqual([false, true]);
   });
 
   for (const testCase of TRANSITION_TABLE.transitions) {

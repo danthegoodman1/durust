@@ -209,6 +209,22 @@ export interface PostgresBackendStatsSnapshot {
   readonly blockWriteTimeMs: number;
   readonly activeConnections: number;
   readonly statements: readonly PostgresStatementStatsSnapshot[];
+  /**
+   * Why `statements` is empty, when it is empty for a reason.
+   *
+   * `null` means nothing went wrong — either the statements were collected, or
+   * the run genuinely issued none. A string means the snapshot *failed*, and
+   * it keeps the server's own error plus the hint that fixes it.
+   *
+   * This exists because the two states used to be indistinguishable. Both
+   * `create extension if not exists pg_stat_statements` and the
+   * `pg_stat_statements` select swallowed their failures — the same bare
+   * discard the Rust harness carried — so a missing extension arrived as an
+   * empty array and `require_postgres_statement_stats: true` failed with
+   * `expected null not to be null`, a message that names neither the cause nor
+   * the fix.
+   */
+  readonly statementStatsUnavailable: string | null;
 }
 
 export interface PostgresStatementStatsSnapshot {
@@ -356,6 +372,29 @@ export class PostgresBackend implements DurableBackend {
         connectionString,
         max: options.poolSize ?? 10
       });
+      // `pg`'s Pool is an EventEmitter, and an idle client that dies emits
+      // `'error'`. With no listener Node treats that as an unhandled `'error'`
+      // event and **kills the process**, so a server-side disconnect crashes
+      // the host application instead of failing a query.
+      //
+      // Reachable, measured with `pg_terminate_backend`: `Unhandled 'error'
+      // event … terminating connection due to administrator command`, exit 1.
+      // The benchmark's `drop database … with (force)` is one producer — it
+      // terminates live backends by design — and the happy path escapes only
+      // because `destroy()` calls `pool.end()` first. So the crash is reachable
+      // exactly when `destroy()` throws on one of its twelve `drop table`
+      // statements, and then this stack *replaces* the real failure, hiding it.
+      //
+      // Only for a pool this backend owns. A caller-supplied pool is the
+      // caller's to instrument, and attaching here would silently suppress a
+      // listener they are entitled to own.
+      this.#pool.on("error", (error) => {
+        console.error(
+          `postgres provider: idle client error (${
+            error instanceof Error ? error.message : String(error)
+          }); the pool will discard it`
+        );
+      });
       this.#ownsPool = true;
     }
   }
@@ -384,6 +423,24 @@ export class PostgresBackend implements DurableBackend {
     if (this.#ownsPool) {
       await this.#pool.end();
     }
+  }
+
+  /**
+   * Why `pg_stat_statements` could not be set up at open, or `null` if it
+   * could. Read by `statsSnapshot`, which prefers it over a query-time
+   * failure.
+   */
+  #statementStatsSetupFailure: string | null = null;
+
+  /** So a run that loses its statement stats says so once, not once per snapshot. */
+  #statementStatsUnavailableReported = false;
+
+  #reportStatementStatsUnavailable(reason: string | null): string | null {
+    if (reason !== null && !this.#statementStatsUnavailableReported) {
+      this.#statementStatsUnavailableReported = true;
+      console.error(`postgres provider: ${reason}`);
+    }
+    return reason;
   }
 
   async statsSnapshot(): Promise<PostgresBackendStatsSnapshot> {
@@ -420,7 +477,7 @@ export class PostgresBackend implements DurableBackend {
       `);
       const connectionRow = connections.rows[0] as Record<string, unknown> | undefined;
       const wal = await postgresWalStats(client);
-      const statements = await postgresStatementStats(client);
+      const statementStats = await postgresStatementStats(client);
       return {
         ...wal,
         xactCommit: postgresStatNumber(databaseRow, "xact_commit"),
@@ -441,7 +498,13 @@ export class PostgresBackend implements DurableBackend {
           connectionRow === undefined
             ? 0
             : postgresStatNumber(connectionRow, "active_connections"),
-        statements
+        statements: statementStats.statements,
+        statementStatsUnavailable: this.#reportStatementStatsUnavailable(
+          // The setup failure is the more useful of the two when both fire:
+          // it is the one that says the extension could not be created, while
+          // the query failure only says the view is missing.
+          this.#statementStatsSetupFailure ?? statementStats.unavailable
+        )
       };
     } finally {
       client.release();
@@ -1176,6 +1239,20 @@ export class PostgresBackend implements DurableBackend {
         await client.query(
           `delete from ${this.#waitsTableName} where wait_id = any($1::text[])`,
           [deleteWaits]
+        );
+      }
+      // Terminal cleanup's wait half on this path. It runs after the upsert
+      // loop above on purpose: a commit that both registers a wait and closes
+      // the run — a losing `select` branch whose winner settles in the same
+      // task — must leave nothing behind, and cancelling before scheduling is
+      // the inversion `cancelCommands` already had to be moved to avoid. The
+      // loaded-state path reaches the same end through
+      // `#abandonWorkForClosedRun`, whose deletions are persisted by the full
+      // normalized rewrite a terminal commit takes.
+      if (terminal) {
+        await client.query(
+          `delete from ${this.#waitsTableName} where run_id = $1`,
+          [String(claim.runId)]
         );
       }
       const consumeSignals = (commit.consumeSignals ?? []).map(String);
@@ -2269,7 +2346,7 @@ export class PostgresBackend implements DurableBackend {
   }
 
   async #initialize(): Promise<void> {
-    await ensureOptionalPostgresStatementStats(this.#pool);
+    this.#statementStatsSetupFailure = await ensureOptionalPostgresStatementStats(this.#pool);
     await this.#pool.query(`
       create table if not exists ${this.#countersTableName}(
         name text primary key,
@@ -4430,7 +4507,21 @@ export class PostgresBackend implements DurableBackend {
    * command on a still-live run, has no such path and cancels the map's
    * children itself; see `#cancelCommandOperationalState`.
    */
+  /**
+   * See `MemoryBackend.#abandonWorkForClosedRun` for why each half is here.
+   *
+   * This half runs on the loaded-state path, whose rewrite scope for a terminal
+   * commit is `fullNormalizedRewriteScope` — `workflowCommitEventRequiresFullProjectionRewrite`
+   * names every terminal event — so mutating `#waitsById` is enough to remove
+   * the rows. The SQL-native commit path does the same deletion as a statement;
+   * see `#commitWorkflowTaskSqlNative`.
+   */
   #abandonWorkForClosedRun(state: WorkflowState): void {
+    for (const [waitIdValue, wait] of this.#waitsById) {
+      if (wait.runId === state.runId) {
+        this.#waitsById.delete(waitIdValue);
+      }
+    }
     for (const activity of this.#activitiesById.values()) {
       if (
         activity.task.mapItem === null &&
@@ -6058,7 +6149,10 @@ async function postgresWalStats(client: PoolClient): Promise<
 
 async function postgresStatementStats(
   client: PoolClient
-): Promise<readonly PostgresStatementStatsSnapshot[]> {
+): Promise<{
+  readonly statements: readonly PostgresStatementStatsSnapshot[];
+  readonly unavailable: string | null;
+}> {
   try {
     const result = await client.query(`
       select
@@ -6073,33 +6167,74 @@ async function postgresStatementStats(
         where datname = current_database()
       )
     `);
-    return result.rows.map((raw) => {
-      const row = raw as Record<string, unknown>;
-      return {
-        queryId: String(row.query_id ?? ""),
-        query: String(row.query ?? ""),
-        calls: postgresStatNumber(row, "calls"),
-        totalExecTimeMs: postgresStatNumber(row, "total_exec_time")
-      };
-    });
+    return {
+      statements: result.rows.map((raw) => {
+        const row = raw as Record<string, unknown>;
+        return {
+          queryId: String(row.query_id ?? ""),
+          query: String(row.query ?? ""),
+          calls: postgresStatNumber(row, "calls"),
+          totalExecTimeMs: postgresStatNumber(row, "total_exec_time")
+        };
+      }),
+      unavailable: null
+    };
   } catch (error) {
     if (
       postgresErrorCode(error) === "42P01" ||
       postgresErrorCode(error) === "42703" ||
       postgresErrorCode(error) === "55000"
     ) {
-      return [];
+      // The same discard this used to do, except the reason survives. `42P01`
+      // is the view not existing at all, which is what a server without
+      // `shared_preload_libraries=pg_stat_statements` produces.
+      return { statements: [], unavailable: statementStatsUnavailableMessage(postgresErrorReason(error)) };
     }
     throw error;
   }
 }
 
-async function ensureOptionalPostgresStatementStats(pool: Pool): Promise<void> {
+/**
+ * What to do when `pg_stat_statements` is missing. Named here once so the
+ * message a user hits and the fixture that fixes it cannot drift apart, and so
+ * the fixture is reachable by grep from the error rather than only from prose.
+ *
+ * Mirrors `PG_STAT_STATEMENTS_PRELOAD_HINT` in
+ * `benchtools/src/bin/durust-benchmark-workload.rs`; the two runtimes hit the
+ * same server limitation and should say the same thing about it.
+ */
+const PG_STAT_STATEMENTS_PRELOAD_HINT =
+  "pg_stat_statements has to be loaded at server start, which `create extension` cannot do on " +
+  "its own: run the server with `-c shared_preload_libraries=pg_stat_statements`. The checked-in " +
+  "fixture does exactly that — `docker compose -f tests/fixtures/postgres.compose.yml up -d " +
+  "--wait`, then DURUST_POSTGRES_URL=postgres://durable:durable@127.0.0.1:55432/durable";
+
+function statementStatsUnavailableMessage(reason: string): string {
+  return `pg_stat_statements snapshot failed (${reason}). ${PG_STAT_STATEMENTS_PRELOAD_HINT}`;
+}
+
+function postgresErrorReason(error: unknown): string {
+  const code = postgresErrorCode(error);
+  const message = error instanceof Error ? error.message : String(error);
+  return code === null || code === undefined ? message : `${code}: ${message}`;
+}
+
+/**
+ * Records the setup failure instead of discarding it.
+ *
+ * Returns the reason rather than throwing, because a missing
+ * `pg_stat_statements` must not stop a provider from opening — it is optional
+ * instrumentation, and every non-benchmark caller works fine without it. What
+ * it must not do is *vanish*: a benchmark that gates on statement stats needs
+ * to fail with the cause, not with `expected null not to be null`.
+ */
+async function ensureOptionalPostgresStatementStats(pool: Pool): Promise<string | null> {
   try {
     await pool.query("create extension if not exists pg_stat_statements");
+    return null;
   } catch (error) {
     if (isOptionalPostgresStatementStatsSetupError(error)) {
-      return;
+      return statementStatsUnavailableMessage(postgresErrorReason(error));
     }
     throw error;
   }
