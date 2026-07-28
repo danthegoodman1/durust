@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, describe, expect, it } from "vitest";
 import {
   Client,
   RetryPolicy,
@@ -54,6 +54,27 @@ import {
 import { SqliteBackend } from "@durust/sqlite";
 
 const roots: string[] = [];
+
+/**
+ * Cases this file actually executed, counted by the module-scope `afterEach`
+ * below, which Vitest runs after every executed test in the file and not for a
+ * skipped one.
+ *
+ * The `afterAll`-equivalent assertion at the bottom of the file catches the
+ * hole this counter exists for: a run where SQLite works fine but the suite
+ * collapsed to nothing — a conformance loop deleted,
+ * `basicProviderConformanceCases()` returning an empty array, a `describe`
+ * accidentally narrowed. Every one of those shapes reports success today,
+ * because a `for` loop over zero cases registers zero tests and a suite of
+ * zero tests is indistinguishable from a suite that passed. Ported from the
+ * Postgres conformance suite, which has carried this counter since a mutation
+ * that narrowed its blob-backed loop to one case still exited 0.
+ *
+ * Unlike the Postgres file there is nothing to skip here — SQLite is
+ * `node:sqlite`, always available — so this file needs no module-scope
+ * availability throw to complement it.
+ */
+let executedCases = 0;
 
 function tempSqlitePath(label: string): string {
   const root = mkdtempSync(join(tmpdir(), `durust-sqlite-${label}-`));
@@ -109,6 +130,10 @@ async function forgedTerminalSqliteClaim(
     claim: claimed.claim
   };
 }
+
+afterEach(() => {
+  executedCases += 1;
+});
 
 afterAll(() => {
   for (const root of roots) {
@@ -1819,5 +1844,39 @@ describe("SqliteBackend upgrade repair", () => {
       writer.exec("ROLLBACK");
       writer.close();
     }
+  });
+});
+
+// Declared last on purpose: Vitest runs a file's tests in declaration order
+// (nothing here sets `sequence.shuffle` or uses `.concurrent`), so every case
+// above has already run and been counted by the time this executes. Its own
+// `afterEach` increment lands after the assertion, so it never counts itself.
+describe("SqliteBackend suite coverage", () => {
+  it("executed the shared conformance list rather than registering none", () => {
+    // Two assertions, and the first is the load-bearing half. A floor read
+    // from the case list tracks the suite instead of going stale — but that
+    // is exactly what makes an *empty* list self-consistent: `2 * 0` is a
+    // floor every run clears, so a length-derived floor alone cannot fail on
+    // the emptied table it is written to catch. The Postgres file had exactly
+    // that gap — measured: its coverage test passed with the shared table
+    // stubbed to `[]` — and carries the same non-empty assertion now. Pinning
+    // the list non-empty first is what turns
+    // `basicProviderConformanceCases() === []` into a failure instead of a
+    // vacuous pass.
+    const cases = basicProviderConformanceCases();
+    expect(
+      cases.length,
+      "basicProviderConformanceCases() returned no cases, so both conformance loops in this file registered zero tests and this suite passed without exercising SqliteBackend at all"
+    ).toBeGreaterThan(0);
+    // The `2 *` is load-bearing: the shared list runs **twice** here, plain
+    // and blob-backed, and a floor of one list's length would let a mutation
+    // that narrowed either loop to a single case still pass. This file's own
+    // 23 non-conformance cases sit on top of the 2N and are far below it on
+    // their own, so narrowing either loop drops the count under the floor.
+    const floor = 2 * cases.length;
+    expect(
+      executedCases,
+      "this suite must run the shared conformance list against both the plain and the blob-backed SQLite backend; if you filtered the run with `-t`, that is the cause and the filtered cases still passed — this check exists for the unfiltered runs CI makes"
+    ).toBeGreaterThanOrEqual(floor);
   });
 });

@@ -3113,14 +3113,29 @@ describe("PostgresBackend suite coverage", () => {
       expect(postgresIsRequired()).toBe(false);
       return;
     }
-    // The floor is read from the case list rather than written down, so it
-    // tracks the suite instead of going stale. The `2 *` is load-bearing and
-    // was wrong once: the shared list runs **twice** here, plain and
-    // blob-backed, and a floor of one list's length let a mutation that
-    // narrowed the blob-backed loop to a single case delete 43 of 44 and still
-    // pass at `86 passed, exit 0`. This file's own cases sit on top of the 88,
-    // so the floor is still comfortably below the real count.
-    const floor = 2 * basicProviderConformanceCases().length;
+    // Two assertions, and the non-empty one had to be added: the floor below
+    // is read from the case list, which makes it track the suite instead of
+    // going stale — but also makes an *empty* list self-consistent, because
+    // `2 * 0` is a floor every run clears. The doc comment on `executedCases`
+    // claimed this check caught "`basicProviderConformanceCases()` returning
+    // an empty array" and it did not. Measured with the shared table stubbed
+    // to `[]` and `DURUST_POSTGRES_URL` set: this test **passed**, the file
+    // reported `41 passed`, and the only thing that failed was Vitest 4.1.9's
+    // own `No test found in suite` error for the two emptied `describe`s —
+    // which is Vitest's floor, not this suite's, and which does not fire for
+    // the narrowing mutation the next assertion exists for.
+    const cases = basicProviderConformanceCases();
+    expect(
+      cases.length,
+      "basicProviderConformanceCases() returned no cases, so both conformance loops in this file registered zero tests and the length-derived floor below collapsed to zero along with them"
+    ).toBeGreaterThan(0);
+    // The `2 *` is load-bearing and was wrong once: the shared list runs
+    // **twice** here, plain and blob-backed, and a floor of one list's length
+    // let a mutation that narrowed the blob-backed loop to a single case
+    // delete 43 of 44 and still pass at `86 passed, exit 0`. This file's own
+    // cases sit on top of the 88, so the floor is still comfortably below the
+    // real count.
+    const floor = 2 * cases.length;
     expect(
       executedCases,
       "DURUST_POSTGRES_URL is set, so this suite must exercise Postgres; the shared conformance list alone should have run this many cases. If you filtered the run with `-t`, that is the cause and the filtered cases still passed; this check exists for the unfiltered runs CI makes"

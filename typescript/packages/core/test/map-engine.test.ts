@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   MemoryBackend,
   RetryPolicy,
@@ -1043,6 +1043,13 @@ interface FanoutCase {
   readonly parentHistory: readonly string[];
 }
 
+/**
+ * The number of fanout cases the shared table is expected to carry, pinned to
+ * match `SHARED_TABLE_FANOUTS` in `tests/map_transitions.rs` so that a change
+ * to the table fails in both runtimes rather than quietly in neither.
+ */
+const SHARED_TABLE_FANOUTS = 5;
+
 const TRANSITION_TABLE = JSON.parse(
   readFileSync(
     fileURLToPath(new URL("../../../fixtures/contract/map-transitions.json", import.meta.url)),
@@ -1248,8 +1255,30 @@ describe("map engine: shared transition table", () => {
 });
 
 describe("map engine: shared transition table fanouts", () => {
+  // Counted inside the loop, so it measures what this file *executed* rather
+  // than what the checked-in table *contains* — the two come apart precisely
+  // when the loop stops running, which is the case worth catching.
+  //
+  // Vitest is not silent here the way libtest was: with `"fanouts": []` it
+  // fails this suite outright with `No test found in suite`, measured. Its
+  // Rust twin had no such backstop — the same mutation reported `ok. 5 passed`
+  // with an identical test count and a runtime of 0.00s — which is why
+  // `tests/map_transitions.rs` grew `SHARED_TABLE_FANOUTS`. This assertion is
+  // not redundant with Vitest's: Vitest only refuses a *wholly* empty suite,
+  // so narrowing the table from five fanouts to one still reports success and
+  // exits 0. An exact count is what catches silent shrinkage, and it keeps
+  // both runtimes failing on the same edit to a table they share.
+  let replayedFanouts = 0;
+  afterAll(() => {
+    expect(
+      replayedFanouts,
+      "this file replayed a different number of the shared table's fanouts than expected; a generated-case loop that runs fewer times than the table has cases still reports success while asserting nothing about the cases that vanished, so restore the missing fanouts or move SHARED_TABLE_FANOUTS in tests/map_transitions.rs and this number together"
+    ).toBe(SHARED_TABLE_FANOUTS);
+  });
+
   for (const fanout of TRANSITION_TABLE.fanouts) {
     it(`fanout: ${fanout.name}`, async () => {
+      replayedFanouts += 1;
       const backend = new MemoryBackend();
       await backend.startWorkflow({
         namespace: namespace(),

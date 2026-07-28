@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   MemoryBackend,
   RetryPolicy,
@@ -17,6 +17,31 @@ import {
   assertCurrentTimeFollowsInjectedClock,
   basicProviderConformanceCases
 } from "@durust/testing";
+
+/**
+ * Cases this file actually executed, counted by the module-scope `afterEach`
+ * below, which Vitest runs after every executed test in the file and not for a
+ * skipped one.
+ *
+ * The assertion at the bottom of the file catches the hole this counter exists
+ * for: a run where `MemoryBackend` is fine but the suite collapsed to nothing
+ * — the conformance loop deleted, `basicProviderConformanceCases()` returning
+ * an empty array, a `describe` accidentally narrowed. Every one of those
+ * shapes reports success today, because a `for` loop over zero cases registers
+ * zero tests and a suite of zero tests is indistinguishable from a suite that
+ * passed. Ported from the Postgres conformance suite, which has carried this
+ * counter since a mutation that narrowed its blob-backed loop to one case
+ * still exited 0.
+ *
+ * Unlike the Postgres file there is nothing to skip here — `MemoryBackend` is
+ * in-process — so this file needs no module-scope availability throw to
+ * complement it.
+ */
+let executedCases = 0;
+
+afterEach(() => {
+  executedCases += 1;
+});
 
 describe("MemoryBackend basic provider conformance", () => {
   for (const conformanceCase of basicProviderConformanceCases()) {
@@ -239,5 +264,39 @@ describe("MemoryBackend heartbeat timing", () => {
       leaseDurationMs: 30_000
     });
     expect(workflowWake?.reason).toBe("ActivityTimedOut");
+  });
+});
+
+// Declared last on purpose: Vitest runs a file's tests in declaration order
+// (nothing here sets `sequence.shuffle` or uses `.concurrent`), so every case
+// above has already run and been counted by the time this executes. Its own
+// `afterEach` increment lands after the assertion, so it never counts itself.
+describe("MemoryBackend suite coverage", () => {
+  it("executed the shared conformance list rather than registering none", () => {
+    // Two assertions, and the first is the load-bearing half. A floor read
+    // from the case list tracks the suite instead of going stale — but that
+    // is exactly what makes an *empty* list self-consistent: `1 * 0` is a
+    // floor every run clears, so a length-derived floor alone cannot fail on
+    // the emptied table it is written to catch. The Postgres file had exactly
+    // that gap — measured: its coverage test passed with the shared table
+    // stubbed to `[]` — and carries the same non-empty assertion now. Pinning
+    // the list non-empty first is what turns
+    // `basicProviderConformanceCases() === []` into a failure instead of a
+    // vacuous pass.
+    const cases = basicProviderConformanceCases();
+    expect(
+      cases.length,
+      "basicProviderConformanceCases() returned no cases, so the conformance loop in this file registered zero tests and this suite passed without exercising MemoryBackend against the shared list at all"
+    ).toBeGreaterThan(0);
+    // No multiplier here, and that is not an oversight: unlike the Postgres
+    // and SQLite suites this file iterates the shared list **once**, plain
+    // only, with no blob-backed second pass. This file's own 3
+    // non-conformance cases sit on top of N and are far below it on their
+    // own, so narrowing the loop drops the count under the floor.
+    const floor = cases.length;
+    expect(
+      executedCases,
+      "this suite must run the whole shared conformance list against MemoryBackend; if you filtered the run with `-t`, that is the cause and the filtered cases still passed — this check exists for the unfiltered runs CI makes"
+    ).toBeGreaterThanOrEqual(floor);
   });
 });

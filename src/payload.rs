@@ -639,7 +639,27 @@ pub(crate) async fn rewrite_history_event_payloads<R: PayloadRewrite>(
             validate_side_effect_marker(&marker)?;
             HistoryEventData::SideEffectMarker(marker)
         }
-        other => other,
+        // The payload-free variants, listed rather than swept up by a
+        // `other => other` catch-all. The catch-all was the asymmetry: its
+        // synchronous twin `map_history_event_payloads` is exhaustive, so a new
+        // payload-bearing variant fails that build immediately, while here it
+        // matched `other` and passed through **unnormalized** on the Postgres
+        // and `payload_backend` paths — a silent storage bug rather than a
+        // compile error. Spelled out, the compiler now stops both.
+        //
+        // The arms below are pass-through, exactly as the catch-all was; the
+        // set of variants this function rewrites is unchanged. A new variant
+        // belongs in this list only once it is known to carry no payload.
+        data @ (HistoryEventData::WorkflowCancelled { reason: _ }
+        | HistoryEventData::WorkflowTaskStarted
+        | HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_)) => data,
     })
 }
 

@@ -2466,65 +2466,107 @@ fn default_durable_names_include_package_module_and_function() {
     );
 }
 
+/// How many scenarios [`provider_conformance`] runs against every provider.
+///
+/// The aggregator is a straight-line list of calls and nothing downstream
+/// counts them, so deleting one used to be invisible: the three provider tests
+/// keep passing, the test count is unchanged (the scenarios are plain `async
+/// fn`s, not `#[test]`s), and the only trace is a `dead_code` warning that
+/// nothing enforces — CI runs neither `-D warnings` nor clippy. That matters
+/// because `PARITY.md` cites individual entries in this list by name, row 21's
+/// Rust column being
+/// `an_empty_map_scheduled_by_a_closing_commit_is_still_accepted`; a deleted
+/// call would leave the row pointing at coverage that no longer runs.
+///
+/// [`run_conformance_scenarios`] counts what it expands and this number is the
+/// floor. Removing a scenario is meant to move it in the same commit.
+const CONFORMANCE_SCENARIOS: usize = 51;
+
+/// Runs each named scenario against a clone of `backend`, in order, and
+/// returns how many it ran.
+///
+/// The scenarios stay listed as bare `fn` idents and no name is assembled from
+/// fragments: `PARITY.md` names tests and scenarios in this file verbatim, so
+/// every identifier a row cites has to remain greppable as a literal here.
+macro_rules! run_conformance_scenarios {
+    ($backend:expr, $($scenario:ident),+ $(,)?) => {{
+        let mut ran = 0usize;
+        $(
+            $scenario($backend.clone()).await;
+            ran += 1;
+        )+
+        ran
+    }};
+}
+
 async fn provider_conformance<B>(backend: B)
 where
     B: DurableBackend,
 {
-    start_workflow_is_idempotent(backend.clone()).await;
-    workflow_claim_filters_by_queue_and_registered_type(backend.clone()).await;
-    stream_history_honors_bounds(backend.clone()).await;
-    released_workflow_task_is_claimable_again(backend.clone()).await;
-    query_projection_updates_atomically_and_reads_payload_refs(backend.clone()).await;
-    missing_provider_blob_ref_is_rejected(backend.clone()).await;
-    provider_blob_ref_metadata_mismatch_is_rejected(backend.clone()).await;
-    workflow_change_version_index_tracks_markers_and_open_status(backend.clone()).await;
-    continue_as_new_closes_current_run_and_starts_claimable_next_run(backend.clone()).await;
-    signal_inbox_is_idempotent_ordered_and_consumed_by_commit(backend.clone()).await;
-    signal_between_claim_and_commit_wakes_workflow(backend.clone()).await;
-    signal_during_claim_window_survives_empty_commit(backend.clone()).await;
-    signal_between_claim_and_commit_wakes_workflows_in_batch_commit(backend.clone()).await;
-    terminal_run_fences_stale_mutating_commits_identically(backend.clone()).await;
-    late_activity_completion_after_cancel_is_idempotent_across_retries(backend.clone()).await;
-    terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals(backend.clone()).await;
-    consumed_signal_dedup_survives_continue_as_new(backend.clone()).await;
-    timer_waits_fire_only_when_due_and_make_workflow_claimable(backend.clone()).await;
-    activity_retry_reschedules_until_max_attempts(backend.clone()).await;
-    non_retryable_activity_failure_skips_retry_and_wakes_workflow(backend.clone()).await;
-    activity_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone()).await;
-    activity_heartbeat_extends_deadline_and_rejects_stale_claim(backend.clone()).await;
-    activity_heartbeat_timeout_retries_until_max_attempts_then_wakes_workflow(backend.clone())
-        .await;
-    cancel_commands_clear_activity_tasks(backend.clone()).await;
-    child_start_dispatch_is_idempotent_and_wakes_parent(backend.clone()).await;
-    child_completion_routes_to_parent(backend.clone()).await;
-    child_start_conflict_records_failure(backend.clone()).await;
-    parent_close_policy_cancel_cancels_child(backend.clone()).await;
-    parent_close_policy_abandon_leaves_child_running(backend.clone()).await;
-    activity_map_materializes_bounded_items_and_writes_result_manifest(backend.clone()).await;
-    activity_map_failure_suppresses_remaining_items_and_wakes_workflow(backend.clone()).await;
-    child_workflow_map_materializes_bounded_children_and_writes_result_manifest(backend.clone())
-        .await;
-    child_workflow_map_fail_fast_cancels_in_flight_children(backend.clone()).await;
-    child_workflow_map_collect_all_records_ordered_outcomes(backend.clone()).await;
-    child_workflow_map_command_cancellation_cancels_started_children(backend.clone()).await;
-    abandoned_child_of_closed_map_parent_can_still_terminate(backend.clone()).await;
-    child_workflow_map_zero_max_in_flight_is_rejected_at_descriptor_creation(backend.clone()).await;
-    a_commit_scheduling_one_map_twice_is_rejected(backend.clone()).await;
-    empty_input_manifest_completes_at_descriptor_creation(backend.clone()).await;
-    an_empty_map_scheduled_by_a_closing_commit_is_still_accepted(backend.clone()).await;
-    one_commit_completing_two_empty_maps_keeps_its_event_ids_contiguous(backend.clone()).await;
-    workflow_cancel_cleans_waits_activities_and_activity_maps(backend.clone()).await;
-    stale_workflow_task_commit_conflicts(backend.clone()).await;
-    batch_workflow_task_claim_and_commit_results_are_ordered(backend.clone()).await;
-    batch_activity_completion_reports_ordered_duplicate_and_stale_results(backend.clone()).await;
-    activity_claim_filters_and_stale_completion_is_rejected(backend.clone()).await;
-    unexpired_workflow_claim_lease_is_not_reclaimable(backend.clone()).await;
-    // Run last: their timeout scans use far-future `now`s that must not
-    // disturb other cases' pending activities.
-    timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder(backend.clone()).await;
-    timeoutless_activity_reclaims_one_lease_after_heartbeats_stop(backend.clone()).await;
-    timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat(backend.clone()).await;
-    explicit_heartbeat_timeout_takes_precedence_over_claim_lease(backend).await;
+    let ran = run_conformance_scenarios!(
+        backend,
+        start_workflow_is_idempotent,
+        workflow_claim_filters_by_queue_and_registered_type,
+        stream_history_honors_bounds,
+        released_workflow_task_is_claimable_again,
+        query_projection_updates_atomically_and_reads_payload_refs,
+        missing_provider_blob_ref_is_rejected,
+        provider_blob_ref_metadata_mismatch_is_rejected,
+        workflow_change_version_index_tracks_markers_and_open_status,
+        continue_as_new_closes_current_run_and_starts_claimable_next_run,
+        signal_inbox_is_idempotent_ordered_and_consumed_by_commit,
+        signal_between_claim_and_commit_wakes_workflow,
+        signal_during_claim_window_survives_empty_commit,
+        signal_between_claim_and_commit_wakes_workflows_in_batch_commit,
+        terminal_run_fences_stale_mutating_commits_identically,
+        late_activity_completion_after_cancel_is_idempotent_across_retries,
+        terminal_cleanup_answers_late_calls_and_keeps_undelivered_signals,
+        consumed_signal_dedup_survives_continue_as_new,
+        timer_waits_fire_only_when_due_and_make_workflow_claimable,
+        activity_retry_reschedules_until_max_attempts,
+        non_retryable_activity_failure_skips_retry_and_wakes_workflow,
+        activity_timeout_retries_until_max_attempts_then_wakes_workflow,
+        activity_heartbeat_extends_deadline_and_rejects_stale_claim,
+        activity_heartbeat_timeout_retries_until_max_attempts_then_wakes_workflow,
+        cancel_commands_clear_activity_tasks,
+        child_start_dispatch_is_idempotent_and_wakes_parent,
+        child_completion_routes_to_parent,
+        child_start_conflict_records_failure,
+        parent_close_policy_cancel_cancels_child,
+        parent_close_policy_abandon_leaves_child_running,
+        activity_map_materializes_bounded_items_and_writes_result_manifest,
+        activity_map_failure_suppresses_remaining_items_and_wakes_workflow,
+        child_workflow_map_materializes_bounded_children_and_writes_result_manifest,
+        child_workflow_map_fail_fast_cancels_in_flight_children,
+        child_workflow_map_collect_all_records_ordered_outcomes,
+        child_workflow_map_command_cancellation_cancels_started_children,
+        abandoned_child_of_closed_map_parent_can_still_terminate,
+        child_workflow_map_zero_max_in_flight_is_rejected_at_descriptor_creation,
+        a_commit_scheduling_one_map_twice_is_rejected,
+        empty_input_manifest_completes_at_descriptor_creation,
+        an_empty_map_scheduled_by_a_closing_commit_is_still_accepted,
+        one_commit_completing_two_empty_maps_keeps_its_event_ids_contiguous,
+        workflow_cancel_cleans_waits_activities_and_activity_maps,
+        stale_workflow_task_commit_conflicts,
+        batch_workflow_task_claim_and_commit_results_are_ordered,
+        batch_activity_completion_reports_ordered_duplicate_and_stale_results,
+        activity_claim_filters_and_stale_completion_is_rejected,
+        unexpired_workflow_claim_lease_is_not_reclaimable,
+        // Run last: their timeout scans use far-future `now`s that must not
+        // disturb other cases' pending activities.
+        timeoutless_activity_lease_expiry_reclaims_and_fences_stale_holder,
+        timeoutless_activity_reclaims_one_lease_after_heartbeats_stop,
+        timeoutless_activity_batch_claim_uses_lease_as_implicit_heartbeat,
+        explicit_heartbeat_timeout_takes_precedence_over_claim_lease,
+    );
+    assert_eq!(
+        ran, CONFORMANCE_SCENARIOS,
+        "this provider ran {ran} conformance scenarios, not \
+         {CONFORMANCE_SCENARIOS}; a scenario dropped from the list stops \
+         running against every provider without failing a test or changing the \
+         test count, and `PARITY.md` cites entries in this list by name, so \
+         restore it or move CONFORMANCE_SCENARIOS deliberately"
+    );
 }
 
 async fn start_large_payload_workflow<B>(

@@ -105,6 +105,27 @@ fn load_table() -> TransitionTable {
         .expect("shared map transition table is valid JSON")
 }
 
+/// How many cases each section of the shared table holds. Every assertion in
+/// this file about either section runs inside a `for` loop, and a loop over an
+/// empty collection asserts nothing while still reporting `ok` — so these
+/// counts are the floor that keeps the loops from going quiet.
+///
+/// The hole they close is narrow and real. Neither `fanouts` nor `transitions`
+/// carries `#[serde(default)]`, so deleting the *key* fails to deserialize and
+/// every test here fails loudly. But `"fanouts": []` deserializes fine:
+/// emptying the array left `memory_replays_every_shared_table_fanout` and
+/// `sqlite_replays_every_shared_table_fanout` passing with an unchanged test
+/// count, replaying nothing, in `0.00s` instead of `0.04s`. That is the only
+/// difference an emptied table produced.
+///
+/// The counts are exact rather than `> 0` on purpose. The table is checked in,
+/// so it changes only deliberately, and an exact count also catches the case a
+/// non-empty check cannot: cases quietly deleted to make a failure go away.
+/// Adding or retiring a case is expected to move the number here in the same
+/// commit — that edit is the point, not an obstacle.
+const SHARED_TABLE_FANOUTS: usize = 5;
+const SHARED_TABLE_TRANSITIONS: usize = 27;
+
 /// The exclusions are the table's contract with the runtimes it cannot make
 /// agree. Losing one would silently start asserting a behaviour one runtime
 /// cannot match, and the failure would read as a regression rather than as an
@@ -139,7 +160,14 @@ fn shared_table_declares_its_cross_runtime_exclusions() {
 #[test]
 fn shared_table_never_asserts_an_excluded_transition() {
     let table = load_table();
-    assert!(!table.transitions.is_empty());
+    assert_eq!(
+        table.transitions.len(),
+        SHARED_TABLE_TRANSITIONS,
+        "the shared table's single-step section changed size; every loop over \
+         `transitions` in this file asserts nothing on the cases that are no \
+         longer there, so update SHARED_TABLE_TRANSITIONS deliberately or put \
+         the cases back"
+    );
     for case in &table.transitions {
         let event_kind = case["event"]["kind"].as_str().expect("event kind");
         assert_ne!(
@@ -203,21 +231,42 @@ fn shared_table_asserts_the_retired_descriptor_created_predicate() {
 #[test]
 fn memory_replays_every_shared_table_fanout() {
     block_on(async {
+        let mut replayed = 0usize;
         for fanout in load_table().fanouts {
             replay_fanout(MemoryBackend::new(), &fanout).await;
+            replayed += 1;
         }
+        assert_replayed_every_fanout(replayed);
     });
 }
 
 #[test]
 fn sqlite_replays_every_shared_table_fanout() {
     block_on(async {
+        let mut replayed = 0usize;
         for fanout in load_table().fanouts {
             let dir = tempfile::tempdir().unwrap();
             let backend = SqliteBackend::open(dir.path().join("map-transitions.sqlite3")).unwrap();
             replay_fanout(backend, &fanout).await;
+            replayed += 1;
         }
+        assert_replayed_every_fanout(replayed);
     });
+}
+
+/// The floor for both replay tests: counted inside the loop and checked after
+/// it, so the count is what each test actually executed rather than what the
+/// file claims to contain. A replay test that replays nothing is not a passing
+/// test — see `SHARED_TABLE_FANOUTS`.
+fn assert_replayed_every_fanout(replayed: usize) {
+    assert_eq!(
+        replayed, SHARED_TABLE_FANOUTS,
+        "this test replayed {replayed} of the shared table's \
+         {SHARED_TABLE_FANOUTS} fanouts; a replay loop that runs fewer times \
+         than the table has cases still reports `ok` while asserting nothing, \
+         so restore the missing fanouts or move SHARED_TABLE_FANOUTS \
+         deliberately"
+    );
 }
 
 async fn replay_fanout<B>(backend: B, fanout: &Fanout)
