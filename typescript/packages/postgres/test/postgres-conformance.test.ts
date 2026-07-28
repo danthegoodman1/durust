@@ -2634,7 +2634,9 @@ describePostgres("PostgresBackend normalized history", () => {
       payloadDigest(activityMapInputs)
     );
     expect(
-      revivePostgresJson(activityMap?.inputs).map((input) => decodePayload(input))
+      revivePostgresJson<readonly PayloadRef[]>(activityMap?.inputs).map((input) =>
+        decodePayload(input)
+      )
     ).toEqual([{ value: 1 }, { value: 2 }, { value: 3 }]);
     const activityMapItems = await readNormalizedActivityMapItemRows(tableName);
     expect(activityMapItems.map((item) => ({
@@ -2696,7 +2698,9 @@ describePostgres("PostgresBackend normalized history", () => {
       payloadDigest(childMapInputs)
     );
     expect(
-      revivePostgresJson(childMap?.inputs).map((input) => decodePayload(input))
+      revivePostgresJson<readonly PayloadRef[]>(childMap?.inputs).map((input) =>
+        decodePayload(input)
+      )
     ).toEqual([{ value: "a" }, { value: "b" }, { value: "c" }]);
     const childMapItems = await readNormalizedChildWorkflowMapItemRows(tableName);
     expect(childMapItems.map((item) => ({
@@ -2774,7 +2778,7 @@ describePostgres("PostgresBackend normalized history", () => {
     // it can delay an admission but can never let one past `maxInFlight`. The
     // truthful per-item view is the item rows asserted just below.
     expect(revivePostgresJson<number>(activityMapAfterTwo?.in_flight)).toBe(2);
-    const activityResultsAfterTwo = revivePostgresJson<unknown[]>(
+    const activityResultsAfterTwo = revivePostgresJson<readonly (PayloadRef | null)[]>(
       activityMapAfterTwo?.results
     );
     expect(
@@ -2815,7 +2819,7 @@ describePostgres("PostgresBackend normalized history", () => {
     });
     expect(revivePostgresJson<number>(completedActivityMap?.in_flight)).toBe(0);
     expect(
-      revivePostgresJson<unknown[]>(completedActivityMap?.results).map((result) =>
+      revivePostgresJson<readonly PayloadRef[]>(completedActivityMap?.results).map((result) =>
         decodePayload(result)
       )
     ).toEqual([{ doubled: 2 }, { doubled: 4 }, { doubled: 6 }]);
@@ -2897,7 +2901,7 @@ describePostgres("PostgresBackend normalized history", () => {
     });
     expect(revivePostgresJson<number>(completedChildMap?.in_flight)).toBe(0);
     expect(
-      revivePostgresJson<Array<{ readonly kind: string; readonly result: unknown }>>(
+      revivePostgresJson<readonly { readonly kind: string; readonly result: PayloadRef }[]>(
         completedChildMap?.outcomes
       ).map((outcome) => ({
         kind: outcome.kind,

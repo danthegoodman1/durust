@@ -1,8 +1,27 @@
 name: CI
 
+# `push` is restricted to `main`; `pull_request` covers everything else. A bare
+# `push` alongside `pull_request` ran this entire workflow — both containers, the
+# full test suite, the Garage conformance step — **twice** for every push to a
+# branch with an open PR. Same commit, same result, double the minutes.
+#
+# `push` cannot simply be dropped, and this is the trap: `release.yml` triggers
+# on `workflow_run` of this workflow and gates on
+# `github.event.workflow_run.event == 'push'` and `head_branch == 'main'`.
+# Removing the push trigger, or filtering `main` out of it, silently stops every
+# release while leaving CI green.
 on:
   pull_request:
   push:
+    branches:
+      - main
+
+# Cancellation is scoped to pull requests for that same reason. On `main` a
+# cancelled run is a *skipped release*, because `release.yml` keys off this
+# workflow's conclusion — so a superseded `main` run must be left to finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -66,10 +85,32 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check feature matrix
+      # This step was named "Check feature matrix" and ran two lines, one of
+      # which was redundant: `default = ["sqlite"]`, so `--features postgres,s3`
+      # *also* enables sqlite and is therefore identical to `--all-features` —
+      # which the "Run tests" step below already builds and, unlike `cargo
+      # check`, actually runs. The name claimed a matrix that neither line
+      # covered.
+      #
+      # What is genuinely distinct is the sqlite-free half: a dependent taking
+      # durust with only Postgres, or only S3, gets a crate this workflow never
+      # compiled. All four combinations below pass today — the point of pinning
+      # them is that a `rusqlite` type leaking into a non-sqlite code path now
+      # fails here rather than at a user's `cargo build`.
+      #
+      # Library only, deliberately. `--no-default-features --all-targets`
+      # currently produces 70 errors, because the test suite's helpers construct
+      # `SqliteBackend` unguarded. That is a real gap, recorded here rather than
+      # hidden: putting thousands of lines of test code behind
+      # `#[cfg(feature = "sqlite")]` is a larger change than this step should
+      # smuggle in, and a `cargo check` that silently covered only the lib while
+      # being named for the whole matrix is how the previous version misled.
+      - name: Check library across sqlite-free feature combinations
         run: |
           cargo check --locked --no-default-features
-          cargo check --locked --features postgres,s3
+          cargo check --locked --no-default-features --features postgres
+          cargo check --locked --no-default-features --features s3
+          cargo check --locked --no-default-features --features postgres,s3
 
       # `DURUST_REQUIRE_POSTGRES` turns every Postgres skip site in the Rust
       # suite into a panic, so this step fails if the service container, the
@@ -171,6 +212,24 @@ jobs:
       # container rather than about the change under test. Performance
       # baselines belong on a controlled machine; they stay in
       # `npm run check:postgres` for that use.
+      #
+      # The controlled machine is what `tests/fixtures/postgres.compose.yml` is
+      # for, and it was the only file in the repository nothing referenced by
+      # name. It is the *only* Postgres in this project started with
+      # `shared_preload_libraries=pg_stat_statements`, which is precisely the
+      # setting a `services:` container cannot supply — so it is the supported
+      # way to run the step this block declines to run:
+      #
+      #   docker compose -f tests/fixtures/postgres.compose.yml up -d
+      #   DURUST_POSTGRES_URL=postgres://durable:durable@localhost:55432/durable \
+      #     npm run check:postgres --prefix typescript
+      #
+      # Note the port and credentials: `55432` and `durable/durable/durable`,
+      # which match neither this workflow nor the `5433` /
+      # `postgres/postgres/durust` container used for ordinary local runs. That
+      # is deliberate — it is a separate, benchmark-only database — but it is
+      # easy to mistake for the everyday one, so the full URL is spelled out
+      # above rather than left to be inferred.
 
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d
@@ -190,6 +249,15 @@ jobs:
       # `garage_s3_feature_is_enabled_when_garage_is_required`, which is
       # compiled unconditionally — so the filter can never match zero tests,
       # and the missing-feature case now fails here instead of passing.
+      #
+      # `--all-features` rather than `--features s3`, purely for build cost:
+      # `--features s3` also enables the default `sqlite` but *not* `postgres`,
+      # so it is a different feature set from the "Run tests" step above and
+      # forced a full rebuild of the crate and the 9,600-line conformance test
+      # binary. Measured with `-- --list`, both feature sets select exactly the
+      # same two tests — `garage_s3_feature_is_enabled_when_garage_is_required`
+      # and `payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured`
+      # — so this reuses the earlier build and runs identical coverage.
       - name: Run Garage S3 conformance
         env:
           DURUST_GARAGE_ENDPOINT: http://127.0.0.1:3900
@@ -199,7 +267,7 @@ jobs:
           DURUST_GARAGE_ACCESS_KEY_ID: GK0123456789abcdef0123456789abcdef
           DURUST_GARAGE_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
           DURUST_REQUIRE_GARAGE: "1"
-        run: cargo test --locked --features s3 --test provider_conformance garage -- --nocapture
+        run: cargo test --locked --all-features --test provider_conformance garage -- --nocapture
 
       - name: Stop Garage
         if: always()

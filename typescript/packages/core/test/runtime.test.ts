@@ -18,6 +18,7 @@ import {
   callActivity,
   childWorkflow,
   childWorkflowMap,
+  commandId,
   continueAsNew,
   decodeActivityMapResults,
   decodeChildWorkflowMapSuccesses,
@@ -52,7 +53,8 @@ import {
   type PayloadRef,
   type RunId,
   type SchemaAdapter,
-  type WorkflowTaskCommit
+  type WorkflowTaskCommit,
+  type WorkflowTaskReason
 } from "@durust/core";
 import { HotWorkflowExecution, HotWorkflowExecutionDisposedError } from "../src/runtime.js";
 import { prepareWorkflowTaskCommit } from "@durust/testing";
@@ -209,7 +211,19 @@ describe("minimal workflow runtime", () => {
       kind: "Activity",
       name: "payments.price-quote"
     });
-    expect(decodePayload<QuoteInput>(scheduledEvent.scheduled.input)).toEqual({ sku: "sku-1" });
+    // The type on the ref, not on `decodePayload`, here and at every other
+    // decode of a history or backend payload in this file. `PayloadRef<T>`
+    // carries `T` only in an optional `__payloadType` marker, so a stored
+    // payload — always statically `PayloadRef<unknown>` — is not assignable to
+    // `PayloadRef<QuoteInput>` and `decodePayload<QuoteInput>(ref)` does not
+    // compile. The runtime re-points the ref at the same boundary for the same
+    // reason (see `decodePayload<Payload>(live.payload as PayloadRef<Payload>)`
+    // in `packages/core/src/runtime.ts`). It checks nothing away:
+    // `decodePayload` returns `decoded as T` regardless, and the `toEqual` is
+    // what pins the value.
+    expect(decodePayload(scheduledEvent.scheduled.input as PayloadRef<QuoteInput>)).toEqual({
+      sku: "sku-1"
+    });
     expect(first.scheduleActivities?.[0]).toMatchObject({
       activityId: "run-1:1",
       activityName: "payments.price-quote",
@@ -521,7 +535,9 @@ describe("minimal workflow runtime", () => {
     if (!activityTask) {
       throw new Error("expected activity task");
     }
-    expect(decodePayload<QuoteInput>(activityTask.task.input)).toEqual({ sku: "sku-1" });
+    expect(decodePayload(activityTask.task.input as PayloadRef<QuoteInput>)).toEqual({
+      sku: "sku-1"
+    });
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
@@ -1777,7 +1793,9 @@ describe("minimal workflow runtime", () => {
     if (!liveSignal) {
       throw new Error("expected live signal");
     }
-    expect(decodePayload<ApprovalSignal>(liveSignal.payload)).toEqual({ approvalId: "a-1" });
+    expect(decodePayload(liveSignal.payload as PayloadRef<ApprovalSignal>)).toEqual({
+      approvalId: "a-1"
+    });
 
     const consumeCommit = await prepareWorkflowTaskCommit(approvalWorkflow, {}, secondClaim, {
       payloadCodec: "Json",
@@ -1878,7 +1896,9 @@ describe("minimal workflow runtime", () => {
       throw new Error("expected live signal");
     }
     expect(liveSignal.payload.schemaFingerprint).toBe("sha256:approval-signal");
-    expect(decodePayload<{ readonly approval_id: string }>(liveSignal.payload)).toEqual({
+    expect(
+      decodePayload(liveSignal.payload as PayloadRef<{ readonly approval_id: string }>)
+    ).toEqual({
       approval_id: "a-schema"
     });
 
@@ -1900,7 +1920,7 @@ describe("minimal workflow runtime", () => {
     if (completed?.data.kind !== "WorkflowCompleted") {
       throw new Error("expected completed event");
     }
-    expect(decodePayload<ApprovalSignal>(completed.data.result)).toEqual({
+    expect(decodePayload(completed.data.result as PayloadRef<ApprovalSignal>)).toEqual({
       approvalId: "a-schema"
     });
   });
@@ -2687,7 +2707,7 @@ describe("minimal workflow runtime", () => {
           data: {
             kind: "VersionMarker",
             marker: {
-              commandId: { runId: runId("run-1"), seq: 1 },
+              commandId: commandId(runId("run-1"), 1),
               changeId: "replace-a-with-b",
               version: 1
             }
@@ -2727,7 +2747,7 @@ describe("minimal workflow runtime", () => {
           data: {
             kind: "VersionMarker",
             marker: {
-              commandId: { runId: runId("run-1"), seq: 1 },
+              commandId: commandId(runId("run-1"), 1),
               changeId: "replace-a-with-b",
               version: 1
             }
@@ -3915,7 +3935,7 @@ describe("minimal workflow runtime", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<string>(completed.result)).toBe("logged");
+    expect(decodePayload(completed.result as PayloadRef<string>)).toBe("logged");
   });
 
   it("leaves process.env an ordinary data property while guards are installed", async () => {
@@ -4073,7 +4093,7 @@ describe("minimal workflow runtime", () => {
     if (marker?.kind !== "SideEffectMarker") {
       throw new Error("expected SideEffectMarker");
     }
-    const recorded = decodePayload<number>(marker.marker.value);
+    const recorded = decodePayload(marker.marker.value as PayloadRef<number>);
     expect(recorded).toBeGreaterThanOrEqual(0);
     expect(recorded).toBeLessThan(1);
 
@@ -4177,23 +4197,25 @@ describe("minimal workflow runtime", () => {
     if (marker?.kind !== "SideEffectMarker") {
       throw new Error("expected SideEffectMarker");
     }
-    const recorded = decodePayload<{
-      readonly dateNow: number;
-      readonly dateStringLength: number;
-      readonly constructedDateLength: number;
-      readonly performanceNow: number;
-      readonly uuidLength: number;
-      readonly randomByte: number;
-      readonly hrtimeLength: number;
-      readonly hrtimeBigintNonNegative: boolean;
-      readonly cwdLength: number;
-      readonly cpuUsageUser: number;
-      readonly memoryUsageRss: number;
-      readonly memoryUsageRssDirect: number;
-      readonly resourceUsageUserCpu: number;
-      readonly uptimeNonNegative: boolean;
-      readonly envValue: string | undefined;
-    }>(marker.marker.value);
+    const recorded = decodePayload(
+      marker.marker.value as PayloadRef<{
+        readonly dateNow: number;
+        readonly dateStringLength: number;
+        readonly constructedDateLength: number;
+        readonly performanceNow: number;
+        readonly uuidLength: number;
+        readonly randomByte: number;
+        readonly hrtimeLength: number;
+        readonly hrtimeBigintNonNegative: boolean;
+        readonly cwdLength: number;
+        readonly cpuUsageUser: number;
+        readonly memoryUsageRss: number;
+        readonly memoryUsageRssDirect: number;
+        readonly resourceUsageUserCpu: number;
+        readonly uptimeNonNegative: boolean;
+        readonly envValue: string | undefined;
+      }>
+    );
     expect(recorded.dateNow).toBeGreaterThan(0);
     expect(recorded.dateStringLength).toBeGreaterThan(0);
     expect(recorded.constructedDateLength).toBe("1970-01-01T00:00:00.000Z".length);
@@ -5409,7 +5431,9 @@ describe("minimal workflow runtime", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 99 });
+    expect(decodePayload(completed.result as PayloadRef<{ readonly cents: number }>)).toEqual({
+      cents: 99
+    });
     expect(trace).toEqual(["second:rejected", "first:99"]);
   });
 
@@ -5481,7 +5505,9 @@ describe("minimal workflow runtime", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 14 });
+    expect(decodePayload(completed.result as PayloadRef<{ readonly cents: number }>)).toEqual({
+      cents: 14
+    });
   });
 
   // Row 4D's exactly-once rule, across tasks. Each branch's ready event is
@@ -5575,7 +5601,9 @@ describe("minimal workflow runtime", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<{ readonly cents: number }>(completed.result)).toEqual({ cents: 42 });
+    expect(decodePayload(completed.result as PayloadRef<{ readonly cents: number }>)).toEqual({
+      cents: 42
+    });
   });
 
   // Row 4D, the memory claim itself. Before removal-on-consume a hot workflow
@@ -5626,7 +5654,8 @@ describe("minimal workflow runtime", () => {
             }
           }
         ],
-        eventId(1)
+        eventId(1),
+        "WorkflowStarted"
       );
       const baseline = retainedBytes();
       const hot = new HotWorkflowExecution(manyActivities, { sku: "sku" }, claim, {
@@ -5646,7 +5675,7 @@ describe("minimal workflow runtime", () => {
                     data: {
                       kind: "ActivityCompleted",
                       completed: {
-                        commandId: { runId: claim.runId, seq: index },
+                        commandId: commandId(claim.runId, index),
                         // Big enough that retaining even a fraction of these is
                         // unmistakable next to measurement noise.
                         result: encodePayload({ cents: 1, filler }, { codec: "Json" })
@@ -5654,7 +5683,8 @@ describe("minimal workflow runtime", () => {
                     }
                   }
                 ],
-                eventId(tail + 1)
+                eventId(tail + 1),
+                "ActivityCompleted"
               )
             ));
         const appended = commit.appendEvents?.length ?? 0;
@@ -5785,7 +5815,7 @@ describe("map input manifest validation", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<number>(completed.result)).toBe(0);
+    expect(decodePayload(completed.result as PayloadRef<number>)).toBe(0);
   });
 
   it("gives an activity map item the same command fingerprint when no options are supplied", async () => {
@@ -5963,10 +5993,22 @@ describe("map input manifest validation", () => {
 // Builds a claim without a provider so a memory test measures the runtime and
 // nothing else: a `MemoryBackend` accumulates the run's history by design, and
 // that growth would swamp what is being asserted.
+//
+// `claim` and `reason` are built to the real provider shapes even though this
+// path reads neither. `HotWorkflowExecution` takes only `runId`,
+// `replayTargetEventId` and `prefetchedHistory` off a claim; `claim` is opaque
+// to the runtime and is handed straight to `commitWorkflowTask`, which never
+// runs here, and `reason` is read in exactly one place in the package —
+// `Worker.#runClaimedWorkflowTask` copying it into a `WorkflowTaskClaimed`
+// event — with no branch anywhere keyed off its value. A claim nothing reads
+// is precisely how the previous shape (`leaseToken`/`leaseExpiresAtMs` from a
+// superseded lease API, and a `reason` of `"Start"` that is not a
+// `WorkflowTaskReason` at all) survived: only the `as` cast held it up.
 function syntheticWorkflowClaim(
   type: ReturnType<typeof workflowType>,
   prefetchedHistory: readonly HistoryEvent[],
-  replayTargetEventId: ReturnType<typeof eventId>
+  replayTargetEventId: ReturnType<typeof eventId>,
+  reason: WorkflowTaskReason
 ): ClaimedWorkflowTask {
   return {
     runId: runId("run/memory"),
@@ -5975,11 +6017,11 @@ function syntheticWorkflowClaim(
     claim: {
       runId: runId("run/memory"),
       workerId: "worker-memory",
-      leaseToken: "lease-memory",
-      leaseExpiresAtMs: 0
-    } as ClaimedWorkflowTask["claim"],
+      // What `MemoryBackend` hands out for a run's first claim.
+      token: 1
+    },
     replayTargetEventId,
-    reason: "Start",
+    reason,
     prefetchedHistory
   };
 }

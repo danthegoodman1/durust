@@ -15,6 +15,7 @@ import {
   decodeChildWorkflowMapSuccesses,
   encodePayload,
   eventId,
+  runId,
   signal,
   sleep,
   timestampMs,
@@ -781,16 +782,29 @@ class SimulationDriver {
     options: SimulationDriverOptions = {}
   ) {
     this.#rng = new SeededRng(seed);
+    // Under `exactOptionalPropertyTypes` an absent tuning knob and one present
+    // with the value `undefined` are different types, and `Worker` accepts only
+    // the absent form — so an unset knob is left off here rather than forwarded
+    // as `undefined`. Built once because both worker pools take the same set.
+    const tuning = {
+      ...(options.workflowHistoryCacheSize === undefined
+        ? {}
+        : { workflowHistoryCacheSize: options.workflowHistoryCacheSize }),
+      ...(options.workflowExecutionCacheSize === undefined
+        ? {}
+        : { workflowExecutionCacheSize: options.workflowExecutionCacheSize }),
+      ...(options.historyFetchMaxEvents === undefined
+        ? {}
+        : { historyFetchMaxEvents: options.historyFetchMaxEvents }),
+      ...(options.leaseDurationMs === undefined ? {} : { leaseDurationMs: options.leaseDurationMs })
+    };
     this.#workflowWorkers = Array.from({ length: options.workflowWorkerCount ?? 3 }, (_, index) => {
       const workerOptions = workerOptionsForSimulation({
         backend,
         registry,
         workerId: `simulation-workflow-worker-${seed}-${index}`,
         signalNames,
-        workflowHistoryCacheSize: options.workflowHistoryCacheSize,
-        workflowExecutionCacheSize: options.workflowExecutionCacheSize,
-        historyFetchMaxEvents: options.historyFetchMaxEvents,
-        leaseDurationMs: options.leaseDurationMs
+        ...tuning
       });
       return new Worker(workerOptions);
     });
@@ -800,10 +814,7 @@ class SimulationDriver {
         registry,
         workerId: `simulation-activity-worker-${seed}-${index}`,
         signalNames,
-        workflowHistoryCacheSize: options.workflowHistoryCacheSize,
-        workflowExecutionCacheSize: options.workflowExecutionCacheSize,
-        historyFetchMaxEvents: options.historyFetchMaxEvents,
-        leaseDurationMs: options.leaseDurationMs
+        ...tuning
       });
       return new Worker(workerOptions);
     });
@@ -872,12 +883,21 @@ class SimulationDriver {
     const action = this.#rng.nextInt(3);
     if (action === 0) {
       const worker = this.#workflowWorkers[this.#rng.nextInt(this.#workflowWorkers.length)];
+      // An empty pool would otherwise make every drawn workflow action a no-op,
+      // and a simulation whose actions do nothing still reaches its step budget
+      // and reports whatever the workflow started out as.
+      if (worker === undefined) {
+        throw new Error(`simulation seed ${this.seed} has no workflow workers`);
+      }
       const outcome = await worker.runWorkflowTaskOnce();
       this.record(`${step}: workflow ${outcome.kind}`);
       return;
     }
     if (action === 1) {
       const worker = this.#activityWorkers[this.#rng.nextInt(this.#activityWorkers.length)];
+      if (worker === undefined) {
+        throw new Error(`simulation seed ${this.seed} has no activity workers`);
+      }
       const outcome = await worker.runActivityTaskOnce();
       this.record(`${step}: activity ${outcome.kind}`);
       return;
@@ -1080,9 +1100,12 @@ async function isWorkflowTerminal(backend: DurableBackend, runId: string): Promi
   return last === "WorkflowCompleted" || last === "WorkflowFailed" || last === "WorkflowCancelled";
 }
 
-async function historyEventTypes(backend: DurableBackend, runId: string): Promise<readonly string[]> {
+// The driver carries run ids as plain strings — they key `Set`s and land in
+// trace lines — so the brand is rebuilt at the one boundary that needs it,
+// through the constructor `@durust/core` exports rather than a cast.
+async function historyEventTypes(backend: DurableBackend, id: string): Promise<readonly string[]> {
   const history = await backend.streamHistory({
-    runId,
+    runId: runId(id),
     afterEventId: eventId(0),
     upToEventId: eventId(Number.MAX_SAFE_INTEGER),
     maxEvents: 10_000,

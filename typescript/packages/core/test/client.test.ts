@@ -11,7 +11,7 @@ import {
   workflow,
   workflowId
 } from "@durust/core";
-import type { SchemaAdapter } from "@durust/core";
+import type { PayloadRef, SchemaAdapter } from "@durust/core";
 import { prepareWorkflowTaskCommit } from "@durust/testing";
 
 interface Input {
@@ -134,7 +134,7 @@ describe("backend-backed Client", () => {
     if (!inbox) {
       throw new Error("expected signal inbox record");
     }
-    expect(decodePayload<Approved>(inbox.payload)).toEqual({ approvalId: "a-1" });
+    expect(decodePayload(inbox.payload as PayloadRef<Approved>)).toEqual({ approvalId: "a-1" });
 
     const history = await backend.streamHistory({
       runId: handle.runId,
@@ -219,7 +219,9 @@ describe("backend-backed Client", () => {
     if (commit.queryProjection === undefined) {
       throw new Error("expected query projection payload");
     }
-    expect(decodePayload<{ readonly wire_status: string }>(commit.queryProjection)).toEqual({
+    expect(
+      decodePayload(commit.queryProjection as PayloadRef<{ readonly wire_status: string }>)
+    ).toEqual({
       wire_status: "encoded-running"
     });
     await backend.commitWorkflowTask(claim.claim, commit);

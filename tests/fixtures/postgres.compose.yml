@@ -1,6 +1,18 @@
+# The benchmark-threshold database. Distinct from the everyday local container
+# (`durust-pg`, port 5433) and from CI's `services:` container: this is the only
+# Postgres here started with `shared_preload_libraries=pg_stat_statements`, which
+# `packages/benchmark/test/thresholds.test.ts` requires and a GitHub service
+# container cannot provide. Usage is documented in `.github/workflows/ci.yml`,
+# above the step that explains why benchmark thresholds do not run in CI.
+#
+# The image is pinned to 17-alpine to match both CI and the local development
+# container. It was 16-alpine, which made CI's claim that its image "tracks the
+# local development container" false for the one database used to record
+# performance baselines — the configuration where a server version difference is
+# most likely to be mistaken for a regression.
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:17-alpine
     command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: durable

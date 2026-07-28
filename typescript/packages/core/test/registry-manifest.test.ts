@@ -361,7 +361,13 @@ describe("registry and manifest", () => {
     expect(manifest.pageLengths).toEqual([1, 1]);
     expect(firstItem.codec).toBe("Json");
     expect(firstItem.schemaFingerprint).toBe("sha256:map-item");
-    expect(decodePayload<{ readonly wire_value: string }>(firstItem)).toEqual({
+    // Decoded without the item schema on purpose: the stored bytes hold the
+    // wire shape `itemSchema.encode` produced, which does not overlap the
+    // `Input` that `firstItem` is statically a ref to. The type argument is
+    // therefore `unknown` — naming the wire type here would be a claim
+    // `decodePayload` cannot honour — and the `toEqual` is what pins the wire
+    // shape. The line below pins the schema-decoded shape from the same ref.
+    expect(decodePayload<unknown>(firstItem)).toEqual({
       wire_value: "one"
     });
     expect(decodePayload(firstItem, itemSchema)).toEqual({ value: "one" });

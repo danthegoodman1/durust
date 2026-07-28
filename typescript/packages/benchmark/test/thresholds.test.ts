@@ -5,9 +5,12 @@ import {
   defaultBenchmarkOptions,
   postgresStatsReportFromSnapshots,
   runBenchmark,
+  type BackendMetricsReport,
+  type BackendOperationReport,
   type BenchmarkBaseline,
   type BenchmarkResult
 } from "@durust/benchmark";
+import type { PostgresBackendStatsSnapshot } from "@durust/postgres";
 import { assertPostgresAvailableWhenRequired, postgresUrlFromEnv } from "@durust/testing";
 
 const postgresUrl = postgresUrlFromEnv();
@@ -261,7 +264,7 @@ describe("benchmark threshold comparison", () => {
         operations: {
           ...result.backend_metrics.operations,
           commitWorkflowTask: {
-            ...result.backend_metrics.operations.commitWorkflowTask,
+            ...backendOperation(result.backend_metrics, "commitWorkflowTask"),
             errors: 1
           }
         }
@@ -472,6 +475,35 @@ describe("benchmark threshold comparison", () => {
   });
 });
 
+/**
+ * Resolve one recorded backend operation, or throw naming the one that is gone.
+ *
+ * `backend_metrics.operations` is a `Record<string, …>`, so an operation the
+ * benchmark stopped recording reads back as `undefined` rather than failing.
+ * Spreading that `undefined` into the regressed fixture above built
+ * `{ errors: 1 }` — no `calls`, no `latency` — and `compareBenchmarkToBaseline`
+ * treats any present entry with `errors !== 0` as a failure, so it would still
+ * emit the `backend_metrics.operations.commitWorkflowTask.errors` path the test
+ * asserts on. The test would keep passing while `runBenchmark` no longer
+ * measured the operation at all. Throwing here is the difference between
+ * "the regression path is still reported" and "the operation still exists".
+ */
+function backendOperation(
+  metrics: BackendMetricsReport,
+  name: string
+): BackendOperationReport {
+  const operation = metrics.operations[name];
+  if (operation === undefined) {
+    const recorded = Object.keys(metrics.operations).sort().join(", ");
+    throw new Error(
+      `benchmark recorded no "${name}" backend operation, so this test can no longer say ` +
+        `anything about it: the benchmark stopped exercising "${name}", or it was renamed. ` +
+        `Recorded operations: ${recorded.length === 0 ? "(none)" : recorded}`
+    );
+  }
+  return operation;
+}
+
 function loadBaseline(name: string): BenchmarkBaseline {
   return JSON.parse(
     readFileSync(new URL(`../baselines/${name}`, import.meta.url), "utf8")
@@ -479,15 +511,22 @@ function loadBaseline(name: string): BenchmarkBaseline {
 }
 
 function postgresSnapshot(
-  overrides: Partial<ReturnType<typeof postgresSnapshotDefaults>>
-): ReturnType<typeof postgresSnapshotDefaults> {
+  overrides: Partial<PostgresBackendStatsSnapshot>
+): PostgresBackendStatsSnapshot {
   return {
     ...postgresSnapshotDefaults(),
     ...overrides
   };
 }
 
-function postgresSnapshotDefaults() {
+// Annotated with the real provider type on purpose, not inferred. While this
+// was unannotated it silently drifted: it omitted `statementStatsUnavailable`
+// entirely, so every fixture snapshot was missing a field the type declares as
+// required, and `statements: []` inferred as `never[]` — which is why the four
+// literal statement rows below it could not be passed in as overrides. Neither
+// test asserts on `statementStatsUnavailable`, so nothing caught it; the
+// annotation is what catches the next omission.
+function postgresSnapshotDefaults(): PostgresBackendStatsSnapshot {
   return {
     walBytes: 0,
     walRecords: 0,
@@ -512,6 +551,9 @@ function postgresSnapshotDefaults() {
     blockReadTimeMs: 0,
     blockWriteTimeMs: 0,
     activeConnections: 0,
-    statements: []
+    statements: [],
+    // `null` is the provider's "nothing went wrong" value, which is what these
+    // hand-built snapshots mean: they are not modelling a failed collection.
+    statementStatsUnavailable: null
   };
 }

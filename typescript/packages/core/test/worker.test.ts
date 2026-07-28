@@ -37,6 +37,20 @@ import {
   REPLAY_WINDOW_LOOKAHEAD_EVENTS
 } from "../src/runtime.js";
 
+/**
+ * The shape a `toMatchObject` argument actually has.
+ *
+ * `toMatchObject` matches *deeply* and partially, so the literal handed to it
+ * is a deep partial of the asserted type. `Partial<T>` loosens only the top
+ * level: under it a nested literal is still checked against the whole nested
+ * type, so `satisfies Partial<WorkflowFailureError>` demanded a complete
+ * `DurableFailure` — `nonRetryable` included — from a `failure` block that
+ * deliberately names two of its three fields. It was a promise the clause
+ * could not structurally keep, and it went unnoticed because nothing
+ * type-checked this file.
+ */
+type DeepPartial<T> = T extends object ? { [Key in keyof T]?: DeepPartial<T[Key]> } : T;
+
 interface EchoInput {
   readonly value: string;
 }
@@ -2870,7 +2884,7 @@ describe("Worker", () => {
         errorType: "Error",
         message: "workflow exploded"
       }
-    } satisfies Partial<WorkflowFailureError>);
+    } satisfies DeepPartial<WorkflowFailureError>);
 
     const history = await backend.streamHistory({
       runId: handle.runId,
@@ -5195,9 +5209,12 @@ function recordBackendCalls(inner: DurableBackend, calls: string[]): DurableBack
       if (typeof value !== "function" || typeof property !== "string") {
         return value;
       }
-      return (...args: readonly unknown[]) => {
+      // Mutable `unknown[]`, not `readonly unknown[]`: a rest parameter is
+      // always a fresh array, and `Function.prototype.apply` is typed to take
+      // one under `strictBindCallApply`.
+      return (...args: unknown[]) => {
         calls.push(property);
-        return (value as (...callArgs: readonly unknown[]) => unknown).apply(target, args);
+        return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
       };
     }
   }) as DurableBackend;

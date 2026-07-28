@@ -21,7 +21,8 @@
     "check:postgres": "node scripts/check-postgres.mjs",
     "check:release": "node scripts/check-release.mjs",
     "test:types": "tsc -p tsconfig.type-tests.json --noEmit",
-    "check": "npm run build && npm run test && npm run test:types && npm run lint && npm run check:fixtures && npm run package:dry-run",
+    "check:test-types": "node scripts/check-test-types.mjs",
+    "check": "npm run build && npm run test && npm run test:types && npm run check:test-types && npm run lint && npm run check:fixtures && npm run package:dry-run",
     "lint": "npm run lint:determinism"
   },
   "durust": {

@@ -71,10 +71,12 @@ import {
   type DurableFailure,
   type HistoryEventData,
   type NewHistoryEvent,
+  type PagedManifest,
   type PayloadRef,
   type RetryPolicy,
   type RunId,
   type WaitRecord,
+  type WorkflowDefinition,
   type WorkflowTaskClaim,
   type WorkflowTaskCommit,
   type CommitOutcome
@@ -277,17 +279,21 @@ const corpusContinueAsNew = workflow({
   }
 });
 
-const PROGRAMS = new Map<string, ReturnType<typeof workflow>>([
-  ["corpus.activity-then-return", corpusActivityThenReturn as never],
-  ["corpus.spawn-sleep-then-activity", corpusSpawnSleepThenActivity as never],
-  ["corpus.select-signal-or-timer", corpusSelectSignalOrTimer as never],
-  ["corpus.select-activity-or-timer", corpusSelectActivityOrTimer as never],
-  ["corpus.signal-then-publish", corpusSignalThenPublish as never],
-  ["corpus.sleep-after-signal", corpusSleepAfterSignal as never],
-  ["corpus.child-await", corpusChildAwait as never],
-  ["corpus.activity-map", corpusActivityMap as never],
-  ["corpus.markers", corpusMarkers as never],
-  ["corpus.continue-as-new", corpusContinueAsNew as never]
+// Typed as the `Registry` itself types a heterogeneous set of workflows.
+// `ReturnType<typeof workflow>` resolved the generic's `Input` to `never`, so
+// the map's own values were not assignable to `registerWorkflow`, and every
+// entry needed an `as never` to be stored at all.
+const PROGRAMS = new Map<string, WorkflowDefinition<any, any, any, string>>([
+  ["corpus.activity-then-return", corpusActivityThenReturn],
+  ["corpus.spawn-sleep-then-activity", corpusSpawnSleepThenActivity],
+  ["corpus.select-signal-or-timer", corpusSelectSignalOrTimer],
+  ["corpus.select-activity-or-timer", corpusSelectActivityOrTimer],
+  ["corpus.signal-then-publish", corpusSignalThenPublish],
+  ["corpus.sleep-after-signal", corpusSleepAfterSignal],
+  ["corpus.child-await", corpusChildAwait],
+  ["corpus.activity-map", corpusActivityMap],
+  ["corpus.markers", corpusMarkers],
+  ["corpus.continue-as-new", corpusContinueAsNew]
 ]);
 
 // ---------------------------------------------------------------------------
@@ -315,12 +321,14 @@ function optionalPayloadJson(payload: PayloadRef | undefined | null): Json {
 }
 
 function activityMapManifestJson(payload: PayloadRef): Json {
-  const manifest = decodePayload<{
-    readonly itemCount: number;
-    readonly pageLengths: readonly number[];
-  }>(payload);
+  // One ref, one type. The manifest read and the item read are the same
+  // payload seen through the same shape, and `readMapManifestItems` infers its
+  // `Page` from the accessor below, so the ref has to be the manifest type
+  // that accessor implies rather than a hand-written subset of it.
+  const manifestRef = payload as PayloadRef<PagedManifest<ActivityMapInputPage<Value1>>>;
+  const manifest = decodePayload(manifestRef);
   const items = readMapManifestItems(
-    payload as PayloadRef<{ readonly items: readonly PayloadRef[] }>,
+    manifestRef,
     (page: ActivityMapInputPage<Value1>) => page.items,
     "activity map input manifest"
   );

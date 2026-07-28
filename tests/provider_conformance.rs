@@ -178,6 +178,81 @@ fn quote_postgres_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
+/// Connects a Postgres backend bound to a fresh, uniquely named schema and runs
+/// `body` against it, or skips exactly as a hand-written `postgres_url_or_skip`
+/// block does.
+///
+/// The skip is still a skip and `DURUST_REQUIRE_POSTGRES` is still armed,
+/// because the decision is still `postgres_url_or_skip`'s, called with the
+/// caller's own `what` string: with `DURUST_POSTGRES_URL` unset the test returns
+/// early having done nothing, and with `DURUST_REQUIRE_POSTGRES` set that same
+/// call panics naming the caller. Nothing about that gate moved into this
+/// function; only the connect boilerplate did.
+///
+/// Teardown deliberately reproduces what the inline blocks did rather than
+/// improving on it: the schema is dropped after a body that *returns*, and is
+/// **left behind** when the body panics, because a sequential
+/// `drop_postgres_schema` at the end of an async block never ran on the panic
+/// path either. Catching the unwind to drop it would change which server-side
+/// state a failing run leaves for inspection, which is a behaviour change and
+/// not this refactor's business.
+#[cfg(feature = "postgres")]
+async fn with_postgres_schema<F, Fut, R>(what: &str, prefix: &str, body: F) -> PostgresRun<R>
+where
+    F: FnOnce(PostgresBackend, String, String) -> Fut,
+    Fut: Future<Output = R>,
+{
+    let Some(url) = postgres_url_or_skip(what) else {
+        return PostgresRun::SkippedNoPostgres;
+    };
+    let schema = postgres_test_schema(prefix);
+    let backend = PostgresBackend::connect_with_config(
+        PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+    )
+    .await
+    .unwrap();
+    let ran = body(backend, url.clone(), schema.clone()).await;
+    drop_postgres_schema(&url, &schema).await;
+    PostgresRun::Ran(ran)
+}
+
+/// What `with_postgres_schema` did — as a value the compiler will not let that
+/// function fabricate.
+///
+/// Folding 22 tests behind one helper concentrates their failure mode as well as
+/// their boilerplate. Were the `body(..)` call simply deleted from
+/// `with_postgres_schema`, all 22 would report `ok` having exercised nothing, and
+/// rustc would say only that a parameter went unused — a warning, in a suite that
+/// already has some. That is this repository's own recurring defect, moved up one
+/// level, and it did not exist while each test carried its own inline body.
+///
+/// `R` closes it. A type parameter cannot be conjured, so the single way to
+/// produce `Ran(R)` is to call `body`. Deleting the call stops compiling; keeping
+/// the shortcut means writing `SkippedNoPostgres` unconditionally, which is a
+/// deliberate line that says what it does rather than an absence nobody reviews.
+///
+/// Not `#[must_use]`, deliberately: the tests are right to ignore this, and 22
+/// `let _ =` bindings would only train people to ignore it. `dead_code` is
+/// allowed for the same reason — the payload exists to constrain this file's
+/// helper, not to be read back.
+#[cfg(feature = "postgres")]
+#[allow(dead_code)]
+enum PostgresRun<R> {
+    Ran(R),
+    SkippedNoPostgres,
+}
+
+/// `with_postgres_schema` for the majority of tests that never name the URL or
+/// the schema after connecting.
+#[cfg(feature = "postgres")]
+async fn with_postgres<F, Fut, R>(what: &str, prefix: &str, body: F) -> PostgresRun<R>
+where
+    F: FnOnce(PostgresBackend) -> Fut,
+    Fut: Future<Output = R>,
+{
+    with_postgres_schema(what, prefix, |backend, _url, _schema| body(backend)).await
+}
+
 #[durust::activity(name = "conformance.echo")]
 async fn echo(input: Input) -> durust::Result<u64> {
     Ok(input.value)
@@ -258,19 +333,13 @@ fn sqlite_provider_passes_basic_conformance() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_provider_passes_basic_conformance_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres provider conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("conformance");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        provider_conformance(backend).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres provider conformance",
+        "conformance",
+        |backend| async move {
+            provider_conformance(backend).await;
+        },
+    ));
 }
 
 #[test]
@@ -315,17 +384,7 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
             .expect("workflow task after heartbeat timeout");
         assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
 
-        let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
-                run_id,
-                after_event_id: EventId::ZERO,
-                up_to_event_id: EventId(100),
-                max_events: 100,
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .events;
+        let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
             panic!("expected ActivityTimedOut event after reopen");
         };
@@ -376,27 +435,21 @@ fn sqlite_workflow_lease_expiry_reclaims_and_fences_stale_holder_across_reopen()
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_workflow_lease_expiry_reclaims_and_fences_stale_holder_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres lease expiry conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("lease_expiry");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        workflow_lease_expiry_reclaims_and_fences_stale_holder(
-            backend,
-            "wf/postgres-lease-expiry",
-            "postgres-lease-expiry-workflows",
-            Duration::from_millis(50),
-            |backend| async move { backend },
-            || async { tokio::time::sleep(Duration::from_millis(120)).await },
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres lease expiry conformance",
+        "lease_expiry",
+        |backend| async move {
+            workflow_lease_expiry_reclaims_and_fences_stale_holder(
+                backend,
+                "wf/postgres-lease-expiry",
+                "postgres-lease-expiry-workflows",
+                Duration::from_millis(50),
+                |backend| async move { backend },
+                || async { tokio::time::sleep(Duration::from_millis(120)).await },
+            )
+            .await;
+        },
+    ));
 }
 
 #[test]
@@ -434,25 +487,19 @@ fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres delayed release conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("delayed_release");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        delayed_released_workflow_task_is_not_claimable_until_visible(
-            backend,
-            "wf/postgres-delayed-release",
-            "postgres-delayed-release-workflows",
-            || async { tokio::time::sleep(Duration::from_millis(40)).await },
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres delayed release conformance",
+        "delayed_release",
+        |backend| async move {
+            delayed_released_workflow_task_is_not_claimable_until_visible(
+                backend,
+                "wf/postgres-delayed-release",
+                "postgres-delayed-release-workflows",
+                || async { tokio::time::sleep(Duration::from_millis(40)).await },
+            )
+            .await;
+        },
+    ));
 }
 
 #[test]
@@ -470,12 +517,7 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             )
             .await
             .unwrap();
-        let claim_opts = ClaimWorkflowTaskOptions {
-            namespace: Namespace::default(),
-            task_queue: TaskQueue::new("sqlite-delayed-visibility-workflows"),
-            registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-            lease_duration: Duration::from_secs(30),
-        };
+        let claim_opts = workflow_claim_opts("sqlite-delayed-visibility-workflows");
         let claimed = backend
             .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-a"), claim_opts.clone())
             .await
@@ -553,27 +595,21 @@ fn sqlite_activity_retry_backoff_persists_across_reopen() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_activity_retry_backoff_delays_reclaim_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres retry backoff conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("retry_backoff");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        exponential_backoff_hides_retry_until_visible(
-            backend.clone(),
-            backend,
-            "postgres",
-            |_| async {
-                tokio::time::sleep(Duration::from_millis(1_000)).await;
-            },
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres retry backoff conformance",
+        "retry_backoff",
+        |backend| async move {
+            exponential_backoff_hides_retry_until_visible(
+                backend.clone(),
+                backend,
+                "postgres",
+                |_| async {
+                    tokio::time::sleep(Duration::from_millis(1_000)).await;
+                },
+            )
+            .await;
+        },
+    ));
 }
 
 // Shared exponential-backoff suite: a failing activity's retry is hidden from
@@ -601,12 +637,7 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .start_workflow::<workflow>(format!("wf/{prefix}-backoff"), &workflow_queue, input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new(&workflow_queue),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts(&workflow_queue);
     let claimed = backend
         .claim_workflow_task(WorkerId::new("backoff-scheduler"), claim_opts.clone())
         .await
@@ -722,17 +753,7 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         )
         .await
         .unwrap();
-    let history = retry_backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&retry_backend, run_id).await;
     assert!(matches!(
         history.last().expect("terminal event").data,
         HistoryEventData::WorkflowCompleted { .. }
@@ -862,17 +883,7 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
             durust::decode_payload::<String>(&payload).unwrap(),
             gc_projection
         );
-        let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
-                run_id,
-                after_event_id: EventId::ZERO,
-                up_to_event_id: EventId(100),
-                max_events: 100,
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .events;
+        let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
             panic!("expected hydrated workflow start");
         };
@@ -959,17 +970,7 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
             blob_store,
             config,
         );
-        let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
-                run_id,
-                after_event_id: EventId::ZERO,
-                up_to_event_id: EventId(100),
-                max_events: 100,
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .events;
+        let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
             panic!("expected hydrated workflow start after wrapper reopen");
         };
@@ -1034,17 +1035,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
             blob_store,
             config,
         );
-        let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
-                run_id,
-                after_event_id: EventId::ZERO,
-                up_to_event_id: EventId(100),
-                max_events: 100,
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .events;
+        let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
             panic!("expected hydrated workflow start after Garage wrapper reopen");
         };
@@ -1105,12 +1096,7 @@ fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
         let claim = inner
             .claim_workflow_task(
                 WorkerId::new("payload-backend-s3-upload-failure-worker"),
-                ClaimWorkflowTaskOptions {
-                    namespace: Namespace::default(),
-                    task_queue: TaskQueue::new("workflows"),
-                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                    lease_duration: Duration::from_secs(30),
-                },
+                workflow_claim_opts("workflows"),
             )
             .await
             .unwrap();
@@ -1230,12 +1216,7 @@ fn payload_backend_upload_failure_does_not_commit_missing_payload_ref() {
         let claim = inner
             .claim_workflow_task(
                 WorkerId::new("payload-backend-upload-failure-worker"),
-                ClaimWorkflowTaskOptions {
-                    namespace: Namespace::default(),
-                    task_queue: TaskQueue::new("workflows"),
-                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                    lease_duration: Duration::from_secs(30),
-                },
+                workflow_claim_opts("workflows"),
             )
             .await
             .unwrap();
@@ -1550,19 +1531,13 @@ fn inline_manifest_root_with_foreign_scheme_pages_completes_over_sqlite_provider
 #[cfg(feature = "postgres")]
 #[test]
 fn inline_manifest_root_with_foreign_scheme_pages_completes_over_postgres_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres foreign-page conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("foreign_page");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        inline_root_foreign_page_activity_map_completes(backend, "postgres").await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres foreign-page conformance",
+        "foreign_page",
+        |backend| async move {
+            inline_root_foreign_page_activity_map_completes(backend, "postgres").await;
+        },
+    ));
 }
 
 #[test]
@@ -1631,19 +1606,13 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
 #[cfg(feature = "postgres")]
 #[test]
 fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres custom-scheme conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("custom_scheme");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        custom_scheme_blob_store_round_trips_and_survives_gc(backend, "postgres").await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres custom-scheme conformance",
+        "custom_scheme",
+        |backend| async move {
+            custom_scheme_blob_store_round_trips_and_survives_gc(backend, "postgres").await;
+        },
+    ));
 }
 
 // Bug A pin, fresh-upload window: every write path uploads its blob before the
@@ -2244,17 +2213,7 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
             durust::decode_payload::<String>(&payload).unwrap(),
             gc_projection
         );
-        let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
-                run_id,
-                after_event_id: EventId::ZERO,
-                up_to_event_id: EventId(100),
-                max_events: 100,
-                max_bytes: usize::MAX,
-            })
-            .await
-            .unwrap()
-            .events;
+        let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
             panic!("expected hydrated workflow start from local object store");
         };
@@ -2295,12 +2254,7 @@ fn sqlite_local_blob_store_upload_failure_does_not_commit_missing_payload_ref() 
         let claim = backend
             .claim_workflow_task(
                 WorkerId::new("sqlite-local-upload-failure-worker"),
-                ClaimWorkflowTaskOptions {
-                    namespace: Namespace::default(),
-                    task_queue: TaskQueue::new("workflows"),
-                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                    lease_duration: Duration::from_secs(30),
-                },
+                workflow_claim_opts("workflows"),
             )
             .await
             .unwrap();
@@ -2782,12 +2736,7 @@ where
     );
     assert!(matches!(input, durust::PayloadRef::Inline { .. }));
 
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new(workflow_queue),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts(workflow_queue);
     let claimed = backend
         .claim_workflow_task(WorkerId::new("payload-offload-workflow"), claim_opts)
         .await
@@ -2819,15 +2768,9 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
                 query_projection: Some(durust::encode_payload(&projection).unwrap()),
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -2944,17 +2887,7 @@ where
         durust::PayloadRef::Inline { .. }
     ));
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id: run_id.clone(),
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id.clone()).await;
     let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
         panic!("expected activity scheduled event");
     };
@@ -3010,12 +2943,7 @@ where
         .unwrap()
         .run_id()
         .clone();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("payload-gc-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("payload-gc-workflows");
     let first_claim = backend
         .claim_workflow_task(
             WorkerId::new(format!("{prefix}-payload-gc-first")),
@@ -3032,7 +2960,6 @@ where
             first_claim.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
                 upsert_waits: vec![durust::WaitRecord {
                     wait_id,
                     run_id: run_id.clone(),
@@ -3041,14 +2968,8 @@ where
                     key: "replace".to_owned(),
                     ready_at: None,
                 }],
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
                 query_projection: Some(durust::encode_payload(&first_projection).unwrap()),
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3086,16 +3007,9 @@ where
             second_claim.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
                 consume_signals: vec![inbox.signal_id],
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
                 query_projection: Some(durust::encode_payload(&second_projection).unwrap()),
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3213,17 +3127,10 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
                     &requested,
                 )],
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3264,15 +3171,7 @@ where
                         result: durust::encode_payload(&child_result).unwrap(),
                     },
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3585,15 +3484,8 @@ where
                         ),
                     }),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3775,15 +3667,8 @@ where
                         ),
                     }),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -3906,12 +3791,7 @@ where
     let wrong_queue = backend
         .claim_workflow_task(
             WorkerId::new("wrong-queue-worker"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("other-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("other-workflows"),
         )
         .await
         .unwrap();
@@ -3934,12 +3814,7 @@ where
     let matched = backend
         .claim_workflow_task(
             WorkerId::new("matched-worker"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("claim-filter-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("claim-filter-workflows"),
         )
         .await
         .unwrap();
@@ -4025,12 +3900,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("worker"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("stale-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("stale-workflows"),
         )
         .await
         .unwrap()
@@ -4040,16 +3910,7 @@ where
             claimed.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId::ZERO,
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -4070,12 +3931,7 @@ where
         .start_workflow::<workflow>("wf/batch-commit-b", "batch-workflows", input(12))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("batch-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("batch-workflows");
     let mut claimed = backend
         .claim_workflow_tasks(
             WorkerId::new("batch-worker"),
@@ -4138,12 +3994,7 @@ where
         .start_workflow::<workflow>("wf/release", "release-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("release-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("release-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("worker-a"), claim_opts.clone())
         .await
@@ -4182,12 +4033,7 @@ async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advanc
         .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new(workflow_queue),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts(workflow_queue);
     let claimed = backend
         .claim_workflow_task(WorkerId::new("worker-a"), claim_opts.clone())
         .await
@@ -4236,12 +4082,7 @@ where
         durust::QueryProjectionOutcome::NotFound
     );
 
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("query-raw-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("query-raw-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("query-raw-worker"), claim_opts)
         .await
@@ -4257,16 +4098,8 @@ where
             claimed.claim.clone(),
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId::ZERO,
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
                 query_projection: Some(stale_payload),
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -4280,12 +4113,7 @@ where
     let reclaimed = backend
         .claim_workflow_task(
             WorkerId::new("query-raw-reclaimer"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("query-raw-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("query-raw-workflows"),
         )
         .await
         .unwrap()
@@ -4296,16 +4124,8 @@ where
             reclaimed.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
                 query_projection: Some(projection_payload.clone()),
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -4381,15 +4201,7 @@ where
     B: DurableBackend,
 {
     backend
-        .claim_workflow_task(
-            WorkerId::new(worker),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new(queue),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
-        )
+        .claim_workflow_task(WorkerId::new(worker), workflow_claim_opts(queue))
         .await
         .unwrap()
         .expect("workflow task")
@@ -4398,16 +4210,8 @@ where
 fn projection_only_commit(payload: durust::PayloadRef) -> WorkflowTaskCommit {
     WorkflowTaskCommit {
         expected_tail_event_id: EventId(1),
-        append_events: Vec::new(),
-        upsert_waits: Vec::new(),
-        schedule_activities: Vec::new(),
-        schedule_activity_maps: Vec::new(),
-        schedule_child_workflow_maps: Vec::new(),
-        start_child_workflows: Vec::new(),
-        consume_signals: Vec::new(),
-        delete_waits: Vec::new(),
-        cancel_commands: Vec::new(),
         query_projection: Some(payload),
+        ..WorkflowTaskCommit::default()
     }
 }
 
@@ -4573,12 +4377,7 @@ where
         let claimed = backend
             .claim_workflow_task(
                 WorkerId::new(format!("blob-metadata-mismatch-{case}")),
-                ClaimWorkflowTaskOptions {
-                    namespace: Namespace::default(),
-                    task_queue: TaskQueue::new("blob-metadata-mismatch-workflows"),
-                    registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                    lease_duration: Duration::from_secs(30),
-                },
+                workflow_claim_opts("blob-metadata-mismatch-workflows"),
             )
             .await
             .unwrap()
@@ -4589,16 +4388,8 @@ where
                 claimed.claim,
                 WorkflowTaskCommit {
                     expected_tail_event_id: EventId(1),
-                    append_events: Vec::new(),
-                    upsert_waits: Vec::new(),
-                    schedule_activities: Vec::new(),
-                    schedule_activity_maps: Vec::new(),
-                    schedule_child_workflow_maps: Vec::new(),
-                    start_child_workflows: Vec::new(),
-                    consume_signals: Vec::new(),
-                    delete_waits: Vec::new(),
-                    cancel_commands: Vec::new(),
                     query_projection: Some(mismatched),
+                    ..WorkflowTaskCommit::default()
                 },
             )
             .await
@@ -4622,12 +4413,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("version-index-worker"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("version-index-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("version-index-workflows"),
         )
         .await
         .unwrap()
@@ -4645,15 +4431,7 @@ where
                         version: 1,
                     }),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -4726,12 +4504,7 @@ where
         .start_workflow::<workflow>("wf/continue-conformance", "continue-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("continue-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("continue-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("continue-worker"), claim_opts.clone())
         .await
@@ -4747,15 +4520,7 @@ where
                         input: durust::encode_payload(&7_u64).unwrap(),
                     },
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -4767,17 +4532,7 @@ where
         }
     );
 
-    let old_history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id: first_run_id.clone(),
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let old_history = stream_history(&backend, first_run_id.clone()).await;
     assert_eq!(old_history.len(), 2);
     assert!(matches!(
         old_history[1].data,
@@ -4796,17 +4551,7 @@ where
     );
     assert_eq!(next.reason, durust::WorkflowTaskReason::WorkflowStarted);
     assert_eq!(next.replay_target_event_id, EventId(1));
-    let new_history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id: next.run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let new_history = stream_history(&backend, next.run_id).await;
     assert_eq!(new_history.len(), 1);
     let HistoryEventData::WorkflowStarted { input, .. } = &new_history[0].data else {
         panic!("expected new run start");
@@ -4912,12 +4657,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("signal-consumer"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("signal-inbox-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("signal-inbox-workflows"),
         )
         .await
         .unwrap()
@@ -4927,16 +4667,8 @@ where
             claimed.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId(1),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
                 consume_signals: vec![first_inbox.signal_id],
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -5579,12 +5311,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("terminal-cleanup-scheduler"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("terminal-cleanup-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("terminal-cleanup-workflows"),
         )
         .await
         .unwrap()
@@ -5762,12 +5489,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("can-signal-scheduler"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("can-signal-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("can-signal-workflows"),
         )
         .await
         .unwrap()
@@ -5842,12 +5564,7 @@ where
     let claimed = backend
         .claim_workflow_task(
             WorkerId::new("late-completion-scheduler"),
-            ClaimWorkflowTaskOptions {
-                namespace: Namespace::default(),
-                task_queue: TaskQueue::new("late-completion-workflows"),
-                registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-                lease_duration: Duration::from_secs(30),
-            },
+            workflow_claim_opts("late-completion-workflows"),
         )
         .await
         .unwrap()
@@ -5948,12 +5665,7 @@ where
         .start_workflow::<workflow>("wf/timer-wait", "timer-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("timer-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("timer-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("timer-scheduler"), claim_opts.clone())
         .await
@@ -5983,14 +5695,7 @@ where
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -6053,12 +5758,7 @@ where
         .start_workflow::<workflow>("wf/activity-retry", "retry-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("retry-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("retry-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("retry-scheduler"), claim_opts.clone())
         .await
@@ -6092,15 +5792,8 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -6161,17 +5854,7 @@ where
         .expect("activity failed workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityFailed);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
     assert!(matches!(
         history[1].data,
@@ -6197,12 +5880,7 @@ where
         )
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("non-retryable-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("non-retryable-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("non-retryable-scheduler"), claim_opts.clone())
         .await
@@ -6233,15 +5911,8 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -6289,17 +5960,7 @@ where
         .expect("activity failed workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityFailed);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
         panic!("expected final ActivityFailed event");
     };
@@ -6315,12 +5976,7 @@ where
         .start_workflow::<workflow>("wf/activity-timeout", "timeout-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("timeout-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("timeout-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("timeout-scheduler"), claim_opts.clone())
         .await
@@ -6351,15 +6007,8 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -6454,17 +6103,7 @@ where
         .expect("activity timed-out workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
     assert!(matches!(
         history[1].data,
@@ -6551,17 +6190,7 @@ where
         .expect("heartbeat timeout workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
         panic!("expected final ActivityTimedOut event");
     };
@@ -6641,17 +6270,7 @@ where
         .expect("heartbeat timeout workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
         panic!("expected final ActivityTimedOut event");
@@ -6678,12 +6297,7 @@ where
         .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new(workflow_queue),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts(workflow_queue);
     let claimed = backend
         .claim_workflow_task(WorkerId::new("heartbeat-scheduler"), claim_opts.clone())
         .await
@@ -6713,15 +6327,8 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                upsert_waits: Vec::new(),
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -6744,12 +6351,7 @@ where
         .start_workflow::<workflow>("wf/lease-unexpired", "lease-unexpired-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("lease-unexpired-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("lease-unexpired-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("lease-unexpired-holder"), claim_opts.clone())
         .await
@@ -6909,12 +6511,7 @@ where
         .start_workflow::<workflow>(workflow_id, workflow_queue, input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new(workflow_queue),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts(workflow_queue);
     let claimed = backend
         .claim_workflow_task(WorkerId::new("timeoutless-scheduler"), claim_opts.clone())
         .await
@@ -7586,27 +7183,21 @@ fn sqlite_heartbeating_timeoutless_activity_survives_lease_periods() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_heartbeating_timeoutless_activity_survives_lease_periods_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres heartbeat lease conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("hb_timeoutless");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        heartbeating_timeoutless_activity_survives_lease_periods(
-            backend,
-            "wf/postgres-hb-timeoutless",
-            "postgres-hb-timeoutless-workflows",
-            "postgres-hb-timeoutless-activities",
-            Duration::from_millis(500),
-            || async { tokio::time::sleep(Duration::from_millis(200)).await },
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres heartbeat lease conformance",
+        "hb_timeoutless",
+        |backend| async move {
+            heartbeating_timeoutless_activity_survives_lease_periods(
+                backend,
+                "wf/postgres-hb-timeoutless",
+                "postgres-hb-timeoutless-workflows",
+                "postgres-hb-timeoutless-activities",
+                Duration::from_millis(500),
+                || async { tokio::time::sleep(Duration::from_millis(200)).await },
+            )
+            .await;
+        },
+    ));
 }
 
 async fn cancel_commands_clear_activity_tasks<B>(backend: B)
@@ -7618,12 +7209,7 @@ where
         .start_workflow::<workflow>("wf/cancel-command", "cancel-command-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("cancel-command-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("cancel-command-workflows");
     let activity_command = durust::command_id(&run_id, 1);
     let timer_command = durust::command_id(&run_id, 2);
     let activity_input = durust::encode_payload(&Input { value: 5 }).unwrap();
@@ -7681,13 +7267,7 @@ where
                     ready_at: Some(durust::TimestampMs(10)),
                 }],
                 schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -7728,16 +7308,8 @@ where
             claimed.claim,
             WorkflowTaskCommit {
                 expected_tail_event_id: EventId(4),
-                append_events: Vec::new(),
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
                 cancel_commands: vec![activity_command],
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -7860,15 +7432,7 @@ where
                         result: result.clone(),
                     },
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -8108,17 +7672,10 @@ where
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
-                schedule_activity_maps: Vec::new(),
-                schedule_child_workflow_maps: Vec::new(),
                 start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
                     &requested,
                 )],
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -8455,19 +8012,13 @@ fn sqlite_child_workflow_map_fail_fast_history_strings_are_pinned() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_child_workflow_map_fail_fast_history_strings_are_pinned_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres fail-fast history strings") else {
-            return;
-        };
-        let schema = postgres_test_schema("failfaststrings");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        child_workflow_map_fail_fast_history_strings(backend, &FAIL_FAST_HISTORY_STRINGS).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres fail-fast history strings",
+        "failfaststrings",
+        |backend| async move {
+            child_workflow_map_fail_fast_history_strings(backend, &FAIL_FAST_HISTORY_STRINGS).await;
+        },
+    ));
 }
 
 fn assert_compact_child_workflow_map_parent_history(history: &[durust::HistoryEvent]) {
@@ -8506,15 +8057,7 @@ fn terminal_parent_commit(expected_tail_event_id: EventId) -> WorkflowTaskCommit
                 result: durust::encode_payload(&()).unwrap(),
             },
         )],
-        upsert_waits: Vec::new(),
-        schedule_activities: Vec::new(),
-        schedule_activity_maps: Vec::new(),
-        schedule_child_workflow_maps: Vec::new(),
-        start_child_workflows: Vec::new(),
-        consume_signals: Vec::new(),
-        delete_waits: Vec::new(),
-        cancel_commands: Vec::new(),
-        query_projection: None,
+        ..WorkflowTaskCommit::default()
     }
 }
 
@@ -8544,12 +8087,7 @@ where
         .start_workflow::<workflow>("wf/activity-map", "map-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("map-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("map-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("map-scheduler"), claim_opts.clone())
         .await
@@ -8609,15 +8147,8 @@ where
                         fingerprint,
                     }),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -8719,17 +8250,7 @@ where
         durust::WorkflowTaskReason::ActivityMapCompleted
     );
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
     assert!(matches!(
         history[1].data,
@@ -8764,12 +8285,7 @@ where
         .start_workflow::<workflow>("wf/activity-map-failure", "map-failure-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("map-failure-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("map-failure-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("map-failure-scheduler"), claim_opts.clone())
         .await
@@ -8825,15 +8341,8 @@ where
                         ),
                     }),
                 )],
-                upsert_waits: Vec::new(),
-                schedule_activities: Vec::new(),
                 schedule_activity_maps: vec![map_task],
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -8927,17 +8436,7 @@ where
         .expect("map-failed workflow task");
     assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityMapFailed);
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
     let HistoryEventData::ActivityMapFailed(failed) = &history[2].data else {
         panic!("expected compact ActivityMapFailed event");
@@ -10128,12 +9627,7 @@ where
         .start_workflow::<workflow>("wf/cancel-cleanup", "cancel-workflows", input(5))
         .await
         .unwrap();
-    let claim_opts = ClaimWorkflowTaskOptions {
-        namespace: Namespace::default(),
-        task_queue: TaskQueue::new("cancel-workflows"),
-        registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
-        lease_duration: Duration::from_secs(30),
-    };
+    let claim_opts = workflow_claim_opts("cancel-workflows");
     let claimed = backend
         .claim_workflow_task(WorkerId::new("cancel-scheduler"), claim_opts.clone())
         .await
@@ -10236,12 +9730,7 @@ where
                     &scheduled_activity,
                 )],
                 schedule_activity_maps: vec![map_task],
-                schedule_child_workflow_maps: Vec::new(),
-                start_child_workflows: Vec::new(),
-                consume_signals: Vec::new(),
-                delete_waits: Vec::new(),
-                cancel_commands: Vec::new(),
-                query_projection: None,
+                ..WorkflowTaskCommit::default()
             },
         )
         .await
@@ -10344,17 +9833,7 @@ where
         .await;
     assert!(matches!(signal_after_cancel, Err(Error::TerminalWorkflow)));
 
-    let history = backend
-        .stream_history(durust::StreamHistoryRequest {
-            run_id,
-            after_event_id: EventId::ZERO,
-            up_to_event_id: EventId(100),
-            max_events: 100,
-            max_bytes: usize::MAX,
-        })
-        .await
-        .unwrap()
-        .events;
+    let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 5);
     assert!(matches!(history[1].data, HistoryEventData::TimerStarted(_)));
     assert!(matches!(
@@ -10960,19 +10439,13 @@ fn sqlite_activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres zero-bound map conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapzerobound");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation(backend).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres zero-bound map conformance",
+        "mapzerobound",
+        |backend| async move {
+            activity_map_zero_max_in_flight_is_rejected_at_descriptor_creation(backend).await;
+        },
+    ));
 }
 
 /// Behaviour change: a failed activity map tombstones its still-pending
@@ -11121,19 +10594,13 @@ fn sqlite_activity_map_failure_tombstones_pending_sibling_items() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_activity_map_failure_tombstones_pending_sibling_items_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres map abandon conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapabandon");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        activity_map_failure_tombstones_pending_sibling_items(backend).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres map abandon conformance",
+        "mapabandon",
+        |backend| async move {
+            activity_map_failure_tombstones_pending_sibling_items(backend).await;
+        },
+    ));
 }
 
 /// Behaviour change 6H: a child-map item whose generated workflow id is
@@ -11291,19 +10758,13 @@ fn sqlite_child_workflow_map_id_collision_holds_the_in_flight_bound() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_child_workflow_map_id_collision_holds_the_in_flight_bound_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres child map collision conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("childmapcollision");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        child_workflow_map_id_collision_holds_the_in_flight_bound(backend).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres child map collision conformance",
+        "childmapcollision",
+        |backend| async move {
+            child_workflow_map_id_collision_holds_the_in_flight_bound(backend).await;
+        },
+    ));
 }
 
 /// The materialization effect is a contiguous *range*, and Postgres turns each
@@ -11392,19 +10853,13 @@ fn sqlite_activity_map_materializes_a_large_batch_in_one_statement() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_activity_map_materializes_a_large_batch_in_one_statement_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres map batch conformance") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapbatch");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        activity_map_materializes_a_large_batch_in_one_statement(backend).await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres map batch conformance",
+        "mapbatch",
+        |backend| async move {
+            activity_map_materializes_a_large_batch_in_one_statement(backend).await;
+        },
+    ));
 }
 
 /// Row 6L: a child-map item whose `workflow_instances` row is absent after the
@@ -11436,84 +10891,79 @@ fn postgres_activity_map_materializes_a_large_batch_in_one_statement_when_config
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres vanishing child map item test") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapvanish");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-
-        let prefix = "wf/map-vanish/item";
-        let parent_queue = "map-vanish-parent";
-        let child_queue = "map-vanish-children";
-        let client = Client::new(backend.clone());
-        let parent_run_id = client
-            .start_workflow::<workflow>("wf/map-vanish", parent_queue, input(1))
-            .await
-            .unwrap();
-        let claimed = backend
-            .claim_workflow_task(
-                WorkerId::new("map-vanish-scheduler"),
-                workflow_claim_opts(parent_queue),
+    block_on_tokio(with_postgres_schema(
+        "Postgres vanishing child map item test",
+        "mapvanish",
+        |backend, url, schema| async move {
+            let prefix = "wf/map-vanish/item";
+            let parent_queue = "map-vanish-parent";
+            let child_queue = "map-vanish-children";
+            let client = Client::new(backend.clone());
+            let parent_run_id = client
+                .start_workflow::<workflow>("wf/map-vanish", parent_queue, input(1))
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("map-vanish-scheduler"),
+                    workflow_claim_opts(parent_queue),
+                )
+                .await
+                .unwrap()
+                .expect("parent workflow task");
+            let command_id = durust::command_id(&parent_run_id, 1);
+            let input_manifest = durust::encode_activity_map_input_manifest(
+                (0..2_u64)
+                    .map(|value| durust::encode_payload(&value).unwrap())
+                    .collect(),
+                2,
             )
-            .await
-            .unwrap()
-            .expect("parent workflow task");
-        let command_id = durust::command_id(&parent_run_id, 1);
-        let input_manifest = durust::encode_activity_map_input_manifest(
-            (0..2_u64)
-                .map(|value| durust::encode_payload(&value).unwrap())
-                .collect(),
-            2,
-        )
-        .unwrap();
-        let workflow_type = WorkflowType::new("conformance.workflow", 1);
-        let task_queue = TaskQueue::new(child_queue);
-        let map_task = ChildWorkflowMapTask {
-            map_command_id: command_id.clone(),
-            workflow_type: workflow_type.clone(),
-            task_queue: task_queue.clone(),
-            input_manifest: input_manifest.clone(),
-            result_manifest_name: "vanish-results".to_owned(),
-            workflow_id_prefix: prefix.to_owned(),
-            max_in_flight: 2,
-            parent_close_policy: durust::ParentClosePolicy::Abandon,
-            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-        };
-        let commit = || WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
-            append_events: vec![durust::NewHistoryEvent::new(
-                HistoryEventData::ChildWorkflowMapScheduled(durust::ChildWorkflowMapScheduled {
-                    command_id: command_id.clone(),
-                    workflow_type: workflow_type.clone(),
-                    task_queue: task_queue.clone(),
-                    input_manifest: input_manifest.clone(),
-                    result_manifest_name: "vanish-results".to_owned(),
-                    workflow_id_prefix: prefix.to_owned(),
-                    max_in_flight: 2,
-                    parent_close_policy: durust::ParentClosePolicy::Abandon,
-                    failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                    fingerprint: durust::child_workflow_map_fingerprint(
-                        workflow_type.clone(),
-                        durust::payload_digest(&input_manifest),
-                        "vanish-results".to_owned(),
-                        prefix.to_owned(),
-                        2,
-                        task_queue.clone(),
-                        durust::ParentClosePolicy::Abandon,
-                        durust::ChildWorkflowMapFailureMode::CollectAll,
+            .unwrap();
+            let workflow_type = WorkflowType::new("conformance.workflow", 1);
+            let task_queue = TaskQueue::new(child_queue);
+            let map_task = ChildWorkflowMapTask {
+                map_command_id: command_id.clone(),
+                workflow_type: workflow_type.clone(),
+                task_queue: task_queue.clone(),
+                input_manifest: input_manifest.clone(),
+                result_manifest_name: "vanish-results".to_owned(),
+                workflow_id_prefix: prefix.to_owned(),
+                max_in_flight: 2,
+                parent_close_policy: durust::ParentClosePolicy::Abandon,
+                failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+            };
+            let commit = || WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowMapScheduled(
+                        durust::ChildWorkflowMapScheduled {
+                            command_id: command_id.clone(),
+                            workflow_type: workflow_type.clone(),
+                            task_queue: task_queue.clone(),
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "vanish-results".to_owned(),
+                            workflow_id_prefix: prefix.to_owned(),
+                            max_in_flight: 2,
+                            parent_close_policy: durust::ParentClosePolicy::Abandon,
+                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+                            fingerprint: durust::child_workflow_map_fingerprint(
+                                workflow_type.clone(),
+                                durust::payload_digest(&input_manifest),
+                                "vanish-results".to_owned(),
+                                prefix.to_owned(),
+                                2,
+                                task_queue.clone(),
+                                durust::ParentClosePolicy::Abandon,
+                                durust::ChildWorkflowMapFailureMode::CollectAll,
+                            ),
+                        },
                     ),
-                }),
-            )],
-            schedule_child_workflow_maps: vec![map_task.clone()],
-            ..WorkflowTaskCommit::default()
-        };
+                )],
+                schedule_child_workflow_maps: vec![map_task.clone()],
+                ..WorkflowTaskCommit::default()
+            };
 
-        run_postgres_sql(
+            run_postgres_sql(
             &url,
             &format!(
                 "create function {schema}.durust_test_swallow_insert() returns trigger as $fn$ \
@@ -11528,66 +10978,65 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
         )
         .await;
 
-        let err = backend
-            .commit_workflow_task(claimed.claim.clone(), commit())
-            .await
-            .expect_err("a vanished child map item must not be silently skipped");
-        match &err {
-            durust::Error::Backend(message) => assert_eq!(
-                message,
-                &format!(
-                    "child workflow map `{}`:{} item 0 could not be started: \
+            let err = backend
+                .commit_workflow_task(claimed.claim.clone(), commit())
+                .await
+                .expect_err("a vanished child map item must not be silently skipped");
+            match &err {
+                durust::Error::Backend(message) => assert_eq!(
+                    message,
+                    &format!(
+                        "child workflow map `{}`:{} item 0 could not be started: \
                      workflow instance `{prefix}/0` was deleted mid-transaction",
-                    command_id.run_id, command_id.seq.0
-                )
-            ),
-            other => panic!("expected a backend error naming the ordinal, got {other:?}"),
-        }
-        // The whole commit rolled back, so nothing half-materialized: no
-        // descriptor, no scheduled event, no partial fanout.
-        assert_eq!(
-            stream_history(&backend, parent_run_id.clone())
-                .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![durust::HistoryEventType::WorkflowStarted],
-        );
+                        command_id.run_id, command_id.seq.0
+                    )
+                ),
+                other => panic!("expected a backend error naming the ordinal, got {other:?}"),
+            }
+            // The whole commit rolled back, so nothing half-materialized: no
+            // descriptor, no scheduled event, no partial fanout.
+            assert_eq!(
+                stream_history(&backend, parent_run_id.clone())
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![durust::HistoryEventType::WorkflowStarted],
+            );
 
-        run_postgres_sql(
-            &url,
-            &format!(
-                "drop trigger durust_test_swallow_insert on {schema}.workflow_instances;",
-                schema = quote_postgres_identifier(&schema),
-            ),
-        )
-        .await;
-        backend
-            .commit_workflow_task(claimed.claim, commit())
-            .await
-            .expect("the retried commit starts the child the trigger had swallowed");
-        dispatch_child_map_starts(&backend).await;
-        let mut started = BTreeSet::new();
-        for index in 0..4 {
-            let Some(child) = backend
-                .claim_workflow_task(
-                    WorkerId::new(format!("map-vanish-{index}")),
-                    workflow_claim_opts(child_queue),
-                )
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "drop trigger durust_test_swallow_insert on {schema}.workflow_instances;",
+                    schema = quote_postgres_identifier(&schema),
+                ),
+            )
+            .await;
+            backend
+                .commit_workflow_task(claimed.claim, commit())
                 .await
-                .unwrap()
-            else {
-                break;
-            };
-            started.insert(child.workflow_id.0.clone());
-        }
-        assert_eq!(
-            started,
-            BTreeSet::from([format!("{prefix}/0"), format!("{prefix}/1")]),
-        );
-
-        drop_postgres_schema(&url, &schema).await;
-    });
+                .expect("the retried commit starts the child the trigger had swallowed");
+            dispatch_child_map_starts(&backend).await;
+            let mut started = BTreeSet::new();
+            for index in 0..4 {
+                let Some(child) = backend
+                    .claim_workflow_task(
+                        WorkerId::new(format!("map-vanish-{index}")),
+                        workflow_claim_opts(child_queue),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    break;
+                };
+                started.insert(child.workflow_id.0.clone());
+            }
+            assert_eq!(
+                started,
+                BTreeSet::from([format!("{prefix}/0"), format!("{prefix}/1")]),
+            );
+        },
+    ));
 }
 
 /// The plain child-start sibling of the case above: `InlineChildStartOutcome`'s
@@ -11606,68 +11055,61 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres vanishing child start test") else {
-            return;
-        };
-        let schema = postgres_test_schema("childvanish");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-
-        let child_id = "wf/child-vanish/child";
-        let client = Client::new(backend.clone());
-        let parent_run_id = client
-            .start_workflow::<workflow>("wf/child-vanish", "child-vanish-parent", input(1))
-            .await
-            .unwrap();
-        let claimed = backend
-            .claim_workflow_task(
-                WorkerId::new("child-vanish-scheduler"),
-                workflow_claim_opts("child-vanish-parent"),
-            )
-            .await
-            .unwrap()
-            .expect("parent workflow task");
-        let command_id = durust::command_id(&parent_run_id, 1);
-        let commit = || WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
-            append_events: vec![durust::NewHistoryEvent::new(
-                HistoryEventData::ChildWorkflowStartRequested(
-                    durust::ChildWorkflowStartRequested {
-                        command_id: command_id.clone(),
-                        workflow_type: WorkflowType::new("conformance.workflow", 1),
-                        workflow_id: durust::WorkflowId::new(child_id),
-                        task_queue: TaskQueue::new("child-vanish-children"),
-                        input: durust::encode_payload(&Input { value: 1 }).unwrap(),
-                        parent_close_policy: durust::ParentClosePolicy::Abandon,
-                        fingerprint: durust::child_workflow_fingerprint(
-                            WorkflowType::new("conformance.workflow", 1),
-                            durust::WorkflowId::new(child_id),
-                            durust::payload_digest(
-                                &durust::encode_payload(&Input { value: 1 }).unwrap(),
+    block_on_tokio(with_postgres_schema(
+        "Postgres vanishing child start test",
+        "childvanish",
+        |backend, url, schema| async move {
+            let child_id = "wf/child-vanish/child";
+            let client = Client::new(backend.clone());
+            let parent_run_id = client
+                .start_workflow::<workflow>("wf/child-vanish", "child-vanish-parent", input(1))
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("child-vanish-scheduler"),
+                    workflow_claim_opts("child-vanish-parent"),
+                )
+                .await
+                .unwrap()
+                .expect("parent workflow task");
+            let command_id = durust::command_id(&parent_run_id, 1);
+            let commit = || WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::ChildWorkflowStartRequested(
+                        durust::ChildWorkflowStartRequested {
+                            command_id: command_id.clone(),
+                            workflow_type: WorkflowType::new("conformance.workflow", 1),
+                            workflow_id: durust::WorkflowId::new(child_id),
+                            task_queue: TaskQueue::new("child-vanish-children"),
+                            input: durust::encode_payload(&Input { value: 1 }).unwrap(),
+                            parent_close_policy: durust::ParentClosePolicy::Abandon,
+                            fingerprint: durust::child_workflow_fingerprint(
+                                WorkflowType::new("conformance.workflow", 1),
+                                durust::WorkflowId::new(child_id),
+                                durust::payload_digest(
+                                    &durust::encode_payload(&Input { value: 1 }).unwrap(),
+                                ),
+                                TaskQueue::new("child-vanish-children"),
+                                durust::ParentClosePolicy::Abandon,
                             ),
-                            TaskQueue::new("child-vanish-children"),
-                            durust::ParentClosePolicy::Abandon,
-                        ),
-                    },
-                ),
-            )],
-            start_child_workflows: vec![durust::ChildStartOutboxMessage {
-                command_id: command_id.clone(),
-                workflow_type: WorkflowType::new("conformance.workflow", 1),
-                workflow_id: durust::WorkflowId::new(child_id),
-                task_queue: TaskQueue::new("child-vanish-children"),
-                input: durust::encode_payload(&Input { value: 1 }).unwrap(),
-                parent_close_policy: durust::ParentClosePolicy::Abandon,
-                child_map_item: None,
-            }],
-            ..WorkflowTaskCommit::default()
-        };
+                        },
+                    ),
+                )],
+                start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                    command_id: command_id.clone(),
+                    workflow_type: WorkflowType::new("conformance.workflow", 1),
+                    workflow_id: durust::WorkflowId::new(child_id),
+                    task_queue: TaskQueue::new("child-vanish-children"),
+                    input: durust::encode_payload(&Input { value: 1 }).unwrap(),
+                    parent_close_policy: durust::ParentClosePolicy::Abandon,
+                    child_map_item: None,
+                }],
+                ..WorkflowTaskCommit::default()
+            };
 
-        run_postgres_sql(
+            run_postgres_sql(
             &url,
             &format!(
                 "create function {schema}.durust_test_swallow_child() returns trigger as $fn$ \
@@ -11682,53 +11124,52 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
         )
         .await;
 
-        let err = backend
-            .commit_workflow_task(claimed.claim.clone(), commit())
-            .await
-            .expect_err("a vanished plain child start must not be silently dropped");
-        match &err {
-            durust::Error::Backend(message) => assert_eq!(
-                message,
-                &format!(
-                    "child workflow `{}`:{} could not be started: \
+            let err = backend
+                .commit_workflow_task(claimed.claim.clone(), commit())
+                .await
+                .expect_err("a vanished plain child start must not be silently dropped");
+            match &err {
+                durust::Error::Backend(message) => assert_eq!(
+                    message,
+                    &format!(
+                        "child workflow `{}`:{} could not be started: \
                      workflow instance `{child_id}` was deleted mid-transaction",
-                    command_id.run_id, command_id.seq.0
-                )
-            ),
-            other => panic!("expected a backend error naming the child, got {other:?}"),
-        }
-        assert_eq!(
-            stream_history(&backend, parent_run_id.clone())
-                .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![durust::HistoryEventType::WorkflowStarted],
-            "the whole commit must roll back",
-        );
+                        command_id.run_id, command_id.seq.0
+                    )
+                ),
+                other => panic!("expected a backend error naming the child, got {other:?}"),
+            }
+            assert_eq!(
+                stream_history(&backend, parent_run_id.clone())
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![durust::HistoryEventType::WorkflowStarted],
+                "the whole commit must roll back",
+            );
 
-        run_postgres_sql(
-            &url,
-            &format!(
-                "drop trigger durust_test_swallow_child on {schema}.workflow_instances;",
-                schema = quote_postgres_identifier(&schema),
-            ),
-        )
-        .await;
-        backend
-            .commit_workflow_task(claimed.claim, commit())
-            .await
-            .expect("the retried commit starts the child the trigger had swallowed");
-        assert!(
-            stream_history(&backend, parent_run_id)
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "drop trigger durust_test_swallow_child on {schema}.workflow_instances;",
+                    schema = quote_postgres_identifier(&schema),
+                ),
+            )
+            .await;
+            backend
+                .commit_workflow_task(claimed.claim, commit())
                 .await
-                .iter()
-                .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowStarted(_))),
-            "the retry appends the started fact the first attempt could not",
-        );
-
-        drop_postgres_schema(&url, &schema).await;
-    });
+                .expect("the retried commit starts the child the trigger had swallowed");
+            assert!(
+                stream_history(&backend, parent_run_id)
+                    .await
+                    .iter()
+                    .any(|event| matches!(event.data, HistoryEventData::ChildWorkflowStarted(_))),
+                "the retry appends the started fact the first attempt could not",
+            );
+        },
+    ));
 }
 
 /// Row 6G's upgrade half: a database written *before* empty manifests completed
@@ -11747,115 +11188,108 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres empty-map upgrade repair test") else {
-            return;
-        };
-        let schema = postgres_test_schema("maprepair");
-        let quoted = quote_postgres_identifier(&schema);
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres_schema(
+        "Postgres empty-map upgrade repair test",
+        "maprepair",
+        |backend, url, schema| async move {
+            let quoted = quote_postgres_identifier(&schema);
 
-        let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
-            &backend,
-            "wf/map-repair",
-            "map-repair-workflows",
-            "map-repair-activities",
-            0,
-            2,
-            durust::RetryPolicy::none(),
-            None,
-        )
-        .await;
-        scheduled.expect("the empty map completes when it is scheduled");
-        assert_eq!(stream_history(&backend, run_id.clone()).await.len(), 3);
+            let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
+                &backend,
+                "wf/map-repair",
+                "map-repair-workflows",
+                "map-repair-activities",
+                0,
+                2,
+                durust::RetryPolicy::none(),
+                None,
+            )
+            .await;
+            scheduled.expect("the empty map completes when it is scheduled");
+            assert_eq!(stream_history(&backend, run_id.clone()).await.len(), 3);
 
-        // Rewind to the pre-upgrade shape: descriptor open, no terminal fact,
-        // tail back at the scheduling event, parent asleep.
-        run_postgres_sql(
-            &url,
-            &format!(
-                "delete from {quoted}.history_events \
+            // Rewind to the pre-upgrade shape: descriptor open, no terminal fact,
+            // tail back at the scheduling event, parent asleep.
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "delete from {quoted}.history_events \
                    where run_id = '{run_id}' and event_type = 'activity_map_completed'; \
                  update {quoted}.workflow_instances \
                    set current_event_id = 2, ready_reason = null where run_id = '{run_id}'; \
                  update {quoted}.activity_maps set completed = false where run_id = '{run_id}'; \
                  delete from {quoted}.meta where key = 'empty_map_repair_done';",
-                run_id = run_id.0,
-            ),
-        )
-        .await;
-        assert_eq!(
-            stream_history(&backend, run_id.clone()).await.len(),
-            2,
-            "the rewind must reproduce the stall"
-        );
-        assert!(
-            backend
+                    run_id = run_id.0,
+                ),
+            )
+            .await;
+            assert_eq!(
+                stream_history(&backend, run_id.clone()).await.len(),
+                2,
+                "the rewind must reproduce the stall"
+            );
+            assert!(
+                backend
+                    .claim_workflow_task(
+                        WorkerId::new("map-repair-stalled"),
+                        workflow_claim_opts("map-repair-workflows"),
+                    )
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a pre-upgrade stalled map leaves its parent asleep"
+            );
+
+            let reopened = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                stream_history(&reopened, run_id.clone())
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    durust::HistoryEventType::WorkflowStarted,
+                    durust::HistoryEventType::ActivityMapScheduled,
+                    durust::HistoryEventType::ActivityMapCompleted,
+                ],
+            );
+            let woken = reopened
                 .claim_workflow_task(
-                    WorkerId::new("map-repair-stalled"),
+                    WorkerId::new("map-repair-woken"),
                     workflow_claim_opts("map-repair-workflows"),
                 )
                 .await
                 .unwrap()
-                .is_none(),
-            "a pre-upgrade stalled map leaves its parent asleep"
-        );
+                .expect("the repaired map wakes its parent");
+            assert_eq!(
+                woken.reason,
+                durust::WorkflowTaskReason::ActivityMapCompleted
+            );
+            assert_eq!(woken.replay_target_event_id, EventId(3));
 
-        let reopened = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            stream_history(&reopened, run_id.clone())
-                .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                durust::HistoryEventType::WorkflowStarted,
-                durust::HistoryEventType::ActivityMapScheduled,
-                durust::HistoryEventType::ActivityMapCompleted,
-            ],
-        );
-        let woken = reopened
-            .claim_workflow_task(
-                WorkerId::new("map-repair-woken"),
-                workflow_claim_opts("map-repair-workflows"),
+            // One-shot: the repair records itself in `meta`, and `migrate` reads that
+            // marker in the query it already issues for `schema_version`, so every
+            // later connect pays nothing for the unindexed descriptor scan.
+            let again = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
             )
             .await
-            .unwrap()
-            .expect("the repaired map wakes its parent");
-        assert_eq!(
-            woken.reason,
-            durust::WorkflowTaskReason::ActivityMapCompleted
-        );
-        assert_eq!(woken.replay_target_event_id, EventId(3));
-
-        // One-shot: the repair records itself in `meta`, and `migrate` reads that
-        // marker in the query it already issues for `schema_version`, so every
-        // later connect pays nothing for the unindexed descriptor scan.
-        let again = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(stream_history(&again, run_id).await.len(), 3);
-        assert_eq!(
-            postgres_scalar(
-                &url,
-                &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
-            )
-            .await,
-            Some(1),
-        );
-
-        drop_postgres_schema(&url, &schema).await;
-    });
+            .unwrap();
+            assert_eq!(stream_history(&again, run_id).await.len(), 3);
+            assert_eq!(
+                postgres_scalar(
+                    &url,
+                    &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
+                )
+                .await,
+                Some(1),
+            );
+        },
+    ));
 }
 
 /// A descriptor this pass cannot interpret at all must not stop the process from
@@ -11873,38 +11307,32 @@ fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres undecodable map repair test") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapundec");
-        let quoted = quote_postgres_identifier(&schema);
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres_schema(
+        "Postgres undecodable map repair test",
+        "mapundec",
+        |backend, url, schema| async move {
+            let quoted = quote_postgres_identifier(&schema);
 
-        let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
-            &backend,
-            "wf/map-undec",
-            "map-undec-workflows",
-            "map-undec-activities",
-            0,
-            2,
-            durust::RetryPolicy::none(),
-            None,
-        )
-        .await;
-        scheduled.expect("the empty map completes when it is scheduled");
+            let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
+                &backend,
+                "wf/map-undec",
+                "map-undec-workflows",
+                "map-undec-activities",
+                0,
+                2,
+                durust::RetryPolicy::none(),
+                None,
+            )
+            .await;
+            scheduled.expect("the empty map completes when it is scheduled");
 
-        // Rewind to the pre-upgrade stall, then add a second stalled descriptor
-        // whose task blob is not an `ActivityMapTask`. Its run row exists, so it
-        // fails inside the pass rather than before it.
-        run_postgres_sql(
-            &url,
-            &format!(
-                "delete from {quoted}.history_events \
+            // Rewind to the pre-upgrade stall, then add a second stalled descriptor
+            // whose task blob is not an `ActivityMapTask`. Its run row exists, so it
+            // fails inside the pass rather than before it.
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "delete from {quoted}.history_events \
                    where run_id = '{run_id}' and event_type = 'activity_map_completed'; \
                  update {quoted}.workflow_instances \
                    set current_event_id = 2, ready_reason = null where run_id = '{run_id}'; \
@@ -11914,50 +11342,51 @@ fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
                    (map_command_id, namespace, run_id, command_seq, task, item_count, \
                     next_ordinal, in_flight, completed) \
                  values ('{run_id}:9', 'default', '{run_id}', 9, '\\x00'::bytea, 0, 0, 0, false);",
-                run_id = run_id.0,
-            ),
-        )
-        .await;
-
-        let reopened = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .expect("an undecodable descriptor must not abort backend construction");
-        assert_eq!(
-            stream_history(&reopened, run_id)
-                .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                durust::HistoryEventType::WorkflowStarted,
-                durust::HistoryEventType::ActivityMapScheduled,
-                durust::HistoryEventType::ActivityMapCompleted,
-            ],
-            "the repairable descriptor beside the bad one is still repaired",
-        );
-        assert_eq!(
-            postgres_scalar(
-                &url,
-                &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
+                    run_id = run_id.0,
+                ),
             )
-            .await,
-            Some(1),
-            "the pass still records itself, so it does not re-scan forever",
-        );
-        assert_eq!(
-            postgres_scalar(
-                &url,
-                &format!("select value from {quoted}.meta where key = 'empty_map_repair_skipped'"),
-            )
-            .await,
-            Some(1),
-            "and what it could not act on is counted, not discarded",
-        );
+            .await;
 
-        drop_postgres_schema(&url, &schema).await;
-    });
+            let reopened = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+            )
+            .await
+            .expect("an undecodable descriptor must not abort backend construction");
+            assert_eq!(
+                stream_history(&reopened, run_id)
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    durust::HistoryEventType::WorkflowStarted,
+                    durust::HistoryEventType::ActivityMapScheduled,
+                    durust::HistoryEventType::ActivityMapCompleted,
+                ],
+                "the repairable descriptor beside the bad one is still repaired",
+            );
+            assert_eq!(
+                postgres_scalar(
+                    &url,
+                    &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
+                )
+                .await,
+                Some(1),
+                "the pass still records itself, so it does not re-scan forever",
+            );
+            assert_eq!(
+                postgres_scalar(
+                    &url,
+                    &format!(
+                        "select value from {quoted}.meta where key = 'empty_map_repair_skipped'"
+                    ),
+                )
+                .await,
+                Some(1),
+                "and what it could not act on is counted, not discarded",
+            );
+        },
+    ));
 }
 
 /// A descriptor whose `workflow_instances` row is gone must not stop the
@@ -11973,76 +11402,69 @@ fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_orphaned_stalled_map_does_not_refuse_to_start_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres orphaned map repair test") else {
-            return;
-        };
-        let schema = postgres_test_schema("maporphan");
-        let quoted = quote_postgres_identifier(&schema);
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres_schema(
+        "Postgres orphaned map repair test",
+        "maporphan",
+        |backend, url, schema| async move {
+            let quoted = quote_postgres_identifier(&schema);
 
-        let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
-            &backend,
-            "wf/map-orphan",
-            "map-orphan-workflows",
-            "map-orphan-activities",
-            0,
-            2,
-            durust::RetryPolicy::none(),
-            None,
-        )
-        .await;
-        scheduled.expect("the empty map completes when it is scheduled");
+            let (run_id, _command_id, _opts, scheduled) = schedule_activity_map(
+                &backend,
+                "wf/map-orphan",
+                "map-orphan-workflows",
+                "map-orphan-activities",
+                0,
+                2,
+                durust::RetryPolicy::none(),
+                None,
+            )
+            .await;
+            scheduled.expect("the empty map completes when it is scheduled");
 
-        // Pre-upgrade stall, then prune the run out from under the descriptor.
-        run_postgres_sql(
-            &url,
-            &format!(
-                "delete from {quoted}.history_events \
+            // Pre-upgrade stall, then prune the run out from under the descriptor.
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "delete from {quoted}.history_events \
                    where run_id = '{run_id}' and event_type = 'activity_map_completed'; \
                  update {quoted}.activity_maps set completed = false where run_id = '{run_id}'; \
                  delete from {quoted}.meta where key = 'empty_map_repair_done'; \
                  delete from {quoted}.workflow_instances where run_id = '{run_id}';",
-                run_id = run_id.0,
-            ),
-        )
-        .await;
-
-        let reopened = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .expect("an orphaned descriptor must not abort backend construction");
-        // Started, and the orphan is left exactly as it was found.
-        assert_eq!(
-            postgres_scalar(
-                &url,
-                &format!(
-                    "select count(*) from {quoted}.activity_maps \
-                     where run_id = '{run_id}' and completed = false"
+                    run_id = run_id.0,
                 ),
             )
-            .await,
-            Some(1),
-            "an unrepairable descriptor is left untouched",
-        );
-        assert_eq!(
-            postgres_scalar(
-                &url,
-                &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
-            )
-            .await,
-            Some(1),
-            "the pass still completes, so it does not re-scan on every connect",
-        );
-        drop(reopened);
+            .await;
 
-        drop_postgres_schema(&url, &schema).await;
-    });
+            let reopened = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+            )
+            .await
+            .expect("an orphaned descriptor must not abort backend construction");
+            // Started, and the orphan is left exactly as it was found.
+            assert_eq!(
+                postgres_scalar(
+                    &url,
+                    &format!(
+                        "select count(*) from {quoted}.activity_maps \
+                     where run_id = '{run_id}' and completed = false"
+                    ),
+                )
+                .await,
+                Some(1),
+                "an unrepairable descriptor is left untouched",
+            );
+            assert_eq!(
+                postgres_scalar(
+                    &url,
+                    &format!("select value from {quoted}.meta where key = 'empty_map_repair_done'"),
+                )
+                .await,
+                Some(1),
+                "the pass still completes, so it does not re-scan on every connect",
+            );
+            drop(reopened);
+        },
+    ));
 }
 
 #[cfg(feature = "postgres")]
@@ -12077,134 +11499,126 @@ async fn postgres_scalar(database_url: &str, sql: &str) -> Option<i64> {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres same-commit ready reason test") else {
-            return;
-        };
-        let schema = postgres_test_schema("mapreadyreason");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres(
+        "Postgres same-commit ready reason test",
+        "mapreadyreason",
+        |backend| async move {
+            let client = Client::new(backend.clone());
+            let run_id = client
+                .start_workflow::<workflow>("wf/reason", "reason-parent", input(1))
+                .await
+                .unwrap();
+            let parent_opts = workflow_claim_opts("reason-parent");
+            let claimed = backend
+                .claim_workflow_task(WorkerId::new("reason-scheduler"), parent_opts.clone())
+                .await
+                .unwrap()
+                .expect("workflow task");
+            let child_command = durust::command_id(&run_id, 1);
+            let map_command = durust::command_id(&run_id, 2);
+            let child_input = durust::encode_payload(&Input { value: 1 }).unwrap();
+            let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+            let activity_name = ActivityName::new("conformance.echo");
+            let activity_queue = TaskQueue::new("reason-activities");
 
-        let client = Client::new(backend.clone());
-        let run_id = client
-            .start_workflow::<workflow>("wf/reason", "reason-parent", input(1))
-            .await
-            .unwrap();
-        let parent_opts = workflow_claim_opts("reason-parent");
-        let claimed = backend
-            .claim_workflow_task(WorkerId::new("reason-scheduler"), parent_opts.clone())
-            .await
-            .unwrap()
-            .expect("workflow task");
-        let child_command = durust::command_id(&run_id, 1);
-        let map_command = durust::command_id(&run_id, 2);
-        let child_input = durust::encode_payload(&Input { value: 1 }).unwrap();
-        let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
-        let activity_name = ActivityName::new("conformance.echo");
-        let activity_queue = TaskQueue::new("reason-activities");
-
-        backend
-            .commit_workflow_task(
-                claimed.claim,
-                WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
-                    append_events: vec![
-                        durust::NewHistoryEvent::new(
-                            HistoryEventData::ChildWorkflowStartRequested(
-                                durust::ChildWorkflowStartRequested {
-                                    command_id: child_command.clone(),
-                                    workflow_type: WorkflowType::new("conformance.workflow", 1),
-                                    workflow_id: durust::WorkflowId::new("wf/reason/child"),
-                                    task_queue: TaskQueue::new("reason-children"),
-                                    input: child_input.clone(),
-                                    parent_close_policy: durust::ParentClosePolicy::Abandon,
-                                    fingerprint: durust::child_workflow_fingerprint(
-                                        WorkflowType::new("conformance.workflow", 1),
-                                        durust::WorkflowId::new("wf/reason/child"),
-                                        durust::payload_digest(&child_input),
-                                        TaskQueue::new("reason-children"),
-                                        durust::ParentClosePolicy::Abandon,
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![
+                            durust::NewHistoryEvent::new(
+                                HistoryEventData::ChildWorkflowStartRequested(
+                                    durust::ChildWorkflowStartRequested {
+                                        command_id: child_command.clone(),
+                                        workflow_type: WorkflowType::new("conformance.workflow", 1),
+                                        workflow_id: durust::WorkflowId::new("wf/reason/child"),
+                                        task_queue: TaskQueue::new("reason-children"),
+                                        input: child_input.clone(),
+                                        parent_close_policy: durust::ParentClosePolicy::Abandon,
+                                        fingerprint: durust::child_workflow_fingerprint(
+                                            WorkflowType::new("conformance.workflow", 1),
+                                            durust::WorkflowId::new("wf/reason/child"),
+                                            durust::payload_digest(&child_input),
+                                            TaskQueue::new("reason-children"),
+                                            durust::ParentClosePolicy::Abandon,
+                                        ),
+                                    },
+                                ),
+                            ),
+                            durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                                durust::ActivityMapScheduled {
+                                    command_id: map_command.clone(),
+                                    activity_name: activity_name.clone(),
+                                    task_queue: activity_queue.clone(),
+                                    retry_policy: durust::RetryPolicy::none(),
+                                    start_to_close_timeout: None,
+                                    heartbeat_timeout: None,
+                                    input_manifest: empty_manifest.clone(),
+                                    result_manifest_name: "empty".to_owned(),
+                                    max_in_flight: 2,
+                                    fingerprint: durust::activity_map_fingerprint(
+                                        activity_name.clone(),
+                                        durust::payload_digest(&empty_manifest),
+                                        "empty".to_owned(),
+                                        2,
+                                        "sha256:test-options".to_owned(),
                                     ),
                                 },
-                            ),
-                        ),
-                        durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
-                            durust::ActivityMapScheduled {
-                                command_id: map_command.clone(),
-                                activity_name: activity_name.clone(),
-                                task_queue: activity_queue.clone(),
-                                retry_policy: durust::RetryPolicy::none(),
-                                start_to_close_timeout: None,
-                                heartbeat_timeout: None,
-                                input_manifest: empty_manifest.clone(),
-                                result_manifest_name: "empty".to_owned(),
-                                max_in_flight: 2,
-                                fingerprint: durust::activity_map_fingerprint(
-                                    activity_name.clone(),
-                                    durust::payload_digest(&empty_manifest),
-                                    "empty".to_owned(),
-                                    2,
-                                    "sha256:test-options".to_owned(),
-                                ),
-                            },
-                        )),
-                    ],
-                    start_child_workflows: vec![durust::ChildStartOutboxMessage {
-                        command_id: child_command,
-                        workflow_type: WorkflowType::new("conformance.workflow", 1),
-                        workflow_id: durust::WorkflowId::new("wf/reason/child"),
-                        task_queue: TaskQueue::new("reason-children"),
-                        input: child_input,
-                        parent_close_policy: durust::ParentClosePolicy::Abandon,
-                        child_map_item: None,
-                    }],
-                    schedule_activity_maps: vec![ActivityMapTask {
-                        map_command_id: map_command,
-                        activity_name,
-                        task_queue: activity_queue,
-                        retry_policy: durust::RetryPolicy::none(),
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: empty_manifest,
-                        result_manifest_name: "empty".to_owned(),
-                        max_in_flight: 2,
-                    }],
-                    ..WorkflowTaskCommit::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            stream_history(&backend, run_id)
+                            )),
+                        ],
+                        start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                            command_id: child_command,
+                            workflow_type: WorkflowType::new("conformance.workflow", 1),
+                            workflow_id: durust::WorkflowId::new("wf/reason/child"),
+                            task_queue: TaskQueue::new("reason-children"),
+                            input: child_input,
+                            parent_close_policy: durust::ParentClosePolicy::Abandon,
+                            child_map_item: None,
+                        }],
+                        schedule_activity_maps: vec![ActivityMapTask {
+                            map_command_id: map_command,
+                            activity_name,
+                            task_queue: activity_queue,
+                            retry_policy: durust::RetryPolicy::none(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: empty_manifest,
+                            result_manifest_name: "empty".to_owned(),
+                            max_in_flight: 2,
+                        }],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
                 .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                durust::HistoryEventType::WorkflowStarted,
-                durust::HistoryEventType::ChildWorkflowStartRequested,
-                durust::HistoryEventType::ActivityMapScheduled,
-                durust::HistoryEventType::ChildWorkflowStarted,
-                durust::HistoryEventType::ActivityMapCompleted,
-            ],
-        );
-        let ready = backend
-            .claim_workflow_task(WorkerId::new("reason-ready"), parent_opts)
-            .await
-            .unwrap()
-            .expect("the parent is woken by its own commit");
-        assert_eq!(
-            ready.reason,
-            durust::WorkflowTaskReason::ActivityMapCompleted,
-            "the last fact this commit appended names the reason, not the inline child start",
-        );
+                .unwrap();
 
-        drop_postgres_schema(&url, &schema).await;
-    });
+            assert_eq!(
+                stream_history(&backend, run_id)
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    durust::HistoryEventType::WorkflowStarted,
+                    durust::HistoryEventType::ChildWorkflowStartRequested,
+                    durust::HistoryEventType::ActivityMapScheduled,
+                    durust::HistoryEventType::ChildWorkflowStarted,
+                    durust::HistoryEventType::ActivityMapCompleted,
+                ],
+            );
+            let ready = backend
+                .claim_workflow_task(WorkerId::new("reason-ready"), parent_opts)
+                .await
+                .unwrap()
+                .expect("the parent is woken by its own commit");
+            assert_eq!(
+                ready.reason,
+                durust::WorkflowTaskReason::ActivityMapCompleted,
+                "the last fact this commit appended names the reason, not the inline child start",
+            );
+        },
+    ));
 }
 
 /// Postgres's descriptor insert is `on conflict(map_command_id) do nothing`,
@@ -12227,37 +11641,31 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres stale map descriptor test") else {
-            return;
-        };
-        let schema = postgres_test_schema("stalemapdesc");
-        let quoted = quote_postgres_identifier(&schema);
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres_schema(
+        "Postgres stale map descriptor test",
+        "stalemapdesc",
+        |backend, url, schema| async move {
+            let quoted = quote_postgres_identifier(&schema);
 
-        // A real descriptor, written by the ordinary commit path, then rewound
-        // so the run is back at the scheduling event with the descriptor still
-        // present. That is a well-formed stale row.
-        let (run_id, command_id, _opts, scheduled) = schedule_activity_map(
-            &backend,
-            "wf/stale-desc",
-            "stale-desc-workflows",
-            "stale-desc-activities",
-            0,
-            2,
-            durust::RetryPolicy::none(),
-            None,
-        )
-        .await;
-        scheduled.expect("the empty map completes when it is scheduled");
-        run_postgres_sql(
-            &url,
-            &format!(
-                "delete from {quoted}.history_events \
+            // A real descriptor, written by the ordinary commit path, then rewound
+            // so the run is back at the scheduling event with the descriptor still
+            // present. That is a well-formed stale row.
+            let (run_id, command_id, _opts, scheduled) = schedule_activity_map(
+                &backend,
+                "wf/stale-desc",
+                "stale-desc-workflows",
+                "stale-desc-activities",
+                0,
+                2,
+                durust::RetryPolicy::none(),
+                None,
+            )
+            .await;
+            scheduled.expect("the empty map completes when it is scheduled");
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "delete from {quoted}.history_events \
                    where run_id = '{run_id}' and event_type = 'activity_map_completed'; \
                  update {quoted}.workflow_instances \
                    set current_event_id = 1, ready_reason = 'workflow_started' \
@@ -12265,110 +11673,110 @@ fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured
                  delete from {quoted}.history_events \
                    where run_id = '{run_id}' and event_type = 'activity_map_scheduled'; \
                  update {quoted}.activity_maps set completed = false where run_id = '{run_id}';",
-                run_id = run_id.0,
-            ),
-        )
-        .await;
+                    run_id = run_id.0,
+                ),
+            )
+            .await;
 
-        let commit = |claim| {
-            let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
-            let activity_name = ActivityName::new("conformance.echo");
-            let task_queue = TaskQueue::new("stale-desc-activities");
-            backend.commit_workflow_task(
-                claim,
-                WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
-                    append_events: vec![durust::NewHistoryEvent::new(
-                        HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                            command_id: command_id.clone(),
-                            activity_name: activity_name.clone(),
-                            task_queue: task_queue.clone(),
+            let commit = |claim| {
+                let empty_manifest =
+                    durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+                let activity_name = ActivityName::new("conformance.echo");
+                let task_queue = TaskQueue::new("stale-desc-activities");
+                backend.commit_workflow_task(
+                    claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![durust::NewHistoryEvent::new(
+                            HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
+                                command_id: command_id.clone(),
+                                activity_name: activity_name.clone(),
+                                task_queue: task_queue.clone(),
+                                retry_policy: durust::RetryPolicy::none(),
+                                start_to_close_timeout: None,
+                                heartbeat_timeout: None,
+                                input_manifest: empty_manifest.clone(),
+                                result_manifest_name: "mapped".to_owned(),
+                                max_in_flight: 2,
+                                fingerprint: durust::activity_map_fingerprint(
+                                    activity_name.clone(),
+                                    durust::payload_digest(&empty_manifest),
+                                    "mapped".to_owned(),
+                                    2,
+                                    "sha256:test-options".to_owned(),
+                                ),
+                            }),
+                        )],
+                        schedule_activity_maps: vec![ActivityMapTask {
+                            map_command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
                             retry_policy: durust::RetryPolicy::none(),
                             start_to_close_timeout: None,
                             heartbeat_timeout: None,
-                            input_manifest: empty_manifest.clone(),
+                            input_manifest: empty_manifest,
                             result_manifest_name: "mapped".to_owned(),
                             max_in_flight: 2,
-                            fingerprint: durust::activity_map_fingerprint(
-                                activity_name.clone(),
-                                durust::payload_digest(&empty_manifest),
-                                "mapped".to_owned(),
-                                2,
-                                "sha256:test-options".to_owned(),
-                            ),
-                        }),
-                    )],
-                    schedule_activity_maps: vec![ActivityMapTask {
-                        map_command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy: durust::RetryPolicy::none(),
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: empty_manifest,
-                        result_manifest_name: "mapped".to_owned(),
-                        max_in_flight: 2,
-                    }],
-                    ..WorkflowTaskCommit::default()
-                },
-            )
-        };
+                        }],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+            };
 
-        let claimed = backend
-            .claim_workflow_task(
-                WorkerId::new("stale-desc-scheduler"),
-                workflow_claim_opts("stale-desc-workflows"),
-            )
-            .await
-            .unwrap()
-            .expect("workflow task");
-        let claim = claimed.claim.clone();
-        commit(claim)
-            .await
-            .expect_err("a stale descriptor must not be silently reused");
-        // The behaviour, not the message: without the tripwire this commit is
-        // accepted and appends an `ActivityMapCompleted` for a descriptor it
-        // never created. The stale row is left open precisely so the engine's
-        // terminal-absorbing rule cannot mask that — a `completed` stale row
-        // would produce no effects and the mutation would look harmless.
-        assert_eq!(
-            stream_history(&backend, run_id.clone())
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new("stale-desc-scheduler"),
+                    workflow_claim_opts("stale-desc-workflows"),
+                )
                 .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![durust::HistoryEventType::WorkflowStarted],
-            "the whole commit must roll back, appending nothing",
-        );
-
-        // Recovery: with the stale row gone the same commit goes through and
-        // the map completes exactly once.
-        run_postgres_sql(
-            &url,
-            &format!(
-                "delete from {quoted}.activity_maps where run_id = '{run_id}';",
-                run_id = run_id.0,
-            ),
-        )
-        .await;
-        commit(claimed.claim)
-            .await
-            .expect("the retried commit creates the descriptor the stale row blocked");
-        assert_eq!(
-            stream_history(&backend, run_id)
+                .unwrap()
+                .expect("workflow task");
+            let claim = claimed.claim.clone();
+            commit(claim)
                 .await
-                .iter()
-                .map(|event| event.event_type)
-                .collect::<Vec<_>>(),
-            vec![
-                durust::HistoryEventType::WorkflowStarted,
-                durust::HistoryEventType::ActivityMapScheduled,
-                durust::HistoryEventType::ActivityMapCompleted,
-            ],
-        );
+                .expect_err("a stale descriptor must not be silently reused");
+            // The behaviour, not the message: without the tripwire this commit is
+            // accepted and appends an `ActivityMapCompleted` for a descriptor it
+            // never created. The stale row is left open precisely so the engine's
+            // terminal-absorbing rule cannot mask that — a `completed` stale row
+            // would produce no effects and the mutation would look harmless.
+            assert_eq!(
+                stream_history(&backend, run_id.clone())
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![durust::HistoryEventType::WorkflowStarted],
+                "the whole commit must roll back, appending nothing",
+            );
 
-        drop_postgres_schema(&url, &schema).await;
-    });
+            // Recovery: with the stale row gone the same commit goes through and
+            // the map completes exactly once.
+            run_postgres_sql(
+                &url,
+                &format!(
+                    "delete from {quoted}.activity_maps where run_id = '{run_id}';",
+                    run_id = run_id.0,
+                ),
+            )
+            .await;
+            commit(claimed.claim)
+                .await
+                .expect("the retried commit creates the descriptor the stale row blocked");
+            assert_eq!(
+                stream_history(&backend, run_id)
+                    .await
+                    .iter()
+                    .map(|event| event.event_type)
+                    .collect::<Vec<_>>(),
+                vec![
+                    durust::HistoryEventType::WorkflowStarted,
+                    durust::HistoryEventType::ActivityMapScheduled,
+                    durust::HistoryEventType::ActivityMapCompleted,
+                ],
+            );
+        },
+    ));
 }
 
 #[cfg(feature = "postgres")]
@@ -12620,26 +12028,20 @@ fn sqlite_terminal_cleanup_deletes_a_closed_runs_waits_across_reopen() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_terminal_cleanup_deletes_a_closed_runs_waits_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres terminal wait cleanup") else {
-            return;
-        };
-        let schema = postgres_test_schema("cleanupwaits");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        let (_, closed_wait_id) =
-            close_a_run_holding_a_due_timer_wait(&backend, "pg-cleanup-waits").await;
-        only_the_live_runs_timer_spends_the_due_scan_budget(
-            &backend,
-            "pg-cleanup-waits",
-            &closed_wait_id,
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres(
+        "Postgres terminal wait cleanup",
+        "cleanupwaits",
+        |backend| async move {
+            let (_, closed_wait_id) =
+                close_a_run_holding_a_due_timer_wait(&backend, "pg-cleanup-waits").await;
+            only_the_live_runs_timer_spends_the_due_scan_budget(
+                &backend,
+                "pg-cleanup-waits",
+                &closed_wait_id,
+            )
+            .await;
+        },
+    ));
 }
 
 /// Postgres is the one provider with two commit implementations: the scalar
@@ -12659,88 +12061,80 @@ fn postgres_terminal_cleanup_deletes_a_closed_runs_waits_when_configured() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_closing_commits_delete_wait_rows_on_both_commit_paths_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres terminal wait row cleanup") else {
-            return;
-        };
-        let schema = postgres_test_schema("waitrows");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
+    block_on_tokio(with_postgres_schema(
+        "Postgres terminal wait row cleanup",
+        "waitrows",
+        |backend, url, schema| async move {
+            let (scalar_run_id, _) =
+                close_a_run_holding_a_due_timer_wait(&backend, "pg-wait-rows").await;
+            assert_eq!(
+                postgres_wait_row_count(&url, &schema, &scalar_run_id).await,
+                0,
+                "the scalar commit path must delete the closed run's wait rows",
+            );
 
-        let (scalar_run_id, _) =
-            close_a_run_holding_a_due_timer_wait(&backend, "pg-wait-rows").await;
-        assert_eq!(
-            postgres_wait_row_count(&url, &schema, &scalar_run_id).await,
-            0,
-            "the scalar commit path must delete the closed run's wait rows",
-        );
-
-        // Two runs, one commit each, both simple-batch eligible (no maps, no
-        // child starts, no cancels, and only timer/terminal events), so the
-        // batch routes through the set-based apply instead of falling back to
-        // the scalar path per item.
-        let queue = "pg-wait-rows-batch-workflows";
-        let client = Client::new(backend.clone());
-        let mut claims = Vec::new();
-        for index in 0..2 {
-            let run_id = client
-                .start_workflow::<workflow>(
-                    format!("wf/pg-wait-rows-batch/{index}"),
-                    queue,
-                    input(1),
-                )
+            // Two runs, one commit each, both simple-batch eligible (no maps, no
+            // child starts, no cancels, and only timer/terminal events), so the
+            // batch routes through the set-based apply instead of falling back to
+            // the scalar path per item.
+            let queue = "pg-wait-rows-batch-workflows";
+            let client = Client::new(backend.clone());
+            let mut claims = Vec::new();
+            for index in 0..2 {
+                let run_id = client
+                    .start_workflow::<workflow>(
+                        format!("wf/pg-wait-rows-batch/{index}"),
+                        queue,
+                        input(1),
+                    )
+                    .await
+                    .unwrap();
+                let claimed = backend
+                    .claim_workflow_task(
+                        WorkerId::new(format!("pg-wait-rows-batch-{index}")),
+                        workflow_claim_opts(queue),
+                    )
+                    .await
+                    .unwrap()
+                    .expect("workflow task");
+                assert_eq!(claimed.run_id, run_id);
+                claims.push(claimed);
+            }
+            let results = backend
+                .commit_workflow_tasks(WorkflowTaskCommitBatch {
+                    commits: claims
+                        .iter()
+                        .map(|claimed| WorkflowTaskCommitInput {
+                            claim: claimed.claim.clone(),
+                            commit: timer_wait_closing_commit(
+                                &claimed.run_id,
+                                durust::TimestampMs(1_000),
+                            )
+                            .1,
+                        })
+                        .collect(),
+                })
                 .await
                 .unwrap();
-            let claimed = backend
-                .claim_workflow_task(
-                    WorkerId::new(format!("pg-wait-rows-batch-{index}")),
-                    workflow_claim_opts(queue),
-                )
-                .await
-                .unwrap()
-                .expect("workflow task");
-            assert_eq!(claimed.run_id, run_id);
-            claims.push(claimed);
-        }
-        let results = backend
-            .commit_workflow_tasks(WorkflowTaskCommitBatch {
-                commits: claims
-                    .iter()
-                    .map(|claimed| WorkflowTaskCommitInput {
-                        claim: claimed.claim.clone(),
-                        commit: timer_wait_closing_commit(
-                            &claimed.run_id,
-                            durust::TimestampMs(1_000),
-                        )
-                        .1,
-                    })
-                    .collect(),
-            })
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 2);
-        for result in &results {
-            assert_eq!(
-                *result.result.as_ref().unwrap(),
-                CommitOutcome::Committed {
-                    new_tail_event_id: EventId(3)
-                },
-            );
-        }
-        for claimed in &claims {
-            assert_eq!(
-                postgres_wait_row_count(&url, &schema, &claimed.run_id).await,
-                0,
-                "the set-based batch commit path must delete closed run `{}`'s wait rows",
-                claimed.run_id,
-            );
-        }
-
-        drop_postgres_schema(&url, &schema).await;
-    });
+            assert_eq!(results.len(), 2);
+            for result in &results {
+                assert_eq!(
+                    *result.result.as_ref().unwrap(),
+                    CommitOutcome::Committed {
+                        new_tail_event_id: EventId(3)
+                    },
+                );
+            }
+            for claimed in &claims {
+                assert_eq!(
+                    postgres_wait_row_count(&url, &schema, &claimed.run_id).await,
+                    0,
+                    "the set-based batch commit path must delete closed run `{}`'s wait rows",
+                    claimed.run_id,
+                );
+            }
+        },
+    ));
 }
 
 #[cfg(feature = "postgres")]
@@ -13115,34 +12509,28 @@ fn sqlite_stray_timer_wait_never_fires_against_a_closed_run_across_reopen() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_stray_timer_wait_never_fires_against_a_closed_run_when_configured() {
-    block_on_tokio(async {
-        let Some(url) = postgres_url_or_skip("Postgres stray timer wait guard") else {
-            return;
-        };
-        let schema = postgres_test_schema("straywait");
-        let backend = PostgresBackend::connect_with_config(
-            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
-        )
-        .await
-        .unwrap();
-        let closed_run_id =
-            forge_a_stray_timer_wait_against_a_closed_run(&backend, "pg-stray").await;
-        a_stray_timer_wait_never_fires(&backend, closed_run_id.clone()).await;
-        // The row itself, directly, on the one provider whose storage this test
-        // file can read: the scan that just refused to fire it must also have
-        // left it alone. The budget case below reaches the same conclusion
-        // through the trait alone, on every provider.
-        assert_eq!(
-            postgres_wait_row_count(&url, &schema, &closed_run_id).await,
-            1,
-            "the sweep that skipped the stray wait must not have deleted it (`SPEC.md` §14)",
-        );
-        a_skipped_stray_wait_still_spends_the_next_scans_budget(
-            &backend,
-            "pg-stray",
-            &closed_run_id,
-        )
-        .await;
-        drop_postgres_schema(&url, &schema).await;
-    });
+    block_on_tokio(with_postgres_schema(
+        "Postgres stray timer wait guard",
+        "straywait",
+        |backend, url, schema| async move {
+            let closed_run_id =
+                forge_a_stray_timer_wait_against_a_closed_run(&backend, "pg-stray").await;
+            a_stray_timer_wait_never_fires(&backend, closed_run_id.clone()).await;
+            // The row itself, directly, on the one provider whose storage this test
+            // file can read: the scan that just refused to fire it must also have
+            // left it alone. The budget case below reaches the same conclusion
+            // through the trait alone, on every provider.
+            assert_eq!(
+                postgres_wait_row_count(&url, &schema, &closed_run_id).await,
+                1,
+                "the sweep that skipped the stray wait must not have deleted it (`SPEC.md` §14)",
+            );
+            a_skipped_stray_wait_still_spends_the_next_scans_budget(
+                &backend,
+                "pg-stray",
+                &closed_run_id,
+            )
+            .await;
+        },
+    ));
 }

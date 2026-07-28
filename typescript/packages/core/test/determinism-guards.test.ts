@@ -14,7 +14,8 @@ import {
   workflow,
   workflowId,
   workflowType,
-  type ClaimedWorkflowTask
+  type ClaimedWorkflowTask,
+  type PayloadRef
 } from "@durust/core";
 import {
   HotWorkflowExecution,
@@ -619,7 +620,7 @@ describe("nondeterminism guard uninstall", () => {
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
     }
-    expect(decodePayload<number>(completed.result)).toBeGreaterThan(0);
+    expect(decodePayload(completed.result as PayloadRef<number>)).toBeGreaterThan(0);
   });
 });
 
