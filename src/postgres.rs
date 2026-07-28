@@ -4240,20 +4240,14 @@ impl PostgresBackend {
             }),
         )
         .await?;
-        tx.execute(
-            &format!(
-                "update {schema}.workflow_instances
-                 set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
-                 where run_id = $3"
-            ),
-            &[
-                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-                &reason_to_str(&WorkflowTaskReason::ActivityCompleted),
-                &task.run_id.0,
-            ],
+        set_workflow_ready_tx(
+            tx,
+            schema,
+            &task.run_id,
+            event_id,
+            WorkflowTaskReason::ActivityCompleted,
         )
-        .await
-        .map_err(postgres_error)?;
+        .await?;
         tx.execute(
             &format!(
                 "update {schema}.activity_tasks
@@ -4426,20 +4420,14 @@ impl PostgresBackend {
             }),
         )
         .await?;
-        tx.execute(
-            &format!(
-                "update {schema}.workflow_instances
-                 set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
-                 where run_id = $3"
-            ),
-            &[
-                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-                &reason_to_str(&WorkflowTaskReason::ActivityFailed),
-                &task.run_id.0,
-            ],
+        set_workflow_ready_tx(
+            &tx,
+            &schema,
+            &task.run_id,
+            event_id,
+            WorkflowTaskReason::ActivityFailed,
         )
-        .await
-        .map_err(postgres_error)?;
+        .await?;
         tx.execute(
             &format!(
                 "update {schema}.activity_tasks
@@ -8710,20 +8698,14 @@ async fn fire_due_timers_tx(
             }),
         )
         .await?;
-        tx.execute(
-            &format!(
-                "update {schema}.workflow_instances
-                 set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
-                 where run_id = $3"
-            ),
-            &[
-                &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-                &reason_to_str(&WorkflowTaskReason::TimerFired),
-                &run_id.0,
-            ],
+        set_workflow_ready_tx(
+            tx,
+            schema,
+            &run_id,
+            event_id,
+            WorkflowTaskReason::TimerFired,
         )
-        .await
-        .map_err(postgres_error)?;
+        .await?;
         tx.execute(
             &format!("delete from {schema}.active_waits where wait_id = $1"),
             &[&wait_id],
@@ -8937,20 +8919,14 @@ async fn timeout_activity_tx(
         }),
     )
     .await?;
-    tx.execute(
-        &format!(
-            "update {schema}.workflow_instances
-             set current_event_id = $1, ready_reason = $2, ready_at_ms = 0
-             where run_id = $3"
-        ),
-        &[
-            &i64::try_from(event_id.0).unwrap_or(i64::MAX),
-            &reason_to_str(&WorkflowTaskReason::ActivityTimedOut),
-            &task.run_id.0,
-        ],
+    set_workflow_ready_tx(
+        tx,
+        schema,
+        &task.run_id,
+        event_id,
+        WorkflowTaskReason::ActivityTimedOut,
     )
-    .await
-    .map_err(postgres_error)?;
+    .await?;
     Ok(true)
 }
 

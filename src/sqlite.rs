@@ -205,6 +205,91 @@ impl SqliteBackend {
             .lock()
             .map_err(|_| Error::Backend("sqlite connection mutex poisoned".to_owned()))
     }
+
+    /// Shared body of [`DurableBackend::stream_history`] and
+    /// [`DurableBackend::stream_history_for_replay`]. `hydrate` is the whole
+    /// difference between them: the public read resolves blob refs, the replay
+    /// read hands them back untouched so the worker pays for only what it
+    /// decodes. Passing `false` on the public path is a silent storage bug, not
+    /// a compile error — `sqlite_provider_replay_stream_keeps_large_payloads_
+    /// lazy_until_explicit_hydration_after_reopen` and the three other
+    /// `sqlite_provider_*` payload tests are what catch it.
+    fn stream_history_inner(
+        &self,
+        req: crate::StreamHistoryRequest,
+        hydrate: bool,
+    ) -> Result<HistoryChunk> {
+        let conn = self.connection()?;
+        let max_events = req.max_events.max(1);
+        let max_bytes = req.max_bytes.max(1);
+        let mut stmt = conn
+            .prepare(
+                "select event_id, event_type, data
+                 from history_events
+                 where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                 order by event_id asc",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(
+                params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(sqlite_error)?;
+
+        let mut events = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let (event_id, event_type, data) = row.map_err(sqlite_error)?;
+            let mut data: HistoryEventData = rmp_serde::from_slice(&data)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let event_bytes = event_payload_len(&data).max(1);
+            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
+            {
+                break;
+            }
+            if hydrate {
+                data = hydrate_history_event_from_storage(&conn, &self.payload_config, data)?;
+            }
+            bytes += event_bytes;
+            events.push(HistoryEvent {
+                event_id: EventId(event_id),
+                event_type: event_type_from_str(&event_type)?,
+                data,
+            });
+            if events.len() >= max_events {
+                break;
+            }
+        }
+
+        let last_event_id = events
+            .last()
+            .map(|event| event.event_id)
+            .unwrap_or(req.after_event_id);
+        let has_more = conn
+            .query_row(
+                "select 1 from history_events
+                 where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                 limit 1",
+                params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .is_some();
+
+        Ok(HistoryChunk {
+            events,
+            last_event_id,
+            has_more,
+        })
+    }
 }
 
 fn open_sqlite_connection(path: &Path) -> Result<Connection> {
@@ -442,155 +527,14 @@ impl DurableBackend for SqliteBackend {
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let result = (|| {
-            let conn = self.connection()?;
-            let max_events = req.max_events.max(1);
-            let max_bytes = req.max_bytes.max(1);
-            let mut stmt = conn
-                .prepare(
-                    "select event_id, event_type, data
-                     from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     order by event_id asc",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(
-                    params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
-                    |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    },
-                )
-                .map_err(sqlite_error)?;
-
-            let mut events = Vec::new();
-            let mut bytes = 0usize;
-            for row in rows {
-                let (event_id, event_type, data) = row.map_err(sqlite_error)?;
-                let data: HistoryEventData = rmp_serde::from_slice(&data)
-                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                let event_bytes = event_payload_len(&data).max(1);
-                if !events.is_empty()
-                    && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-                {
-                    break;
-                }
-                let data = hydrate_history_event_from_storage(&conn, &self.payload_config, data)?;
-                bytes += event_bytes;
-                events.push(HistoryEvent {
-                    event_id: EventId(event_id),
-                    event_type: event_type_from_str(&event_type)?,
-                    data,
-                });
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-
-            let last_event_id = events
-                .last()
-                .map(|event| event.event_id)
-                .unwrap_or(req.after_event_id);
-            let has_more = conn
-                .query_row(
-                    "select 1 from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     limit 1",
-                    params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(sqlite_error)?
-                .is_some();
-
-            Ok(HistoryChunk {
-                events,
-                last_event_id,
-                has_more,
-            })
-        })();
-        Box::pin(ready(result))
+        Box::pin(ready(self.stream_history_inner(req, true)))
     }
 
     fn stream_history_for_replay(
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let result = (|| {
-            let conn = self.connection()?;
-            let max_events = req.max_events.max(1);
-            let max_bytes = req.max_bytes.max(1);
-            let mut stmt = conn
-                .prepare(
-                    "select event_id, event_type, data
-                     from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     order by event_id asc",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(
-                    params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
-                    |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    },
-                )
-                .map_err(sqlite_error)?;
-
-            let mut events = Vec::new();
-            let mut bytes = 0usize;
-            for row in rows {
-                let (event_id, event_type, data) = row.map_err(sqlite_error)?;
-                let data: HistoryEventData = rmp_serde::from_slice(&data)
-                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                let event_bytes = event_payload_len(&data).max(1);
-                if !events.is_empty()
-                    && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-                {
-                    break;
-                }
-                bytes += event_bytes;
-                events.push(HistoryEvent {
-                    event_id: EventId(event_id),
-                    event_type: event_type_from_str(&event_type)?,
-                    data,
-                });
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-
-            let last_event_id = events
-                .last()
-                .map(|event| event.event_id)
-                .unwrap_or(req.after_event_id);
-            let has_more = conn
-                .query_row(
-                    "select 1 from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     limit 1",
-                    params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(sqlite_error)?
-                .is_some();
-
-            Ok(HistoryChunk {
-                events,
-                last_event_id,
-                has_more,
-            })
-        })();
-        Box::pin(ready(result))
+        Box::pin(ready(self.stream_history_inner(req, false)))
     }
 
     fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
@@ -1183,17 +1127,7 @@ impl DurableBackend for SqliteBackend {
                         fired_at: req.now,
                     }),
                 )?;
-                tx.execute(
-                    "update workflow_instances
-                     set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                     where run_id = ?3",
-                    params![
-                        event_id.0,
-                        reason_to_str(&WorkflowTaskReason::TimerFired),
-                        run_id.0
-                    ],
-                )
-                .map_err(sqlite_error)?;
+                set_workflow_ready(&tx, &run_id, event_id, WorkflowTaskReason::TimerFired)?;
                 tx.execute(
                     "delete from active_waits where wait_id = ?1",
                     params![wait_id],
@@ -1511,17 +1445,12 @@ impl DurableBackend for SqliteBackend {
                     result,
                 }),
             )?;
-            tx.execute(
-                "update workflow_instances
-                 set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                 where run_id = ?3",
-                params![
-                    event_id.0,
-                    reason_to_str(&WorkflowTaskReason::ActivityCompleted),
-                    task.run_id.0
-                ],
-            )
-            .map_err(sqlite_error)?;
+            set_workflow_ready(
+                &tx,
+                &task.run_id,
+                event_id,
+                WorkflowTaskReason::ActivityCompleted,
+            )?;
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
@@ -1673,17 +1602,12 @@ impl DurableBackend for SqliteBackend {
                     failure,
                 }),
             )?;
-            tx.execute(
-                "update workflow_instances
-                 set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                 where run_id = ?3",
-                params![
-                    event_id.0,
-                    reason_to_str(&WorkflowTaskReason::ActivityFailed),
-                    task.run_id.0
-                ],
-            )
-            .map_err(sqlite_error)?;
+            set_workflow_ready(
+                &tx,
+                &task.run_id,
+                event_id,
+                WorkflowTaskReason::ActivityFailed,
+            )?;
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
@@ -5571,17 +5495,12 @@ fn timeout_activity(
             message: timeout_message(&activity_id, task.attempt, attribution),
         }),
     )?;
-    tx.execute(
-        "update workflow_instances
-         set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-         where run_id = ?3",
-        params![
-            event_id.0,
-            reason_to_str(&WorkflowTaskReason::ActivityTimedOut),
-            task.run_id.0
-        ],
-    )
-    .map_err(sqlite_error)?;
+    set_workflow_ready(
+        tx,
+        &task.run_id,
+        event_id,
+        WorkflowTaskReason::ActivityTimedOut,
+    )?;
     Ok(true)
 }
 

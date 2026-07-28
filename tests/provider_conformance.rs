@@ -216,6 +216,39 @@ where
     PostgresRun::Ran(ran)
 }
 
+/// `with_postgres` for tests that need a non-default payload storage config —
+/// in practice, an inline threshold low enough to force offloading.
+///
+/// Separate rather than a fifth parameter on the two helpers above, because 22
+/// of the 23 Postgres tests here want the default and would gain an argument
+/// that is the same at every call site.
+#[cfg(feature = "postgres")]
+async fn with_postgres_payload_storage<F, Fut, R>(
+    what: &str,
+    prefix: &str,
+    payload_config: durust::PayloadStorageConfig,
+    body: F,
+) -> PostgresRun<R>
+where
+    F: FnOnce(PostgresBackend) -> Fut,
+    Fut: Future<Output = R>,
+{
+    let Some(url) = postgres_url_or_skip(what) else {
+        return PostgresRun::SkippedNoPostgres;
+    };
+    let schema = postgres_test_schema(prefix);
+    let backend = PostgresBackend::connect_with_config(
+        PostgresBackendConfig::new(url.clone())
+            .schema(schema.clone())
+            .payload_storage(payload_config),
+    )
+    .await
+    .unwrap();
+    let ran = body(backend).await;
+    drop_postgres_schema(&url, &schema).await;
+    PostgresRun::Ran(ran)
+}
+
 /// What `with_postgres_schema` did — as a value the compiler will not let that
 /// function fabricate.
 ///
@@ -911,6 +944,44 @@ fn sqlite_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydrat
 
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         assert_replay_stream_payload_hydrates_explicitly(reopened, run_id).await;
+    });
+}
+
+// The Postgres arm of the same guard, and the only test here added rather than
+// consolidated during the simplification pass.
+//
+// `assert_replay_stream_payload_hydrates_explicitly` is the one function that
+// calls `stream_history` and `stream_history_for_replay` on the same run and
+// compares them — the difference between the two being the whole of what the
+// `hydrate` flag controls. It had exactly two call sites, memory and SQLite. On
+// Postgres the distinction was caught only *incidentally*, by five tests in
+// `src/postgres.rs` whose subject is something else; measured, inverting the flag
+// on the Postgres non-replay path failed those five and none of these.
+//
+// Incidental was enough, but nothing made it true on purpose, and the two
+// providers' `stream_history`/`stream_history_for_replay` pairs have now been
+// merged into one function behind that flag. Consolidating the code that a guard
+// protects is the moment to stop relying on the guard's coverage being accidental.
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_provider_replay_stream_keeps_large_payloads_lazy_until_explicit_hydration_when_configured()
+ {
+    block_on_tokio(async {
+        with_postgres_payload_storage(
+            "Postgres lazy replay payload hydration",
+            "lazyreplay",
+            durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
+            |backend| async move {
+                let run_id = start_large_payload_workflow(
+                    backend.clone(),
+                    "wf/postgres-lazy-replay-payload",
+                    "postgres-lazy-replay-workflows",
+                )
+                .await;
+                assert_replay_stream_payload_hydrates_explicitly(backend, run_id).await;
+            },
+        )
+        .await;
     });
 }
 

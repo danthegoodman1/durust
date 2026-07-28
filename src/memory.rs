@@ -86,6 +86,63 @@ impl MemoryBackend {
         // Delayed releases and due timers may have become visible.
         self.notify_work();
     }
+
+    /// Shared body of [`DurableBackend::stream_history`] and
+    /// [`DurableBackend::stream_history_for_replay`]. `hydrate` is the whole
+    /// difference between them: the public read resolves blob refs, the replay
+    /// read hands them back untouched so the worker pays for only what it
+    /// decodes. Passing `false` on the public path is a silent storage bug, not
+    /// a compile error — `memory_provider_replay_stream_keeps_large_payloads_
+    /// lazy_until_explicit_hydration` and three other payload tests are what
+    /// catch it.
+    fn stream_history_inner(
+        &self,
+        req: crate::StreamHistoryRequest,
+        hydrate: bool,
+    ) -> Result<HistoryChunk> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        let Some(run) = state.runs.get(&req.run_id) else {
+            return Err(Error::RunNotFound(req.run_id));
+        };
+
+        let max_events = req.max_events.max(1);
+        let max_bytes = req.max_bytes.max(1);
+        let mut bytes = 0usize;
+        let mut events = Vec::new();
+        for event in run.history.iter().filter(|event| {
+            event.event_id > req.after_event_id && event.event_id <= req.up_to_event_id
+        }) {
+            let event_bytes = event_payload_len(&event.data).max(1);
+            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
+            {
+                break;
+            }
+            bytes += event_bytes;
+            let mut event = event.clone();
+            if hydrate {
+                event.data = hydrate_history_event_from_storage(&state, event.data)?;
+            }
+            events.push(event);
+            if events.len() >= max_events {
+                break;
+            }
+        }
+
+        let last_event_id = events
+            .last()
+            .map(|event| event.event_id)
+            .unwrap_or(req.after_event_id);
+        let has_more = run
+            .history
+            .iter()
+            .any(|event| event.event_id > last_event_id && event.event_id <= req.up_to_event_id);
+
+        Ok(HistoryChunk {
+            events,
+            last_event_id,
+            has_more,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -447,93 +504,14 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let state = self.state.lock().expect("memory backend mutex poisoned");
-        let Some(run) = state.runs.get(&req.run_id) else {
-            return Box::pin(ready(Err(Error::RunNotFound(req.run_id))));
-        };
-
-        let max_events = req.max_events.max(1);
-        let max_bytes = req.max_bytes.max(1);
-        let mut bytes = 0usize;
-        let mut events = Vec::new();
-        for event in run.history.iter().filter(|event| {
-            event.event_id > req.after_event_id && event.event_id <= req.up_to_event_id
-        }) {
-            let event_bytes = event_payload_len(&event.data).max(1);
-            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-            {
-                break;
-            }
-            bytes += event_bytes;
-            let mut event = event.clone();
-            event.data = match hydrate_history_event_from_storage(&state, event.data) {
-                Ok(data) => data,
-                Err(err) => return Box::pin(ready(Err(err))),
-            };
-            events.push(event);
-            if events.len() >= max_events {
-                break;
-            }
-        }
-
-        let last_event_id = events
-            .last()
-            .map(|event| event.event_id)
-            .unwrap_or(req.after_event_id);
-        let has_more = run
-            .history
-            .iter()
-            .any(|event| event.event_id > last_event_id && event.event_id <= req.up_to_event_id);
-
-        Box::pin(ready(Ok(HistoryChunk {
-            events,
-            last_event_id,
-            has_more,
-        })))
+        Box::pin(ready(self.stream_history_inner(req, true)))
     }
 
     fn stream_history_for_replay(
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let state = self.state.lock().expect("memory backend mutex poisoned");
-        let Some(run) = state.runs.get(&req.run_id) else {
-            return Box::pin(ready(Err(Error::RunNotFound(req.run_id))));
-        };
-
-        let max_events = req.max_events.max(1);
-        let max_bytes = req.max_bytes.max(1);
-        let mut bytes = 0usize;
-        let mut events = Vec::new();
-        for event in run.history.iter().filter(|event| {
-            event.event_id > req.after_event_id && event.event_id <= req.up_to_event_id
-        }) {
-            let event_bytes = event_payload_len(&event.data).max(1);
-            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-            {
-                break;
-            }
-            bytes += event_bytes;
-            events.push(event.clone());
-            if events.len() >= max_events {
-                break;
-            }
-        }
-
-        let last_event_id = events
-            .last()
-            .map(|event| event.event_id)
-            .unwrap_or(req.after_event_id);
-        let has_more = run
-            .history
-            .iter()
-            .any(|event| event.event_id > last_event_id && event.event_id <= req.up_to_event_id);
-
-        Box::pin(ready(Ok(HistoryChunk {
-            events,
-            last_event_id,
-            has_more,
-        })))
+        Box::pin(ready(self.stream_history_inner(req, false)))
     }
 
     fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
