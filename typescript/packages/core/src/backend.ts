@@ -919,9 +919,10 @@ export class MemoryBackend implements DurableBackend {
       // audit and terminal-cleanup assumption in the system rests on not
       // happening — and it is not even a resurrection, because the next claim
       // still refuses the run, so the only outcome is corrupted history.
-      // Rust's memory provider tests the same condition in the same place
-      // (`src/memory.rs`: `if run.namespace != req.namespace || run.terminal`)
-      // and skips without deleting, so a wait the terminal cleanup should have
+      // Every Rust provider tests the same condition in the same place
+      // (`src/memory.rs`: `if run.namespace != req.namespace || run.terminal`;
+      // `src/sqlite.rs` and `src/postgres.rs`: `if terminal`) and all three
+      // skip without deleting, so a wait the terminal cleanup should have
       // removed stays visible rather than being quietly swallowed here.
       if (state.terminal) {
         continue;
@@ -1165,7 +1166,10 @@ export class MemoryBackend implements DurableBackend {
    * what makes a wait this cleanup cannot reach harmless rather than
    * corrupting, and it is a backstop, not the cleanup. `PARITY.md` note 22
    * records the same split, because it decides which provider's test detects
-   * which revert.
+   * which revert. All three Rust providers sit on this side of the split — the
+   * per-row skip — deliberately: paying the slot is what keeps every one of
+   * them a live detector of a cleanup that stopped deleting waits, and the
+   * starvation is reachable only once that cleanup has already failed.
    *
    * Continue-as-new is included. The new run has its own id and its own waits;
    * the closed run's belong to nobody, which is the same conclusion Rust's
@@ -1292,9 +1296,14 @@ export class MemoryBackend implements DurableBackend {
             activity.availableAtMs = effect.visibleAtMs ?? 0;
             activity.claim = null;
           }
-          // `effect.timeoutAtMs` has no consumer: map items are exempt from
-          // the start-to-close and heartbeat scanners in every TypeScript
-          // provider, which is tracked as its own plan row.
+          // `effect.timeoutAtMs` has no consumer here. Not because map items
+          // are exempt from the timeout scanners — they are not; see
+          // `activityTimeoutDeadline`, which covers them on the same terms as
+          // any other activity. It is unused because the deadline is derived
+          // at claim time from `claim.startedAtMs` and
+          // `claim.heartbeatDeadlineAtMs`, and this effect hands the item back
+          // unclaimed: anything stamped here would be recomputed by the claim
+          // that follows.
           break;
         }
         case "CompleteMap":

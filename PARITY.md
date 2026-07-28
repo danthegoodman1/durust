@@ -70,10 +70,14 @@ npx vitest run --config vitest.config.ts packages/core/test/FILE.test.ts -t "NAM
 | 19 | A worker crash between claim and commit completes the run exactly once | `tests/sim_worker.rs::real_worker_crash_between_claim_and_commit_completes_exactly_once` | `simulation.test.ts` — `recovers a workflow task after a worker crashes with an uncommitted claim` | **Both** |
 | 20 | Cache eviction mid-run does not change the committed outcome | `tests/sim_worker.rs::real_worker_cache_eviction_storm_matches_fault_free_control` | `simulation.test.ts` — `survives a cache-eviction replay soak across concurrent mixed workflows` | **Both** |
 | 21 | A commit that both schedules an empty map and closes its run is accepted, and no map fact lands behind the run's own terminal event — for the activity-map arm, which `terminalParent` would have rejected, and the child-map arm, which it would have let through | `tests/provider_conformance.rs::memory_provider_passes_basic_conformance`; `tests/provider_conformance.rs::sqlite_provider_passes_basic_conformance` — the `an_empty_map_scheduled_by_a_closing_commit_is_still_accepted` section | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` / `postgres-conformance.test.ts` — `an empty map scheduled by a closing commit is accepted and appends nothing` | **Both**, revert-verified: dropping the `parentTerminal` branch in `map-engine.ts` failed the TypeScript case on all three providers with `newTailEventId: 4` |
-| 22 | A run's waits are deleted by the same transaction that closes it (`SPEC.md` §19.1), so operational storage does not grow with closed runs and maintenance scans do not pay for them | — **gap**, see note 22: `cleanup_run_operational_state` (`src/memory.rs`, `src/sqlite.rs`) does delete them, but no Rust test names the invariant and the revert was not run, so this column is unproved rather than absent | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` — `terminal cleanup deletes a closed run's waits`; `postgres-conformance.test.ts` — `deletes a closed run's normalized wait rows on both commit paths` | **Gap (Rust)**; TypeScript revert-verified — removing the cleanup failed the shared case on memory and SQLite (`fired 0`) and the Postgres row assertion on both of its commit paths |
-| 23 | A due-timer scan never appends `TimerFired` to a run that has already reached a terminal event | — **gap**, see note 23: the guard exists (`src/memory.rs`, `if run.namespace != req.namespace \|\| run.terminal`), but a grep of the Rust suite finds no test that asserts it | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` / `postgres-conformance.test.ts` — `a stray timer wait never fires against a closed run` | **Gap (Rust)**; TypeScript revert-verified — removing the guard failed the case on all three providers with `fired 1` |
+| 22 | A run's waits are deleted by the same transaction that closes it (`SPEC.md` §19.1), so operational storage does not grow with closed runs and maintenance scans do not pay for them | `tests/provider_conformance.rs::memory_terminal_cleanup_deletes_a_closed_runs_waits`; `::sqlite_terminal_cleanup_deletes_a_closed_runs_waits_across_reopen`; `::postgres_terminal_cleanup_deletes_a_closed_runs_waits_when_configured`; `::postgres_closing_commits_delete_wait_rows_on_both_commit_paths_when_configured` | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` — `terminal cleanup deletes a closed run's waits`; `postgres-conformance.test.ts` — `deletes a closed run's normalized wait rows on both commit paths` | **Both**, revert-verified on both sides. TypeScript: removing the cleanup failed the shared case on memory and SQLite (`fired 0`) and the Postgres row assertion on both commit paths. Rust: the detector is the *scan budget* — two runs, one due timer wait each, `limit: 1` — and each provider's cleanup revert failed it with `a closed run's leftover wait must not spend the due-timer scan's only slot; fired 0`, `left: 0 / right: 1`. The Postgres batch commit path is covered separately and its non-vacuity is established by mutation rather than inspection: the test cannot observe which path a commit took, but deleting **only** the batch path's `cleanup_runs_operational_state_tx` call fails it, which is possible only if the batch reached that path |
+| 23 | A due-timer scan never appends `TimerFired` to a run that has already reached a terminal event | `tests/provider_conformance.rs::memory_stray_timer_wait_never_fires_against_a_closed_run`; `::sqlite_stray_timer_wait_never_fires_against_a_closed_run_across_reopen`; `::postgres_stray_timer_wait_never_fires_against_a_closed_run_when_configured` | `memory-conformance.test.ts` / `sqlite-conformance.test.ts` / `postgres-conformance.test.ts` — `a stray timer wait never fires against a closed run` | **Both**, revert-verified on both sides — removing each guard failed with `a closed run's timer wait must not fire; fired 1`. Rust forges the state the same way TypeScript does: the wait is committed by a **second, live run** naming the already-closed run, so it exists against a terminal run rather than being cleaned up first. Under the memory revert the second assertion reports the corruption directly — `left: [WorkflowStarted, WorkflowCompleted, TimerFired] / right: [WorkflowStarted, WorkflowCompleted]` |
+| 24 | A wait skipped by the due-timer terminal guard is skipped, **not deleted** (`SPEC.md` §14), so the leftover survives as evidence of the §19.1 cleanup defect that produced it | `tests/provider_conformance.rs::memory_stray_timer_wait_never_fires_against_a_closed_run`; `::sqlite_stray_timer_wait_never_fires_against_a_closed_run_across_reopen`; `::postgres_stray_timer_wait_never_fires_against_a_closed_run_when_configured` — all three call the shared driver `a_skipped_stray_wait_still_spends_the_next_scans_budget`, and the Postgres case additionally asserts the surviving row through `postgres_wait_row_count` | — no test names it, but all three providers comply, by two different routes: `backend.ts` and `sqlite/src/index.ts` skip per row, while `postgres/src/index.ts` puts `and runs.terminal = false` inside the limited query, so the row is never selected and so never deleted. Same contract, different mechanism — and the mechanism matters, see the status column | **Both**, revert-verified. Gap closed: `src/sqlite.rs` and `src/postgres.rs` now skip where they used to `delete from active_waits`. The detector is the *next* scan's budget — a wait the guard skipped is still there to spend the following sweep's only slot — and each provider's revert to the delete failed its own case and only its own: `the stray wait the previous sweep skipped must still be there to take this sweep's only slot`, `left: 1 / right: 0`. Postgres fails one assertion earlier and more directly, `the sweep that skipped the stray wait must not have deleted it (SPEC.md §14)`, `left: 0 / right: 1`. Cross-revert holds both ways: reverting the skip leaves all four row-22 cases green, and reverting row 22's terminal cleanup fails all four on all three providers while leaving these three green. That is why the terminal check stayed a per-row skip rather than moving into the selecting query as a predicate. The predicate would keep the leftover out of the `limit` budget, but it would also blind this provider to a terminal cleanup that stopped deleting waits — which is exactly what row 22 tests, and exactly why TypeScript's Postgres is blind there. The starvation the predicate avoids is reachable only once §19.1 is already broken |
 
-Eight of twenty-three rows are gaps: 2, 4, 9, 10, 12, 22, 23 (Rust), and 16 (TypeScript).
+Six of twenty-four rows are gaps: 2, 4, 9, 10, 12 (Rust), and 16 (TypeScript). Row 24 closed when the two Rust SQL providers stopped deleting the wait they had refused — and closing it settled a design question rather than just a behaviour: the guard stays a per-row skip so that row 22's budget detector keeps working.
+Rows 22 and 23 closed when the Rust detectors landed; row 24 opened in the same
+work, which is the usual shape — building a detector for one invariant is how
+the next one gets found.
 
 ### Revert verification
 
@@ -266,6 +270,21 @@ covers both of that provider's commit paths, which delete the rows in different
 places — the SQL-native path with its own `delete`, the loaded-state path
 through `#abandonWorkForClosedRun`.
 
+The paragraph above is about **TypeScript's** Postgres provider, and the
+coordinator read it as a fact about Postgres in general when briefing the Rust
+work — asserting that Rust's Postgres would likewise pass row 22 with the
+cleanup removed, and that its arm therefore needed a TypeScript-style special
+case. Measured, that is false. `fire_due_timers_tx` (`src/postgres.rs:8611`)
+selects on `namespace / kind / ready_at_ms` only and re-reads each row's run for
+`terminal` afterwards — structurally SQLite's shape, not TypeScript Postgres's.
+The leftover row *is* selected and *does* spend a `limit` slot, so the shared
+budget detector reaches Rust's Postgres unaided, failing `fired 0 / expected 1`
+with the cleanup removed. What it genuinely cannot reach is the set-based batch
+commit path, which is why the separate row assertion exists and why it covers
+both paths. The two runtimes' Postgres providers differ structurally here, and
+the assumption that they did not was the coordinator's, corrected by
+measurement.
+
 **Note 23 — the construction is the point, and the previous one had rotted.**
 Rust's guard is defence in depth on both sides now: every terminal transition
 cleans the waits up first, so the state it refuses is reachable only by forging.
@@ -276,6 +295,31 @@ construction, committing the wait in the same task that closes the run, became
 vacuous the moment terminal cleanup landed: measured at `fired: 0` with the
 guard removed, it would have passed for the wrong reason. The rebuild was not
 tidying; it was the difference between a detector and a decoration.
+
+Rust's cases now forge the state the same way, and the cross-revert holds on
+both sides: under each of the three row-22 cleanup reverts all three row-23
+tests passed, and under each of the three row-23 guard reverts all four row-22
+tests passed. Six mutations, and no detector wearing two hats.
+
+**Note 24 — found by building the detector for row 23, not by reading the
+SPEC.** §14 is explicit that a wait the terminal guard refuses is "skipped, not
+deleted: deleting it would hide the defect the cleanup is supposed to have
+prevented." Rust's memory provider obeys it. `src/sqlite.rs:1146` and
+`src/postgres.rs:8675` each run `delete from active_waits` and then `continue`,
+so the evidence the SPEC wants preserved is destroyed by the very guard that
+detected it — and destroyed silently, since firing zero timers is also what
+correct behaviour looks like. The measurement that separates them is a second
+scan after the guard has run: memory fires `0` (the wait is still there and
+still refused), SQLite and Postgres fire `0` for the different reason that
+there is nothing left to refuse.
+
+Row 23's Rust cases deliberately assert only the guard's contract — no
+`TimerFired`, history unchanged — and say nothing about the wait's fate, so they
+do not freeze one provider's answer into the ledger while the question is open.
+Whether §14 or the two providers should move is unresolved and deliberately
+left so; what is not in doubt is that they disagree today, and that three
+TypeScript providers were written to a description of Rust that only Rust's
+memory provider satisfies.
 
 ---
 

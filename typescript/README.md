@@ -785,7 +785,10 @@ until all of these are true for the target release:
   provider I/O, and benchmark vocabulary.
 - `npm run test:soak` passes for the release candidate. The default soak enables
   `DURUST_LONG_SOAK=1` and runs the hot execution cache crash/restart/fault
-  matrix; tune `DURUST_LONG_SOAK_SEEDS`, `DURUST_LONG_SOAK_WORKFLOWS`,
+  matrix. The switch is on for any value except empty, `0`, and `false`, the
+  same reading as `DURUST_REQUIRE_POSTGRES`; set `DURUST_REQUIRE_LONG_SOAK=1`
+  alongside it to turn a soak that is switched off into a failure rather than a
+  skip. Tune `DURUST_LONG_SOAK_SEEDS`, `DURUST_LONG_SOAK_WORKFLOWS`,
   `DURUST_LONG_SOAK_GENERATIONS`, `DURUST_LONG_SOAK_STEPS`,
   `DURUST_LONG_SOAK_FINAL_STEPS`, and `DURUST_LONG_SOAK_CONFLICTS` upward for
   release-candidate burn-in.

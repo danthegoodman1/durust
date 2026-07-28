@@ -2010,8 +2010,11 @@ export class PostgresBackend implements DurableBackend {
             -- replay, audit and terminal-cleanup assumption rests on not
             -- happening. Expressed as a predicate rather than as a per-row
             -- skip so the row is never selected, and therefore never included
-            -- in the delete below: Rust's memory provider likewise skips a
-            -- terminal run's wait without removing it.
+            -- in the delete below. Every Rust provider reaches the same end by
+            -- the other route, a per-row skip that leaves the row alone; the
+            -- trade is recorded in PARITY.md note 22, because the predicate
+            -- also keeps a leftover out of the scan's budget and so makes this
+            -- provider blind to a terminal cleanup that stopped deleting waits.
             and runs.terminal = false
           order by waits.ready_at_ms asc, waits.wait_id asc
           limit $3::bigint
@@ -4628,9 +4631,14 @@ export class PostgresBackend implements DurableBackend {
             activity.availableAtMs = effect.visibleAtMs ?? 0;
             activity.claim = null;
           }
-          // `effect.timeoutAtMs` has no consumer: map items are exempt from
-          // the start-to-close and heartbeat scanners in every TypeScript
-          // provider, which is tracked as its own plan row.
+          // `effect.timeoutAtMs` has no consumer here. Not because map items
+          // are exempt from the timeout scanners — they are not; see
+          // `activityTimeoutDeadline`, which covers them on the same terms as
+          // any other activity. It is unused because the deadline is derived
+          // at claim time — `activityTimeoutDeadlineFromTask` stamps
+          // `timeout_deadline_at_ms` on the claiming update — and this effect
+          // hands the item back unclaimed: anything stamped here would be
+          // recomputed by the claim that follows.
           break;
         }
         case "CompleteMap":

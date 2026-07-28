@@ -884,7 +884,7 @@ export class SqliteBackend implements DurableBackend {
         }
         // Same guard, same reason, as `MemoryBackend.fireDueTimers`: a stray
         // wait must not append `TimerFired` past a closed run's terminal
-        // event. Skipped rather than deleted, matching Rust's memory provider.
+        // event. Skipped rather than deleted, matching every Rust provider.
         if (state.terminal) {
           continue;
         }
@@ -1830,9 +1830,14 @@ export class SqliteBackend implements DurableBackend {
             activity.claim = null;
             this.#insertActivity(activity);
           }
-          // `effect.timeoutAtMs` has no consumer: map items are exempt from
-          // the start-to-close and heartbeat scanners in every TypeScript
-          // provider, which is tracked as its own plan row.
+          // `effect.timeoutAtMs` has no consumer here. Not because map items
+          // are exempt from the timeout scanners — they are not; see
+          // `activityTimeoutDeadline`, which covers them on the same terms as
+          // any other activity. It is unused because the deadline is derived
+          // at claim time from `claim.startedAtMs` and
+          // `claim.heartbeatDeadlineAtMs`, and this effect hands the item back
+          // unclaimed: anything stamped here would be recomputed by the claim
+          // that follows.
           break;
         }
         case "CompleteMap":

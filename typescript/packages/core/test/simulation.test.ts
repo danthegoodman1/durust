@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { assertLongSoakEnabledWhenRequired, longSoakIsEnabled } from "@durust/testing";
 import {
   Client,
   MemoryBackend,
@@ -25,7 +26,10 @@ import {
 
 const WORKFLOW_QUEUE = "workflows";
 const ACTIVITY_QUEUE = "activities";
-const LONG_SOAK_ENABLED = process.env.DURUST_LONG_SOAK === "1";
+const LONG_SOAK_ENABLED = longSoakIsEnabled();
+// Module scope on purpose: the soak lives in a `describe.skip`ped suite when
+// it is off, and a skipped suite runs no hooks. See the helper's own comment.
+assertLongSoakEnabledWhenRequired(LONG_SOAK_ENABLED);
 const LONG_SOAK_SEED_BASE = positiveIntEnv("DURUST_LONG_SOAK_SEED_BASE", 1_009);
 const LONG_SOAK_SEEDS = positiveIntEnv("DURUST_LONG_SOAK_SEEDS", 12);
 const LONG_SOAK_WORKFLOWS = positiveIntEnv("DURUST_LONG_SOAK_WORKFLOWS", 12);

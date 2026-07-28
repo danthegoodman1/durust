@@ -69,6 +69,24 @@ export function postgresUrlFromEnv(
 }
 
 /**
+ * The on/off reading of a `DURUST_*` boolean switch, shared by every flag here
+ * so that no two of them can drift apart.
+ *
+ * On for any value except unset, empty, `0`, and `false` (case-insensitive).
+ * That an unrecognized value reads as *on* is the deliberate part: a typo in
+ * `DURUST_REQUIRE_POSTGRES=ture` runs the gated work rather than silently
+ * dropping it. For a switch whose only job is to stop a suite passing
+ * vacuously, failing toward more coverage is the sole safe direction.
+ */
+function envFlagIsOn(value: string | undefined): boolean {
+  if (value === undefined) {
+    return false;
+  }
+  const trimmed = value.trim();
+  return !(trimmed.length === 0 || trimmed === "0" || trimmed.toLowerCase() === "false");
+}
+
+/**
  * Whether this run is *obliged* to exercise Postgres.
  *
  * Mirrors Rust's `postgres_is_required` exactly, including the off switches:
@@ -80,11 +98,57 @@ export function postgresUrlFromEnv(
 export function postgresIsRequired(
   value: string | undefined = process.env.DURUST_REQUIRE_POSTGRES
 ): boolean {
-  if (value === undefined) {
-    return false;
+  return envFlagIsOn(value);
+}
+
+/**
+ * Whether the long-running soak profile is switched on.
+ *
+ * This was `process.env.DURUST_LONG_SOAK === "1"`, which made
+ * `DURUST_LONG_SOAK=true` *disable* the soak — and `true` is precisely the
+ * spelling someone who had just read `DURUST_REQUIRE_POSTGRES=true` would
+ * reach for. The failure was silent in the worst way: the suite reports
+ * `1 skipped` and exits 0, so a run that was asked for the soak and did not
+ * do it is indistinguishable from a green one.
+ */
+export function longSoakIsEnabled(
+  value: string | undefined = process.env.DURUST_LONG_SOAK
+): boolean {
+  return envFlagIsOn(value);
+}
+
+/** Whether this run is *obliged* to execute the long soak. */
+export function longSoakIsRequired(
+  value: string | undefined = process.env.DURUST_REQUIRE_LONG_SOAK
+): boolean {
+  return envFlagIsOn(value);
+}
+
+/**
+ * Fails a run that is supposed to execute the long soak but has it switched
+ * off.
+ *
+ * **Call this at module scope**, for the reason spelled out at length on
+ * `assertPostgresAvailableWhenRequired`: a `describe.skip`ped suite still has
+ * its module body evaluated during collection, but none of its hooks run, so
+ * a hook-based check never fires in the one case it exists for.
+ *
+ * The two variables are deliberately set from different places — `test:soak`
+ * supplies `DURUST_LONG_SOAK`, CI's step supplies `DURUST_REQUIRE_LONG_SOAK`.
+ * A flag that switched itself on from the same line it guards could only ever
+ * agree with itself; sourcing them separately is what lets this catch an
+ * edited script, a lost CI variable, or a spelling the old parse dropped.
+ */
+export function assertLongSoakEnabledWhenRequired(
+  enabled: boolean = longSoakIsEnabled(),
+  required: boolean = longSoakIsRequired()
+): void {
+  if (required && !enabled) {
+    throw new Error(
+      "DURUST_REQUIRE_LONG_SOAK is set, so the long soak must run, but " +
+        "DURUST_LONG_SOAK is unset, empty, `0`, or `false`"
+    );
   }
-  const trimmed = value.trim();
-  return !(trimmed.length === 0 || trimmed === "0" || trimmed.toLowerCase() === "false");
 }
 
 /**

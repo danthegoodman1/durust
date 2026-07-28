@@ -113,30 +113,50 @@ jobs:
       # check:postgres`, because that script also runs
       # `test:benchmark-thresholds` — see the note below it.
       #
-      # `DURUST_REQUIRE_POSTGRES` is the same flag the Rust suite uses, and is
-      # set here so the TypeScript side can fail rather than skip once it
-      # honours it. Until then the `test -n` guard is the whole protection, and
-      # it is weaker than it looks: it checks a value set two lines above it,
-      # so it fires only if a future edit deletes that `env:` block. It does
-      # *not* catch the case that matters — a file whose cases are all skipped
-      # reports success — which needs an executed-count assertion on the
-      # TypeScript side.
-      - name: Run TypeScript Postgres conformance
+      # `DURUST_REQUIRE_POSTGRES` is the same flag the Rust suite uses, and the
+      # TypeScript side now honours it: both files below call
+      # `assertPostgresAvailableWhenRequired` at module scope, which throws on
+      # a missing URL. Measured: require set with no URL exits 1.
+      #
+      # The `test -n` guard stays, and is not redundant, because it covers the
+      # one case the assertion cannot. Delete this `env:` block and
+      # `DURUST_REQUIRE_POSTGRES` goes with it — so the assertion sees "not
+      # required", skips quietly, and the step is green. The guard fires on
+      # exactly that edit. It is narrow, and that narrowness is the point;
+      # it is not the general protection it used to be described as.
+      #
+      # `database-guard.test.ts` is listed because nothing else in CI ran it.
+      # `npm run check` collects it and skips it (no URL at job level, by
+      # design — see the note at the top), the conformance step named only the
+      # other file, and `check:postgres` is not invoked here at all. That left
+      # its seven cases — the guard in front of `drop database`, the only
+      # unrecoverable statement this repository issues — ungated, while its
+      # Rust twin in `benchtools` ran on every push.
+      - name: Run TypeScript Postgres conformance and database guard
         env:
           DURUST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/durust
           DURUST_REQUIRE_POSTGRES: "1"
         run: |
           test -n "$DURUST_POSTGRES_URL" || {
-            echo "DURUST_POSTGRES_URL must be set: without it every case in this file is skipped and the step still passes"
+            echo "DURUST_POSTGRES_URL must be set: without it every case in these files is skipped and the step still passes"
             exit 1
           }
-          npm run test --prefix typescript -- packages/postgres/test/postgres-conformance.test.ts
+          npm run test --prefix typescript -- \
+            packages/postgres/test/postgres-conformance.test.ts \
+            packages/benchmark/test/database-guard.test.ts
 
       # `DURUST_LONG_SOAK=1` adds exactly one case to the simulation suite
       # (16 tests instead of 15 passed + 1 skipped) and costs ~90 ms of the
       # run's 0.6 s wall clock, measured. There is no reason for something that
       # cheap to live outside CI.
+      #
+      # `DURUST_REQUIRE_LONG_SOAK` is set *here* rather than in `test:soak`,
+      # which supplies `DURUST_LONG_SOAK`. Two sources, so the check can catch
+      # something: if the script ever stops enabling the soak, this step fails
+      # instead of quietly reporting `1 skipped` and exiting 0.
       - name: Run TypeScript hot execution cache soak
+        env:
+          DURUST_REQUIRE_LONG_SOAK: "1"
         run: npm run test:soak --prefix typescript
 
       # Deliberately **not** run here, and this is the decision rather than an
@@ -155,6 +175,21 @@ jobs:
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d
 
+      # `DURUST_REQUIRE_GARAGE` is to this step what `DURUST_REQUIRE_POSTGRES`
+      # is to the two above: without it the conformance case skips on missing
+      # variables and reports `ok. 1 passed`, so the step's greenness never
+      # depended on Garage being reachable. The compose service and the six
+      # variables below meant it did genuinely run — but a container that fails
+      # to become ready, or one dropped variable, would have gone unnoticed.
+      #
+      # The filter is the substring `garage`, not the full test name it used to
+      # be. `cargo test` with a filter that matches nothing prints `0 passed`
+      # and exits 0, so naming a single test meant that dropping `--features
+      # s3`, or renaming that test, left this step green having run nothing at
+      # all. `garage` also matches
+      # `garage_s3_feature_is_enabled_when_garage_is_required`, which is
+      # compiled unconditionally — so the filter can never match zero tests,
+      # and the missing-feature case now fails here instead of passing.
       - name: Run Garage S3 conformance
         env:
           DURUST_GARAGE_ENDPOINT: http://127.0.0.1:3900
@@ -163,7 +198,8 @@ jobs:
           DURUST_GARAGE_PREFIX: ci/${{ github.run_id }}/${{ github.run_attempt }}
           DURUST_GARAGE_ACCESS_KEY_ID: GK0123456789abcdef0123456789abcdef
           DURUST_GARAGE_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: cargo test --locked --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+          DURUST_REQUIRE_GARAGE: "1"
+        run: cargo test --locked --features s3 --test provider_conformance garage -- --nocapture
 
       - name: Stop Garage
         if: always()

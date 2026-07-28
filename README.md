@@ -761,9 +761,24 @@ DURUST_GARAGE_REGION=garage \
 DURUST_GARAGE_PREFIX=local/payloads \
 DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
 DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-cargo test --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+DURUST_REQUIRE_GARAGE=1 \
+cargo test --features s3 --test provider_conformance garage -- --nocapture
 docker compose -f tests/fixtures/garage.compose.yml down -v
 ```
+
+`DURUST_REQUIRE_GARAGE` makes a missing or blank `DURUST_GARAGE_*` variable a
+failure instead of a skip, and it names the variables that are actually
+missing. Leave it unset if you have no Garage: the test then skips and the run
+still passes. It is on for any value except empty, `0`, and `false`, so a typo
+runs the test rather than quietly dropping it.
+
+The filter is the substring `garage` rather than the full test name, and that
+matters more than it looks. `cargo test` with a filter matching nothing prints
+`0 passed` and exits 0, so naming the single conformance test meant a run
+without `--features s3` was green having executed nothing. `garage` also
+matches `garage_s3_feature_is_enabled_when_garage_is_required`, which compiles
+unconditionally and fails when the feature is absent — so the filter can never
+select zero tests.
 
 ## Recovery Model
 

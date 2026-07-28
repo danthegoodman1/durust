@@ -90,7 +90,54 @@ fn postgres_feature_is_enabled_when_postgres_is_required() {
 /// Deliberately outside `#[cfg(feature = "postgres")]`: the test above needs it
 /// in a build that has no Postgres support at all.
 fn postgres_is_required() -> bool {
-    match std::env::var("DURUST_REQUIRE_POSTGRES") {
+    env_flag_is_on("DURUST_REQUIRE_POSTGRES")
+}
+
+/// `DURUST_REQUIRE_GARAGE` can only fail a Garage test that was compiled, and
+/// the Garage test lives behind `#[cfg(feature = "s3")]` — so a build without
+/// that feature contains no Garage test and the flag has nothing to fire on.
+///
+/// That hole is wider here than it is for Postgres, because CI's Garage step
+/// selects a *single* test by name filter. `cargo test <filter>` that matches
+/// nothing prints `0 passed` and **exits 0** (measured, not assumed): drop the
+/// feature, or rename the conformance test, and the step stays green having
+/// run no S3 at all. Two independent ways to pass vacuously, and the container
+/// coming up healthy disguises both.
+///
+/// So this test sits outside the `cfg`, and CI filters on the substring
+/// `garage` rather than the full test name. This test's own name contains it,
+/// so the filter always matches at least one test, that test always compiles,
+/// and it fails when the feature is gone. A filter that can never match zero
+/// tests is the part that makes the rest of the guard reachable.
+#[test]
+fn garage_s3_feature_is_enabled_when_garage_is_required() {
+    if !garage_is_required() {
+        return;
+    }
+    assert!(
+        cfg!(feature = "s3"),
+        "DURUST_REQUIRE_GARAGE is set, but this binary was built without the `s3` feature, so \
+         the Garage conformance test was compiled out and the run proves nothing. Add \
+         `--features s3` or `--all-features`."
+    );
+}
+
+/// Deliberately outside `#[cfg(feature = "s3")]`: the test above needs it in a
+/// build that has no S3 support at all.
+fn garage_is_required() -> bool {
+    env_flag_is_on("DURUST_REQUIRE_GARAGE")
+}
+
+/// The on/off reading of a `DURUST_REQUIRE_*` switch, shared by every flag in
+/// this file so that no two of them can drift apart.
+///
+/// On for any value except unset, empty, `0`, and `false` (case-insensitive).
+/// That an unrecognized value reads as *on* is the deliberate part: a typo in
+/// `DURUST_REQUIRE_GARAGE=ture` runs the gated work rather than silently
+/// dropping it. For a switch whose only job is to stop a suite passing
+/// vacuously, failing toward more coverage is the sole safe direction.
+fn env_flag_is_on(name: &str) -> bool {
+    match std::env::var(name) {
         Ok(value) => {
             let value = value.trim();
             !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
@@ -951,8 +998,7 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
 #[test]
 fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
     block_on_tokio(async {
-        let Some(garage) = garage_config_from_env() else {
-            eprintln!("skipping Garage S3 conformance; set DURUST_GARAGE_* env vars");
+        let Some(garage) = garage_config_or_skip("Garage S3 conformance") else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -1083,22 +1129,61 @@ where
         .block_on(future)
 }
 
+/// The Garage connection settings, or `None` when this run is not expected to
+/// have a Garage.
+///
+/// Same shape and same reason as `postgres_url_or_skip`: libtest captures
+/// `eprintln!` on a passing test, so with the variables unset this returns
+/// `None`, the caller returns early, and the run reports `ok. 1 passed` having
+/// touched no S3 at all. `DURUST_REQUIRE_GARAGE` turns that into a panic.
+///
+/// The panic names the variables that are actually missing rather than the
+/// `DURUST_GARAGE_*` family, because a dropped `DURUST_GARAGE_BUCKET` and a
+/// Garage container that never came up are different failures and should not
+/// print the same sentence.
+///
+/// Blank is missing. The four required reads used `env::var(..).ok()?`, which
+/// accepts `DURUST_GARAGE_ENDPOINT=""` as a value and hands an empty endpoint
+/// to the client; the Postgres helper above has always rejected empty, and
+/// there is no reason for the two to disagree about what "set" means.
 #[cfg(feature = "s3")]
-fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
-    let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
-    let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
-    let access_key_id = env::var("DURUST_GARAGE_ACCESS_KEY_ID").ok()?;
-    let secret_access_key = env::var("DURUST_GARAGE_SECRET_ACCESS_KEY").ok()?;
-    let region = env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned());
-    let prefix = env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "payloads".to_owned());
+fn garage_config_or_skip(what: &str) -> Option<durust::S3BlobStoreConfig> {
+    const REQUIRED: [&str; 4] = [
+        "DURUST_GARAGE_ENDPOINT",
+        "DURUST_GARAGE_BUCKET",
+        "DURUST_GARAGE_ACCESS_KEY_ID",
+        "DURUST_GARAGE_SECRET_ACCESS_KEY",
+    ];
+    let missing: Vec<&str> = REQUIRED
+        .into_iter()
+        .filter(|name| non_empty_env(name).is_none())
+        .collect();
+    if !missing.is_empty() {
+        let missing = missing.join(", ");
+        assert!(
+            !garage_is_required(),
+            "DURUST_REQUIRE_GARAGE is set, so `{what}` must run, \
+             but these are unset or empty: {missing}"
+        );
+        eprintln!("skipping {what}; set {missing}");
+        return None;
+    }
     Some(durust::S3BlobStoreConfig {
-        bucket,
-        endpoint,
-        region,
-        prefix,
-        access_key_id,
-        secret_access_key,
+        bucket: non_empty_env("DURUST_GARAGE_BUCKET").expect("checked above"),
+        endpoint: non_empty_env("DURUST_GARAGE_ENDPOINT").expect("checked above"),
+        region: env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned()),
+        prefix: env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "payloads".to_owned()),
+        access_key_id: non_empty_env("DURUST_GARAGE_ACCESS_KEY_ID").expect("checked above"),
+        secret_access_key: non_empty_env("DURUST_GARAGE_SECRET_ACCESS_KEY").expect("checked above"),
     })
+}
+
+#[cfg(feature = "s3")]
+fn non_empty_env(name: &str) -> Option<String> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Some(value),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "s3")]
@@ -12254,4 +12339,768 @@ async fn run_postgres_sql(database_url: &str, sql: &str) {
     });
     client.batch_execute(sql).await.unwrap();
     connection.abort();
+}
+
+/// The closing commit both halves of the terminal-wait coverage are built on:
+/// it starts a timer, records that timer's wait, and closes the run in one
+/// transaction, so the commit creates a wait and makes it unreachable at the
+/// same instant. Shared with the Postgres batch-path case so both of that
+/// provider's commit paths apply a byte-identical commit.
+fn timer_wait_closing_commit(
+    run_id: &durust::RunId,
+    fire_at: durust::TimestampMs,
+) -> (durust::WaitId, WorkflowTaskCommit) {
+    let command_id = durust::command_id(run_id, 1);
+    let wait_id = durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
+    let commit = WorkflowTaskCommit {
+        expected_tail_event_id: EventId(1),
+        append_events: vec![
+            durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(durust::TimerStarted {
+                command_id: command_id.clone(),
+                fire_at,
+                fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+            })),
+            durust::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                result: durust::encode_payload(&()).unwrap(),
+            }),
+        ],
+        upsert_waits: vec![durust::WaitRecord {
+            wait_id: wait_id.clone(),
+            run_id: run_id.clone(),
+            command_id,
+            kind: durust::WaitKind::Timer,
+            key: "timer".to_owned(),
+            ready_at: Some(fire_at),
+        }],
+        ..WorkflowTaskCommit::default()
+    };
+    (wait_id, commit)
+}
+
+/// A run's waits are deleted by the same transaction that closes it
+/// (`SPEC.md` §19.1), so operational storage does not grow with closed runs and
+/// maintenance scans do not pay for them.
+///
+/// The observable consequence is starvation, not corruption — corruption is
+/// what the due-timer terminal guard prevents, and that is pinned by
+/// `a_stray_timer_wait_never_fires`. A leftover wait is
+/// still selected by the due scan, still spends one of its `limit` slots, and
+/// is only then refused by the guard — which leaves it in place (`SPEC.md` §14;
+/// see `a_skipped_stray_wait_still_spends_the_next_scans_budget`), so it spends
+/// a slot on every later sweep too and a fleet's dead waits crowd out the
+/// timers that could actually fire. Two runs, one due wait each,
+/// `limit: 1`: with the cleanup the live run's timer fires, and without it the
+/// closed run's wait takes the only slot.
+///
+/// Every Rust provider selects the leftover row before it checks the run, so
+/// this is a real detector on all three. (The equivalent TypeScript case is
+/// blind on Postgres, whose scan carries `terminal = false` as a predicate
+/// *inside* the limited query; the Rust Postgres scan filters only on
+/// namespace, kind and `ready_at_ms`, then re-reads each row's run.)
+///
+/// Each provider gets its own backend rather than a case in the shared
+/// `provider_conformance` list, because this is a *budget* observation: the
+/// single scan slot has to be contended by exactly these two runs. On the
+/// shared backend an unrelated case's surviving timer wait can take the slot
+/// instead — and under the very mutation this case exists to catch, terminal
+/// cleanup stops running for every earlier case too, so the shared backend
+/// accumulates precisely the leftovers that would make the failure
+/// unattributable.
+async fn close_a_run_holding_a_due_timer_wait<B>(
+    backend: &B,
+    prefix: &str,
+) -> (durust::RunId, durust::WaitId)
+where
+    B: DurableBackend,
+{
+    let queue = format!("{prefix}-terminal-cleanup-workflows");
+    let run_id = Client::new(backend.clone())
+        .start_workflow::<workflow>(format!("wf/{prefix}-closed-timer"), queue.clone(), input(1))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-closing-timer-scheduler")),
+            workflow_claim_opts(&queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let (wait_id, commit) = timer_wait_closing_commit(&run_id, durust::TimestampMs(1_000));
+    let outcome = backend
+        .commit_workflow_task(claimed.claim, commit)
+        .await
+        .expect("a commit that starts a timer and closes its own run must be accepted");
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(3)
+        },
+    );
+    (run_id, wait_id)
+}
+
+async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
+    backend: &B,
+    prefix: &str,
+    closed_wait_id: &durust::WaitId,
+) where
+    B: DurableBackend,
+{
+    let queue = format!("{prefix}-terminal-cleanup-workflows");
+    let live_run_id = Client::new(backend.clone())
+        .start_workflow::<workflow>(format!("wf/{prefix}-live-timer"), queue.clone(), input(1))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-live-timer-scheduler")),
+            workflow_claim_opts(&queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let command_id = durust::command_id(&live_run_id, 1);
+    let live_wait_id =
+        durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
+    // The closed run's leftover has to be picked first under both selection
+    // orders in play — key order in the memory provider's wait map, `order by
+    // ready_at_ms asc, wait_id asc` in the SQL providers — or it never contends
+    // for the slot and this case cannot fail. The earlier `ready_at` covers the
+    // SQL providers; this covers the memory provider, and fails loudly if run
+    // id generation ever stops sorting the first-started run first.
+    assert!(
+        closed_wait_id.0 < live_wait_id.0,
+        "the closed run's leftover wait must sort before the live run's, or it never \
+         contends for the scan slot: `{}` vs `{}`",
+        closed_wait_id.0,
+        live_wait_id.0,
+    );
+    let fire_at = durust::TimestampMs(2_000);
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                        command_id: command_id.clone(),
+                        fire_at,
+                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                    }),
+                )],
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: live_wait_id,
+                    run_id: live_run_id.clone(),
+                    command_id,
+                    kind: durust::WaitKind::Timer,
+                    key: "timer".to_owned(),
+                    ready_at: Some(fire_at),
+                }],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        },
+    );
+
+    let fired = backend
+        .fire_due_timers(durust::FireDueTimersRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(10_000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fired.fired, 1,
+        "a closed run's leftover wait must not spend the due-timer scan's only slot; fired {}",
+        fired.fired,
+    );
+    assert_eq!(
+        stream_history(backend, live_run_id)
+            .await
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            durust::HistoryEventType::WorkflowStarted,
+            durust::HistoryEventType::TimerStarted,
+            durust::HistoryEventType::TimerFired,
+        ],
+        "the live run's timer is the one that must have fired",
+    );
+}
+
+#[test]
+fn memory_terminal_cleanup_deletes_a_closed_runs_waits() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let (_, closed_wait_id) =
+            close_a_run_holding_a_due_timer_wait(&backend, "memory-cleanup-waits").await;
+        only_the_live_runs_timer_spends_the_due_scan_budget(
+            &backend,
+            "memory-cleanup-waits",
+            &closed_wait_id,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_terminal_cleanup_deletes_a_closed_runs_waits_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("terminal-cleanup-waits.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let (_, closed_wait_id) =
+            close_a_run_holding_a_due_timer_wait(&backend, "sqlite-cleanup-waits").await;
+        drop(backend);
+
+        // Reopened before the scan: the delete has to be on disk, or a
+        // restarted provider inherits the dead wait it was supposed to have
+        // dropped and the storage bound is only true for one process.
+        let reopened = SqliteBackend::open(&path).unwrap();
+        only_the_live_runs_timer_spends_the_due_scan_budget(
+            &reopened,
+            "sqlite-cleanup-waits",
+            &closed_wait_id,
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_terminal_cleanup_deletes_a_closed_runs_waits_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_or_skip("Postgres terminal wait cleanup") else {
+            return;
+        };
+        let schema = postgres_test_schema("cleanupwaits");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        let (_, closed_wait_id) =
+            close_a_run_holding_a_due_timer_wait(&backend, "pg-cleanup-waits").await;
+        only_the_live_runs_timer_spends_the_due_scan_budget(
+            &backend,
+            "pg-cleanup-waits",
+            &closed_wait_id,
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+/// Postgres is the one provider with two commit implementations: the scalar
+/// `commit_workflow_task` and the set-based path a multi-run
+/// `commit_workflow_tasks` batch takes when more than one of its commits is
+/// simple-batch eligible. Both must delete a closed run's wait rows, and the
+/// budget case above can only reach the scalar one.
+///
+/// Asserted on the rows themselves rather than on a scan, because that is the
+/// §19.1 invariant directly — operational storage does not grow with closed
+/// runs — and because a row count cannot be satisfied by a scan that merely
+/// skips what it finds.
+///
+/// Non-vacuity is established by mutation, not by inspection: this test cannot
+/// see which path the batch took, but deleting the batch path's cleanup call
+/// alone fails it, which is only possible if the batch reached that path.
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_closing_commits_delete_wait_rows_on_both_commit_paths_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_or_skip("Postgres terminal wait row cleanup") else {
+            return;
+        };
+        let schema = postgres_test_schema("waitrows");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+
+        let (scalar_run_id, _) =
+            close_a_run_holding_a_due_timer_wait(&backend, "pg-wait-rows").await;
+        assert_eq!(
+            postgres_wait_row_count(&url, &schema, &scalar_run_id).await,
+            0,
+            "the scalar commit path must delete the closed run's wait rows",
+        );
+
+        // Two runs, one commit each, both simple-batch eligible (no maps, no
+        // child starts, no cancels, and only timer/terminal events), so the
+        // batch routes through the set-based apply instead of falling back to
+        // the scalar path per item.
+        let queue = "pg-wait-rows-batch-workflows";
+        let client = Client::new(backend.clone());
+        let mut claims = Vec::new();
+        for index in 0..2 {
+            let run_id = client
+                .start_workflow::<workflow>(
+                    format!("wf/pg-wait-rows-batch/{index}"),
+                    queue,
+                    input(1),
+                )
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    WorkerId::new(format!("pg-wait-rows-batch-{index}")),
+                    workflow_claim_opts(queue),
+                )
+                .await
+                .unwrap()
+                .expect("workflow task");
+            assert_eq!(claimed.run_id, run_id);
+            claims.push(claimed);
+        }
+        let results = backend
+            .commit_workflow_tasks(WorkflowTaskCommitBatch {
+                commits: claims
+                    .iter()
+                    .map(|claimed| WorkflowTaskCommitInput {
+                        claim: claimed.claim.clone(),
+                        commit: timer_wait_closing_commit(
+                            &claimed.run_id,
+                            durust::TimestampMs(1_000),
+                        )
+                        .1,
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            assert_eq!(
+                *result.result.as_ref().unwrap(),
+                CommitOutcome::Committed {
+                    new_tail_event_id: EventId(3)
+                },
+            );
+        }
+        for claimed in &claims {
+            assert_eq!(
+                postgres_wait_row_count(&url, &schema, &claimed.run_id).await,
+                0,
+                "the set-based batch commit path must delete closed run `{}`'s wait rows",
+                claimed.run_id,
+            );
+        }
+
+        drop_postgres_schema(&url, &schema).await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+async fn postgres_wait_row_count(database_url: &str, schema: &str, run_id: &durust::RunId) -> i64 {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let row = client
+        .query_one(
+            &format!(
+                "select count(*) from {}.active_waits where run_id = $1",
+                quote_postgres_identifier(schema)
+            ),
+            &[&run_id.0],
+        )
+        .await
+        .unwrap();
+    connection.abort();
+    row.get(0)
+}
+
+/// A due-timer scan never appends `TimerFired` to a run that has already
+/// reached a terminal event (`SPEC.md` §14 timers, §19.1 cleanup).
+///
+/// Terminal cleanup deletes a closed run's waits, so a stray wait against a
+/// closed run is state that cleanup could not reach. This case forges exactly
+/// that state and requires the provider to refuse it: a `TimerFired` appended
+/// after the terminal event corrupts a history every replay, audit and cleanup
+/// path assumes is finished, and the run is not even resurrected by it — the
+/// next claim still refuses a closed run, so the only outcome is the
+/// corruption.
+///
+/// **How the state is forged, and why it has to be.** The obvious
+/// construction — commit the wait in the same task that closes the run — is
+/// vacuous, because that is precisely the commit terminal cleanup deletes the
+/// wait from; the scan would find nothing and the case would pass with the
+/// guard deleted. It is forged here by committing the wait from a *second,
+/// live* run after the first has closed, naming the closed run in the record.
+/// Every provider stores the record's own `run_id`, so the row outlives a
+/// cleanup that already ran. This is the integration-level form of the
+/// `force_terminal` helpers the provider unit tests use, which poke the
+/// terminal flag directly because every real terminal transition would have
+/// cleaned up first.
+///
+/// `only_the_live_runs_timer_spends_the_due_scan_budget` pins the cleanup;
+/// this pins the guard behind it. Reverting either fix leaves the other case
+/// green, which is the point of having both.
+///
+/// What this case asserts is the guard's contract — no `TimerFired` past the
+/// terminal event. The skipped wait's *fate* is a separate contract, asserted
+/// separately by `a_skipped_stray_wait_still_spends_the_next_scans_budget`,
+/// which every caller of this helper runs next.
+async fn forge_a_stray_timer_wait_against_a_closed_run<B>(
+    backend: &B,
+    prefix: &str,
+) -> durust::RunId
+where
+    B: DurableBackend,
+{
+    let queue = format!("{prefix}-stray-wait-workflows");
+    let client = Client::new(backend.clone());
+    let closed_run_id = client
+        .start_workflow::<workflow>(format!("wf/{prefix}-stray-closed"), queue.clone(), input(1))
+        .await
+        .unwrap();
+    let closing = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-stray-closer")),
+            workflow_claim_opts(&queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let outcome = backend
+        .commit_workflow_task(
+            closing.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::WorkflowCompleted {
+                        result: durust::encode_payload(&()).unwrap(),
+                    },
+                )],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        },
+    );
+
+    client
+        .start_workflow::<workflow>(
+            format!("wf/{prefix}-stray-injector"),
+            queue.clone(),
+            input(1),
+        )
+        .await
+        .unwrap();
+    let injector = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-stray-injector")),
+            workflow_claim_opts(&queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let stray_command_id = durust::command_id(&closed_run_id, 1);
+    let injected = backend
+        .commit_workflow_task(
+            injector.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: durust::WaitId::new(format!(
+                        "{}:{}:timer",
+                        stray_command_id.run_id, stray_command_id.seq.0
+                    )),
+                    run_id: closed_run_id.clone(),
+                    command_id: stray_command_id,
+                    kind: durust::WaitKind::Timer,
+                    key: "timer".to_owned(),
+                    ready_at: Some(durust::TimestampMs(1_000)),
+                }],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .expect("the forging commit is a live run's own commit and must be accepted");
+    assert_eq!(
+        injected,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(1)
+        },
+    );
+    closed_run_id
+}
+
+async fn a_stray_timer_wait_never_fires<B>(backend: &B, closed_run_id: durust::RunId)
+where
+    B: DurableBackend,
+{
+    let fired = backend
+        .fire_due_timers(durust::FireDueTimersRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(10_000),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fired.fired, 0,
+        "a closed run's timer wait must not fire; fired {}",
+        fired.fired,
+    );
+    assert_eq!(
+        stream_history(backend, closed_run_id)
+            .await
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            durust::HistoryEventType::WorkflowStarted,
+            durust::HistoryEventType::WorkflowCompleted,
+        ],
+        "nothing may be appended past the run's own terminal event",
+    );
+}
+
+/// A wait the due-timer scan skipped for the terminal guard is *skipped, not
+/// deleted* (`SPEC.md` §14): "deleting it would hide the defect the cleanup is
+/// supposed to have prevented".
+///
+/// Asserted through the scan's own budget, because that is the one consequence
+/// of the row's survival that every provider exposes through `DurableBackend`
+/// alone: a wait the scan skipped is still there for the next sweep to select,
+/// so it still spends one of that sweep's `limit` slots; a wait the scan
+/// deleted does not. The caller has already run one full sweep over the stray
+/// (`a_stray_timer_wait_never_fires`), so on a provider that deletes, the row
+/// is already gone before this starts and the live run's timer takes the slot.
+///
+/// This runs against the *same* forged state as the guard case rather than
+/// forging its own, so the two cases assert two different contracts about one
+/// row: the guard refuses the append, and the row survives the refusal.
+///
+/// The starvation being pinned here is deliberate, and is not a licence for
+/// leftovers to accumulate. It is reachable only once §19.1's terminal cleanup
+/// has already failed — every `TerminalCleanup` variant deletes the run's waits
+/// unconditionally — and it is exactly what makes
+/// `only_the_live_runs_timer_spends_the_due_scan_budget` a detector of that
+/// failure. A provider that pushed the terminal check into the selecting query
+/// as a predicate would keep the leftover out of the budget and go blind on
+/// that case instead; TypeScript's Postgres provider makes that trade, and no
+/// Rust provider does.
+///
+/// Non-vacuity is asserted rather than assumed: the live run's timer must fire
+/// on the unbudgeted sweep at the end, or `fired == 0` above would be equally
+/// satisfied by a live wait that was never due, never committed, or committed
+/// against the wrong run.
+async fn a_skipped_stray_wait_still_spends_the_next_scans_budget<B>(
+    backend: &B,
+    prefix: &str,
+    closed_run_id: &durust::RunId,
+) where
+    B: DurableBackend,
+{
+    let queue = format!("{prefix}-stray-wait-workflows");
+    let live_run_id = Client::new(backend.clone())
+        .start_workflow::<workflow>(format!("wf/{prefix}-stray-live"), queue.clone(), input(1))
+        .await
+        .unwrap();
+    let claimed = backend
+        .claim_workflow_task(
+            WorkerId::new(format!("{prefix}-stray-live-scheduler")),
+            workflow_claim_opts(&queue),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    assert_eq!(
+        claimed.run_id, live_run_id,
+        "the live run must be the task claimed here, or the timer below is committed against \
+         the wrong run and the final sweep proves nothing",
+    );
+    let command_id = durust::command_id(&live_run_id, 1);
+    let live_wait_id =
+        durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
+    let stray_command_id = durust::command_id(closed_run_id, 1);
+    let stray_wait_id = durust::WaitId::new(format!(
+        "{}:{}:timer",
+        stray_command_id.run_id, stray_command_id.seq.0
+    ));
+    // The stray has to be selected first under both selection orders in play —
+    // key order in the memory provider's wait map, `order by ready_at_ms asc,
+    // wait_id asc` in the SQL providers — or it never contends for the single
+    // slot and this case cannot fail. The earlier `ready_at` (1_000 against the
+    // 2_000 below) covers the SQL providers; this covers the memory provider,
+    // and fails loudly if run id generation ever stops sorting the
+    // first-started run first.
+    assert!(
+        stray_wait_id.0 < live_wait_id.0,
+        "the closed run's stray wait must sort before the live run's, or it never contends \
+         for the scan slot: `{}` vs `{}`",
+        stray_wait_id.0,
+        live_wait_id.0,
+    );
+    let fire_at = durust::TimestampMs(2_000);
+    let outcome = backend
+        .commit_workflow_task(
+            claimed.claim,
+            WorkflowTaskCommit {
+                expected_tail_event_id: EventId(1),
+                append_events: vec![durust::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                        command_id: command_id.clone(),
+                        fire_at,
+                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                    }),
+                )],
+                upsert_waits: vec![durust::WaitRecord {
+                    wait_id: live_wait_id,
+                    run_id: live_run_id.clone(),
+                    command_id,
+                    kind: durust::WaitKind::Timer,
+                    key: "timer".to_owned(),
+                    ready_at: Some(fire_at),
+                }],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        CommitOutcome::Committed {
+            new_tail_event_id: EventId(2)
+        },
+    );
+
+    let budgeted = backend
+        .fire_due_timers(durust::FireDueTimersRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(10_000),
+            limit: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        budgeted.fired, 0,
+        "the stray wait the previous sweep skipped must still be there to take this sweep's \
+         only slot; a scan that deleted it instead would have let the live run's timer through. \
+         fired {}",
+        budgeted.fired,
+    );
+
+    let unbudgeted = backend
+        .fire_due_timers(durust::FireDueTimersRequest {
+            namespace: Namespace::default(),
+            now: durust::TimestampMs(10_000),
+            limit: 16,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        unbudgeted.fired, 1,
+        "the live run's timer was due all along and must fire once the budget is not the \
+         binding constraint; fired {}",
+        unbudgeted.fired,
+    );
+    assert_eq!(
+        stream_history(backend, live_run_id)
+            .await
+            .iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>(),
+        vec![
+            durust::HistoryEventType::WorkflowStarted,
+            durust::HistoryEventType::TimerStarted,
+            durust::HistoryEventType::TimerFired,
+        ],
+        "the live run's timer is the one that must have fired",
+    );
+}
+
+#[test]
+fn memory_stray_timer_wait_never_fires_against_a_closed_run() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let closed_run_id =
+            forge_a_stray_timer_wait_against_a_closed_run(&backend, "memory-stray").await;
+        a_stray_timer_wait_never_fires(&backend, closed_run_id.clone()).await;
+        a_skipped_stray_wait_still_spends_the_next_scans_budget(
+            &backend,
+            "memory-stray",
+            &closed_run_id,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn sqlite_stray_timer_wait_never_fires_against_a_closed_run_across_reopen() {
+    block_on(async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stray-timer-wait.sqlite3");
+        let backend = SqliteBackend::open(&path).unwrap();
+        let closed_run_id =
+            forge_a_stray_timer_wait_against_a_closed_run(&backend, "sqlite-stray").await;
+        drop(backend);
+
+        // Reopened before the scan, so the forged row and the closed run's
+        // terminal flag both come off disk: a guard that only holds for the
+        // process that wrote the row would not protect a restarted fleet.
+        let reopened = SqliteBackend::open(&path).unwrap();
+        a_stray_timer_wait_never_fires(&reopened, closed_run_id.clone()).await;
+        a_skipped_stray_wait_still_spends_the_next_scans_budget(
+            &reopened,
+            "sqlite-stray",
+            &closed_run_id,
+        )
+        .await;
+    });
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn postgres_stray_timer_wait_never_fires_against_a_closed_run_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_or_skip("Postgres stray timer wait guard") else {
+            return;
+        };
+        let schema = postgres_test_schema("straywait");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url.clone()).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        let closed_run_id =
+            forge_a_stray_timer_wait_against_a_closed_run(&backend, "pg-stray").await;
+        a_stray_timer_wait_never_fires(&backend, closed_run_id.clone()).await;
+        // The row itself, directly, on the one provider whose storage this test
+        // file can read: the scan that just refused to fire it must also have
+        // left it alone. The budget case below reaches the same conclusion
+        // through the trait alone, on every provider.
+        assert_eq!(
+            postgres_wait_row_count(&url, &schema, &closed_run_id).await,
+            1,
+            "the sweep that skipped the stray wait must not have deleted it (`SPEC.md` §14)",
+        );
+        a_skipped_stray_wait_still_spends_the_next_scans_budget(
+            &backend,
+            "pg-stray",
+            &closed_run_id,
+        )
+        .await;
+        drop_postgres_schema(&url, &schema).await;
+    });
 }

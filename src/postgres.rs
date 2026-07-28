@@ -8672,13 +8672,26 @@ async fn fire_due_timers_tx(
         };
         let tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
         let terminal: bool = row.get(1);
+        // Skipped, not deleted (`SPEC.md` §14). A wait that outlived its run's
+        // terminal event is a defect, not a state to handle: §19.1 requires the
+        // terminal commit to delete the run's waits in the same transaction, so
+        // this row can only exist because that cleanup did not run. Deleting it
+        // here would hide the defect the cleanup was supposed to have prevented
+        // — the scan would silently repair the symptom once and leave no trace,
+        // and `only_the_live_runs_timer_spends_the_due_scan_budget` would stop
+        // detecting a broken cleanup, because a leftover that disappears after
+        // one sweep stops contending for the scan's budget. The guard's job is
+        // only to refuse the append: a `TimerFired` past a terminal event is a
+        // history every replay, audit and cleanup path assumes cannot exist.
+        //
+        // Deliberately a per-row skip rather than a `terminal = false`
+        // predicate on the selecting query: the predicate (TypeScript's
+        // Postgres provider takes that route) would keep a leftover out of the
+        // scan's `limit` budget, but it would also make this provider blind to
+        // a terminal cleanup that stopped deleting waits, which is what the
+        // budget case above actually tests. The starvation the predicate would
+        // avoid is reachable only once that invariant is already broken.
         if terminal {
-            tx.execute(
-                &format!("delete from {schema}.active_waits where wait_id = $1"),
-                &[&wait_id],
-            )
-            .await
-            .map_err(postgres_error)?;
             continue;
         }
 
