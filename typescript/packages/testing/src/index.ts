@@ -1,15 +1,25 @@
 import type {
+  ActivityName,
   ActivityTaskClaim,
+  ClaimedActivityTask,
   ClaimedWorkflowTask,
   CommandId,
   DurableBackend,
+  HistoryChunk,
+  Namespace,
   RunId,
   HistoryEvent,
   PrepareWorkflowTaskOptions,
+  SignalName,
+  StartWorkflowOutcome,
+  TaskQueue,
+  WorkerId,
   WorkflowDefinition,
+  WorkflowId,
   WorkflowInput,
   WorkflowTaskClaim,
-  WorkflowTaskCommit
+  WorkflowTaskCommit,
+  WorkflowType
 } from "@durust/core";
 import {
   HotWorkflowExecution,
@@ -205,6 +215,171 @@ export async function prepareWorkflowTaskCommit<
   return new HotWorkflowExecution(workflowDefinition, input, claimed, options).nextCommit();
 }
 
+/**
+ * The lease every fixture claim takes. Long enough that no test in this
+ * workspace observes it expiring by accident; the cases that *are* about lease
+ * expiry pass an explicit `leaseDurationMs` instead.
+ */
+const DEFAULT_FIXTURE_LEASE_MS = 30_000;
+
+/** The parts of a `StartWorkflowRequest` a test has to decide for itself. */
+export interface StartWorkflowFixtureRequest {
+  readonly workflowId: WorkflowId | string;
+  readonly workflowType: WorkflowType;
+  readonly input: PayloadRef;
+  readonly namespace?: Namespace | string;
+  readonly taskQueue?: TaskQueue | string;
+}
+
+/**
+ * Start a run with this workspace's default namespace and workflow task queue.
+ *
+ * Deliberately still a named-property request rather than positional arguments:
+ * `workflowId`, `workflowType` and `input` are what each test is actually
+ * choosing, and three same-shaped positional arguments would be easy to
+ * transpose silently. Only the two constants every site repeated are defaulted.
+ *
+ * The outcome is returned rather than swallowed, so a caller that needs the
+ * `runId` — or wants to assert `AlreadyStarted` — keeps it. A body that stopped
+ * calling `backend.startWorkflow` could not produce one.
+ */
+export async function startTestWorkflow(
+  backend: DurableBackend,
+  request: StartWorkflowFixtureRequest
+): Promise<StartWorkflowOutcome> {
+  return backend.startWorkflow({
+    namespace: request.namespace ?? namespace(),
+    workflowId: request.workflowId,
+    workflowType: request.workflowType,
+    taskQueue: request.taskQueue ?? taskQueue("workflows"),
+    input: request.input
+  });
+}
+
+/**
+ * Options for {@link claimWorkflow}. Everything except the registered types has
+ * a default, because almost every claim site in this workspace spelled the same
+ * three values — the default namespace, the `workflows` queue, a 30s lease —
+ * out longhand.
+ */
+export interface ClaimWorkflowFixtureOptions {
+  readonly workflowTypes: readonly WorkflowType[];
+  readonly namespace?: Namespace | string;
+  readonly taskQueue?: TaskQueue | string;
+  readonly registeredSignalNames?: readonly (SignalName | string)[];
+  readonly leaseDurationMs?: number;
+}
+
+/**
+ * Claim one workflow task, or throw naming what could not be claimed.
+ *
+ * The return type is the load-bearing part, not the defaults. `claimWorkflowTask`
+ * returns `ClaimedWorkflowTask | null` and every caller here wants the non-null
+ * half, so each one used to spell out an `expect(...).not.toBeNull()` and an
+ * `if (!claimed) throw` to narrow it. Returning `ClaimedWorkflowTask` moves that
+ * obligation into the type system: delete the `throw` below and the return type
+ * widens back to `| null`, and every one of the ~200 call sites stops compiling
+ * on its first `.claim` or `.runId`. There is no version of this fixture that
+ * silently hands back "no task claimed" — the emptied-body failure mode that
+ * makes a shared fixture turn its callers vacuous cannot be spelled here.
+ *
+ * Use it only where a claim is *expected*. The suite has cases that assert a
+ * claim is refused — wrong queue, wrong type, live lease — and those still call
+ * `backend.claimWorkflowTask` directly and assert `toBeNull()`, which is the
+ * behaviour under test rather than setup.
+ */
+export async function claimWorkflow(
+  backend: DurableBackend,
+  workerId: WorkerId | string,
+  options: ClaimWorkflowFixtureOptions
+): Promise<ClaimedWorkflowTask> {
+  const namespaceValue = options.namespace ?? namespace();
+  const taskQueueValue = options.taskQueue ?? taskQueue("workflows");
+  const claimed = await backend.claimWorkflowTask(workerId, {
+    namespace: namespaceValue,
+    taskQueue: taskQueueValue,
+    registeredWorkflowTypes: options.workflowTypes,
+    ...(options.registeredSignalNames === undefined
+      ? {}
+      : { registeredSignalNames: options.registeredSignalNames }),
+    leaseDurationMs: options.leaseDurationMs ?? DEFAULT_FIXTURE_LEASE_MS
+  });
+  if (claimed === null) {
+    throw new Error(
+      `no workflow task to claim as ${String(workerId)} on ${String(namespaceValue)}/` +
+        `${String(taskQueueValue)} for [${options.workflowTypes
+          .map((type) => `${type.name}@${type.version}`)
+          .join(", ")}]`
+    );
+  }
+  return claimed;
+}
+
+/** Options for {@link claimActivity}; see {@link ClaimWorkflowFixtureOptions}. */
+export interface ClaimActivityFixtureOptions {
+  readonly activityNames: readonly (ActivityName | string)[];
+  readonly namespace?: Namespace | string;
+  readonly taskQueue?: TaskQueue | string;
+  readonly leaseDurationMs?: number;
+}
+
+/**
+ * Claim one activity task, or throw naming what could not be claimed. The
+ * non-null return carries the same obligation as {@link claimWorkflow}'s.
+ *
+ * Note the different task-queue default: activities are scheduled onto
+ * `activities` in this workspace's fixtures, workflow tasks onto `workflows`.
+ */
+export async function claimActivity(
+  backend: DurableBackend,
+  workerId: WorkerId | string,
+  options: ClaimActivityFixtureOptions
+): Promise<ClaimedActivityTask> {
+  const namespaceValue = options.namespace ?? namespace();
+  const taskQueueValue = options.taskQueue ?? taskQueue("activities");
+  const claimed = await backend.claimActivityTask(workerId, {
+    namespace: namespaceValue,
+    taskQueue: taskQueueValue,
+    registeredActivityNames: options.activityNames,
+    leaseDurationMs: options.leaseDurationMs ?? DEFAULT_FIXTURE_LEASE_MS
+  });
+  if (claimed === null) {
+    throw new Error(
+      `no activity task to claim as ${String(workerId)} on ${String(namespaceValue)}/` +
+        `${String(taskQueueValue)} for [${options.activityNames.map(String).join(", ")}]`
+    );
+  }
+  return claimed;
+}
+
+/**
+ * Read a run's durable history from the start, up to `limit` events.
+ *
+ * `limit` is deliberately one number feeding both `upToEventId` and `maxEvents`:
+ * every site this replaced passed the same value for the two, and a fixture that
+ * let them drift would be a fixture that silently truncates. Pagination and
+ * chunk-boundary cases — the ones where the two differ, or where `afterEventId`
+ * is not zero — still build their own `StreamHistoryRequest`, because there the
+ * request *is* the thing under test.
+ *
+ * There is no default for `limit`. A default would let a caller under-read and
+ * see a short history that looks like a real one; requiring the number keeps the
+ * decision at the call site where the expected event list already lives.
+ */
+export async function readHistory(
+  backend: DurableBackend,
+  runIdValue: RunId,
+  limit: number
+): Promise<HistoryChunk> {
+  return backend.streamHistory({
+    runId: runIdValue,
+    afterEventId: eventId(0),
+    upToEventId: eventId(limit),
+    maxEvents: limit,
+    maxBytes: Number.MAX_SAFE_INTEGER
+  });
+}
+
 export function assertHistoryEventTypeMatches(event: HistoryEvent): void {
   const derived = historyEventType(event.data);
   if (event.eventType !== derived) {
@@ -298,11 +473,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       name: "claim workflow task filters by queue and registered workflow type",
       async run(factory) {
         const backend = factory();
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId("wf/claim"),
           workflowType: workflowType("conformance.workflow", 1),
-          taskQueue: taskQueue("workflows"),
           input: encodePayload({ value: 1 }, { codec: "Json" })
         });
 
@@ -336,11 +509,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       name: "expired workflow task leases are reclaimable and fence old commits",
       async run(factory) {
         const backend = factory();
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId("wf/expired-workflow-lease"),
           workflowType: workflowType("conformance.workflow", 1),
-          taskQueue: taskQueue("workflows"),
           input: encodePayload({ value: 1 }, { codec: "Json" })
         });
 
@@ -395,11 +566,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       name: "released workflow task claims are immediately reclaimable and stale releases are no-ops",
       async run(factory) {
         const backend = factory();
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId("wf/release-workflow-lease"),
           workflowType: workflowType("conformance.workflow", 1),
-          taskQueue: taskQueue("workflows"),
           input: encodePayload({ value: 1 }, { codec: "Json" })
         });
 
@@ -543,13 +712,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "commit should append contiguous event ids"
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventId).join(",") === "1,2,3",
           "history event ids should remain contiguous"
@@ -797,13 +960,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "valid batch completion should append the next event"
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityScheduled,ActivityScheduled,ActivityCompleted,ActivityCompleted",
@@ -876,13 +1033,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "activity failure wake should preserve reason"
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         const event = history.events.at(-1);
         assert(event?.data.kind === "ActivityFailed", "history should end in ActivityFailed");
         assert(
@@ -978,13 +1129,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityFailed", "terminal retry failure should wake workflow");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityScheduled,ActivityFailed",
@@ -1060,13 +1205,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityTimedOut", "timeout should wake workflow");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
@@ -1158,13 +1297,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityTimedOut", "exhausted timeout should wake workflow");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
@@ -1246,13 +1379,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityTimedOut", "heartbeat timeout should wake workflow");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         const timedOut = history.events.at(-1);
         assert(timedOut?.data.kind === "ActivityTimedOut", "history should end in ActivityTimedOut");
         assert(
@@ -1535,13 +1662,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityTimedOut", "exhausted timeout should wake workflow");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityScheduled,ActivityTimedOut",
@@ -1655,13 +1776,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           parentReady.reason === "ActivityMapCompleted",
           "activity map wake should preserve reason"
         );
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityMapCompleted",
@@ -1796,13 +1911,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(workflowWake?.reason === "ActivityMapFailed", "terminal map failure should wake parent");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
@@ -1906,13 +2015,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const resurrected = await backend.claimActivityTask("map-abandon-3", claimOptions);
         assert(resurrected === null, "no item of a failed map should be claimable");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
@@ -1932,8 +2035,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const { backend, claim } = await startedAndClaimed(factory);
         const prefix = "wf/child-map-collide";
         const childType = workflowType("conformance.child-map-collide", 1);
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId(`${prefix}/0`),
           workflowType: childType,
           taskQueue: taskQueue("child-workflows"),
@@ -1990,13 +2092,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         // map ended durably terminal with the parent never notified and never
         // woken, so this assertion is the regression test for that lost
         // update.
-        const parentHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const parentHistory = await readHistory(backend, claim.runId, 10);
         assert(
           parentHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapFailed",
@@ -2029,8 +2125,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
 
         // Ordinal 1 shared the collision's admission batch, so it was started
         // before the map ended and must be cancelled rather than orphaned.
-        const sibling = await backend.startWorkflow({
-          namespace: namespace(),
+        const sibling = await startTestWorkflow(backend, {
           workflowId: workflowId(`${prefix}/1`),
           workflowType: childType,
           taskQueue: taskQueue("child-workflows"),
@@ -2040,13 +2135,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           sibling.kind === "AlreadyStarted",
           "the collision's batch-mate should already exist"
         );
-        const siblingHistory = await backend.streamHistory({
-          runId: sibling.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const siblingHistory = await readHistory(backend, sibling.runId, 10);
         assert(
           siblingHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,WorkflowCancelled",
@@ -2117,13 +2206,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )}`
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityMapCompleted",
@@ -2202,13 +2285,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapCompleted",
@@ -2304,13 +2381,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             outcome
           )}`
         );
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(20),
-          maxEvents: 20,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 20);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,WorkflowCompleted",
@@ -2378,13 +2449,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             childOutcome
           )}`
         );
-        const childHistory = await backend.streamHistory({
-          runId: child.claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(20),
-          maxEvents: 20,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const childHistory = await readHistory(backend, child.claim.runId, 20);
         assert(
           childHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ChildWorkflowMapScheduled,WorkflowCompleted",
@@ -2564,13 +2629,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           `a plain activity of a closed run must be fenced, got ${latePlain.kind}`
         );
 
-        const ownerHistory = await backend.streamHistory({
-          runId: owner.claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(20),
-          maxEvents: 20,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const ownerHistory = await readHistory(backend, owner.claim.runId, 20);
         assert(
           ownerHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityScheduled,WorkflowCancelled",
@@ -2756,13 +2815,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           `cancelling both commands must leave no claimable work, got ${afterCancel?.task.activityId}`
         );
 
-        const historyAfter = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(20),
-          maxEvents: 20,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const historyAfter = await readHistory(backend, claim.runId, 20);
         assert(
           !historyAfter.events.some(
             (event) =>
@@ -2842,8 +2895,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
 
         const childRunIds: RunId[] = [];
         for (const ordinal of [0, 1]) {
-          const started = await backend.startWorkflow({
-            namespace: namespace(),
+          const started = await startTestWorkflow(backend, {
             workflowId: workflowId(`${prefix}/${ordinal}`),
             workflowType: childType,
             taskQueue: taskQueue("child-workflows"),
@@ -2875,13 +2927,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
 
         for (const [ordinal, childRunId] of childRunIds.entries()) {
-          const history = await backend.streamHistory({
-            runId: childRunId,
-            afterEventId: eventId(0),
-            upToEventId: eventId(10),
-            maxEvents: 10,
-            maxBytes: Number.MAX_SAFE_INTEGER
-          });
+          const history = await readHistory(backend, childRunId, 10);
           assert(
             history.events.map((event) => event.eventType).join(",") ===
               "WorkflowStarted,WorkflowCancelled",
@@ -2897,13 +2943,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           );
         }
 
-        const parentHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(20),
-          maxEvents: 20,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const parentHistory = await readHistory(backend, claim.runId, 20);
         assert(
           !parentHistory.events.some(
             (event) =>
@@ -2998,13 +3038,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         // A lapsed deadline has already paced this attempt, so the retry the
         // engine schedules is immediately claimable rather than delayed by the
         // policy backoff, and the map is still running.
-        const midHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const midHistory = await readHistory(backend, claim.runId, 10);
         assert(
           midHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled",
@@ -3036,13 +3070,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           `the exhausting timeout must also be reclaimed, got ${due.timedOut}`
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ActivityMapScheduled,ActivityMapFailed",
@@ -3267,13 +3295,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           `a closed run's timer wait must not fire, fired ${fired.fired}`
         );
 
-        const history = await backend.streamHistory({
-          runId: closedRunId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, closedRunId, 10);
         assert(
           history.events.map((event) => String(event.eventType)).join(",") ===
             "WorkflowStarted,WorkflowCompleted",
@@ -3389,13 +3411,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           fired.fired === 1,
           `a closed run's leftover wait must not spend the timer scan's budget, fired ${fired.fired}`
         );
-        const liveHistory = await backend.streamHistory({
-          runId: live.claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const liveHistory = await readHistory(backend, live.claim.runId, 10);
         assert(
           liveHistory.events.map((event) => String(event.eventType)).join(",") ===
             "WorkflowStarted,TimerStarted,TimerFired",
@@ -3520,11 +3536,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       async run(factory) {
         const backend = factory();
         const workflowInput = encodePayload({ value: "workflow-input" }, { codec: "Json" });
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId("wf/payload-roots"),
           workflowType: workflowType("conformance.workflow", 1),
-          taskQueue: taskQueue("workflows"),
           input: workflowInput
         });
         const claimed = await backend.claimWorkflowTask("worker-a", {
@@ -3785,13 +3799,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "child input should round-trip"
         );
 
-        const parentHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const parentHistory = await readHistory(backend, claim.runId, 10);
         assert(
           parentHistory.events.some((event) => event.data.kind === "ChildWorkflowStarted"),
           "parent history should include ChildWorkflowStarted"
@@ -3926,13 +3934,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "child workflow map wake should preserve reason"
         );
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         assert(
           history.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapCompleted",
@@ -3965,8 +3967,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
         const childType = workflowType("conformance.child-map-collect", 1);
-        await backend.startWorkflow({
-          namespace: namespace(),
+        await startTestWorkflow(backend, {
           workflowId: workflowId("wf/child-map-collect/0"),
           workflowType: childType,
           taskQueue: taskQueue("other-child-workflows"),
@@ -4047,13 +4048,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(parentReady !== null, "collect-all map should wake parent on completion");
         assert(parentReady.reason === "ChildWorkflowMapCompleted", "collect-all failures complete the map");
 
-        const history = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const history = await readHistory(backend, claim.runId, 10);
         const completed = history.events.at(-1)?.data;
         assert(completed?.kind === "ChildWorkflowMapCompleted", "expected ChildWorkflowMapCompleted");
         assert(completed.completed.failureCount === 1, "one collect-all item should fail");
@@ -4158,26 +4153,14 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(parentReady !== null, "fail-fast child map should wake parent");
         assert(parentReady.reason === "ChildWorkflowMapFailed", "fail-fast wake should preserve failure reason");
 
-        const parentHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const parentHistory = await readHistory(backend, claim.runId, 10);
         assert(
           parentHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,ChildWorkflowMapScheduled,ChildWorkflowMapFailed",
           "fail-fast parent history should stay compact"
         );
 
-        const siblingHistory = await backend.streamHistory({
-          runId: second.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const siblingHistory = await readHistory(backend, second.runId, 10);
         assert(
           siblingHistory.events.map((event) => event.eventType).join(",") ===
             "WorkflowStarted,WorkflowCancelled",
@@ -4276,13 +4259,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           "cancelled fail-fast item should wake the parent as failed"
         );
 
-        const parentHistory = await backend.streamHistory({
-          runId: claim.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const parentHistory = await readHistory(backend, claim.runId, 10);
         const failed = parentHistory.events.at(-1)?.data;
         assert(failed?.kind === "ChildWorkflowMapFailed", "expected ChildWorkflowMapFailed");
         assert(
@@ -4296,13 +4273,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           `unpinned fail-fast item message: ${failed.failed.failure.message}`
         );
 
-        const siblingHistory = await backend.streamHistory({
-          runId: second.runId,
-          afterEventId: eventId(0),
-          upToEventId: eventId(10),
-          maxEvents: 10,
-          maxBytes: Number.MAX_SAFE_INTEGER
-        });
+        const siblingHistory = await readHistory(backend, second.runId, 10);
         const cancelled = siblingHistory.events.at(-1)?.data;
         assert(cancelled?.kind === "WorkflowCancelled", "sibling should be cancelled");
         assert(
@@ -4340,11 +4311,9 @@ export async function scheduleTerminalRunLeftovers(
   label: string
 ): Promise<TerminalRunLeftovers> {
   const type = workflowType(`${label}.upgrade-repair`, 1);
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(`wf/${label}-upgrade-repair`),
     workflowType: type,
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: 1 }, { codec: "Json" })
   });
   const claimed = await backend.claimWorkflowTask("repair-worker", {
@@ -4520,11 +4489,9 @@ export async function scheduleTerminalRunPlainLeftover(
   label: string
 ): Promise<TerminalRunPlainLeftover> {
   const type = workflowType(`${label}.plain-repair`, 1);
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(`wf/${label}-plain-repair`),
     workflowType: type,
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: 1 }, { codec: "Json" })
   });
   const claimed = await backend.claimWorkflowTask("plain-repair-worker", {
@@ -4580,13 +4547,7 @@ export async function assertTerminalRunPlainLeftoverIsRepaired(
     completed.kind === "AlreadyCompleted",
     `a repaired plain activity must be fenced with no map present, got ${completed.kind}`
   );
-  const history = await backend.streamHistory({
-    runId: leftover.runId,
-    afterEventId: eventId(0),
-    upToEventId: eventId(20),
-    maxEvents: 20,
-    maxBytes: Number.MAX_SAFE_INTEGER
-  });
+  const history = await readHistory(backend, leftover.runId, 20);
   assert(
     !history.events.some((event) => event.eventType === "ActivityCompleted"),
     `nothing may be appended past the terminal event, got ${history.events
@@ -4686,11 +4647,9 @@ async function startedAndClaimed(
   options: { readonly backend?: DurableBackend; readonly workflowId?: string } = {}
 ): Promise<{ backend: DurableBackend; claim: WorkflowTaskClaim }> {
   const backend = options.backend ?? factory();
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(options.workflowId ?? "wf/commit"),
     workflowType: workflowType("conformance.workflow", 1),
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: 1 }, { codec: "Json" })
   });
   const claimed = await backend.claimWorkflowTask("worker-a", {

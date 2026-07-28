@@ -3,16 +3,14 @@ import {
   Client,
   MemoryBackend,
   decodePayload,
-  eventId,
   namespace,
   publish,
   signal,
-  taskQueue,
   workflow,
   workflowId
 } from "@durust/core";
 import type { PayloadRef, SchemaAdapter } from "@durust/core";
-import { prepareWorkflowTaskCommit } from "@durust/testing";
+import { claimWorkflow, prepareWorkflowTaskCommit, readHistory } from "@durust/testing";
 
 interface Input {
   readonly value: string;
@@ -88,15 +86,9 @@ describe("backend-backed Client", () => {
       value: "done"
     });
 
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [echoWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [echoWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
     const commit = await prepareWorkflowTaskCommit(echoWorkflow, { value: "done" }, claim, {
       payloadCodec: "Json"
     });
@@ -136,13 +128,7 @@ describe("backend-backed Client", () => {
     }
     expect(decodePayload(inbox.payload as PayloadRef<Approved>)).toEqual({ approvalId: "a-1" });
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events).toHaveLength(1);
   });
 
@@ -170,15 +156,9 @@ describe("backend-backed Client", () => {
       "workflow query projection is not available"
     );
 
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [queryWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [queryWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
     const commit = await prepareWorkflowTaskCommit(queryWorkflow, { value: "running" }, claim, {
       payloadCodec: "Json"
     });
@@ -200,15 +180,9 @@ describe("backend-backed Client", () => {
       { value: "encoded-running" }
     );
 
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [schemaQueryWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [schemaQueryWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
     const commit = await prepareWorkflowTaskCommit(
       schemaQueryWorkflow,
       { value: "encoded-running" },

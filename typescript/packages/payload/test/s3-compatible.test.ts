@@ -5,7 +5,6 @@ import {
   decodePayload,
   digestBytes,
   encodePayload,
-  eventId,
   namespace,
   taskQueue,
   workflowId,
@@ -17,6 +16,7 @@ import {
   decodePayloadWithStorage,
   encodePayloadWithStorage
 } from "@durust/payload";
+import { readHistory, startTestWorkflow } from "@durust/testing";
 
 describe("S3-compatible payload storage", () => {
   it("offloads, lists, hydrates, and deletes payloads through signed S3 requests", async () => {
@@ -72,21 +72,13 @@ describe("S3-compatible payload storage", () => {
         blobStore: fakeS3Store(fakeS3.endpoint),
         inlineThresholdBytes: 8
       });
-      const started = await backend.startWorkflow({
-        namespace: namespace(),
+      const started = await startTestWorkflow(backend, {
         workflowId: workflowId("wf/s3-payload-start"),
         workflowType: workflowType("payload.s3", 1),
-        taskQueue: taskQueue("workflows"),
         input: encodePayload({ body: "reachable".repeat(32) }, { codec: "Json" })
       });
 
-      const rawHistory = await inner.streamHistory({
-        runId: started.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(10),
-        maxEvents: 10,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const rawHistory = await readHistory(inner, started.runId, 10);
       const rawStarted = rawHistory.events[0]?.data;
       expect(rawStarted?.kind).toBe("WorkflowStarted");
       if (rawStarted?.kind !== "WorkflowStarted") {

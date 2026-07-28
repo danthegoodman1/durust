@@ -36,6 +36,8 @@ import {
   HotWorkflowExecutionDisposedError,
   REPLAY_WINDOW_LOOKAHEAD_EVENTS
 } from "../src/runtime.js";
+import { claimActivity, readHistory } from "@durust/testing";
+import { workerFixture } from "./support.js";
 
 /**
  * The shape a `toMatchObject` argument actually has.
@@ -412,14 +414,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(echoWorkflow, workflowId("wf/worker-echo"), "workflows", {
       value: "ok"
     });
@@ -451,12 +446,8 @@ describe("Worker", () => {
       .registerWorkflow(unqueuedWorkflow)
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "unqueued-activity-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "worker-activities",
       payloadCodec: "Json"
     });
@@ -468,13 +459,7 @@ describe("Worker", () => {
     );
 
     await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
-    const scheduled = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const scheduled = await readHistory(backend, handle.runId, 10);
     const activityScheduled = scheduled.events.find(
       (event) => event.data.kind === "ActivityScheduled"
     );
@@ -509,12 +494,8 @@ describe("Worker", () => {
     });
     const registry = new Registry().registerWorkflow(sleeper);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "clock-relative-timer-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json"
     });
     const handle = await client.startWorkflow(
@@ -525,13 +506,7 @@ describe("Worker", () => {
     );
 
     await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     const started = history.events.find((event) => event.data.kind === "TimerStarted");
     if (started?.data.kind !== "TimerStarted") {
       throw new Error("expected TimerStarted");
@@ -555,12 +530,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -592,12 +563,8 @@ describe("Worker", () => {
       .registerWorkflow(heartbeatQuoteWorkflow)
       .registerActivity(heartbeatQuoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "heartbeat-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -633,12 +600,8 @@ describe("Worker", () => {
       .registerWorkflow(catchesActivityTimeoutWorkflow)
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "timeout-workflow-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -653,13 +616,9 @@ describe("Worker", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const claimed = await backend.claimActivityTask("stalled-activity-worker", {
-      namespace: namespace(),
-      taskQueue: "activities",
-      registeredActivityNames: [quoteActivity.name],
-      leaseDurationMs: 30_000
+    await claimActivity(backend, "stalled-activity-worker", {
+      activityNames: [quoteActivity.name]
     });
-    expect(claimed).not.toBeNull();
 
     await expect(worker.runActivityTimeoutMaintenanceOnce()).resolves.toEqual({ timedOut: 1 });
     await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
@@ -677,12 +636,8 @@ describe("Worker", () => {
     const events: WorkerEvent[] = [];
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 2,
       payloadCodec: "Json",
@@ -728,12 +683,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json",
       onEvent: () => {
         throw new Error("metrics sink failed");
@@ -766,12 +717,8 @@ describe("Worker", () => {
       .registerWorkflow(twoQuoteWorkflow)
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 2,
       payloadCodec: "Json"
@@ -809,12 +756,8 @@ describe("Worker", () => {
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
     const claimedActivityIds: string[] = [];
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 2,
       payloadCodec: "Json",
@@ -825,12 +768,8 @@ describe("Worker", () => {
         }
       }
     });
-    const recoveryWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const recoveryWorker = workerFixture(backend, registry, {
       workerId: "worker-b",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 2,
       payloadCodec: "Json"
@@ -884,12 +823,8 @@ describe("Worker", () => {
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
     const events: WorkerEvent[] = [];
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 3,
       payloadCodec: "Json",
@@ -900,12 +835,8 @@ describe("Worker", () => {
         }
       }
     });
-    const recoveryWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const recoveryWorker = workerFixture(backend, registry, {
       workerId: "worker-b",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       activityCompletionBatchSize: 3,
       payloadCodec: "Json"
@@ -958,14 +889,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(timerWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       timerWorkflow,
       workflowId("wf/worker-loop-timer"),
@@ -996,14 +920,7 @@ describe("Worker", () => {
   it("stops the worker loop when aborted during idle backoff", async () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(echoWorkflow);
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 5);
 
@@ -1021,14 +938,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
     controller.abort();
     const handle = await client.startWorkflow(
@@ -1071,12 +981,8 @@ describe("Worker", () => {
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json",
       onEvent: (event) => {
@@ -1085,10 +991,7 @@ describe("Worker", () => {
         }
       }
     });
-    const activityWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const activityWorker = workerFixture(backend, registry, {
       workerId: "activity-worker",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -1137,12 +1040,8 @@ describe("Worker", () => {
       .registerWorkflow(timerWorkflow)
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const setupWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const setupWorker = workerFixture(backend, registry, {
       workerId: "setup-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json"
     });
 
@@ -1169,12 +1068,8 @@ describe("Worker", () => {
     });
 
     const controller = new AbortController();
-    const loopWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const loopWorker = workerFixture(backend, registry, {
       workerId: "loop-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json",
       onEvent: (event) => {
@@ -1224,12 +1119,8 @@ describe("Worker", () => {
       .registerWorkflow(catchesActivityTimeoutWorkflow)
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const setupWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const setupWorker = workerFixture(backend, registry, {
       workerId: "setup-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json"
     });
 
@@ -1254,22 +1145,14 @@ describe("Worker", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const claimedActivity = await backend.claimActivityTask("timeout-claimer", {
-      namespace: namespace(),
-      taskQueue: "activities",
-      registeredActivityNames: [quoteActivity.name],
-      leaseDurationMs: 30_000
+    await claimActivity(backend, "timeout-claimer", {
+      activityNames: [quoteActivity.name]
     });
-    expect(claimedActivity).not.toBeNull();
 
     const controller = new AbortController();
     const events: WorkerEvent[] = [];
-    const loopWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const loopWorker = workerFixture(backend, registry, {
       workerId: "loop-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json",
       onEvent: (event) => {
         events.push(event);
@@ -1332,12 +1215,8 @@ describe("Worker", () => {
       .registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
-    const workflowWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json",
       onEvent: (event) => {
         if (event.kind === "WorkflowTaskCommitted") {
@@ -1345,10 +1224,7 @@ describe("Worker", () => {
         }
       }
     });
-    const activityWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const activityWorker = workerFixture(backend, registry, {
       workerId: "activity-worker",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -1421,12 +1297,8 @@ describe("Worker", () => {
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
       const controller = new AbortController();
-      const workflowWorker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const workflowWorker = workerFixture(backend, registry, {
         workerId: "workflow-worker",
-        workflowTaskQueue: "workflows",
         payloadCodec: "Json",
         onEvent: (event) => {
           if (event.kind === "WorkflowTaskCommitted") {
@@ -1434,10 +1306,7 @@ describe("Worker", () => {
           }
         }
       });
-      const activityWorker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const activityWorker = workerFixture(backend, registry, {
         workerId: "activity-worker",
         workflowTaskQueue: "unused",
         activityTaskQueue: "activities",
@@ -1488,14 +1357,7 @@ describe("Worker", () => {
     const backend = failFirstWorkflowClaim(inner);
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       echoWorkflow,
       workflowId("wf/worker-loop-transient-error"),
@@ -1522,14 +1384,7 @@ describe("Worker", () => {
   it("stops the worker loop when onError aborts immediately", async () => {
     const backend = failFirstWorkflowClaim(new MemoryBackend());
     const registry = new Registry().registerWorkflow(echoWorkflow);
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
     const errors: unknown[] = [];
 
@@ -1563,14 +1418,7 @@ describe("Worker", () => {
   it("stops the worker loop when aborted during error backoff", async () => {
     const backend = failFirstWorkflowClaim(new MemoryBackend());
     const registry = new Registry().registerWorkflow(echoWorkflow);
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
     const errors: unknown[] = [];
     setTimeout(() => controller.abort(), 5);
@@ -1604,12 +1452,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(signalWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       registeredSignalNames: ["approved"],
       payloadCodec: "Json"
     });
@@ -1637,12 +1481,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -1673,12 +1513,8 @@ describe("Worker", () => {
     const backend = truncateWorkflowClaimPrefetch(inner, 1, streamRequests);
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       historyFetchMaxEvents: 1,
       workflowExecutionCacheSize: 0,
@@ -1722,12 +1558,8 @@ describe("Worker", () => {
     const backend = truncateWorkflowClaimPrefetch(inner, 1, streamRequests);
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       historyFetchMaxEvents: 1,
       workflowHistoryCacheSize: 1,
@@ -1795,12 +1627,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(hotQuoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -1852,21 +1680,13 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(restartWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const firstWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const firstWorker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
-    const restartedWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const restartedWorker = workerFixture(backend, registry, {
       workerId: "worker-b",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -1911,12 +1731,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(hotEvictionWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       workflowExecutionCacheSize: 1,
       payloadCodec: "Json"
@@ -1978,12 +1794,8 @@ describe("Worker", () => {
     });
     const registry = new Registry().registerWorkflow(conflictWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       leaseDurationMs: 1,
       payloadCodec: "Json"
@@ -2037,12 +1849,8 @@ describe("Worker", () => {
         .registerWorkflow(conflictWorkflow)
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: "worker-a",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         leaseDurationMs: 1,
         payloadCodec: "Json"
@@ -2112,12 +1920,8 @@ describe("Worker", () => {
         .registerWorkflow(failingWorkflow)
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: "worker-a",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         payloadCodec: "Json"
       });
@@ -2178,12 +1982,8 @@ describe("Worker", () => {
         .registerWorkflow(evictedWorkflow)
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: "worker-a",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         workflowExecutionCacheSize: 1,
         payloadCodec: "Json"
@@ -2256,12 +2056,8 @@ describe("Worker", () => {
         .registerWorkflow(uncachedWorkflow)
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: "worker-a",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         // The configuration where this fires on every committed task.
         workflowExecutionCacheSize: 0,
@@ -2427,12 +2223,8 @@ describe("Worker", () => {
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
-    const workflowWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-local-abort-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       maxLocalActivitiesPerWorkflowTask: 1,
       payloadCodec: "Json",
@@ -2442,10 +2234,7 @@ describe("Worker", () => {
         }
       }
     });
-    const remoteWorker = new Worker({
-      backend,
-      registry: remoteRegistry,
-      namespace: namespace(),
+    const remoteWorker = workerFixture(backend, remoteRegistry, {
       workerId: "remote-after-local-abort-worker",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -2496,12 +2285,8 @@ describe("Worker", () => {
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
     const localCompleted: string[] = [];
-    const workflowWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-local-abort-between-activities",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       maxLocalActivitiesPerWorkflowTask: 2,
       payloadCodec: "Json",
@@ -2512,10 +2297,7 @@ describe("Worker", () => {
         }
       }
     });
-    const remoteWorker = new Worker({
-      backend,
-      registry: remoteRegistry,
-      namespace: namespace(),
+    const remoteWorker = workerFixture(backend, remoteRegistry, {
       workerId: "remote-after-local-between-abort",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -2563,20 +2345,13 @@ describe("Worker", () => {
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const workflowWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-local-activity-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       maxLocalActivitiesPerWorkflowTask: 1,
       payloadCodec: "Json"
     });
-    const remoteWorker = new Worker({
-      backend,
-      registry: remoteRegistry,
-      namespace: namespace(),
+    const remoteWorker = workerFixture(backend, remoteRegistry, {
       workerId: "remote-activity-worker",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -2595,13 +2370,7 @@ describe("Worker", () => {
       localActivityTasks: 1
     });
 
-    const historyAfterLocal = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const historyAfterLocal = await readHistory(backend, handle.runId, 10);
     expect(historyAfterLocal.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -2621,20 +2390,13 @@ describe("Worker", () => {
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const workflowWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-no-local-capacity",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       maxLocalActivitiesPerWorkflowTask: 0,
       payloadCodec: "Json"
     });
-    const remoteWorker = new Worker({
-      backend,
-      registry: remoteRegistry,
-      namespace: namespace(),
+    const remoteWorker = workerFixture(backend, remoteRegistry, {
       workerId: "remote-fallback-worker",
       workflowTaskQueue: "unused",
       activityTaskQueue: "activities",
@@ -2652,13 +2414,7 @@ describe("Worker", () => {
       outcome: { kind: "Committed" },
       localActivityTasks: 0
     });
-    const historyAfterSchedule = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const historyAfterSchedule = await readHistory(backend, handle.runId, 10);
     expect(historyAfterSchedule.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled"
@@ -2679,12 +2435,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteMapWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -2717,13 +2469,7 @@ describe("Worker", () => {
     });
     await expect(handle.result()).resolves.toEqual({ totalCents: 7 });
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityMapScheduled",
@@ -2736,12 +2482,8 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(failingMapWorkflow).registerActivity(failingActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -2766,13 +2508,7 @@ describe("Worker", () => {
     });
     await expect(handle.result()).resolves.toEqual({ failure: "activity exploded" });
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityMapScheduled",
@@ -2787,12 +2523,8 @@ describe("Worker", () => {
       .registerWorkflow(catchesFailureWorkflow)
       .registerActivity(failingActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -2821,14 +2553,7 @@ describe("Worker", () => {
       .registerWorkflow(parentWorkflow)
       .registerWorkflow(childEchoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       parentWorkflow,
       workflowId("wf/worker-parent"),
@@ -2859,14 +2584,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(throwsWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       throwsWorkflow,
       workflowId("wf/worker-throws"),
@@ -2886,13 +2604,7 @@ describe("Worker", () => {
       }
     } satisfies DeepPartial<WorkflowFailureError>);
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowFailed"
@@ -2903,14 +2615,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(childConflictParentWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     await client.startWorkflow(
       childEchoWorkflow,
       workflowId("child/conflict"),
@@ -2943,14 +2648,7 @@ describe("Worker", () => {
       .registerWorkflow(childMapWorkflow)
       .registerWorkflow(childEchoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       childMapWorkflow,
       workflowId("wf/worker-child-map"),
@@ -2982,13 +2680,7 @@ describe("Worker", () => {
       values: ["a/child", "b/child", "c/child"]
     });
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowMapScheduled",
@@ -3003,14 +2695,7 @@ describe("Worker", () => {
       .registerWorkflow(childMapWorkflow)
       .registerWorkflow(childEchoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     await client.startWorkflow(
       childMapWorkflow,
       workflowId("wf/worker-child-map-bounded"),
@@ -3048,14 +2733,7 @@ describe("Worker", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(childMapConflictWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     await client.startWorkflow(
       childEchoWorkflow,
       workflowId("child-map/conflict/0"),
@@ -3081,13 +2759,7 @@ describe("Worker", () => {
       errorType: "durust.child_workflow_id_conflict"
     });
 
-    const history = await backend.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowMapScheduled",
@@ -3102,14 +2774,7 @@ describe("Worker", () => {
       .registerWorkflow(parentCancelWorkflow)
       .registerWorkflow(childEchoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       parentCancelWorkflow,
       workflowId("wf/worker-parent-cancel"),
@@ -3122,13 +2787,7 @@ describe("Worker", () => {
     const result = await handle.result();
     await expect(worker.runWorkflowTaskOnce()).resolves.toEqual({ kind: "NoTask" });
 
-    const childHistory = await backend.streamHistory({
-      runId: runId(result.childRunId),
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const childHistory = await readHistory(backend, runId(result.childRunId), 10);
     expect(childHistory.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCancelled"
@@ -3141,14 +2800,7 @@ describe("Worker", () => {
       .registerWorkflow(parentAbandonWorkflow)
       .registerWorkflow(childEchoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
-      workerId: "worker-a",
-      workflowTaskQueue: "workflows",
-      payloadCodec: "Json"
-    });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       parentAbandonWorkflow,
       workflowId("wf/worker-parent-abandon"),
@@ -3164,13 +2816,7 @@ describe("Worker", () => {
       outcome: { kind: "Committed" }
     });
 
-    const childHistory = await backend.streamHistory({
-      runId: runId(result.childRunId),
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const childHistory = await readHistory(backend, runId(result.childRunId), 10);
     expect(childHistory.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -3186,12 +2832,8 @@ describe("Worker claim release on error paths", () => {
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-missing-workflow"), "workflows", {
       value: "ok"
     });
-    const worker = new Worker({
-      backend,
-      registry: new Registry(),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry(), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
     });
@@ -3240,12 +2882,8 @@ describe("Worker claim release on error paths", () => {
       "workflows",
       { value: "three" }
     );
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(echoWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
     });
@@ -3276,12 +2914,8 @@ describe("Worker claim release on error paths", () => {
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-signal-read"), "workflows", {
       value: "ok"
     });
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(echoWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       registeredSignalNames: ["approval"],
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
@@ -3306,12 +2940,8 @@ describe("Worker claim release on error paths", () => {
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-stream"), "workflows", {
       value: "ok"
     });
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(echoWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       workflowExecutionCacheSize: 0,
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
@@ -3335,12 +2965,8 @@ describe("Worker claim release on error paths", () => {
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-commit"), "workflows", {
       value: "ok"
     });
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(echoWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
     });
@@ -3373,12 +2999,8 @@ describe("Worker claim release on error paths", () => {
       "workflows",
       {}
     );
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(nondeterministicWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(nondeterministicWorkflow), {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       leaseDurationMs: 30_000,
       nondeterminismRetryBackoffMs: 100,
       payloadCodec: "Json",
@@ -3419,12 +3041,8 @@ describe("Worker claim release on error paths", () => {
       "workflows",
       { sku: "sku-1" }
     );
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
@@ -3487,12 +3105,8 @@ describe("Worker run loops", () => {
     const controller = new AbortController();
     const echoCommitted = deferred<void>();
     let parkedRunId: string | null = null;
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "loop-split-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json",
       onEvent: (event) => {
@@ -3556,12 +3170,8 @@ describe("Worker run loops", () => {
     const inner = new MemoryBackend();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
-    const setupWorker = new Worker({
-      backend: inner,
-      registry,
-      namespace: namespace(),
+    const setupWorker = workerFixture(inner, registry, {
       workerId: "isolation-setup-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json"
     });
     const handle = await client.startWorkflow(
@@ -3582,12 +3192,8 @@ describe("Worker run loops", () => {
     );
     const controller = new AbortController();
     const errors: unknown[] = [];
-    const loopWorker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const loopWorker = workerFixture(backend, registry, {
       workerId: "isolation-loop-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json",
       onEvent: (event) => {
@@ -3641,12 +3247,8 @@ describe("Worker run loops", () => {
     const controller = new AbortController();
     const allCommitted = deferred<void>();
     let commits = 0;
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "maintenance-cadence-worker",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json",
       onEvent: (event) => {
         if (event.kind === "WorkflowTaskCommitted") {
@@ -3739,12 +3341,8 @@ describe("Worker run loops", () => {
     const backlogTasks = 51;
     let commits = 0;
     let commitsWhenActivityCompleted: number | null = null;
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "saturated-workflow-loop-worker",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json",
       onEvent: (event) => {
@@ -3811,12 +3409,8 @@ describe("Worker run loops", () => {
       const scheduleFor = async (workerIdValue: string): Promise<readonly number[]> => {
         const scans: number[] = [];
         const backend = recordMaintenanceScans(new MemoryBackend(), scans, []);
-        const worker = new Worker({
-          backend,
-          registry: new Registry().registerWorkflow(echoWorkflow),
-          namespace: namespace(),
+        const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
           workerId: workerIdValue,
-          workflowTaskQueue: "workflows",
           payloadCodec: "Json"
         });
         const controller = new AbortController();
@@ -3890,12 +3484,8 @@ describe("Worker run loops", () => {
         .registerActivity(parkedActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
       const controller = new AbortController();
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: "shutdown-worker",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         payloadCodec: "Json"
       });
@@ -3989,12 +3579,8 @@ describe("Worker run loops", () => {
         .registerWorkflow(parkedWorkflow)
         .registerActivity(parkedActivity);
       const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
-      const setupWorker = new Worker({
-        backend: inner,
-        registry,
-        namespace: namespace(),
+      const setupWorker = workerFixture(inner, registry, {
         workerId: "error-budget-setup-worker",
-        workflowTaskQueue: "workflows",
         payloadCodec: "Json"
       });
       await client.startWorkflow(
@@ -4008,12 +3594,8 @@ describe("Worker run loops", () => {
         outcome: { kind: "Committed" }
       });
 
-      const worker = new Worker({
-        backend: failBackendCall(inner, "claimWorkflowTask", new Error("workflow claim exploded")),
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(failBackendCall(inner, "claimWorkflowTask", new Error("workflow claim exploded")), registry, {
         workerId: "error-budget-worker",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         payloadCodec: "Json"
       });
@@ -4083,12 +3665,8 @@ describe("Worker run loops", () => {
         .registerWorkflow(parkedWorkflow)
         .registerActivity(parkedActivity);
       const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
-      const setupWorker = new Worker({
-        backend: inner,
-        registry,
-        namespace: namespace(),
+      const setupWorker = workerFixture(inner, registry, {
         workerId: "maintenance-budget-setup-worker",
-        workflowTaskQueue: "workflows",
         payloadCodec: "Json"
       });
       await client.startWorkflow(
@@ -4102,12 +3680,8 @@ describe("Worker run loops", () => {
         outcome: { kind: "Committed" }
       });
 
-      const worker = new Worker({
-        backend: failBackendCall(inner, "fireDueTimers", new Error("timers exploded")),
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(failBackendCall(inner, "fireDueTimers", new Error("timers exploded")), registry, {
         workerId: "maintenance-error-budget-worker",
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         payloadCodec: "Json"
       });
@@ -4175,12 +3749,8 @@ describe("Worker run loops", () => {
         new Error("workflow claim exploded"),
         30
       );
-      const worker = new Worker({
-        backend,
-        registry: new Registry().registerWorkflow(echoWorkflow),
-        namespace: namespace(),
+      const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
         workerId: "both-budgets-fail-worker",
-        workflowTaskQueue: "workflows",
         payloadCodec: "Json"
       });
 
@@ -4237,12 +3807,8 @@ describe("Worker run loops", () => {
         .registerWorkflow(quoteWorkflow)
         .registerActivity(quoteActivity);
       const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = new Worker({
-        backend,
-        registry,
-        namespace: namespace(),
+      const worker = workerFixture(backend, registry, {
         workerId: `one-shot-${testCase.name}`,
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         payloadCodec: "Json"
       });
@@ -4278,12 +3844,8 @@ describe("Worker run loops", () => {
   it("keeps runActivityTimeoutMaintenanceOnce to a single timeout scan", async () => {
     const calls: string[] = [];
     const backend = recordBackendCalls(new MemoryBackend(), calls);
-    const worker = new Worker({
-      backend,
-      registry: new Registry().registerWorkflow(echoWorkflow),
-      namespace: namespace(),
+    const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "one-shot-timeout-maintenance",
-      workflowTaskQueue: "workflows",
       payloadCodec: "Json"
     });
 
@@ -4327,12 +3889,8 @@ describe("Worker hot join settlement", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(joinWorkflow).registerActivity(joinQuote);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, registry, {
       workerId: "join-across-tasks",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -4418,12 +3976,8 @@ describe("Worker replay window reserve", () => {
     const backend = new MemoryBackend();
     const registry = new Registry().registerWorkflow(definition).registerActivity(markerActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const recorder = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const recorder = workerFixture(backend, registry, {
       workerId: `marker-recorder-${label}`,
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -4438,12 +3992,8 @@ describe("Worker replay window reserve", () => {
     await expect(recorder.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(recorder.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
 
-    const replayer = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const replayer = workerFixture(backend, registry, {
       workerId: `marker-replayer-${label}`,
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       historyFetchMaxEvents,
       // Cold, with nothing carried over from the recording worker.
@@ -4556,12 +4106,8 @@ describe("Worker replay memory", () => {
       .registerWorkflow(memoryWorkflow)
       .registerActivity(memoryActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const builder = new Worker({
-      backend,
-      registry,
-      namespace: namespace(),
+    const builder = workerFixture(backend, registry, {
       workerId: "memory-builder",
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       payloadCodec: "Json"
     });
@@ -4625,12 +4171,8 @@ describe("Worker replay memory", () => {
         samples.push(retainedBytes());
       }
     });
-    const worker = new Worker({
-      backend,
-      registry: built.registry,
-      namespace: namespace(),
+    const worker = workerFixture(backend, built.registry, {
       workerId: `memory-cold-replayer-${historyFetchMaxEvents}`,
-      workflowTaskQueue: "workflows",
       activityTaskQueue: "activities",
       historyFetchMaxEvents,
       // Measured with the worker's own history cache off. It is a separate,
@@ -4722,12 +4264,8 @@ describe("Worker replay memory", () => {
       label: string
     ): Promise<number> => {
       const built = await buildLongHistory(steps, runs);
-      const worker = new Worker({
-        backend: materializeFreshHistoryChunks(built.backend, () => undefined),
-        registry: built.registry,
-        namespace: namespace(),
+      const worker = workerFixture(materializeFreshHistoryChunks(built.backend, () => undefined), built.registry, {
         workerId: `memory-cache-${label}`,
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         historyFetchMaxEvents: 32,
         // Far more entries than the byte budget can hold, so the byte bound is
@@ -4779,12 +4317,8 @@ describe("Worker replay memory", () => {
     const recorded: string[][] = [];
     for (const historyFetchMaxEvents of [4096, 1]) {
       const built = await buildLongHistory(steps);
-      const worker = new Worker({
-        backend: built.backend,
-        registry: built.registry,
-        namespace: namespace(),
+      const worker = workerFixture(built.backend, built.registry, {
         workerId: `memory-chunking-${historyFetchMaxEvents}`,
-        workflowTaskQueue: "workflows",
         activityTaskQueue: "activities",
         historyFetchMaxEvents,
         workflowExecutionCacheSize: 0,

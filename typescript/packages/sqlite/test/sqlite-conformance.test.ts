@@ -46,9 +46,13 @@ import {
   assertTerminalRunLeftoversAreRepaired,
   assertTerminalRunPlainLeftoverIsRepaired,
   basicProviderConformanceCases,
+  claimActivity,
+  claimWorkflow,
   prepareWorkflowTaskCommit,
+  readHistory,
   scheduleTerminalRunLeftovers,
   scheduleTerminalRunPlainLeftover,
+  startTestWorkflow,
   workflowVisibleMutationCommitCases
 } from "@durust/testing";
 import { SqliteBackend } from "@durust/sqlite";
@@ -102,23 +106,14 @@ async function forgedTerminalSqliteClaim(
 ): Promise<{ readonly backend: SqliteBackend; readonly claim: WorkflowTaskClaim }> {
   const path = tempSqlitePath(label);
   const first = new SqliteBackend({ path });
-  await first.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(first, {
     workflowId: workflowId(`wf/sqlite-${label}`),
     workflowType: workflowType("sqlite.terminal-guard", 1),
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: label }, { codec: "Json" })
   });
-  const claimed = await first.claimWorkflowTask("terminal-forger", {
-    namespace: namespace(),
-    taskQueue: taskQueue("workflows"),
-    registeredWorkflowTypes: [workflowType("sqlite.terminal-guard", 1)],
-    leaseDurationMs: 30_000
+  const claimed = await claimWorkflow(first, "terminal-forger", {
+    workflowTypes: [workflowType("sqlite.terminal-guard", 1)]
   });
-  expect(claimed).not.toBeNull();
-  if (claimed === null) {
-    throw new Error("expected forged terminal claim");
-  }
   first.close();
 
   withRawSqlite(path, (db) => {
@@ -230,26 +225,17 @@ describe("SqliteBackend persistence", () => {
     });
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-reopen"),
       workflowType: echo.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
     first.close();
 
     const reopened = new SqliteBackend({ path });
-    const claimed = await reopened.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [echo.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(reopened, "worker-a", {
+      workflowTypes: [echo.workflowType]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected reopened claim");
-    }
 
     const commit = await prepareWorkflowTaskCommit(
       echo,
@@ -262,13 +248,7 @@ describe("SqliteBackend persistence", () => {
       newTailEventId: eventId(2)
     });
 
-    const history = await reopened.streamHistory({
-      runId: claimed.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -286,11 +266,9 @@ describe("SqliteBackend persistence", () => {
     });
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-normalized-corrupt"),
       workflowType: echo.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "from-normalized" }, { codec: "Json" })
     });
     first.close();
@@ -301,16 +279,9 @@ describe("SqliteBackend persistence", () => {
     });
 
     const reopened = new SqliteBackend({ path });
-    const claimed = await reopened.claimWorkflowTask("worker-normalized-history", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [echo.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(reopened, "worker-normalized-history", {
+      workflowTypes: [echo.workflowType]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected normalized history claim");
-    }
     expect(claimed.prefetchedHistory.map((event) => event.eventType)).toEqual([
       "WorkflowStarted"
     ]);
@@ -326,13 +297,7 @@ describe("SqliteBackend persistence", () => {
       newTailEventId: eventId(2)
     });
 
-    const history = await reopened.streamHistory({
-      runId: claimed.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -350,11 +315,9 @@ describe("SqliteBackend persistence", () => {
     });
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-workflow-projection"),
       workflowType: projected.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "projected" }, { codec: "Json" })
     });
     first.close();
@@ -385,13 +348,9 @@ describe("SqliteBackend persistence", () => {
       })
     ).resolves.toBeNull();
 
-    const claimed = await reopened.claimWorkflowTask("correct-type-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [projected.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(reopened, "correct-type-worker", {
+      workflowTypes: [projected.workflowType]
     });
-    expect(claimed).not.toBeNull();
     expect(claimed?.workflowType).toEqual(projected.workflowType);
     reopened.close();
   });
@@ -409,11 +368,9 @@ describe("SqliteBackend persistence", () => {
       inlineThresholdBytes: 0
     });
 
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-normalized-roots"),
       workflowType: workflowType("sqlite.normalized.roots", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "root-payload" }, { codec: "Json" })
     });
     firstInner.close();
@@ -442,23 +399,14 @@ describe("SqliteBackend persistence", () => {
     const projection = encodePayload({ status: "projected" }, { codec: "Json" });
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-query-projection-normalized"),
       workflowType: workflowTypeValue,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await first.claimWorkflowTask("query-projection-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowTypeValue],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(first, "query-projection-worker", {
+      workflowTypes: [workflowTypeValue]
     });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected query projection workflow claim");
-    }
     await first.commitWorkflowTask(claim.claim, {
       expectedTailEventId: eventId(1),
       queryProjection: projection
@@ -493,23 +441,14 @@ describe("SqliteBackend persistence", () => {
     const first = new SqliteBackend({ path });
     const activityType = "sqlite.activity-input-root.activity";
     const workflowTypeValue = workflowType("sqlite.activity-input-root.workflow", 1);
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-activity-input-root"),
       workflowType: workflowTypeValue,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const workflowClaim = await first.claimWorkflowTask("activity-root-workflow", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowTypeValue],
-      leaseDurationMs: 30_000
+    const workflowClaim = await claimWorkflow(first, "activity-root-workflow", {
+      workflowTypes: [workflowTypeValue]
     });
-    expect(workflowClaim).not.toBeNull();
-    if (!workflowClaim) {
-      throw new Error("expected workflow claim");
-    }
     const input = encodePayload({ value: "activity-root" }, { codec: "Json" });
     const scheduled = {
       commandId: commandId(workflowClaim.runId, 1),
@@ -602,13 +541,7 @@ describe("SqliteBackend persistence", () => {
         limit: 10
       })
     ).resolves.toEqual({ fired: 1 });
-    const history = await reopened.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "TimerStarted",
@@ -691,13 +624,7 @@ describe("SqliteBackend persistence", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const history = await reopened.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, handle.runId, 10);
     const completed = history.events.at(-1)?.data;
     if (completed?.kind !== "WorkflowCompleted") {
       throw new Error("expected WorkflowCompleted");
@@ -794,13 +721,7 @@ describe("SqliteBackend persistence", () => {
       outcome: { kind: "Committed" }
     });
 
-    const history = await reopenedAgain.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopenedAgain, handle.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -940,13 +861,7 @@ describe("SqliteBackend persistence", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const history = await completeWorkflow.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(20),
-      maxEvents: 20,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(completeWorkflow, handle.runId, 20);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -1027,13 +942,7 @@ describe("SqliteBackend persistence", () => {
     }
 
     const verify = new SqliteBackend({ path });
-    const history = await verify.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(20),
-      maxEvents: 20,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(verify, handle.runId, 20);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowStartRequested",
@@ -1056,30 +965,21 @@ describe("SqliteBackend persistence", () => {
   it("reclaims expired workflow and activity leases after close and reopen", async () => {
     const path = tempSqlitePath("expired-lease-reopen");
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-expired-lease"),
       workflowType: workflowType("sqlite.expired-lease", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const expiredWorkflowClaim = await first.claimWorkflowTask("expired-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("sqlite.expired-lease", 1)],
+    const expiredWorkflowClaim = await claimWorkflow(first, "expired-workflow-worker", {
+      workflowTypes: [workflowType("sqlite.expired-lease", 1)],
       leaseDurationMs: 0
     });
-    expect(expiredWorkflowClaim).not.toBeNull();
     first.close();
 
     const reopened = new SqliteBackend({ path });
-    const reclaimedWorkflowClaim = await reopened.claimWorkflowTask("replacement-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("sqlite.expired-lease", 1)],
-      leaseDurationMs: 30_000
+    const reclaimedWorkflowClaim = await claimWorkflow(reopened, "replacement-workflow-worker", {
+      workflowTypes: [workflowType("sqlite.expired-lease", 1)]
     });
-    expect(reclaimedWorkflowClaim).not.toBeNull();
     if (!expiredWorkflowClaim || !reclaimedWorkflowClaim) {
       throw new Error("expected workflow claims");
     }
@@ -1106,23 +1006,16 @@ describe("SqliteBackend persistence", () => {
       appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
       scheduleActivities: [activityTaskFromScheduled(scheduled)]
     });
-    const expiredActivityClaim = await reopened.claimActivityTask("expired-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["sqlite.expired-lease.activity"],
+    const expiredActivityClaim = await claimActivity(reopened, "expired-activity-worker", {
+      activityNames: ["sqlite.expired-lease.activity"],
       leaseDurationMs: 0
     });
-    expect(expiredActivityClaim).not.toBeNull();
     reopened.close();
 
     const reopenedAgain = new SqliteBackend({ path });
-    const reclaimedActivityClaim = await reopenedAgain.claimActivityTask("replacement-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["sqlite.expired-lease.activity"],
-      leaseDurationMs: 30_000
+    const reclaimedActivityClaim = await claimActivity(reopenedAgain, "replacement-activity-worker", {
+      activityNames: ["sqlite.expired-lease.activity"]
     });
-    expect(reclaimedActivityClaim).not.toBeNull();
     if (!expiredActivityClaim || !reclaimedActivityClaim) {
       throw new Error("expected activity claims");
     }
@@ -1146,23 +1039,14 @@ describe("SqliteBackend persistence", () => {
     const path = tempSqlitePath("heartbeat-deadline-reopen");
     let now = 1_000;
     const first = new SqliteBackend({ path, nowMs: () => now });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-heartbeat-deadline-reopen"),
       workflowType: workflowType("sqlite.heartbeat-deadline", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const workflowClaim = await first.claimWorkflowTask("heartbeat-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("sqlite.heartbeat-deadline", 1)],
-      leaseDurationMs: 30_000
+    const workflowClaim = await claimWorkflow(first, "heartbeat-workflow-worker", {
+      workflowTypes: [workflowType("sqlite.heartbeat-deadline", 1)]
     });
-    expect(workflowClaim).not.toBeNull();
-    if (!workflowClaim) {
-      throw new Error("expected heartbeat workflow claim");
-    }
     const input = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {
       commandId: commandId(workflowClaim.runId, 1),
@@ -1183,16 +1067,9 @@ describe("SqliteBackend persistence", () => {
       appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
       scheduleActivities: [activityTaskFromScheduled(scheduled)]
     });
-    const activityClaim = await first.claimActivityTask("heartbeat-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["sqlite.heartbeat-deadline.activity"],
-      leaseDurationMs: 30_000
+    const activityClaim = await claimActivity(first, "heartbeat-activity-worker", {
+      activityNames: ["sqlite.heartbeat-deadline.activity"]
     });
-    expect(activityClaim).not.toBeNull();
-    if (!activityClaim) {
-      throw new Error("expected heartbeat activity claim");
-    }
     now = 1_050;
     await expect(first.heartbeatActivity({ claim: activityClaim.claim })).resolves.toEqual({
       kind: "Recorded"
@@ -1215,13 +1092,7 @@ describe("SqliteBackend persistence", () => {
       leaseDurationMs: 30_000
     });
     expect(workflowWake?.reason).toBe("ActivityTimedOut");
-    const history = await reopened.streamHistory({
-      runId: workflowClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, workflowClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -1244,23 +1115,12 @@ describe("SqliteBackend persistence", () => {
     );
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-activity-map-reopen"),
       workflowType: parentType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await first.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parentType],
-      leaseDurationMs: 30_000
-    });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected activity-map parent claim");
-    }
+    const claim = await claimWorkflow(first, "worker-a", { workflowTypes: [parentType] });
     const scheduled = {
       commandId: commandId(claim.runId, 1),
       activityName: "sqlite.map",
@@ -1362,13 +1222,7 @@ describe("SqliteBackend persistence", () => {
       throw new Error("expected activity-map parent wake");
     }
 
-    const history = await reopenedAgain.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopenedAgain, claim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityMapScheduled",
@@ -1400,23 +1254,12 @@ describe("SqliteBackend persistence", () => {
     const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-activity-map-item-roots"),
       workflowType: parentType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await first.claimWorkflowTask("map-root-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parentType],
-      leaseDurationMs: 30_000
-    });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected map-root workflow claim");
-    }
+    const claim = await claimWorkflow(first, "map-root-worker", { workflowTypes: [parentType] });
     const scheduled = {
       commandId: commandId(claim.runId, 1),
       activityName: "sqlite.map-root",
@@ -1484,23 +1327,14 @@ describe("SqliteBackend persistence", () => {
     const inputManifest = activityMapManifest([{ value: 1 }, { value: 2 }], 2);
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-child-map-item-roots"),
       workflowType: parentType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await first.claimWorkflowTask("child-map-root-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parentType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(first, "child-map-root-worker", {
+      workflowTypes: [parentType]
     });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected child-map-root workflow claim");
-    }
     const scheduled = {
       commandId: commandId(claim.runId, 1),
       workflowType: childType,
@@ -1577,23 +1411,12 @@ describe("SqliteBackend persistence", () => {
     );
 
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/sqlite-child-map-reopen"),
       workflowType: parentType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await first.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parentType],
-      leaseDurationMs: 30_000
-    });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected child-map parent claim");
-    }
+    const claim = await claimWorkflow(first, "worker-a", { workflowTypes: [parentType] });
     const scheduled = {
       commandId: commandId(claim.runId, 1),
       workflowType: childType,
@@ -1719,13 +1542,7 @@ describe("SqliteBackend persistence", () => {
       throw new Error("expected child-map parent wake");
     }
 
-    const history = await reopenedAgain.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopenedAgain, claim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowMapScheduled",
@@ -1823,11 +1640,9 @@ describe("SqliteBackend upgrade repair", () => {
     // read-only.
     const path = tempSqlitePath("upgrade-repair-lock");
     const first = new SqliteBackend({ path });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/repair-lock"),
       workflowType: workflowType("sqlite.repair-lock", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
     first.close();

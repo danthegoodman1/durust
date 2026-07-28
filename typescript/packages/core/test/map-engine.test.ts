@@ -37,6 +37,7 @@ import {
   type MapState,
   type MapTransition
 } from "../src/map-engine.js";
+import { claimActivity, claimWorkflow, readHistory, startTestWorkflow } from "@durust/testing";
 
 const MAP_COMMAND_ID = commandId(runId("run-1"), 7);
 
@@ -584,22 +585,14 @@ describe("map engine: per-item retry and exhaustion", () => {
     for (const policy of policies) {
       const nowMs = 1_000;
       const backend = new MemoryBackend({ nowMs: () => nowMs });
-      await backend.startWorkflow({
-        namespace: namespace(),
+      await startTestWorkflow(backend, {
         workflowId: workflowId("wf/map-engine-retry"),
         workflowType: workflowType("map-engine.retry", 1),
-        taskQueue: taskQueue("workflows"),
         input: encodePayload({ value: 1 }, { codec: "Json" })
       });
-      const claimed = await backend.claimWorkflowTask("workflow-worker", {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [workflowType("map-engine.retry", 1)],
-        leaseDurationMs: 30_000
+      const claimed = await claimWorkflow(backend, "workflow-worker", {
+        workflowTypes: [workflowType("map-engine.retry", 1)]
       });
-      if (claimed === null) {
-        throw new Error("expected workflow claim");
-      }
       const input = encodePayload({ value: 1 }, { codec: "Json" });
       const scheduled = {
         commandId: commandId(claimed.runId, 1),
@@ -620,15 +613,9 @@ describe("map engine: per-item retry and exhaustion", () => {
         appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
         scheduleActivities: [activityTaskFromScheduled(scheduled)]
       });
-      const attempt = await backend.claimActivityTask("activity-worker", {
-        namespace: namespace(),
-        taskQueue: taskQueue("activities"),
-        registeredActivityNames: ["map-engine.retry.activity"],
-        leaseDurationMs: 30_000
+      const attempt = await claimActivity(backend, "activity-worker", {
+        activityNames: ["map-engine.retry.activity"]
       });
-      if (attempt === null) {
-        throw new Error("expected activity claim");
-      }
       const outcome = await backend.failActivity({
         claim: attempt.claim,
         failure: { errorType: "map-engine.retryable", message: "boom", nonRetryable: false }
@@ -1280,22 +1267,14 @@ describe("map engine: shared transition table fanouts", () => {
     it(`fanout: ${fanout.name}`, async () => {
       replayedFanouts += 1;
       const backend = new MemoryBackend();
-      await backend.startWorkflow({
-        namespace: namespace(),
+      await startTestWorkflow(backend, {
         workflowId: workflowId("wf/map-table-fanout"),
         workflowType: workflowType("map-table.workflow", 1),
-        taskQueue: taskQueue("workflows"),
         input: encodePayload({ value: 1 }, { codec: "Json" })
       });
-      const claimed = await backend.claimWorkflowTask("fanout-scheduler", {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [workflowType("map-table.workflow", 1)],
-        leaseDurationMs: 30_000
+      const claimed = await claimWorkflow(backend, "fanout-scheduler", {
+        workflowTypes: [workflowType("map-table.workflow", 1)]
       });
-      if (claimed === null) {
-        throw new Error("expected workflow claim");
-      }
       const items = Array.from({ length: fanout.itemCount }, (_, index) => ({ value: index }));
       const inputManifest = activityMapManifest(items, 2);
       const scheduled = {
@@ -1377,13 +1356,7 @@ describe("map engine: shared transition table fanouts", () => {
         expect(outcome.kind, where).toBe("Failed");
       }
 
-      const history = await backend.streamHistory({
-        runId: claimed.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(50),
-        maxEvents: 50,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const history = await readHistory(backend, claimed.runId, 50);
       expect(history.events.map((event) => event.eventType), fanout.name).toEqual(
         fanout.parentHistory
       );

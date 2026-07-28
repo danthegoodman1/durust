@@ -57,7 +57,13 @@ import {
   type WorkflowTaskReason
 } from "@durust/core";
 import { HotWorkflowExecution, HotWorkflowExecutionDisposedError } from "../src/runtime.js";
-import { prepareWorkflowTaskCommit } from "@durust/testing";
+import {
+  claimActivity,
+  claimWorkflow,
+  prepareWorkflowTaskCommit,
+  readHistory,
+  startTestWorkflow
+} from "@durust/testing";
 
 // Captured at module load, before any workflow execution installs the
 // determinism guards, so this is Node's real environment object rather than
@@ -290,22 +296,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/unqueued-replay"),
       workflowType: checkout.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [checkout.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const scheduleCommit = await prepareWorkflowTaskCommit(
       checkout,
       { sku: "sku-1" },
@@ -314,29 +312,18 @@ describe("minimal workflow runtime", () => {
     );
     await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("queue-a"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("queue-a")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task on the queue the scheduling worker resolved");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [checkout.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       checkout,
       { sku: "sku-1" },
@@ -347,13 +334,7 @@ describe("minimal workflow runtime", () => {
       "WorkflowCompleted"
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => String(event.eventType))).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -372,23 +353,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/runtime"),
       workflowType: checkout.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [checkout.workflowType]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
 
     const commit = await prepareWorkflowTaskCommit(checkout, { sku: "sku-1" }, claimed, {
       payloadCodec: "Json"
@@ -396,13 +368,7 @@ describe("minimal workflow runtime", () => {
     const outcome = await backend.commitWorkflowTask(claimed.claim, commit);
     expect(outcome).toEqual({ kind: "Committed", newTailEventId: eventId(2) });
 
-    const history = await backend.streamHistory({
-      runId: claimed.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled"
@@ -503,38 +469,24 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-complete"),
       workflowType: checkout.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [checkout.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const scheduleCommit = await prepareWorkflowTaskCommit(checkout, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
     await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    expect(activityTask).not.toBeNull();
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     expect(decodePayload(activityTask.task.input as PayloadRef<QuoteInput>)).toEqual({
       sku: "sku-1"
     });
@@ -543,16 +495,9 @@ describe("minimal workflow runtime", () => {
       result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [checkout.workflowType]
     });
-    expect(secondClaim).not.toBeNull();
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       checkout,
       { sku: "sku-1" },
@@ -564,13 +509,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -592,23 +531,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-activity"),
       workflowType: checkout.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [checkout.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(checkout, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -621,29 +552,18 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
     );
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 1234 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [checkout.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [checkout.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -674,23 +594,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-child-parent"),
       workflowType: parent.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "order-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parent.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [parent.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first parent claim");
-    }
     const hot = new HotWorkflowExecution(parent, { value: "order-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -704,15 +616,9 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, requestCommit))
     );
 
-    const startedClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parent.workflowType],
-      leaseDurationMs: 30_000
+    const startedClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [parent.workflowType]
     });
-    if (!startedClaim) {
-      throw new Error("expected child-start parent claim");
-    }
     const waitForResultCommit = await hot.advance(startedClaim);
     expect(waitForResultCommit.appendEvents).toEqual([]);
     expect(waitForResultCommit.startChildWorkflows).toEqual([]);
@@ -721,15 +627,9 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(startedClaim.claim, waitForResultCommit))
     );
 
-    const childClaim = await backend.claimWorkflowTask("worker-child", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [childEchoWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const childClaim = await claimWorkflow(backend, "worker-child", {
+      workflowTypes: [childEchoWorkflow.workflowType]
     });
-    if (!childClaim) {
-      throw new Error("expected child workflow claim");
-    }
     const childCommit = await prepareWorkflowTaskCommit(
       childEchoWorkflow,
       { value: "order-1" },
@@ -741,15 +641,9 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(childClaim.claim, childCommit);
 
-    const completedClaim = await backend.claimWorkflowTask("worker-c", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parent.workflowType],
-      leaseDurationMs: 30_000
+    const completedClaim = await claimWorkflow(backend, "worker-c", {
+      workflowTypes: [parent.workflowType]
     });
-    if (!completedClaim) {
-      throw new Error("expected child-complete parent claim");
-    }
     const completionCommit = await hot.advance(completedClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -764,13 +658,7 @@ describe("minimal workflow runtime", () => {
     );
     expect(hot.closed).toBe(true);
 
-    const history = await backend.streamHistory({
-      runId: firstClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(20),
-      maxEvents: 20,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, firstClaim.runId, 20);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowStartRequested",
@@ -804,30 +692,20 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("child/hot-conflict"),
       workflowType: childEchoWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "already-running" }, { codec: "Json" })
     });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-child-conflict-parent"),
       workflowType: parent.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parent.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [parent.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first parent claim");
-    }
     const hot = new HotWorkflowExecution(parent, {}, firstClaim, { payloadCodec: "Json" });
     const requestCommit = await hot.nextCommit();
     expect(requestCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
@@ -838,15 +716,9 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, requestCommit))
     );
 
-    const failedClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parent.workflowType],
-      leaseDurationMs: 30_000
+    const failedClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [parent.workflowType]
     });
-    if (!failedClaim) {
-      throw new Error("expected child-failed parent claim");
-    }
     const completionCommit = await hot.advance(failedClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -884,23 +756,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-activity-map"),
       workflowType: mappedWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [mappedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [mappedWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first map claim");
-    }
     const hot = new HotWorkflowExecution(mappedWorkflow, {}, firstClaim, { payloadCodec: "Json" });
     const scheduleCommit = await hot.nextCommit();
     expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
@@ -912,42 +776,26 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
     );
 
-    const firstActivity = await backend.claimActivityTask("activity-worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const firstActivity = await claimActivity(backend, "activity-worker-a", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!firstActivity) {
-      throw new Error("expected first map activity");
-    }
     await backend.completeActivity({
       claim: firstActivity.claim,
       result: encodePayload<QuoteOutput>({ cents: 100 }, { codec: "Json" })
     });
-    const secondActivity = await backend.claimActivityTask("activity-worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const secondActivity = await claimActivity(backend, "activity-worker-b", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!secondActivity) {
-      throw new Error("expected second map activity");
-    }
     await backend.completeActivity({
       claim: secondActivity.claim,
       result: encodePayload<QuoteOutput>({ cents: 250 }, { codec: "Json" })
     });
 
-    const completedClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [mappedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const completedClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [mappedWorkflow.workflowType]
     });
-    if (!completedClaim) {
-      throw new Error("expected map-complete claim");
-    }
     const completionCommit = await hot.advance(completedClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -981,23 +829,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-child-workflow-map"),
       workflowType: mappedWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [mappedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [mappedWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first child-map claim");
-    }
     const hot = new HotWorkflowExecution(mappedWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -1012,15 +852,9 @@ describe("minimal workflow runtime", () => {
     );
 
     for (const value of ["a", "b"]) {
-      const childClaim = await backend.claimWorkflowTask(`worker-child-${value}`, {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [childEchoWorkflow.workflowType],
-        leaseDurationMs: 30_000
+      const childClaim = await claimWorkflow(backend, `worker-child-${value}`, {
+        workflowTypes: [childEchoWorkflow.workflowType]
       });
-      if (!childClaim) {
-        throw new Error(`expected child workflow claim for ${value}`);
-      }
       const childCommit = await prepareWorkflowTaskCommit(
         childEchoWorkflow,
         { value },
@@ -1033,15 +867,9 @@ describe("minimal workflow runtime", () => {
       await backend.commitWorkflowTask(childClaim.claim, childCommit);
     }
 
-    const completedClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [mappedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const completedClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [mappedWorkflow.workflowType]
     });
-    if (!completedClaim) {
-      throw new Error("expected child-map-complete claim");
-    }
     const completionCommit = await hot.advance(completedClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -1055,13 +883,7 @@ describe("minimal workflow runtime", () => {
     );
     expect(hot.closed).toBe(true);
 
-    const history = await backend.streamHistory({
-      runId: firstClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(20),
-      maxEvents: 20,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, firstClaim.runId, 20);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ChildWorkflowMapScheduled",
@@ -1087,23 +909,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-failure"),
       workflowType: failingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [failingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [failingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const scheduleCommit = await prepareWorkflowTaskCommit(
       failingWorkflow,
       { sku: "sku-1" },
@@ -1112,15 +926,10 @@ describe("minimal workflow runtime", () => {
     );
     await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.failActivity({
       claim: activityTask.claim,
       failure: {
@@ -1130,15 +939,9 @@ describe("minimal workflow runtime", () => {
       }
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [failingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [failingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     expect(secondClaim.reason).toBe("ActivityFailed");
     const completionCommit = await prepareWorkflowTaskCommit(
       failingWorkflow,
@@ -1151,13 +954,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -1205,23 +1002,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/continue-as-new"),
       workflowType: continuingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ count: 0 }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [continuingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [continuingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const continuedCommit = await prepareWorkflowTaskCommit(
       continuingWorkflow,
       { count: 0 },
@@ -1238,15 +1027,9 @@ describe("minimal workflow runtime", () => {
     expect(decodePayload(continued.input)).toEqual({ count: 1 });
     await backend.commitWorkflowTask(firstClaim.claim, continuedCommit);
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [continuingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [continuingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     expect(secondClaim.runId).not.toBe(firstClaim.runId);
     expect(secondClaim.reason).toBe("WorkflowStarted");
     const secondStarted = secondClaim.prefetchedHistory[0]?.data;
@@ -1266,25 +1049,13 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const firstHistory = await backend.streamHistory({
-      runId: firstClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const firstHistory = await readHistory(backend, firstClaim.runId, 10);
     expect(firstHistory.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowContinuedAsNew"
     ]);
 
-    const secondHistory = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const secondHistory = await readHistory(backend, secondClaim.runId, 10);
     expect(secondHistory.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -1436,23 +1207,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/timer"),
       workflowType: reminder.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ deadlineMs: 1_000 }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const timerCommit = await prepareWorkflowTaskCommit(
       reminder,
       { deadlineMs: 1_000 },
@@ -1468,15 +1231,9 @@ describe("minimal workflow runtime", () => {
       fired: 1
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     expect(secondClaim.reason).toBe("TimerFired");
 
     const completionCommit = await prepareWorkflowTaskCommit(
@@ -1490,13 +1247,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "TimerStarted",
@@ -1522,24 +1273,16 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId(`wf/${durableName}`),
       workflowType: twoTimer.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
     for (const [worker, timerNow] of [["worker-a", 1_000], ["worker-b", 2_000]] as const) {
-      const claim = await backend.claimWorkflowTask(worker, {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [twoTimer.workflowType],
-        leaseDurationMs: 30_000
+      const claim = await claimWorkflow(backend, worker, {
+        workflowTypes: [twoTimer.workflowType]
       });
-      if (!claim) {
-        throw new Error(`expected claim for ${worker}`);
-      }
       await backend.commitWorkflowTask(
         claim.claim,
         await prepareWorkflowTaskCommit(twoTimer, {}, claim, { payloadCodec: "Json" })
@@ -1547,15 +1290,9 @@ describe("minimal workflow runtime", () => {
       await backend.fireDueTimers({ namespace: namespace(), now: timerNow, limit: 16 });
     }
 
-    const replayClaim = await backend.claimWorkflowTask("worker-replay", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [twoTimer.workflowType],
-      leaseDurationMs: 30_000
+    const replayClaim = await claimWorkflow(backend, "worker-replay", {
+      workflowTypes: [twoTimer.workflowType]
     });
-    if (!replayClaim) {
-      throw new Error("expected replay claim");
-    }
     return { backend, replayClaim };
   }
 
@@ -1652,23 +1389,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-timer"),
       workflowType: reminder.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ deadlineMs: 1_000 }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(reminder, { deadlineMs: 1_000 }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -1678,15 +1407,9 @@ describe("minimal workflow runtime", () => {
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, timerCommit)));
 
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -1734,23 +1457,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/signal"),
       workflowType: approvalWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(approvalWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -1775,15 +1490,9 @@ describe("minimal workflow runtime", () => {
       })
     ).toEqual({ kind: "Duplicate" });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     expect(secondClaim.reason).toBe("SignalReceived");
     const liveSignal = await backend.readSignalInbox({
       runId: secondClaim.runId,
@@ -1813,13 +1522,7 @@ describe("minimal workflow runtime", () => {
       await backend.readSignalInbox({ runId: secondClaim.runId, signalName: "approved" })
     ).toBeNull();
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "SignalConsumed",
@@ -1850,23 +1553,15 @@ describe("minimal workflow runtime", () => {
       signalIdFactory: () => "schema-sig-1"
     });
 
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/schema-signal"),
       workflowType: approvalWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(approvalWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -1878,15 +1573,9 @@ describe("minimal workflow runtime", () => {
       payload: { approvalId: "a-schema" }
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const liveSignal = await backend.readSignalInbox({
       runId: secondClaim.runId,
       signalName: "schema-approved"
@@ -1908,13 +1597,7 @@ describe("minimal workflow runtime", () => {
     });
     await backend.commitWorkflowTask(secondClaim.claim, consumeCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     const completed = history.events.find((event) => event.data.kind === "WorkflowCompleted");
     expect(completed?.data.kind).toBe("WorkflowCompleted");
     if (completed?.data.kind !== "WorkflowCompleted") {
@@ -1938,23 +1621,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-signal"),
       workflowType: approvalWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(approvalWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -1980,15 +1655,9 @@ describe("minimal workflow runtime", () => {
       signalName: "approved",
       payload: encodePayload<ApprovalSignal>({ approvalId: "a-hot" }, { codec: "Json" })
     });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [approvalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [approvalWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const liveSignal = await backend.readSignalInbox({
       runId: secondClaim.runId,
       signalName: "approved"
@@ -2057,51 +1726,32 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/join"),
       workflowType: joinedWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(joinedWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 4321 }, { codec: "Json" })
     });
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       joinedWorkflow,
       { sku: "sku-1" },
@@ -2113,13 +1763,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -2151,22 +1795,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-join"),
       workflowType: joinedWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(joinedWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -2178,30 +1814,19 @@ describe("minimal workflow runtime", () => {
     expect(trace).toEqual(["before-join"]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 8765 }, { codec: "Json" })
     });
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -2260,22 +1885,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-join-all"),
       workflowType: joinedWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(joinedWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -2287,30 +1904,19 @@ describe("minimal workflow runtime", () => {
     expect(trace).toEqual(["before-join-all"]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 9753 }, { codec: "Json" })
     });
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [joinedWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [joinedWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "WorkflowCompleted"
@@ -2332,23 +1938,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-all"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(racingWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -2359,15 +1957,9 @@ describe("minimal workflow runtime", () => {
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
     await backend.fireDueTimers({ namespace: namespace(), now: 500, limit: 16 });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(racingWorkflow, {}, secondClaim, {
       payloadCodec: "Json"
     });
@@ -2384,13 +1976,7 @@ describe("minimal workflow runtime", () => {
     expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "TimerStarted",
@@ -2425,23 +2011,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-select-all"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -2453,29 +2031,18 @@ describe("minimal workflow runtime", () => {
     expect(trace).toEqual(["before-select-all"]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 8642 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "SelectWinner",
@@ -2549,33 +2116,19 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/version-old"),
       workflowType: originalWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [originalWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [originalWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
     const originalCommit = await prepareWorkflowTaskCommit(originalWorkflow, {}, claim, {
       payloadCodec: "Json"
     });
     await backend.commitWorkflowTask(claim.claim, originalCommit);
-    const history = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claim.runId, 10);
     const replayClaim: ClaimedWorkflowTask = {
       ...claim,
       replayTargetEventId: eventId(2),
@@ -2776,23 +2329,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect"),
       workflowType: sideEffectWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [sideEffectWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [sideEffectWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(sideEffectWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -2809,15 +2354,9 @@ describe("minimal workflow runtime", () => {
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [sideEffectWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [sideEffectWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(sideEffectWorkflow, {}, secondClaim, {
       payloadCodec: "Json"
     });
@@ -2827,13 +2366,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "SideEffectMarker",
@@ -2914,22 +2447,14 @@ describe("minimal workflow runtime", () => {
         await sideEffect("make-id", () => `id-${getVersion("side-effect-reentrant", 1, 2)}`)
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect-reentrant"),
       workflowType: reentrantWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reentrantWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [reentrantWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
 
     // Commit whatever the task produces. Without the guard the task succeeds and
     // this records the poisoned pair, so a regression is exhibited as the
@@ -2947,13 +2472,7 @@ describe("minimal workflow runtime", () => {
       await backend.commitWorkflowTask(claim.claim, commit);
     }
 
-    const history = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claim.runId, 10);
     expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted"]);
     expect(commit).toBeNull();
     expect(String(taskError)).toContain(
@@ -3455,22 +2974,14 @@ describe("minimal workflow runtime", () => {
         }) as unknown as { readonly ok: boolean }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/encode-reentrant-output"),
       workflowType: reentrantOutputWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reentrantOutputWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [reentrantOutputWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
 
     let commit: WorkflowTaskCommit | null = null;
     let taskError: unknown = null;
@@ -3485,13 +2996,7 @@ describe("minimal workflow runtime", () => {
       await backend.commitWorkflowTask(claim.claim, commit);
     }
 
-    const history = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claim.runId, 10);
     // No VersionMarker, and nothing appended ahead of the terminal event.
     expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted", "WorkflowFailed"]);
     expect(taskError).toBeNull();
@@ -3577,22 +3082,14 @@ describe("minimal workflow runtime", () => {
     });
 
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/manifest-item-durable-call"),
       workflowType: manifestWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [manifestWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [manifestWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
 
     // The task does not fail, and both markers are allocated in call order
     // ahead of the map command's own seq.
@@ -3621,13 +3118,7 @@ describe("minimal workflow runtime", () => {
     // conversions run again and must match the recorded commands in the same
     // order. This holds because of the replay model itself, not because any
     // runtime path re-encodes.
-    const history = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claim.runId, 10);
     expect(history.events.map(commandTrace)).toEqual([
       "WorkflowStarted",
       "VersionMarker#1",
@@ -3783,22 +3274,14 @@ describe("minimal workflow runtime", () => {
         })
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect-async-reentrant"),
       workflowType: asyncWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [asyncWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [asyncWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
 
     let commit: WorkflowTaskCommit | null = null;
     let taskError: unknown = null;
@@ -3822,13 +3305,7 @@ describe("minimal workflow runtime", () => {
     expect(String(taskError)).toContain(
       'nondeterminism: sideEffect callback must be synchronous; side effect "async-key"'
     );
-    const history = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claim.runId, 10);
     expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted"]);
   });
 
@@ -4391,23 +3868,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-handle"),
       workflowType: handleWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [handleWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [handleWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(
       handleWorkflow,
       { sku: "sku-1" },
@@ -4420,30 +3889,19 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 777 }, { codec: "Json" })
     });
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [handleWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [handleWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       handleWorkflow,
       { sku: "sku-1" },
@@ -4455,13 +3913,7 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -4498,23 +3950,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(
       racingWorkflow,
       { sku: "sku-1" },
@@ -4527,29 +3971,18 @@ describe("minimal workflow runtime", () => {
     ]);
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 2468 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       racingWorkflow,
       { sku: "sku-1" },
@@ -4569,13 +4002,7 @@ describe("minimal workflow runtime", () => {
     expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -4615,23 +4042,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-select"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -4643,29 +4062,18 @@ describe("minimal workflow runtime", () => {
     expect(trace).toEqual(["before-select"]);
     hot.markCommitted(committedTail(await backend.commitWorkflowTask(firstClaim.claim, waitCommit)));
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 1357 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "SelectWinner",
@@ -4704,23 +4112,15 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-replay"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
 
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const waitCommit = await prepareWorkflowTaskCommit(
       racingWorkflow,
       { sku: "sku-1" },
@@ -4729,29 +4129,18 @@ describe("minimal workflow runtime", () => {
     );
     await backend.commitWorkflowTask(firstClaim.claim, waitCommit);
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 1357 }, { codec: "Json" })
     });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await prepareWorkflowTaskCommit(
       racingWorkflow,
       { sku: "sku-1" },
@@ -4760,13 +4149,7 @@ describe("minimal workflow runtime", () => {
     );
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 10);
     const badHistory = history.events.map((event) => {
       if (event.data.kind !== "SelectWinner") {
         return event;
@@ -4813,22 +4196,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-timer"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(racingWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -4846,15 +4221,9 @@ describe("minimal workflow runtime", () => {
       signalName: "approved",
       payload: encodePayload<ApprovalSignal>({ approvalId: "a-1" }, { codec: "Json" })
     });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const liveSignal = await backend.readSignalInbox({
       runId: secondClaim.runId,
       signalName: "approved"
@@ -4887,13 +4256,7 @@ describe("minimal workflow runtime", () => {
     await expect(
       backend.fireDueTimers({ namespace: namespace(), now: 10_000, limit: 16 })
     ).resolves.toEqual({ fired: 0 });
-    const history = await backend.streamHistory({
-      runId: secondClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(20),
-      maxEvents: 20,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, secondClaim.runId, 20);
     expect(history.events.map((event) => String(event.eventType))).toEqual([
       "WorkflowStarted",
       "TimerStarted",
@@ -4916,22 +4279,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-signal"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(racingWorkflow, {}, firstClaim, {
       payloadCodec: "Json"
     });
@@ -4942,15 +4297,9 @@ describe("minimal workflow runtime", () => {
       backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 })
     ).resolves.toEqual({ fired: 1 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
     expect(completionCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
       "SelectWinner",
@@ -4990,11 +4339,9 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-activity-same-task"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
     // The signal is already in the inbox when the first task runs, so the
@@ -5006,15 +4353,9 @@ describe("minimal workflow runtime", () => {
       signalName: "approved",
       payload: encodePayload<ApprovalSignal>({ approvalId: "a-1" }, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
     const liveSignal = await backend.readSignalInbox({
       runId: claim.runId,
       signalName: "approved"
@@ -5068,22 +4409,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-activity"),
       workflowType: racingWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(racingWorkflow, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -5094,15 +4427,9 @@ describe("minimal workflow runtime", () => {
       backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 })
     ).resolves.toEqual({ fired: 1 });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [racingWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [racingWorkflow.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const selectCommit = await hot.advance(secondClaim);
     expect(selectCommit.appendEvents?.map((event) => event.data.kind)).toEqual(["SelectWinner"]);
     // An activity branch has no wait; Rust withdraws it through
@@ -5369,22 +4696,14 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-double-await"),
       workflowType: doubleAwait.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [doubleAwait.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [doubleAwait.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(doubleAwait, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -5402,28 +4721,17 @@ describe("minimal workflow runtime", () => {
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, scheduleCommit))
     );
 
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 99 }, { codec: "Json" })
     });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [doubleAwait.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [doubleAwait.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
 
     // The retained waiter is the *first* one, and it still resolves normally.
     const completionCommit = await hot.advance(secondClaim);
@@ -5456,50 +4764,31 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-handle-reread"),
       workflowType: rereadHandle.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [rereadHandle.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [rereadHandle.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(rereadHandle, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
     hot.markCommitted(
       committedTail(await backend.commitWorkflowTask(firstClaim.claim, await hot.nextCommit()))
     );
-    const activityTask = await backend.claimActivityTask("activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("payments"),
-      registeredActivityNames: ["payments.price-quote"],
-      leaseDurationMs: 30_000
+    const activityTask = await claimActivity(backend, "activity-worker", {
+      activityNames: ["payments.price-quote"],
+      taskQueue: taskQueue("payments")
     });
-    if (!activityTask) {
-      throw new Error("expected activity task");
-    }
     await backend.completeActivity({
       claim: activityTask.claim,
       result: encodePayload<QuoteOutput>({ cents: 7 }, { codec: "Json" })
     });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [rereadHandle.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [rereadHandle.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const commit = await hot.advance(secondClaim);
     const completed = commit.appendEvents?.at(-1)?.data;
     if (completed?.kind !== "WorkflowCompleted") {
@@ -5533,42 +4822,25 @@ describe("minimal workflow runtime", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-joinall-across-tasks"),
       workflowType: partialJoin.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ sku: "sku-1" }, { codec: "Json" })
     });
-    const claimWorkflow = async (worker: string): Promise<ClaimedWorkflowTask> => {
-      const claimed = await backend.claimWorkflowTask(worker, {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [partialJoin.workflowType],
-        leaseDurationMs: 30_000
-      });
-      if (!claimed) {
-        throw new Error(`expected a workflow claim for ${worker}`);
-      }
-      return claimed;
-    };
+    const claimPartialJoin = async (worker: string): Promise<ClaimedWorkflowTask> =>
+      claimWorkflow(backend, worker, { workflowTypes: [partialJoin.workflowType] });
     const completeOneActivity = async (cents: number): Promise<void> => {
-      const task = await backend.claimActivityTask("activity-worker", {
-        namespace: namespace(),
-        taskQueue: taskQueue("payments"),
-        registeredActivityNames: ["payments.price-quote"],
-        leaseDurationMs: 30_000
+      const task = await claimActivity(backend, "activity-worker", {
+        activityNames: ["payments.price-quote"],
+        taskQueue: taskQueue("payments")
       });
-      if (!task) {
-        throw new Error("expected an activity task");
-      }
       await backend.completeActivity({
         claim: task.claim,
         result: encodePayload<QuoteOutput>({ cents }, { codec: "Json" })
       });
     };
 
-    const firstClaim = await claimWorkflow("worker-a");
+    const firstClaim = await claimPartialJoin("worker-a");
     const hot = new HotWorkflowExecution(partialJoin, { sku: "sku-1" }, firstClaim, {
       payloadCodec: "Json"
     });
@@ -5584,7 +4856,7 @@ describe("minimal workflow runtime", () => {
     // Only the first branch completes. The join stays pending, so this task has
     // nothing to record — but it must still commit rather than park forever.
     await completeOneActivity(11);
-    const partialClaim = await claimWorkflow("worker-b");
+    const partialClaim = await claimPartialJoin("worker-b");
     const partialCommit = await hot.advance(partialClaim);
     expect(partialCommit.appendEvents ?? []).toEqual([]);
     hot.markCommitted(
@@ -5595,7 +4867,7 @@ describe("minimal workflow runtime", () => {
     // The first branch's completion left the runtime's index two tasks ago, so
     // the composite has to remember it.
     await completeOneActivity(31);
-    const finalClaim = await claimWorkflow("worker-c");
+    const finalClaim = await claimPartialJoin("worker-c");
     const finalCommit = await hot.advance(finalClaim);
     const completed = finalCommit.appendEvents?.at(-1)?.data;
     if (completed?.kind !== "WorkflowCompleted") {
@@ -5725,22 +4997,14 @@ describe("map input manifest validation", () => {
     label: string
   ): Promise<WorkflowTaskCommit> {
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId(`wf/${label}`),
       workflowType: definition.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [definition.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [definition.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
     return prepareWorkflowTaskCommit(definition, {}, claim, { payloadCodec: "Json" });
   }
 
@@ -5762,22 +5026,14 @@ describe("map input manifest validation", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/empty-activity-map"),
       workflowType: emptyMapWorkflow.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [emptyMapWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [emptyMapWorkflow.workflowType]
     });
-    if (!claim) {
-      throw new Error("expected claim");
-    }
     const hot = new HotWorkflowExecution(emptyMapWorkflow, {}, claim, { payloadCodec: "Json" });
     const scheduleCommit = await hot.nextCommit();
     expect(scheduleCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
@@ -5797,15 +5053,9 @@ describe("map input manifest validation", () => {
     });
     expect(noItem).toBeNull();
 
-    const completedClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [emptyMapWorkflow.workflowType],
-      leaseDurationMs: 30_000
+    const completedClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [emptyMapWorkflow.workflowType]
     });
-    if (!completedClaim) {
-      throw new Error("an empty map must wake its parent");
-    }
     expect(completedClaim.reason).toBe("ActivityMapCompleted");
     const finalCommit = await hot.advance(completedClaim);
     expect(finalCommit.appendEvents?.map((event) => event.data.kind)).toEqual([
@@ -6061,22 +5311,14 @@ async function startHotExecution(
 }> {
   const definition = workflow({ name, version: 1, handler });
   const backend = new MemoryBackend();
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(`wf/${name}`),
     workflowType: definition.workflowType,
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({}, { codec: "Json" })
   });
-  const claim = await backend.claimWorkflowTask("worker-a", {
-    namespace: namespace(),
-    taskQueue: taskQueue("workflows"),
-    registeredWorkflowTypes: [definition.workflowType],
-    leaseDurationMs: 30_000
+  const claim = await claimWorkflow(backend, "worker-a", {
+    workflowTypes: [definition.workflowType]
   });
-  if (!claim) {
-    throw new Error(`expected a workflow claim for ${name}`);
-  }
   return {
     hot: new HotWorkflowExecution(definition, {}, claim, { payloadCodec: "Json" }),
     claim

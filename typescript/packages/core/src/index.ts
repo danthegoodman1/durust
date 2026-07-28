@@ -7,6 +7,10 @@ export * from "./map-engine.js";
 export * from "./map-manifest.js";
 export * from "./options.js";
 export * from "./payload.js";
+// The pure helpers a durable provider needs. Exported for the same reason the
+// map engine is: `@durust/sqlite` and `@durust/postgres` are separate packages,
+// so anything they must not disagree about has to be reachable from here.
+export * from "./provider-util.js";
 export * from "./registry.js";
 export {
   ActivityFailureError,

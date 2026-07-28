@@ -51,7 +51,8 @@ import { assertMapInputManifest } from "./map-manifest.js";
 import { RetryPolicy, type ActivityCallOptions, type ChildWorkflowOptions } from "./options.js";
 import { decodePayload, digestBytes, encodePayload, payloadDigest, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { commandId, eventId, timestampMs, waitId, type CommandId, type DurableInput, type EventId, type RunId, type WaitId, type WorkflowId } from "./types.js";
-import { assertDurableInputValue, commandKey, sameCommandId } from "./internal.js";
+import { assertDurableInputValue } from "./internal.js";
+import { commandKey, sameCommandId } from "./provider-util.js";
 
 const runtimeStorage = new AsyncLocalStorage<WorkflowRuntimeContext>();
 

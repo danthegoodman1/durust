@@ -82,6 +82,7 @@ import {
   type CommitOutcome
 } from "@durust/core";
 import { fnv1a32, maintenanceJitterSource } from "../src/worker.js";
+import { workerFixture } from "./support.js";
 
 // ---------------------------------------------------------------------------
 // The program catalogue.
@@ -783,10 +784,7 @@ function buildRegistry(): Registry {
 }
 
 function buildWorker(backend: RecordingBackend, historyChunkEvents?: number): Worker {
-  return new Worker({
-    backend,
-    registry: buildRegistry(),
-    namespace: namespace(),
+  return workerFixture(backend, buildRegistry(), {
     workerId: "corpus-worker",
     workflowTaskQueue: CORPUS_WORKFLOW_QUEUE,
     activityTaskQueue: CORPUS_ACTIVITY_QUEUE,

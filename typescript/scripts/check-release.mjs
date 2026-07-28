@@ -7,6 +7,25 @@ import { dirname, join } from "node:path";
 const dryRun = process.argv.includes("--dry-run");
 const requiredEnv = "DURUST_POSTGRES_URL";
 
+// Each entry is a script that `npm run check` must invoke, and what is lost if
+// it stops. These are the gates that nothing else references: CI runs
+// `npm run check` and never names them individually, so deleting one from the
+// chain removes it from every pipeline in the repository with no other signal.
+//
+// This assertion reaches CI through `release-scripts.test.ts`, which runs this
+// script with `--dry-run` inside `npm run test` and asserts an empty stderr —
+// so a missing gate fails there, not only on a manual release.
+const REQUIRED_CHECK_SCRIPTS = [
+  [
+    "check:fixtures",
+    "the cross-runtime contract fixtures, the only thing that proves the Rust and TypeScript runtimes agree"
+  ],
+  [
+    "check:test-types",
+    "type-checking of the test suite, and the assertion that every test file is actually covered by a tsconfig"
+  ]
+];
+
 // `check:fixtures` used to run here as its own step, immediately after
 // `npm run check` — which already runs it. That is several minutes of duplicated
 // work, because `check-fixtures.mjs` shells out to `cargo` four times.
@@ -25,7 +44,7 @@ assertCheckStillRunsFixtures();
 
 const steps = [
   {
-    name: "Fast workspace gate (includes check:fixtures)",
+    name: "Fast workspace gate (includes check:fixtures and check:test-types)",
     args: ["run", "check"]
   },
   {
@@ -49,13 +68,16 @@ function assertCheckStillRunsFixtures() {
     );
     process.exit(1);
   }
-  if (!/\bcheck:fixtures\b/.test(check)) {
+  const missing = REQUIRED_CHECK_SCRIPTS.filter(
+    ([name]) => !new RegExp(`\\b${name.replace(":", "\\:")}\\b`).test(check)
+  );
+  if (missing.length > 0) {
     console.error(
-      `npm run check:release relies on "npm run check" to run check:fixtures, and it no longer does.\n` +
-        `  check = ${check}\n` +
-        `The cross-runtime contract fixtures are the only thing that proves the Rust and TypeScript runtimes agree. ` +
-        `Restore check:fixtures to the "check" script, or add it back as an explicit step here — but do not leave it unreachable, ` +
-        `which is the state it was in before Phase 7 and the reason this assertion exists.`
+      `npm run check:release relies on "npm run check" to run these, and it no longer does:\n` +
+        missing.map(([name, why]) => `  ${name} — ${why}`).join("\n") +
+        `\n  check = ${check}\n` +
+        `Restore them to the "check" script, or add them back as explicit steps here — but do not leave one ` +
+        `unreachable, which is the state check:fixtures was in before Phase 7 and the reason this assertion exists.`
     );
     process.exit(1);
   }

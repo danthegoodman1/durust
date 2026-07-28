@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { assertLongSoakEnabledWhenRequired, longSoakIsEnabled } from "@durust/testing";
+import {
+  assertLongSoakEnabledWhenRequired,
+  claimActivity,
+  claimWorkflow,
+  longSoakIsEnabled
+} from "@durust/testing";
 import {
   Client,
   MemoryBackend,
@@ -175,13 +180,12 @@ describe("seeded worker/provider simulations", () => {
       { value: 7 }
     );
 
-    const crashedClaim = await backend.claimWorkflowTask("crashed-workflow-worker", {
+    const crashedClaim = await claimWorkflow(backend, "crashed-workflow-worker", {
+      workflowTypes: [echoSimulationWorkflow.workflowType],
       namespace: "default",
       taskQueue: WORKFLOW_QUEUE,
-      registeredWorkflowTypes: [echoSimulationWorkflow.workflowType],
       leaseDurationMs: 10
     });
-    expect(crashedClaim).not.toBeNull();
     await expect(
       workerFor(backend, registry, "replacement-workflow-worker").runWorkflowTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
@@ -218,13 +222,12 @@ describe("seeded worker/provider simulations", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const crashedClaim = await backend.claimActivityTask("crashed-activity-worker", {
+    const crashedClaim = await claimActivity(backend, "crashed-activity-worker", {
+      activityNames: [simActivity.name],
       namespace: "default",
       taskQueue: ACTIVITY_QUEUE,
-      registeredActivityNames: [simActivity.name],
       leaseDurationMs: 10
     });
-    expect(crashedClaim).not.toBeNull();
     await expect(
       activityWorkerFor(backend, registry, "replacement-activity-worker").runActivityTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
@@ -262,13 +265,12 @@ describe("seeded worker/provider simulations", () => {
       { value: 21 }
     );
 
-    const crashedWorkflowClaim = await backend.claimWorkflowTask("crashed-workflow-worker", {
+    const crashedWorkflowClaim = await claimWorkflow(backend, "crashed-workflow-worker", {
+      workflowTypes: [mixedSimulationWorkflow.workflowType],
       namespace: "default",
       taskQueue: WORKFLOW_QUEUE,
-      registeredWorkflowTypes: [mixedSimulationWorkflow.workflowType],
       leaseDurationMs: 5
     });
-    expect(crashedWorkflowClaim).not.toBeNull();
     await expect(
       workerFor(backend, registry, "workflow-worker-before-expiry", ["approved"], 5)
         .runWorkflowTaskOnce()
@@ -289,13 +291,12 @@ describe("seeded worker/provider simulations", () => {
       })
     ).rejects.toThrow("stale workflow task lease");
 
-    const crashedActivityClaim = await backend.claimActivityTask("crashed-activity-worker", {
+    const crashedActivityClaim = await claimActivity(backend, "crashed-activity-worker", {
+      activityNames: [simActivity.name],
       namespace: "default",
       taskQueue: ACTIVITY_QUEUE,
-      registeredActivityNames: [simActivity.name],
       leaseDurationMs: 5
     });
-    expect(crashedActivityClaim).not.toBeNull();
     await expect(
       activityWorkerFor(backend, registry, "activity-worker-before-expiry", 5)
         .runActivityTaskOnce()

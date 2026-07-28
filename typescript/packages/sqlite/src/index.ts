@@ -4,18 +4,12 @@ import {
   historyEventType,
   runId,
   timestampMs,
-  type ActivityMapInputManifest,
-  type ActivityMapInputPage,
-  type ActivityMapResultManifest,
-  type ActivityMapResultPage,
   type ActivityMapTask,
   type ActivityHeartbeatOutcome,
   type ActivityHeartbeatRequest,
   type ActivityTask,
   type ActivityTaskClaim,
   type ChildWorkflowMapItemOutcome,
-  type ChildWorkflowMapResultManifest,
-  type ChildWorkflowMapResultPage,
   type ChildWorkflowMapTask,
   type ChildWorkflowStartRequested,
   type ClaimedActivityTask,
@@ -62,11 +56,33 @@ import {
   type WorkflowType,
   workflowTaskCommitHasWorkflowVisibleMutations
 } from "@durust/core";
-import { completeMapItems, readMapManifestItems, writeMapManifest } from "@durust/core";
+import { completeMapItems } from "@durust/core";
+import {
+  activityHeartbeatDeadlineAt,
+  activityMapItemId,
+  activityTimeoutDeadline,
+  activityTimeoutFailure,
+  activityTimeoutMessage,
+  childWorkflowMapItemOutcome,
+  commandKey,
+  decodeActivityMapInputs,
+  encodeActivityMapResultManifest,
+  encodeChildWorkflowMapResultManifest,
+  makeHistoryEvent,
+  mapItemInFlight,
+  parseJson,
+  retryActivityAfterFailure,
+  retryActivityAfterTimeout,
+  sameCommandId,
+  stringifyJson,
+  tailEventId,
+  workflowLeaseMatches,
+  workflowTypeKey,
+  type ChildTerminalUpdate
+} from "@durust/core";
 import {
   activityOutcomeCounts,
   itemRetryDecision,
-  itemRetryDelayMs,
   mapCommandCancelledReason,
   mapRejectMessage,
   outcomeCounts,
@@ -2569,11 +2585,6 @@ export class SqliteBackend implements DurableBackend {
   }
 }
 
-type ChildTerminalUpdate =
-  | { readonly kind: "Completed"; readonly result: PayloadRef }
-  | { readonly kind: "Failed"; readonly failure: DurableFailure }
-  | { readonly kind: "Cancelled"; readonly reason: string };
-
 function workflowStateFromRowWithHistory(
   row: WorkflowRow,
   history: readonly HistoryEvent[]
@@ -2667,28 +2678,6 @@ function activityRootFromRow(row: ActivityRow): {
         ? parseJson<ActivityTask>(row.task).input as PayloadRef
         : parseJson<PayloadRef>(row.input)
   };
-}
-
-/**
- * When the timeout scanner should reclaim this attempt, and which deadline
- * lapsed. Map items are covered on the same terms as any other activity; the
- * exemption that skipped every task with a `mapItem` meant a hung item was
- * never recovered, only re-offered by lease expiry.
- */
-function activityTimeoutDeadline(
-  activity: ActivityState
-): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
-  if (activity.claim === null || activity.terminalEventId !== null) {
-    return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
-  }
-  const startToCloseDeadline =
-    activity.task.startToCloseTimeoutMs === null
-      ? Number.POSITIVE_INFINITY
-      : activity.claim.startedAtMs + Math.max(0, activity.task.startToCloseTimeoutMs);
-  const heartbeatDeadline = activity.claim.heartbeatDeadlineAtMs ?? Number.POSITIVE_INFINITY;
-  return heartbeatDeadline < startToCloseDeadline
-    ? { deadline: heartbeatDeadline, kind: "Heartbeat" }
-    : { deadline: startToCloseDeadline, kind: "StartToClose" };
 }
 
 function activityMapStateFromRow(row: ActivityMapRow): ActivityMapState {
@@ -2797,59 +2786,11 @@ function childWorkflowMapItemRootFromRow(row: ChildWorkflowMapItemRow): {
   };
 }
 
-function workflowTypeKey(workflowTypeValue: WorkflowType): string {
-  return `${workflowTypeValue.name}@${workflowTypeValue.version}`;
-}
-
-function commandKey(id: CommandId): string {
-  return `${id.runId}:${id.seq}`;
-}
-
-function sameCommandId(left: CommandId, right: CommandId): boolean {
-  return left.runId === right.runId && Number(left.seq) === Number(right.seq);
-}
-
 function commandIdFromParts(runIdValue: string, seq: number): CommandId {
   return {
     runId: runId(runIdValue),
     seq: seq as CommandId["seq"]
   };
-}
-
-function tailEventId(state: WorkflowState): EventId {
-  return state.history.at(-1)?.eventId ?? eventId(0);
-}
-
-/** The generated activity id of one materialized activity-map item. */
-function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
-  return `${mapCommandId.runId}:map:${mapCommandId.seq}:${ordinal}`;
-}
-
-/** A child run's terminal fact as the map engine's item outcome. */
-function childWorkflowMapItemOutcome(
-  terminal: ChildTerminalUpdate
-): ChildWorkflowMapItemOutcome<unknown> {
-  if (terminal.kind === "Completed") {
-    return { kind: "Succeeded", result: terminal.result };
-  }
-  if (terminal.kind === "Failed") {
-    return { kind: "Failed", failure: terminal.failure };
-  }
-  return { kind: "Cancelled", reason: terminal.reason };
-}
-
-/**
- * Whether one item row is still in flight: admitted by the descriptor cursor,
- * without a terminal outcome, on a map that has not ended. Derived rather than
- * tracked, so the descriptor's slot count stays the engine's alone.
- */
-function mapItemInFlight(
-  nextOrdinal: number,
-  terminal: boolean,
-  ordinal: number,
-  outcome: unknown
-): boolean {
-  return !terminal && ordinal < nextOrdinal && (outcome ?? null) === null;
 }
 
 /**
@@ -2867,151 +2808,9 @@ function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): vo
   state.readyAtMs = 0;
 }
 
-function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
-  return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
-}
-
-function retryActivityAfterFailure(
-  activity: ActivityState,
-  failure: DurableFailure,
-  nowMs: number
-): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
-  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (
-    activity.task.attempt >= maxAttempts ||
-    failure.nonRetryable ||
-    policy.nonRetryableErrorTypes.includes(failure.errorType)
-  ) {
-    return null;
-  }
-  return {
-    task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
-    },
-    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
-  };
-}
-
-function retryActivityAfterTimeout(
-  activity: ActivityState,
-  nowMs: number
-): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
-  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (activity.task.attempt >= maxAttempts) {
-    return null;
-  }
-  return {
-    task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
-    },
-    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
-  };
-}
-
-function activityHeartbeatDeadlineAt(
-  task: ActivityTask,
-  nowMs: number,
-  leaseDurationMs: number
-): number | null {
-  if (task.heartbeatTimeoutMs !== null) {
-    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
-  }
-  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
-}
-
-function activityTimeoutMessage(
-  activity: ActivityState,
-  kind: "StartToClose" | "Heartbeat"
-): string {
-  return kind === "Heartbeat"
-    ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
-    : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
-}
-
-/**
- * A lapsed activity deadline as the parent-visible failure a map item carries.
- * A plain activity records the same text in its `ActivityTimedOut` event; a map
- * item has no per-item history, so the text rides the failure instead.
- */
-function activityTimeoutFailure(
-  activity: ActivityState,
-  kind: "StartToClose" | "Heartbeat"
-): DurableFailure {
-  return {
-    errorType: "durust.activity_timed_out",
-    message: activityTimeoutMessage(activity, kind),
-    nonRetryable: false
-  };
-}
-
-function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
-  return {
-    eventId: id,
-    eventType: historyEventType(data),
-    data
-  };
-}
-
-function stringifyJson(value: unknown): string {
-  return JSON.stringify(value, (_key, nested) =>
-    nested instanceof Uint8Array
-      ? { __durustType: "Uint8Array", data: [...nested] }
-      : nested
-  );
-}
-
-function parseJson<T>(value: string): T {
-  return JSON.parse(value, (_key, nested) => {
-    if (
-      nested &&
-      typeof nested === "object" &&
-      (nested as { readonly __durustType?: unknown }).__durustType === "Uint8Array" &&
-      Array.isArray((nested as { readonly data?: unknown }).data)
-    ) {
-      return Uint8Array.from((nested as { readonly data: readonly number[] }).data);
-    }
-    return nested;
-  }) as T;
-}
-
 function isSqliteDuplicateColumnError(error: unknown): boolean {
   return (
     error instanceof Error &&
     error.message.includes("duplicate column name:")
   );
-}
-
-function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {
-  return readMapManifestItems<ActivityMapInputPage<object>, PayloadRef>(
-    inputManifest as PayloadRef<ActivityMapInputManifest<object>>,
-    (page) => page.items,
-    "activity map manifest"
-  );
-}
-
-function encodeActivityMapResultManifest(
-  name: string,
-  results: readonly PayloadRef[]
-): PayloadRef<ActivityMapResultManifest<unknown>> {
-  return writeMapManifest<PayloadRef, ActivityMapResultPage<unknown>>(
-    name,
-    results,
-    (pageResults) => ({ results: pageResults })
-  ) as PayloadRef<ActivityMapResultManifest<unknown>>;
-}
-
-function encodeChildWorkflowMapResultManifest(
-  name: string,
-  outcomes: readonly ChildWorkflowMapItemOutcome<unknown>[]
-): PayloadRef<ChildWorkflowMapResultManifest<unknown>> {
-  return writeMapManifest<
-    ChildWorkflowMapItemOutcome<unknown>,
-    ChildWorkflowMapResultPage<unknown>
-  >(name, outcomes, (pageOutcomes) => ({ outcomes: pageOutcomes })) as PayloadRef<
-    ChildWorkflowMapResultManifest<unknown>
-  >;
 }

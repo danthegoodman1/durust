@@ -39,7 +39,12 @@ import {
   hydratePayloadRef,
   planPayloadGarbageCollection
 } from "@durust/payload";
-import { basicProviderConformanceCases } from "@durust/testing";
+import {
+  basicProviderConformanceCases,
+  claimWorkflow,
+  readHistory,
+  startTestWorkflow
+} from "@durust/testing";
 
 /**
  * Cases this file actually executed, counted by the module-scope `afterEach`
@@ -162,21 +167,15 @@ describe("local-directory payload storage", () => {
       inlineThresholdBytes: 1024
     });
     const foreign = foreignBlobRef({ value: "foreign" });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/payload-foreign-ref"),
       workflowType: workflowType("payload.foreign", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ foreign }, { codec: "Json" })
     });
 
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("payload.foreign", 1)],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("payload.foreign", 1)]
     });
-    expect(claim).not.toBeNull();
     const started = claim?.prefetchedHistory[0]?.data;
     if (started?.kind !== "WorkflowStarted") {
       throw new Error("expected hydrated WorkflowStarted");
@@ -300,13 +299,7 @@ describe("local-directory payload storage", () => {
     });
     await expect(firstWorker.runWorkflowTaskOnce()).rejects.toThrow("blob store unavailable");
 
-    const rawAfterOutage = await inner.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const rawAfterOutage = await readHistory(inner, handle.runId, 10);
     expect(rawAfterOutage.events.map((event) => event.eventType)).toEqual(["WorkflowStarted"]);
 
     const tooEarlyWorker = new Worker({
@@ -337,13 +330,7 @@ describe("local-directory payload storage", () => {
     });
     await expect(handle.result()).resolves.toEqual({ body: "recoverable".repeat(32) });
 
-    const rawCompleted = await inner.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const rawCompleted = await readHistory(inner, handle.runId, 10);
     expect(rawCompleted.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -369,22 +356,14 @@ describe("local-directory payload storage", () => {
       blobStore: store,
       inlineThresholdBytes: 8
     });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/payload-activity"),
       workflowType: workflowType("payload.activity-parent", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("payload.activity-parent", 1)],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("payload.activity-parent", 1)]
     });
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
     const activityInput = encodePayload({ body: "i".repeat(128) }, { codec: "Json" });
     const scheduled = {
       commandId: commandId(claim.runId, 1),
@@ -422,13 +401,7 @@ describe("local-directory payload storage", () => {
       claim: activityTask.claim,
       result: encodePayload({ body: "r".repeat(128) }, { codec: "Json" })
     });
-    const rawHistory = await inner.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const rawHistory = await readHistory(inner, claim.runId, 10);
     const rawCompleted = rawHistory.events.find((event) => event.data.kind === "ActivityCompleted")
       ?.data;
     expect(rawCompleted?.kind).toBe("ActivityCompleted");
@@ -437,13 +410,7 @@ describe("local-directory payload storage", () => {
     }
     expect(rawCompleted.completed.result.kind).toBe("Blob");
 
-    const hydratedHistory = await backend.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const hydratedHistory = await readHistory(backend, claim.runId, 10);
     const hydratedCompleted = hydratedHistory.events.find(
       (event) => event.data.kind === "ActivityCompleted"
     )?.data;
@@ -465,22 +432,14 @@ describe("local-directory payload storage", () => {
       blobStore: store,
       inlineThresholdBytes: 8
     });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/payload-map"),
       workflowType: workflowType("payload.map-parent", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({}, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("payload.map-parent", 1)],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("payload.map-parent", 1)]
     });
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
     const inputManifest = activityMapManifest([
       { body: "a".repeat(64) },
       { body: "b".repeat(64) }
@@ -521,13 +480,7 @@ describe("local-directory payload storage", () => {
       ]
     });
 
-    const rawHistory = await inner.streamHistory({
-      runId: claim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const rawHistory = await readHistory(inner, claim.runId, 10);
     const rawScheduled = rawHistory.events.find((event) => event.data.kind === "ActivityMapScheduled")
       ?.data;
     expect(rawScheduled?.kind).toBe("ActivityMapScheduled");
@@ -921,13 +874,7 @@ describe("local-directory payload storage", () => {
       deletedCount: 1
     });
 
-    const history = await inner.streamHistory({
-      runId: started.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(inner, started.runId, 10);
     const startedEvent = history.events[0]?.data;
     if (startedEvent?.kind !== "WorkflowStarted" || startedEvent.input.kind !== "Blob") {
       throw new Error("expected blob-backed stored workflow input");

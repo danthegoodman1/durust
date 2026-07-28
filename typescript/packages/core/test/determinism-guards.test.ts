@@ -10,7 +10,6 @@ import {
   namespace,
   runId,
   sleepUntil,
-  taskQueue,
   workflow,
   workflowId,
   workflowType,
@@ -22,6 +21,7 @@ import {
   installNondeterminismGuards,
   uninstallNondeterminismGuards
 } from "../src/runtime.js";
+import { claimWorkflow, startTestWorkflow } from "@durust/testing";
 
 // Every global captured here is read *before* any guard installs, because the
 // module body runs at import time and only a `HotWorkflowExecution` installs
@@ -569,22 +569,14 @@ describe("nondeterminism guard uninstall", () => {
       }
     });
     const backend = new MemoryBackend();
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/mid-flight-uninstall"),
       workflowType: reminder.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ deadlineMs: 1_000 }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const firstClaim = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
     const hot = new HotWorkflowExecution(reminder, { deadlineMs: 1_000 }, firstClaim, {
       payloadCodec: "Json",
       nondeterminismGuards: true
@@ -602,15 +594,9 @@ describe("nondeterminism guard uninstall", () => {
     expect(globalThis.Date).toBe(pristine.Date);
 
     await backend.fireDueTimers({ namespace: namespace(), now: 1_000, limit: 16 });
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [reminder.workflowType],
-      leaseDurationMs: 30_000
+    const secondClaim = await claimWorkflow(backend, "worker-b", {
+      workflowTypes: [reminder.workflowType]
     });
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
     const completionCommit = await hot.advance(secondClaim);
 
     // The run neither hangs nor fails: durable APIs and AsyncLocalStorage are

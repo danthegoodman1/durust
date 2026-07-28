@@ -25,12 +25,22 @@ import { defineConfig } from "vitest/config";
 // checking them.
 //
 // `tsconfig.tests.json` is the config that actually covers
-// `packages/*/test/**/*.ts` (33 test files, 481 files total, 26.9k lines of
-// test source). It reports 85 pre-existing errors and catches the false probe
-// above, so it is a real check but not yet a green one — it is deliberately
-// not wired into `npm run check` until those are triaged. Turn typecheck back
-// on here only against that config, and only once it is at zero; pointing it
-// at `tsconfig.json` again just restores the green line for work nothing does.
+// `packages/*/test/**/*.ts`, and it catches the false probe above. It reported
+// 85 errors when it was introduced; those are now at **zero**, and it runs in
+// `npm run check` via `check:test-types`, so the test suite is type-checked on
+// every CI run — by that script rather than from here.
+//
+// It is a script rather than a bare `tsc -p` because `tsc` exits 0 when it has
+// nothing to check: one bad `include` glob would turn the gate green and silent
+// in the same edit, which is the defect this block exists to remember.
+// `scripts/check-test-types.mjs` therefore also asserts that every test file on
+// disk was in the set `tsc` read, that each expected package still has tests,
+// that no file carries `@ts-nocheck`, and that the strictness options have not
+// been weakened.
+//
+// So there is still no reason to re-add `typecheck` here. If you ever do, point
+// it at `tsconfig.tests.json` and nothing else; pointing it back at
+// `tsconfig.json` restores the green line for work nothing does.
 export default defineConfig({
   test: {
     include: ["packages/*/test/**/*.test.ts"]

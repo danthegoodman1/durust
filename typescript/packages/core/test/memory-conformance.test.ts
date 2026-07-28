@@ -15,7 +15,9 @@ import {
 } from "@durust/core";
 import {
   assertCurrentTimeFollowsInjectedClock,
-  basicProviderConformanceCases
+  basicProviderConformanceCases,
+  claimWorkflow,
+  startTestWorkflow
 } from "@durust/testing";
 
 /**
@@ -65,23 +67,14 @@ describe("MemoryBackend retry timing", () => {
   it("delays retryable activity attempts according to retry policy", async () => {
     let now = 1_000;
     const backend = new MemoryBackend({ nowMs: () => now });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/retry-timing"),
       workflowType: workflowType("memory.retry-timing", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("memory.retry-timing", 1)],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "workflow-worker", {
+      workflowTypes: [workflowType("memory.retry-timing", 1)]
     });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
 
     const input = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {
@@ -190,23 +183,14 @@ describe("MemoryBackend heartbeat timing", () => {
   it("extends heartbeat timeout deadlines when the activity records liveness", async () => {
     let now = 1_000;
     const backend = new MemoryBackend({ nowMs: () => now });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/heartbeat-deadline"),
       workflowType: workflowType("memory.heartbeat-deadline", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const claim = await backend.claimWorkflowTask("workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("memory.heartbeat-deadline", 1)],
-      leaseDurationMs: 30_000
+    const claim = await claimWorkflow(backend, "workflow-worker", {
+      workflowTypes: [workflowType("memory.heartbeat-deadline", 1)]
     });
-    expect(claim).not.toBeNull();
-    if (!claim) {
-      throw new Error("expected workflow claim");
-    }
 
     const input = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {

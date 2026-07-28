@@ -35,40 +35,50 @@ describe("release gate scripts", () => {
   // so the step's expectations are not simply deleted: they are replaced by the
   // assertion that took the step's place, which is what now guarantees the
   // fixtures run at all.
-  it("refuses to run the release gate when npm run check no longer runs check:fixtures", async () => {
-    const root = await mkdtemp(join(tmpdir(), "durust-release-gate-"));
-    await mkdir(join(root, "scripts"));
-    await copyFile(checkReleaseScript, join(root, "scripts", "check-release.mjs"));
-    // Everything the real `check` runs *except* check:fixtures — the exact edit
-    // that once left the shared corpus ungated in CI.
-    await writeFile(
-      join(root, "package.json"),
-      JSON.stringify({
-        name: "release-gate-fixture",
-        scripts: { check: "npm run build && npm run test && npm run lint" }
-      })
-    );
+  //
+  // The two gates below are checked one at a time rather than together. A single
+  // fixture missing both would pass while only one clause worked — and a fixture
+  // that reproduces the *realistic* edit, dropping exactly one script, is the one
+  // that proves each clause independently.
+  const REQUIRED_IN_CHECK = ["check:fixtures", "check:test-types"] as const;
 
-    await expect(
-      execFileAsync(process.execPath, [join(root, "scripts", "check-release.mjs"), "--dry-run"], {
-        cwd: root,
-        env: withoutPostgresUrl()
-      })
-    ).rejects.toMatchObject({
-      stderr: expect.stringContaining(
-        'npm run check:release relies on "npm run check" to run check:fixtures, and it no longer does.'
-      )
+  for (const required of REQUIRED_IN_CHECK) {
+    it(`refuses to run the release gate when npm run check no longer runs ${required}`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "durust-release-gate-"));
+      await mkdir(join(root, "scripts"));
+      await copyFile(checkReleaseScript, join(root, "scripts", "check-release.mjs"));
+      // Everything the real `check` runs *except* this one script — the shape of
+      // the edit that once left the shared corpus ungated in CI.
+      const check = REQUIRED_IN_CHECK.filter((name) => name !== required)
+        .map((name) => `npm run ${name}`)
+        .concat("npm run build", "npm run test", "npm run lint")
+        .join(" && ");
+      await writeFile(
+        join(root, "package.json"),
+        JSON.stringify({ name: "release-gate-fixture", scripts: { check } })
+      );
+
+      await expect(
+        execFileAsync(process.execPath, [join(root, "scripts", "check-release.mjs"), "--dry-run"], {
+          cwd: root,
+          env: withoutPostgresUrl()
+        })
+      ).rejects.toMatchObject({
+        stderr: expect.stringContaining(required)
+      });
     });
-  });
+  }
 
-  // The companion to the case above: with the real `package.json` the same
-  // assertion must *pass*, or it would be failing for a reason unrelated to the
-  // edit it is meant to catch and the case above would prove nothing.
-  it("accepts the workspace package.json, whose check script does run check:fixtures", () => {
+  // The companion to the cases above: with the real `package.json` the same
+  // assertion must *pass*, or they would be failing for a reason unrelated to
+  // the edit they are meant to catch and would prove nothing.
+  it("accepts the workspace package.json, whose check script runs every required gate", () => {
     const check = JSON.parse(
       readFileSync(fileURLToPath(new URL("package.json", workspaceRootUrl)), "utf8")
     ).scripts.check;
-    expect(check).toContain("check:fixtures");
+    for (const required of REQUIRED_IN_CHECK) {
+      expect(check).toContain(required);
+    }
   });
 
   it("fails before running the aggregate release gate when Postgres is not configured", async () => {

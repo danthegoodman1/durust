@@ -15,11 +15,31 @@ import {
   type SignalId,
   type SignalName
 } from "./types.js";
-import { commandKey, sameCommandId } from "./internal.js";
+import {
+  activityHeartbeatDeadlineAt,
+  activityLeaseMatches,
+  activityMapItemId,
+  activityTimeoutDeadline,
+  activityTimeoutFailure,
+  activityTimeoutMessage,
+  childWorkflowMapItemOutcome,
+  commandKey,
+  decodeActivityMapInputs,
+  encodeActivityMapResultManifest,
+  encodeChildWorkflowMapResultManifest,
+  makeHistoryEvent,
+  retryActivityAfterFailure,
+  retryActivityAfterTimeout,
+  sameCommandId,
+  tailEventId,
+  workflowKey,
+  workflowLeaseMatches,
+  workflowTypeKey,
+  type ChildTerminalUpdate
+} from "./provider-util.js";
 import {
   activityOutcomeCounts,
   itemRetryDecision,
-  itemRetryDelayMs,
   mapCommandCancelledReason,
   mapRejectMessage,
   outcomeCounts,
@@ -39,19 +59,9 @@ import type {
   HistoryEvent,
   HistoryEventData
 } from "./history.js";
-import { historyEventType } from "./history.js";
 import type { PayloadRef } from "./payload.js";
-import { completeMapItems, readMapManifestItems, writeMapManifest } from "./map-manifest.js";
-import type {
-  ActivityMapInputManifest,
-  ActivityMapInputPage,
-  ActivityMapResultManifest,
-  ActivityMapResultPage,
-  ChildWorkflowMapItemOutcome,
-  ChildWorkflowMapResultManifest,
-  ChildWorkflowMapResultPage,
-  DurableFailure
-} from "./api.js";
+import { completeMapItems } from "./map-manifest.js";
+import type { ChildWorkflowMapItemOutcome, DurableFailure } from "./api.js";
 
 export interface DurableBackend {
   startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome>;
@@ -1918,196 +1928,10 @@ export class MemoryBackend implements DurableBackend {
   }
 }
 
-type ChildTerminalUpdate =
-  | { readonly kind: "Completed"; readonly result: PayloadRef }
-  | { readonly kind: "Failed"; readonly failure: DurableFailure }
-  | { readonly kind: "Cancelled"; readonly reason: string };
-
-function workflowKey(namespace: Namespace | string, workflowId: WorkflowId | string): string {
-  return `${namespace}/${workflowId}`;
-}
-
-function workflowTypeKey(workflowType: WorkflowType): string {
-  return `${workflowType.name}@${workflowType.version}`;
-}
-
-
-/** The generated activity id of one materialized activity-map item. */
-function activityMapItemId(mapCommandId: CommandId, ordinal: number): string {
-  return `${mapCommandId.runId}:map:${mapCommandId.seq}:${ordinal}`;
-}
-
-/** A child run's terminal fact as the map engine's item outcome. */
-function childWorkflowMapItemOutcome(
-  terminal: ChildTerminalUpdate
-): ChildWorkflowMapItemOutcome<unknown> {
-  if (terminal.kind === "Completed") {
-    return { kind: "Succeeded", result: terminal.result };
-  }
-  if (terminal.kind === "Failed") {
-    return { kind: "Failed", failure: terminal.failure };
-  }
-  return { kind: "Cancelled", reason: terminal.reason };
-}
-
-function tailEventId(state: WorkflowState): EventId {
-  return state.history.at(-1)?.eventId ?? eventId(0);
-}
-
+// Mutates its argument, so it stays with the state it mutates rather than
+// joining the pure helpers in `./provider-util.ts`. Each provider owns when a
+// run becomes claimable; only the arithmetic is shared.
 function markWorkflowReady(state: WorkflowState, reason: WorkflowTaskReason): void {
   state.readyReason = reason;
   state.readyAtMs = 0;
-}
-
-function workflowLeaseMatches(lease: WorkflowLease, claim: WorkflowTaskClaim): boolean {
-  return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
-}
-
-function activityLeaseMatches(lease: ActivityLease, claim: ActivityTaskClaim): boolean {
-  return lease.claim.token === claim.token && lease.claim.workerId === claim.workerId;
-}
-
-function retryActivityAfterFailure(
-  activity: ActivityState,
-  failure: DurableFailure,
-  nowMs: number
-): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
-  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (
-    activity.task.attempt >= maxAttempts ||
-    failure.nonRetryable ||
-    policy.nonRetryableErrorTypes.includes(failure.errorType)
-  ) {
-    return null;
-  }
-  return {
-    task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
-    },
-    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
-  };
-}
-
-function retryActivityAfterTimeout(
-  activity: ActivityState,
-  nowMs: number
-): { readonly task: ActivityTask; readonly readyAtMs: number } | null {
-  const policy = activity.task.retryPolicy;
-  const maxAttempts = Math.max(1, Math.trunc(policy.maxAttempts));
-  if (activity.task.attempt >= maxAttempts) {
-    return null;
-  }
-  return {
-    task: {
-      ...activity.task,
-      attempt: activity.task.attempt + 1
-    },
-    readyAtMs: nowMs + itemRetryDelayMs(policy, activity.task.attempt)
-  };
-}
-
-function activityHeartbeatDeadlineAt(
-  task: ActivityTask,
-  nowMs: number,
-  leaseDurationMs: number
-): number | null {
-  if (task.heartbeatTimeoutMs !== null) {
-    return nowMs + Math.max(0, task.heartbeatTimeoutMs);
-  }
-  return task.startToCloseTimeoutMs === null ? nowMs + Math.max(0, leaseDurationMs) : null;
-}
-
-/**
- * When the timeout scanner should reclaim this attempt, and which deadline
- * lapsed.
- *
- * Map items are covered on the same terms as any other activity. They used to
- * be exempt — the scanner skipped every task with a `mapItem`, so a hung item
- * was never recovered even though `ActivityMapTask` carries
- * `startToCloseTimeoutMs`/`heartbeatTimeoutMs` and every materialized item
- * copies them. Stored and never enforced is worse than not stored: with no
- * explicit timeout an item still gets the implicit lease-length heartbeat
- * deadline, so a worker that dies mid-item left the item to be re-offered by
- * lease expiry forever instead of failing its map.
- */
-function activityTimeoutDeadline(
-  activity: ActivityState
-): { readonly deadline: number; readonly kind: "StartToClose" | "Heartbeat" } {
-  if (activity.claim === null || activity.terminalEventId !== null) {
-    return { deadline: Number.POSITIVE_INFINITY, kind: "StartToClose" };
-  }
-  const startToCloseDeadline =
-    activity.task.startToCloseTimeoutMs === null
-      ? Number.POSITIVE_INFINITY
-      : activity.claim.startedAtMs + Math.max(0, activity.task.startToCloseTimeoutMs);
-  const heartbeatDeadline = activity.claim.heartbeatDeadlineAtMs ?? Number.POSITIVE_INFINITY;
-  return heartbeatDeadline < startToCloseDeadline
-    ? { deadline: heartbeatDeadline, kind: "Heartbeat" }
-    : { deadline: startToCloseDeadline, kind: "StartToClose" };
-}
-
-function activityTimeoutMessage(
-  activity: ActivityState,
-  kind: "StartToClose" | "Heartbeat"
-): string {
-  return kind === "Heartbeat"
-    ? `activity ${activity.task.activityId} missed heartbeat on attempt ${activity.task.attempt}`
-    : `activity ${activity.task.activityId} start-to-close timed out after ${activity.task.startToCloseTimeoutMs}ms`;
-}
-
-/**
- * A lapsed activity deadline as the parent-visible failure a map item carries.
- * A plain activity records the same text in its `ActivityTimedOut` event; a map
- * item has no per-item history, so the text rides the failure instead.
- */
-function activityTimeoutFailure(
-  activity: ActivityState,
-  kind: "StartToClose" | "Heartbeat"
-): DurableFailure {
-  return {
-    errorType: "durust.activity_timed_out",
-    message: activityTimeoutMessage(activity, kind),
-    nonRetryable: false
-  };
-}
-
-function makeHistoryEvent(id: EventId, data: HistoryEventData): HistoryEvent {
-  return {
-    eventId: id,
-    eventType: historyEventType(data),
-    data
-  };
-}
-
-function decodeActivityMapInputs(inputManifest: PayloadRef): readonly PayloadRef[] {
-  return readMapManifestItems<ActivityMapInputPage<object>, PayloadRef>(
-    inputManifest as PayloadRef<ActivityMapInputManifest<object>>,
-    (page) => page.items,
-    "activity map manifest"
-  );
-}
-
-function encodeActivityMapResultManifest(
-  name: string,
-  results: readonly PayloadRef[]
-): PayloadRef<ActivityMapResultManifest<unknown>> {
-  return writeMapManifest<PayloadRef, ActivityMapResultPage<unknown>>(
-    name,
-    results,
-    (pageResults) => ({ results: pageResults })
-  ) as PayloadRef<ActivityMapResultManifest<unknown>>;
-}
-
-function encodeChildWorkflowMapResultManifest(
-  name: string,
-  outcomes: readonly ChildWorkflowMapItemOutcome<unknown>[]
-): PayloadRef<ChildWorkflowMapResultManifest<unknown>> {
-  return writeMapManifest<
-    ChildWorkflowMapItemOutcome<unknown>,
-    ChildWorkflowMapResultPage<unknown>
-  >(name, outcomes, (pageOutcomes) => ({ outcomes: pageOutcomes })) as PayloadRef<
-    ChildWorkflowMapResultManifest<unknown>
-  >;
 }

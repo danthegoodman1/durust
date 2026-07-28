@@ -57,11 +57,15 @@ import {
   assertTerminalRunLeftoversAreRepaired,
   assertTerminalRunPlainLeftoverIsRepaired,
   basicProviderConformanceCases,
+  claimActivity,
+  claimWorkflow,
   postgresIsRequired,
   postgresUrlFromEnv,
   prepareWorkflowTaskCommit,
+  readHistory,
   scheduleTerminalRunLeftovers,
   scheduleTerminalRunPlainLeftover,
+  startTestWorkflow,
   workflowVisibleMutationCommitCases
 } from "@durust/testing";
 
@@ -265,13 +269,7 @@ describePostgres("PostgresBackend payload roots and GC", () => {
       await reopenedInner.close();
     }
 
-    const history = await inner.streamHistory({
-      runId: started.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(inner, started.runId, 10);
     const startedEvent = history.events[0]?.data;
     if (startedEvent?.kind !== "WorkflowStarted" || startedEvent.input.kind !== "Blob") {
       throw new Error("expected blob-backed stored workflow input");
@@ -422,26 +420,17 @@ describePostgres("PostgresBackend persistence", () => {
       tableName,
       poolSize: 1
     });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/postgres-reopen"),
       workflowType: echo.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
     await first.close();
 
     const reopened = trackedPostgresBackendWithTable(tableName);
-    const claimed = await reopened.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [echo.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(reopened, "worker-a", {
+      workflowTypes: [echo.workflowType]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected reopened claim");
-    }
 
     const commit = await prepareWorkflowTaskCommit(
       echo,
@@ -454,13 +443,7 @@ describePostgres("PostgresBackend persistence", () => {
       newTailEventId: eventId(2)
     });
 
-    const history = await reopened.streamHistory({
-      runId: claimed.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "WorkflowCompleted"
@@ -617,13 +600,7 @@ describePostgres("PostgresBackend persistence", () => {
         kind: "Committed",
         outcome: { kind: "Committed" }
       });
-      const history = await completeWorkflow.streamHistory({
-        runId: handle.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(20),
-        maxEvents: 20,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const history = await readHistory(completeWorkflow, handle.runId, 20);
       expect(history.events.map((event) => event.eventType)).toEqual([
         "WorkflowStarted",
         "ActivityScheduled",
@@ -730,13 +707,7 @@ describePostgres("PostgresBackend persistence", () => {
       }
 
       const verify = open();
-      const history = await verify.streamHistory({
-        runId: handle.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(20),
-        maxEvents: 20,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const history = await readHistory(verify, handle.runId, 20);
       expect(history.events.map((event) => event.eventType)).toEqual([
         "WorkflowStarted",
         "ChildWorkflowStartRequested",
@@ -791,23 +762,12 @@ describePostgres("PostgresBackend persistence", () => {
 
     try {
       const first = open();
-      await first.startWorkflow({
-        namespace: namespace(),
+      await startTestWorkflow(first, {
         workflowId: workflowId("wf/postgres-activity-map-reopen"),
         workflowType: parentType,
-        taskQueue: taskQueue("workflows"),
         input: encodePayload({}, { codec: "Json" })
       });
-      const claim = await first.claimWorkflowTask("worker-a", {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [parentType],
-        leaseDurationMs: 30_000
-      });
-      expect(claim).not.toBeNull();
-      if (!claim) {
-        throw new Error("expected activity-map parent claim");
-      }
+      const claim = await claimWorkflow(first, "worker-a", { workflowTypes: [parentType] });
       const scheduled = {
         commandId: commandId(claim.runId, 1),
         activityName: "postgres.map",
@@ -909,13 +869,7 @@ describePostgres("PostgresBackend persistence", () => {
         throw new Error("expected activity-map parent wake");
       }
 
-      const history = await reopenedAgain.streamHistory({
-        runId: claim.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(10),
-        maxEvents: 10,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const history = await readHistory(reopenedAgain, claim.runId, 10);
       expect(history.events.map((event) => event.eventType)).toEqual([
         "WorkflowStarted",
         "ActivityMapScheduled",
@@ -977,23 +931,12 @@ describePostgres("PostgresBackend persistence", () => {
 
     try {
       const first = open();
-      await first.startWorkflow({
-        namespace: namespace(),
+      await startTestWorkflow(first, {
         workflowId: workflowId("wf/postgres-child-map-reopen"),
         workflowType: parentType,
-        taskQueue: taskQueue("workflows"),
         input: encodePayload({}, { codec: "Json" })
       });
-      const claim = await first.claimWorkflowTask("worker-a", {
-        namespace: namespace(),
-        taskQueue: taskQueue("workflows"),
-        registeredWorkflowTypes: [parentType],
-        leaseDurationMs: 30_000
-      });
-      expect(claim).not.toBeNull();
-      if (!claim) {
-        throw new Error("expected child-map parent claim");
-      }
+      const claim = await claimWorkflow(first, "worker-a", { workflowTypes: [parentType] });
       const scheduled = {
         commandId: commandId(claim.runId, 1),
         workflowType: childType,
@@ -1119,13 +1062,7 @@ describePostgres("PostgresBackend persistence", () => {
         throw new Error("expected child-map parent wake");
       }
 
-      const history = await reopenedAgain.streamHistory({
-        runId: claim.runId,
-        afterEventId: eventId(0),
-        upToEventId: eventId(10),
-        maxEvents: 10,
-        maxBytes: Number.MAX_SAFE_INTEGER
-      });
+      const history = await readHistory(reopenedAgain, claim.runId, 10);
       expect(history.events.map((event) => event.eventType)).toEqual([
         "WorkflowStarted",
         "ChildWorkflowMapScheduled",
@@ -1168,20 +1105,15 @@ describePostgres("PostgresBackend persistence", () => {
       tableName,
       poolSize: 1
     });
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/postgres-expired-lease"),
       workflowType: workflowType("postgres.expired-lease", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const expiredWorkflowClaim = await first.claimWorkflowTask("expired-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.expired-lease", 1)],
+    const expiredWorkflowClaim = await claimWorkflow(first, "expired-workflow-worker", {
+      workflowTypes: [workflowType("postgres.expired-lease", 1)],
       leaseDurationMs: 0
     });
-    expect(expiredWorkflowClaim).not.toBeNull();
     await first.close();
 
     const reopened = new PostgresBackend({
@@ -1189,13 +1121,9 @@ describePostgres("PostgresBackend persistence", () => {
       tableName,
       poolSize: 1
     });
-    const reclaimedWorkflowClaim = await reopened.claimWorkflowTask("replacement-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.expired-lease", 1)],
-      leaseDurationMs: 30_000
+    const reclaimedWorkflowClaim = await claimWorkflow(reopened, "replacement-workflow-worker", {
+      workflowTypes: [workflowType("postgres.expired-lease", 1)]
     });
-    expect(reclaimedWorkflowClaim).not.toBeNull();
     if (!expiredWorkflowClaim || !reclaimedWorkflowClaim) {
       throw new Error("expected workflow claims");
     }
@@ -1222,13 +1150,10 @@ describePostgres("PostgresBackend persistence", () => {
       appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
       scheduleActivities: [activityTaskFromScheduled(scheduled)]
     });
-    const expiredActivityClaim = await reopened.claimActivityTask("expired-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["postgres.expired-lease.activity"],
+    const expiredActivityClaim = await claimActivity(reopened, "expired-activity-worker", {
+      activityNames: ["postgres.expired-lease.activity"],
       leaseDurationMs: 0
     });
-    expect(expiredActivityClaim).not.toBeNull();
     await reopened.close();
 
     const reopenedAgain = trackedPostgresBackendWithTable(tableName);
@@ -1270,23 +1195,14 @@ describePostgres("PostgresBackend persistence", () => {
       nowMs: () => now
     });
     managedBackends.push(first);
-    await first.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(first, {
       workflowId: workflowId("wf/postgres-heartbeat-deadline-reopen"),
       workflowType: workflowType("postgres.heartbeat-deadline", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
-    const workflowClaim = await first.claimWorkflowTask("heartbeat-workflow-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.heartbeat-deadline", 1)],
-      leaseDurationMs: 30_000
+    const workflowClaim = await claimWorkflow(first, "heartbeat-workflow-worker", {
+      workflowTypes: [workflowType("postgres.heartbeat-deadline", 1)]
     });
-    expect(workflowClaim).not.toBeNull();
-    if (!workflowClaim) {
-      throw new Error("expected heartbeat workflow claim");
-    }
     const input = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {
       commandId: commandId(workflowClaim.runId, 1),
@@ -1307,16 +1223,9 @@ describePostgres("PostgresBackend persistence", () => {
       appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
       scheduleActivities: [activityTaskFromScheduled(scheduled)]
     });
-    const activityClaim = await first.claimActivityTask("heartbeat-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["postgres.heartbeat-deadline.activity"],
-      leaseDurationMs: 30_000
+    const activityClaim = await claimActivity(first, "heartbeat-activity-worker", {
+      activityNames: ["postgres.heartbeat-deadline.activity"]
     });
-    expect(activityClaim).not.toBeNull();
-    if (!activityClaim) {
-      throw new Error("expected heartbeat activity claim");
-    }
     now = 1_050;
     await expect(first.heartbeatActivity({ claim: activityClaim.claim })).resolves.toEqual({
       kind: "Recorded"
@@ -1345,13 +1254,7 @@ describePostgres("PostgresBackend persistence", () => {
       leaseDurationMs: 30_000
     });
     expect(workflowWake?.reason).toBe("ActivityTimedOut");
-    const history = await reopened.streamHistory({
-      runId: workflowClaim.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(reopened, workflowClaim.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
       "WorkflowStarted",
       "ActivityScheduled",
@@ -1370,11 +1273,9 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_query_projection");
     const backend = trackedPostgresBackendWithTable(tableName);
     const queryProjection = encodePayload({ status: "ready" }, { codec: "Json" });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-query"),
       workflowType: workflowType("postgres.normalized-query", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
 
@@ -1385,16 +1286,9 @@ describePostgres("PostgresBackend normalized history", () => {
       })
     ).resolves.toEqual({ kind: "NoProjection" });
 
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.normalized-query", 1)],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("postgres.normalized-query", 1)]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
 
     await backend.commitWorkflowTask(claimed.claim, {
       expectedTailEventId: eventId(1),
@@ -1434,23 +1328,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const backend = trackedPostgresBackendWithTable(tableName);
     const queryProjection = encodePayload({ status: "rooted" }, { codec: "Json" });
     const type = workflowType("postgres.normalized-query-payload-roots", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-query-payload-roots"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
     await backend.commitWorkflowTask(claimed.claim, {
       expectedTailEventId: eventId(1),
       queryProjection
@@ -1466,23 +1349,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_query_continue");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-query-continue", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-query-continue"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "first" }, { codec: "Json" })
     });
-    const firstClaim = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(firstClaim).not.toBeNull();
-    if (!firstClaim) {
-      throw new Error("expected first claim");
-    }
+    const firstClaim = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     await backend.commitWorkflowTask(firstClaim.claim, {
       expectedTailEventId: eventId(1),
@@ -1504,16 +1376,7 @@ describePostgres("PostgresBackend normalized history", () => {
       })
     ).resolves.toEqual({ kind: "NoProjection" });
 
-    const secondClaim = await backend.claimWorkflowTask("worker-b", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(secondClaim).not.toBeNull();
-    if (!secondClaim) {
-      throw new Error("expected second claim");
-    }
+    const secondClaim = await claimWorkflow(backend, "worker-b", { workflowTypes: [type] });
     const currentProjection = encodePayload({ status: "new-run" }, { codec: "Json" });
     await backend.commitWorkflowTask(secondClaim.claim, {
       expectedTailEventId: eventId(1),
@@ -1534,11 +1397,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("uses normalized workflow-id projection during idempotent start", async () => {
     const tableName = nextTableName("normalized_start_projection");
     const backend = trackedPostgresBackendWithTable(tableName);
-    const first = await backend.startWorkflow({
-      namespace: namespace(),
+    const first = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-start-a"),
       workflowType: workflowType("postgres.normalized-start", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "a" }, { codec: "Json" })
     });
 
@@ -1563,11 +1424,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("stores workflow run queue, lease, tail, and terminal state in normalized rows", async () => {
     const tableName = nextTableName("normalized_workflow_runs");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-workflow-runs"),
       workflowType: workflowType("postgres.normalized-workflow-runs", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
 
@@ -1586,16 +1445,9 @@ describePostgres("PostgresBackend normalized history", () => {
       }
     ]);
 
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.normalized-workflow-runs", 1)],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("postgres.normalized-workflow-runs", 1)]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
 
     const claimedRows = await readNormalizedWorkflowRunRows(tableName);
     expect(claimedRows).toHaveLength(1);
@@ -1638,23 +1490,14 @@ describePostgres("PostgresBackend normalized history", () => {
   it("stores continued-as-new runs without requiring workflow-id uniqueness", async () => {
     const tableName = nextTableName("normalized_workflow_continue");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-workflow-continue"),
       workflowType: workflowType("postgres.normalized-workflow-continue", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "first" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [workflowType("postgres.normalized-workflow-continue", 1)],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(backend, "worker-a", {
+      workflowTypes: [workflowType("postgres.normalized-workflow-continue", 1)]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
 
     await expect(
       backend.commitWorkflowTask(claimed.claim, {
@@ -1684,11 +1527,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("uses the normalized workflow-run projection for claim selection", async () => {
     const tableName = nextTableName("normalized_workflow_claim_selection");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-workflow-claim-selection"),
       workflowType: workflowType("postgres.normalized-workflow-claim-selection", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
     await expect(
@@ -1708,18 +1549,14 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_workflow_claim_targeted_update");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-workflow-claim-targeted-update", 1);
-    const first = await backend.startWorkflow({
-      namespace: namespace(),
+    const first = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-targeted-claim-a"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "a" }, { codec: "Json" })
     });
-    const second = await backend.startWorkflow({
-      namespace: namespace(),
+    const second = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-targeted-claim-b"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "b" }, { codec: "Json" })
     });
     await rewriteNormalizedWorkflowRunTaskQueue(tableName, String(second.runId), "corrupted");
@@ -1750,23 +1587,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_waits_timer_selection");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-waits.timer-selection", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-waits-timer-selection"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     const timerCommand = commandId(claimed.runId, 1);
     const timerWaitId = waitId(`${claimed.runId}:timer:1`);
@@ -1939,22 +1765,14 @@ describePostgres("PostgresBackend normalized history", () => {
     // The loaded-state path. Scheduling a child-workflow map in the closing
     // commit takes `canUseSqlNativeWorkflowCommit` off the fast path.
     const childType = workflowType("postgres.terminal-cleanup.child", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-terminal-cleanup-fallback"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "fallback" }, { codec: "Json" })
     });
-    const fallbackFirstClaim = await backend.claimWorkflowTask("terminal-cleanup-fallback-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
+    const fallbackFirstClaim = await claimWorkflow(backend, "terminal-cleanup-fallback-worker", {
+      workflowTypes: [type]
     });
-    if (!fallbackFirstClaim) {
-      throw new Error("expected to claim the fallback-path run");
-    }
     const fallbackRunId = String(fallbackFirstClaim.runId);
     const fallbackTimerWait = waitId(`${fallbackRunId}:timer:3`);
     const fallbackSignalWait = waitId(`${fallbackRunId}:signal:8`);
@@ -2074,23 +1892,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_simple_commit_targeted_update");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-simple-commit-targeted-update", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-simple-commit-targeted"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "commit" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("simple-commit-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected simple commit workflow claim");
-    }
+    const claimed = await claimWorkflow(backend, "simple-commit-worker", { workflowTypes: [type] });
     const other = await startClaimAndScheduleTimer(
       backend,
       "wf/postgres-normalized-simple-commit-unrelated-wait",
@@ -2121,11 +1928,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("uses normalized signal projection for inbox reads", async () => {
     const tableName = nextTableName("normalized_signal_inbox");
     const backend = trackedPostgresBackendWithTable(tableName);
-    const started = await backend.startWorkflow({
-      namespace: namespace(),
+    const started = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-signal-inbox"),
       workflowType: workflowType("postgres.normalized-signal-inbox", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
     const payload = encodePayload({ approvalId: "a-1" }, { codec: "Json" });
@@ -2156,18 +1961,14 @@ describePostgres("PostgresBackend normalized history", () => {
   it("upserts only the delivered normalized signal row", async () => {
     const tableName = nextTableName("normalized_signal_targeted_update");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-signal-targeted-a"),
       workflowType: workflowType("postgres.normalized-signal-targeted", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "a" }, { codec: "Json" })
     });
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-signal-targeted-b"),
       workflowType: workflowType("postgres.normalized-signal-targeted", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "b" }, { codec: "Json" })
     });
     await backend.signalWorkflow({
@@ -2201,11 +2002,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("uses the normalized current-run projection for signal target selection", async () => {
     const tableName = nextTableName("normalized_signal_target_selection");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-signal-target"),
       workflowType: workflowType("postgres.normalized-signal-target", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
 
@@ -2234,23 +2033,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_activity_claim_selection");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-activity-claim-selection", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-activity-claim-selection"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected workflow claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     const activityInput = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {
@@ -2317,23 +2105,12 @@ describePostgres("PostgresBackend normalized history", () => {
     });
     managedBackends.push(backend);
     const type = workflowType("postgres.normalized-activity-timeout-selection", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-activity-timeout-selection"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected workflow claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     const activityInput = encodePayload({ value: 1 }, { codec: "Json" });
     const scheduled = {
@@ -2357,16 +2134,9 @@ describePostgres("PostgresBackend normalized history", () => {
       scheduleActivities: [task]
     });
 
-    const activityClaim = await backend.claimActivityTask("activity-worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["postgres.normalized-activity-timeout"],
-      leaseDurationMs: 30_000
+    await claimActivity(backend, "activity-worker-a", {
+      activityNames: ["postgres.normalized-activity-timeout"]
     });
-    expect(activityClaim).not.toBeNull();
-    if (!activityClaim) {
-      throw new Error("expected activity claim");
-    }
     const claimedProjection = (await readNormalizedActivityTaskRows(tableName))[0];
     expect(claimedProjection?.activity_id).toBe(task.activityId);
     expect(Number(claimedProjection?.timeout_deadline_at_ms)).toBe(1_010);
@@ -2383,13 +2153,7 @@ describePostgres("PostgresBackend normalized history", () => {
       leaseDurationMs: 30_000
     });
     expect(workflowWake?.reason).toBe("ActivityTimedOut");
-    const history = await backend.streamHistory({
-      runId: claimed.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toContain("ActivityTimedOut");
   });
 
@@ -2409,16 +2173,9 @@ describePostgres("PostgresBackend normalized history", () => {
       type,
       2
     );
-    const claimedActivity = await backend.claimActivityTask("activity-targeted-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["postgres.normalized-activity-completion-targeted"],
-      leaseDurationMs: 30_000
+    const claimedActivity = await claimActivity(backend, "activity-targeted-worker", {
+      activityNames: ["postgres.normalized-activity-completion-targeted"]
     });
-    expect(claimedActivity).not.toBeNull();
-    if (!claimedActivity) {
-      throw new Error("expected activity claim");
-    }
     const untouchedActivityId =
       claimedActivity.task.activityId === first.activityId ? second.activityId : first.activityId;
     await rewriteNormalizedActivityTaskQueue(
@@ -2457,23 +2214,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_activity_input_roots");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-activity-input-roots", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-activity-input-roots"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected workflow claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     const activityInput = encodePayload({ value: "activity-root" }, { codec: "Json" });
     const scheduled = {
@@ -2508,23 +2254,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const tableName = nextTableName("normalized_map_state_projection");
     const backend = trackedPostgresBackendWithTable(tableName);
     const type = workflowType("postgres.normalized-map-state", 1);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-map-state"),
       workflowType: type,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [type],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected workflow claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [type] });
 
     const activityMapInputs = activityMapManifest(
       [{ value: 1 }, { value: 2 }, { value: 3 }],
@@ -2751,16 +2486,9 @@ describePostgres("PostgresBackend normalized history", () => {
     }
 
     for (const result of [{ doubled: 2 }, { doubled: 4 }]) {
-      const activity = await backend.claimActivityTask("map-activity-worker", {
-        namespace: namespace(),
-        taskQueue: taskQueue("activities"),
-        registeredActivityNames: ["postgres.normalized-map-activity"],
-        leaseDurationMs: 30_000
+      const activity = await claimActivity(backend, "map-activity-worker", {
+        activityNames: ["postgres.normalized-map-activity"]
       });
-      expect(activity).not.toBeNull();
-      if (!activity) {
-        throw new Error("expected activity-map item claim");
-      }
       await backend.completeActivity({
         claim: activity.claim,
         result: encodePayload(result, { codec: "Json" })
@@ -2798,16 +2526,9 @@ describePostgres("PostgresBackend normalized history", () => {
       { item_ordinal: 2, result: null, in_flight: true, terminal: false }
     ]);
 
-    const finalActivity = await backend.claimActivityTask("map-activity-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("activities"),
-      registeredActivityNames: ["postgres.normalized-map-activity"],
-      leaseDurationMs: 30_000
+    const finalActivity = await claimActivity(backend, "map-activity-worker", {
+      activityNames: ["postgres.normalized-map-activity"]
     });
-    expect(finalActivity).not.toBeNull();
-    if (!finalActivity) {
-      throw new Error("expected final activity-map item claim");
-    }
     await backend.completeActivity({
       claim: finalActivity.claim,
       result: encodePayload({ doubled: 6 }, { codec: "Json" })
@@ -2825,16 +2546,10 @@ describePostgres("PostgresBackend normalized history", () => {
     ).toEqual([{ doubled: 2 }, { doubled: 4 }, { doubled: 6 }]);
 
     for (const result of [{ letter: "a" }, { letter: "b" }]) {
-      const child = await backend.claimWorkflowTask("child-map-worker", {
-        namespace: namespace(),
-        taskQueue: taskQueue("child-workflows"),
-        registeredWorkflowTypes: [childMapType],
-        leaseDurationMs: 30_000
+      const child = await claimWorkflow(backend, "child-map-worker", {
+        workflowTypes: [childMapType],
+        taskQueue: taskQueue("child-workflows")
       });
-      expect(child).not.toBeNull();
-      if (!child) {
-        throw new Error("expected child-map workflow claim");
-      }
       await backend.commitWorkflowTask(child.claim, {
         expectedTailEventId: eventId(1),
         appendEvents: [
@@ -2873,16 +2588,10 @@ describePostgres("PostgresBackend normalized history", () => {
       { item_ordinal: 2, outcome: null, in_flight: true, terminal: false }
     ]);
 
-    const finalChild = await backend.claimWorkflowTask("child-map-worker", {
-      namespace: namespace(),
-      taskQueue: taskQueue("child-workflows"),
-      registeredWorkflowTypes: [childMapType],
-      leaseDurationMs: 30_000
+    const finalChild = await claimWorkflow(backend, "child-map-worker", {
+      workflowTypes: [childMapType],
+      taskQueue: taskQueue("child-workflows")
     });
-    expect(finalChild).not.toBeNull();
-    if (!finalChild) {
-      throw new Error("expected final child-map workflow claim");
-    }
     await backend.commitWorkflowTask(finalChild.claim, {
       expectedTailEventId: eventId(1),
       appendEvents: [
@@ -2917,11 +2626,9 @@ describePostgres("PostgresBackend normalized history", () => {
   it("uses normalized history for workflow claim prefetch", async () => {
     const tableName = nextTableName("normalized_claim_prefetch");
     const backend = trackedPostgresBackendWithTable(tableName);
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-claim-prefetch"),
       workflowType: workflowType("postgres.normalized-claim-prefetch", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
 
@@ -2944,21 +2651,13 @@ describePostgres("PostgresBackend normalized history", () => {
   it("streams initialized normalized history", async () => {
     const tableName = nextTableName("normalized_stream_no_state");
     const backend = trackedPostgresBackendWithTable(tableName);
-    const started = await backend.startWorkflow({
-      namespace: namespace(),
+    const started = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-stream-no-state"),
       workflowType: workflowType("postgres.normalized-stream-no-state", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
 
-    const history = await backend.streamHistory({
-      runId: started.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(10),
-      maxEvents: 10,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
+    const history = await readHistory(backend, started.runId, 10);
 
     expect(history.events.map((event) => event.eventType)).toEqual(["WorkflowStarted"]);
   });
@@ -2977,26 +2676,17 @@ describePostgres("PostgresBackend normalized history", () => {
       tableName,
       poolSize: 1
     });
-    const started = await first.startWorkflow({
-      namespace: namespace(),
+    const started = await startTestWorkflow(first, {
       workflowId: workflowId("wf/postgres-normalized-history-reopen"),
       workflowType: echo.workflowType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "ok" }, { codec: "Json" })
     });
     await first.close();
 
     const reopened = trackedPostgresBackendWithTable(tableName);
-    const claimed = await reopened.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [echo.workflowType],
-      leaseDurationMs: 30_000
+    const claimed = await claimWorkflow(reopened, "worker-a", {
+      workflowTypes: [echo.workflowType]
     });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected reopened claim");
-    }
 
     const commit = await prepareWorkflowTaskCommit(
       echo,
@@ -3024,23 +2714,12 @@ describePostgres("PostgresBackend normalized history", () => {
     const childInput = encodePayload({ value: "child" }, { codec: "Json" });
     const childQueue = taskQueue("child-workflows");
     const childId = workflowId("wf/postgres-normalized-history-child");
-    const started = await backend.startWorkflow({
-      namespace: namespace(),
+    const started = await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-normalized-history-parent"),
       workflowType: parentType,
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: "parent" }, { codec: "Json" })
     });
-    const claimed = await backend.claimWorkflowTask("worker-a", {
-      namespace: namespace(),
-      taskQueue: taskQueue("workflows"),
-      registeredWorkflowTypes: [parentType],
-      leaseDurationMs: 30_000
-    });
-    expect(claimed).not.toBeNull();
-    if (!claimed) {
-      throw new Error("expected parent claim");
-    }
+    const claimed = await claimWorkflow(backend, "worker-a", { workflowTypes: [parentType] });
 
     await expect(
       backend.commitWorkflowTask(claimed.claim, {
@@ -3077,11 +2756,9 @@ describePostgres("PostgresBackend normalized history", () => {
 describePostgres("PostgresBackend stats", () => {
   it("captures statement stats when pg_stat_statements is available", async () => {
     const backend = trackedPostgresBackend("stats_snapshot");
-    await backend.startWorkflow({
-      namespace: namespace(),
+    await startTestWorkflow(backend, {
       workflowId: workflowId("wf/postgres-stats"),
       workflowType: workflowType("postgres.stats", 1),
-      taskQueue: taskQueue("workflows"),
       input: encodePayload({ value: 1 }, { codec: "Json" })
     });
 
@@ -3166,23 +2843,14 @@ async function forgedTerminalPostgresClaim(
 ): Promise<{ readonly backend: PostgresBackend; readonly claim: WorkflowTaskClaim }> {
   const tableName = nextTableName(label);
   const backend = trackedPostgresBackendWithTable(tableName);
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(`wf/postgres-${label}`),
     workflowType: workflowType("postgres.terminal-guard", 1),
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: label }, { codec: "Json" })
   });
-  const claimed = await backend.claimWorkflowTask("terminal-forger", {
-    namespace: namespace(),
-    taskQueue: taskQueue("workflows"),
-    registeredWorkflowTypes: [workflowType("postgres.terminal-guard", 1)],
-    leaseDurationMs: 30_000
+  const claimed = await claimWorkflow(backend, "terminal-forger", {
+    workflowTypes: [workflowType("postgres.terminal-guard", 1)]
   });
-  expect(claimed).not.toBeNull();
-  if (claimed === null) {
-    throw new Error("expected forged terminal claim");
-  }
 
   await withPostgresPool(async (pool) => {
     await pool.query(
@@ -3241,23 +2909,12 @@ async function startClaimAndScheduleTimer(
   fireAt: ReturnType<typeof timestampMs>,
   sequence: number
 ): Promise<{ readonly runId: string; readonly waitId: string }> {
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(workflowIdValue),
     workflowType: type,
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: workflowIdValue }, { codec: "Json" })
   });
-  const claimed = await backend.claimWorkflowTask(`worker-${sequence}`, {
-    namespace: namespace(),
-    taskQueue: taskQueue("workflows"),
-    registeredWorkflowTypes: [type],
-    leaseDurationMs: 30_000
-  });
-  expect(claimed).not.toBeNull();
-  if (!claimed) {
-    throw new Error("expected timer workflow claim");
-  }
+  const claimed = await claimWorkflow(backend, `worker-${sequence}`, { workflowTypes: [type] });
   const timerCommand = commandId(claimed.runId, sequence);
   const timerWaitId = waitId(`${claimed.runId}:timer:${sequence}`);
   await backend.commitWorkflowTask(claimed.claim, {
@@ -3294,23 +2951,14 @@ async function startClaimAndScheduleActivity(
   type: ReturnType<typeof workflowType>,
   sequence: number
 ): Promise<{ readonly runId: string; readonly activityId: string }> {
-  await backend.startWorkflow({
-    namespace: namespace(),
+  await startTestWorkflow(backend, {
     workflowId: workflowId(workflowIdValue),
     workflowType: type,
-    taskQueue: taskQueue("workflows"),
     input: encodePayload({ value: workflowIdValue }, { codec: "Json" })
   });
-  const claimed = await backend.claimWorkflowTask(`activity-scheduler-${sequence}`, {
-    namespace: namespace(),
-    taskQueue: taskQueue("workflows"),
-    registeredWorkflowTypes: [type],
-    leaseDurationMs: 30_000
+  const claimed = await claimWorkflow(backend, `activity-scheduler-${sequence}`, {
+    workflowTypes: [type]
   });
-  expect(claimed).not.toBeNull();
-  if (!claimed) {
-    throw new Error("expected activity workflow claim");
-  }
   const activityInput = encodePayload({ value: sequence }, { codec: "Json" });
   const scheduled = {
     commandId: commandId(claimed.runId, 1),
