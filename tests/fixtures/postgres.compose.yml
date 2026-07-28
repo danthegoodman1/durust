@@ -5,14 +5,25 @@
 # container cannot provide. Usage is documented in `.github/workflows/ci.yml`,
 # above the step that explains why benchmark thresholds do not run in CI.
 #
-# The image is pinned to 17-alpine to match both CI and the local development
-# container. It was 16-alpine, which made CI's claim that its image "tracks the
-# local development container" false for the one database used to record
-# performance baselines — the configuration where a server version difference is
-# most likely to be mistaken for a regression.
+# The image stays on 16-alpine, deliberately, and **must not** be bumped to match
+# CI or the everyday local container without re-recording the baselines first.
+#
+# `packages/benchmark/baselines/postgres-mixed-accepted.json` records
+# `metadata.postgres = "PostgreSQL 16.11 …"` and `metadata.notes` naming this
+# file. Those baselines are what `npm run test:benchmark-thresholds` compares
+# measured throughput, latency and transaction ratios against. Moving the server
+# to a different major version without re-recording does not remove a
+# version-difference-mistaken-for-a-regression — it manufactures one, in the one
+# configuration whose entire job is to make performance comparable run to run.
+#
+# This was bumped to 17-alpine earlier in this pass on the reasoning that CI
+# claims its image "tracks the local development container". That claim is about
+# CI's own service container; this file is a third database with a different port,
+# different credentials and a `pg_stat_statements` preload none of the others
+# have, and its version is pinned by the recorded baseline rather than by CI.
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:16-alpine
     command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: durable

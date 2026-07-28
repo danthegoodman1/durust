@@ -196,14 +196,36 @@ fn quote_postgres_identifier(identifier: &str) -> String {
 /// path either. Catching the unwind to drop it would change which server-side
 /// state a failing run leaves for inspection, which is a behaviour change and
 /// not this refactor's business.
+///
+/// `Fut::Output` is pinned to `()` on purpose, and the reason is a detector that
+/// was briefly lost here. Folding 22 tests behind one helper does concentrate
+/// their failure mode — delete the `body(..)` call below and all 22 report `ok`
+/// having connected to nothing, with rustc offering only an unused-parameter
+/// warning. An earlier version closed that by making the helper generic over the
+/// body's output and returning a `PostgresRun<R>`, so `Ran(R)` could only be
+/// produced by calling `body`.
+///
+/// That was a bad trade, measured. With a generic `R`, a test body whose tail is
+/// a forgotten `.await` type-checks: the statement becomes
+/// `PostgresRun<impl Future>`, and `unused_must_use` does not look inside a
+/// generic ADT's type parameter. Such a test connects, creates a schema, runs
+/// nothing, drops the schema and passes. Before that change the same mistake got
+/// `warning: unused implementer of Future that must be used`.
+///
+/// Pinning the output to `()` is strictly stronger than the warning it restores:
+/// a body ending in an unawaited future is now `E0271: expected (), found
+/// future` — an error, not a warning. It costs the guard against deleting the
+/// `body(..)` call, which is the right way round: forgetting an `.await` is a
+/// mistake anyone makes at 22 call sites, while deleting a helper's only
+/// meaningful line is not a mistake anyone makes at all.
 #[cfg(feature = "postgres")]
-async fn with_postgres_schema<F, Fut, R>(what: &str, prefix: &str, body: F) -> PostgresRun<R>
+async fn with_postgres_schema<F, Fut>(what: &str, prefix: &str, body: F)
 where
     F: FnOnce(PostgresBackend, String, String) -> Fut,
-    Fut: Future<Output = R>,
+    Fut: Future<Output = ()>,
 {
     let Some(url) = postgres_url_or_skip(what) else {
-        return PostgresRun::SkippedNoPostgres;
+        return;
     };
     let schema = postgres_test_schema(prefix);
     let backend = PostgresBackend::connect_with_config(
@@ -211,9 +233,8 @@ where
     )
     .await
     .unwrap();
-    let ran = body(backend, url.clone(), schema.clone()).await;
+    body(backend, url.clone(), schema.clone()).await;
     drop_postgres_schema(&url, &schema).await;
-    PostgresRun::Ran(ran)
 }
 
 /// `with_postgres` for tests that need a non-default payload storage config —
@@ -223,18 +244,17 @@ where
 /// of the 23 Postgres tests here want the default and would gain an argument
 /// that is the same at every call site.
 #[cfg(feature = "postgres")]
-async fn with_postgres_payload_storage<F, Fut, R>(
+async fn with_postgres_payload_storage<F, Fut>(
     what: &str,
     prefix: &str,
     payload_config: durust::PayloadStorageConfig,
     body: F,
-) -> PostgresRun<R>
-where
+) where
     F: FnOnce(PostgresBackend) -> Fut,
-    Fut: Future<Output = R>,
+    Fut: Future<Output = ()>,
 {
     let Some(url) = postgres_url_or_skip(what) else {
-        return PostgresRun::SkippedNoPostgres;
+        return;
     };
     let schema = postgres_test_schema(prefix);
     let backend = PostgresBackend::connect_with_config(
@@ -244,46 +264,19 @@ where
     )
     .await
     .unwrap();
-    let ran = body(backend).await;
+    body(backend).await;
     drop_postgres_schema(&url, &schema).await;
-    PostgresRun::Ran(ran)
-}
-
-/// What `with_postgres_schema` did — as a value the compiler will not let that
-/// function fabricate.
-///
-/// Folding 22 tests behind one helper concentrates their failure mode as well as
-/// their boilerplate. Were the `body(..)` call simply deleted from
-/// `with_postgres_schema`, all 22 would report `ok` having exercised nothing, and
-/// rustc would say only that a parameter went unused — a warning, in a suite that
-/// already has some. That is this repository's own recurring defect, moved up one
-/// level, and it did not exist while each test carried its own inline body.
-///
-/// `R` closes it. A type parameter cannot be conjured, so the single way to
-/// produce `Ran(R)` is to call `body`. Deleting the call stops compiling; keeping
-/// the shortcut means writing `SkippedNoPostgres` unconditionally, which is a
-/// deliberate line that says what it does rather than an absence nobody reviews.
-///
-/// Not `#[must_use]`, deliberately: the tests are right to ignore this, and 22
-/// `let _ =` bindings would only train people to ignore it. `dead_code` is
-/// allowed for the same reason — the payload exists to constrain this file's
-/// helper, not to be read back.
-#[cfg(feature = "postgres")]
-#[allow(dead_code)]
-enum PostgresRun<R> {
-    Ran(R),
-    SkippedNoPostgres,
 }
 
 /// `with_postgres_schema` for the majority of tests that never name the URL or
 /// the schema after connecting.
 #[cfg(feature = "postgres")]
-async fn with_postgres<F, Fut, R>(what: &str, prefix: &str, body: F) -> PostgresRun<R>
+async fn with_postgres<F, Fut>(what: &str, prefix: &str, body: F)
 where
     F: FnOnce(PostgresBackend) -> Fut,
-    Fut: Future<Output = R>,
+    Fut: Future<Output = ()>,
 {
-    with_postgres_schema(what, prefix, |backend, _url, _schema| body(backend)).await
+    with_postgres_schema(what, prefix, |backend, _url, _schema| body(backend)).await;
 }
 
 #[durust::activity(name = "conformance.echo")]

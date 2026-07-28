@@ -16,11 +16,21 @@ on:
     branches:
       - main
 
-# Cancellation is scoped to pull requests for that same reason. On `main` a
-# cancelled run is a *skipped release*, because `release.yml` keys off this
-# workflow's conclusion — so a superseded `main` run must be left to finish.
+# Cancellation is scoped to pull requests, because on `main` a cancelled run is a
+# *skipped release*: `release.yml` keys off this workflow's conclusion, and a
+# release's version bump is derived from that one commit, so losing the run loses
+# the bump rather than deferring it.
+#
+# `cancel-in-progress: false` is **not** sufficient on its own, which is why the
+# group key differs by event. That setting governs only runs already executing; a
+# run queued into an occupied group becomes *pending*, and GitHub cancels a
+# previously pending run in the group regardless. With a single `ci-refs/heads/main`
+# group, three pushes to `main` inside one CI duration would cancel the middle
+# one and silently skip its release. Keying pushes by commit sha gives each its
+# own group, so they queue independently; pull requests keep a per-ref group so
+# that superseding a PR push still cancels the run it replaces.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('ci-push-{0}', github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
