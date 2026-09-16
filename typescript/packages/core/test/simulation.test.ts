@@ -204,14 +204,10 @@ describe("seeded worker/provider simulations", () => {
     now = 1_011;
     await expect(
       workerFor(backend, registry, "replacement-workflow-worker").runWorkflowTaskOnce()
-    ).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    ).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: 7 });
     await expect(
       backend.commitWorkflowTask(crashedClaim!.claim, {
-        expectedTailEventId: eventId(1),
         appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
       })
     ).rejects.toThrow("stale workflow task lease");
@@ -246,7 +242,6 @@ describe("seeded worker/provider simulations", () => {
     // A's late commit arrives while B holds the claim; only the token refuses it.
     await expect(
       backend.commitWorkflowTask(claimA!.claim, {
-        expectedTailEventId: eventId(1),
         appendEvents: [
           {
             data: {
@@ -257,9 +252,7 @@ describe("seeded worker/provider simulations", () => {
         ]
       })
     ).rejects.toThrow("stale workflow task lease");
-    await expect(
-      backend.commitWorkflowTask(claimB!.claim, { expectedTailEventId: eventId(1) })
-    ).resolves.toMatchObject({ kind: "Committed" });
+    await expect(backend.commitWorkflowTask(claimB!.claim, {})).resolves.toBe(eventId(1));
     expect(await historyEventTypes(backend, String(handle.runId))).toEqual(["WorkflowStarted"]);
   });
 
@@ -275,10 +268,7 @@ describe("seeded worker/provider simulations", () => {
       { value: 9 }
     );
 
-    await expect(workerFor(backend, registry, "workflow-worker-a").runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workerFor(backend, registry, "workflow-worker-a").runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     const crashedClaim = await claimActivity(backend, "crashed-activity-worker", {
       activityNames: [simActivity.name],
       namespace: "default",
@@ -303,10 +293,7 @@ describe("seeded worker/provider simulations", () => {
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(workerFor(backend, registry, "workflow-worker-b").runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workerFor(backend, registry, "workflow-worker-b").runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: 10 });
   });
 
@@ -338,13 +325,9 @@ describe("seeded worker/provider simulations", () => {
     await expect(
       workerFor(backend, registry, "workflow-worker-after-expiry", 5)
         .runWorkflowTaskOnce()
-    ).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    ).resolves.toMatchObject({ kind: "Committed" });
     await expect(
       backend.commitWorkflowTask(crashedWorkflowClaim!.claim, {
-        expectedTailEventId: eventId(1),
         appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
       })
     ).rejects.toThrow("stale workflow task lease");
@@ -626,7 +609,7 @@ describe("seeded worker/provider simulations", () => {
     expect(metrics.workflowExecutionCacheHits).toBeGreaterThan(0);
     expect(metrics.workflowExecutionCacheMisses).toBeGreaterThan(0);
     expect(metrics.workflowExecutionCacheEvictions).toBeGreaterThan(0);
-    expect(metrics.workflowTaskConflicts).toBeGreaterThan(0);
+    expect(metrics.workflowTaskCommits).toBeGreaterThan(0);
     expect(metrics.workflowHistoryCacheMisses).toBeGreaterThan(0);
     expect(metrics.historyStreamChunks).toBeGreaterThan(0);
     expect(metrics.historyStreamEvents).toBeGreaterThan(0);
@@ -655,7 +638,7 @@ describeLongSoak("long-running hot execution cache soak", () => {
     expect(metrics.workflowExecutionCacheHits).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
     expect(metrics.workflowExecutionCacheMisses).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
     expect(metrics.workflowExecutionCacheEvictions).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
-    expect(metrics.workflowTaskConflicts).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
+    expect(metrics.workflowTaskCommits).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
     expect(metrics.workflowHistoryCacheMisses).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
     expect(metrics.historyStreamChunks).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
     expect(metrics.historyStreamEvents).toBeGreaterThanOrEqual(LONG_SOAK_SEEDS);
@@ -995,7 +978,7 @@ const WORKER_METRIC_KEYS = [
   "workflowTaskClaims",
   "workflowTaskNoTasks",
   "workflowTaskCommits",
-  "workflowTaskConflicts",
+  "workflowTaskCommits",
   "activityTaskClaims",
   "activityTaskNoTasks",
   "activityTaskCompletions",
@@ -1053,7 +1036,6 @@ function emptyWorkerMetricsSnapshot(): MutableWorkerMetricsSnapshot {
     workflowTaskClaims: 0,
     workflowTaskNoTasks: 0,
     workflowTaskCommits: 0,
-    workflowTaskConflicts: 0,
     activityTaskClaims: 0,
     activityTaskNoTasks: 0,
     activityTaskCompletions: 0,

@@ -521,7 +521,6 @@ fn event_json(data: &durust::HistoryEventData) -> Value {
             "type": "SelectWinner",
             "selectCommandId": command_id_json(&winner.select_command_id),
             "branchOrdinal": winner.branch_ordinal,
-            "winningEventId": winner.winning_event_id.0,
             "branchesDigest": SELECT_BRANCHES_PLACEHOLDER,
         }),
         E::VersionMarker(marker) => json!({
@@ -653,7 +652,6 @@ fn commit_json(commit: &WorkflowTaskCommit) -> Value {
         "no corpus case schedules a child workflow map yet; add a neutral encoding first"
     );
     json!({
-        "expectedTailEventId": commit.expected_tail_event_id.0,
         "appendEvents": commit
             .append_events
             .iter()
@@ -738,7 +736,7 @@ impl DurableBackend for RecordingBackend {
         &self,
         claim: durust::WorkflowTaskClaim,
         commit: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         self.record(&commit);
         self.inner.commit_workflow_task(claim, commit)
     }

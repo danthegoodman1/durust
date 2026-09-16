@@ -234,11 +234,13 @@ pub enum ChildWorkflowMapItemOutcome {
     Cancelled { reason: String },
 }
 
+/// The branch a `select!` or `select_all` chose, recorded so replay follows
+/// the decision instead of recomputing it. `branches_digest` pins the branch
+/// set the decision was made over.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectWinner {
     pub select_command_id: CommandId,
     pub branch_ordinal: u32,
-    pub winning_event_id: EventId,
     pub branches_digest: String,
 }
 

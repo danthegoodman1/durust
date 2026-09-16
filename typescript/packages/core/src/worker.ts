@@ -1,7 +1,6 @@
 import type {
   ClaimedActivityTask,
   ClaimedWorkflowTask,
-  CommitOutcome,
   CompleteActivityItemOutcome,
   CompleteActivityOutcome,
   FailActivityOutcome,
@@ -92,7 +91,7 @@ export type RunWorkflowTaskOnceOutcome =
   | {
       readonly kind: "Committed";
       readonly runId: RunId;
-      readonly outcome: CommitOutcome;
+      readonly newTailEventId: EventId;
       readonly localActivityTasks: number;
     };
 
@@ -175,7 +174,7 @@ export type WorkerEvent =
   | {
       readonly kind: "WorkflowTaskCommitted";
       readonly runId: RunId;
-      readonly outcome: CommitOutcome;
+      readonly newTailEventId: EventId;
       readonly localActivityTasks: number;
     }
   | {
@@ -212,7 +211,6 @@ export interface WorkerMetricsSnapshot {
   readonly workflowTaskClaims: number;
   readonly workflowTaskNoTasks: number;
   readonly workflowTaskCommits: number;
-  readonly workflowTaskConflicts: number;
   readonly activityTaskClaims: number;
   readonly activityTaskNoTasks: number;
   readonly activityTaskCompletions: number;
@@ -237,7 +235,6 @@ interface MutableWorkerMetrics {
   workflowTaskClaims: number;
   workflowTaskNoTasks: number;
   workflowTaskCommits: number;
-  workflowTaskConflicts: number;
   activityTaskClaims: number;
   activityTaskNoTasks: number;
   activityTaskCompletions: number;
@@ -726,7 +723,7 @@ export class Worker {
     signal?: AbortSignal
   ): Promise<RunWorkflowTaskOnceOutcome> {
     let prepared: PreparedWorkflowExecution | null = null;
-    let outcome: CommitOutcome | null = null;
+    let newTailEventId: EventId | null = null;
     try {
       await this.#emit({
         kind: "WorkflowTaskClaimed",
@@ -751,7 +748,7 @@ export class Worker {
         claimed,
         liveSignals
       );
-      outcome = await this.#backend.commitWorkflowTask(claimed.claim, prepared.commit);
+      newTailEventId = await this.#backend.commitWorkflowTask(claimed.claim, prepared.commit);
     } catch (error) {
       if (prepared !== null) {
         if (prepared.cacheKey !== null) {
@@ -766,43 +763,35 @@ export class Worker {
       await this.#releaseFailedWorkflowTask(claimed.claim, error);
       throw error;
     }
-    if (prepared === null || outcome === null) {
+    if (prepared === null || newTailEventId === null) {
       throw new Error("workflow task finished without a prepared commit");
     }
-    if (outcome.kind === "Committed") {
-      prepared.execution.markCommitted(outcome.newTailEventId);
-      this.#updateWorkflowExecutionCacheAfterCommit(prepared, outcome.newTailEventId);
+    {
+      prepared.execution.markCommitted(newTailEventId);
+      this.#updateWorkflowExecutionCacheAfterCommit(
+        prepared,
+        newTailEventId,
+        claimed.replayTargetEventId
+      );
       // One path for both cold and hot commits: the cached prefix is extended
       // by the events this task appended, or dropped if it no longer lines up.
       this.#appendCommittedEventsToHistoryCache(
         prepared.claim.runId,
         prepared.commit,
-        outcome.newTailEventId
+        newTailEventId
       );
-    } else {
-      if (prepared.cacheKey !== null) {
-        this.#workflowExecutionCache.delete(prepared.cacheKey);
-      }
-      // The provider rejected the commit, so this execution's in-memory state
-      // has diverged from durable history and can never be used again.
-      prepared.execution.dispose("workflow task commit conflicted");
     }
-    const localActivityTasks =
-      outcome.kind === "Committed" && !signal?.aborted
-        ? await this.#runLocalActivitiesAfterWorkflowTask(signal)
-        : 0;
-    if (outcome.kind === "Committed") {
-      this.#metrics.workflowTaskCommits += 1;
-    } else {
-      this.#metrics.workflowTaskConflicts += 1;
-    }
+    const localActivityTasks = signal?.aborted
+      ? 0
+      : await this.#runLocalActivitiesAfterWorkflowTask(signal);
+    this.#metrics.workflowTaskCommits += 1;
     await this.#emit({
       kind: "WorkflowTaskCommitted",
       runId: claimed.runId,
-      outcome,
+      newTailEventId,
       localActivityTasks
     });
-    return { kind: "Committed", runId: claimed.runId, outcome, localActivityTasks };
+    return { kind: "Committed", runId: claimed.runId, newTailEventId, localActivityTasks };
   }
 
   async #releaseFailedWorkflowTask(
@@ -1330,20 +1319,23 @@ export class Worker {
     if (entry === undefined) {
       return;
     }
-    if (Number(entry.events.at(-1)?.eventId ?? 0) !== Number(commit.expectedTailEventId)) {
-      // The cached prefix does not end where this commit began, so appending
-      // would fabricate a history that never existed. Drop the entry instead;
-      // the next cold replay rebuilds it from the provider.
+    // A commit's appends are contiguous and land at the end of history, so the
+    // block starts here. Derived from the real tail rather than from what the
+    // task expected: facts appended by activity workers, timer sweeps, and
+    // child dispatch no longer void a commit, so they can sit between what this
+    // task replayed and what it appended.
+    const firstAppendedEventId = Number(newTailEventId) - appended.length;
+    if (Number(entry.events.at(-1)?.eventId ?? 0) !== firstAppendedEventId) {
+      // The cached prefix does not end where this commit's appends begin, so
+      // appending would fabricate a history that never existed. Drop the entry
+      // instead; the next cold replay rebuilds it from the provider.
       this.#deleteWorkflowHistoryCacheEntry(key);
-      return;
-    }
-    if (Number(commit.expectedTailEventId) + appended.length > Number(newTailEventId)) {
       return;
     }
     const events: HistoryEvent[] = [];
     for (const [index, event] of appended.entries()) {
       events.push({
-        eventId: eventId(Number(commit.expectedTailEventId) + index + 1),
+        eventId: eventId(firstAppendedEventId + index + 1),
         eventType: historyEventType(event.data),
         data: event.data
       });
@@ -1353,9 +1345,20 @@ export class Worker {
 
   #updateWorkflowExecutionCacheAfterCommit(
     prepared: PreparedWorkflowExecution,
-    newTailEventId: EventId
+    newTailEventId: EventId,
+    observedTailEventId: EventId
   ): void {
     if (prepared.cacheKey === null) {
+      return;
+    }
+    // Facts can land under a claim now that the claim token is the whole
+    // commit fence. When they do, this execution's state is behind the run's
+    // history, so the entry is dropped and the next task cold-replays.
+    const runtimeAppendedTail =
+      Number(observedTailEventId) + (prepared.commit.appendEvents?.length ?? 0);
+    if (Number(newTailEventId) > runtimeAppendedTail) {
+      this.#workflowExecutionCache.delete(prepared.cacheKey);
+      prepared.execution.dispose("facts were appended while the workflow task was claimed");
       return;
     }
     // Split from the cache-disabled arm below on measured cost, not style. A
@@ -1379,9 +1382,7 @@ export class Worker {
     this.#storeWorkflowExecution(prepared.cacheKey, {
       execution: prepared.execution,
       tailEventId: newTailEventId,
-      ingestedEventId: eventId(
-        Number(prepared.commit.expectedTailEventId) + (prepared.commit.appendEvents?.length ?? 0)
-      ),
+      ingestedEventId: eventId(runtimeAppendedTail),
       workflowType: prepared.claim.workflowType
     });
   }
@@ -1714,7 +1715,6 @@ function emptyWorkerMetrics(): MutableWorkerMetrics {
     workflowTaskClaims: 0,
     workflowTaskNoTasks: 0,
     workflowTaskCommits: 0,
-    workflowTaskConflicts: 0,
     activityTaskClaims: 0,
     activityTaskNoTasks: 0,
     activityTaskCompletions: 0,

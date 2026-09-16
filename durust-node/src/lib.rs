@@ -43,7 +43,7 @@ trait Provider: Send + Sync {
         &self,
         claim: durust::WorkflowTaskClaim,
         commit: durust::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>>;
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>>;
     fn release_workflow_task(
         &self,
         claim: durust::WorkflowTaskClaim,
@@ -260,7 +260,7 @@ where
         &self,
         claim: durust::WorkflowTaskClaim,
         commit: durust::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         DurableBackend::commit_workflow_task(self, claim, commit)
     }
 
@@ -757,11 +757,11 @@ impl NativeBackend {
             ));
         }
         let backend = self.provider()?;
-        let outcome = backend
+        let new_tail_event_id = backend
             .commit_workflow_task(claim.into(), commit.into())
             .await
             .map_err(|err| provider_error(err, false))?;
-        encode(&wire::CommitOutcome::from(outcome))
+        encode(&new_tail_event_id.0)
     }
 
     #[napi]

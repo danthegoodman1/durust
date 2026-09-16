@@ -4,19 +4,18 @@ use crate::{
     ActivityMapResultPage, ActivityTask, CancelWorkflowOutcome, CancelWorkflowRequest,
     ChildStartOutboxMessage, ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest,
     ChildWorkflowMapResultPage, ChildWorkflowMapTask, ClaimActivityOptions,
-    ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommitOutcome,
-    CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
-    CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
-    DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, FailActivityOutcome,
-    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
-    HistoryEventData, PayloadBlob, PayloadGarbageCollectionOutcome,
-    PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
-    PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
-    ReadSignalInboxesRequest, Result, SignalInboxRecord, SignalWorkflowOutcome,
-    SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest, TimeoutDueActivitiesOutcome,
-    TimeoutDueActivitiesRequest, TimestampMs, WorkerId, WorkflowChangeVersionsOutcome,
-    WorkflowChangeVersionsRequest, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskRelease,
-    digest_bytes,
+    ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CompleteActivityOutcome,
+    CompleteActivityRequest, CompleteActivityTaskBatchResult, CompleteActivityTasksRequest,
+    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend,
+    DurableFailure, Error, EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome,
+    FireDueTimersRequest, HistoryChunk, HistoryEvent, HistoryEventData, PayloadBlob,
+    PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef,
+    PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest,
+    ReadSignalInboxRequest, ReadSignalInboxesRequest, Result, SignalInboxRecord,
+    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
+    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WorkerId,
+    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowTaskClaim,
+    WorkflowTaskCommit, WorkflowTaskRelease, digest_bytes,
     provider_util::{payload_gc_cutoff_ms, unix_epoch_millis},
 };
 use futures::future::{BoxFuture, ready};
@@ -307,7 +306,7 @@ where
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>> {
+    ) -> BoxFuture<'static, Result<EventId>> {
         let inner = self.inner.clone();
         let blob_store = self.blob_store.clone();
         let config = self.payload_config.clone();

@@ -181,7 +181,6 @@ async fn start_inline_child_for_tests(
             .commit_workflow_task(
                 parent.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                     )],
@@ -193,9 +192,7 @@ async fn start_inline_child_for_tests(
             )
             .await
             .unwrap(),
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        }
+        EventId(3)
     );
     let history = backend
         .stream_history(crate::StreamHistoryRequest {
@@ -295,7 +292,7 @@ fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when
         .await;
         force_terminal_for_tests(&backend, &schema, &claimed.run_id).await;
         for (kind, commit) in
-            crate::provider_util::commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
+            crate::provider_util::commit_test_support::mutating_commits(&claimed.run_id)
         {
             let err = backend
                 .commit_workflow_task(claimed.claim.clone(), commit)
@@ -312,18 +309,12 @@ fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when
             .commit_workflow_task(
                 claimed.claim.clone(),
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     ..WorkflowTaskCommit::default()
                 },
             )
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(1)
-            }
-        );
+        assert_eq!(outcome, EventId(1));
 
         // Batch path: two simple-eligible mutating commits on two forged
         // terminal runs route through the set-based batch apply and must both
@@ -345,13 +336,11 @@ fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when
         let batch_commits = [&first, &second]
             .iter()
             .map(|claimed| {
-                let (kind, commit) = crate::provider_util::commit_test_support::mutating_commits(
-                    &claimed.run_id,
-                    EventId(1),
-                )
-                .into_iter()
-                .find(|(kind, _)| *kind == "upsert_waits")
-                .expect("upsert_waits catalog entry");
+                let (kind, commit) =
+                    crate::provider_util::commit_test_support::mutating_commits(&claimed.run_id)
+                        .into_iter()
+                        .find(|(kind, _)| *kind == "upsert_waits")
+                        .expect("upsert_waits catalog entry");
                 assert!(postgres_simple_batch_commit_eligible(&commit), "{kind}");
                 crate::WorkflowTaskCommitInput {
                     claim: claimed.claim.clone(),
@@ -861,7 +850,6 @@ fn postgres_stale_shard_owner_cannot_commit_when_configured() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::WorkflowCompleted {
                             result: crate::encode_payload(&"done").unwrap(),
@@ -926,7 +914,6 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::WorkflowCompleted {
                             result: crate::encode_payload(&"done").unwrap(),
@@ -937,12 +924,7 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
+        assert_eq!(outcome, EventId(2));
 
         let leases = shard_leases_for_tests(&backend, &schema, &[shard_id]).await;
         assert_eq!(leases.len(), 1);
@@ -1031,7 +1013,6 @@ fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
                     .map(|claimed| crate::WorkflowTaskCommitInput {
                         claim: claimed.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: claimed.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::WorkflowCompleted {
                                     result: crate::encode_payload(&"done").unwrap(),
@@ -1051,12 +1032,7 @@ fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
             .collect::<BTreeSet<_>>();
         assert_eq!(committed_run_ids, expected_run_ids);
         for result in results {
-            assert_eq!(
-                result.result.unwrap(),
-                CommitOutcome::Committed {
-                    new_tail_event_id: EventId(2)
-                }
-            );
+            assert_eq!(result.result.unwrap(), EventId(2));
         }
 
         // Committing through the acquired lease must not bump its epoch:
@@ -1321,7 +1297,6 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             .commit_workflow_task(
                 visible.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: visible.replay_target_event_id,
                     append_events: vec![
                         crate::NewHistoryEvent::new(HistoryEventData::VersionMarker(
                             crate::VersionMarker {
@@ -1369,12 +1344,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            commit,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
-        );
+        assert_eq!(commit, EventId(4));
 
         let projection = backend
             .query_projection(crate::QueryProjectionRequest {
@@ -1490,15 +1460,12 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
                 .commit_workflow_task(
                     activity_ready.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: activity_ready.replay_target_event_id,
                         ..WorkflowTaskCommit::default()
                     },
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(5)
-            }
+            EventId(5)
         );
 
         let signal_payload_value = "postgres-signal-payload".repeat(8);
@@ -1548,7 +1515,6 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             .commit_workflow_task(
                 signal_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: signal_claim.replay_target_event_id,
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::SignalConsumed(crate::SignalConsumed {
                             command_id: signal_command_id,
@@ -1568,12 +1534,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            signal_commit,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(6)
-            }
-        );
+        assert_eq!(signal_commit, EventId(6));
 
         let timer_outcome = backend
             .fire_due_timers(crate::FireDueTimersRequest {
@@ -1597,7 +1558,6 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             .commit_workflow_task(
                 timer_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: timer_claim.replay_target_event_id,
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::WorkflowCompleted {
                             result: crate::encode_payload(&output_value).unwrap(),
@@ -1608,12 +1568,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            commit,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(8)
-            }
-        );
+        assert_eq!(commit, EventId(8));
 
         let completed_history = backend
             .stream_history(crate::StreamHistoryRequest {
@@ -1739,7 +1694,6 @@ fn postgres_child_start_is_inline_when_configured() {
             .commit_workflow_task(
                 parent.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                     )],
@@ -1751,12 +1705,7 @@ fn postgres_child_start_is_inline_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            commit,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
-        );
+        assert_eq!(commit, EventId(3));
         assert_eq!(
             backend
                 .dispatch_child_workflow_starts(crate::DispatchChildWorkflowStartsRequest {
@@ -1923,7 +1872,6 @@ fn postgres_child_start_conflict_records_failure_when_configured() {
                 .commit_workflow_task(
                     parent.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                         )],
@@ -1935,9 +1883,7 @@ fn postgres_child_start_conflict_records_failure_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
+            EventId(3)
         );
 
         let parent_ready = backend
@@ -2006,7 +1952,6 @@ fn postgres_child_completion_routes_to_parent_when_configured() {
                 .commit_workflow_task(
                     child.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowCompleted {
                                 result: crate::encode_payload(&child_result).unwrap(),
@@ -2017,9 +1962,7 @@ fn postgres_child_completion_routes_to_parent_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
+            EventId(2)
         );
         let parent = backend
             .claim_workflow_task(
@@ -2091,7 +2034,6 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
                 .commit_workflow_task(
                     cancel_parent.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(3),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowCompleted {
                                 result: crate::encode_payload(&()).unwrap(),
@@ -2102,9 +2044,7 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
+            EventId(4)
         );
         let cancelled_child_claim = backend
             .claim_workflow_task(
@@ -2156,7 +2096,6 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
                 .commit_workflow_task(
                     abandon_parent.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(3),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowCompleted {
                                 result: crate::encode_payload(&()).unwrap(),
@@ -2167,9 +2106,7 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
+            EventId(4)
         );
         let abandoned_child = backend
             .claim_workflow_task(
@@ -2256,7 +2193,6 @@ fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             crate::NewHistoryEvent::new(HistoryEventData::TimerStarted(
                                 crate::TimerStarted {
@@ -2286,9 +2222,7 @@ fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
+            EventId(3)
         );
         let activity_opts = ClaimActivityOptions {
             namespace: crate::Namespace::default(),
@@ -2656,7 +2590,6 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             .commit_workflow_task(
                 first_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     upsert_waits: vec![signal_wait],
                     query_projection: Some(reused_payload.clone()),
                     ..WorkflowTaskCommit::default()
@@ -2689,7 +2622,6 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             .commit_workflow_task(
                 second_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     consume_signals: vec![first_signal],
                     query_projection: Some(reused_payload),
                     ..WorkflowTaskCommit::default()
@@ -2705,7 +2637,6 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             .commit_workflow_task(
                 third_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     consume_signals: vec![second_signal],
                     query_projection: Some(crate::encode_payload(&"replaced").unwrap()),
                     ..WorkflowTaskCommit::default()
@@ -2860,7 +2791,6 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
                 .commit_workflow_task(
                     first_claim.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                                 scheduled.clone(),
@@ -2887,9 +2817,7 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
+            EventId(3)
         );
         let activity_opts = ClaimActivityOptions {
             namespace: crate::Namespace::default(),
@@ -2936,16 +2864,13 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
                 .commit_workflow_task(
                     timer_claim.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(4),
                         cancel_commands: vec![activity_command_id],
                         ..WorkflowTaskCommit::default()
                     },
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
+            EventId(4)
         );
         assert!(
             backend
@@ -3017,7 +2942,6 @@ fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowContinuedAsNew {
                                 input: crate::encode_payload(&next_input_value).unwrap(),
@@ -3028,9 +2952,7 @@ fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
+            EventId(2)
         );
 
         let old_history = backend
@@ -3168,7 +3090,6 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::ActivityMapScheduled(scheduled),
                         )],
@@ -3178,9 +3099,7 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
+            EventId(2)
         );
 
         let activity_opts = ClaimActivityOptions {
@@ -3484,7 +3403,6 @@ fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured(
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             crate::NewHistoryEvent::new(HistoryEventData::TimerStarted(
                                 crate::TimerStarted {
@@ -3519,9 +3437,7 @@ fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured(
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
+            EventId(3)
         );
         drop(backend);
 
@@ -3689,7 +3605,6 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
             .commit_workflow_task(
                 stale_claim.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: stale_claim.replay_target_event_id,
                     ..WorkflowTaskCommit::default()
                 },
             )
@@ -3701,7 +3616,6 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
                 .commit_workflow_task(
                     replacement.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: replacement.replay_target_event_id,
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowCompleted {
                                 result: crate::encode_payload(&()).unwrap(),
@@ -3712,9 +3626,7 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
+            EventId(2)
         );
 
         backend.drop_schema().await.unwrap();
@@ -3789,7 +3701,6 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: schedules
                         .iter()
                         .cloned()
@@ -3808,12 +3719,7 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
-        );
+        assert_eq!(outcome, EventId(4));
 
         let activity_opts = ClaimActivityOptions {
             namespace: crate::Namespace::default(),
@@ -3987,7 +3893,6 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
                     crate::WorkflowTaskCommitInput {
                         claim: timer_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: timer_claim.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::TimerStarted(crate::TimerStarted {
                                     command_id: timer_command.clone(),
@@ -4018,7 +3923,6 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
                     crate::WorkflowTaskCommitInput {
                         claim: activity_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: activity_claim.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::ActivityScheduled(activity_scheduled.clone()),
                             )],
@@ -4034,18 +3938,8 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
             .unwrap();
 
         assert_eq!(results.len(), 2);
-        assert_eq!(
-            results[0].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
-        assert_eq!(
-            results[1].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
+        assert_eq!(results[0].result.as_ref().unwrap(), &EventId(2));
+        assert_eq!(results[1].result.as_ref().unwrap(), &EventId(2));
         let projection = backend
             .query_projection(crate::QueryProjectionRequest {
                 namespace: crate::Namespace::default(),
@@ -4155,7 +4049,6 @@ fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when
                     crate::WorkflowTaskCommitInput {
                         claim: child_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: child_claim.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::WorkflowCompleted {
                                     result: crate::encode_payload(&child_result).unwrap(),
@@ -4167,7 +4060,6 @@ fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when
                     crate::WorkflowTaskCommitInput {
                         claim: standalone_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: standalone_claim.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::WorkflowCompleted {
                                     result: crate::encode_payload(&standalone_result).unwrap(),
@@ -4181,18 +4073,8 @@ fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(
-            results[0].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
-        assert_eq!(
-            results[1].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
+        assert_eq!(results[0].result.as_ref().unwrap(), &EventId(2));
+        assert_eq!(results[1].result.as_ref().unwrap(), &EventId(2));
 
         let parent = backend
             .claim_workflow_task(
@@ -4326,7 +4208,6 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
                     crate::WorkflowTaskCommitInput {
                         claim: claim_a.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: claim_a.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::ChildWorkflowStartRequested(request_a.clone()),
                             )],
@@ -4339,7 +4220,6 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
                     crate::WorkflowTaskCommitInput {
                         claim: claim_b.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: claim_b.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::ChildWorkflowStartRequested(request_b.clone()),
                             )],
@@ -4354,18 +4234,8 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
             .await
             .unwrap();
         assert_eq!(results.len(), 2);
-        assert_eq!(
-            results[0].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
-        );
-        assert_eq!(
-            results[1].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
-        );
+        assert_eq!(results[0].result.as_ref().unwrap(), &EventId(3));
+        assert_eq!(results[1].result.as_ref().unwrap(), &EventId(3));
 
         let mut child_run_ids = BTreeSet::new();
         for run_id in [&parent_a, &parent_b] {
@@ -4504,7 +4374,6 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
                     crate::WorkflowTaskCommitInput {
                         claim: first_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: first_claim.replay_target_event_id,
                             append_events: vec![timer_event(&first, 1)],
                             ..WorkflowTaskCommit::default()
                         },
@@ -4512,7 +4381,6 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
                     crate::WorkflowTaskCommitInput {
                         claim: stale_claim.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: stale_claim.replay_target_event_id,
                             append_events: vec![timer_event(&second, 1)],
                             ..WorkflowTaskCommit::default()
                         },
@@ -4522,12 +4390,7 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
             .await
             .unwrap();
 
-        assert_eq!(
-            results[0].result.as_ref().unwrap(),
-            &CommitOutcome::Committed {
-                new_tail_event_id: EventId(2)
-            }
-        );
+        assert_eq!(results[0].result.as_ref().unwrap(), &EventId(2));
         assert!(matches!(results[1].result, Err(Error::StaleLease)));
         let stale_history = backend
             .stream_history(crate::StreamHistoryRequest {
@@ -4599,7 +4462,6 @@ fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_config
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: vec![
                         crate::NewHistoryEvent::new(HistoryEventData::VersionMarker(
                             crate::VersionMarker {
@@ -4632,12 +4494,7 @@ fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_config
             )
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
-        );
+        assert_eq!(outcome, EventId(4));
 
         let history = backend
             .stream_history(crate::StreamHistoryRequest {
@@ -4753,7 +4610,6 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: schedules
                         .iter()
                         .cloned()
@@ -4772,12 +4628,7 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
-        );
+        assert_eq!(outcome, EventId(3));
 
         let activity_opts = ClaimActivityOptions {
             namespace: crate::Namespace::default(),
@@ -4918,7 +4769,6 @@ fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
                     .commit_workflow_task(
                         claimed.claim,
                         WorkflowTaskCommit {
-                            expected_tail_event_id: claimed.replay_target_event_id,
                             append_events: vec![crate::NewHistoryEvent::new(
                                 HistoryEventData::ActivityScheduled(scheduled.clone()),
                             )],
@@ -4928,9 +4778,7 @@ fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
                     )
                     .await
                     .unwrap(),
-                CommitOutcome::Committed {
-                    new_tail_event_id: EventId(2)
-                }
+                EventId(2)
             );
         }
 
@@ -5061,7 +4909,6 @@ fn postgres_batch_activity_completion_preserves_mixed_result_order() {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: claimed.replay_target_event_id,
                         append_events: schedules
                             .iter()
                             .cloned()
@@ -5080,9 +4927,7 @@ fn postgres_batch_activity_completion_preserves_mixed_result_order() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
+            EventId(4)
         );
 
         let activity_opts = ClaimActivityOptions {
@@ -5237,7 +5082,6 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                                 retry_scheduled.clone(),
@@ -5255,9 +5099,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(3)
-            }
+            EventId(3)
         );
 
         let retry_activity_opts = ClaimActivityOptions {
@@ -5339,15 +5181,12 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
                 .commit_workflow_task(
                     failed_ready.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(4),
                         ..WorkflowTaskCommit::default()
                     },
                 )
                 .await
                 .unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(4)
-            }
+            EventId(4)
         );
 
         // Start-to-close is measured from the claim, so the attempt has to be

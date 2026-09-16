@@ -17,7 +17,7 @@ use crate::{
     ActivityTaskClaim, CancelWorkflowOutcome, CancelWorkflowRequest, ChildStartOutboxMessage,
     ChildWorkflowMapFailureMode, ChildWorkflowMapItem, ChildWorkflowMapItemOutcome,
     ChildWorkflowMapTask, ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimedActivityTask,
-    ClaimedWorkflowTask, CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
+    ClaimedWorkflowTask, CompleteActivityOutcome, CompleteActivityRequest,
     DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
     EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
     HistoryChunk, HistoryEvent, HistoryEventData, Namespace, ParentClosePolicy, PayloadBlob,
@@ -268,6 +268,11 @@ impl RunRecord {
 struct WorkflowClaim {
     token: u64,
     lease_until: TimestampMs,
+    /// The run's history tail when this claim was handed out, which is also the
+    /// worker's replay target. At commit it answers whether facts landed under
+    /// the claim that the task never saw, so their wake reason is kept rather
+    /// than consumed with the task.
+    tail_at_claim: EventId,
 }
 
 impl WorkflowClaim {
@@ -511,10 +516,6 @@ impl DurableBackend for MemoryBackend {
         // The ready reason stays on the run while claimed so a reclaim after
         // lease expiry hands out the same task a fresh claim would; commit,
         // conflict, and release overwrite it.
-        run.workflow_claim = Some(WorkflowClaim {
-            token,
-            lease_until: TimestampMs(claim_lease_until_ms(now, opts.lease_duration)),
-        });
         let reason = run
             .ready
             .clone()
@@ -524,6 +525,11 @@ impl DurableBackend for MemoryBackend {
             .last()
             .map(|event| event.event_id)
             .unwrap_or(EventId::ZERO);
+        run.workflow_claim = Some(WorkflowClaim {
+            token,
+            lease_until: TimestampMs(claim_lease_until_ms(now, opts.lease_duration)),
+            tail_at_claim: replay_target_event_id,
+        });
         let prefetched_history = run
             .history
             .iter()
@@ -583,27 +589,17 @@ impl DurableBackend for MemoryBackend {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>> {
+    ) -> BoxFuture<'static, Result<EventId>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
             };
+            // The claim token is the fence. Facts appended while this task was
+            // held (activity results, fired timers, child terminals) never
+            // enter the replay window, so they do not invalidate it.
             if !WorkflowClaim::holds(&run.workflow_claim, claim.token) {
                 return Box::pin(ready(Err(Error::StaleLease)));
-            }
-            let current_tail = run
-                .history
-                .last()
-                .map(|event| event.event_id)
-                .unwrap_or(EventId::ZERO);
-            if current_tail != batch.expected_tail_event_id {
-                run.workflow_claim = None;
-                run.ready = Some(WorkflowTaskReason::CacheEvicted);
-                run.ready_at = None;
-                drop(state);
-                self.notify_work();
-                return Box::pin(ready(Ok(CommitOutcome::Conflict)));
             }
             if run.terminal && commit_has_workflow_visible_mutations(&batch) {
                 return Box::pin(ready(Err(Error::TerminalWorkflow)));
@@ -741,7 +737,7 @@ impl DurableBackend for MemoryBackend {
         let mut projection_update = None;
         let mut change_version_updates = Vec::new();
         let now = state.now;
-        let next_event_id = {
+        let (next_event_id, unobserved_fact_reason) = {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
             };
@@ -771,6 +767,17 @@ impl DurableBackend for MemoryBackend {
                 });
             }
 
+            // Read before the claim is cleared: facts that landed under this
+            // claim are ones the task never saw, so their wake reason is
+            // carried past the clear below and re-applied instead of being
+            // consumed with the task.
+            let tail_at_claim = run
+                .workflow_claim
+                .as_ref()
+                .map_or(EventId::ZERO, |claim| claim.tail_at_claim);
+            let unobserved_fact_reason = (tail_at_claim < current_tail)
+                .then_some(run.ready.clone())
+                .flatten();
             run.workflow_claim = None;
             // Commit consumes the claimed task's readiness (the reason stays
             // on the run while claimed so lease-expiry reclaims see it); the
@@ -793,7 +800,7 @@ impl DurableBackend for MemoryBackend {
                 ));
             }
 
-            (next_event_id, terminal)
+            ((next_event_id, terminal), unobserved_fact_reason)
         };
         // A map scheduled with an empty input manifest is terminal at
         // descriptor creation, so its terminal fact is appended by this very
@@ -948,9 +955,12 @@ impl DurableBackend for MemoryBackend {
         // reason this bookkeeping can produce, and only the signal recheck can
         // otherwise re-mark the run; the child starts dispatched below set
         // their own reason afterwards.
-        if let Some(reason) =
-            post_commit_ready_reason(terminal_after_commit, map_ready_reason, signal_wait_ready)
-            && let Some(run) = state.runs.get_mut(&claim.run_id)
+        if let Some(reason) = post_commit_ready_reason(
+            terminal_after_commit,
+            map_ready_reason,
+            signal_wait_ready,
+            unobserved_fact_reason,
+        ) && let Some(run) = state.runs.get_mut(&claim.run_id)
         {
             run.ready = Some(reason);
             run.ready_at = None;
@@ -990,7 +1000,7 @@ impl DurableBackend for MemoryBackend {
 
         drop(state);
         self.notify_work();
-        Box::pin(ready(Ok(CommitOutcome::Committed { new_tail_event_id })))
+        Box::pin(ready(Ok(new_tail_event_id)))
     }
 
     fn release_workflow_task(
@@ -3821,7 +3831,6 @@ mod tests {
                 .commit_workflow_task(
                     parent.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         schedule_child_workflow_maps: vec![map_task],
                         ..WorkflowTaskCommit::default()
                     },
@@ -3859,7 +3868,6 @@ mod tests {
                 .commit_workflow_task(
                     item0.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         start_child_workflows: vec![ChildStartOutboxMessage {
                             command_id: crate::CommandId {
                                 run_id: item0_run_id.clone(),
@@ -3968,8 +3976,7 @@ mod tests {
             let claimed = start_and_claim(&backend, "wf/memory-terminal-guard", "guard-q").await;
             force_terminal(&backend, &claimed.run_id);
 
-            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
-            {
+            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id) {
                 let err = backend
                     .commit_workflow_task(claimed.claim.clone(), commit)
                     .await
@@ -3985,18 +3992,12 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim.clone(),
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         ..WorkflowTaskCommit::default()
                     },
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                outcome,
-                CommitOutcome::Committed {
-                    new_tail_event_id: EventId(1)
-                }
-            );
+            assert_eq!(outcome, EventId(1));
         });
     }
 
@@ -4022,7 +4023,6 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim.clone(),
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         schedule_activities: vec![task],
                         ..WorkflowTaskCommit::default()
                     },

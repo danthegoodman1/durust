@@ -3,11 +3,10 @@ use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_mai
 use durust::PayloadBlobStore;
 use durust::{
     ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
-    ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
-    DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
-    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
-    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
-    WorkflowType,
+    ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CompleteActivityRequest, DurableBackend,
+    DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData, MemoryBackend, Namespace,
+    NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest, TaskQueue, TimestampMs, WaitKind,
+    WaitRecord, Worker, WorkerId, WorkflowTaskCommit, WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
 #[cfg(feature = "postgres")]
@@ -353,7 +352,7 @@ fn workflow_task_append_commit(c: &mut Criterion) {
                         .commit_workflow_task(state.claimed.claim, state.batch)
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -370,7 +369,7 @@ fn workflow_task_append_commit(c: &mut Criterion) {
                         .commit_workflow_task(state.claimed.claim, state.batch)
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -645,7 +644,6 @@ fn projection_update(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: Vec::new(),
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
@@ -660,7 +658,7 @@ fn projection_update(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -842,7 +840,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(claimed.claim, batch)
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                         }
                     });
                 },
@@ -1072,7 +1070,6 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(
                                     claimed.claim,
                                     WorkflowTaskCommit {
-                                        expected_tail_event_id: EventId(1),
                                         append_events: Vec::new(),
                                         upsert_waits: Vec::new(),
                                         schedule_activities: Vec::new(),
@@ -1087,7 +1084,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 )
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                         }
                     });
                 },
@@ -1134,12 +1131,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(claimed.claim, batch)
                                 .await
                                 .unwrap();
-                            assert_eq!(
-                                outcome,
-                                CommitOutcome::Committed {
-                                    new_tail_event_id: EventId(3)
-                                }
-                            );
+                            assert_eq!(outcome, EventId(3));
                         }
                     });
                 },
@@ -1165,7 +1157,6 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(
                                     claimed.claim,
                                     WorkflowTaskCommit {
-                                        expected_tail_event_id: EventId(1),
                                         append_events: vec![NewHistoryEvent::new(
                                             HistoryEventData::ActivityMapScheduled(scheduled),
                                         )],
@@ -1182,7 +1173,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 )
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                             for value in 0..8_u64 {
                                 let claimed = fixture
                                     .backend
@@ -1296,7 +1287,6 @@ fn signal_send_consume(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: Vec::new(),
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
@@ -1311,7 +1301,7 @@ fn signal_send_consume(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(commit, CommitOutcome::Committed { .. }));
+                    assert!(commit.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1329,7 +1319,6 @@ fn activity_map_materialize(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::ActivityMapScheduled(scheduled),
                                 )],
@@ -1346,7 +1335,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1393,7 +1382,6 @@ fn child_workflow_map_materialize(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                                 )],
@@ -1410,7 +1398,7 @@ fn child_workflow_map_materialize(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1428,7 +1416,6 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
                         .commit_workflow_task(
                             child_claim.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::WorkflowCompleted {
                                         result: durust::encode_payload(&20_u64).unwrap(),
@@ -1447,7 +1434,7 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -2007,7 +1994,6 @@ fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: Vec::new(),
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
@@ -2120,7 +2106,6 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
             backend,
             claimed,
             batch: WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled,
                 ))],
@@ -2167,7 +2152,6 @@ fn setup_claimed_workflow_for_commit_sqlite() -> SqliteAppendCommitBenchState {
             backend,
             claimed,
             batch: WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled,
                 ))],
@@ -2250,7 +2234,6 @@ fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskCla
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                         scheduled.clone(),
                     ))],
@@ -2292,7 +2275,6 @@ fn setup_due_timer() -> MemoryBackend {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
                         durust::TimerStarted {
                             command_id: command_id.clone(),
@@ -2348,7 +2330,6 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
             .commit_workflow_task(
                 claimed.claim.clone(),
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: Vec::new(),
                     upsert_waits: vec![WaitRecord {
                         wait_id: durust::WaitId::new(format!(
@@ -2435,7 +2416,6 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(
                         HistoryEventData::ActivityMapScheduled(scheduled),
                     )],
@@ -2523,7 +2503,6 @@ fn setup_materialized_child_workflow_map() -> (MemoryBackend, ClaimedWorkflowTas
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(
                         HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                     )],
@@ -3045,7 +3024,6 @@ fn setup_postgres_claimed_workflow_for_commit(
     (
         claimed,
         WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
             append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                 scheduled,
             ))],
@@ -3098,7 +3076,6 @@ fn setup_postgres_claimed_heartbeat_activity(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
@@ -3135,7 +3112,6 @@ fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
                     durust::TimerStarted {
                         command_id: command_id.clone(),
@@ -3180,7 +3156,6 @@ fn setup_postgres_signal_wait(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: Vec::new(),
                 upsert_waits: vec![WaitRecord {
                     wait_id: durust::WaitId::new(format!(
@@ -3237,7 +3212,6 @@ fn setup_postgres_projection_read(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: Vec::new(),
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3269,7 +3243,6 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: events,
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3304,7 +3277,6 @@ fn setup_postgres_large_history_stream(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: events,
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3351,7 +3323,6 @@ fn setup_postgres_child_start(
     (
         claimed,
         WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
             append_events: vec![NewHistoryEvent::new(
                 HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
             )],

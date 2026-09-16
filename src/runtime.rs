@@ -217,8 +217,10 @@ pub(crate) struct RuntimeContext {
     next_command_seq: u64,
     indexes: ReadyEventIndexes,
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
+    // Keyed by payload content, so a fanout whose items share one payload
+    // makes one request; the request carries how many consumers wait on it.
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
-    hydrated_payloads: BTreeMap<String, PayloadRef>,
+    hydrated_payloads: BTreeMap<String, (usize, PayloadRef)>,
     replay_window_overrun: bool,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
@@ -453,6 +455,11 @@ pub(crate) enum PayloadHydrationKind {
 pub(crate) struct PayloadHydrationRequest {
     pub kind: PayloadHydrationKind,
     pub payload: PayloadRef,
+    /// How many consumers are blocked on this payload. A fanout whose items
+    /// share one payload registers one request; without the count the first
+    /// consumer would claim the hydrated value and the rest would re-request
+    /// the same blob, costing one provider read per consumer.
+    pub waiting: usize,
 }
 
 impl PayloadHydrationRequest {
@@ -646,9 +653,9 @@ impl RuntimeContext {
     }
 
     pub(crate) fn take_payload_hydration_requests(&mut self) -> Vec<PayloadHydrationRequest> {
-        let requests = self.payload_hydration_requests.values().cloned().collect();
-        self.payload_hydration_requests.clear();
-        requests
+        std::mem::take(&mut self.payload_hydration_requests)
+            .into_values()
+            .collect()
     }
 
     pub(crate) fn fulfill_payload_hydration(
@@ -661,7 +668,8 @@ impl RuntimeContext {
                 "backend returned an unresolved blob for an observed replay payload".to_owned(),
             ));
         }
-        self.hydrated_payloads.insert(request.key(), hydrated);
+        self.hydrated_payloads
+            .insert(request.key(), (request.waiting, hydrated));
         Ok(())
     }
 
@@ -830,14 +838,26 @@ impl RuntimeContext {
             return Ok(payload);
         }
         let key = payload_hydration_key(kind, &payload);
-        if let Some(hydrated) = self.hydrated_payloads.remove(&key) {
-            return Ok(hydrated);
+        if let Some((waiting, hydrated)) = self.hydrated_payloads.get_mut(&key) {
+            // The last waiter takes the value; the others get a copy, which is
+            // a memcpy against the provider read it replaces.
+            if *waiting <= 1 {
+                let (_, hydrated) = self
+                    .hydrated_payloads
+                    .remove(&key)
+                    .expect("hydrated payload present");
+                return Ok(hydrated);
+            }
+            *waiting -= 1;
+            return Ok(hydrated.clone());
         }
         self.payload_hydration_requests
             .entry(key)
+            .and_modify(|request| request.waiting += 1)
             .or_insert_with(|| PayloadHydrationRequest {
                 kind,
                 payload: payload.clone(),
+                waiting: 1,
             });
         Err(payload)
     }
@@ -1891,36 +1911,42 @@ where
             }
         }
 
-        let mut winner: Option<(usize, crate::EventId)> = None;
+        // The branch this poll would pick with nothing recorded: earliest
+        // observed fact first, ties broken by ordinal.
+        let mut live_choice: Option<(usize, crate::EventId)> = None;
         for (index, output) in self.outputs.iter().enumerate() {
             if let Some((event_id, _)) = output {
-                match winner {
-                    Some((winner_index, winner_event_id))
-                        if (winner_event_id, winner_index) <= (*event_id, index) => {}
-                    _ => winner = Some((index, *event_id)),
+                match live_choice {
+                    Some((choice_index, choice_event_id))
+                        if (choice_event_id, choice_index) <= (*event_id, index) => {}
+                    _ => live_choice = Some((index, *event_id)),
                 }
             }
         }
-        let Some((winner_index, winning_event_id)) = winner else {
-            return Poll::Pending;
-        };
         let command_id = self
             .command_id
             .as_ref()
             .expect("select_all command id initialized")
             .clone();
-        match record_select_winner(
+        let outputs = &self.outputs;
+        let resolved = __durust_select_resolve(
             &command_id,
-            winner_index as u32,
-            winning_event_id,
             &self.branches_digest,
-        ) {
+            |ordinal| {
+                outputs
+                    .get(ordinal as usize)
+                    .is_some_and(|output| output.is_some())
+            },
+            live_choice.map(|(index, _)| index as u32),
+        );
+        match resolved {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(err)) => {
                 self.done = true;
                 Poll::Ready(Err(err))
             }
-            Poll::Ready(Ok(())) => {
+            Poll::Ready(Ok(winner_ordinal)) => {
+                let winner_index = winner_ordinal as usize;
                 for index in 0..self.branches.len() {
                     if index != winner_index
                         && self.outputs[index].is_none()
@@ -1971,30 +1997,28 @@ pub fn __durust_select_take_ready_event_id() -> Option<crate::EventId> {
     with_context(|runtime| runtime.take_last_ready_event_id())
 }
 
+/// Settles which branch of a `select!` or `select_all` wins.
+///
+/// Replay **follows** the recorded decision rather than recomputing it. That
+/// is what lets the commit fence be the claim token alone: recomputing meant
+/// comparing the arrival order of the winning fact against every other
+/// branch's, which only held if no unrelated fact had been appended to the run
+/// since the task was claimed.
+///
+/// `ready` reports whether a branch already produced an output this poll, and
+/// `live_choice` is the branch this poll would pick with nothing recorded —
+/// earliest observed fact first, ties broken by ordinal. Neither closure may
+/// call a durable API; both run under the context borrow.
 #[doc(hidden)]
-pub fn __durust_select_record_winner(
+pub fn __durust_select_resolve(
     select_command_id: &CommandId,
-    branch_ordinal: u32,
-    winning_event_id: crate::EventId,
     branches_digest: &str,
-) -> Poll<Result<()>> {
-    record_select_winner(
-        select_command_id,
-        branch_ordinal,
-        winning_event_id,
-        branches_digest,
-    )
-}
-
-fn record_select_winner(
-    select_command_id: &CommandId,
-    branch_ordinal: u32,
-    winning_event_id: crate::EventId,
-    branches_digest: &str,
-) -> Poll<Result<()>> {
+    ready: impl Fn(u32) -> bool,
+    live_choice: Option<u32>,
+) -> Poll<Result<u32>> {
     with_context(|runtime| {
-        // Borrowed, not cloned: the recorded winner is only ever compared
-        // field by field against what the select just observed.
+        // Borrowed, not cloned: the recorded winner is only compared field by
+        // field against what this select just observed.
         if let Some(event) = runtime.peek_replay_command_event()
             && let HistoryEventData::SelectWinner(winner) = &event.data
         {
@@ -2010,35 +2034,40 @@ fn record_select_winner(
                     select_command_id.seq.0, winner.branches_digest, branches_digest
                 ))));
             }
-            if winner.branch_ordinal != branch_ordinal {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "select winner changed for command {}: recorded {}, observed {}",
-                    select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
-                ))));
+            let recorded = winner.branch_ordinal;
+            if ready(recorded) {
+                runtime.advance_replay();
+                return Poll::Ready(Ok(recorded));
             }
-            if winner.winning_event_id != winning_event_id {
-                return Poll::Ready(Err(Error::Nondeterminism(format!(
-                    "select winning event changed for command {}: recorded {}, observed {}",
-                    select_command_id.seq.0, winner.winning_event_id, winning_event_id
-                ))));
+            // The recorded winner has not produced its output yet. Its fact was
+            // committed no later than this `SelectWinner`, so more history must
+            // still be loading; with all of it loaded the history contradicts
+            // itself.
+            if runtime.request_more_history_if_available() {
+                return Poll::Pending;
             }
-            runtime.advance_replay();
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Err(Error::Nondeterminism(format!(
+                "select command {} recorded branch {recorded} as the winner, but replay never \
+                 produced that branch's result",
+                select_command_id.seq.0
+            ))));
         }
         if runtime.request_more_history_if_available() {
             return Poll::Pending;
         }
+        let Some(branch_ordinal) = live_choice else {
+            return Poll::Pending;
+        };
         runtime
             .append_events
             .push(NewHistoryEvent::new(HistoryEventData::SelectWinner(
                 SelectWinner {
                     select_command_id: select_command_id.clone(),
                     branch_ordinal,
-                    winning_event_id,
                     branches_digest: branches_digest.to_owned(),
                 },
             )));
-        Poll::Ready(Ok(()))
+        Poll::Ready(Ok(branch_ordinal))
     })
 }
 

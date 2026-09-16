@@ -57,10 +57,18 @@ export interface DurableBackend {
     opts: ClaimWorkflowBatchOptions
   ): Promise<readonly ClaimedWorkflowTask[]>;
   streamHistory(req: StreamHistoryRequest): Promise<HistoryChunk>;
-  commitWorkflowTask(
-    claim: WorkflowTaskClaim,
-    commit: WorkflowTaskCommit
-  ): Promise<CommitOutcome>;
+  /**
+   * Applies one workflow task's writes atomically and returns the run's new
+   * history tail.
+   *
+   * The claim token is the whole fence. Only the claim holder appends
+   * replay-window events, and the paths that append one from outside a claim
+   * revoke the claim in the same transaction, so a provider rejects a commit
+   * whose token no longer owns the run and needs no further check. Facts
+   * appended concurrently by activity workers, timer sweeps, and child
+   * dispatch never invalidate a task.
+   */
+  commitWorkflowTask(claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<EventId>;
   releaseWorkflowTask(
     claim: WorkflowTaskClaim,
     options?: ReleaseWorkflowTaskOptions
@@ -166,7 +174,6 @@ export interface NewHistoryEvent {
 }
 
 export interface WorkflowTaskCommit {
-  readonly expectedTailEventId: EventId;
   readonly appendEvents?: readonly NewHistoryEvent[];
   readonly upsertWaits?: readonly WaitRecord[];
   readonly deleteWaits?: readonly WaitId[];
@@ -191,10 +198,6 @@ export interface WorkflowTaskCommit {
   readonly cancelCommands?: readonly CommandId[];
   readonly queryProjection?: PayloadRef;
 }
-
-export type CommitOutcome =
-  | { readonly kind: "Committed"; readonly newTailEventId: EventId }
-  | { readonly kind: "Conflict" };
 
 export interface ReleaseWorkflowTaskOptions {
   readonly visibilityDelayMs?: number;

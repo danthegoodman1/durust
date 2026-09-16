@@ -603,7 +603,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),

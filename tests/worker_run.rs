@@ -484,7 +484,7 @@ impl DurableBackend for ObservingBackend {
         fn commit_workflow_task(
             claim: durust::WorkflowTaskClaim,
             commit: durust::WorkflowTaskCommit
-        ) -> durust::CommitOutcome;
+        ) -> durust::EventId;
         fn commit_workflow_tasks(
             batch: durust::WorkflowTaskCommitBatch
         ) -> Vec<durust::WorkflowTaskCommitBatchResult>;

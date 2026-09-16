@@ -1753,7 +1753,6 @@ fn commit_validates_already_offloaded_refs_without_downloading() {
             .commit_workflow_task(
                 claimed.claim,
                 durust::WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: Vec::new(),
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
@@ -4203,7 +4202,6 @@ fn select_chooses_earliest_ready_event_before_lexical_order() {
             panic!("expected SelectWinner");
         };
         assert_eq!(winner.branch_ordinal, 1);
-        assert_eq!(winner.winning_event_id, EventId(4));
         let HistoryEventData::WorkflowCompleted { result } = &history[6].data else {
             panic!("select workflow did not complete");
         };
@@ -4244,7 +4242,6 @@ fn select_same_tick_timer_race_is_deterministic() {
             panic!("expected SelectWinner");
         };
         assert_eq!(winner.branch_ordinal, 0);
-        assert_eq!(winner.winning_event_id, EventId(4));
         let HistoryEventData::WorkflowCompleted { result } = &history[6].data else {
             panic!("select workflow did not complete");
         };
@@ -7419,23 +7416,25 @@ fn activity_lease_duration_knob_bounds_default_option_activity_runtime() {
 }
 
 #[test]
-fn batch_per_item_conflict_does_not_abort_the_rest_of_the_chunk() {
+fn batch_per_item_commit_error_does_not_abort_the_rest_of_the_chunk() {
     block_on(async {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
         let run_a = client
-            .start_workflow::<double_plus_one>("wf/batch-conflict-a", "workflows", number(1))
+            .start_workflow::<double_plus_one>("wf/batch-commit-error-a", "workflows", number(1))
             .await
             .unwrap();
         let run_b = client
-            .start_workflow::<double_plus_one>("wf/batch-conflict-b", "workflows", number(2))
+            .start_workflow::<double_plus_one>("wf/batch-commit-error-b", "workflows", number(2))
             .await
             .unwrap();
         let mut worker = batch_error_worker(backend.clone());
 
-        backend.conflict_batch_commit_for_run(run_a.clone());
-        let committed = worker.run_workflow_batch_once().await.unwrap();
-        assert_eq!(committed, 1);
+        // One item of the batch fails to commit. Its claim is released and the
+        // fault surfaces, but its neighbour in the same chunk still commits.
+        backend.fail_batch_commit_for_run(run_a.clone());
+        let err = worker.run_workflow_batch_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::Backend(_)));
 
         let history_a = stream_all(&backend, &run_a).await;
         assert_eq!(history_a.len(), 1);
@@ -7911,38 +7910,6 @@ fn sqlite_worker_loop_runs_until_idle() {
     });
 }
 
-#[test]
-fn worker_drops_cache_and_retries_after_workflow_task_commit_conflict() {
-    block_on(async {
-        let inner = MemoryBackend::new();
-        let backend = RecordingBackend::new(inner);
-        let client = Client::new(backend.clone());
-        let run_id = client
-            .start_workflow::<double_plus_one>("wf/commit-conflict", "workflows", number(11))
-            .await
-            .unwrap();
-        backend.conflict_next_commit();
-
-        let mut worker = Worker::builder(backend.clone())
-            .workflow_task_queue("workflows")
-            .activity_task_queue("activities")
-            .register_workflow(double_plus_one)
-            .register_activity(double)
-            .build();
-        assert!(worker.run_workflow_once().await.unwrap());
-        assert_eq!(stream_all(&backend, &run_id).await.len(), 1);
-
-        let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.workflow_tasks, 2);
-        assert_eq!(stats.activity_tasks, 1);
-        let history = stream_all(&backend, &run_id).await;
-        let HistoryEventData::WorkflowCompleted { result } = &history[3].data else {
-            panic!("workflow did not complete after retry");
-        };
-        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 23);
-    });
-}
-
 // A command builder that is rejected after its seq is allocated leaves a gap
 // in the run's command seqs, and that gap is part of the recorded history: the
 // activity scheduled after the rejection carries seq 2.
@@ -8307,13 +8274,12 @@ struct RecordingBackend {
     inner: MemoryBackend,
     stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
     signal_batch_requests: Arc<Mutex<Vec<durust::ReadSignalInboxesRequest>>>,
-    conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
     fail_next_current_time: Arc<Mutex<bool>>,
     fail_next_replay_stream: Arc<Mutex<bool>>,
     hydrate_failures_remaining: Arc<Mutex<u32>>,
     fail_next_commit_batch: Arc<Mutex<bool>>,
-    conflict_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
+    fail_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
     advance_before_activity_completion: Arc<Mutex<Option<Duration>>>,
     claim_prefetch_enabled: bool,
 }
@@ -8324,13 +8290,12 @@ impl RecordingBackend {
             inner,
             stream_requests: Arc::new(Mutex::new(Vec::new())),
             signal_batch_requests: Arc::new(Mutex::new(Vec::new())),
-            conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
             fail_next_current_time: Arc::new(Mutex::new(false)),
             fail_next_replay_stream: Arc::new(Mutex::new(false)),
             hydrate_failures_remaining: Arc::new(Mutex::new(0)),
             fail_next_commit_batch: Arc::new(Mutex::new(false)),
-            conflict_batch_commit_run: Arc::new(Mutex::new(None)),
+            fail_batch_commit_run: Arc::new(Mutex::new(None)),
             advance_before_activity_completion: Arc::new(Mutex::new(None)),
             claim_prefetch_enabled: true,
         }
@@ -8353,10 +8318,6 @@ impl RecordingBackend {
         self.signal_batch_requests.lock().unwrap().clone()
     }
 
-    fn conflict_next_commit(&self) {
-        *self.conflict_next_commit.lock().unwrap() = true;
-    }
-
     fn backpressure_next_replay_stream(&self, retry_after: Duration) {
         *self.backpressure_next_replay_stream.lock().unwrap() = Some(retry_after);
     }
@@ -8377,8 +8338,8 @@ impl RecordingBackend {
         *self.fail_next_commit_batch.lock().unwrap() = true;
     }
 
-    fn conflict_batch_commit_for_run(&self, run_id: durust::RunId) {
-        *self.conflict_batch_commit_run.lock().unwrap() = Some(run_id);
+    fn fail_batch_commit_for_run(&self, run_id: durust::RunId) {
+        *self.fail_batch_commit_run.lock().unwrap() = Some(run_id);
     }
 
     // Simulates an activity whose execution outlives `advance` of virtual time
@@ -8490,28 +8451,13 @@ impl DurableBackend for RecordingBackend {
         &self,
         claim: durust::WorkflowTaskClaim,
         batch: durust::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
-        let should_conflict = {
-            let mut conflict_next_commit = self.conflict_next_commit.lock().unwrap();
-            let should_conflict = *conflict_next_commit;
-            *conflict_next_commit = false;
-            should_conflict
-        };
-        if should_conflict {
-            let inner = self.inner.clone();
-            return Box::pin(async move {
-                inner
-                    .release_workflow_task(claim, durust::WorkflowTaskRelease::immediate())
-                    .await?;
-                Ok(durust::CommitOutcome::Conflict)
-            });
-        }
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         self.inner.commit_workflow_task(claim, batch)
     }
 
     // Overridden (instead of relying on the default per-item loop) so tests
-    // can fail the whole batch RPC or fabricate a per-item conflict while the
-    // other items commit for real.
+    // can fail the whole batch RPC or fail one item while the others commit
+    // for real.
     fn commit_workflow_tasks(
         &self,
         batch: durust::WorkflowTaskCommitBatch,
@@ -8523,25 +8469,18 @@ impl DurableBackend for RecordingBackend {
                 ))
             });
         }
-        let conflict_run = self.conflict_batch_commit_run.lock().unwrap().take();
+        let failed_run = self.fail_batch_commit_run.lock().unwrap().take();
         let backend = self.clone();
         Box::pin(async move {
             let mut results = Vec::with_capacity(batch.commits.len());
             for input in batch.commits {
                 let claim = input.claim;
-                if conflict_run.as_ref() == Some(&claim.run_id) {
-                    // Mirror a real conflict: the provider releases the claim
-                    // as part of reporting it.
-                    backend
-                        .inner
-                        .release_workflow_task(
-                            claim.clone(),
-                            durust::WorkflowTaskRelease::immediate(),
-                        )
-                        .await?;
+                if failed_run.as_ref() == Some(&claim.run_id) {
                     results.push(durust::WorkflowTaskCommitBatchResult {
                         claim,
-                        result: Ok(durust::CommitOutcome::Conflict),
+                        result: Err(durust::Error::Backend(
+                            "injected per-item commit failure".to_owned(),
+                        )),
                     });
                     continue;
                 }

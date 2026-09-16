@@ -1,11 +1,11 @@
 use durust::{
     ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ActivityName,
     ChildWorkflowMapTask, ClaimActivityOptions, ClaimActivityTasksOptions,
-    ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CommitOutcome,
-    CompleteActivityRequest, CompleteActivityTasksRequest, DurableBackend, Error, EventId,
-    FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent,
-    PayloadBackend, PayloadBlobStore, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
-    WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
+    ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CompleteActivityRequest,
+    CompleteActivityTasksRequest, DurableBackend, Error, EventId, FailActivityRequest,
+    HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent, PayloadBackend, PayloadBlobStore,
+    Registry, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowTaskCommit,
+    WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -690,7 +690,6 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -772,7 +771,6 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .commit_workflow_task(
             ready.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: ready.replay_target_event_id,
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&9_u64).unwrap(),
@@ -2504,7 +2502,7 @@ fn default_durable_names_include_package_module_and_function() {
 ///
 /// [`run_conformance_scenarios`] counts what it expands and this number is the
 /// floor. Removing a scenario is meant to move it in the same commit.
-const CONFORMANCE_SCENARIOS: usize = 55;
+const CONFORMANCE_SCENARIOS: usize = 56;
 
 /// Runs each named scenario against a clone of `backend`, in order, and
 /// returns how many it ran.
@@ -2574,7 +2572,8 @@ where
         an_empty_map_scheduled_by_a_closing_commit_is_still_accepted,
         one_commit_completing_two_empty_maps_keeps_its_event_ids_contiguous,
         workflow_cancel_cleans_waits_activities_and_activity_maps,
-        stale_workflow_task_commit_conflicts,
+        concurrent_fact_does_not_void_a_workflow_task_commit,
+        committed_claim_cannot_commit_again,
         commit_side_signal_and_wait_mutations_are_fenced_to_the_claimed_run,
         batch_workflow_task_claim_and_commit_results_are_ordered,
         batch_activity_completion_reports_ordered_duplicate_and_stale_results,
@@ -2704,7 +2703,6 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::SideEffectMarker(durust::SideEffectMarker {
                         command_id,
@@ -2717,12 +2715,7 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        durust::CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     assert_side_effect_marker_stays_inline_in_existing_history(backend, workflow_id).await;
 }
@@ -2838,7 +2831,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -2849,12 +2841,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let query = backend
         .query_projection(durust::QueryProjectionRequest {
@@ -3033,7 +3020,6 @@ where
         .commit_workflow_task(
             first_claim.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 upsert_waits: vec![durust::WaitRecord {
                     wait_id,
                     run_id: run_id.clone(),
@@ -3080,7 +3066,6 @@ where
         .commit_workflow_task(
             second_claim.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![inbox.signal_id],
                 query_projection: Some(durust::encode_payload(&second_projection).unwrap()),
                 ..WorkflowTaskCommit::default()
@@ -3197,7 +3182,6 @@ where
         .commit_workflow_task(
             parent.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
@@ -3239,7 +3223,6 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&child_result).unwrap(),
@@ -3344,7 +3327,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
                         durust::ChildWorkflowMapScheduled {
@@ -3492,7 +3474,6 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&value.to_owned()).unwrap(),
@@ -3557,7 +3538,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -3764,7 +3744,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -4006,7 +3985,97 @@ where
     assert!(one_event_by_byte_budget.has_more);
 }
 
-async fn stale_workflow_task_commit_conflicts<B>(backend: B)
+/// The claim token is the whole commit fence. A fact appended to the run while
+/// a workflow task is held — here an activity result for a command the task
+/// never observed — must not void that task: facts are looked up by command
+/// seq and never enter the replay window, so the task's decisions still stand.
+async fn concurrent_fact_does_not_void_a_workflow_task_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/racing-fact", "racing-fact-workflows", input(3))
+        .await
+        .unwrap();
+
+    // Task one schedules two activities.
+    let first = backend
+        .claim_workflow_task(
+            WorkerId::new("racing-fact-worker"),
+            workflow_claim_opts("racing-fact-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let commands: Vec<durust::CommandId> = (1..=2)
+        .map(|seq| durust::CommandId {
+            run_id: first.run_id.clone(),
+            seq: durust::CommandSeq(seq),
+        })
+        .collect();
+    backend
+        .commit_workflow_task(
+            first.claim,
+            WorkflowTaskCommit {
+                append_events: commands
+                    .iter()
+                    .map(|command_id| {
+                        NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                            racing_fact_activity(command_id),
+                        ))
+                    })
+                    .collect(),
+                schedule_activities: commands
+                    .iter()
+                    .map(|command_id| {
+                        durust::ActivityTask::from_scheduled(&racing_fact_activity(command_id))
+                    })
+                    .collect(),
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The first activity completes, which makes the run claimable again.
+    let one = claim_racing_fact_activity(&backend).await;
+    let two = claim_racing_fact_activity(&backend).await;
+    complete_racing_fact_activity(&backend, one).await;
+
+    // Task two is claimed, and only then does the second activity complete:
+    // a fact for a command this task never observed, landing under its claim.
+    let held = backend
+        .claim_workflow_task(
+            WorkerId::new("racing-fact-worker"),
+            workflow_claim_opts("racing-fact-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("second workflow task");
+    let tail_at_claim = held.replay_target_event_id;
+    complete_racing_fact_activity(&backend, two).await;
+
+    // The run's tail moved under the held claim, and the commit still lands.
+    let new_tail = backend
+        .commit_workflow_task(
+            held.claim,
+            WorkflowTaskCommit {
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowTaskStarted)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        new_tail > tail_at_claim,
+        "commit landed after the racing fact, so the tail must have advanced past the claim's"
+    );
+}
+
+/// The fence that does exist: once a commit lands it clears the claim, so
+/// re-submitting the same claim is rejected rather than applied twice.
+async fn committed_claim_cannot_commit_again<B>(backend: B)
 where
     B: DurableBackend,
 {
@@ -4023,17 +4092,16 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let outcome = backend
-        .commit_workflow_task(
-            claimed.claim,
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId::ZERO,
-                ..WorkflowTaskCommit::default()
-            },
-        )
+    backend
+        .commit_workflow_task(claimed.claim.clone(), WorkflowTaskCommit::default())
         .await
         .unwrap();
-    assert_eq!(outcome, CommitOutcome::Conflict);
+    assert!(matches!(
+        backend
+            .commit_workflow_task(claimed.claim, WorkflowTaskCommit::default())
+            .await,
+        Err(durust::Error::StaleLease)
+    ));
 }
 
 async fn batch_workflow_task_claim_and_commit_results_are_ordered<B>(backend: B)
@@ -4065,14 +4133,15 @@ where
     let first = claimed.remove(0);
     let second = claimed.remove(0);
     let completion = WorkflowTaskCommit {
-        expected_tail_event_id: first.replay_target_event_id,
         append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
             result: durust::encode_payload(&first.run_id.0).unwrap(),
         })],
         ..WorkflowTaskCommit::default()
     };
-    let stale = WorkflowTaskCommit {
-        expected_tail_event_id: EventId::ZERO,
+    let second_completion = WorkflowTaskCommit {
+        append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+            result: durust::encode_payload(&second.run_id.0).unwrap(),
+        })],
         ..WorkflowTaskCommit::default()
     };
     let results = backend
@@ -4084,7 +4153,7 @@ where
                 },
                 WorkflowTaskCommitInput {
                     claim: second.claim.clone(),
-                    commit: stale,
+                    commit: second_completion,
                 },
             ],
         })
@@ -4093,14 +4162,9 @@ where
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].claim.run_id, first.run_id);
-    assert_eq!(
-        results[0].result,
-        Ok(CommitOutcome::Committed {
-            new_tail_event_id: EventId(2),
-        })
-    );
+    assert_eq!(results[0].result, Ok(EventId(2)));
     assert_eq!(results[1].claim.run_id, second.run_id);
-    assert_eq!(results[1].result, Ok(CommitOutcome::Conflict));
+    assert_eq!(results[1].result, Ok(EventId(2)));
 }
 
 async fn released_workflow_task_is_claimable_again<B>(backend: B)
@@ -4204,50 +4268,19 @@ where
         backend.query_projection(req.clone()).await.unwrap(),
         durust::QueryProjectionOutcome::NoProjection
     );
-    let stale_payload = durust::encode_payload(&"stale").unwrap();
-    let conflict = backend
-        .commit_workflow_task(
-            claimed.claim.clone(),
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId::ZERO,
-                query_projection: Some(stale_payload),
-                ..WorkflowTaskCommit::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(conflict, CommitOutcome::Conflict);
-    assert_eq!(
-        backend.query_projection(req.clone()).await.unwrap(),
-        durust::QueryProjectionOutcome::NoProjection
-    );
-
-    let reclaimed = backend
-        .claim_workflow_task(
-            WorkerId::new("query-raw-reclaimer"),
-            workflow_claim_opts("query-raw-workflows"),
-        )
-        .await
-        .unwrap()
-        .expect("workflow task after conflict");
+    let reclaimed = claimed.clone();
     let projection_payload = durust::encode_payload(&"visible").unwrap();
     let committed = backend
         .commit_workflow_task(
             reclaimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 query_projection: Some(projection_payload.clone()),
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        committed,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(committed, EventId(1));
     assert_eq!(
         backend.query_projection(req).await.unwrap(),
         durust::QueryProjectionOutcome::Found {
@@ -4321,7 +4354,6 @@ where
 
 fn projection_only_commit(payload: durust::PayloadRef) -> WorkflowTaskCommit {
     WorkflowTaskCommit {
-        expected_tail_event_id: EventId(1),
         query_projection: Some(payload),
         ..WorkflowTaskCommit::default()
     }
@@ -4499,7 +4531,6 @@ where
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     query_projection: Some(mismatched),
                     ..WorkflowTaskCommit::default()
                 },
@@ -4535,7 +4566,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::VersionMarker(durust::VersionMarker {
                         command_id: command_id.clone(),
@@ -4548,12 +4578,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let open = backend
         .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
@@ -4626,7 +4651,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowContinuedAsNew {
                         input: durust::encode_payload(&7_u64).unwrap(),
@@ -4637,12 +4661,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let old_history = stream_history(&backend, first_run_id.clone()).await;
     assert_eq!(old_history.len(), 2);
@@ -4778,19 +4797,13 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![first_inbox.signal_id],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let second_inbox = backend
         .read_signal_inbox(durust::ReadSignalInboxRequest {
@@ -4847,10 +4860,9 @@ fn signal_race_claim_opts(queue: &str) -> ClaimWorkflowTaskOptions {
 
 /// The commit the signal-race workflow's first task produces: no appends, one
 /// signal wait registered for command seq 1 on signal name `go`.
-fn signal_wait_commit(run_id: &durust::RunId, expected_tail: EventId) -> WorkflowTaskCommit {
+fn signal_wait_commit(run_id: &durust::RunId) -> WorkflowTaskCommit {
     let command_id = durust::command_id(run_id, 1);
     WorkflowTaskCommit {
-        expected_tail_event_id: expected_tail,
         upsert_waits: vec![durust::WaitRecord {
             wait_id: durust::WaitId::new(format!(
                 "{}:{}:signal",
@@ -4943,15 +4955,10 @@ where
     assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
 
     let outcome = backend
-        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id))
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let woken = backend
         .claim_workflow_task(
@@ -5011,7 +5018,7 @@ where
         .unwrap()
         .expect("workflow task");
     backend
-        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id))
         .await
         .unwrap();
     // Blocked on the signal: not claimable until a delivery arrives.
@@ -5063,18 +5070,12 @@ where
         .commit_workflow_task(
             woken.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let rewoken = backend
         .claim_workflow_task(
@@ -5158,7 +5159,7 @@ where
                 .iter()
                 .map(|claimed| WorkflowTaskCommitInput {
                     claim: claimed.claim.clone(),
-                    commit: signal_wait_commit(&claimed.run_id, EventId(1)),
+                    commit: signal_wait_commit(&claimed.run_id),
                 })
                 .collect(),
         })
@@ -5166,12 +5167,7 @@ where
         .unwrap();
     assert_eq!(results.len(), 2);
     for result in &results {
-        assert_eq!(
-            *result.result.as_ref().unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(1)
-            }
-        );
+        assert_eq!(*result.result.as_ref().unwrap(), EventId(1));
     }
 
     let mut woken = Vec::new();
@@ -5240,11 +5236,11 @@ where
         .cancel_workflow("wf/terminal-fence", "fence test")
         .await
         .unwrap();
-    let durust::CancelWorkflowOutcome::Cancelled { event_id, .. } = cancelled else {
+    let durust::CancelWorkflowOutcome::Cancelled { .. } = cancelled else {
         panic!("expected cancellation, got {cancelled:?}");
     };
 
-    for (kind, commit) in terminal_fence_commits(&run_id, event_id) {
+    for (kind, commit) in terminal_fence_commits(&run_id) {
         let err = backend
             .commit_workflow_task(claimed.claim.clone(), commit)
             .await
@@ -5256,15 +5252,11 @@ where
     }
 }
 
-/// One commit per workflow-visible mutation kind, aimed at the post-cancel
-/// tail so only claim fencing (not a tail conflict) decides the outcome.
-fn terminal_fence_commits(
-    run_id: &durust::RunId,
-    expected_tail: EventId,
-) -> Vec<(&'static str, WorkflowTaskCommit)> {
+/// One commit per workflow-visible mutation kind, so every kind is shown to be
+/// rejected against a run the claim no longer owns.
+fn terminal_fence_commits(run_id: &durust::RunId) -> Vec<(&'static str, WorkflowTaskCommit)> {
     let command_id = durust::command_id(run_id, 900);
     let base = WorkflowTaskCommit {
-        expected_tail_event_id: expected_tail,
         ..WorkflowTaskCommit::default()
     };
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
@@ -5528,7 +5520,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
@@ -5693,7 +5684,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     NewHistoryEvent::new(HistoryEventData::SignalConsumed(
                         durust::SignalConsumed {
@@ -5781,7 +5771,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
@@ -5871,7 +5860,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::TimerStarted(durust::TimerStarted {
                         command_id: command_id.clone(),
@@ -5892,12 +5880,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let early = backend
         .fire_due_timers(durust::FireDueTimersRequest {
@@ -5980,7 +5963,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -6102,7 +6084,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -6203,7 +6184,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -6527,7 +6507,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -6662,7 +6641,6 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         .commit_workflow_task(
             original.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: original.replay_target_event_id,
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6679,7 +6657,6 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         .commit_workflow_task(
             reclaimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: reclaimed.replay_target_event_id,
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                     result: durust::encode_payload(&5_u64).unwrap(),
                 })],
@@ -6688,7 +6665,7 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 }
 
 async fn schedule_timeoutless_activity<B>(
@@ -6739,7 +6716,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
@@ -7441,7 +7417,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                         scheduled.clone(),
@@ -7474,7 +7449,7 @@ where
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 
     let claimed_activity = backend
         .claim_activity_task(
@@ -7509,14 +7484,13 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(4),
                 cancel_commands: vec![activity_command],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 
     let late_completion = backend
         .complete_activity(CompleteActivityRequest {
@@ -7628,7 +7602,6 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: result.clone(),
@@ -7748,10 +7721,7 @@ where
         .unwrap()
         .expect("parent ready after child start");
     backend
-        .commit_workflow_task(
-            parent.claim,
-            terminal_parent_commit(parent.replay_target_event_id),
-        )
+        .commit_workflow_task(parent.claim, terminal_parent_commit())
         .await
         .unwrap();
 
@@ -7807,10 +7777,7 @@ where
         .unwrap()
         .expect("parent ready after child start");
     backend
-        .commit_workflow_task(
-            parent.claim,
-            terminal_parent_commit(parent.replay_target_event_id),
-        )
+        .commit_workflow_task(parent.claim, terminal_parent_commit())
         .await
         .unwrap();
 
@@ -7870,7 +7837,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
@@ -7900,7 +7866,7 @@ async fn schedule_child_workflow_map<B>(
     durust::CommandId,
     ClaimWorkflowTaskOptions,
     ClaimWorkflowTaskOptions,
-    durust::Result<CommitOutcome>,
+    durust::Result<EventId>,
 )
 where
     B: DurableBackend,
@@ -7968,7 +7934,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                 )],
@@ -8006,7 +7971,6 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&value).unwrap(),
@@ -8031,7 +7995,6 @@ async fn fail_child_run<B>(
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowFailed {
                         failure: durust::DurableFailure::new(error_type, message),
@@ -8052,7 +8015,6 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCancelled {
                         reason: reason.to_owned(),
@@ -8252,9 +8214,62 @@ fn workflow_claim_opts(task_queue: &str) -> ClaimWorkflowTaskOptions {
     }
 }
 
-fn terminal_parent_commit(expected_tail_event_id: EventId) -> WorkflowTaskCommit {
+fn racing_fact_activity(command_id: &durust::CommandId) -> durust::ActivityScheduled {
+    let input = durust::encode_payload(&Input { value: 3 }).unwrap();
+    durust::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("racing-fact-activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    }
+}
+
+async fn claim_racing_fact_activity<B>(backend: &B) -> durust::ClaimedActivityTask
+where
+    B: DurableBackend,
+{
+    backend
+        .claim_activity_task(
+            WorkerId::new("racing-fact-activity-worker"),
+            racing_fact_activity_claim_opts(),
+        )
+        .await
+        .unwrap()
+        .expect("activity task")
+}
+
+async fn complete_racing_fact_activity<B>(backend: &B, activity: durust::ClaimedActivityTask)
+where
+    B: DurableBackend,
+{
+    backend
+        .complete_activity(durust::CompleteActivityRequest {
+            claim: activity.claim,
+            result: durust::encode_payload(&6u64).unwrap(),
+        })
+        .await
+        .unwrap();
+}
+
+fn racing_fact_activity_claim_opts() -> durust::ClaimActivityOptions {
+    durust::ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("racing-fact-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+fn terminal_parent_commit() -> WorkflowTaskCommit {
     WorkflowTaskCommit {
-        expected_tail_event_id,
         append_events: vec![durust::NewHistoryEvent::new(
             HistoryEventData::WorkflowCompleted {
                 result: durust::encode_payload(&()).unwrap(),
@@ -8434,7 +8449,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -8455,12 +8469,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -8622,7 +8631,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -8649,12 +8657,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -9061,7 +9064,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(scheduled),
                 )],
@@ -9084,9 +9086,7 @@ where
         .unwrap();
     assert_eq!(
         outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
+        EventId(3),
         "the empty map's terminal fact is appended by the scheduling commit, \
          so the returned tail must count it"
     );
@@ -9144,7 +9144,7 @@ where
     );
     assert_eq!(ready.replay_target_event_id, EventId(3));
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(3)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 
@@ -9181,7 +9181,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
                         durust::ChildWorkflowMapScheduled {
@@ -9213,12 +9212,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     let history = stream_history(&backend, child_run_id).await;
     assert_eq!(
         history
@@ -9255,7 +9249,7 @@ where
         durust::WorkflowTaskReason::ChildWorkflowMapCompleted
     );
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(3)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 }
@@ -9321,7 +9315,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(scheduled)),
                     durust::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
@@ -9344,12 +9337,7 @@ where
         )
         .await
         .expect("a commit that schedules an empty map and closes its run must stay accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     assert_eq!(
         stream_history(&backend, run_id)
             .await
@@ -9393,7 +9381,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::ChildWorkflowMapScheduled(
                         durust::ChildWorkflowMapScheduled {
@@ -9438,12 +9425,7 @@ where
         )
         .await
         .expect("a commit that schedules an empty child map and closes its run stays accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     assert_eq!(
         stream_history(&backend, child_run_id)
             .await
@@ -9500,7 +9482,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
                         durust::ActivityMapScheduled {
@@ -9575,12 +9556,7 @@ where
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(5)
-        },
-    );
+    assert_eq!(outcome, EventId(5),);
     let history = stream_history(&backend, run_id).await;
     assert_eq!(
         history
@@ -9631,7 +9607,7 @@ where
     );
     assert_eq!(ready.replay_target_event_id, EventId(5));
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(5)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 }
@@ -9801,7 +9777,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::ChildWorkflowMapScheduled(
                         scheduled,
@@ -9866,7 +9841,6 @@ where
         .commit_workflow_task(
             ready.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: ready.replay_target_event_id,
                 cancel_commands: vec![map_command_id.clone()],
                 ..WorkflowTaskCommit::default()
             },
@@ -9987,7 +9961,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(
                         durust::TimerStarted {
@@ -10040,12 +10013,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(4)
-        }
-    );
+    assert_eq!(outcome, EventId(4));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -10291,7 +10259,6 @@ where
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: schedules
                         .iter()
                         .cloned()
@@ -10310,9 +10277,7 @@ where
             )
             .await
             .unwrap(),
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        }
+        EventId(3)
     );
 
     let mut claimed_activities = backend
@@ -10431,7 +10396,7 @@ async fn schedule_activity_map<B>(
     durust::RunId,
     durust::CommandId,
     ClaimActivityOptions,
-    durust::Result<CommitOutcome>,
+    durust::Result<EventId>,
 )
 where
     B: DurableBackend,
@@ -10481,7 +10446,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -10682,7 +10646,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: command_id.clone(),
@@ -10984,7 +10947,6 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
                         durust::ChildWorkflowMapScheduled {
@@ -11236,7 +11198,6 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
                 failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
             };
             let commit = || WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
                         durust::ChildWorkflowMapScheduled {
@@ -11378,7 +11339,6 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
                 .expect("parent workflow task");
             let command_id = durust::command_id(&parent_run_id, 1);
             let commit = || WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(
                         durust::ChildWorkflowStartRequested {
@@ -11828,7 +11788,6 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             durust::NewHistoryEvent::new(
                                 HistoryEventData::ChildWorkflowStartRequested(
@@ -11989,7 +11948,6 @@ fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured
                 backend.commit_workflow_task(
                     claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![durust::NewHistoryEvent::new(
                             HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                                 command_id: command_id.clone(),
@@ -12106,7 +12064,6 @@ fn timer_wait_closing_commit(
     let command_id = durust::command_id(run_id, 1);
     let wait_id = durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
     let commit = WorkflowTaskCommit {
-        expected_tail_event_id: EventId(1),
         append_events: vec![
             durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(durust::TimerStarted {
                 command_id: command_id.clone(),
@@ -12183,12 +12140,7 @@ where
         .commit_workflow_task(claimed.claim, commit)
         .await
         .expect("a commit that starts a timer and closes its own run must be accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     (run_id, wait_id)
 }
 
@@ -12233,7 +12185,6 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::TimerStarted(durust::TimerStarted {
                         command_id: command_id.clone(),
@@ -12254,12 +12205,7 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     let fired = backend
         .fire_due_timers(durust::FireDueTimersRequest {
@@ -12464,12 +12410,7 @@ fn postgres_closing_commits_delete_wait_rows_on_both_commit_paths_when_configure
                 .unwrap();
             assert_eq!(results.len(), 2);
             for result in &results {
-                assert_eq!(
-                    *result.result.as_ref().unwrap(),
-                    CommitOutcome::Committed {
-                        new_tail_event_id: EventId(3)
-                    },
-                );
+                assert_eq!(*result.result.as_ref().unwrap(), EventId(3),);
             }
             for claimed in &claims {
                 assert_eq!(
@@ -12562,7 +12503,6 @@ where
         .commit_workflow_task(
             closing.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&()).unwrap(),
@@ -12573,12 +12513,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     client
         .start_workflow::<workflow>(
@@ -12601,7 +12536,6 @@ where
         .commit_workflow_task(
             injector.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 upsert_waits: vec![durust::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
@@ -12618,12 +12552,7 @@ where
         )
         .await
         .expect("the forging commit is a live run's own commit and must be accepted");
-    assert_eq!(
-        injected,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        },
-    );
+    assert_eq!(injected, EventId(1),);
     closed_run_id
 }
 
@@ -12728,7 +12657,6 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::TimerStarted(durust::TimerStarted {
                         command_id: command_id.clone(),
@@ -12749,12 +12677,7 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     let budgeted = backend
         .fire_due_timers(durust::FireDueTimersRequest {
@@ -12899,7 +12822,6 @@ where
         .commit_workflow_task(
             claimed_b.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::TimerStarted(durust::TimerStarted {
                         command_id: timer_command.clone(),
@@ -12920,12 +12842,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     // A's commit names B's signal, B's wait, and a new wait for B.
     let claimed_a = backend
@@ -12942,7 +12859,6 @@ where
         .commit_workflow_task(
             claimed_a.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![durust::SignalId::new("signal/fence/b")],
                 delete_waits: vec![timer_wait_id],
                 upsert_waits: vec![durust::WaitRecord {
@@ -12961,12 +12877,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let inbox = backend
         .read_signal_inbox(durust::ReadSignalInboxRequest {
@@ -13071,7 +12982,6 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
                     durust::WorkflowTaskCommitInput {
                         claim: first.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: EventId(1),
                             append_events: vec![durust::NewHistoryEvent::new(
                                 HistoryEventData::ActivityScheduled(scheduled.clone()),
                             )],
@@ -13084,7 +12994,6 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
                     durust::WorkflowTaskCommitInput {
                         claim: second.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: EventId(1),
                             append_events: vec![durust::NewHistoryEvent::new(
                                 HistoryEventData::WorkflowCompleted {
                                     result: durust::encode_payload(&"done").unwrap(),
@@ -13251,7 +13160,6 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
             let fire_at = durust::TimestampMs(1_000);
             let timer_command = durust::command_id(&run_a, 1);
             let valid = WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::TimerStarted(durust::TimerStarted {
                         command_id: timer_command.clone(),
@@ -13278,7 +13186,6 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
             let activity_name = ActivityName::new("conformance.echo");
             let task_queue = TaskQueue::new("savepoint-activities");
             let failing = WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![durust::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
                         command_id: map_command.clone(),
@@ -13329,12 +13236,7 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
                 .await
                 .unwrap();
             assert_eq!(results.len(), 2);
-            assert_eq!(
-                results[0].result.as_ref().unwrap(),
-                &CommitOutcome::Committed {
-                    new_tail_event_id: EventId(2)
-                }
-            );
+            assert_eq!(results[0].result.as_ref().unwrap(), &EventId(2));
             let err = results[1].result.as_ref().unwrap_err();
             assert!(
                 !matches!(err, durust::Error::Backend(_)),
@@ -13455,7 +13357,6 @@ fn memory_timeout_retry_becomes_visible_after_the_policy_backoff() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![durust::NewHistoryEvent::new(
                         HistoryEventData::ActivityScheduled(scheduled.clone()),
                     )],
@@ -13564,7 +13465,6 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![durust::NewHistoryEvent::new(
                         HistoryEventData::ActivityScheduled(scheduled.clone()),
                     )],

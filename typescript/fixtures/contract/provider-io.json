@@ -14,7 +14,25 @@
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     },
     "started": {
@@ -69,7 +87,25 @@
               "schemaFingerprint": "sha256:checkout-input",
               "compression": "None",
               "encryption": null,
-              "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+              "bytes": [
+                123,
+                34,
+                111,
+                114,
+                100,
+                101,
+                114,
+                73,
+                100,
+                34,
+                58,
+                34,
+                111,
+                45,
+                49,
+                34,
+                125
+              ]
             }
           }
         }
@@ -101,7 +137,25 @@
               "schemaFingerprint": "sha256:checkout-input",
               "compression": "None",
               "encryption": null,
-              "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+              "bytes": [
+                123,
+                34,
+                111,
+                114,
+                100,
+                101,
+                114,
+                73,
+                100,
+                34,
+                58,
+                34,
+                111,
+                45,
+                49,
+                34,
+                125
+              ]
             }
           }
         }
@@ -117,7 +171,6 @@
       "token": 7
     },
     "commit": {
-      "expectedTailEventId": 1,
       "appendEvents": [
         {
           "data": {
@@ -138,24 +191,40 @@
           "readyAt": 1781821484000
         }
       ],
-      "deleteWaits": ["run-1:signal:6"],
-      "consumeSignals": ["signal-1"],
+      "deleteWaits": [
+        "run-1:signal:6"
+      ],
+      "consumeSignals": [
+        "signal-1"
+      ],
       "queryProjection": {
         "kind": "Inline",
         "codec": "Json",
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     },
-    "committed": {
-      "kind": "Committed",
-      "newTailEventId": 2
-    },
-    "conflict": {
-      "kind": "Conflict"
-    }
+    "newTailEventId": 2
   },
   "signalWorkflow": {
     "request": {
@@ -169,7 +238,25 @@
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     },
     "accepted": {
@@ -187,7 +274,25 @@
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     }
   },
@@ -209,7 +314,25 @@
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     },
     "completed": {
@@ -233,7 +356,25 @@
             "schemaFingerprint": "sha256:checkout-input",
             "compression": "None",
             "encryption": null,
-            "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+            "bytes": [
+              123,
+              34,
+              111,
+              114,
+              100,
+              101,
+              114,
+              73,
+              100,
+              34,
+              58,
+              34,
+              111,
+              45,
+              49,
+              34,
+              125
+            ]
           }
         }
       ]
@@ -299,7 +440,25 @@
         "schemaFingerprint": "sha256:checkout-input",
         "compression": "None",
         "encryption": null,
-        "bytes": [123, 34, 111, 114, 100, 101, 114, 73, 100, 34, 58, 34, 111, 45, 49, 34, 125]
+        "bytes": [
+          123,
+          34,
+          111,
+          114,
+          100,
+          101,
+          114,
+          73,
+          100,
+          34,
+          58,
+          34,
+          111,
+          45,
+          49,
+          34,
+          125
+        ]
       }
     },
     "notFound": {

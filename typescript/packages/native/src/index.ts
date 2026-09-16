@@ -20,8 +20,9 @@ import {
   type ClaimWorkflowBatchOptions,
   type ClaimWorkflowTaskOptions,
   type ClaimedActivityTask,
+  eventId,
   type ClaimedWorkflowTask,
-  type CommitOutcome,
+  type EventId,
   type CompleteActivitiesOutcome,
   type CompleteActivitiesRequest,
   type CompleteActivityOutcome,
@@ -354,8 +355,10 @@ export class NativeBackend implements DurableBackend {
     return unpack(await this.#invoke((handle) => handle.streamHistory(pack(req))));
   }
 
-  async commitWorkflowTask(claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<CommitOutcome> {
-    return unpack(await this.#invoke((handle) => handle.commitWorkflowTask(pack(claim), pack(commit))));
+  async commitWorkflowTask(claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<EventId> {
+    return eventId(
+      Number(unpack(await this.#invoke((handle) => handle.commitWorkflowTask(pack(claim), pack(commit)))))
+    );
   }
 
   async releaseWorkflowTask(claim: WorkflowTaskClaim, options?: ReleaseWorkflowTaskOptions): Promise<void> {

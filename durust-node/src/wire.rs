@@ -245,7 +245,6 @@ pub struct SignalConsumed {
 pub struct SelectWinner {
     pub select_command_id: CommandId,
     pub branch_ordinal: u32,
-    pub winning_event_id: u64,
     pub branches_digest: String,
 }
 
@@ -558,7 +557,6 @@ impl From<durust::HistoryEventData> for HistoryEventData {
                 winner: SelectWinner {
                     select_command_id: (&w.select_command_id).into(),
                     branch_ordinal: w.branch_ordinal,
-                    winning_event_id: w.winning_event_id.0,
                     branches_digest: w.branches_digest,
                 },
             },
@@ -744,7 +742,6 @@ impl From<HistoryEventData> for durust::HistoryEventData {
             HistoryEventData::SelectWinner { winner: w } => R::SelectWinner(durust::SelectWinner {
                 select_command_id: w.select_command_id.into(),
                 branch_ordinal: w.branch_ordinal,
-                winning_event_id: durust::EventId(w.winning_event_id),
                 branches_digest: w.branches_digest,
             }),
             HistoryEventData::VersionMarker { marker: m } => {
@@ -1176,7 +1173,6 @@ impl From<durust::HistoryChunk> for HistoryChunk {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowTaskCommit {
-    pub expected_tail_event_id: u64,
     #[serde(default)]
     pub append_events: Option<Vec<NewHistoryEvent>>,
     #[serde(default)]
@@ -1202,7 +1198,6 @@ pub struct WorkflowTaskCommit {
 impl From<WorkflowTaskCommit> for durust::WorkflowTaskCommit {
     fn from(commit: WorkflowTaskCommit) -> Self {
         durust::WorkflowTaskCommit {
-            expected_tail_event_id: durust::EventId(commit.expected_tail_event_id),
             append_events: commit
                 .append_events
                 .unwrap_or_default()
@@ -1262,24 +1257,6 @@ impl From<WorkflowTaskCommit> for durust::WorkflowTaskCommit {
                 .map(Into::into)
                 .collect(),
             query_projection: commit.query_projection,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all_fields = "camelCase")]
-pub enum CommitOutcome {
-    Committed { new_tail_event_id: u64 },
-    Conflict,
-}
-
-impl From<durust::CommitOutcome> for CommitOutcome {
-    fn from(outcome: durust::CommitOutcome) -> Self {
-        match outcome {
-            durust::CommitOutcome::Committed { new_tail_event_id } => Self::Committed {
-                new_tail_event_id: new_tail_event_id.0,
-            },
-            durust::CommitOutcome::Conflict => Self::Conflict,
         }
     }
 }

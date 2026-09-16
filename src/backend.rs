@@ -85,11 +85,21 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         self.hydrate_payload(payload)
     }
 
+    /// Applies one workflow task's writes atomically and returns the run's new
+    /// history tail.
+    ///
+    /// The claim token is the whole fence. Only the claim holder appends
+    /// replay-window events, and the three paths that append one from outside
+    /// a claim — `cancel_workflow` and the two parent-close paths — revoke the
+    /// claim in the same transaction. So a provider rejects a commit whose
+    /// token no longer owns the run ([`Error::StaleLease`]) and needs no
+    /// further check: facts appended concurrently by activity workers, timer
+    /// sweeps, and child dispatch never invalidate a task.
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>>;
+    ) -> BoxFuture<'static, Result<EventId>>;
 
     fn commit_workflow_tasks(
         &self,
@@ -438,9 +448,11 @@ pub struct HistoryChunk {
     pub has_more: bool,
 }
 
+/// Everything one workflow task writes, applied atomically (see the
+/// `commit_workflow_task` contract). The claim token is the fence: a provider
+/// applies this only while `claim` still owns the run.
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowTaskCommit {
-    pub expected_tail_event_id: EventId,
     pub append_events: Vec<NewHistoryEvent>,
     pub upsert_waits: Vec<WaitRecord>,
     pub schedule_activities: Vec<ActivityTask>,
@@ -467,13 +479,8 @@ pub struct WorkflowTaskCommitInput {
 #[derive(Clone, Debug)]
 pub struct WorkflowTaskCommitBatchResult {
     pub claim: WorkflowTaskClaim,
-    pub result: Result<CommitOutcome>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommitOutcome {
-    Committed { new_tail_event_id: EventId },
-    Conflict,
+    /// The run's new history tail, or why this item could not be applied.
+    pub result: Result<EventId>,
 }
 
 #[derive(Clone, Debug)]
@@ -776,12 +783,5 @@ impl WorkflowChangeVersionsOutcome {
         self.records
             .iter()
             .all(|record| record.status == WorkflowChangeVersionStatus::Closed)
-    }
-}
-
-pub fn conflict_to_error(outcome: CommitOutcome) -> Result<EventId> {
-    match outcome {
-        CommitOutcome::Committed { new_tail_event_id } => Ok(new_tail_event_id),
-        CommitOutcome::Conflict => Err(Error::Conflict),
     }
 }

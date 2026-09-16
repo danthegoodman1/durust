@@ -433,10 +433,7 @@ describe("Worker", () => {
       value: "ok"
     });
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: "ok" });
     await expect(worker.runWorkflowTaskOnce()).resolves.toEqual({ kind: "NoTask" });
   });
@@ -589,18 +586,12 @@ describe("Worker", () => {
       { sku: "sku-1" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -626,19 +617,13 @@ describe("Worker", () => {
       { sku: "sku-timeout" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await claimActivity(backend, "stalled-activity-worker", {
       activityNames: [quoteActivity.name]
     });
 
     await expect(worker.runActivityTimeoutMaintenanceOnce()).resolves.toEqual({ timedOut: 1 });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toMatchObject({
       errorType: "ActivityTimedOut",
       message: expect.stringContaining("start-to-close timed out")
@@ -711,10 +696,7 @@ describe("Worker", () => {
       { value: "ok" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: "ok" });
     expect(worker.metrics()).toMatchObject({
       workflowTaskClaims: 1,
@@ -744,10 +726,7 @@ describe("Worker", () => {
       { first: "aa", second: "bbbb" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     const outcome = await worker.run({
       maxIterations: 4,
       idleBackoffMs: 0,
@@ -795,10 +774,7 @@ describe("Worker", () => {
       { first: "aa", second: "bbbb" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     const stopped = await worker.run({
       signal: controller.signal,
       maxIterations: 64,
@@ -865,10 +841,7 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     const stopped = await worker.run({
       signal: controller.signal,
       maxIterations: 64,
@@ -993,10 +966,7 @@ describe("Worker", () => {
       activityTaskClaims: 0,
       timersFired: 0
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: "ok" });
   });
 
@@ -1056,10 +1026,7 @@ describe("Worker", () => {
         ? { kind: "Completed", outcome: { kind: "Completed" } }
         : { kind: "NoTask" }
     );
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -1083,10 +1050,7 @@ describe("Worker", () => {
       "workflows",
       {}
     );
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const quoteHandle = await client.startWorkflow(
       quoteWorkflow,
@@ -1094,10 +1058,7 @@ describe("Worker", () => {
       "workflows",
       { sku: "sku-1" }
     );
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const loopWorker = workerFixture(backend, registry, {
       workerId: "loop-worker",
@@ -1158,10 +1119,7 @@ describe("Worker", () => {
       "workflows",
       {}
     );
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const timeoutHandle = await client.startWorkflow(
       catchesActivityTimeoutWorkflow,
@@ -1169,10 +1127,7 @@ describe("Worker", () => {
       "workflows",
       { sku: "sku-timeout" }
     );
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await claimActivity(backend, "timeout-claimer", {
       activityNames: [quoteActivity.name]
     });
@@ -1276,10 +1231,7 @@ describe("Worker", () => {
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(trace).toEqual(["start:sku-1", "after:5"]);
     expect(workflowWorker.metrics()).toMatchObject({
@@ -1360,10 +1312,7 @@ describe("Worker", () => {
         kind: "Completed",
         outcome: { kind: "Completed" }
       });
-      await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
       expect(unhandledRejections).toEqual([]);
       expect(trace).toEqual(["start:sku-1", "after:5"]);
@@ -1490,10 +1439,7 @@ describe("Worker", () => {
       idempotencyKey: "approved-1"
     });
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: "ok" });
   });
 
@@ -1519,10 +1465,7 @@ describe("Worker", () => {
       outcome: { kind: "Completed" }
     });
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
     await expect(worker.runActivityTaskOnce()).resolves.toEqual({ kind: "NoTask" });
   });
@@ -1547,18 +1490,12 @@ describe("Worker", () => {
       { sku: "sku-1" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(streamRequests.map((request) => Number(request.afterEventId))).toEqual([2]);
     expect(streamRequests.map((request) => Number(request.upToEventId))).toEqual([3]);
@@ -1599,22 +1536,13 @@ describe("Worker", () => {
       { sku: "sku-2" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(streamRequests.map((request) => Number(request.afterEventId))).toEqual([1, 2]);
     expect(streamRequests.map((request) => Number(request.upToEventId))).toEqual([3, 3]);
@@ -1659,18 +1587,12 @@ describe("Worker", () => {
       { sku: "sku-1" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(trace).toEqual(["start:sku-1", "after:5"]);
     expect(worker.metrics()).toMatchObject({
@@ -1719,10 +1641,7 @@ describe("Worker", () => {
 
     await firstWorker.runWorkflowTaskOnce();
     await firstWorker.runActivityTaskOnce();
-    await expect(restartedWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(restartedWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(trace).toEqual(["start:sku-1", "start:sku-1", "after:5"]);
     expect(restartedWorker.metrics()).toMatchObject({
@@ -1773,10 +1692,7 @@ describe("Worker", () => {
     await worker.runWorkflowTaskOnce();
     await worker.runWorkflowTaskOnce();
     await worker.runActivityTaskOnce();
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     expect(trace).toEqual([
       "start:one",
@@ -1790,134 +1706,6 @@ describe("Worker", () => {
       workflowExecutionCacheEvictions: 1
     });
     await expect(first.result()).resolves.toEqual({ cents: 3 });
-  });
-
-  it("invalidates a hot workflow execution after a provider commit conflict", async () => {
-    let nowMs = 0;
-    const inner = NativeBackend.memory({ nowMs: () => nowMs });
-    let conflictsRemaining = 1;
-    const backend = conflictWorkflowCompletionOnce(inner, () => conflictsRemaining-- > 0);
-    const trace: string[] = [];
-    const conflictWorkflow = workflow({
-      name: "worker.hot-cache-conflict",
-      version: 1,
-      handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
-        trace.push(`start:${input.sku}`);
-        const quote = await callActivity(
-          quoteActivity,
-          { sku: input.sku },
-          { taskQueue: "activities" }
-        );
-        trace.push(`after:${quote.cents}`);
-        return { cents: quote.cents };
-      }
-    });
-    const registry = new Registry().registerWorkflow(conflictWorkflow).registerActivity(quoteActivity);
-    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = workerFixture(backend, registry, {
-      workerId: "worker-a",
-      activityTaskQueue: "activities",
-      leaseDurationMs: 1,
-      payloadCodec: "Json"
-    });
-    const handle = await client.startWorkflow(
-      conflictWorkflow,
-      workflowId("wf/worker-hot-cache-conflict"),
-      "workflows",
-      { sku: "sku-1" }
-    );
-
-    await worker.runWorkflowTaskOnce();
-    await worker.runActivityTaskOnce();
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Conflict" }
-    });
-    nowMs = 2;
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-
-    expect(trace).toEqual(["start:sku-1", "after:5", "start:sku-1", "after:5"]);
-    expect(worker.metrics()).toMatchObject({
-      workflowTaskConflicts: 1,
-      workflowExecutionCacheHits: 1,
-      workflowExecutionCacheMisses: 2
-    });
-    await expect(handle.result()).resolves.toEqual({ cents: 5 });
-  });
-
-  it("disposes a parked hot workflow execution after a commit conflict", async () => {
-    let nowMs = 0;
-    const inner = NativeBackend.memory({ nowMs: () => nowMs });
-    let conflictsRemaining = 1;
-    const backend = conflictActivitySchedulingOnce(inner, () => conflictsRemaining-- > 0);
-    const trace: string[] = [];
-    const unhandledRejections: unknown[] = [];
-    const onUnhandledRejection = (reason: unknown): void => {
-      unhandledRejections.push(reason);
-    };
-    process.on("unhandledRejection", onUnhandledRejection);
-    try {
-      const conflictWorkflow = workflow({
-        name: "worker.hot-dispose-conflict",
-        version: 1,
-        handler: disposalTracingHandler(trace)
-      });
-      const registry = new Registry()
-        .registerWorkflow(conflictWorkflow)
-        .registerActivity(quoteActivity);
-      const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-      const worker = workerFixture(backend, registry, {
-        workerId: "worker-a",
-        activityTaskQueue: "activities",
-        leaseDurationMs: 1,
-        payloadCodec: "Json"
-      });
-      const handle = await client.startWorkflow(
-        conflictWorkflow,
-        workflowId("wf/worker-hot-dispose-conflict"),
-        "workflows",
-        { sku: "sku-1" }
-      );
-
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Conflict" }
-      });
-      await flushUnhandledRejectionTurn();
-      // The conflicted execution was parked on its activity waiter. Without
-      // disposal that frame stays pending for the life of the process.
-      expect(trace).toEqual(["start:sku-1", "waiter:workflow task commit conflicted"]);
-      expect(unhandledRejections).toEqual([]);
-
-      nowMs = 2;
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
-      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
-        kind: "Completed",
-        outcome: { kind: "Completed" }
-      });
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
-      await flushUnhandledRejectionTurn();
-
-      expect(trace).toEqual([
-        "start:sku-1",
-        "waiter:workflow task commit conflicted",
-        "start:sku-1",
-        "after:5"
-      ]);
-      expect(unhandledRejections).toEqual([]);
-      await expect(handle.result()).resolves.toEqual({ cents: 5 });
-    } finally {
-      process.off("unhandledRejection", onUnhandledRejection);
-    }
   });
 
   it("disposes a parked hot workflow execution after a failed workflow task", async () => {
@@ -1957,18 +1745,12 @@ describe("Worker", () => {
       expect(trace).toEqual(["start:sku-1", "waiter:workflow task failed before commit"]);
       expect(unhandledRejections).toEqual([]);
 
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
         kind: "Completed",
         outcome: { kind: "Completed" }
       });
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
 
       expect(trace).toEqual([
@@ -2038,10 +1820,7 @@ describe("Worker", () => {
         kind: "Completed",
         outcome: { kind: "Completed" }
       });
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
 
       expect(trace).toEqual([
@@ -2090,10 +1869,7 @@ describe("Worker", () => {
         { sku: "sku-1" }
       );
 
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
       // The task committed, but the frame it left parked on the activity waiter
       // is never reused, so it is abandoned the moment the commit lands.
@@ -2104,10 +1880,7 @@ describe("Worker", () => {
         kind: "Completed",
         outcome: { kind: "Completed" }
       });
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
 
       expect(trace).toEqual([
@@ -2190,26 +1963,17 @@ describe("Worker", () => {
       );
 
       // The caching worker schedules the first activity and keeps the frame.
-      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await cachingWorker.runActivityTaskOnce();
 
       // A different worker takes the wake task and appends command events the
       // cached frame never saw, so it can no longer be woken hot.
-      await expect(competingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(competingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await competingWorker.runActivityTaskOnce();
       await flushUnhandledRejectionTurn();
       expect(unhandledRejections).toEqual([]);
 
-      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(cachingWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await flushUnhandledRejectionTurn();
 
       expect(trace).toEqual([
@@ -2289,10 +2053,7 @@ describe("Worker", () => {
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -2390,7 +2151,6 @@ describe("Worker", () => {
 
     await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
-      outcome: { kind: "Committed" },
       localActivityTasks: 1
     });
 
@@ -2402,10 +2162,7 @@ describe("Worker", () => {
     ]);
     await expect(remoteWorker.runActivityTaskOnce()).resolves.toEqual({ kind: "NoTask" });
 
-    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -2435,7 +2192,6 @@ describe("Worker", () => {
 
     await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
-      outcome: { kind: "Committed" },
       localActivityTasks: 0
     });
     const historyAfterSchedule = await readHistory(backend, handle.runId, 10);
@@ -2448,10 +2204,7 @@ describe("Worker", () => {
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -2471,10 +2224,7 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Completed",
       outcome: { kind: "Completed" }
@@ -2487,10 +2237,7 @@ describe("Worker", () => {
       kind: "Completed",
       outcome: { kind: "Completed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ totalCents: 7 });
 
     const history = await readHistory(backend, handle.runId, 10);
@@ -2518,18 +2265,12 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Failed",
       outcome: { kind: "Failed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ failure: "activity exploded" });
 
     const history = await readHistory(backend, handle.runId, 10);
@@ -2564,10 +2305,7 @@ describe("Worker", () => {
       kind: "Failed",
       outcome: { kind: "Failed" }
     });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ failure: "activity exploded" });
   });
 
@@ -2585,22 +2323,10 @@ describe("Worker", () => {
       { value: "order-1" }
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ value: "order-1/child" });
   });
 
@@ -2650,10 +2376,7 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).rejects.toMatchObject({
       name: "WorkflowFailureError",
       failure: {
@@ -2688,14 +2411,8 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({
       errorType: "durust.child_workflow_id_conflict"
     });
@@ -2715,26 +2432,11 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({
       values: ["a/child", "b/child", "c/child"]
     });
@@ -2806,14 +2508,8 @@ describe("Worker", () => {
       {}
     );
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({
       errorType: "durust.child_workflow_id_conflict"
     });
@@ -2870,10 +2566,7 @@ describe("Worker", () => {
     await worker.runWorkflowTaskOnce();
     await worker.runWorkflowTaskOnce();
     const result = await handle.result();
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const childHistory = await readHistory(backend, runId(result.childRunId), 10);
     expect(childHistory.events.map((event) => event.eventType)).toEqual([
@@ -3108,10 +2801,7 @@ describe("Worker claim release on error paths", () => {
       payloadCodec: "Json"
     });
 
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
       kind: "Failed",
       outcome: { kind: "Failed" }
@@ -3185,10 +2875,7 @@ describe("Worker run loops", () => {
       { sku: "sku-1" }
     );
     parkedRunId = String(parkedHandle.runId);
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const running = worker.run({
       signal: controller.signal,
@@ -3219,10 +2906,7 @@ describe("Worker run loops", () => {
 
     await expect(echoHandle.result()).resolves.toEqual({ value: "ok" });
     expect(parkedActivityFinished).toBe(true);
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(parkedHandle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -3240,10 +2924,7 @@ describe("Worker run loops", () => {
       "workflows",
       { sku: "sku-1" }
     );
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     const backend = failBackendCall(
       inner,
@@ -3289,10 +2970,7 @@ describe("Worker run loops", () => {
       expect((error as Error).message).toBe("workflow claim exploded");
     }
     expect(loopWorker.metrics()).toMatchObject({ activityTaskCompletions: 1 });
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
   });
 
@@ -3594,10 +3272,7 @@ describe("Worker run loops", () => {
       expect(calls.length).toBe(afterStop);
       expect(unhandledRejections).toEqual([]);
 
-      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
       await expect(handle.result()).resolves.toEqual({ cents: 5 });
     } finally {
       process.off("unhandledRejection", onUnhandledRejection);
@@ -3649,10 +3324,7 @@ describe("Worker run loops", () => {
         "workflows",
         { sku: "sku-1" }
       );
-      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
       const worker = workerFixture(failBackendCall(inner, "claimWorkflowTask", new Error("workflow claim exploded")), registry, {
         workerId: "error-budget-worker",
@@ -3735,10 +3407,7 @@ describe("Worker run loops", () => {
         "workflows",
         { sku: "sku-1" }
       );
-      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-        kind: "Committed",
-        outcome: { kind: "Committed" }
-      });
+      await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
       const worker = workerFixture(failBackendCall(inner, "fireDueTimers", new Error("timers exploded")), registry, {
         workerId: "maintenance-error-budget-worker",
@@ -3967,18 +3636,12 @@ describe("Worker hot join settlement", () => {
     // is still pending. It must commit anyway rather than park until its lease
     // expires.
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     // The second branch completes in a later task. The first branch's
     // completion left the runtime's ready-event index two tasks ago and is not
     // in this wake's delta, so the join has to remember it.
     await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
 
     await expect(handle.result()).resolves.toEqual({ total: 15 });
   });
@@ -4062,7 +3725,7 @@ describe("Worker replay window reserve", () => {
       payloadCodec: "Json"
     });
     const outcome = await replayer.runWorkflowTaskOnce();
-    expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+    expect(outcome).toMatchObject({ kind: "Committed" });
     if (outcome.kind !== "Committed") {
       throw new Error("expected a committed workflow task");
     }
@@ -4242,10 +3905,7 @@ describe("Worker replay memory", () => {
       payloadCodec: "Json"
     });
     const baseline = retainedBytes();
-    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     expect(samples.length).toBeGreaterThan(0);
     return Math.max(...samples) - baseline;
   }
@@ -4350,7 +4010,7 @@ describe("Worker replay memory", () => {
         if (outcome.kind === "NoTask") {
           break;
         }
-        expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+        expect(outcome).toMatchObject({ kind: "Committed" });
         commits += 1;
       }
       const retained = retainedBytes() - baseline;
@@ -4388,7 +4048,7 @@ describe("Worker replay memory", () => {
         payloadCodec: "Json"
       });
       const outcome = await worker.runWorkflowTaskOnce();
-      expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+      expect(outcome).toMatchObject({ kind: "Committed" });
       if (outcome.kind !== "Committed") {
         throw new Error("expected a committed workflow task");
       }
@@ -4636,28 +4296,6 @@ function truncateWorkflowClaimPrefetch(
   }) as DurableBackend;
 }
 
-function conflictWorkflowCompletionOnce(
-  inner: DurableBackend,
-  shouldConflict: () => boolean
-): DurableBackend {
-  return new Proxy(inner, {
-    get(target, property, receiver) {
-      if (property === "commitWorkflowTask") {
-        return async (...args: Parameters<DurableBackend["commitWorkflowTask"]>) => {
-          const commit = args[1];
-          const completing = (commit.appendEvents ?? [])
-            .some((event) => event.data.kind === "WorkflowCompleted");
-          if (completing && shouldConflict()) {
-            return { kind: "Conflict" };
-          }
-          return await target.commitWorkflowTask(...args);
-        };
-      }
-      const value = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    }
-  }) as DurableBackend;
-}
 
 // A workflow that parks on an activity and records whichever disposal reason
 // the runtime raises into that waiter, so a test pins the exact call site that
@@ -4683,28 +4321,6 @@ function disposalTracingHandler(
   };
 }
 
-// Conflicts the commit that schedules an activity, so the abandoned execution
-// is parked on a durable-API waiter rather than already terminal.
-function conflictActivitySchedulingOnce(
-  inner: DurableBackend,
-  shouldConflict: () => boolean
-): DurableBackend {
-  return new Proxy(inner, {
-    get(target, property, receiver) {
-      if (property === "commitWorkflowTask") {
-        return async (...args: Parameters<DurableBackend["commitWorkflowTask"]>) => {
-          const scheduling = (args[1].scheduleActivities ?? []).length > 0;
-          if (scheduling && shouldConflict()) {
-            return { kind: "Conflict" };
-          }
-          return await target.commitWorkflowTask(...args);
-        };
-      }
-      const value = Reflect.get(target, property, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    }
-  }) as DurableBackend;
-}
 
 // Throws out of the commit call itself, which is the post-prepare failure path:
 // the execution is prepared and parked, and its task dies before any commit.
@@ -4783,7 +4399,7 @@ async function drainWorkflowTasks(worker: Worker, atLeast: number): Promise<void
     if (outcome.kind === "NoTask") {
       break;
     }
-    expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+    expect(outcome).toMatchObject({ kind: "Committed" });
     committed += 1;
   }
   expect(committed).toBeGreaterThanOrEqual(atLeast);

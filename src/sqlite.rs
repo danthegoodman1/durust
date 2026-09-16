@@ -22,12 +22,12 @@ use crate::{
     ChildStartOutboxMessage, ChildWorkflowMapFailureMode, ChildWorkflowMapItem,
     ChildWorkflowMapItemOutcome, ChildWorkflowMapTask, ClaimActivityOptions,
     ClaimWorkflowTaskOptions, ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq,
-    CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest,
-    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend, Error,
-    EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, ParentClosePolicy, PayloadBlob, PayloadRef,
-    PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result,
-    RunId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    CompleteActivityOutcome, CompleteActivityRequest, DispatchChildWorkflowStartsOutcome,
+    DispatchChildWorkflowStartsRequest, DurableBackend, Error, EventId, FailActivityOutcome,
+    FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest, HistoryChunk, HistoryEvent,
+    HistoryEventData, ParentClosePolicy, PayloadBlob, PayloadRef, PayloadRootRef,
+    PayloadRootsOutcome, PayloadStorageConfig, ReadSignalInboxRequest, Result, RunId,
+    SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
     StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
     WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
     WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
@@ -550,7 +550,8 @@ impl DurableBackend for SqliteBackend {
             let token = next_counter(&tx, "claim")?;
             tx.execute(
                 "update workflow_instances
-                 set workflow_claim_token = ?1, claim_lease_until_ms = ?2
+                 set workflow_claim_token = ?1, claim_lease_until_ms = ?2,
+                     claim_tail_event_id = current_event_id
                  where run_id = ?3",
                 params![
                     token,
@@ -629,15 +630,24 @@ impl DurableBackend for SqliteBackend {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>> {
+    ) -> BoxFuture<'static, Result<EventId>> {
         let result = (|| {
             let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let Some((current_tail, claim_token, terminal, namespace, workflow_id)) = tx
+            let Some((
+                current_tail,
+                claim_token,
+                terminal,
+                namespace,
+                workflow_id,
+                ready_reason,
+                claim_tail_event_id,
+            )) = tx
                 .query_row(
-                    "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id
+                    "select current_event_id, workflow_claim_token, terminal, namespace,
+                            workflow_id, ready_reason, claim_tail_event_id
                      from workflow_instances where run_id = ?1",
                     params![claim.run_id.0],
                     |row| {
@@ -647,6 +657,8 @@ impl DurableBackend for SqliteBackend {
                             row.get::<_, bool>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<u64>>(6)?,
                         ))
                     },
                 )
@@ -658,20 +670,14 @@ impl DurableBackend for SqliteBackend {
             if claim_token != Some(claim.token) {
                 return Err(Error::StaleLease);
             }
-            if EventId(current_tail) != batch.expected_tail_event_id {
-                tx.execute(
-                    "update workflow_instances
-                     set workflow_claim_token = null, ready_reason = ?1, ready_at_ms = 0
-                     where run_id = ?2",
-                    params![
-                        reason_to_str(&WorkflowTaskReason::CacheEvicted),
-                        claim.run_id.0
-                    ],
-                )
-                .map_err(sqlite_error)?;
-                tx.commit().map_err(sqlite_error)?;
-                return Ok(CommitOutcome::Conflict);
-            }
+            // Facts that landed under this claim: the task never saw them, so
+            // their wake reason must survive the commit's wholesale rewrite of
+            // `ready_reason` below.
+            let unobserved_fact_reason = if claim_tail_event_id < Some(current_tail) {
+                ready_reason.as_deref().map(reason_from_str).transpose()?
+            } else {
+                None
+            };
             if terminal && commit_has_workflow_visible_mutations(&batch) {
                 return Err(Error::TerminalWorkflow);
             }
@@ -878,9 +884,7 @@ impl DurableBackend for SqliteBackend {
                     // returned tail predates their `ChildWorkflowStarted` events.
                     dispatch_pending_child_starts(&tx, &config, namespace.as_str(), usize::MAX)?;
                     tx.commit().map_err(sqlite_error)?;
-                    return Ok(CommitOutcome::Committed {
-                        new_tail_event_id: next_event_id,
-                    });
+                    return Ok(next_event_id);
                 }
                 if let Some(event) = terminal_event {
                     handle_terminal_run(&tx, &config, &claim.run_id, &event)?;
@@ -894,14 +898,19 @@ impl DurableBackend for SqliteBackend {
             // reason `append_map_terminal_event` already wrote has to be
             // carried through it rather than left to survive it.
             let signal_ready = !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)?;
-            let ready_reason =
-                post_commit_ready_reason(terminal_after_commit, map_ready_reason, signal_ready)
-                    .as_ref()
-                    .map(reason_to_str);
+            let ready_reason = post_commit_ready_reason(
+                terminal_after_commit,
+                map_ready_reason,
+                signal_ready,
+                unobserved_fact_reason,
+            )
+            .as_ref()
+            .map(reason_to_str);
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
                      workflow_claim_token = null,
+                     claim_tail_event_id = null,
                      terminal = ?2,
                      ready_reason = ?3,
                      ready_at_ms = 0
@@ -928,9 +937,7 @@ impl DurableBackend for SqliteBackend {
                 )
                 .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
-            Ok(CommitOutcome::Committed {
-                new_tail_event_id: EventId(new_tail_event_id),
-            })
+            Ok(EventId(new_tail_event_id))
         })();
         Box::pin(ready(result))
     }
@@ -3128,6 +3135,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
             ready_at_ms integer not null default 0,
             workflow_claim_token integer,
             claim_lease_until_ms integer,
+            claim_tail_event_id integer,
             terminal integer not null,
             parent_run_id text,
             parent_command_seq integer,
@@ -3301,6 +3309,7 @@ fn init_schema(conn: &Connection) -> Result<()> {
         "ready_at_ms",
         "integer not null default 0",
     )?;
+    ensure_column(conn, "workflow_instances", "claim_tail_event_id", "integer")?;
     ensure_column(conn, "workflow_instances", "parent_run_id", "text")?;
     ensure_column(conn, "workflow_instances", "parent_command_seq", "integer")?;
     ensure_column(conn, "workflow_instances", "parent_close_policy", "text")?;
@@ -5642,7 +5651,6 @@ mod tests {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![crate::NewHistoryEvent::new(
                         HistoryEventData::ActivityMapScheduled(crate::ActivityMapScheduled {
                             command_id: map_command_id.clone(),
@@ -5839,7 +5847,6 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::ActivityMapScheduled(crate::ActivityMapScheduled {
                                 command_id: map_command_id.clone(),
@@ -6034,7 +6041,6 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                         )],
@@ -6075,7 +6081,6 @@ mod tests {
                 .commit_workflow_task(
                     child_claim.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![crate::NewHistoryEvent::new(
                             HistoryEventData::WorkflowCompleted {
                                 result: crate::encode_payload(&14_u64).unwrap(),
@@ -6274,7 +6279,6 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
                             crate::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                                 scheduled.clone(),
@@ -6441,8 +6445,7 @@ mod tests {
                 )
                 .unwrap();
 
-            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id, EventId(1))
-            {
+            for (kind, commit) in commit_test_support::mutating_commits(&claimed.run_id) {
                 let err = backend
                     .commit_workflow_task(claimed.claim.clone(), commit)
                     .await
@@ -6458,18 +6461,12 @@ mod tests {
                 .commit_workflow_task(
                     claimed.claim.clone(),
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         ..WorkflowTaskCommit::default()
                     },
                 )
                 .await
                 .unwrap();
-            assert_eq!(
-                outcome,
-                CommitOutcome::Committed {
-                    new_tail_event_id: EventId(1)
-                }
-            );
+            assert_eq!(outcome, EventId(1));
         });
     }
 

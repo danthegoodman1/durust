@@ -244,15 +244,22 @@ pub(crate) fn commit_has_workflow_visible_mutations(commit: &WorkflowTaskCommit)
 /// ready. A child start/failure event appended by the same commit keeps its
 /// specific reason; otherwise a still-consumable signal matching a live signal
 /// wait re-marks the run so a delivery racing the claim window is not lost.
+/// `unobserved_fact_reason` is the run's standing wake reason when facts landed
+/// under this task's claim — the run's tail moved past the one the claim handed
+/// the worker as its replay target.
+/// Keeping it is what stops a commit from clearing the readiness an activity
+/// result, fired timer, or child terminal set while the task was held.
 pub(crate) fn post_commit_ready_reason(
     terminal_after_commit: bool,
     same_commit_child_reason: Option<WorkflowTaskReason>,
     signal_wait_ready: bool,
+    unobserved_fact_reason: Option<WorkflowTaskReason>,
 ) -> Option<WorkflowTaskReason> {
     if terminal_after_commit {
         return None;
     }
     same_commit_child_reason
+        .or(unobserved_fact_reason)
         .or_else(|| signal_wait_ready.then_some(WorkflowTaskReason::SignalReceived))
 }
 
@@ -551,20 +558,15 @@ pub(crate) fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static 
 #[cfg(test)]
 pub(crate) mod commit_test_support {
     use crate::{
-        CommandId, EventId, HistoryEventData, ParentClosePolicy, RunId, WaitKind,
-        WorkflowTaskCommit,
+        CommandId, HistoryEventData, ParentClosePolicy, RunId, WaitKind, WorkflowTaskCommit,
     };
 
-    pub(crate) fn mutating_commits(
-        run_id: &RunId,
-        expected_tail_event_id: EventId,
-    ) -> Vec<(&'static str, WorkflowTaskCommit)> {
+    pub(crate) fn mutating_commits(run_id: &RunId) -> Vec<(&'static str, WorkflowTaskCommit)> {
         let command_id = CommandId {
             run_id: run_id.clone(),
             seq: crate::CommandSeq(900),
         };
         let base = WorkflowTaskCommit {
-            expected_tail_event_id,
             ..WorkflowTaskCommit::default()
         };
         vec![
@@ -1001,8 +1003,7 @@ mod tests {
         assert!(!commit_has_workflow_visible_mutations(
             &WorkflowTaskCommit::default()
         ));
-        let commits =
-            commit_test_support::mutating_commits(&crate::RunId::new("run"), crate::EventId::ZERO);
+        let commits = commit_test_support::mutating_commits(&crate::RunId::new("run"));
         assert_eq!(commits.len(), 10, "one catalog entry per mutation kind");
         for (kind, commit) in commits {
             assert!(
@@ -1018,18 +1019,47 @@ mod tests {
         // its specific reason, and a consumable signal fills the gap so a
         // delivery racing the claim window cannot be lost.
         assert_eq!(
-            post_commit_ready_reason(true, Some(WorkflowTaskReason::ChildWorkflowStarted), true),
+            post_commit_ready_reason(
+                true,
+                Some(WorkflowTaskReason::ChildWorkflowStarted),
+                true,
+                None
+            ),
             None
         );
         assert_eq!(
-            post_commit_ready_reason(false, Some(WorkflowTaskReason::ChildWorkflowStarted), true),
+            post_commit_ready_reason(
+                false,
+                Some(WorkflowTaskReason::ChildWorkflowStarted),
+                true,
+                None
+            ),
             Some(WorkflowTaskReason::ChildWorkflowStarted)
         );
         assert_eq!(
-            post_commit_ready_reason(false, None, true),
+            post_commit_ready_reason(false, None, true, None),
             Some(WorkflowTaskReason::SignalReceived)
         );
-        assert_eq!(post_commit_ready_reason(false, None, false), None);
+        assert_eq!(post_commit_ready_reason(false, None, false, None), None);
+        // A fact that landed under the claim keeps the run ready.
+        assert_eq!(
+            post_commit_ready_reason(
+                false,
+                None,
+                false,
+                Some(WorkflowTaskReason::ActivityCompleted)
+            ),
+            Some(WorkflowTaskReason::ActivityCompleted)
+        );
+        assert_eq!(
+            post_commit_ready_reason(
+                true,
+                None,
+                false,
+                Some(WorkflowTaskReason::ActivityCompleted)
+            ),
+            None
+        );
     }
 
     #[test]

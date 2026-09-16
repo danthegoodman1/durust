@@ -96,7 +96,6 @@ impl DurableFailure {
                 Self::new("durust.duplicate_workflow", workflow_type.to_string())
                     .marked_non_retryable()
             }
-            Error::Conflict => Self::new("durust.conflict", "backend conflict"),
             Error::RunNotFound(run_id) => {
                 Self::new("durust.run_not_found", run_id.to_string()).marked_non_retryable()
             }
@@ -141,9 +140,6 @@ pub enum Error {
 
     #[error("duplicate workflow registration for `{0}`")]
     DuplicateWorkflow(WorkflowType),
-
-    #[error("backend conflict")]
-    Conflict,
 
     #[error("workflow run `{0}` was not found")]
     RunNotFound(RunId),

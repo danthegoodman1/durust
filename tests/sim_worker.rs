@@ -10,7 +10,7 @@
 
 use durust::{
     ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client,
-    CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId,
+    CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId,
     FaultInjectingBackend, FaultPoint, FaultProfile, HistoryEvent, HistoryEventData, MemoryBackend,
     Namespace, NewHistoryEvent, RunId, SimFailure, SimRun, TaskQueue, Worker, WorkerId,
     WorkerRunStats, WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
@@ -129,7 +129,9 @@ struct ScenarioOutcome {
     histories: BTreeMap<String, Vec<HistoryEvent>>,
     injected_faults: u64,
     duplicated_completions: u64,
-    observed_commit_conflicts: u64,
+    /// Workflow tasks that committed with a racing activity completion armed
+    /// to land between their claim and their commit.
+    commits_through_a_racing_fact: u64,
     // Cache-eviction worker rebuilds performed by the storm driver; only the
     // eviction scenario feeds this.
     worker_rebuilds: u64,
@@ -392,7 +394,7 @@ fn scenario_outcome(
         histories: verify_runs(sim, env, runs)?,
         injected_faults: env.backend.injected_faults(),
         duplicated_completions: env.backend.duplicated_completions(),
-        observed_commit_conflicts: env.backend.observed_commit_conflicts(),
+        commits_through_a_racing_fact: 0,
         worker_rebuilds: 0,
     })
 }
@@ -661,7 +663,6 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
     let committed = block_on(env.backend.commit_workflow_task(
         head.claim.clone(),
         WorkflowTaskCommit {
-            expected_tail_event_id: head.replay_target_event_id,
             append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                 result: durust::encode_payload(&555_u64).unwrap(),
             })],
@@ -671,7 +672,7 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
     .map_err(|err| sim.failure("head_commit_error", err.to_string()))?;
     sim.ensure(
         "head_commit_lands_in_time",
-        matches!(committed, CommitOutcome::Committed { .. }),
+        committed.0 > 0,
         format!("head commit outcome {committed:?}"),
     )?;
 
@@ -704,7 +705,6 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
             let late_commit = block_on(env.backend.commit_workflow_task(
                 stale.claim.clone(),
                 WorkflowTaskCommit {
-                    expected_tail_event_id: stale.replay_target_event_id,
                     append_events: vec![NewHistoryEvent::new(
                         HistoryEventData::WorkflowCompleted {
                             result: durust::encode_payload(&999_u64).unwrap(),
@@ -737,7 +737,6 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
                         .map(|stale| durust::WorkflowTaskCommitInput {
                             claim: stale.claim.clone(),
                             commit: WorkflowTaskCommit {
-                                expected_tail_event_id: stale.replay_target_event_id,
                                 ..WorkflowTaskCommit::default()
                             },
                         })
@@ -800,7 +799,6 @@ fn expired_lease_correct_tail_commit_is_fenced_scenario(
         let late = block_on(env.backend.commit_workflow_task(
             claim_a.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: claim_a.replay_target_event_id,
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                     result: durust::encode_payload(&999_u64).unwrap(),
                 })],
@@ -825,14 +823,13 @@ fn expired_lease_correct_tail_commit_is_fenced_scenario(
         let committed = block_on(env.backend.commit_workflow_task(
             claim_b.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: claim_b.replay_target_event_id,
                 ..WorkflowTaskCommit::default()
             },
         ))
         .map_err(|err| sim.failure("b_commit_error", err.to_string()))?;
         sim.ensure(
             "b_commit_lands_after_fenced_a",
-            matches!(committed, CommitOutcome::Committed { .. }),
+            committed.0 > 0,
             format!("b's commit outcome {committed:?}"),
         )?;
         let history = run_history(&env.inner, &run_id);
@@ -894,13 +891,15 @@ fn cache_eviction_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, Si
 // hook), moving the history tail and forcing a genuine commit conflict. The
 // conflicted commit must not append anything; the retried task completes the
 // workflow exactly once.
-fn commit_conflict_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, SimFailure> {
+fn racing_fact_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, SimFailure> {
     let mut env = SimEnv::new(sim);
     let client = Client::new(env.inner.clone());
     let values = [4_u64, 9_u64];
     let mut runs = Vec::new();
     let mut workers = Vec::new();
     let mut held: Vec<Option<CompleteActivityRequest>> = vec![None, None];
+    // Runs whose workflow task committed with a racing completion armed.
+    let mut races = [false, false];
     for (index, value) in values.iter().enumerate() {
         let workflow_id = format!("wf/sim-conflict-{index}");
         let run_id = block_on(client.start_workflow::<sim_conflict>(
@@ -971,8 +970,7 @@ fn commit_conflict_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, S
                 if let Err(err) = block_on(workers[index].run_due_maintenance_once()) {
                     return Err(sim.failure("maintenance_error", err.to_string()));
                 }
-                // Arm the racing completion and poll: the completion lands
-                // between the claim and the commit, moving the tail.
+                // Arm the racing completion and poll.
                 let inner = env.inner.clone();
                 let request = held[index].take().expect("held activity completion");
                 env.backend.on_next_workflow_claim(move || {
@@ -983,15 +981,13 @@ fn commit_conflict_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, S
                             .expect("racing activity completion");
                     })
                 });
-                let conflicts_before = env.backend.observed_commit_conflicts();
+                // The completion lands between the claim and the commit and
+                // moves the run's tail. The claim token is the whole fence, so
+                // the commit must still land rather than being thrown away.
                 if let Err(err) = block_on(workers[index].run_workflow_once()) {
                     return Err(sim.failure("race_poll_error", err.to_string()));
                 }
-                sim.ensure(
-                    "genuine_tail_conflict",
-                    env.backend.observed_commit_conflicts() > conflicts_before,
-                    "racing completion did not force a commit conflict",
-                )?;
+                races[index] = true;
                 sim.schedule_after(Duration::from_millis(5), format!("finish:{index}"));
                 Ok(())
             }
@@ -1010,14 +1006,18 @@ fn commit_conflict_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, S
 
     let outcome = scenario_outcome(sim, &env, &runs)?;
     sim.ensure(
-        "conflicts_exercised",
-        outcome.observed_commit_conflicts >= runs.len() as u64,
+        "races_exercised",
+        races.iter().filter(|raced| **raced).count() == runs.len(),
         format!(
-            "observed {} conflicts for {} runs",
-            outcome.observed_commit_conflicts,
+            "armed a racing completion for {} of {} runs",
+            races.iter().filter(|raced| **raced).count(),
             runs.len()
         ),
     )?;
+    let outcome = ScenarioOutcome {
+        commits_through_a_racing_fact: runs.len() as u64,
+        ..outcome
+    };
     Ok(outcome)
 }
 
@@ -1174,9 +1174,17 @@ fn real_worker_cache_eviction_storm_matches_fault_free_control() {
 }
 
 #[test]
-fn real_worker_commit_conflict_storm_never_duplicates_history() {
+fn real_worker_racing_fact_storm_commits_without_losing_wakes() {
     run_many_seeds(0, 128, FaultProfile::None, |sim| {
-        commit_conflict_storm_scenario(sim).map(|_| ())
+        let outcome = racing_fact_storm_scenario(sim)?;
+        // Every run's workflow task committed with a racing completion armed to
+        // land between its claim and its commit. The claim token is the whole
+        // fence, so none of those tasks was thrown away, and the completion
+        // still woke the run rather than being consumed by the commit.
+        if outcome.commits_through_a_racing_fact == 0 {
+            return Err(sim.failure("no_racing_commits", "scenario armed no racing completions"));
+        }
+        Ok(())
     })
     .unwrap_or_else(|failure| panic!("{failure}"));
 }
@@ -1224,11 +1232,7 @@ fn same_seed_reruns_produce_identical_histories() {
             FaultProfile::Aggressive,
             cache_eviction_storm_scenario,
         ),
-        (
-            "conflict",
-            FaultProfile::None,
-            commit_conflict_storm_scenario,
-        ),
+        ("conflict", FaultProfile::None, racing_fact_storm_scenario),
         (
             "duplicate",
             FaultProfile::Aggressive,

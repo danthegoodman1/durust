@@ -1,8 +1,8 @@
 use durust::{
-    ClaimWorkflowTaskOptions, DurableBackend, DurableManifest, EventId, HistoryEventData,
-    ManifestActivity, ManifestWorkflow, Namespace, NewHistoryEvent, SqliteBackend,
-    StartWorkflowOutcome, StartWorkflowRequest, TaskQueue, VersionMarker, WorkerId,
-    WorkflowChangeMarkerKind, WorkflowId, WorkflowTaskCommit, WorkflowType, write_manifest,
+    ClaimWorkflowTaskOptions, DurableBackend, DurableManifest, HistoryEventData, ManifestActivity,
+    ManifestWorkflow, Namespace, NewHistoryEvent, SqliteBackend, StartWorkflowOutcome,
+    StartWorkflowRequest, TaskQueue, VersionMarker, WorkerId, WorkflowChangeMarkerKind, WorkflowId,
+    WorkflowTaskCommit, WorkflowType, write_manifest,
 };
 use futures::executor::block_on;
 use std::process::Command;
@@ -193,7 +193,6 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(HistoryEventData::VersionMarker(
                         VersionMarker {
                             command_id,

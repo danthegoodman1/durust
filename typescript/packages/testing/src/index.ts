@@ -542,12 +542,10 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         await assertProviderError(
           () =>
             backend.commitWorkflowTask(expired.claim, {
-              expectedTailEventId: eventId(1),
               appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
             }), "StaleWorkflowLease");
 
         const committed = await backend.commitWorkflowTask(reclaimed.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -557,7 +555,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             }
           ]
         });
-        assert(committed.kind === "Committed", "replacement claim should be able to commit");
+        assert(committed !== undefined, "replacement claim should be able to commit");
       }
     },
     {
@@ -611,20 +609,19 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
     {
       name: "terminal workflow task commits are fenced through the public API",
       async run(factory) {
-        for (const testCase of workflowVisibleMutationCommitCases(runId("run-placeholder"), eventId(2))) {
+        for (const testCase of workflowVisibleMutationCommitCases(runId("run-placeholder"))) {
           assert(
             workflowTaskCommitHasWorkflowVisibleMutations(testCase.commit),
             `${testCase.name} should be classified as workflow-visible`
           );
         }
         assert(
-          !workflowTaskCommitHasWorkflowVisibleMutations({ expectedTailEventId: eventId(2) }),
+          !workflowTaskCommitHasWorkflowVisibleMutations({}),
           "empty commit should not be workflow-visible"
         );
 
         const { backend, claim } = await startedAndClaimed(factory);
         const terminal = await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -634,9 +631,9 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             }
           ]
         });
-        assert(terminal.kind === "Committed", "terminal commit should close the run");
+        assert(terminal !== undefined, "terminal commit should close the run");
 
-        for (const testCase of workflowVisibleMutationCommitCases(claim.runId, eventId(2))) {
+        for (const testCase of workflowVisibleMutationCommitCases(claim.runId)) {
           await assertProviderError(
             () => backend.commitWorkflowTask(claim, testCase.commit), "StaleWorkflowLease");
         }
@@ -647,7 +644,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "WorkflowTaskStarted" } },
             {
@@ -673,25 +669,10 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       }
     },
     {
-      name: "workflow task commit appends contiguous event ids and detects stale tails",
+      name: "workflow task commit appends contiguous event ids and fences a spent claim",
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
-        const conflict = await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(0),
-          appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
-        });
-        assert(conflict.kind === "Conflict", "stale expected tail should conflict");
-
-        const reclaimed = await backend.claimWorkflowTask("worker-b", {
-          namespace: namespace(),
-          taskQueue: taskQueue("workflows"),
-          registeredWorkflowTypes: [workflowType("conformance.workflow", 1)],
-          leaseDurationMs: 30_000
-        });
-        assert(reclaimed !== null, "conflicted workflow task should become claimable again");
-
-        const committed = await backend.commitWorkflowTask(reclaimed.claim, {
-          expectedTailEventId: eventId(1),
+        const committed = await backend.commitWorkflowTask(claim, {
           appendEvents: [
             { data: { kind: "WorkflowTaskStarted" } },
             {
@@ -702,10 +683,12 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             }
           ]
         });
+        assert(committed === eventId(3), "commit should append contiguous event ids");
 
-        assert(
-          committed.kind === "Committed" && committed.newTailEventId === eventId(3),
-          "commit should append contiguous event ids"
+        // The commit clears the claim, so the same claim cannot commit twice.
+        await assertProviderError(
+          () => backend.commitWorkflowTask(claim, { appendEvents: [] }),
+          "StaleWorkflowLease"
         );
 
         const history = await readHistory(backend, claim.runId, 10);
@@ -735,7 +718,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -812,7 +794,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -922,7 +903,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ActivityScheduled", scheduled: firstScheduled } },
             { data: { kind: "ActivityScheduled", scheduled: secondScheduled } }
@@ -1023,7 +1003,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1101,7 +1080,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1192,7 +1170,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1279,7 +1256,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1366,7 +1342,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1450,7 +1425,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             )
           };
           await backend.commitWorkflowTask(claim, {
-            expectedTailEventId: eventId(1),
             appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
             scheduleActivities: [activityTaskFromScheduled(scheduled)]
           });
@@ -1556,7 +1530,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             )
           };
           await backend.commitWorkflowTask(claim, {
-            expectedTailEventId: eventId(1),
             appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
             scheduleActivities: [activityTaskFromScheduled(scheduled)]
           });
@@ -1638,7 +1611,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)]
         });
@@ -1732,7 +1704,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -1860,7 +1831,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -1981,7 +1951,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -2095,7 +2064,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -2204,7 +2172,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         const outcome = await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -2220,11 +2187,11 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
             }
           ]
         });
-        assert(outcome.kind === "Committed", "an empty map must commit");
+        assert(outcome !== undefined, "an empty map must commit");
         assert(
-          Number(outcome.newTailEventId) === 3,
+          Number(outcome) === 3,
           `an empty map's terminal fact must be part of the commit's tail, got ${String(
-            outcome.newTailEventId
+            outcome
           )}`
         );
 
@@ -2290,7 +2257,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -2373,7 +2339,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         const outcome = await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ActivityMapScheduled", scheduled } },
             {
@@ -2398,7 +2363,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          outcome.kind === "Committed" && Number(outcome.newTailEventId) === 3,
+          outcome !== undefined && Number(outcome) === 3,
           `a commit that schedules an empty map and closes its run must stay accepted, got ${JSON.stringify(
             outcome
           )}`
@@ -2441,7 +2406,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         const childOutcome = await backend.commitWorkflowTask(child.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ChildWorkflowMapScheduled", scheduled: childScheduled } },
             {
@@ -2466,7 +2430,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          childOutcome.kind === "Committed" && Number(childOutcome.newTailEventId) === 3,
+          childOutcome !== undefined && Number(childOutcome) === 3,
           `a commit that schedules an empty child map and closes its run must stay accepted, got ${JSON.stringify(
             childOutcome
           )}`
@@ -2494,7 +2458,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const childCommand = commandId(claim.runId, 1);
         const childInput = encodePayload({ value: "owner" }, { codec: "Json" });
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           startChildWorkflows: [
             {
               commandId: childCommand,
@@ -2564,7 +2527,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(owner.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ActivityMapScheduled", scheduled } },
             { data: { kind: "ActivityScheduled", scheduled: plainScheduled } }
@@ -2610,7 +2572,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(grandparent !== null, "the grandparent should be claimable");
         await backend.commitWorkflowTask(grandparent.claim, {
-          expectedTailEventId: grandparent.replayTargetEventId,
           appendEvents: [
             {
               data: {
@@ -2701,7 +2662,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)],
           cancelCommands: [activityCommand]
@@ -2766,7 +2726,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ActivityScheduled", scheduled: scheduledActivity } },
             { data: { kind: "ActivityMapScheduled", scheduled: scheduledMap } }
@@ -2822,7 +2781,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(waker !== null, "the fired timer should wake the run");
 
         await backend.commitWorkflowTask(waker.claim, {
-          expectedTailEventId: waker.replayTargetEventId,
           cancelCommands: [activityCommand, mapCommandId]
         });
 
@@ -2888,7 +2846,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -2944,7 +2901,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(waker !== null, "the fired timer should wake the run");
         await backend.commitWorkflowTask(waker.claim, {
-          expectedTailEventId: waker.replayTargetEventId,
           cancelCommands: [mapCommandId]
         });
 
@@ -3014,7 +2970,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           )
         };
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -3142,7 +3097,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         let rejected: unknown = null;
         try {
           await backend.commitWorkflowTask(claim, {
-            expectedTailEventId: eventId(1),
             scheduleActivityMaps: [
               {
                 mapCommandId,
@@ -3183,7 +3137,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const { backend, claim } = await startedAndClaimed(factory);
         const timerCommand = commandId(claim.runId, 1);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3269,7 +3222,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const backend = closed.backend;
         const closedRunId = closed.claim.runId;
         const committed = await backend.commitWorkflowTask(closed.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3280,7 +3232,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          committed.kind === "Committed" && committed.newTailEventId === eventId(2),
+          committed === eventId(2),
           "the run should close"
         );
 
@@ -3290,7 +3242,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         const strayCommand = commandId(closedRunId, 1);
         const injected = await backend.commitWorkflowTask(injector.claim, {
-          expectedTailEventId: eventId(1),
           upsertWaits: [
             {
               waitId: waitId(`${closedRunId}:timer:1`),
@@ -3303,7 +3254,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          injected.kind === "Committed",
+          injected !== undefined,
           "the forging commit should be accepted; it is a live run's own commit"
         );
 
@@ -3358,7 +3309,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const backend = closed.backend;
         const closedTimer = commandId(closed.claim.runId, 1);
         const closingCommit = await backend.commitWorkflowTask(closed.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3389,7 +3339,7 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         assert(
-          closingCommit.kind === "Committed",
+          closingCommit !== undefined,
           "a commit that both starts a timer and closes the run should be accepted"
         );
 
@@ -3399,7 +3349,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         const liveTimer = commandId(live.claim.runId, 1);
         await backend.commitWorkflowTask(live.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3449,7 +3398,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const { backend, claim } = await startedAndClaimed(factory);
         const signalCommand = commandId(claim.runId, 1);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           upsertWaits: [
             {
               waitId: waitId(`${claim.runId}:signal:1`),
@@ -3497,7 +3445,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(inbox !== null, "readSignalInbox should return unconsumed signal");
 
         await backend.commitWorkflowTask(workflowWake.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3528,7 +3475,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
       async run(factory) {
         const { backend, claim } = await startedAndClaimed(factory);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3564,7 +3510,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const { backend, claim } = await startedAndClaimed(factory);
         const big = encodePayload({ blob: "x".repeat(4_096) }, { codec: "Json" });
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "WorkflowTaskStarted" } },
             { data: { kind: "WorkflowTaskStarted" } },
@@ -3620,7 +3565,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
         const signalCommand = commandId(claim.runId, 2);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)],
           upsertWaits: [
@@ -3659,7 +3603,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(closing !== null, "the signal must wake the run");
         await backend.commitWorkflowTask(closing.claim, {
-          expectedTailEventId: eventId(2),
           appendEvents: [
             {
               data: {
@@ -3719,7 +3662,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
         const childRequest = startChild(claim, "wf/closing-child", "child-workflows");
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowStartRequested", requested: childRequest } }],
           startChildWorkflows: [childRequest]
         });
@@ -3734,7 +3676,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         // The child starts a grandchild with the Cancel policy, then closes.
         const grandchildRequest = startChild(child.claim, "wf/closing-grandchild", "grandchild-workflows");
         await backend.commitWorkflowTask(child.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             { data: { kind: "ChildWorkflowStartRequested", requested: grandchildRequest } }
           ],
@@ -3756,7 +3697,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         });
         assert(childAgain !== null, "the grandchild start must wake the child");
         await backend.commitWorkflowTask(childAgain.claim, {
-          expectedTailEventId: childAgain.replayTargetEventId,
           appendEvents: [
             {
               data: {
@@ -3798,7 +3738,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         const timerCommand = commandId(claimB.runId, 1);
         const timerWait = waitId(`${claimB.runId}:timer:1`);
         await backend.commitWorkflowTask(claimB, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -3825,7 +3764,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
 
         const foreignCommand = commandId(claimB.runId, 2);
         await backend.commitWorkflowTask(claimA, {
-          expectedTailEventId: eventId(1),
           consumeSignals: [signalId("sig-fence-b")],
           deleteWaits: [timerWait],
           upsertWaits: [
@@ -3865,7 +3803,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         // received, which is the one the runtime consumes first everywhere.
         const { backend, claim } = await startedAndClaimed(factory);
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           upsertWaits: [
             {
               waitId: waitId(`${claim.runId}:signal:1`),
@@ -3919,7 +3856,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
 
         const projection = encodePayload({ status: "running" }, { codec: "Json" });
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           queryProjection: projection
         });
 
@@ -3971,7 +3907,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
         const projection = encodePayload({ status: "projected" }, { codec: "Json" });
         await backend.commitWorkflowTask(claimed.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityScheduled", scheduled } }],
           scheduleActivities: [activityTaskFromScheduled(scheduled)],
           queryProjection: projection
@@ -4024,7 +3959,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
           scheduleActivityMaps: [
             {
@@ -4102,7 +4036,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -4136,7 +4069,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(firstChild !== null, "first child-workflow-map item should be claimable");
         const result = encodePayload({ value: 10 }, { codec: "Json" });
         await backend.commitWorkflowTask(firstChild.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "WorkflowCompleted", result } }]
         });
 
@@ -4172,7 +4104,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowStartRequested", requested } }],
           startChildWorkflows: [requested]
         });
@@ -4243,7 +4174,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -4284,7 +4214,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(second.workflowId === workflowId("wf/child-map/1"), "second child id should be ordinal 1");
 
         await backend.commitWorkflowTask(first.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -4305,7 +4234,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(third.workflowId === workflowId("wf/child-map/2"), "third child id should be ordinal 2");
 
         await backend.commitWorkflowTask(second.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -4316,7 +4244,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
           ]
         });
         await backend.commitWorkflowTask(third.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -4406,7 +4333,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -4433,7 +4359,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(second.workflowId === workflowId("wf/child-map-collect/1"), "second child id should be ordinal 1");
 
         await backend.commitWorkflowTask(second.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -4502,7 +4427,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -4534,7 +4458,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         assert(first !== null && second !== null, "fail-fast should materialize both initial children");
 
         await backend.commitWorkflowTask(first.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [
             {
               data: {
@@ -4609,7 +4532,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         };
 
         await backend.commitWorkflowTask(claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "ChildWorkflowMapScheduled", scheduled } }],
           scheduleChildWorkflowMaps: [
             {
@@ -4649,7 +4571,6 @@ export function basicProviderConformanceCases(): readonly ProviderConformanceCas
         );
 
         await backend.commitWorkflowTask(first.claim, {
-          expectedTailEventId: eventId(1),
           appendEvents: [{ data: { kind: "WorkflowCancelled", reason: "child stopped" } }]
         });
 
@@ -4751,7 +4672,6 @@ export async function assertCurrentTimeFollowsInjectedClock(
   const { claim } = await startedAndClaimed(() => backend);
   const timerCommand = commandId(claim.runId, 1);
   await backend.commitWorkflowTask(claim, {
-    expectedTailEventId: eventId(1),
     appendEvents: [
       {
         data: {
@@ -4799,9 +4719,7 @@ export async function assertCurrentTimeFollowsInjectedClock(
 
 
 export function workflowVisibleMutationCommitCases(
-  runIdValue: WorkflowTaskClaim["runId"],
-  expectedTailEventId: WorkflowTaskCommit["expectedTailEventId"]
-): readonly { readonly name: string; readonly commit: WorkflowTaskCommit }[] {
+  runIdValue: WorkflowTaskClaim["runId"]): readonly { readonly name: string; readonly commit: WorkflowTaskCommit }[] {
   const activityInput = encodePayload({ value: "activity" }, { codec: "Json" });
   const activityCommand = commandId(runIdValue, 1);
   const scheduledActivity = {
@@ -4829,14 +4747,12 @@ export function workflowVisibleMutationCommitCases(
     {
       name: "appendEvents",
       commit: {
-        expectedTailEventId,
         appendEvents: [{ data: { kind: "WorkflowTaskStarted" } }]
       }
     },
     {
       name: "upsertWaits",
       commit: {
-        expectedTailEventId,
         upsertWaits: [
           {
             waitId: waitId(`${runIdValue}:terminal-wait`),
@@ -4852,28 +4768,24 @@ export function workflowVisibleMutationCommitCases(
     {
       name: "deleteWaits",
       commit: {
-        expectedTailEventId,
         deleteWaits: [waitId(`${runIdValue}:terminal-wait`)]
       }
     },
     {
       name: "consumeSignals",
       commit: {
-        expectedTailEventId,
         consumeSignals: [signalId("terminal-signal")]
       }
     },
     {
       name: "scheduleActivities",
       commit: {
-        expectedTailEventId,
         scheduleActivities: [activityTaskFromScheduled(scheduledActivity)]
       }
     },
     {
       name: "scheduleActivityMaps",
       commit: {
-        expectedTailEventId,
         scheduleActivityMaps: [
           {
             mapCommandId: activityMapCommand,
@@ -4892,7 +4804,6 @@ export function workflowVisibleMutationCommitCases(
     {
       name: "startChildWorkflows",
       commit: {
-        expectedTailEventId,
         startChildWorkflows: [
           {
             commandId: childCommand,
@@ -4915,7 +4826,6 @@ export function workflowVisibleMutationCommitCases(
     {
       name: "scheduleChildWorkflowMaps",
       commit: {
-        expectedTailEventId,
         scheduleChildWorkflowMaps: [
           {
             mapCommandId: childMapCommand,
@@ -4934,14 +4844,12 @@ export function workflowVisibleMutationCommitCases(
     {
       name: "cancelCommands",
       commit: {
-        expectedTailEventId,
         cancelCommands: [activityCommand]
       }
     },
     {
       name: "queryProjection",
       commit: {
-        expectedTailEventId,
         queryProjection: encodePayload({ status: "terminal" }, { codec: "Json" })
       }
     }

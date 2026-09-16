@@ -792,7 +792,7 @@ where
         &self,
         claim: durust::WorkflowTaskClaim,
         batch: durust::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {

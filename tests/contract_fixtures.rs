@@ -320,7 +320,6 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     let workflow_claim = workflow_task_claim_from_fixture(&fixture["commitWorkflowTask"]["claim"]);
     assert_eq!(workflow_claim.worker_id, durust::WorkerId::new("worker-a"));
     let commit = workflow_task_commit_from_fixture(&fixture["commitWorkflowTask"]["commit"]);
-    assert_eq!(commit.expected_tail_event_id, durust::EventId(1));
     assert!(matches!(
         commit.append_events.first().map(|event| &event.data),
         Some(durust::HistoryEventData::WorkflowTaskStarted)
@@ -350,15 +349,9 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
             order_id: "o-1".to_owned()
         }
     );
-    assert_commit_outcome(
-        &fixture["commitWorkflowTask"]["committed"],
-        durust::CommitOutcome::Committed {
-            new_tail_event_id: durust::EventId(2),
-        },
-    );
-    assert_commit_outcome(
-        &fixture["commitWorkflowTask"]["conflict"],
-        durust::CommitOutcome::Conflict,
+    assert_eq!(
+        durust::EventId(u64_field(&fixture["commitWorkflowTask"], "newTailEventId")),
+        durust::EventId(2)
     );
 
     let signal_request =
@@ -791,7 +784,6 @@ fn workflow_task_commit_from_fixture(value: &Value) -> durust::WorkflowTaskCommi
         .collect();
 
     durust::WorkflowTaskCommit {
-        expected_tail_event_id: durust::EventId(u64_field(value, "expectedTailEventId")),
         append_events,
         upsert_waits,
         delete_waits,
@@ -800,19 +792,6 @@ fn workflow_task_commit_from_fixture(value: &Value) -> durust::WorkflowTaskCommi
             .get("queryProjection")
             .map(payload_ref_from_fixture_json),
         ..Default::default()
-    }
-}
-
-fn assert_commit_outcome(value: &Value, expected: durust::CommitOutcome) {
-    match (string_field(value, "kind").as_str(), expected) {
-        ("Committed", durust::CommitOutcome::Committed { new_tail_event_id }) => {
-            assert_eq!(
-                durust::EventId(u64_field(value, "newTailEventId")),
-                new_tail_event_id
-            );
-        }
-        ("Conflict", durust::CommitOutcome::Conflict) => {}
-        (actual, expected) => panic!("unexpected commit outcome {actual} for {expected:?}"),
     }
 }
 

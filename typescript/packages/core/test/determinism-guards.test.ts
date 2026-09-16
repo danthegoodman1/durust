@@ -585,10 +585,10 @@ describe("nondeterminism guard uninstall", () => {
     const timerCommit = await hot.nextCommit();
     expect(timerCommit.appendEvents?.map((event) => event.data.kind)).toEqual(["TimerStarted"]);
     const firstOutcome = await backend.commitWorkflowTask(firstClaim.claim, timerCommit);
-    if (firstOutcome.kind !== "Committed") {
+    if (Number(firstOutcome) === 0) {
       throw new Error("expected first commit to succeed");
     }
-    hot.markCommitted(firstOutcome.newTailEventId);
+    hot.markCommitted(firstOutcome);
 
     // The workflow is parked on a durable timer and its guards come down now.
     expect(uninstallNondeterminismGuards()).toBe(true);

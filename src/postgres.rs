@@ -22,22 +22,21 @@ use crate::{
     CancelWorkflowRequest, ChildStartOutboxMessage, ChildWorkflowMapFailureMode,
     ChildWorkflowMapItem, ChildWorkflowMapItemOutcome, ChildWorkflowMapTask, ClaimActivityOptions,
     ClaimActivityTasksOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions,
-    ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq, CommitOutcome,
-    CompleteActivityOutcome, CompleteActivityRequest, CompleteActivityTaskBatchResult,
-    CompleteActivityTasksRequest, DispatchChildWorkflowStartsOutcome,
-    DispatchChildWorkflowStartsRequest, DurableBackend, DurableFailure, Error, EventId,
-    FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome, FireDueTimersRequest,
-    HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType, Namespace, ParentClosePolicy,
-    PayloadBlob, PayloadGarbageCollectionOutcome, PayloadGarbageCollectionRequest, PayloadRef,
-    PayloadRootRef, PayloadRootsOutcome, PayloadStorageConfig, QueryProjectionOutcome,
-    QueryProjectionRequest, ReadSignalInboxRequest, ReadSignalInboxesRequest, Result,
-    RunDueMaintenanceOutcome, RunDueMaintenanceRequest, RunId, ShardId, SignalInboxRecord,
-    SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome, StartWorkflowRequest,
-    TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs, WaitKind, WorkerId,
-    WorkflowChangeMarkerKind, WorkflowChangeVersionRecord, WorkflowChangeVersionStatus,
-    WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskClaim,
-    WorkflowTaskCommit, WorkflowTaskReason, WorkflowType, activity_map_input_at, digest_bytes,
-    encode_activity_map_result_manifest_with_codec,
+    ClaimedActivityTask, ClaimedWorkflowTask, CommandId, CommandSeq, CompleteActivityOutcome,
+    CompleteActivityRequest, CompleteActivityTaskBatchResult, CompleteActivityTasksRequest,
+    DispatchChildWorkflowStartsOutcome, DispatchChildWorkflowStartsRequest, DurableBackend,
+    DurableFailure, Error, EventId, FailActivityOutcome, FailActivityRequest, FireDueTimersOutcome,
+    FireDueTimersRequest, HistoryChunk, HistoryEvent, HistoryEventData, HistoryEventType,
+    Namespace, ParentClosePolicy, PayloadBlob, PayloadGarbageCollectionOutcome,
+    PayloadGarbageCollectionRequest, PayloadRef, PayloadRootRef, PayloadRootsOutcome,
+    PayloadStorageConfig, QueryProjectionOutcome, QueryProjectionRequest, ReadSignalInboxRequest,
+    ReadSignalInboxesRequest, Result, RunDueMaintenanceOutcome, RunDueMaintenanceRequest, RunId,
+    ShardId, SignalInboxRecord, SignalWorkflowOutcome, SignalWorkflowRequest, StartWorkflowOutcome,
+    StartWorkflowRequest, TimeoutDueActivitiesOutcome, TimeoutDueActivitiesRequest, TimestampMs,
+    WaitKind, WorkerId, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
+    WorkflowChangeVersionStatus, WorkflowChangeVersionsOutcome, WorkflowChangeVersionsRequest,
+    WorkflowId, WorkflowTaskClaim, WorkflowTaskCommit, WorkflowTaskReason, WorkflowType,
+    activity_map_input_at, digest_bytes, encode_activity_map_result_manifest_with_codec,
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use deadpool_postgres::{
@@ -124,6 +123,8 @@ struct LockedWorkflowCommitRow {
     namespace: String,
     workflow_id: String,
     shard_id: i32,
+    ready_reason: Option<String>,
+    claim_tail_event_id: Option<EventId>,
 }
 
 struct PreparedSimpleWorkflowCommit {
@@ -141,6 +142,9 @@ struct PreparedSimpleWorkflowCommit {
     query_projection: Option<PayloadRef>,
     terminal_event: Option<HistoryEventData>,
     ready_reason: Option<WorkflowTaskReason>,
+    /// The run's standing wake reason when facts landed under this claim; kept
+    /// so the commit's wholesale `ready_reason` rewrite does not erase them.
+    unobserved_fact_reason: Option<WorkflowTaskReason>,
 }
 
 struct PreparedSimpleChildStart {
@@ -528,6 +532,7 @@ impl PostgresBackend {
                     ready_at_ms bigint not null default 0,
                     workflow_claim_token bigint,
                     claim_lease_until_ms bigint,
+                    claim_tail_event_id bigint,
                     terminal boolean not null,
                     parent_run_id text,
                     parent_command_seq bigint,
@@ -535,6 +540,9 @@ impl PostgresBackend {
                     parent_child_map_ordinal bigint,
                     unique(namespace, workflow_id)
                 );
+
+                alter table {schema}.workflow_instances
+                    add column if not exists claim_tail_event_id bigint;
 
                 alter table {schema}.workflow_instances
                     add column if not exists shard_id integer not null default 0;
@@ -1149,7 +1157,7 @@ impl DurableBackend for PostgresBackend {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>> {
+    ) -> BoxFuture<'static, Result<EventId>> {
         let backend = self.clone();
         Box::pin(async move { backend.commit_workflow_task_inner(claim, batch).await })
     }
@@ -1467,6 +1475,7 @@ impl PostgresBackend {
                 "update {schema}.workflow_instances
                  set current_event_id = $1,
                      workflow_claim_token = null,
+                     claim_tail_event_id = null,
                      terminal = true,
                      ready_reason = null,
                      ready_at_ms = 0
@@ -1675,7 +1684,8 @@ impl PostgresBackend {
             &format!(
                 "update {schema}.workflow_instances workflows
                  set workflow_claim_token = claimed.claim_token,
-                     claim_lease_until_ms = $3
+                     claim_lease_until_ms = $3,
+                     claim_tail_event_id = workflows.current_event_id
                  from unnest($1::text[], $2::bigint[]) as claimed(run_id, claim_token)
                  where workflows.run_id = claimed.run_id"
             ),
@@ -1846,7 +1856,8 @@ impl PostgresBackend {
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances
-                 set workflow_claim_token = $1, claim_lease_until_ms = $2
+                 set workflow_claim_token = $1, claim_lease_until_ms = $2,
+                     claim_tail_event_id = current_event_id
                  where run_id = $3"
             ),
             &[
@@ -2083,7 +2094,7 @@ impl PostgresBackend {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> Result<CommitOutcome> {
+    ) -> Result<EventId> {
         self.retry_transaction(|| {
             let claim = claim.clone();
             let batch = batch.clone();
@@ -2096,7 +2107,7 @@ impl PostgresBackend {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> Result<CommitOutcome> {
+    ) -> Result<EventId> {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
@@ -2517,7 +2528,7 @@ impl PostgresBackend {
         schema: &str,
         commits: &[crate::WorkflowTaskCommitInput],
         indices: &[usize],
-    ) -> Result<Vec<(usize, Result<CommitOutcome>)>> {
+    ) -> Result<Vec<(usize, Result<EventId>)>> {
         let run_id_values = indices
             .iter()
             .map(|index| commits[*index].claim.run_id.0.clone())
@@ -2526,7 +2537,8 @@ impl PostgresBackend {
             .query(
                 &format!(
                     "select run_id, current_event_id, workflow_claim_token, terminal,
-                            namespace, workflow_id, shard_id
+                            namespace, workflow_id, shard_id, ready_reason,
+                            claim_tail_event_id
                      from {schema}.workflow_instances
                      where run_id = any($1::text[])
                      for update"
@@ -2547,13 +2559,16 @@ impl PostgresBackend {
                     namespace: row.get(4),
                     workflow_id: row.get(5),
                     shard_id: row.get(6),
+                    ready_reason: row.get(7),
+                    claim_tail_event_id: row
+                        .get::<_, Option<i64>>(8)
+                        .map(|tail| EventId(u64::try_from(tail).unwrap_or(u64::MAX))),
                 },
             );
         }
 
         let mut item_results = Vec::with_capacity(indices.len());
         let mut prepared = Vec::<PreparedSimpleWorkflowCommit>::new();
-        let mut conflict_updates = Vec::<(RunId, EventId)>::new();
         let lease_keys = indices
             .iter()
             .filter_map(|index| {
@@ -2578,12 +2593,6 @@ impl PostgresBackend {
             let lease_key = (claim.worker_id.clone(), row.shard_id);
             if !lease_epochs.contains_key(&lease_key) {
                 item_results.push((*index, Err(Error::StaleLease)));
-                continue;
-            }
-            let expected_tail_event_id = input.commit.expected_tail_event_id;
-            if row.current_tail != expected_tail_event_id {
-                conflict_updates.push((claim.run_id.clone(), row.current_tail));
-                item_results.push((*index, Ok(CommitOutcome::Conflict)));
                 continue;
             }
             if row.terminal && commit_has_workflow_visible_mutations(&input.commit) {
@@ -2628,10 +2637,19 @@ impl PostgresBackend {
                 None => None,
             };
 
+            let unobserved_fact_reason = if row.claim_tail_event_id < Some(row.current_tail) {
+                row.ready_reason
+                    .as_deref()
+                    .map(reason_from_str)
+                    .transpose()?
+            } else {
+                None
+            };
             prepared.push(PreparedSimpleWorkflowCommit {
                 input_index: *index,
                 claim,
                 next_event_id,
+                unobserved_fact_reason,
                 namespace: row.namespace.clone(),
                 workflow_id: row.workflow_id.clone(),
                 append_history,
@@ -2644,25 +2662,6 @@ impl PostgresBackend {
                 terminal_event,
                 ready_reason: None,
             });
-        }
-
-        if !conflict_updates.is_empty() {
-            let run_ids = conflict_updates
-                .iter()
-                .map(|(run_id, _)| run_id.0.clone())
-                .collect::<Vec<_>>();
-            tx.execute(
-                &format!(
-                    "update {schema}.workflow_instances workflows
-                     set workflow_claim_token = null,
-                         ready_reason = $2,
-                         ready_at_ms = 0
-                     where workflows.run_id = any($1::text[])"
-                ),
-                &[&run_ids, &reason_to_str(&WorkflowTaskReason::CacheEvicted)],
-            )
-            .await
-            .map_err(postgres_error)?;
         }
 
         self.apply_child_starts_for_simple_commits_tx(tx, schema, &mut prepared)
@@ -2734,6 +2733,7 @@ impl PostgresBackend {
                 commit.terminal_event.is_some(),
                 commit.ready_reason.take(),
                 signal_ready_run_ids.contains(&commit.claim.run_id.0),
+                commit.unobserved_fact_reason.take(),
             );
         }
 
@@ -2778,12 +2778,7 @@ impl PostgresBackend {
         }
 
         for commit in prepared {
-            item_results.push((
-                commit.input_index,
-                Ok(CommitOutcome::Committed {
-                    new_tail_event_id: commit.next_event_id,
-                }),
-            ));
+            item_results.push((commit.input_index, Ok(commit.next_event_id)));
         }
         Ok(item_results)
     }
@@ -2795,12 +2790,13 @@ impl PostgresBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
         lease_epoch_cache: Option<&mut BTreeMap<(WorkerId, i32), i64>>,
-    ) -> Result<CommitOutcome> {
+    ) -> Result<EventId> {
         let Some(row) = tx
             .query_opt(
                 &format!(
                     "select current_event_id, workflow_claim_token, terminal, namespace, workflow_id,
-                            shard_id, workflow_name, workflow_version
+                            shard_id, workflow_name, workflow_version, ready_reason,
+                            claim_tail_event_id
                      from {schema}.workflow_instances
                      where run_id = $1
                      for update"
@@ -2820,6 +2816,8 @@ impl PostgresBackend {
         let shard_id: i32 = row.get(5);
         let workflow_name: String = row.get(6);
         let workflow_version: i32 = row.get(7);
+        let standing_ready_reason: Option<String> = row.get(8);
+        let claim_tail_event_id: Option<i64> = row.get(9);
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
@@ -2844,23 +2842,16 @@ impl PostgresBackend {
             }
         }
         let current_tail = EventId(u64::try_from(current_tail_i64).unwrap_or(u64::MAX));
-        let expected_tail_event_id = batch.expected_tail_event_id;
-        if current_tail != expected_tail_event_id {
-            tx.execute(
-                &format!(
-                    "update {schema}.workflow_instances
-                     set workflow_claim_token = null, ready_reason = $1, ready_at_ms = 0
-                     where run_id = $2"
-                ),
-                &[
-                    &reason_to_str(&WorkflowTaskReason::CacheEvicted),
-                    &claim.run_id.0,
-                ],
-            )
-            .await
-            .map_err(postgres_error)?;
-            return Ok(CommitOutcome::Conflict);
-        }
+        // Facts that landed under this claim: the task never saw them, so their
+        // wake reason must survive the commit's rewrite of `ready_reason`.
+        let unobserved_fact_reason = if claim_tail_event_id < Some(current_tail_i64) {
+            standing_ready_reason
+                .as_deref()
+                .map(reason_from_str)
+                .transpose()?
+        } else {
+            None
+        };
         if terminal && commit_has_workflow_visible_mutations(&batch) {
             return Err(Error::TerminalWorkflow);
         }
@@ -3188,9 +3179,7 @@ impl PostgresBackend {
                 terminal_event.clone()
             {
                 continue_run_as_new_tx(tx, schema, &claim.run_id, event).await?;
-                return Ok(CommitOutcome::Committed {
-                    new_tail_event_id: next_event_id,
-                });
+                return Ok(next_event_id);
             }
             if let Some(event) = terminal_event {
                 handle_terminal_run_tx(self, tx, schema, &claim.run_id, &event).await?;
@@ -3202,8 +3191,12 @@ impl PostgresBackend {
         // erased by this update.
         let signal_ready =
             !terminal_after_commit && signal_wait_ready(tx, schema, &claim.run_id).await?;
-        let ready_reason =
-            post_commit_ready_reason(terminal_after_commit, ready_after_commit, signal_ready);
+        let ready_reason = post_commit_ready_reason(
+            terminal_after_commit,
+            ready_after_commit,
+            signal_ready,
+            unobserved_fact_reason,
+        );
         let ready_reason = ready_reason.as_ref().map(reason_to_str);
         tx.execute(
             &format!(
@@ -3224,9 +3217,7 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
-        Ok(CommitOutcome::Committed {
-            new_tail_event_id: next_event_id,
-        })
+        Ok(next_event_id)
     }
 
     async fn signal_workflow_inner(
@@ -7404,8 +7395,8 @@ async fn insert_activity_map_tx(
     // function reporting success against a descriptor it did not write. That
     // became consequential when `DescriptorCreated` gained the ability to append
     // a history fact: Postgres would step a *stale* descriptor where SQLite's
-    // plain insert raises. Unreachable behind `expected_tail_event_id`, which
-    // fences a replayed commit before it gets here, so this is a tripwire for an
+    // plain insert raises. Unreachable behind the claim token, which the
+    // commit clears, so a replayed commit is rejected before it gets here, so this is a tripwire for an
     // invariant violation rather than a race to be handled.
     if inserted != 1 {
         return Err(Error::Backend(format!(
@@ -7984,8 +7975,8 @@ async fn insert_child_workflow_map_tx(
     // function reporting success against a descriptor it did not write. That
     // became consequential when `DescriptorCreated` gained the ability to append
     // a history fact: Postgres would step a *stale* descriptor where SQLite's
-    // plain insert raises. Unreachable behind `expected_tail_event_id`, which
-    // fences a replayed commit before it gets here, so this is a tripwire for an
+    // plain insert raises. Unreachable behind the claim token, which the
+    // commit clears, so a replayed commit is rejected before it gets here, so this is a tripwire for an
     // invariant violation rather than a race to be handled.
     if inserted != 1 {
         return Err(Error::Backend(format!(
