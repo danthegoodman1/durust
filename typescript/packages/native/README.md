@@ -20,6 +20,10 @@ The package resolves its addon in this order:
    installs for the running platform: `linux-x64-gnu`, `linux-arm64-gnu`,
    `darwin-x64`, or `darwin-arm64`. Linux builds link glibc 2.34 or newer.
 
+The addon bundles SQLite; a system SQLite library is not required. CI and the
+release builds inspect each built addon's shared-library dependencies to verify
+this before packaging it.
+
 Inside this repository, build once before running any TypeScript test or
 example; `release.yml` builds the four platform packages on their own
 runners and publishes them before this package.

@@ -332,6 +332,9 @@ jobs:
       - name: Build the durust-node addon
         run: npm --prefix typescript run build:native --workspace @durust/native
 
+      - name: Check addon SQLite linkage
+        run: bash scripts/check-native-linkage.sh typescript/packages/native/durust-node.linux-x64-gnu.node
+
 
       # The four platform packages under `packages/native/npm` must agree with
       # the facade on name, version, and the addon file each ships.

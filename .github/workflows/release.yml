@@ -129,6 +129,7 @@ jobs:
       - name: Load the addon
         run: |
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
+          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node"
           node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
 
       - uses: actions/upload-artifact@v4
@@ -172,6 +173,7 @@ jobs:
       - name: Load the addon
         run: |
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
+          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node"
           node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
 
       - uses: actions/upload-artifact@v4

@@ -1182,6 +1182,8 @@ commits the updated manifests and lockfiles back to `main` with
 built on four platform runners (Linux x64 and arm64 in manylinux 2.34
 containers, macOS x64 and arm64) and shipped as one `@durust/native-<target>`
 package each, published before the facade that depends on them.
+The addons bundle SQLite and are checked for a system SQLite dependency before
+packaging, so npm installations do not require SQLite to be installed separately.
 
 Manual dispatch can publish the `current` checked-in version without creating a
 new version commit. This is only for recovering a partially published release.
