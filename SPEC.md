@@ -952,7 +952,7 @@ never include future events beyond up_to_event_id
 
 Backends may internally read history segments, journal ranges, rows, pages, or object chunks. The runtime-facing API is chunked event streaming with byte and event backpressure.
 
-External appends that commit after the claim's `replay_target_event_id` are not part of that recovery stream. They either produce a later workflow task or cause the current workflow task commit to return `CommitOutcome::Conflict`, after which the worker drops the recovered future and replays or catches up from the newer tail.
+External appends that commit after the claim's `replay_target_event_id` are not part of that recovery stream. They do not invalidate the task: they are facts looked up by command sequence rather than matched positionally, so they cannot contradict what the task replayed. The commit still lands, the run stays ready because the fact arrived under the claim, and the next workflow task observes it. The worker drops the cached future when the committed tail is past what this task alone appended, so that next task replays from the newer tail.
 
 Live operational state is separate from replay history:
 
@@ -1673,7 +1673,7 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> durust::Result<CommitOutcome>;
+    ) -> durust::Result<EventId>;
 
     async fn commit_workflow_tasks(
         &self,
@@ -1769,12 +1769,12 @@ pub struct ClaimWorkflowTaskOptions {
     pub task_queue: TaskQueue,
     pub registered_workflow_types: Vec<WorkflowType>,
     pub lease_duration: Duration,
+    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 pub struct ClaimWorkflowTasksOptions {
     pub claim: ClaimWorkflowTaskOptions,
     pub limit: usize,
-    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 pub struct ClaimActivityOptions {
@@ -1813,14 +1813,13 @@ pub struct WorkflowTaskCommitInput {
 
 pub struct WorkflowTaskCommitBatchResult {
     pub claim: WorkflowTaskClaim,
-    pub result: durust::Result<CommitOutcome>,
+    pub result: durust::Result<EventId>,
 }
 ```
 
-Per-item `CommitOutcome::Conflict` means the workflow task was fenced correctly
-but the expected tail was stale. Per-item `Error::StaleLease` means the claim or
-owning shard lease was stale. Providers may fail the outer batch result only
-when the batch could not be evaluated at all.
+A per-item `Ok` carries that run's new history tail. Per-item `Error::StaleLease`
+means the claim or owning shard lease was stale. Providers may fail the outer
+batch result only when the batch could not be evaluated at all.
 
 Batch activity claim and completion methods follow the same optimization
 contract. Batch activity completion returns one result per input completion in
@@ -1835,8 +1834,6 @@ or other failures that prevent evaluating the batch safely.
 
 ```rust
 pub struct WorkflowTaskCommit {
-    pub expected_tail_event_id: EventId,
-
     pub append_events: Vec<NewHistoryEvent>,
 
     pub upsert_waits: Vec<WaitRecord>,
@@ -1930,25 +1927,34 @@ The backend must atomically:
 
 ```text
 1. verify workflow task fence token
-2. verify expected_tail_event_id
-3. append history events
-4. update active waits
-5. create activity tasks
-6. create activity map descriptors
-7. create child workflow map descriptors
-8. enqueue child handoff messages or apply inline child starts
-9. consume signals
-10. update query projection
-11. mark workflow ready/not ready
+2. append history events
+3. update active waits
+4. create activity tasks
+5. create activity map descriptors
+6. create child workflow map descriptors
+7. enqueue child handoff messages or apply inline child starts
+8. consume signals
+9. update query projection
+10. mark workflow ready/not ready
 ```
 
-If another event was appended concurrently, return:
+The fence token is the whole fence. A provider rejects a commit whose token no
+longer owns the run with `Error::StaleLease`, and checks nothing else.
 
-```rust
-CommitOutcome::Conflict
-```
+That is sufficient because of a property every provider must uphold: **an actor
+that appends a replay-window event without holding the claim must revoke the
+claim in the same transaction.** The window is the events replay matches
+positionally — the command events, the markers, and the terminal events. Only
+`cancel_workflow` and the two parent-close paths append one from outside a
+claim, and all three revoke. Everything else a provider appends concurrently —
+activity results, fired timers, child terminals — is a fact keyed by command
+sequence, which replay looks up rather than matching in sequence, so it cannot
+contradict a task that never observed it.
 
-The worker must drop the cached future and replay from the new tail.
+A commit must not consume readiness that arrived underneath it. A provider
+records the run's tail when it hands out a claim and compares it at commit: if
+the tail has moved, facts landed that this task never saw, and the run keeps its
+standing wake reason so the next task picks them up.
 
 ## 8.4 Append-journal provider shape
 
@@ -2015,6 +2021,7 @@ pub struct WorkerConcurrencyOptions {
     pub workflow_task_commit_batch_size: usize,
     pub workflow_task_commit_max_delay: Duration,
     pub shard_filter: Option<Vec<ShardId>>,
+    pub max_concurrent_payload_hydrations: usize,
 }
 ```
 
@@ -2307,17 +2314,23 @@ Replay event:
 SelectWinner {
     select_command_id: CommandId,
     branch_ordinal: u32,
-    winning_event_id: EventId,
     branches_digest: String, // "select:{branch_count}"
 }
 ```
 
-Tie-break:
+Tie-break, applied only when the select first runs:
 
 ```text
 1. earliest history event id
 2. lexical branch order
 ```
+
+Replay does not re-apply it. The recorded `branch_ordinal` is authoritative:
+replay drives that branch to its result and cancels the rest. Recomputing the
+tie-break would order the winning fact against every other branch's by arrival,
+which holds only while nothing unrelated can be appended to the run between a
+task's claim and its commit — a constraint the commit fence deliberately does
+not impose (§8.3).
 
 `branches_digest` is structural: it records only the branch count
 (`select:{count}`; `select_all` records `select_all:{count}`), so benign
@@ -3607,7 +3620,9 @@ workflow task commit is shard-local for one run
 stale shard lease owner cannot commit
 stream_history honors up_to_event_id, max_events, and max_bytes
 stream_history never returns uncommitted or future events
-commit_workflow_task detects stale expected_tail_event_id
+commit_workflow_task rejects a claim token that no longer owns the run
+a fact appended under a claim does not void that task's commit
+a fact appended under a claim leaves the run ready for the next task
 append event ids are strictly ordered per run
 claim activity task filters by task_queue and activity_name
 activity map scheduling creates a compact map descriptor

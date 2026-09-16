@@ -633,6 +633,30 @@ There is no changelog yet, so breaking changes are recorded here, newest first.
 A change is listed if it can break a deployment that is working today — either
 its code will not compile, or its in-flight runs stop replaying.
 
+### The commit fence is the claim token, and `SelectWinner` drops its event id
+
+**Who is affected.** Every deployment. In-flight runs whose history contains a
+`SelectWinner` event cannot be replayed by this version.
+
+**What changes.** `WorkflowTaskCommit` loses `expectedTailEventId`, and
+`commitWorkflowTask` resolves to the run's new `EventId` rather than a
+`CommitOutcome`; the `CommitOutcome` type, its `Conflict` variant, and
+`WorkerMetrics.workflowTaskConflicts` are gone. A fact appended to a run while
+a workflow task was claimed no longer voids that task, so the claim token is
+the whole fence.
+
+`SelectWinner` loses `winningEventId`. Replay follows the recorded
+`branchOrdinal` instead of recomputing which branch won. This is the
+history-format break: a history recorded by 0.2.1 that contains a
+`SelectWinner` will fail to decode.
+
+The same change in the Rust crate is described in the root
+[`README.md`](../README.md); this ledger repeats it because the affected reader
+only reads one.
+
+**What to do.** Drain in-flight runs before upgrading, or accept that runs with
+a recorded `SelectWinner` will not replay.
+
 ### `callActivity()` with no `taskQueue` now runs on the worker's activity queue
 
 **Who is affected.** A deployment whose workflow workers set
