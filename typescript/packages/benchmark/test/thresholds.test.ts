@@ -16,6 +16,15 @@ import { assertPostgresAvailableWhenRequired, postgresUrlFromEnv } from "@durust
 const postgresUrl = postgresUrlFromEnv();
 const postgresStatementStatsRequired = process.env.DURUST_REQUIRE_POSTGRES_STATEMENT_STATS === "1";
 
+// Every accepted baseline below gates throughput through its own
+// `min_processing_*_per_second_ratio`, which is 0.1 — a machine ten times
+// slower than the one that recorded it still passes. Vitest's default 5 s
+// case timeout is a *tighter* wall-clock gate than that, so on a loaded CI
+// runner the clock fired before the comparison ran and reported "Test timed
+// out" instead of the threshold that was actually missed. This is large
+// enough that the baseline comparison stays the thing that fails.
+const ACCEPTED_BASELINE_TIMEOUT_MS = 120_000;
+
 /** The baseline with its statement-statistics gates lifted, for a server that has none. */
 function withoutStatementStatsThresholds(baseline: BenchmarkBaseline): BenchmarkBaseline {
   const {
@@ -157,7 +166,7 @@ describe("benchmark threshold comparison", () => {
       baseline: "memory-mixed-local-4-worker",
       failures: []
     });
-  });
+  }, ACCEPTED_BASELINE_TIMEOUT_MS);
 
   it.each([
     ["sqlite-mixed-local-1-worker.json", 1],
@@ -179,7 +188,7 @@ describe("benchmark threshold comparison", () => {
       baseline: baseline.name,
       failures: []
     });
-  });
+  }, ACCEPTED_BASELINE_TIMEOUT_MS);
 
   const itPostgres = postgresUrl === undefined ? it.skip : it;
 
@@ -258,7 +267,7 @@ describe("benchmark threshold comparison", () => {
         failures: []
       });
     },
-    180_000
+    ACCEPTED_BASELINE_TIMEOUT_MS
   );
 
   it("reports logical counter and latency failures with paths", async () => {

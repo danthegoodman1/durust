@@ -2952,12 +2952,12 @@ before delegating durable writes to the inner provider and hydrates external
 Blob URI ownership is exclusive and total: every blob ref has exactly one owner,
 identified by its URI scheme. A concrete provider validates, hydrates, and
 garbage-collects only refs carrying its own scheme(s) and persists every other
-scheme opaquely; it must not know S3, Garage, signing, endpoints, retry policy,
+scheme opaquely; it must not know S3, signing, endpoints, retry policy,
 or the set of schemes other layers use. A ref whose scheme no layer owns commits
 and persists unchanged and surfaces an error only when hydration is attempted at
 the outermost payload layer.
 
-Tests should use local Garage as the S3-compatible service so
+Tests should use a local S3-compatible service so
 `PayloadBackend<SqliteBackend, S3BlobStore>` behavior is covered without
 depending on AWS.
 
@@ -3026,7 +3026,7 @@ payload roots without object-store policy. Roots are typed so an outer
 manifests and child-workflow-map input and result manifests, validate
 wrapper-owned blob refs through `PayloadBlobStore`, and delete only unreachable
 wrapper-owned objects. Concrete providers may persist unknown external blob refs
-opaquely and must not know whether they point at S3, Garage, or another object
+opaquely and must not know whether they point at S3 or another object
 store. Operational map task state still requires provider-decodable manifest
 containers so providers can materialize bounded map items without
 object-store-specific logic.
@@ -3651,7 +3651,7 @@ cross-shard child start and completion survive dispatcher crash
 parent close policy is persisted and enforced
 inline and blob-backed payloads behave identically through public APIs
 SQLite provider offloads payloads above configured threshold
-PayloadBackend over SQLite passes blob payload conformance against local Garage
+PayloadBackend over SQLite passes blob payload conformance against a local S3 service
 derived indexes can be rebuilt from append history
 provider restart loses no committed facts
 terminal workflow rejects new workflow-visible commands

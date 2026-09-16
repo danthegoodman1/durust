@@ -20,6 +20,7 @@ import {
   joinAll,
   decodeActivityMapResults,
   decodeChildWorkflowMapSuccesses,
+  encodePayload,
   eventId,
   getVersion,
   heartbeat,
@@ -1706,6 +1707,98 @@ describe("Worker", () => {
       workflowExecutionCacheEvictions: 1
     });
     await expect(first.result()).resolves.toEqual({ cents: 3 });
+  });
+
+  it("disposes a parked hot workflow execution when facts land under its claim", async () => {
+    const inner = NativeBackend.memory();
+    // The second workflow commit is the one held open: by then both activities
+    // are scheduled and the first has completed, so completing the second lands
+    // a fact on a run whose task is already claimed.
+    let commits = 0;
+    const backend = completeActivityDuringWorkflowCommit(
+      inner,
+      [quoteActivity.name],
+      () => ++commits === 2
+    );
+    const trace: string[] = [];
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown): void => {
+      unhandledRejections.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+    try {
+      const racingWorkflow = workflow({
+        name: "worker.hot-dispose-racing-fact",
+        version: 1,
+        handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> => {
+          trace.push(`start:${input.sku}`);
+          let quotes: readonly { readonly cents: number }[];
+          try {
+            quotes = await joinAll([
+              callActivity(quoteActivity, { sku: input.sku }, { taskQueue: "activities" }),
+              callActivity(quoteActivity, { sku: `${input.sku}-b` }, { taskQueue: "activities" })
+            ]);
+          } catch (error) {
+            trace.push(
+              error instanceof HotWorkflowExecutionDisposedError
+                ? `waiter:${error.reason}`
+                : `waiter:unexpected:${String(error)}`
+            );
+            throw error;
+          }
+          const cents = quotes.reduce((total, quote) => total + quote.cents, 0);
+          trace.push(`after:${cents}`);
+          return { cents };
+        }
+      });
+      const registry = new Registry()
+        .registerWorkflow(racingWorkflow)
+        .registerActivity(quoteActivity);
+      const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
+      const worker = workerFixture(backend, registry, {
+        workerId: "worker-a",
+        activityTaskQueue: "activities",
+        payloadCodec: "Json"
+      });
+      const handle = await client.startWorkflow(
+        racingWorkflow,
+        workflowId("wf/worker-hot-dispose-racing-fact"),
+        "workflows",
+        { sku: "sku-1" }
+      );
+
+      // Commit one schedules both activities and parks the execution.
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+      await expect(worker.runActivityTaskOnce()).resolves.toMatchObject({
+        kind: "Completed",
+        outcome: { kind: "Completed" }
+      });
+
+      // Commit two lands while the other activity completes. The commit itself
+      // still succeeds — a concurrent fact no longer voids it — and the cached
+      // execution is what gives way, because its state is behind the run.
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+      await flushUnhandledRejectionTurn();
+      expect(trace).toEqual([
+        "start:sku-1",
+        "waiter:facts were appended while the workflow task was claimed"
+      ]);
+      expect(unhandledRejections).toEqual([]);
+
+      // Cold replay picks the run up from history and finishes it.
+      await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+      await flushUnhandledRejectionTurn();
+      expect(trace).toEqual([
+        "start:sku-1",
+        "waiter:facts were appended while the workflow task was claimed",
+        "start:sku-1",
+        "after:10"
+      ]);
+      expect(unhandledRejections).toEqual([]);
+      await expect(handle.result()).resolves.toEqual({ cents: 10 });
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+    }
   });
 
   it("disposes a parked hot workflow execution after a failed workflow task", async () => {
@@ -4321,6 +4414,37 @@ function disposalTracingHandler(
   };
 }
 
+
+// Lands a fact under the claim: the chosen commit is held while a *different*
+// already-scheduled activity is completed against the same run, which is the
+// window the claim-token fence deliberately allows. The commit still succeeds;
+// what the worker must do is notice the run moved and drop the cached
+// execution.
+function completeActivityDuringWorkflowCommit(
+  inner: DurableBackend,
+  activityNames: Parameters<DurableBackend["claimActivityTask"]>[1]["registeredActivityNames"],
+  shouldLand: () => boolean
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      if (property === "commitWorkflowTask") {
+        return async (...args: Parameters<DurableBackend["commitWorkflowTask"]>) => {
+          if (shouldLand()) {
+            const claimed = await claimActivity(inner, "racing-fact-worker", { activityNames });
+            await inner.completeActivities({
+              completions: [
+                { claim: claimed.claim, result: encodePayload({ cents: 5 }, { codec: "Json" }) }
+              ]
+            });
+          }
+          return await target.commitWorkflowTask(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as DurableBackend;
+}
 
 // Throws out of the commit call itself, which is the post-prepare failure path:
 // the execution is prepared and parked, and its task dies before any commit.

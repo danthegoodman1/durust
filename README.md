@@ -711,13 +711,13 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
 
 let backend = durust::PayloadBackend::with_payload_storage(
     durust::SqliteBackend::open("durust.sqlite3")?,
-    durust::S3BlobStore::garage(durust::S3BlobStoreConfig {
+    durust::S3BlobStore::new(durust::S3BlobStoreConfig {
         bucket: "durust-payloads".to_owned(),
         endpoint: "http://127.0.0.1:3900".to_owned(),
-        region: "garage".to_owned(),
+        region: "us-east-1".to_owned(),
         prefix: "payloads".to_owned(),
-        access_key_id: "garage-access-key".to_owned(),
-        secret_access_key: "garage-secret-key".to_owned(),
+        access_key_id: "durust-access-key".to_owned(),
+        secret_access_key: "durust-secret-key".to_owned(),
     })?,
     durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
 );
@@ -739,8 +739,8 @@ records a small inline value, capped at 8 KiB, and is never offloaded. Use
 activities or ordinary payload refs for larger values.
 
 The SQLite local-directory store is content-addressed and keeps large encoded
-bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
-use `PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
+bytes outside hot SQLite rows. For S3-compatible object stores, use
+`PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
 async object-store implementation works across durability providers instead of
 being duplicated inside each provider. Blob URI
 ownership is exclusive: each provider resolves only refs carrying its own
@@ -758,34 +758,38 @@ content-addressed re-put do so, while S3 skips the refresh and relies on the
 grace period exceeding the worst upload-to-commit latency plus one GC scan.
 Delete failures are recorded in the outcome and the sweep continues.
 
-To run the local Garage-backed S3 conformance test:
+To run the local S3 conformance test, against the S3Proxy fixture:
 
 ```bash
-docker compose -f tests/fixtures/garage.compose.yml up -d
-DURUST_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
-DURUST_GARAGE_BUCKET=durust-payloads \
-DURUST_GARAGE_REGION=garage \
-DURUST_GARAGE_PREFIX=local/payloads \
-DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
-DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-DURUST_REQUIRE_GARAGE=1 \
-cargo test --features s3 --test provider_conformance garage -- --nocapture
-docker compose -f tests/fixtures/garage.compose.yml down -v
+docker compose -f tests/fixtures/s3proxy.compose.yml up -d
+DURUST_S3_ENDPOINT=http://127.0.0.1:3900 \
+DURUST_S3_BUCKET=durust-payloads \
+DURUST_S3_REGION=us-east-1 \
+DURUST_S3_PREFIX=local/payloads \
+DURUST_S3_ACCESS_KEY_ID=durust-access-key \
+DURUST_S3_SECRET_ACCESS_KEY=durust-secret-key \
+DURUST_REQUIRE_S3=1 \
+cargo test --features s3 --test provider_conformance s3 -- --nocapture
+docker compose -f tests/fixtures/s3proxy.compose.yml down -v
 ```
 
-`DURUST_REQUIRE_GARAGE` makes a missing or blank `DURUST_GARAGE_*` variable a
-failure instead of a skip, and it names the variables that are actually
-missing. Leave it unset if you have no Garage: the test then skips and the run
-still passes. It is on for any value except empty, `0`, and `false`, so a typo
-runs the test rather than quietly dropping it.
+The fixture arrives with `durust-payloads` already created, because its init
+service makes the directory that jclouds' filesystem provider exposes as a
+bucket. A provider is handed a bucket; neither S3Proxy nor the test provisions
+one.
 
-The filter is the substring `garage` rather than the full test name, and that
-matters more than it looks. `cargo test` with a filter matching nothing prints
+`DURUST_REQUIRE_S3` makes a missing or blank `DURUST_S3_*` variable a failure
+instead of a skip, and it names the variables that are actually missing. Leave
+it unset if you have no object store: the test then skips and the run still
+passes. It is on for any value except empty, `0`, and `false`, so a typo runs
+the test rather than quietly dropping it.
+
+The filter is the substring `s3` rather than a full test name, and that matters
+more than it looks. `cargo test` with a filter matching nothing prints
 `0 passed` and exits 0, so naming the single conformance test meant a run
-without `--features s3` was green having executed nothing. `garage` also
-matches `garage_s3_feature_is_enabled_when_garage_is_required`, which compiles
-unconditionally and fails when the feature is absent — so the filter can never
-select zero tests.
+without `--features s3` was green having executed nothing. `s3` also matches
+`s3_feature_is_enabled_when_s3_is_required`, which compiles unconditionally and
+fails when the feature is absent — so the filter can never select zero tests.
 
 ## Recovery Model
 

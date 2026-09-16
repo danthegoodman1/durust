@@ -97,41 +97,41 @@ fn postgres_is_required() -> bool {
     env_flag_is_on("DURUST_REQUIRE_POSTGRES")
 }
 
-/// `DURUST_REQUIRE_GARAGE` can only fail a Garage test that was compiled, and
-/// the Garage test lives behind `#[cfg(feature = "s3")]` — so a build without
-/// that feature contains no Garage test and the flag has nothing to fire on.
+/// `DURUST_REQUIRE_S3` can only fail an S3 test that was compiled, and the S3
+/// conformance test lives behind `#[cfg(feature = "s3")]` — so a build without
+/// that feature contains no such test and the flag has nothing to fire on.
 ///
-/// That hole is wider here than it is for Postgres, because CI's Garage step
-/// selects a *single* test by name filter. `cargo test <filter>` that matches
-/// nothing prints `0 passed` and **exits 0** (measured, not assumed): drop the
+/// That hole is wider here than it is for Postgres, because CI's S3 step
+/// selects tests by name filter. `cargo test <filter>` that matches nothing
+/// prints `0 passed` and **exits 0** (measured, not assumed): drop the
 /// feature, or rename the conformance test, and the step stays green having
 /// run no S3 at all. Two independent ways to pass vacuously, and the container
 /// coming up healthy disguises both.
 ///
-/// So this test sits outside the `cfg`, and CI filters on the substring
-/// `garage` rather than the full test name. This test's own name contains it,
-/// so the filter always matches at least one test, that test always compiles,
-/// and it fails when the feature is gone. A filter that can never match zero
-/// tests is the part that makes the rest of the guard reachable.
+/// So this test sits outside the `cfg`, and CI filters on the substring `s3`
+/// rather than a full test name. This test's own name contains it, so the
+/// filter always matches at least one test, that test always compiles, and it
+/// fails when the feature is gone. A filter that can never match zero tests is
+/// the part that makes the rest of the guard reachable.
 // Deliberately constant: the assertion is a build-configuration check.
 #[allow(clippy::assertions_on_constants)]
 #[test]
-fn garage_s3_feature_is_enabled_when_garage_is_required() {
-    if !garage_is_required() {
+fn s3_feature_is_enabled_when_s3_is_required() {
+    if !s3_is_required() {
         return;
     }
     assert!(
         cfg!(feature = "s3"),
-        "DURUST_REQUIRE_GARAGE is set, but this binary was built without the `s3` feature, so \
-         the Garage conformance test was compiled out and the run proves nothing. Add \
+        "DURUST_REQUIRE_S3 is set, but this binary was built without the `s3` feature, so \
+         the S3 conformance test was compiled out and the run proves nothing. Add \
          `--features s3` or `--all-features`."
     );
 }
 
 /// Deliberately outside `#[cfg(feature = "s3")]`: the test above needs it in a
 /// build that has no S3 support at all.
-fn garage_is_required() -> bool {
-    env_flag_is_on("DURUST_REQUIRE_GARAGE")
+fn s3_is_required() -> bool {
+    env_flag_is_on("DURUST_REQUIRE_S3")
 }
 
 /// The on/off reading of a `DURUST_REQUIRE_*` switch, shared by every flag in
@@ -139,7 +139,7 @@ fn garage_is_required() -> bool {
 ///
 /// On for any value except unset, empty, `0`, and `false` (case-insensitive).
 /// That an unrecognized value reads as *on* is the deliberate part: a typo in
-/// `DURUST_REQUIRE_GARAGE=ture` runs the gated work rather than silently
+/// `DURUST_REQUIRE_S3=ture` runs the gated work rather than silently
 /// dropping it. For a switch whose only job is to stop a suite passing
 /// vacuously, failing toward more coverage is the sole safe direction.
 fn env_flag_is_on(name: &str) -> bool {
@@ -1073,14 +1073,14 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
 
 #[cfg(feature = "s3")]
 #[test]
-fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
+fn payload_backend_over_sqlite_passes_s3_conformance_when_configured() {
     block_on_tokio(async {
-        let Some(garage) = garage_config_or_skip("Garage S3 conformance") else {
+        let Some(s3) = s3_config_or_skip("S3 conformance") else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("payload-wrapper-garage.sqlite3");
-        let blob_store = durust::provider::S3BlobStore::garage(garage).unwrap();
+        let path = dir.path().join("payload-wrapper-s3.sqlite3");
+        let blob_store = durust::provider::S3BlobStore::new(s3).unwrap();
         wait_for_blob_store(&blob_store).await;
         let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
         let backend = PayloadBackend::with_payload_storage(
@@ -1090,17 +1090,16 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         );
         let run_id = payload_offload_public_api_round_trip(
             backend.clone(),
-            "wf/payload-backend-garage-offload",
-            "payload-backend-garage-workflows",
-            "payload-backend-garage-activities",
+            "wf/payload-backend-s3-offload",
+            "payload-backend-s3-workflows",
+            "payload-backend-s3-activities",
         )
         .await;
-        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-garage").await;
-        payload_offload_child_workflow_map_round_trip(backend.clone(), "payload-backend-garage")
-            .await;
-        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-garage").await;
+        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-s3").await;
+        payload_offload_child_workflow_map_round_trip(backend.clone(), "payload-backend-s3").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-s3").await;
         let (gc_workflow_id, gc_projection) =
-            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-garage").await;
+            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-s3").await;
         let external_blobs = durust::provider::PayloadBlobStore::list_payload_blobs(&blob_store)
             .await
             .unwrap();
@@ -1113,7 +1112,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         );
         let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
-            panic!("expected hydrated workflow start after Garage wrapper reopen");
+            panic!("expected hydrated workflow start after S3 wrapper reopen");
         };
         assert_eq!(
             durust::decode_payload::<String>(input).unwrap(),
@@ -1127,7 +1126,7 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
             .await
             .unwrap();
         let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
-            panic!("expected retained Garage projection after reopen");
+            panic!("expected retained S3 projection after reopen");
         };
         assert_eq!(
             durust::decode_payload::<String>(&payload).unwrap(),
@@ -1141,17 +1140,16 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
 fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     block_on_tokio(async {
         let inner = MemoryBackend::new();
-        let blob_store =
-            durust::provider::S3BlobStore::garage(durust::provider::S3BlobStoreConfig {
-                bucket: "durust-payloads".to_owned(),
-                endpoint: "http://127.0.0.1:9".to_owned(),
-                region: "garage".to_owned(),
-                prefix: "payloads".to_owned(),
-                access_key_id: "GK0123456789abcdef0123456789abcdef".to_owned(),
-                secret_access_key:
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
-            })
-            .unwrap();
+        let blob_store = durust::provider::S3BlobStore::new(durust::provider::S3BlobStoreConfig {
+            bucket: "durust-payloads".to_owned(),
+            endpoint: "http://127.0.0.1:9".to_owned(),
+            region: "us-east-1".to_owned(),
+            prefix: "payloads".to_owned(),
+            access_key_id: "GK0123456789abcdef0123456789abcdef".to_owned(),
+            secret_access_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_owned(),
+        })
+        .unwrap();
         let backend = PayloadBackend::with_payload_storage(
             inner.clone(),
             blob_store,
@@ -1192,30 +1190,30 @@ where
         .block_on(future)
 }
 
-/// The Garage connection settings, or `None` when this run is not expected to
-/// have a Garage.
+/// The S3 connection settings, or `None` when this run is not expected to have
+/// an object store.
 ///
 /// Same shape and same reason as `postgres_url_or_skip`: libtest captures
 /// `eprintln!` on a passing test, so with the variables unset this returns
 /// `None`, the caller returns early, and the run reports `ok. 1 passed` having
-/// touched no S3 at all. `DURUST_REQUIRE_GARAGE` turns that into a panic.
+/// touched no S3 at all. `DURUST_REQUIRE_S3` turns that into a panic.
 ///
 /// The panic names the variables that are actually missing rather than the
-/// `DURUST_GARAGE_*` family, because a dropped `DURUST_GARAGE_BUCKET` and a
-/// Garage container that never came up are different failures and should not
-/// print the same sentence.
+/// `DURUST_S3_*` family, because a dropped `DURUST_S3_BUCKET` and a container
+/// that never came up are different failures and should not print the same
+/// sentence.
 ///
 /// Blank is missing. The four required reads used `env::var(..).ok()?`, which
-/// accepts `DURUST_GARAGE_ENDPOINT=""` as a value and hands an empty endpoint
-/// to the client; the Postgres helper above has always rejected empty, and
-/// there is no reason for the two to disagree about what "set" means.
+/// accepts `DURUST_S3_ENDPOINT=""` as a value and hands an empty endpoint to
+/// the client; the Postgres helper above has always rejected empty, and there
+/// is no reason for the two to disagree about what "set" means.
 #[cfg(feature = "s3")]
-fn garage_config_or_skip(what: &str) -> Option<durust::provider::S3BlobStoreConfig> {
+fn s3_config_or_skip(what: &str) -> Option<durust::provider::S3BlobStoreConfig> {
     const REQUIRED: [&str; 4] = [
-        "DURUST_GARAGE_ENDPOINT",
-        "DURUST_GARAGE_BUCKET",
-        "DURUST_GARAGE_ACCESS_KEY_ID",
-        "DURUST_GARAGE_SECRET_ACCESS_KEY",
+        "DURUST_S3_ENDPOINT",
+        "DURUST_S3_BUCKET",
+        "DURUST_S3_ACCESS_KEY_ID",
+        "DURUST_S3_SECRET_ACCESS_KEY",
     ];
     let missing: Vec<&str> = REQUIRED
         .into_iter()
@@ -1224,20 +1222,20 @@ fn garage_config_or_skip(what: &str) -> Option<durust::provider::S3BlobStoreConf
     if !missing.is_empty() {
         let missing = missing.join(", ");
         assert!(
-            !garage_is_required(),
-            "DURUST_REQUIRE_GARAGE is set, so `{what}` must run, \
+            !s3_is_required(),
+            "DURUST_REQUIRE_S3 is set, so `{what}` must run, \
              but these are unset or empty: {missing}"
         );
         eprintln!("skipping {what}; set {missing}");
         return None;
     }
     Some(durust::provider::S3BlobStoreConfig {
-        bucket: non_empty_env("DURUST_GARAGE_BUCKET").expect("checked above"),
-        endpoint: non_empty_env("DURUST_GARAGE_ENDPOINT").expect("checked above"),
-        region: env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned()),
-        prefix: env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "payloads".to_owned()),
-        access_key_id: non_empty_env("DURUST_GARAGE_ACCESS_KEY_ID").expect("checked above"),
-        secret_access_key: non_empty_env("DURUST_GARAGE_SECRET_ACCESS_KEY").expect("checked above"),
+        bucket: non_empty_env("DURUST_S3_BUCKET").expect("checked above"),
+        endpoint: non_empty_env("DURUST_S3_ENDPOINT").expect("checked above"),
+        region: env::var("DURUST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+        prefix: env::var("DURUST_S3_PREFIX").unwrap_or_else(|_| "payloads".to_owned()),
+        access_key_id: non_empty_env("DURUST_S3_ACCESS_KEY_ID").expect("checked above"),
+        secret_access_key: non_empty_env("DURUST_S3_SECRET_ACCESS_KEY").expect("checked above"),
     })
 }
 
@@ -1265,7 +1263,7 @@ where
             }
         }
     }
-    panic!("Garage S3 blob store did not become ready: {last_error:?}");
+    panic!("S3 blob store did not become ready: {last_error:?}");
 }
 
 #[test]

@@ -57,13 +57,13 @@
       "fail_above_ns": 300000
     },
     {
-      "name": "payload_garage_object_store_64kb/get_existing_blob",
+      "name": "payload_s3_object_store_64kb/get_existing_blob",
       "local_baseline_ns": 1180000,
       "warn_above_ns": 5000000,
       "fail_above_ns": 15000000
     },
     {
-      "name": "payload_garage_object_store_64kb/put_unique_blob",
+      "name": "payload_s3_object_store_64kb/put_unique_blob",
       "local_baseline_ns": 3480000,
       "warn_above_ns": 12000000,
       "fail_above_ns": 30000000

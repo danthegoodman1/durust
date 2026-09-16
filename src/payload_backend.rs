@@ -1681,10 +1681,6 @@ impl S3BlobStore {
             prefix: normalize_s3_prefix(&config.prefix),
         })
     }
-
-    pub fn garage(config: S3BlobStoreConfig) -> Result<Self> {
-        Self::new(config)
-    }
 }
 
 #[cfg(feature = "s3")]

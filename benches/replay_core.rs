@@ -1483,18 +1483,18 @@ fn payload_codec(c: &mut Criterion) {
 }
 
 #[cfg(feature = "s3")]
-fn payload_garage_object_store(c: &mut Criterion) {
-    let Some(config) = garage_config_from_env() else {
+fn payload_s3_object_store(c: &mut Criterion) {
+    let Some(config) = s3_config_from_env() else {
         return;
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let store = durust::provider::S3BlobStore::garage(config).unwrap();
+    let store = durust::provider::S3BlobStore::new(config).unwrap();
     runtime
         .block_on(store.list_payload_blobs())
-        .expect("Garage S3 benchmark store must be reachable");
+        .expect("S3 benchmark store must be reachable");
 
     let bytes = encoded_payload_bytes(&large_payload());
     let digest = durust::digest_bytes(&bytes);
@@ -1502,7 +1502,7 @@ fn payload_garage_object_store(c: &mut Criterion) {
         .block_on(store.put_payload_blob(digest.clone(), bytes.clone()))
         .unwrap();
 
-    let mut group = c.benchmark_group("payload_garage_object_store_64kb");
+    let mut group = c.benchmark_group("payload_s3_object_store_64kb");
     group.throughput(Throughput::Bytes(bytes.len() as u64));
     group.bench_function("get_existing_blob", |b| {
         b.iter(|| {
@@ -2584,13 +2584,13 @@ fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
 }
 
 #[cfg(feature = "s3")]
-fn garage_config_from_env() -> Option<durust::provider::S3BlobStoreConfig> {
-    let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
-    let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
-    let access_key_id = env::var("DURUST_GARAGE_ACCESS_KEY_ID").ok()?;
-    let secret_access_key = env::var("DURUST_GARAGE_SECRET_ACCESS_KEY").ok()?;
-    let region = env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned());
-    let prefix = env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "bench/payloads".to_owned());
+fn s3_config_from_env() -> Option<durust::provider::S3BlobStoreConfig> {
+    let endpoint = env::var("DURUST_S3_ENDPOINT").ok()?;
+    let bucket = env::var("DURUST_S3_BUCKET").ok()?;
+    let access_key_id = env::var("DURUST_S3_ACCESS_KEY_ID").ok()?;
+    let secret_access_key = env::var("DURUST_S3_SECRET_ACCESS_KEY").ok()?;
+    let region = env::var("DURUST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let prefix = env::var("DURUST_S3_PREFIX").unwrap_or_else(|_| "bench/payloads".to_owned());
     Some(durust::provider::S3BlobStoreConfig {
         bucket,
         endpoint,
@@ -3489,7 +3489,7 @@ fn version_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
 fn postgres_provider_hot_paths(_: &mut Criterion) {}
 
 #[cfg(not(feature = "s3"))]
-fn payload_garage_object_store(_: &mut Criterion) {}
+fn payload_s3_object_store(_: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -3515,7 +3515,7 @@ criterion_group!(
     postgres_provider_hot_paths,
     activity_heartbeat,
     payload_codec,
-    payload_garage_object_store,
+    payload_s3_object_store,
     payload_provider_refs,
     payload_replay,
     timer_due_scan_wakeup,
