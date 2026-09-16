@@ -15,10 +15,12 @@ import type {
   ActivityCallOptions,
   ChildWorkflowMapFailureMode,
   ChildWorkflowOptions,
-  ParentClosePolicy
+  ParentClosePolicy,
+  RetryPolicy
 } from "./options.js";
 import { decodePayload, encodePayload, type CodecId, type PayloadRef, type SchemaAdapter } from "./payload.js";
 import { assertDurableInputValue } from "./internal.js";
+import { readMapManifestItems } from "./map-manifest.js";
 import {
   createActivityDurablePromise,
   createActivityMapHandle,
@@ -493,43 +495,10 @@ export interface ActivityMapResultPage<Output> {
   readonly results: readonly PayloadRef<Output>[];
 }
 
-interface PagedManifest<Page> {
-  readonly itemCount: number;
-  readonly pageLengths: readonly number[];
-  readonly pages: readonly PayloadRef<Page>[];
-}
-
-// Single paged-manifest reader for the activity-map and child-workflow-map result
-// manifests: walk pages, flatten items, and enforce the item-count and page-length
-// invariants once instead of in each decoder.
-function decodePagedManifestItems<Page, Item>(
-  manifestRef: PayloadRef<PagedManifest<Page>>,
-  pageItems: (page: Page) => readonly Item[],
-  label: string
-): readonly Item[] {
-  const manifest = decodePayload<PagedManifest<Page>>(manifestRef);
-  const items: Item[] = [];
-  for (const pageRef of manifest.pages) {
-    items.push(...pageItems(decodePayload<Page>(pageRef)));
-  }
-  if (items.length !== manifest.itemCount) {
-    throw new Error(
-      `${label} item count mismatch: expected ${manifest.itemCount}, got ${items.length}`
-    );
-  }
-  const pageItemCount = manifest.pageLengths.reduce((sum, count) => sum + count, 0);
-  if (pageItemCount !== manifest.itemCount) {
-    throw new Error(
-      `${label} page length mismatch: expected ${manifest.itemCount}, got ${pageItemCount}`
-    );
-  }
-  return items;
-}
-
 function decodeActivityMapResultRefs<Output>(
   manifestRef: PayloadRef<ActivityMapResultManifest<Output>>
 ): readonly PayloadRef<Output>[] {
-  return decodePagedManifestItems(
+  return readMapManifestItems(
     manifestRef,
     (page: ActivityMapResultPage<Output>) => page.results,
     "activity map result manifest"
@@ -550,6 +519,25 @@ export interface ActivityMapOptions<Input extends DurableInputObject> {
   readonly resultManifest: string;
   readonly taskQueue?: string;
   readonly maxInFlight: number;
+  /**
+   * Retry policy for each item attempt. Defaults to `RetryPolicy.none()` — one
+   * attempt — which is the same default a map item has always had, and the same
+   * one Rust's `activity_map` builder gets from `ActivityOptions::default()`.
+   *
+   * **Set this if items can be slow or workers can die mid-item.** With one
+   * attempt and no explicit timeout below, an item still carries the implicit
+   * lease-length heartbeat deadline every claimed activity gets, so a worker
+   * that dies holding an item — or an item that simply outruns the lease
+   * without heartbeating — exhausts its only attempt and fails the whole map.
+   * That is what a plain `callActivity` with default options does too; map
+   * items were the anomaly in being exempt from the deadline scanner entirely,
+   * which meant a dead worker's item was silently re-offered forever instead.
+   */
+  readonly retry?: RetryPolicy;
+  /** Per-item start-to-close timeout. `undefined` means no explicit deadline. */
+  readonly startToCloseTimeoutMs?: number;
+  /** Per-item heartbeat timeout. `undefined` means no explicit deadline. */
+  readonly heartbeatTimeoutMs?: number;
 }
 
 export interface ActivityMapHandle<Output> {
@@ -627,7 +615,7 @@ export interface ChildWorkflowMapResultPage<Output> {
 export function decodeChildWorkflowMapOutcomes<Output>(
   manifestRef: PayloadRef<ChildWorkflowMapResultManifest<Output>>
 ): readonly ChildWorkflowMapItemOutcome<Output>[] {
-  return decodePagedManifestItems(
+  return readMapManifestItems(
     manifestRef,
     (page: ChildWorkflowMapResultPage<Output>) => page.outcomes,
     "child workflow map result manifest"

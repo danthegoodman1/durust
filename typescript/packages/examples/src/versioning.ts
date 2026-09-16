@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   deprecatePatch,
@@ -12,6 +11,7 @@ import {
   runId,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import type { PayloadRef } from "@durust/core";
 
 interface RolloutInput {
@@ -104,7 +104,7 @@ const deprecatedRouteWorkflow = workflow({
 });
 
 export async function runMemoryVersioningExample(): Promise<VersioningExampleResult> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry().registerWorkflow(rolloutWorkflow);
   const client = new Client(backend, { payloadCodec: "Json" });
   const worker = new Worker({
@@ -150,7 +150,7 @@ export async function runMemoryVersioningExample(): Promise<VersioningExampleRes
 }
 
 export async function runMemoryVersionBridgeExample(): Promise<VersionBridgeExampleResult> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(versionedScoreWorkflow)
     .registerWorkflow(deprecatedRouteWorkflow);
@@ -196,7 +196,7 @@ export async function runMemoryVersionBridgeExample(): Promise<VersionBridgeExam
   };
 }
 
-async function history(backend: MemoryBackend, runIdValue: string) {
+async function history(backend: NativeBackend, runIdValue: string) {
   return await backend.streamHistory({
     runId: runId(runIdValue),
     afterEventId: eventId(0),

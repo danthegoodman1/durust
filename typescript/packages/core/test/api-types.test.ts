@@ -272,6 +272,13 @@ describe("typed public API contract", () => {
       "Cancelled"
     ]);
     const first = outcomes[0];
+    // `noUncheckedIndexedAccess` makes this `... | undefined`, and an empty
+    // `outcomes` would otherwise skip the `Succeeded` branch entirely rather
+    // than fail. Thrown, not asserted, so the array being empty can never read
+    // as this test having checked the decoded result.
+    if (first === undefined) {
+      throw new Error("expected decodeChildWorkflowMapOutcomes to return three outcomes");
+    }
     if (first.kind !== "Succeeded") {
       throw new Error("expected first outcome to be Succeeded");
     }

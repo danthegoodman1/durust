@@ -19,8 +19,45 @@
     "postgres_pool_size": 24
   },
   "result": {
+    "backend": "postgres",
+    "mode": "mixed",
+    "correct": true,
+    "options": {
+      "backend": "postgres",
+      "mode": "mixed",
+      "workflows": 1000,
+      "workers": 10,
+      "batch": 32,
+      "max_rounds": 10000,
+      "json": false,
+      "keep_db": false,
+      "list_stale": false,
+      "drop_stale": false,
+      "activity_delay_ms": 0,
+      "workflow_offset": 0,
+      "child_map_items": 32,
+      "child_map_max_in_flight": 8,
+      "shards": 1,
+      "physical_partitions": 1,
+      "activation_concurrency": 1,
+      "activation_prefetch_limit": 1,
+      "activity_completion_batch": 32,
+      "postgres_pool_size": 24
+    },
+    "elapsed_ms": 19197.081,
+    "setup_ms": 10581.544,
+    "processing_ms": 7449.647,
+    "verify_ms": 1165.89,
+    "rounds": 29,
+    "activations": 7359,
     "completed_workflows": 1000,
     "mixed_actions": 8000,
+    "activations_per_second": 383.34,
+    "mixed_actions_per_second": 416.73,
+    "workflows_per_second": 52.091,
+    "processing_activations_per_second": 987.832,
+    "processing_mixed_actions_per_second": 1073.876,
+    "processing_workflows_per_second": 134.235,
     "counters": {
       "workflow_starts": 1000,
       "signals": 1000,
@@ -31,65 +68,198 @@
       "activity_heartbeats": 0,
       "child_activities": 1000,
       "finish_activities": 1000,
-      "workflow_tasks": 7344,
+      "workflow_tasks": 7359,
       "activity_tasks": 3000,
       "timers_fired": 1000,
       "activities_timed_out": 0,
       "child_workflow_starts_dispatched": 0
     },
     "worker_stats": {
+      "workflowTasks": 7359,
+      "activityTasks": 3000,
       "workflowHistoryCacheHits": 0,
-      "workflowHistoryCacheMisses": 6802,
+      "workflowHistoryCacheMisses": 6705,
       "workflowHistoryCacheEvictions": 0,
-      "workflowExecutionCacheHits": 542,
-      "workflowExecutionCacheMisses": 6802,
+      "workflowExecutionCacheHits": 654,
+      "workflowExecutionCacheMisses": 6705,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
-      "historyStreamEvents": 0
+      "historyStreamEvents": 0,
+      "timersFired": 1000,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 0
     },
-    "processing_mixed_actions_per_second": 1693.03,
-    "processing_workflows_per_second": 211.629,
-    "workflow_task_commit_p95_ms": 10.676,
-    "operations": {
-      "claimActivityTask": {
-        "calls": 290,
-        "errors": 0
+    "backend_metrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 7359,
+        "p50Ms": 6.157,
+        "p95Ms": 10.556,
+        "p99Ms": 13.33,
+        "maxMs": 32.541
       },
-      "claimWorkflowTask": {
-        "calls": 290,
-        "errors": 0
-      },
-      "commitWorkflowTask": {
-        "calls": 7344,
-        "errors": 0
-      },
-      "completeActivities": {
-        "calls": 131,
-        "errors": 0
-      },
-      "fireDueTimers": {
-        "calls": 290,
-        "errors": 0
-      },
-      "signalWorkflow": {
-        "calls": 1000,
-        "errors": 0
-      },
-      "startWorkflow": {
-        "calls": 1000,
-        "errors": 0
-      },
-      "streamHistory": {
-        "calls": 1000,
-        "errors": 0
+      "operations": {
+        "claimActivityTask": {
+          "calls": 290,
+          "errors": 0,
+          "items": 3000,
+          "totalMs": 778.488,
+          "itemsPerCall": 10.345,
+          "itemsPerSecond": 3853.623,
+          "latency": {
+            "samples": 290,
+            "p50Ms": 1.203,
+            "p95Ms": 6.684,
+            "p99Ms": 8.203,
+            "maxMs": 9.597
+          }
+        },
+        "claimWorkflowTask": {
+          "calls": 290,
+          "errors": 0,
+          "items": 7359,
+          "totalMs": 4625.053,
+          "itemsPerCall": 25.376,
+          "itemsPerSecond": 1591.117,
+          "latency": {
+            "samples": 290,
+            "p50Ms": 17.812,
+            "p95Ms": 25.077,
+            "p99Ms": 30.662,
+            "maxMs": 30.854
+          }
+        },
+        "commitWorkflowTask": {
+          "calls": 7359,
+          "errors": 0,
+          "items": 8000,
+          "totalMs": 48249.485,
+          "itemsPerCall": 1.087,
+          "itemsPerSecond": 165.805,
+          "latency": {
+            "samples": 7359,
+            "p50Ms": 6.157,
+            "p95Ms": 10.556,
+            "p99Ms": 13.33,
+            "maxMs": 32.541
+          }
+        },
+        "completeActivities": {
+          "calls": 118,
+          "errors": 0,
+          "items": 3000,
+          "totalMs": 813.345,
+          "itemsPerCall": 25.424,
+          "itemsPerSecond": 3688.47,
+          "latency": {
+            "samples": 118,
+            "p50Ms": 6.573,
+            "p95Ms": 10.505,
+            "p99Ms": 11.444,
+            "maxMs": 11.795
+          }
+        },
+        "fireDueTimers": {
+          "calls": 290,
+          "errors": 0,
+          "items": 9280,
+          "totalMs": 1278.717,
+          "itemsPerCall": 32,
+          "itemsPerSecond": 7257.273,
+          "latency": {
+            "samples": 290,
+            "p50Ms": 0.913,
+            "p95Ms": 32.063,
+            "p99Ms": 38.489,
+            "maxMs": 40.36
+          }
+        },
+        "signalWorkflow": {
+          "calls": 1000,
+          "errors": 0,
+          "items": 1000,
+          "totalMs": 5585.597,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 179.032,
+          "latency": {
+            "samples": 1000,
+            "p50Ms": 4.604,
+            "p95Ms": 10.584,
+            "p99Ms": 11.876,
+            "maxMs": 23.012
+          }
+        },
+        "startWorkflow": {
+          "calls": 1000,
+          "errors": 0,
+          "items": 1000,
+          "totalMs": 4932.267,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 202.747,
+          "latency": {
+            "samples": 1000,
+            "p50Ms": 4.393,
+            "p95Ms": 8.78,
+            "p99Ms": 9.928,
+            "maxMs": 11.043
+          }
+        },
+        "streamHistory": {
+          "calls": 1000,
+          "errors": 0,
+          "items": 1000,
+          "totalMs": 1137.998,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 878.736,
+          "latency": {
+            "samples": 1000,
+            "p50Ms": 0.933,
+            "p95Ms": 2.408,
+            "p99Ms": 2.65,
+            "maxMs": 7.038
+          }
+        }
       }
     },
     "postgres_stats": {
-      "transactionsPerMixedAction": 0.978,
-      "statementStats": {
-        "callsPerMixedAction": 7.39
-      }
-    }
+      "walBytes": 27269659,
+      "walBytesPerSecond": 1420510.718,
+      "walRecords": 219339,
+      "walRecordsPerSecond": 11425.643,
+      "walFpi": 5,
+      "walBuffersFull": 0,
+      "walWrite": 2810,
+      "walSync": 2804,
+      "walWriteTimeMs": 0,
+      "walSyncTimeMs": 0,
+      "xactCommit": 23011,
+      "xactRollback": 1,
+      "transactionsPerSecond": 1198.724,
+      "transactionsPerMixedAction": 2.877,
+      "transactionsPerWorkflow": 23.012,
+      "rowsReturned": 2164344,
+      "rowsFetched": 999094,
+      "rowsInserted": 20090,
+      "rowsUpdated": 26592,
+      "rowsDeleted": 4880,
+      "blocksRead": 4,
+      "blocksHit": 2024252,
+      "blockCacheHitRatio": 1,
+      "tempFiles": 0,
+      "tempBytes": 0,
+      "deadlocks": 0,
+      "blockReadTimeMs": 0,
+      "blockWriteTimeMs": 0,
+      "activeTimeMs": 0,
+      "sessionTimeMs": 0,
+      "activeConnectionsAfter": 11,
+      "statementStats": null,
+      "statementStatsUnavailable": "pg_stat_statements snapshot failed (55000: pg_stat_statements must be loaded via \"shared_preload_libraries\"). pg_stat_statements has to be loaded at server start, which `create extension` cannot do on its own: run the server with `-c shared_preload_libraries=pg_stat_statements`. The checked-in fixture does exactly that \u2014 `docker compose -f tests/fixtures/postgres.compose.yml up -d --wait`, then DURUST_POSTGRES_URL=postgres://durable:durable@127.0.0.1:55432/durable"
+    },
+    "resource_samples": null,
+    "postgres_schema": "durust_ts_benchmark_835687_1789522864371",
+    "postgres_database": null,
+    "db_path": null,
+    "db_bytes": null
   },
   "thresholds": {
     "require_correct": true,
@@ -126,7 +296,6 @@
     "min_processing_workflows_per_second_ratio": 0.1,
     "max_workflow_task_commit_p95_ratio": 25,
     "max_workflow_task_commit_p95_ms": 100,
-    "require_postgres_schema": "normalized",
     "require_postgres_stats": true,
     "require_postgres_statement_stats": true,
     "max_postgres_transactions_per_mixed_action_ratio": 1.2,

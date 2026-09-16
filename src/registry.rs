@@ -99,7 +99,7 @@ impl WorkflowRegistration {
                 Box::pin(async move {
                     let input = crate::decode_payload::<W::Input>(&input)?;
                     let output = W::default().run(input).await?;
-                    crate::encode_payload_with_codec(&output, codec)
+                    crate::runtime::encode_workflow_output(&output, codec)
                 })
             }),
         }

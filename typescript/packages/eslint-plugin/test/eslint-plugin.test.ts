@@ -10,7 +10,9 @@ import plugin, {
   checkStaticCall,
   checkStaticRead,
   checkStaticReference,
-  noWorkflowNondeterminismRule
+  noWorkflowNondeterminismRule,
+  ruleName,
+  type EslintNode
 } from "@durust/eslint-plugin";
 
 describe("@durust/eslint-plugin", () => {
@@ -145,31 +147,31 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.ImportDeclaration({
+    visit(listeners, "ImportDeclaration", {
       type: "ImportDeclaration",
       source: { type: "Literal", value: "node:vm" }
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: { type: "Identifier", name: "eval" },
       arguments: []
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "unsafeEval" },
       init: { type: "Identifier", name: "eval" }
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: { type: "Identifier", name: "Function" },
       arguments: []
     });
-    listeners.NewExpression({
+    visit(listeners, "NewExpression", {
       type: "NewExpression",
       callee: { type: "Identifier", name: "Function" },
       arguments: []
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: {
         type: "MemberExpression",
@@ -178,7 +180,7 @@ describe("@durust/eslint-plugin", () => {
       },
       arguments: []
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "wasmCompile" },
       init: {
@@ -187,7 +189,7 @@ describe("@durust/eslint-plugin", () => {
         property: { type: "Identifier", name: "compile" }
       }
     });
-    listeners.NewExpression({
+    visit(listeners, "NewExpression", {
       type: "NewExpression",
       callee: {
         type: "MemberExpression",
@@ -244,7 +246,7 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.ImportDeclaration({
+    visit(listeners, "ImportDeclaration", {
       type: "ImportDeclaration",
       source: { type: "Literal", value: "node:crypto" },
       specifiers: [
@@ -260,7 +262,7 @@ describe("@durust/eslint-plugin", () => {
         }
       ]
     });
-    listeners.ImportDeclaration({
+    visit(listeners, "ImportDeclaration", {
       type: "ImportDeclaration",
       source: { type: "Literal", value: "node:crypto" },
       specifiers: [
@@ -298,11 +300,11 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.ImportDeclaration({
+    visit(listeners, "ImportDeclaration", {
       type: "ImportDeclaration",
       source: { type: "Literal", value: "node:fs" }
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: {
         type: "MemberExpression",
@@ -311,7 +313,7 @@ describe("@durust/eslint-plugin", () => {
       },
       arguments: []
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: {
         type: "MemberExpression",
@@ -320,21 +322,21 @@ describe("@durust/eslint-plugin", () => {
       },
       arguments: []
     });
-    listeners.MemberExpression({
+    visit(listeners, "MemberExpression", {
       type: "MemberExpression",
       object: { type: "Identifier", name: "process" },
       property: { type: "Identifier", name: "pid" }
     });
-    listeners.NewExpression({
+    visit(listeners, "NewExpression", {
       type: "NewExpression",
       callee: { type: "Identifier", name: "WebSocket" }
     });
-    listeners.NewExpression({
+    visit(listeners, "NewExpression", {
       type: "NewExpression",
       callee: { type: "Identifier", name: "Date" },
       arguments: []
     });
-    listeners.AwaitExpression({
+    visit(listeners, "AwaitExpression", {
       type: "AwaitExpression",
       argument: {
         type: "CallExpression",
@@ -360,7 +362,7 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "now" },
       init: {
@@ -369,7 +371,7 @@ describe("@durust/eslint-plugin", () => {
         property: { type: "Identifier", name: "now" }
       }
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: {
         type: "ObjectPattern",
@@ -383,7 +385,7 @@ describe("@durust/eslint-plugin", () => {
       },
       init: { type: "Identifier", name: "Math" }
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: {
         type: "ObjectPattern",
@@ -397,7 +399,7 @@ describe("@durust/eslint-plugin", () => {
       },
       init: { type: "Identifier", name: "Promise" }
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "hrtimeBigint" },
       init: {
@@ -442,7 +444,7 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: {
         type: "MemberExpression",
@@ -452,7 +454,7 @@ describe("@durust/eslint-plugin", () => {
       },
       arguments: []
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "computedNow" },
       init: {
@@ -462,13 +464,13 @@ describe("@durust/eslint-plugin", () => {
         computed: true
       }
     });
-    listeners.MemberExpression({
+    visit(listeners, "MemberExpression", {
       type: "MemberExpression",
       object: { type: "Identifier", name: "process" },
       property: { type: "Literal", value: "env" },
       computed: true
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "computedHrtimeBigint" },
       init: {
@@ -515,7 +517,7 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.ImportDeclaration({
+    visit(listeners, "ImportDeclaration", {
       type: "ImportDeclaration",
       source: { type: "Literal", value: "@durust/core" },
       specifiers: [
@@ -530,12 +532,12 @@ describe("@durust/eslint-plugin", () => {
         }
       ]
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: { type: "Identifier", name: "activityHeartbeat" },
       arguments: []
     });
-    listeners.CallExpression({
+    visit(listeners, "CallExpression", {
       type: "CallExpression",
       callee: {
         type: "MemberExpression",
@@ -572,12 +574,12 @@ describe("@durust/eslint-plugin", () => {
       }
     });
 
-    listeners.MemberExpression({
+    visit(listeners, "MemberExpression", {
       type: "MemberExpression",
       object: { type: "Identifier", name: "process" },
       property: { type: "Identifier", name: "env" }
     });
-    listeners.MemberExpression({
+    visit(listeners, "MemberExpression", {
       type: "MemberExpression",
       object: {
         type: "MemberExpression",
@@ -586,7 +588,7 @@ describe("@durust/eslint-plugin", () => {
       },
       property: { type: "Identifier", name: "env" }
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: { type: "Identifier", name: "env" },
       init: {
@@ -595,7 +597,7 @@ describe("@durust/eslint-plugin", () => {
         property: { type: "Identifier", name: "env" }
       }
     });
-    listeners.VariableDeclarator({
+    visit(listeners, "VariableDeclarator", {
       type: "VariableDeclarator",
       id: {
         type: "ObjectPattern",
@@ -627,3 +629,46 @@ describe("@durust/eslint-plugin", () => {
     );
   });
 });
+
+/**
+ * Invoke one of the rule's visitors by key, and fail loudly if it is not there.
+ *
+ * `create()` returns `Record<string, (node: EslintNode) => void>`, so
+ * `listeners.ImportDeclaration` is `… | undefined` and TypeScript refuses the
+ * call outright. The one-character silencer — `listeners.ImportDeclaration?.(…)`
+ * — is the wrong fix and is banned here on purpose: it converts "the rule
+ * stopped registering a visitor for this node type" from a loud error into a
+ * silent no-op. Every call in the affected block would do nothing, `reports`
+ * would come back short, and the only thing left objecting would be a
+ * `toHaveLength` whose message talks about an array length rather than about a
+ * whole class of syntax the rule no longer inspects. A block whose expected
+ * length ever reached zero would then pass while checking nothing at all —
+ * this repository's documented failure mode.
+ *
+ * Throwing instead names the lost coverage. The `node.type !== key` check keeps
+ * the key argument and the literal's own `type` field from drifting apart,
+ * since duplicating the node type in the call is otherwise a second place to
+ * get it wrong.
+ */
+function visit(
+  listeners: ReturnType<typeof noWorkflowNondeterminismRule.create>,
+  key: string,
+  node: EslintNode
+): void {
+  const listener = listeners[key];
+  if (listener === undefined) {
+    const registered = Object.keys(listeners).sort().join(", ");
+    throw new Error(
+      `${ruleName} registered no "${key}" visitor, so this test no longer exercises ${key} ` +
+        `syntax at all — the rule stopped covering it, or the visitor was renamed. ` +
+        `Registered visitors: ${registered.length === 0 ? "(none)" : registered}`
+    );
+  }
+  if (node.type !== key) {
+    throw new Error(
+      `visit() was asked for the "${key}" visitor but handed a "${node.type}" node; ` +
+        "the visitor key and the node literal's own type must name the same syntax"
+    );
+  }
+  listener(node);
+}

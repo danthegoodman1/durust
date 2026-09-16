@@ -1,13 +1,65 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import {
   compareBenchmarkToBaseline,
   defaultBenchmarkOptions,
   postgresStatsReportFromSnapshots,
   runBenchmark,
+  type BackendMetricsReport,
+  type BackendOperationReport,
   type BenchmarkBaseline,
-  type BenchmarkResult
+  type BenchmarkResult,
+  type PostgresBackendStatsSnapshot
 } from "@durust/benchmark";
+import { assertPostgresAvailableWhenRequired, postgresUrlFromEnv } from "@durust/testing";
+
+const postgresUrl = postgresUrlFromEnv();
+const postgresStatementStatsRequired = process.env.DURUST_REQUIRE_POSTGRES_STATEMENT_STATS === "1";
+
+/** The baseline with its statement-statistics gates lifted, for a server that has none. */
+function withoutStatementStatsThresholds(baseline: BenchmarkBaseline): BenchmarkBaseline {
+  const {
+    require_postgres_statement_stats: _required,
+    max_postgres_statement_calls_per_mixed_action: _max,
+    max_postgres_statement_calls_per_mixed_action_ratio: _ratio,
+    ...thresholds
+  } = baseline.thresholds;
+  return { ...baseline, thresholds };
+}
+
+// The sibling of the guard in `packages/postgres/test/postgres-conformance.test.ts`,
+// and it has to be at module scope for the same measured reason: a suite whose
+// cases are all `it.skip` reports success, and only a module-body throw runs
+// early enough to stop it.
+//
+// This file is the *weaker* of the two cases, and deliberately so rather than
+// by oversight. Nothing in CI runs it with a database — `npm run check` leaves
+// `DURUST_POSTGRES_URL` unset precisely so these throughput comparisons stay
+// out of it — and the one script that does run it, `scripts/check-postgres.mjs`
+// (also reached through `check:release`), already exits 1 on a missing or blank
+// URL before Vitest starts. So the hole this closes is only reachable by
+// invoking `npm run test:benchmark-thresholds` directly with
+// `DURUST_REQUIRE_POSTGRES` set. It is here anyway, because the *reason* it is
+// currently unreachable is a property of one npm script, and that is not a
+// thing the next person editing CI would think to check.
+assertPostgresAvailableWhenRequired(postgresUrl, "the env-gated Postgres benchmark thresholds");
+
+/** See the identical counter in the Postgres conformance suite. */
+let executedPostgresCases = 0;
+
+afterAll(() => {
+  if (postgresUrl === undefined) {
+    return;
+  }
+  if (executedPostgresCases < 2) {
+    throw new Error(
+      "DURUST_POSTGRES_URL is set, so both env-gated Postgres baselines must run, but " +
+        `${executedPostgresCases} did. If you filtered the run with \`-t\`, that is the cause and ` +
+        "the filtered cases still passed; this check exists for the unfiltered runs CI makes, " +
+        "where a silently skipped Postgres baseline would report success"
+    );
+  }
+});
 
 describe("benchmark threshold comparison", () => {
   it("passes the memory mixed smoke baseline", async () => {
@@ -129,10 +181,10 @@ describe("benchmark threshold comparison", () => {
     });
   });
 
-  const postgresUrl = process.env.DURUST_POSTGRES_URL;
   const itPostgres = postgresUrl === undefined ? it.skip : it;
 
   itPostgres("passes the env-gated Postgres mixed smoke baseline", async () => {
+    executedPostgresCases += 1;
     const baseline = loadBaseline("postgres-mixed-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
@@ -146,7 +198,7 @@ describe("benchmark threshold comparison", () => {
       postgres_pool_size: 10
     });
 
-    expect(result.postgres_schema).toBe("normalized");
+    expect(result.postgres_schema).toMatch(/^durust_ts_benchmark_/);
     expect(result.postgres_stats).not.toBeNull();
     if (result.postgres_stats?.statementStats !== null) {
       expect(result.postgres_stats?.statementStats.calls).toBeGreaterThan(0);
@@ -161,6 +213,7 @@ describe("benchmark threshold comparison", () => {
   itPostgres(
     "passes the env-gated Postgres mixed accepted baseline",
     async () => {
+      executedPostgresCases += 1;
       const baseline = loadBaseline("postgres-mixed-accepted.json");
       const result = await runBenchmark({
         ...defaultBenchmarkOptions(),
@@ -173,11 +226,33 @@ describe("benchmark threshold comparison", () => {
         postgres_pool_size: 24
       });
 
-      expect(result.postgres_schema).toBe("normalized");
+      expect(result.postgres_schema).toMatch(/^durust_ts_benchmark_/);
       expect(result.postgres_stats).not.toBeNull();
-      expect(result.postgres_stats?.statementStats).not.toBeNull();
-      expect(result.postgres_stats?.statementStats?.calls).toBeGreaterThan(0);
-      expect(compareBenchmarkToBaseline(result, baseline)).toMatchObject({
+      // Statement statistics need a server started with
+      // `shared_preload_libraries=pg_stat_statements`, which the compose
+      // fixture provides and a stock container does not. They are asserted
+      // when `DURUST_REQUIRE_POSTGRES_STATEMENT_STATS=1` says the server has
+      // them, with the server's own reason as the message when they are
+      // missing; otherwise the case reports the reason and gates on
+      // everything else.
+      const statementStats = result.postgres_stats?.statementStats ?? null;
+      if (postgresStatementStatsRequired) {
+        expect(
+          statementStats,
+          result.postgres_stats?.statementStatsUnavailable ??
+            "statement stats are missing and the provider recorded no reason"
+        ).not.toBeNull();
+        expect(statementStats?.calls).toBeGreaterThan(0);
+      } else if (statementStats === null) {
+        console.warn(
+          `postgres statement stats not asserted: ${result.postgres_stats?.statementStatsUnavailable ?? "no reason recorded"}`
+        );
+      }
+      const comparedBaseline =
+        statementStats === null && !postgresStatementStatsRequired
+          ? withoutStatementStatsThresholds(baseline)
+          : baseline;
+      expect(compareBenchmarkToBaseline(result, comparedBaseline)).toMatchObject({
         passed: true,
         baseline: "postgres-mixed-accepted",
         failures: []
@@ -213,7 +288,7 @@ describe("benchmark threshold comparison", () => {
         operations: {
           ...result.backend_metrics.operations,
           commitWorkflowTask: {
-            ...result.backend_metrics.operations.commitWorkflowTask,
+            ...backendOperation(result.backend_metrics, "commitWorkflowTask"),
             errors: 1
           }
         }
@@ -424,6 +499,35 @@ describe("benchmark threshold comparison", () => {
   });
 });
 
+/**
+ * Resolve one recorded backend operation, or throw naming the one that is gone.
+ *
+ * `backend_metrics.operations` is a `Record<string, …>`, so an operation the
+ * benchmark stopped recording reads back as `undefined` rather than failing.
+ * Spreading that `undefined` into the regressed fixture above built
+ * `{ errors: 1 }` — no `calls`, no `latency` — and `compareBenchmarkToBaseline`
+ * treats any present entry with `errors !== 0` as a failure, so it would still
+ * emit the `backend_metrics.operations.commitWorkflowTask.errors` path the test
+ * asserts on. The test would keep passing while `runBenchmark` no longer
+ * measured the operation at all. Throwing here is the difference between
+ * "the regression path is still reported" and "the operation still exists".
+ */
+function backendOperation(
+  metrics: BackendMetricsReport,
+  name: string
+): BackendOperationReport {
+  const operation = metrics.operations[name];
+  if (operation === undefined) {
+    const recorded = Object.keys(metrics.operations).sort().join(", ");
+    throw new Error(
+      `benchmark recorded no "${name}" backend operation, so this test can no longer say ` +
+        `anything about it: the benchmark stopped exercising "${name}", or it was renamed. ` +
+        `Recorded operations: ${recorded.length === 0 ? "(none)" : recorded}`
+    );
+  }
+  return operation;
+}
+
 function loadBaseline(name: string): BenchmarkBaseline {
   return JSON.parse(
     readFileSync(new URL(`../baselines/${name}`, import.meta.url), "utf8")
@@ -431,15 +535,22 @@ function loadBaseline(name: string): BenchmarkBaseline {
 }
 
 function postgresSnapshot(
-  overrides: Partial<ReturnType<typeof postgresSnapshotDefaults>>
-): ReturnType<typeof postgresSnapshotDefaults> {
+  overrides: Partial<PostgresBackendStatsSnapshot>
+): PostgresBackendStatsSnapshot {
   return {
     ...postgresSnapshotDefaults(),
     ...overrides
   };
 }
 
-function postgresSnapshotDefaults() {
+// Annotated with the real provider type on purpose, not inferred. While this
+// was unannotated it silently drifted: it omitted `statementStatsUnavailable`
+// entirely, so every fixture snapshot was missing a field the type declares as
+// required, and `statements: []` inferred as `never[]` — which is why the four
+// literal statement rows below it could not be passed in as overrides. Neither
+// test asserts on `statementStatsUnavailable`, so nothing caught it; the
+// annotation is what catches the next omission.
+function postgresSnapshotDefaults(): PostgresBackendStatsSnapshot {
   return {
     walBytes: 0,
     walRecords: 0,
@@ -464,6 +575,9 @@ function postgresSnapshotDefaults() {
     blockReadTimeMs: 0,
     blockWriteTimeMs: 0,
     activeConnections: 0,
-    statements: []
+    statements: [],
+    // `null` is the provider's "nothing went wrong" value, which is what these
+    // hand-built snapshots mean: they are not modelling a failed collection.
+    statementStatsUnavailable: null
   };
 }

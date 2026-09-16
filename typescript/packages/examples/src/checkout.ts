@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -8,6 +7,7 @@ import {
   childWorkflow,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface CheckoutInput {
   readonly orderId: string;
@@ -99,7 +99,7 @@ const checkout = workflow({
 });
 
 export async function runMemoryCheckoutExample(): Promise<CheckoutOutput> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(checkout)
     .registerWorkflow(shipOrder)

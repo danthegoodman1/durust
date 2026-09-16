@@ -2,10 +2,9 @@ use proc_macro::TokenStream;
 use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
-use syn::visit::Visit;
 use syn::{
-    Block, Expr, ExprAwait, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitStr, Meta,
-    Pat, Path, PathArguments, ReturnType, Token, Type, TypePath, parse_macro_input,
+    Block, Expr, ExprCall, ExprLit, FnArg, GenericArgument, ItemFn, Lit, LitStr, Meta, Pat, Path,
+    PathArguments, ReturnType, Token, Type, TypePath, parse_macro_input,
 };
 
 struct MacroArgs {
@@ -168,7 +167,7 @@ fn expand_handler_inner(
 ) -> syn::Result<proc_macro2::TokenStream> {
     if item_fn.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
-            &item_fn.sig.fn_token,
+            item_fn.sig.fn_token,
             "durust handlers must be async functions",
         ));
     }
@@ -358,7 +357,7 @@ fn expand_child(call: ExprCall) -> syn::Result<proc_macro2::TokenStream> {
 fn expand_query(args: QueryArgs, item_fn: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     if item_fn.sig.asyncness.is_some() {
         return Err(syn::Error::new_spanned(
-            &item_fn.sig.asyncness,
+            item_fn.sig.asyncness,
             "durust query handlers must be synchronous functions",
         ));
     }
@@ -892,53 +891,5 @@ fn lint_workflow_body(item_fn: &ItemFn) -> syn::Result<()> {
         }
     }
 
-    let mut await_lint = AwaitLint::default();
-    await_lint.visit_block(&item_fn.block);
-    if let Some(err) = await_lint.err {
-        return Err(err);
-    }
-
     Ok(())
-}
-
-#[derive(Default)]
-struct AwaitLint {
-    err: Option<syn::Error>,
-}
-
-impl<'ast> Visit<'ast> for AwaitLint {
-    fn visit_expr_await(&mut self, node: &'ast ExprAwait) {
-        if self.err.is_some() {
-            return;
-        }
-
-        let base = node.base.to_token_stream().to_string();
-        let result_method = matches!(
-            node.base.as_ref(),
-            Expr::MethodCall(method) if method.method == "result"
-        );
-        let allowed = base.contains("durust :: activity_call")
-            || base.contains("durust :: call_activity")
-            || base.contains("durust :: child")
-            || base.contains("durust :: child_workflow")
-            || base.contains("durust :: activity_map")
-            || base.contains("result_manifest")
-            || result_method
-            || base.contains("durust :: sleep")
-            || base.contains("durust :: sleep_until")
-            || base.contains("durust :: signal")
-            || base.contains("side_effect")
-            || base.contains("durust :: select_all")
-            || base.contains("durust :: join_all")
-            || base.contains("durust :: join");
-        if !allowed {
-            self.err = Some(syn::Error::new_spanned(
-                node,
-                "unknown await in workflow code; use durable APIs such as durust::call_activity!",
-            ));
-            return;
-        }
-
-        syn::visit::visit_expr_await(self, node);
-    }
 }

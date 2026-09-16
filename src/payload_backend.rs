@@ -1,3 +1,4 @@
+use crate::payload::ManifestWalk;
 use crate::{
     ActivityMapInputManifest, ActivityMapInputPage, ActivityMapResultManifest,
     ActivityMapResultPage, ActivityTask, CancelWorkflowOutcome, CancelWorkflowRequest,
@@ -101,6 +102,25 @@ where
         }
     }
 
+    /// `events` with every payload this decorator's store holds pulled
+    /// inline, as `stream_history` returns them. The Rust worker hydrates
+    /// lazily and never needs this; the Node binding hydrates a claim's
+    /// prefetched history eagerly because the TypeScript worker reads
+    /// payloads straight from the events it is handed.
+    pub fn hydrate_history_events(
+        &self,
+        events: Vec<HistoryEvent>,
+    ) -> BoxFuture<'static, Result<Vec<HistoryEvent>>> {
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let mut hydrated = Vec::with_capacity(events.len());
+            for event in events {
+                hydrated.push(hydrate_history_event(&blob_store, event).await?);
+            }
+            Ok(hydrated)
+        })
+    }
+
     pub fn inner(&self) -> &B {
         &self.inner
     }
@@ -155,6 +175,65 @@ where
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>> {
         self.inner.claim_workflow_task(worker_id, opts)
+    }
+
+    // The batch methods forward to the provider rather than taking the trait
+    // defaults: the defaults loop over the scalar methods and reject shard
+    // filters, so a decorated shard-aware provider would lose both.
+    fn claim_workflow_tasks(
+        &self,
+        worker_id: WorkerId,
+        opts: crate::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, Result<Vec<ClaimedWorkflowTask>>> {
+        self.inner.claim_workflow_tasks(worker_id, opts)
+    }
+
+    // Offload failure on any item fails the whole batch: the only way an
+    // offload fails is blob-store I/O, which is transient and affects every
+    // item alike, so releasing the batch for retry beats reporting one item.
+    fn commit_workflow_tasks(
+        &self,
+        batch: crate::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, Result<Vec<crate::WorkflowTaskCommitBatchResult>>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        let config = self.payload_config.clone();
+        Box::pin(async move {
+            let mut commits = Vec::with_capacity(batch.commits.len());
+            for input in batch.commits {
+                let commit =
+                    normalize_workflow_task_commit(&blob_store, &config, input.commit).await?;
+                commits.push(crate::WorkflowTaskCommitInput { commit, ..input });
+            }
+            inner
+                .commit_workflow_tasks(crate::WorkflowTaskCommitBatch { commits })
+                .await
+        })
+    }
+
+    fn claim_activity_tasks(
+        &self,
+        worker_id: WorkerId,
+        opts: crate::ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, Result<Vec<ClaimedActivityTask>>> {
+        let inner = self.inner.clone();
+        let blob_store = self.blob_store.clone();
+        Box::pin(async move {
+            let claimed = inner.claim_activity_tasks(worker_id, opts).await?;
+            let mut hydrated = Vec::with_capacity(claimed.len());
+            for claimed in claimed {
+                let task = hydrate_activity_task(&blob_store, claimed.task).await?;
+                hydrated.push(ClaimedActivityTask { task, ..claimed });
+            }
+            Ok(hydrated)
+        })
+    }
+
+    fn run_due_maintenance(
+        &self,
+        req: crate::RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, Result<crate::RunDueMaintenanceOutcome>> {
+        self.inner.run_due_maintenance(req)
     }
 
     fn wait_for_ready(&self, req: crate::WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
@@ -411,6 +490,7 @@ where
                     payload: hydrate_payload_ref(&blob_store, payload).await?,
                 }),
                 QueryProjectionOutcome::NotFound => Ok(QueryProjectionOutcome::NotFound),
+                QueryProjectionOutcome::NoProjection => Ok(QueryProjectionOutcome::NoProjection),
             }
         })
     }
@@ -1015,22 +1095,20 @@ where
     S: PayloadBlobStore,
 {
     for root in roots {
-        match root {
-            PayloadRootRef::Payload(payload) => {
-                collect_reachable_external_payload(blob_store, &payload, reachable);
-            }
-            PayloadRootRef::ActivityMapInputManifest(payload) => {
-                collect_reachable_external_input_manifest(blob_store, payload, reachable).await?;
-            }
-            PayloadRootRef::ActivityMapResultManifest(payload) => {
-                collect_reachable_external_result_manifest(blob_store, payload, reachable).await?;
-            }
-            PayloadRootRef::ChildWorkflowMapResultManifest(payload) => {
-                collect_reachable_external_child_workflow_map_result_manifest(
-                    blob_store, payload, reachable,
-                )
-                .await?;
-            }
+        let Some(kind) = root.manifest_kind() else {
+            collect_reachable_external_payload(blob_store, root.payload(), reachable);
+            continue;
+        };
+        // Containers load because the walk needs their contents; every ref
+        // the walk hands back, containers included, is then marked by
+        // digest.
+        let mut walk = ManifestWalk::new(kind, root.payload().clone());
+        while let Some(container) = walk.next_container() {
+            let hydrated = load_external_container(blob_store, container, walk.context()).await?;
+            walk.provide(&hydrated)?;
+        }
+        for payload in walk.into_refs() {
+            collect_reachable_external_payload(blob_store, &payload, reachable);
         }
     }
     Ok(())
@@ -1038,8 +1116,7 @@ where
 
 // Leaves are marked reachable from the ref's digest alone. Downloading them
 // here would fetch every live blob per sweep; bytes are digest-validated at
-// put and get time. Containers still load because traversal needs their
-// contents.
+// put and get time.
 fn collect_reachable_external_payload<S>(
     blob_store: &S,
     payload: &PayloadRef,
@@ -1059,130 +1136,20 @@ fn collect_reachable_external_payload<S>(
 async fn load_external_container<S>(
     blob_store: &S,
     payload: PayloadRef,
-    reachable: &mut BTreeSet<String>,
     context: &str,
 ) -> Result<PayloadRef>
 where
     S: PayloadBlobStore,
 {
-    let (digest, uri) = match &payload {
-        PayloadRef::Inline { .. } => return Ok(payload),
-        PayloadRef::Blob { digest, uri, .. } => (digest.clone(), uri.clone()),
+    let PayloadRef::Blob { uri, .. } = &payload else {
+        return Ok(payload);
     };
-    if !blob_store.owns_payload_blob_uri(&uri) {
+    if !blob_store.owns_payload_blob_uri(uri) {
         return Err(Error::PayloadDecode(format!(
             "{context} references a non-wrapper payload blob `{uri}`"
         )));
     }
-    let hydrated = hydrate_payload_ref(blob_store, payload).await?;
-    reachable.insert(digest);
-    Ok(hydrated)
-}
-
-async fn collect_reachable_external_input_manifest<S>(
-    blob_store: &S,
-    payload: PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()>
-where
-    S: PayloadBlobStore,
-{
-    let root = load_external_container(
-        blob_store,
-        payload,
-        reachable,
-        "activity map input manifest root",
-    )
-    .await?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&root)?;
-    for page in manifest.pages {
-        let page = load_external_container(
-            blob_store,
-            page,
-            reachable,
-            "activity map input manifest page",
-        )
-        .await?;
-        let page: ActivityMapInputPage = crate::decode_payload(&page)?;
-        for item in page.items {
-            collect_reachable_external_payload(blob_store, &item, reachable);
-        }
-    }
-    Ok(())
-}
-
-async fn collect_reachable_external_result_manifest<S>(
-    blob_store: &S,
-    payload: PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()>
-where
-    S: PayloadBlobStore,
-{
-    let root = load_external_container(
-        blob_store,
-        payload,
-        reachable,
-        "activity map result manifest root",
-    )
-    .await?;
-    let manifest: ActivityMapResultManifest = crate::decode_payload(&root)?;
-    for page in manifest.pages {
-        let page = load_external_container(
-            blob_store,
-            page,
-            reachable,
-            "activity map result manifest page",
-        )
-        .await?;
-        let page: ActivityMapResultPage = crate::decode_payload(&page)?;
-        for result in page.results {
-            collect_reachable_external_payload(blob_store, &result, reachable);
-        }
-    }
-    Ok(())
-}
-
-async fn collect_reachable_external_child_workflow_map_result_manifest<S>(
-    blob_store: &S,
-    payload: PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()>
-where
-    S: PayloadBlobStore,
-{
-    let root = load_external_container(
-        blob_store,
-        payload,
-        reachable,
-        "child workflow map result manifest root",
-    )
-    .await?;
-    let manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
-    for page in manifest.pages {
-        let page = load_external_container(
-            blob_store,
-            page,
-            reachable,
-            "child workflow map result manifest page",
-        )
-        .await?;
-        let page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
-        for outcome in page.outcomes {
-            match outcome {
-                ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                    collect_reachable_external_payload(blob_store, &result, reachable);
-                }
-                ChildWorkflowMapItemOutcome::Failed { failure } => {
-                    if let Some(details) = failure.details {
-                        collect_reachable_external_payload(blob_store, &details, reachable);
-                    }
-                }
-                ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-            }
-        }
-    }
-    Ok(())
+    hydrate_payload_ref(blob_store, payload).await
 }
 
 async fn normalize_payload_ref<S>(
@@ -1313,6 +1280,242 @@ fn validate_payload_blob_bytes(digest: &str, expected_size: u64, bytes: &[u8]) -
 struct MemoryBlobRecord {
     bytes: Vec<u8>,
     last_modified: TimestampMs,
+}
+
+/// Blobs as files under one directory, each named by its digest. A put writes
+/// its own temporary file and renames it into place, so a reader never sees a
+/// partial blob and two puts of one digest never share a file; a put for a
+/// digest already present refreshes the file's modified time, which the GC
+/// grace period reads. The SQLite provider's `BlobStoreConfig::LocalDirectory`
+/// offload stores through the same type.
+#[derive(Clone, Debug)]
+pub struct LocalDirectoryBlobStore {
+    dir: std::path::PathBuf,
+}
+
+/// Distinguishes the temporary files of concurrent puts within one process;
+/// the process id distinguishes processes sharing the directory.
+static LOCAL_BLOB_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn local_blob_uri(digest: &str) -> String {
+    format!("local://payload/{digest}")
+}
+
+impl LocalDirectoryBlobStore {
+    pub fn new(root: impl Into<std::path::PathBuf>, prefix: &str) -> Self {
+        let root: std::path::PathBuf = root.into();
+        let dir = if prefix.is_empty() {
+            root
+        } else {
+            root.join(prefix)
+        };
+        Self { dir }
+    }
+
+    pub fn directory(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    fn blob_path(&self, digest: &str) -> std::path::PathBuf {
+        self.dir.join(digest)
+    }
+
+    pub fn put_sync(&self, digest: &str, bytes: &[u8]) -> Result<String> {
+        let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        validate_payload_blob_bytes(digest, expected_size, bytes)?;
+        std::fs::create_dir_all(&self.dir).map_err(|err| {
+            Error::Backend(format!(
+                "failed to create local payload blob directory `{}`: {err}",
+                self.dir.display()
+            ))
+        })?;
+        let path = self.blob_path(digest);
+        if path.exists() {
+            let metadata = std::fs::metadata(&path).map_err(|err| {
+                Error::Backend(format!(
+                    "failed to inspect local payload blob `{}`: {err}",
+                    path.display()
+                ))
+            })?;
+            if metadata.len() != expected_size {
+                return Err(Error::PayloadDecode(format!(
+                    "payload blob size mismatch: expected {expected_size}, got {}",
+                    metadata.len()
+                )));
+            }
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+                .map_err(|err| {
+                    Error::Backend(format!(
+                        "failed to refresh local payload blob `{}`: {err}",
+                        path.display()
+                    ))
+                })?;
+            return Ok(local_blob_uri(digest));
+        }
+        let sequence = LOCAL_BLOB_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = self
+            .dir
+            .join(format!("{digest}.tmp-{}-{sequence}", std::process::id()));
+        std::fs::write(&tmp_path, bytes).map_err(|err| {
+            Error::Backend(format!(
+                "failed to write local payload blob `{}`: {err}",
+                tmp_path.display()
+            ))
+        })?;
+        match std::fs::rename(&tmp_path, &path) {
+            Ok(()) => {}
+            Err(_) if path.exists() => {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(Error::Backend(format!(
+                    "failed to commit local payload blob `{}`: {err}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(local_blob_uri(digest))
+    }
+
+    /// The blob's bytes, digest-checked; a missing file is a decode error
+    /// because the reference that led here promised the blob exists.
+    pub fn get_sync(&self, digest: &str) -> Result<Vec<u8>> {
+        let path = self.blob_path(digest);
+        let bytes = std::fs::read(&path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => {
+                Error::PayloadDecode(format!("missing payload blob `{digest}`"))
+            }
+            _ => Error::PayloadDecode(format!(
+                "failed to read local payload blob `{}`: {err}",
+                path.display()
+            )),
+        })?;
+        validate_payload_blob_bytes(
+            digest,
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            &bytes,
+        )?;
+        Ok(bytes)
+    }
+
+    pub fn exists_sync(&self, digest: &str) -> Result<bool> {
+        Ok(self.blob_path(digest).is_file())
+    }
+
+    /// Every blob with its modified time. A file without a readable time
+    /// counts as brand new, so GC retains rather than deletes when unsure.
+    pub fn list_sync(&self) -> Result<BTreeMap<String, TimestampMs>> {
+        let mut blobs = BTreeMap::new();
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(blobs),
+            Err(err) => {
+                return Err(Error::Backend(format!(
+                    "failed to list local payload blob directory `{}`: {err}",
+                    self.dir.display()
+                )));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|err| {
+                Error::Backend(format!(
+                    "failed to list local payload blob directory `{}`: {err}",
+                    self.dir.display()
+                ))
+            })?;
+            let metadata = entry.metadata().map_err(|err| {
+                Error::Backend(format!(
+                    "failed to inspect local payload blob `{}`: {err}",
+                    entry.path().display()
+                ))
+            })?;
+            if !metadata.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".tmp-") {
+                continue;
+            }
+            blobs.insert(name, modified_at(&metadata));
+        }
+        Ok(blobs)
+    }
+
+    pub fn last_modified_sync(&self, digest: &str) -> Result<Option<TimestampMs>> {
+        let path = self.blob_path(digest);
+        match std::fs::metadata(&path) {
+            Ok(metadata) => Ok(Some(modified_at(&metadata))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(Error::Backend(format!(
+                "failed to inspect local payload blob `{}`: {err}",
+                path.display()
+            ))),
+        }
+    }
+
+    pub fn delete_sync(&self, digest: &str) -> Result<()> {
+        let path = self.blob_path(digest);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(Error::Backend(format!(
+                "failed to delete local payload blob `{}`: {err}",
+                path.display()
+            ))),
+        }
+    }
+}
+
+fn modified_at(metadata: &std::fs::Metadata) -> TimestampMs {
+    let millis = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since_epoch| i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_else(unix_epoch_millis);
+    TimestampMs(millis)
+}
+
+impl PayloadBlobStore for LocalDirectoryBlobStore {
+    fn put_payload_blob(
+        &self,
+        digest: String,
+        bytes: Vec<u8>,
+    ) -> BoxFuture<'static, Result<String>> {
+        Box::pin(ready(self.put_sync(&digest, &bytes)))
+    }
+
+    fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>> {
+        Box::pin(ready(self.get_sync(&digest)))
+    }
+
+    fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>> {
+        Box::pin(ready(self.exists_sync(&digest)))
+    }
+
+    fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>> {
+        Box::pin(ready(self.list_sync()))
+    }
+
+    fn payload_blob_last_modified(
+        &self,
+        digest: String,
+    ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
+        Box::pin(ready(self.last_modified_sync(&digest)))
+    }
+
+    fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>> {
+        Box::pin(ready(self.delete_sync(&digest)))
+    }
+
+    fn owns_payload_blob_uri(&self, uri: &str) -> bool {
+        uri.starts_with("local://payload/")
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1853,10 +2056,12 @@ mod tests {
     // sentenced digest inside the first delete call, deterministically
     // landing the reuse in the window between the sweep's listing and its
     // remaining deletes.
+    type PendingReput = Arc<Mutex<Option<(String, Vec<u8>)>>>;
+
     #[derive(Clone)]
     struct ReputOnFirstDeleteStore {
         inner: MemoryBlobStore,
-        reput: Arc<Mutex<Option<(String, Vec<u8>)>>>,
+        reput: PendingReput,
     }
 
     impl PayloadBlobStore for ReputOnFirstDeleteStore {
@@ -2025,5 +2230,36 @@ mod tests {
             parse_s3_last_modified_ms("Wed, 01 Jul 2026 12:34:56 GMT"),
             Some(TimestampMs(1_782_909_296_000))
         );
+    }
+
+    /// Concurrent puts of one digest each write their own temporary file, so
+    /// none truncates another's and every reader sees whole bytes.
+    #[test]
+    fn local_directory_store_survives_concurrent_puts_of_one_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "durust-local-blob-race-{}-{}",
+            std::process::id(),
+            unix_epoch_millis()
+        ));
+        let store = LocalDirectoryBlobStore::new(root.clone(), "");
+        for round in 0..100u8 {
+            let bytes = vec![round; 32_000];
+            let digest = digest_bytes(&bytes);
+            let threads = (0..8)
+                .map(|_| {
+                    let store = store.clone();
+                    let bytes = bytes.clone();
+                    let digest = digest.clone();
+                    std::thread::spawn(move || {
+                        store.put_sync(&digest, &bytes).unwrap();
+                        assert_eq!(store.get_sync(&digest).unwrap(), bytes);
+                    })
+                })
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread.join().unwrap();
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

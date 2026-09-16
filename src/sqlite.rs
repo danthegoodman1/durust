@@ -1,14 +1,19 @@
+use crate::map_engine::{
+    ACTIVITY_MAP_LABEL, CHILD_WORKFLOW_MAP_LABEL, ItemAttemptFailureKind, ItemRetryDecision,
+    MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
+    map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
+};
+use crate::payload::ManifestKind;
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
-    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
-    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
-    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
-    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
-    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
-    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
-    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
-    unix_epoch_millis, wait_kind_to_str,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms_from,
+    activity_timeout_attribution, activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
+    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
+    decode_encryption_metadata, encode_encryption_metadata, event_type_to_str,
+    marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
+    post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
+    retry_visible_at_ms, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -34,8 +39,6 @@ use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -47,6 +50,9 @@ pub struct SqliteBackend {
     path: PathBuf,
     payload_config: PayloadStorageConfig,
     conn: Arc<Mutex<Connection>>,
+    /// Read for every lease, deadline, and `current_time`; blob and marker
+    /// index timestamps stay on the wall clock.
+    clock: crate::ProviderClock,
 }
 
 impl fmt::Debug for SqliteBackend {
@@ -60,30 +66,137 @@ impl fmt::Debug for SqliteBackend {
 
 impl SqliteBackend {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let conn = open_sqlite_connection(&path)?;
-        configure_journal_mode(&conn)?;
-        init_schema(&conn)?;
-        Ok(Self {
-            path,
-            payload_config: PayloadStorageConfig::default(),
-            conn: Arc::new(Mutex::new(conn)),
-        })
+        Self::open_with_payload_storage(path, PayloadStorageConfig::default())
     }
 
     pub fn open_with_payload_storage(
         path: impl AsRef<Path>,
         payload_config: PayloadStorageConfig,
     ) -> Result<Self> {
+        Self::open_with_clock(path, payload_config, crate::ProviderClock::System)
+    }
+
+    pub fn open_with_clock(
+        path: impl AsRef<Path>,
+        payload_config: PayloadStorageConfig,
+        clock: crate::ProviderClock,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = open_sqlite_connection(&path)?;
         configure_journal_mode(&conn)?;
         init_schema(&conn)?;
-        Ok(Self {
+        let backend = Self {
             path,
             payload_config,
             conn: Arc::new(Mutex::new(conn)),
-        })
+            clock,
+        };
+        backend.repair_stalled_empty_maps()?;
+        Ok(backend)
+    }
+
+    /// Upgrade repair: complete maps that a database written before empty input
+    /// manifests completed at descriptor creation left permanently stalled.
+    ///
+    /// Such a descriptor has `item_count = 0` and was never completed, so
+    /// nothing materialized, no later event can reach the completion check, and
+    /// the parent blocks on `result_manifest()` forever. The fix does not reach
+    /// it on its own: `DescriptorCreated` is only stepped as a descriptor is
+    /// created. There is no operator recovery short of hand-writing the terminal
+    /// history event, so the repair runs here.
+    ///
+    /// **No descriptor can refuse to start the process.** This runs before
+    /// anything else can run, so a row it cannot interpret must not be able to
+    /// abort construction — and the population it exists to process is, by
+    /// definition, rows written by an older binary. Each descriptor therefore
+    /// gets its own transaction: any failure rolls that one back and the pass
+    /// moves on. Skips are counted into `meta` under
+    /// [`EMPTY_MAP_REPAIR_SKIPPED`] rather than discarded, because the pass
+    /// still records itself and will not look at them again.
+    ///
+    /// The promise is about descriptor *content* — an orphaned run row, a
+    /// `task` blob that does not decode, a missing input-manifest blob, an
+    /// engine or encoder failure. Reading or writing the marker itself still
+    /// propagates: that is a database that cannot be used at all rather than a
+    /// row this pass cannot interpret.
+    ///
+    /// **One-shot.** No index backs the probe's predicate, so it is a sequential
+    /// scan of the descriptor tables — and their size is the number of
+    /// *concurrently open maps*, which on a fanout workload is exactly the
+    /// number expected to be large. Measured at 200k open descriptors: 12.3 ms
+    /// of scan, +7 ms on `open`, growing linearly. This is an upgrade step, so
+    /// it only ever needs to run once per database; the `meta` marker turns
+    /// every later open into one primary-key lookup.
+    ///
+    /// **Read-only probe first, write transaction only when rows come back.**
+    /// `open` is synchronous and has no retry hook, so taking `BEGIN IMMEDIATE`
+    /// unconditionally would make it fail with `database is locked` against any
+    /// concurrent writer — the exact shape the equivalent TypeScript repair had
+    /// to fix on review. The marker write is bounded to the first open of a
+    /// database, where `init_schema`'s DDL has already taken the same lock.
+    fn repair_stalled_empty_maps(&self) -> Result<()> {
+        let mut conn = self.connection()?;
+        if read_meta_counter(&conn, EMPTY_MAP_REPAIR_MARKER)? > 0 {
+            return Ok(());
+        }
+        let stalled = {
+            let mut stmt = conn
+                .prepare(
+                    "select 0 as is_child, run_id, command_seq from activity_maps
+                      where item_count = 0 and completed = 0
+                     union all
+                     select 1, run_id, command_seq from child_workflow_maps
+                      where item_count = 0 and completed = 0
+                     order by 1, 2, 3",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map([], |row| {
+                    let kind = if row.get::<_, i64>(0)? == 1 {
+                        MapKind::ChildWorkflow
+                    } else {
+                        MapKind::Activity
+                    };
+                    Ok((
+                        kind,
+                        CommandId {
+                            run_id: RunId::new(row.get::<_, String>(1)?),
+                            seq: CommandSeq(row.get::<_, u64>(2)?),
+                        },
+                    ))
+                })
+                .map_err(sqlite_error)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(sqlite_error)?
+        };
+
+        let config = self.payload_config.clone();
+        let mut skipped = 0_u64;
+        for (kind, map_command_id) in stalled {
+            // One transaction per descriptor, so a skip is a rollback of that
+            // descriptor alone. A shared transaction would either propagate the
+            // failure or commit a half-applied repair — a terminal fact appended
+            // to the parent with the descriptor still open.
+            let repaired = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(sqlite_error)
+                .and_then(|tx| {
+                    repair_one_stalled_empty_map(&tx, &config, kind, &map_command_id)?;
+                    tx.commit().map_err(sqlite_error)
+                });
+            if repaired.is_err() {
+                skipped += 1;
+            }
+        }
+
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sqlite_error)?;
+        write_meta_counter(&tx, EMPTY_MAP_REPAIR_MARKER, 1)?;
+        if skipped > 0 {
+            write_meta_counter(&tx, EMPTY_MAP_REPAIR_SKIPPED, skipped)?;
+        }
+        tx.commit().map_err(sqlite_error)
     }
 
     pub fn payload_blob_count(&self) -> Result<usize> {
@@ -97,10 +210,142 @@ impl SqliteBackend {
         Ok(sqlite_blobs + external_blobs)
     }
 
+    /// The first unconsumed inbox record of every signal name the run holds,
+    /// in received order: what a claim carries in the TypeScript contract.
+    pub fn live_signals(&self, run_id: &RunId) -> Result<Vec<SignalInboxRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "select signal_id, signal_name, payload
+                 from signals
+                 where run_id = ?1 and consumed = 0
+                 order by received_sequence asc",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(params![run_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(sqlite_error)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut records = Vec::new();
+        for row in rows {
+            let (signal_id, signal_name, payload) = row.map_err(sqlite_error)?;
+            if !seen.insert(signal_name.clone()) {
+                continue;
+            }
+            let payload: PayloadRef = rmp_serde::from_slice(&payload)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let payload = hydrate_payload_from_storage(&conn, &self.payload_config, payload)?;
+            records.push(SignalInboxRecord {
+                signal_id: crate::SignalId::new(signal_id),
+                signal_name: crate::SignalName::new(signal_name),
+                payload,
+            });
+        }
+        Ok(records)
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
             .map_err(|_| Error::Backend("sqlite connection mutex poisoned".to_owned()))
+    }
+
+    /// Shared body of [`DurableBackend::stream_history`] and
+    /// [`DurableBackend::stream_history_for_replay`]. `hydrate` is the whole
+    /// difference between them: the public read resolves blob refs, the replay
+    /// read hands them back untouched so the worker pays for only what it
+    /// decodes. Passing `false` on the public path is a silent storage bug, not
+    /// a compile error — `sqlite_provider_replay_stream_keeps_large_payloads_
+    /// lazy_until_explicit_hydration_after_reopen` and the three other
+    /// `sqlite_provider_*` payload tests are what catch it.
+    fn stream_history_inner(
+        &self,
+        req: crate::StreamHistoryRequest,
+        hydrate: bool,
+    ) -> Result<HistoryChunk> {
+        let conn = self.connection()?;
+        let max_events = req.max_events.max(1);
+        let max_bytes = req.max_bytes.max(1);
+        let mut stmt = conn
+            .prepare(
+                "select event_id, event_type, data
+                 from history_events
+                 where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                 order by event_id asc",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    req.run_id.0,
+                    i64::try_from(req.after_event_id.0).unwrap_or(i64::MAX),
+                    i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .map_err(sqlite_error)?;
+
+        let mut events = Vec::new();
+        let mut bytes = 0usize;
+        for row in rows {
+            let (event_id, _event_type, data) = row.map_err(sqlite_error)?;
+            let mut data: HistoryEventData = rmp_serde::from_slice(&data)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let event_bytes = event_payload_len(&data).max(1);
+            if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
+            {
+                break;
+            }
+            if hydrate {
+                data = hydrate_history_event_from_storage(&conn, &self.payload_config, data)?;
+            }
+            bytes += event_bytes;
+            events.push(HistoryEvent {
+                event_id: EventId(event_id),
+                data,
+            });
+            if events.len() >= max_events {
+                break;
+            }
+        }
+
+        let last_event_id = events
+            .last()
+            .map(|event| event.event_id)
+            .unwrap_or(req.after_event_id);
+        let has_more = conn
+            .query_row(
+                "select 1 from history_events
+                 where run_id = ?1 and event_id > ?2 and event_id <= ?3
+                 limit 1",
+                params![
+                    req.run_id.0,
+                    i64::try_from(last_event_id.0).unwrap_or(i64::MAX),
+                    i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX)
+                ],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(sqlite_error)?
+            .is_some();
+
+        Ok(HistoryChunk {
+            events,
+            last_event_id,
+            has_more,
+        })
     }
 }
 
@@ -197,10 +442,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "workflow `{}` was not found",
-                    req.workflow_id.0
-                )));
+                return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
             };
             if terminal {
                 tx.commit().map_err(sqlite_error)?;
@@ -230,7 +472,7 @@ impl DurableBackend for SqliteBackend {
     }
 
     fn current_time(&self) -> BoxFuture<'static, Result<TimestampMs>> {
-        Box::pin(ready(Ok(TimestampMs(unix_epoch_millis()))))
+        Box::pin(ready(Ok(self.clock.now())))
     }
 
     fn claim_workflow_task(
@@ -243,7 +485,7 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let now_ms = unix_epoch_millis();
+            let now_ms = self.clock.now().0;
             // A held claim blocks reclaiming only while its lease is unexpired.
             // A held claim with a null lease (only possible for rows claimed
             // before the lease column existed) stays unclaimable, failing safe.
@@ -339,155 +581,14 @@ impl DurableBackend for SqliteBackend {
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let result = (|| {
-            let conn = self.connection()?;
-            let max_events = req.max_events.max(1);
-            let max_bytes = req.max_bytes.max(1);
-            let mut stmt = conn
-                .prepare(
-                    "select event_id, event_type, data
-                     from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     order by event_id asc",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(
-                    params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
-                    |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    },
-                )
-                .map_err(sqlite_error)?;
-
-            let mut events = Vec::new();
-            let mut bytes = 0usize;
-            for row in rows {
-                let (event_id, event_type, data) = row.map_err(sqlite_error)?;
-                let data: HistoryEventData = rmp_serde::from_slice(&data)
-                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                let event_bytes = event_payload_len(&data).max(1);
-                if !events.is_empty()
-                    && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-                {
-                    break;
-                }
-                let data = hydrate_history_event_from_storage(&conn, &self.payload_config, data)?;
-                bytes += event_bytes;
-                events.push(HistoryEvent {
-                    event_id: EventId(event_id),
-                    event_type: event_type_from_str(&event_type)?,
-                    data,
-                });
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-
-            let last_event_id = events
-                .last()
-                .map(|event| event.event_id)
-                .unwrap_or(req.after_event_id);
-            let has_more = conn
-                .query_row(
-                    "select 1 from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     limit 1",
-                    params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(sqlite_error)?
-                .is_some();
-
-            Ok(HistoryChunk {
-                events,
-                last_event_id,
-                has_more,
-            })
-        })();
-        Box::pin(ready(result))
+        Box::pin(ready(self.stream_history_inner(req, true)))
     }
 
     fn stream_history_for_replay(
         &self,
         req: crate::StreamHistoryRequest,
     ) -> BoxFuture<'static, Result<HistoryChunk>> {
-        let result = (|| {
-            let conn = self.connection()?;
-            let max_events = req.max_events.max(1);
-            let max_bytes = req.max_bytes.max(1);
-            let mut stmt = conn
-                .prepare(
-                    "select event_id, event_type, data
-                     from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     order by event_id asc",
-                )
-                .map_err(sqlite_error)?;
-            let rows = stmt
-                .query_map(
-                    params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
-                    |row| {
-                        Ok((
-                            row.get::<_, u64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                        ))
-                    },
-                )
-                .map_err(sqlite_error)?;
-
-            let mut events = Vec::new();
-            let mut bytes = 0usize;
-            for row in rows {
-                let (event_id, event_type, data) = row.map_err(sqlite_error)?;
-                let data: HistoryEventData = rmp_serde::from_slice(&data)
-                    .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-                let event_bytes = event_payload_len(&data).max(1);
-                if !events.is_empty()
-                    && (events.len() >= max_events || bytes + event_bytes > max_bytes)
-                {
-                    break;
-                }
-                bytes += event_bytes;
-                events.push(HistoryEvent {
-                    event_id: EventId(event_id),
-                    event_type: event_type_from_str(&event_type)?,
-                    data,
-                });
-                if events.len() >= max_events {
-                    break;
-                }
-            }
-
-            let last_event_id = events
-                .last()
-                .map(|event| event.event_id)
-                .unwrap_or(req.after_event_id);
-            let has_more = conn
-                .query_row(
-                    "select 1 from history_events
-                     where run_id = ?1 and event_id > ?2 and event_id <= ?3
-                     limit 1",
-                    params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
-                    |_| Ok(()),
-                )
-                .optional()
-                .map_err(sqlite_error)?
-                .is_some();
-
-            Ok(HistoryChunk {
-                events,
-                last_event_id,
-                has_more,
-            })
-        })();
-        Box::pin(ready(result))
+        Box::pin(ready(self.stream_history_inner(req, false)))
     }
 
     fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
@@ -612,38 +713,96 @@ impl DurableBackend for SqliteBackend {
                 insert_history_event(&tx, &claim.run_id, next_event_id, event.data)?;
             }
             for task in schedule_activities {
-                let timeout_at_ms = activity_timeout_at_ms(task.start_to_close_timeout);
                 let task_blob = rmp_serde::to_vec_named(&task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                // `timeout_at_ms` is stamped by the claim: start-to-close is
+                // measured from the attempt's start.
                 tx.execute(
                     "insert into activity_tasks
                      (activity_id, namespace, run_id, activity_name, task_queue, task,
                       claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
+                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, null, null)",
                     params![
                         task.activity_id.0,
                         namespace.as_str(),
                         task.run_id.0,
                         task.activity_name.0,
                         task.task_queue.0,
-                        task_blob,
-                        timeout_at_ms
+                        task_blob
                     ],
                 )
                 .map_err(sqlite_error)?;
             }
+            let mut map_ready_reason = None;
+            // The query projection records the history point the workflow task
+            // itself observed, so it keeps the append loop's tail even when a
+            // map completed during this commit appends past it. Memory has no
+            // separate cursor to drift, so capturing this is what keeps the
+            // three providers stamping the same event id.
+            let projection_event_id = next_event_id;
+            let mut commit_tail_published = false;
             for map_task in schedule_activity_maps {
                 insert_activity_map(&tx, &config, namespace.as_str(), &map_task)?;
-                materialize_activity_map_items(&tx, &config, &map_task.map_command_id)?;
+                if let Some((state, map_namespace, task)) =
+                    activity_map_state(&tx, &map_task.map_command_id)?
+                {
+                    publish_commit_tail_before_map_append(
+                        &tx,
+                        &claim.run_id,
+                        next_event_id,
+                        &state,
+                        &mut commit_tail_published,
+                    )?;
+                    if let Some(event_id) = step_map(
+                        &tx,
+                        &config,
+                        &state,
+                        &map_namespace,
+                        &MapTask::Activity(task),
+                        MapEvent::DescriptorCreated {
+                            parent_terminal: became_terminal,
+                        },
+                    )? {
+                        next_event_id = event_id;
+                        map_ready_reason = Some(WorkflowTaskReason::ActivityMapCompleted);
+                    }
+                }
             }
             for map_task in schedule_child_workflow_maps {
                 insert_child_workflow_map(&tx, &config, namespace.as_str(), &map_task)?;
-                materialize_child_workflow_map_items(&tx, &config, &map_task.map_command_id)?;
+                if let Some((state, map_namespace, task)) =
+                    child_workflow_map_state(&tx, &map_task.map_command_id)?
+                {
+                    publish_commit_tail_before_map_append(
+                        &tx,
+                        &claim.run_id,
+                        next_event_id,
+                        &state,
+                        &mut commit_tail_published,
+                    )?;
+                    if let Some(event_id) = step_map(
+                        &tx,
+                        &config,
+                        &state,
+                        &map_namespace,
+                        &MapTask::ChildWorkflow(task),
+                        MapEvent::DescriptorCreated {
+                            parent_terminal: became_terminal,
+                        },
+                    )? {
+                        next_event_id = event_id;
+                        map_ready_reason = Some(WorkflowTaskReason::ChildWorkflowMapCompleted);
+                    }
+                }
             }
             for message in start_child_workflows {
                 insert_child_outbox(&tx, namespace.as_str(), &message)?;
             }
+            // Fenced to the claimed run, as in the memory provider.
             for wait in batch.upsert_waits {
+                if wait.run_id != claim.run_id {
+                    continue;
+                }
                 tx.execute(
                     "insert into active_waits
                      (wait_id, run_id, command_seq, kind, wait_key, ready_at_ms)
@@ -667,20 +826,20 @@ impl DurableBackend for SqliteBackend {
             }
             for signal_id in batch.consume_signals {
                 tx.execute(
-                    "update signals set consumed = 1 where signal_id = ?1",
-                    params![signal_id.0],
+                    "update signals set consumed = 1 where signal_id = ?1 and run_id = ?2",
+                    params![signal_id.0, claim.run_id.0],
                 )
                 .map_err(sqlite_error)?;
             }
             for wait_id in batch.delete_waits {
                 tx.execute(
-                    "delete from active_waits where wait_id = ?1",
-                    params![wait_id.0],
+                    "delete from active_waits where wait_id = ?1 and run_id = ?2",
+                    params![wait_id.0, claim.run_id.0],
                 )
                 .map_err(sqlite_error)?;
             }
             for command_id in batch.cancel_commands {
-                cancel_command_operational_state(&tx, &command_id)?;
+                cancel_command_operational_state(&tx, &config, &command_id)?;
             }
             if let Some(payload) = query_projection {
                 let payload_blob = rmp_serde::to_vec_named(&payload)
@@ -697,7 +856,7 @@ impl DurableBackend for SqliteBackend {
                         namespace.as_str(),
                         workflow_id.as_str(),
                         claim.run_id.0,
-                        next_event_id.0,
+                        projection_event_id.0,
                         payload_blob
                     ],
                 )
@@ -714,6 +873,10 @@ impl DurableBackend for SqliteBackend {
                     terminal_event.clone()
                 {
                     continue_run_as_new(&tx, &claim.run_id, event)?;
+                    // The commit starts the children it requested and the map items it
+                    // admitted before it commits, as the Postgres provider does; the
+                    // returned tail predates their `ChildWorkflowStarted` events.
+                    dispatch_pending_child_starts(&tx, &config, namespace.as_str(), usize::MAX)?;
                     tx.commit().map_err(sqlite_error)?;
                     return Ok(CommitOutcome::Committed {
                         new_tail_event_id: next_event_id,
@@ -724,12 +887,17 @@ impl DurableBackend for SqliteBackend {
                 }
             }
             // SQLite applies child starts through the outbox, so no
-            // same-commit child reason exists; only the signal recheck can
-            // re-mark the run.
+            // same-commit child reason exists; an empty map completed at
+            // descriptor creation is the one same-commit reason this provider
+            // can produce, and only the signal recheck can otherwise re-mark
+            // the run. This update rewrites `ready_reason` wholesale, so a
+            // reason `append_map_terminal_event` already wrote has to be
+            // carried through it rather than left to survive it.
             let signal_ready = !terminal_after_commit && signal_wait_ready(&tx, &claim.run_id)?;
-            let ready_reason = post_commit_ready_reason(terminal_after_commit, None, signal_ready)
-                .as_ref()
-                .map(reason_to_str);
+            let ready_reason =
+                post_commit_ready_reason(terminal_after_commit, map_ready_reason, signal_ready)
+                    .as_ref()
+                    .map(reason_to_str);
             tx.execute(
                 "update workflow_instances
                  set current_event_id = ?1,
@@ -746,9 +914,22 @@ impl DurableBackend for SqliteBackend {
                 ],
             )
             .map_err(sqlite_error)?;
+            // The commit starts the children it requested and the map items it
+            // admitted before it commits, as the Postgres provider does; the
+            // returned tail predates their `ChildWorkflowStarted` events.
+            dispatch_pending_child_starts(&tx, &config, namespace.as_str(), usize::MAX)?;
+            // The tail the caller learns includes what the dispatch appended,
+            // as it does on Postgres.
+            let new_tail_event_id: u64 = tx
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![claim.run_id.0],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
             Ok(CommitOutcome::Committed {
-                new_tail_event_id: next_event_id,
+                new_tail_event_id: EventId(new_tail_event_id),
             })
         })();
         Box::pin(ready(result))
@@ -778,7 +959,6 @@ impl DurableBackend for SqliteBackend {
             if claim_token != Some(claim.token) {
                 return Err(Error::StaleLease);
             }
-            let ready_reason = (!terminal).then(|| reason_to_str(&release.reason));
             let ready_at_ms = if terminal {
                 0
             } else {
@@ -786,9 +966,11 @@ impl DurableBackend for SqliteBackend {
             };
             tx.execute(
                 "update workflow_instances
-                 set workflow_claim_token = null, ready_reason = ?1, ready_at_ms = ?2
-                 where run_id = ?3",
-                params![ready_reason, ready_at_ms, claim.run_id.0],
+                 set workflow_claim_token = null,
+                     ready_reason = case when terminal then null else ready_reason end,
+                     ready_at_ms = ?1
+                 where run_id = ?2",
+                params![ready_at_ms, claim.run_id.0],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)
@@ -830,10 +1012,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "workflow `{}` was not found",
-                    req.workflow_id.0
-                )));
+                return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
             };
             if terminal {
                 return Err(Error::TerminalWorkflow);
@@ -929,8 +1108,8 @@ impl DurableBackend for SqliteBackend {
                 .prepare(
                     "select w.wait_id, w.run_id, w.command_seq
                      from active_waits w
-                     join workflow_instances i on i.run_id = w.run_id
-                     where i.namespace = ?1
+                     left join workflow_instances i on i.run_id = w.run_id
+                     where (i.namespace = ?1 or i.run_id is null)
                        and w.kind = ?2
                        and w.ready_at_ms is not null
                        and w.ready_at_ms <= ?3
@@ -981,12 +1160,30 @@ impl DurableBackend for SqliteBackend {
                     .map_err(sqlite_error)?;
                     continue;
                 };
+                // Skipped, not deleted (`SPEC.md` §14). A wait that outlived
+                // its run's terminal event is a defect, not a state to handle:
+                // §19.1 requires the terminal commit to delete the run's waits
+                // in the same transaction, so this row can only exist because
+                // that cleanup did not run. Deleting it here would hide the
+                // defect the cleanup was supposed to have prevented — the scan
+                // would silently repair the symptom once and leave no trace,
+                // and `only_the_live_runs_timer_spends_the_due_scan_budget`
+                // would stop detecting a broken cleanup, because a leftover
+                // that disappears after one sweep stops contending for the
+                // scan's budget. The guard's job is only to refuse the append:
+                // a `TimerFired` past a terminal event is a history every
+                // replay, audit and cleanup path assumes cannot exist.
+                //
+                // Deliberately a per-row skip rather than an `i.terminal = 0`
+                // predicate on the selecting join above, which is a one-word
+                // change and tempting for exactly that reason: the predicate
+                // (TypeScript's Postgres provider takes that route) would keep
+                // a leftover out of the scan's `limit` budget, but it would
+                // also make this provider blind to a terminal cleanup that
+                // stopped deleting waits, which is what the budget case above
+                // actually tests. The starvation the predicate would avoid is
+                // reachable only once that invariant is already broken.
                 if terminal {
-                    tx.execute(
-                        "delete from active_waits where wait_id = ?1",
-                        params![wait_id],
-                    )
-                    .map_err(sqlite_error)?;
                     continue;
                 }
 
@@ -1003,17 +1200,7 @@ impl DurableBackend for SqliteBackend {
                         fired_at: req.now,
                     }),
                 )?;
-                tx.execute(
-                    "update workflow_instances
-                     set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                     where run_id = ?3",
-                    params![
-                        event_id.0,
-                        reason_to_str(&WorkflowTaskReason::TimerFired),
-                        run_id.0
-                    ],
-                )
-                .map_err(sqlite_error)?;
+                set_workflow_ready(&tx, &run_id, event_id, WorkflowTaskReason::TimerFired)?;
                 tx.execute(
                     "delete from active_waits where wait_id = ?1",
                     params![wait_id],
@@ -1074,7 +1261,7 @@ impl DurableBackend for SqliteBackend {
 
             let mut timed_out = 0usize;
             for activity_id in due {
-                if timeout_activity(&tx, ActivityId(activity_id), req.now)? {
+                if timeout_activity(&tx, &self.payload_config, ActivityId(activity_id), req.now)? {
                     timed_out += 1;
                 }
             }
@@ -1095,7 +1282,7 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let now = TimestampMs(unix_epoch_millis());
+            let now = self.clock.now();
             let mut stmt = tx
                 .prepare(
                     "select a.activity_id, a.activity_name, a.task
@@ -1105,7 +1292,6 @@ impl DurableBackend for SqliteBackend {
                        and a.task_queue = ?2
                        and a.completed = 0
                        and a.claim_token is null
-                       and (a.timeout_at_ms is null or a.timeout_at_ms > ?3)
                        and (a.visible_at_ms is null or a.visible_at_ms <= ?3)
                        and i.terminal = 0
                      order by a.rowid asc",
@@ -1131,19 +1317,19 @@ impl DurableBackend for SqliteBackend {
                     let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
                     let task = hydrate_activity_task_from_storage(&tx, &self.payload_config, task)?;
-                    if let Some(map_item) = &task.map_item {
-                        if activity_map_is_completed(&tx, &map_item.map_command_id)? {
-                            tx.execute(
-                                "update activity_tasks
+                    if let Some(map_item) = &task.map_item
+                        && activity_map_is_completed(&tx, &map_item.map_command_id)?
+                    {
+                        tx.execute(
+                            "update activity_tasks
                                  set completed = 1,
                                      heartbeat_deadline_at_ms = null,
                                      implicit_heartbeat_ms = null
                                  where activity_id = ?1",
-                                params![activity_id],
-                            )
-                            .map_err(sqlite_error)?;
-                            continue;
-                        }
+                            params![activity_id],
+                        )
+                        .map_err(sqlite_error)?;
+                        continue;
                     }
                     selected = Some((ActivityId(activity_id), task));
                     break;
@@ -1156,9 +1342,9 @@ impl DurableBackend for SqliteBackend {
                 return Ok(None);
             };
             let token = next_counter(&tx, "claim")?;
-            // Tasks without explicit timeouts get the lease as an implicit
-            // heartbeat interval; explicit deadlines stay authoritative and
-            // the stored timeout_at_ms is untouched by the claim.
+            // Start-to-close is measured from the claim, so the deadline is
+            // stamped here; tasks without explicit timeouts get the lease as
+            // an implicit heartbeat interval instead.
             let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
                 task.start_to_close_timeout,
                 task.heartbeat_timeout,
@@ -1167,11 +1353,13 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set claim_token = ?1,
-                     heartbeat_deadline_at_ms = ?2,
-                     implicit_heartbeat_ms = ?3
-                 where activity_id = ?4",
+                     timeout_at_ms = ?2,
+                     heartbeat_deadline_at_ms = ?3,
+                     implicit_heartbeat_ms = ?4
+                 where activity_id = ?5",
                 params![
                     token,
+                    activity_timeout_at_ms_from(now, task.start_to_close_timeout),
                     activity_heartbeat_deadline_at_ms(
                         now,
                         task.heartbeat_timeout,
@@ -1222,8 +1410,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Activity rows exist until their run's terminal cleanup
-                // deletes them, so a missing row is a completed activity.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted);
             };
@@ -1243,7 +1430,7 @@ impl DurableBackend for SqliteBackend {
                  where activity_id = ?2",
                 params![
                     activity_heartbeat_deadline_at_ms(
-                        TimestampMs(unix_epoch_millis()),
+                        self.clock.now(),
                         task.heartbeat_timeout,
                         implicit_heartbeat_ms
                     ),
@@ -1281,7 +1468,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Missing row means the run's terminal cleanup deleted it.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(CompleteActivityOutcome::AlreadyCompleted);
             };
@@ -1331,17 +1518,12 @@ impl DurableBackend for SqliteBackend {
                     result,
                 }),
             )?;
-            tx.execute(
-                "update workflow_instances
-                 set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                 where run_id = ?3",
-                params![
-                    event_id.0,
-                    reason_to_str(&WorkflowTaskReason::ActivityCompleted),
-                    task.run_id.0
-                ],
-            )
-            .map_err(sqlite_error)?;
+            set_workflow_ready(
+                &tx,
+                &task.run_id,
+                event_id,
+                WorkflowTaskReason::ActivityCompleted,
+            )?;
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
@@ -1381,7 +1563,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Missing row means the run's terminal cleanup deleted it.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(FailActivityOutcome::AlreadyCompleted);
             };
@@ -1394,9 +1576,47 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            if let ActivityFailureDecision::Retry { next_attempt } =
-                activity_failure_decision(&task, req.failure.non_retryable)
-            {
+            let decision = activity_failure_decision(&task, &req.failure);
+
+            // Map items take the engine route for *both* verdicts: a retry of
+            // an item whose map already ended must not reschedule anything,
+            // and only the engine knows whether the map ended.
+            if let Some(map_item) = task.map_item.clone() {
+                let decision = ItemRetryDecision::from(decision);
+                // Only an exhausting attempt persists its failure, so a
+                // retried attempt never offloads a payload the map discards.
+                let failure = if matches!(decision, ItemRetryDecision::Exhausted) {
+                    normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?
+                } else {
+                    req.failure
+                };
+                let now = self.clock.now();
+                let outcome = fail_map_item(
+                    &tx,
+                    &self.payload_config,
+                    task,
+                    map_item,
+                    failure,
+                    ItemAttemptFailureKind::Failed,
+                    decision,
+                    now,
+                )?;
+                if !matches!(outcome, FailActivityOutcome::RetryScheduled { .. }) {
+                    tx.execute(
+                        "update activity_tasks
+                         set completed = 1,
+                             heartbeat_deadline_at_ms = null,
+                             implicit_heartbeat_ms = null
+                         where activity_id = ?1",
+                        params![req.claim.activity_id.0],
+                    )
+                    .map_err(sqlite_error)?;
+                }
+                tx.commit().map_err(sqlite_error)?;
+                return Ok(outcome);
+            }
+
+            if let ActivityFailureDecision::Retry { next_attempt } = decision {
                 let mut retry_task = task.clone();
                 retry_task.attempt = next_attempt;
                 let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -1404,39 +1624,27 @@ impl DurableBackend for SqliteBackend {
                 // The retry backoff delays visibility; the start-to-close
                 // clock restarts at the visibility instant so the timeout
                 // scanner cannot fire on a task that was never claimable.
-                let now = TimestampMs(unix_epoch_millis());
+                let now = self.clock.now();
                 let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
-                let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
                 tx.execute(
                     "update activity_tasks
                      set task = ?1,
                          claim_token = null,
-                         timeout_at_ms = ?2,
+                         timeout_at_ms = null,
                          heartbeat_deadline_at_ms = null,
                          implicit_heartbeat_ms = null,
-                         visible_at_ms = ?3
-                     where activity_id = ?4",
-                    params![
-                        retry_blob,
-                        activity_timeout_at_ms_from(
-                            visible_from,
-                            retry_task.start_to_close_timeout
-                        ),
-                        visible_at_ms,
-                        req.claim.activity_id.0
-                    ],
+                         visible_at_ms = ?2
+                     where activity_id = ?3",
+                    params![retry_blob, visible_at_ms, req.claim.activity_id.0],
                 )
                 .map_err(sqlite_error)?;
                 tx.commit().map_err(sqlite_error)?;
-                return Ok(FailActivityOutcome::RetryScheduled { next_attempt });
+                return Ok(FailActivityOutcome::RetryScheduled {
+                    next_attempt,
+                    ready_at: visible_at_ms.map(TimestampMs).unwrap_or(now),
+                });
             }
             let failure = normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?;
-            if let Some(map_item) = task.map_item.clone() {
-                let outcome =
-                    fail_map_item(&tx, task, map_item, failure, req.claim.activity_id.clone())?;
-                tx.commit().map_err(sqlite_error)?;
-                return Ok(outcome);
-            }
             let Some((tail, terminal)) = tx
                 .query_row(
                     "select current_event_id, terminal from workflow_instances where run_id = ?1",
@@ -1461,17 +1669,12 @@ impl DurableBackend for SqliteBackend {
                     failure,
                 }),
             )?;
-            tx.execute(
-                "update workflow_instances
-                 set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-                 where run_id = ?3",
-                params![
-                    event_id.0,
-                    reason_to_str(&WorkflowTaskReason::ActivityFailed),
-                    task.run_id.0
-                ],
-            )
-            .map_err(sqlite_error)?;
+            set_workflow_ready(
+                &tx,
+                &task.run_id,
+                event_id,
+                WorkflowTaskReason::ActivityFailed,
+            )?;
             tx.execute(
                 "update activity_tasks
                  set completed = 1,
@@ -1496,30 +1699,12 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let limit = req.limit.max(1);
-            let outbox_ids = {
-                let mut stmt = tx
-                    .prepare(
-                        "select outbox_id
-                         from child_outbox
-                         where namespace = ?1 and dispatched = 0
-                         order by outbox_id asc
-                         limit ?2",
-                    )
-                    .map_err(sqlite_error)?;
-                let rows = stmt
-                    .query_map(params![req.namespace.0, limit as i64], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .map_err(sqlite_error)?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(sqlite_error)?
-            };
-            let mut dispatched = 0usize;
-            for outbox_id in outbox_ids {
-                dispatch_child_start(&tx, &self.payload_config, &outbox_id)?;
-                dispatched += 1;
-            }
+            let dispatched = dispatch_pending_child_starts(
+                &tx,
+                &self.payload_config,
+                &req.namespace.0,
+                req.limit,
+            )?;
             tx.commit().map_err(sqlite_error)?;
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
         })();
@@ -1559,7 +1744,26 @@ impl DurableBackend for SqliteBackend {
                 })
             })
             .transpose()
-            .map(|outcome| outcome.unwrap_or(crate::QueryProjectionOutcome::NotFound))
+            .and_then(|outcome| match outcome {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    let exists = conn
+                        .query_row(
+                            "select 1 from workflow_instances
+                             where namespace = ?1 and workflow_id = ?2",
+                            params![req.namespace.0, req.workflow_id.0],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(sqlite_error)?
+                        .is_some();
+                    Ok(if exists {
+                        crate::QueryProjectionOutcome::NoProjection
+                    } else {
+                        crate::QueryProjectionOutcome::NotFound
+                    })
+                }
+            })
         })();
         Box::pin(ready(result))
     }
@@ -1683,6 +1887,9 @@ impl DurableBackend for SqliteBackend {
             // makes them reachable commits, so an unreachable-but-young blob
             // may belong to an in-flight commit. Only blobs older than the
             // grace period are garbage.
+            // Blob ages are wall-clock readings, file modified times and the stamps
+            // on `payload_blobs` rows, so the grace period is measured on that clock
+            // rather than on the provider's, which a caller may drive.
             let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
             let mut all_blobs: BTreeMap<String, i64> = {
                 let mut stmt = tx
@@ -1839,7 +2046,12 @@ fn collect_activity_map_payload_roots(
         let task: ActivityMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
         roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+            hydrate_manifest_root(
+                conn,
+                config,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+            )?,
         ));
     }
     drop(stmt);
@@ -1877,7 +2089,12 @@ fn collect_child_workflow_map_payload_roots(
         let task: ChildWorkflowMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
         roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+            hydrate_manifest_root(
+                conn,
+                config,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+            )?,
         ));
     }
     drop(stmt);
@@ -1895,24 +2112,11 @@ fn collect_child_workflow_map_payload_roots(
         let blob = row.map_err(sqlite_error)?;
         let outcome: ChildWorkflowMapItemOutcome =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_child_workflow_map_outcome_payload_roots(&outcome, roots);
+        if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+            roots.push(PayloadRootRef::Payload(payload.clone()));
+        }
     }
     Ok(())
-}
-
-fn collect_child_workflow_map_outcome_payload_roots(
-    outcome: &ChildWorkflowMapItemOutcome,
-    roots: &mut Vec<PayloadRootRef>,
-) {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
-        }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_roots(failure, roots);
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-    }
 }
 
 fn collect_child_outbox_payload_roots(
@@ -1975,118 +2179,62 @@ fn collect_history_event_payload_roots(
     data: &HistoryEventData,
     roots: &mut Vec<PayloadRootRef>,
 ) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            roots.push(PayloadRootRef::Payload(input.clone()));
+    crate::payload::history_event_payload_roots(data, roots, &mut |kind, payload| {
+        hydrate_manifest_root(conn, config, kind, payload)
+    })
+}
+
+/// A manifest root with its bytes in place when this provider holds them.
+fn hydrate_manifest_root(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    kind: ManifestKind,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(config, payload) {
+        return Ok(payload.clone());
+    }
+    match kind {
+        ManifestKind::ActivityMapInput => {
+            hydrate_activity_map_input_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::WorkflowCompleted { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
+        ManifestKind::ActivityMapResult => {
+            hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_roots(failure, roots);
+        ManifestKind::ChildWorkflowMapResult => {
+            hydrate_child_workflow_map_result_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ActivityMapResultManifest(
-                activity_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
-                child_workflow_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            roots.push(PayloadRootRef::Payload(requested.input.clone()));
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            roots.push(PayloadRootRef::Payload(signal.payload.clone()));
-        }
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)?;
-        }
-        HistoryEventData::WorkflowCancelled { .. }
-        | HistoryEventData::WorkflowTaskStarted
-        | HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => {}
+    }
+}
+
+/// A manifest container's bytes when this provider holds them; `None` leaves
+/// a container in another store unopened.
+fn load_manifest_container(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<Option<PayloadRef>> {
+    if is_external_payload_ref(config, payload) {
+        Ok(None)
+    } else {
+        hydrate_payload_from_storage(conn, config, payload.clone()).map(Some)
+    }
+}
+
+/// Marks every ref a manifest reaches, the manifest and its pages included.
+fn collect_manifest_refs(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    kind: ManifestKind,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    for payload in crate::payload::manifest_refs(kind, payload, &mut |container| {
+        load_manifest_container(conn, config, container)
+    })? {
+        collect_payload_blob_ref(conn, config, &payload, reachable)?;
     }
     Ok(())
-}
-
-fn collect_failure_payload_roots(failure: &crate::DurableFailure, roots: &mut Vec<PayloadRootRef>) {
-    if let Some(details) = &failure.details {
-        roots.push(PayloadRootRef::Payload(details.clone()));
-    }
-}
-
-fn activity_map_input_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_activity_map_input_manifest_from_storage(conn, config, payload.clone())
-}
-
-fn activity_map_result_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
-}
-
-fn child_workflow_map_result_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_child_workflow_map_result_manifest_from_storage(conn, config, payload.clone())
 }
 
 fn collect_history_payload_blobs(
@@ -2144,7 +2292,13 @@ fn collect_activity_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ActivityMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
+        collect_manifest_refs(
+            conn,
+            config,
+            ManifestKind::ActivityMapInput,
+            &task.input_manifest,
+            reachable,
+        )?;
     }
     drop(stmt);
 
@@ -2180,7 +2334,13 @@ fn collect_child_workflow_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ChildWorkflowMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
+        collect_manifest_refs(
+            conn,
+            config,
+            ManifestKind::ActivityMapInput,
+            &task.input_manifest,
+            reachable,
+        )?;
     }
     drop(stmt);
 
@@ -2197,25 +2357,9 @@ fn collect_child_workflow_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let outcome: ChildWorkflowMapItemOutcome =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_child_workflow_map_outcome_payload_blobs(conn, config, &outcome, reachable)?;
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_outcome_payload_blobs(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    outcome: &ChildWorkflowMapItemOutcome,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            collect_payload_blob_ref(conn, config, result, reachable)?;
+        if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+            collect_payload_blob_ref(conn, config, payload, reachable)?;
         }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_blobs(conn, config, failure, reachable)?;
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
     }
     Ok(())
 }
@@ -2286,103 +2430,11 @@ fn collect_history_event_payload_blobs(
     data: &HistoryEventData,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            collect_payload_blob_ref(conn, config, input, reachable)
-        }
-        HistoryEventData::WorkflowCompleted { result } => {
-            collect_payload_blob_ref(conn, config, result, reachable)
-        }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_blobs(conn, config, failure, reachable)
-        }
-        HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
-            Ok(())
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            collect_payload_blob_ref(conn, config, &scheduled.input, reachable)
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(
-                conn,
-                config,
-                &scheduled.input_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            collect_activity_map_result_manifest_ref(
-                conn,
-                config,
-                &completed.result_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(
-                conn,
-                config,
-                &scheduled.input_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            collect_child_workflow_map_result_manifest_ref(
-                conn,
-                config,
-                &completed.result_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            collect_payload_blob_ref(conn, config, &completed.result, reachable)
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            collect_payload_blob_ref(conn, config, &requested.input, reachable)
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            collect_payload_blob_ref(conn, config, &completed.result, reachable)
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            collect_payload_blob_ref(conn, config, &signal.payload, reachable)
-        }
-    }
-}
-
-fn collect_failure_payload_blobs(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    failure: &crate::DurableFailure,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    if let Some(details) = &failure.details {
-        collect_payload_blob_ref(conn, config, details, reachable)?;
-    }
-    Ok(())
+    crate::payload::history_event_payload_refs(
+        data,
+        &mut |container| load_manifest_container(conn, config, container),
+        &mut |payload| collect_payload_blob_ref(conn, config, payload, reachable),
+    )
 }
 
 fn collect_payload_blob_ref(
@@ -2392,96 +2444,10 @@ fn collect_payload_blob_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let PayloadRef::Blob { digest, uri, .. } = payload {
-        if is_sqlite_payload_uri(uri) {
+        if is_sqlite_payload_uri(config, uri) {
             load_payload_blob(conn, config, payload, false)?;
         }
         reachable.insert(digest.clone());
-    }
-    Ok(())
-}
-
-fn collect_activity_map_input_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
-        for item in &page.items {
-            collect_payload_blob_ref(conn, config, item, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_activity_map_result_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
-        for result in &page.results {
-            collect_payload_blob_ref(conn, config, result, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_result_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
-        for outcome in &page.outcomes {
-            match outcome {
-                crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                    collect_payload_blob_ref(conn, config, result, reachable)?;
-                }
-                crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
-                    collect_failure_payload_blobs(conn, config, failure, reachable)?;
-                }
-                crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-            }
-        }
     }
     Ok(())
 }
@@ -2493,7 +2459,7 @@ fn normalize_history_event_for_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
                     conn,
                     config,
@@ -2503,7 +2469,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
                     conn,
                     config,
@@ -2513,7 +2479,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
                     conn,
                     config,
@@ -2523,7 +2489,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
         }
         HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest =
                     normalize_child_workflow_map_result_manifest_for_storage(
                         conn,
@@ -2546,7 +2512,7 @@ fn hydrate_history_event_from_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
                     conn,
                     config,
@@ -2556,7 +2522,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
                     conn,
                     config,
@@ -2566,7 +2532,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
                     conn,
                     config,
@@ -2576,7 +2542,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
         }
         HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest =
                     hydrate_child_workflow_map_result_manifest_from_storage(
                         conn,
@@ -2678,7 +2644,7 @@ fn normalize_activity_map_input_manifest_for_storage(
             // owning layer normalized its items before this commit, so it
             // passes through untouched (mirroring the reachability
             // collectors' external-page skip).
-            if is_external_payload_ref(&page) {
+            if is_external_payload_ref(config, &page) {
                 return Ok(page);
             }
             let page = hydrate_payload_from_storage(conn, config, page)?;
@@ -2928,7 +2894,8 @@ fn normalize_payload_for_storage(
         payload @ PayloadRef::Blob { .. } => {
             // Only refs with this provider's schemes are validated against its
             // stores; every other scheme is opaque and persists unchanged.
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(uri)) {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(config, uri))
+            {
                 load_payload_blob(conn, config, &payload, true)?;
             }
             Ok(payload)
@@ -2944,7 +2911,8 @@ fn hydrate_payload_from_storage(
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri)) {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(config, uri))
+            {
                 return Ok(payload);
             }
             let PayloadRef::Blob {
@@ -3057,76 +3025,23 @@ fn load_payload_blob(
     Ok(blob)
 }
 
+fn local_blob_store(config: &PayloadStorageConfig) -> Option<crate::LocalDirectoryBlobStore> {
+    config
+        .blob_store
+        .as_ref()
+        .map(|BlobStoreConfig::LocalDirectory { root, prefix }| {
+            crate::LocalDirectoryBlobStore::new(root.clone(), prefix)
+        })
+}
+
 fn store_external_payload_blob(
     config: &PayloadStorageConfig,
     digest: &str,
     bytes: &[u8],
 ) -> Result<Option<String>> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(None);
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let dir = local_blob_dir(root, prefix);
-            fs::create_dir_all(&dir).map_err(|err| {
-                Error::Backend(format!(
-                    "failed to create local payload blob directory `{}`: {err}",
-                    dir.display()
-                ))
-            })?;
-            let path = dir.join(digest);
-            if path.exists() {
-                let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                let metadata = fs::metadata(&path).map_err(|err| {
-                    Error::Backend(format!(
-                        "failed to inspect local payload blob `{}`: {err}",
-                        path.display()
-                    ))
-                })?;
-                if metadata.len() != expected_size {
-                    return Err(Error::PayloadDecode(format!(
-                        "payload blob size mismatch: expected {expected_size}, got {}",
-                        metadata.len()
-                    )));
-                }
-                // Refresh the mtime so the GC grace period keeps protecting a
-                // blob that this in-flight commit is about to reference; the
-                // digest is re-validated on every read.
-                fs::File::options()
-                    .write(true)
-                    .open(&path)
-                    .and_then(|file| file.set_modified(std::time::SystemTime::now()))
-                    .map_err(|err| {
-                        Error::Backend(format!(
-                            "failed to refresh local payload blob `{}`: {err}",
-                            path.display()
-                        ))
-                    })?;
-                return Ok(Some(local_blob_uri(digest)));
-            }
-            let tmp_path = dir.join(format!("{digest}.tmp-{}", std::process::id()));
-            fs::write(&tmp_path, bytes).map_err(|err| {
-                Error::Backend(format!(
-                    "failed to write local payload blob `{}`: {err}",
-                    tmp_path.display()
-                ))
-            })?;
-            match fs::rename(&tmp_path, &path) {
-                Ok(()) => {}
-                Err(_) if path.exists() => {
-                    let _ = fs::remove_file(&tmp_path);
-                }
-                Err(err) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(Error::Backend(format!(
-                        "failed to commit local payload blob `{}`: {err}",
-                        path.display()
-                    )));
-                }
-            }
-            Ok(Some(local_blob_uri(digest)))
-        }
-    }
+    local_blob_store(config)
+        .map(|store| store.put_sync(digest, bytes))
+        .transpose()
 }
 
 fn load_external_payload_blob(
@@ -3134,140 +3049,63 @@ fn load_external_payload_blob(
     digest: &str,
     expected_size: &u64,
 ) -> Result<Vec<u8>> {
-    let Some(blob_store) = &config.blob_store else {
+    let Some(store) = local_blob_store(config) else {
         return Err(Error::PayloadDecode(format!(
             "missing payload blob `{digest}`"
         )));
     };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let path = local_blob_path(root, prefix, digest);
-            let bytes = fs::read(&path).map_err(|err| match err.kind() {
-                ErrorKind::NotFound => {
-                    Error::PayloadDecode(format!("missing payload blob `{digest}`"))
-                }
-                _ => Error::PayloadDecode(format!(
-                    "failed to read local payload blob `{}`: {err}",
-                    path.display()
-                )),
-            })?;
-            let actual_digest = digest_bytes(&bytes);
-            if actual_digest != digest {
-                return Err(Error::PayloadDecode(format!(
-                    "payload blob digest mismatch: expected `{digest}`, got `{actual_digest}`"
-                )));
-            }
-            let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if actual_size != *expected_size {
-                return Err(Error::PayloadDecode(format!(
-                    "payload blob size mismatch: expected {expected_size}, got {actual_size}"
-                )));
-            }
-            Ok(bytes)
-        }
+    let bytes = store.get_sync(digest)?;
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != *expected_size {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob size mismatch: expected {expected_size}, got {actual_size}"
+        )));
     }
+    Ok(bytes)
 }
 
 fn external_blob_listings(config: &PayloadStorageConfig) -> Result<BTreeMap<String, TimestampMs>> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(BTreeMap::new());
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let dir = local_blob_dir(root, prefix);
-            let mut blobs = BTreeMap::new();
-            match fs::read_dir(&dir) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let entry = entry.map_err(|err| {
-                            Error::Backend(format!(
-                                "failed to list local payload blob directory `{}`: {err}",
-                                dir.display()
-                            ))
-                        })?;
-                        let metadata = entry.metadata().map_err(|err| {
-                            Error::Backend(format!(
-                                "failed to inspect local payload blob `{}`: {err}",
-                                entry.path().display()
-                            ))
-                        })?;
-                        if !metadata.is_file() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if name.contains(".tmp-") {
-                            continue;
-                        }
-                        // A file without a readable mtime counts as brand new
-                        // so GC retains rather than deletes when unsure.
-                        let last_modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|modified| {
-                                modified.duration_since(std::time::UNIX_EPOCH).ok()
-                            })
-                            .map(|since_epoch| {
-                                i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
-                            })
-                            .unwrap_or_else(unix_epoch_millis);
-                        blobs.insert(name, TimestampMs(last_modified));
-                    }
-                    Ok(blobs)
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(blobs),
-                Err(err) => Err(Error::Backend(format!(
-                    "failed to list local payload blob directory `{}`: {err}",
-                    dir.display()
-                ))),
-            }
-        }
-    }
+    local_blob_store(config).map_or_else(|| Ok(BTreeMap::new()), |store| store.list_sync())
 }
 
 fn delete_external_blob(config: &PayloadStorageConfig, digest: &str) -> Result<()> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(());
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let path = local_blob_path(root, prefix, digest);
-            match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(Error::Backend(format!(
-                    "failed to delete local payload blob `{}`: {err}",
-                    path.display()
-                ))),
-            }
-        }
-    }
+    local_blob_store(config).map_or(Ok(()), |store| store.delete_sync(digest))
 }
 
-fn local_blob_dir(root: &Path, prefix: &str) -> PathBuf {
-    if prefix.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(prefix)
-    }
-}
-
-fn local_blob_path(root: &Path, prefix: &str, digest: &str) -> PathBuf {
-    local_blob_dir(root, prefix).join(digest)
-}
-
-fn local_blob_uri(digest: &str) -> String {
-    format!("local://payload/{digest}")
-}
-
-fn is_sqlite_payload_uri(uri: &str) -> bool {
-    uri.starts_with("sqlite://payload/") || uri.starts_with("local://payload/")
+/// Whether this database stores the blob behind a reference: its own
+/// `sqlite://` blobs always, and `local://` blobs only when it was opened with
+/// a local directory store. A `local://` reference with no store configured
+/// belongs to a `PayloadBackend` wrapping this provider, which hydrates it.
+fn is_sqlite_payload_uri(config: &PayloadStorageConfig, uri: &str) -> bool {
+    uri.starts_with("sqlite://payload/")
+        || (config.blob_store.is_some() && uri.starts_with("local://payload/"))
 }
 
 // Every blob ref this provider did not mint is opaque: it belongs to whatever
 // layer owns its scheme (a `PayloadBackend` blob store), so the provider never
 // hydrates, validates, or garbage-collects it.
-fn is_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri))
+fn is_external_payload_ref(config: &PayloadStorageConfig, payload: &PayloadRef) -> bool {
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(config, uri))
+}
+
+/// A late call for an activity row that is gone: terminal cleanup deleted it,
+/// so the activity is over, unless the id names a run this database never
+/// held.
+fn missing_activity_outcome(conn: &Connection, activity_id: &ActivityId) -> Result<()> {
+    let run_id = crate::provider_util::activity_run_id(activity_id);
+    let known = conn
+        .query_row(
+            "select 1 from workflow_instances where run_id = ?1",
+            params![run_id.0],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if known.is_some() {
+        Ok(())
+    } else {
+        Err(Error::RunNotFound(run_id))
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -3904,43 +3742,68 @@ fn cancel_children_for_parent(tx: &Transaction<'_>, parent_run_id: &RunId) -> Re
     Ok(())
 }
 
-fn cancel_command_operational_state(tx: &Transaction<'_>, command_id: &CommandId) -> Result<()> {
+fn cancel_command_operational_state(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    command_id: &CommandId,
+) -> Result<()> {
     let activity_id = ActivityId::new(command_id);
-    let map_prefix = format!("{}:map:%", activity_id.0);
     tx.execute(
         "update activity_tasks
          set completed = 1,
              claim_token = null,
              heartbeat_deadline_at_ms = null,
              implicit_heartbeat_ms = null
-         where activity_id = ?1 or activity_id like ?2",
-        params![activity_id.0, map_prefix],
+         where activity_id = ?1",
+        params![activity_id.0],
     )
     .map_err(sqlite_error)?;
-    tx.execute(
-        "update activity_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![map_command_key(command_id)],
-    )
-    .map_err(sqlite_error)?;
-    tx.execute(
-        "update child_workflow_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![map_command_key(command_id)],
-    )
-    .map_err(sqlite_error)?;
+    // A cancelled map is a terminal map: the engine's `ParentCancelled`
+    // transition tombstones its pending work and closes the descriptor, so
+    // this path cannot drift from the fail-fast one.
+    if let Some((state, namespace, task)) = activity_map_state(tx, command_id)? {
+        step_map(
+            tx,
+            config,
+            &state,
+            &namespace,
+            &MapTask::Activity(task),
+            MapEvent::ParentCancelled,
+        )?;
+    }
+    if let Some((state, namespace, task)) = child_workflow_map_state(tx, command_id)? {
+        if !state.completed {
+            // Withdrawing the command on a still-live run means the
+            // `ParentClosePolicy` path never runs, so without this the children
+            // the map already started keep running with nothing waiting for
+            // them. The engine cannot emit this: `ParentCancelled`'s other
+            // producer is a run reaching a terminal event, where the children
+            // belong to the close policy, which is free to abandon them.
+            //
+            // Children first, descriptor last, matching the fail-fast effect
+            // order. That is a consistency choice, not a constraint: child
+            // cancellation reads the child's parent link and terminal flag and
+            // never the descriptor's state.
+            cancel_child_workflow_map_children(
+                tx,
+                command_id,
+                &map_command_cancelled_reason(command_id),
+            )?;
+        }
+        step_map(
+            tx,
+            config,
+            &state,
+            &namespace,
+            &MapTask::ChildWorkflow(task),
+            MapEvent::ParentCancelled,
+        )?;
+    }
     tx.execute(
         "update child_outbox
          set dispatched = 1
-         where outbox_id = ?1
-            or (parent_run_id = ?2 and command_seq = ?3)",
-        params![
-            child_outbox_id_for_command(command_id),
-            command_id.run_id.0,
-            command_id.seq.0
-        ],
+         where outbox_id = ?1",
+        params![child_outbox_id_for_command(command_id)],
     )
     .map_err(sqlite_error)?;
     Ok(())
@@ -3966,6 +3829,7 @@ fn insert_activity_map(
     namespace: &str,
     map_task: &ActivityMapTask,
 ) -> Result<()> {
+    validate_map_slot_bound(ACTIVITY_MAP_LABEL, map_task.max_in_flight)?;
     let manifest_payload = hydrate_activity_map_input_manifest_from_storage(
         tx,
         config,
@@ -3998,6 +3862,7 @@ fn insert_child_workflow_map(
     namespace: &str,
     map_task: &ChildWorkflowMapTask,
 ) -> Result<()> {
+    validate_map_slot_bound(CHILD_WORKFLOW_MAP_LABEL, map_task.max_in_flight)?;
     let manifest_payload = hydrate_activity_map_input_manifest_from_storage(
         tx,
         config,
@@ -4050,6 +3915,51 @@ fn insert_child_outbox(
     )
     .map_err(sqlite_error)?;
     Ok(())
+}
+
+/// Starts every undispatched child of the namespace's runs, at most `limit`
+/// of them, and returns how many it started. A commit calls this before it
+/// commits, so the outbox only carries what a later drain may still need.
+fn dispatch_pending_child_starts(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    namespace: &str,
+    limit: usize,
+) -> Result<usize> {
+    let limit = limit.max(1);
+    let mut dispatched = 0usize;
+    while dispatched < limit {
+        let outbox_ids = {
+            let mut stmt = tx
+                .prepare(
+                    "select outbox_id
+                     from child_outbox
+                     where namespace = ?1 and dispatched = 0
+                     order by outbox_id asc
+                     limit ?2",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        namespace,
+                        i64::try_from(limit - dispatched).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(sqlite_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?
+        };
+        if outbox_ids.is_empty() {
+            break;
+        }
+        for outbox_id in outbox_ids {
+            dispatch_child_start(tx, config, &outbox_id)?;
+            dispatched += 1;
+        }
+    }
+    Ok(dispatched)
 }
 
 fn dispatch_child_start(
@@ -4119,7 +4029,7 @@ fn dispatch_child_start(
             if !same_child {
                 let failure = crate::DurableFailure::non_retryable(
                     "durust.child_workflow_id_conflict",
-                    format!("workflow id `{}` is already started", message.workflow_id),
+                    format!("child workflow id already exists: {}", message.workflow_id),
                 );
                 if let Some(item) = message.child_map_item.clone() {
                     complete_child_workflow_map_item(
@@ -4280,6 +4190,39 @@ fn parent_tail_and_terminal(tx: &Transaction<'_>, run_id: &RunId) -> Result<Opti
     .map_err(sqlite_error)
 }
 
+/// Publish the tail this commit has reached so far, but only when the map about
+/// to be stepped is one that will *append*.
+///
+/// A map terminal fact produced during the scheduling commit goes through
+/// [`append_map_terminal_event`], which reads the run's tail from
+/// `workflow_instances.current_event_id` — a column this commit only writes at
+/// its end. Without this the fact would reuse an event id the commit already
+/// inserted, and the insert would fail on the history primary key.
+///
+/// The condition is the engine's own completion predicate rather than "a map is
+/// being scheduled", so an ordinary non-empty map pays no statement and the
+/// guard cannot drift from the thing that actually appends. Once per commit is
+/// enough: [`append_map_terminal_event`] moves `current_event_id` itself, so a
+/// second completing map in the same commit already reads the right tail.
+fn publish_commit_tail_before_map_append(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    tail: EventId,
+    state: &MapState,
+    published: &mut bool,
+) -> Result<()> {
+    if *published || state.recorded_outcomes < state.item_count {
+        return Ok(());
+    }
+    tx.execute(
+        "update workflow_instances set current_event_id = ?1 where run_id = ?2",
+        params![tail.0, run_id.0],
+    )
+    .map_err(sqlite_error)?;
+    *published = true;
+    Ok(())
+}
+
 fn set_workflow_ready(
     tx: &Transaction<'_>,
     run_id: &RunId,
@@ -4317,17 +4260,21 @@ fn child_event_exists(tx: &Transaction<'_>, command_id: &CommandId) -> Result<bo
         .is_some())
 }
 
-fn materialize_activity_map_items(
+/// The activity-map descriptor as [`crate::map_engine`] sees it, plus the
+/// decoded task the effect appliers need. `None` when the descriptor row is
+/// gone, which means the run's terminal cleanup deleted it.
+fn activity_map_state(
     tx: &Transaction<'_>,
-    config: &PayloadStorageConfig,
     map_command_id: &CommandId,
-) -> Result<()> {
+) -> Result<Option<(MapState, String, ActivityMapTask)>> {
     let key = map_command_key(map_command_id);
-    let Some((namespace, task_blob, item_count, next_ordinal, in_flight, completed)) = tx
+    let Some((namespace, task_blob, item_count, next_ordinal, in_flight, completed, recorded)) = tx
         .query_row(
-            "select namespace, task, item_count, next_ordinal, in_flight, completed
-             from activity_maps
-             where map_command_id = ?1",
+            "select m.namespace, m.task, m.item_count, m.next_ordinal, m.in_flight, m.completed,
+                    (select count(*) from activity_map_results r
+                      where r.map_command_id = m.map_command_id)
+             from activity_maps m
+             where m.map_command_id = ?1",
             params![key.as_str()],
             |row| {
                 Ok((
@@ -4337,146 +4284,398 @@ fn materialize_activity_map_items(
                     row.get::<_, u64>(3)?,
                     row.get::<_, u64>(4)?,
                     row.get::<_, bool>(5)?,
+                    row.get::<_, u64>(6)?,
                 ))
             },
         )
         .optional()
         .map_err(sqlite_error)?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    if completed {
-        return Ok(());
-    }
-
     let task: ActivityMapTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let mut next_ordinal = next_ordinal;
-    let mut in_flight = in_flight;
-    let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
-    let manifest_payload =
-        hydrate_activity_map_input_manifest_from_storage(tx, config, task.input_manifest.clone())?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    let state = MapState {
+        map_command_id: map_command_id.clone(),
+        kind: MapKind::Activity,
+        // An activity map is always fail-fast; the field is inert for it.
+        failure_mode: ChildWorkflowMapFailureMode::FailFast,
+        item_count,
+        next_ordinal,
+        in_flight,
+        max_in_flight: task.max_in_flight,
+        recorded_outcomes: recorded,
+        completed,
+    };
+    Ok(Some((state, namespace, task)))
+}
 
-    while in_flight < max_in_flight && next_ordinal < item_count {
-        let input = activity_map_input_at(&manifest, next_ordinal)?;
-        let activity_id = ActivityId::map_item(map_command_id, next_ordinal);
-        let item_task = ActivityTask {
-            activity_id: activity_id.clone(),
-            run_id: map_command_id.run_id.clone(),
-            command_id: map_command_id.clone(),
-            activity_name: task.activity_name.clone(),
-            task_queue: task.task_queue.clone(),
-            retry_policy: task.retry_policy.clone(),
-            start_to_close_timeout: task.start_to_close_timeout,
-            heartbeat_timeout: task.heartbeat_timeout,
-            attempt: 1,
-            input,
-            map_item: Some(ActivityMapItem {
-                map_command_id: map_command_id.clone(),
-                item_ordinal: next_ordinal,
-            }),
-        };
-        let item_task = normalize_activity_task_for_storage(tx, config, item_task)?;
-        let item_blob = rmp_serde::to_vec_named(&item_task)
-            .map_err(|err| Error::PayloadEncode(err.to_string()))?;
-        tx.execute(
-            "insert into activity_tasks
-             (activity_id, namespace, run_id, activity_name, task_queue, task,
-              claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
-             values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
-            params![
-                activity_id.0,
-                namespace.as_str(),
-                item_task.run_id.0,
-                item_task.activity_name.0,
-                item_task.task_queue.0,
-                item_blob,
-                activity_timeout_at_ms(item_task.start_to_close_timeout),
-            ],
+/// The child-workflow-map descriptor as [`crate::map_engine`] sees it.
+fn child_workflow_map_state(
+    tx: &Transaction<'_>,
+    map_command_id: &CommandId,
+) -> Result<Option<(MapState, String, ChildWorkflowMapTask)>> {
+    let key = map_command_key(map_command_id);
+    let Some((namespace, task_blob, item_count, next_ordinal, in_flight, completed, recorded)) = tx
+        .query_row(
+            "select m.namespace, m.task, m.item_count, m.next_ordinal, m.in_flight, m.completed,
+                    (select count(*) from child_workflow_map_results r
+                      where r.map_command_id = m.map_command_id)
+             from child_workflow_maps m
+             where m.map_command_id = ?1",
+            params![key.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, bool>(5)?,
+                    row.get::<_, u64>(6)?,
+                ))
+            },
         )
-        .map_err(sqlite_error)?;
-        next_ordinal += 1;
-        in_flight += 1;
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Ok(None);
+    };
+    let task: ChildWorkflowMapTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    let state = MapState {
+        map_command_id: map_command_id.clone(),
+        kind: MapKind::ChildWorkflow,
+        failure_mode: task.failure_mode,
+        item_count,
+        next_ordinal,
+        in_flight,
+        max_in_flight: task.max_in_flight,
+        recorded_outcomes: recorded,
+        completed,
+    };
+    Ok(Some((state, namespace, task)))
+}
+
+/// A rejected transition never reaches storage: the caller returns this error
+/// and the transaction rolls back, so no effect from the same event lands.
+fn map_reject_error(kind: MapKind, reject: MapReject) -> Error {
+    match reject {
+        MapReject::OutOfBounds { ordinal } => match kind {
+            MapKind::Activity => {
+                Error::Backend(format!("activity map item ordinal {ordinal} out of bounds"))
+            }
+            MapKind::ChildWorkflow => Error::Backend(format!(
+                "child workflow map item ordinal {ordinal} out of bounds"
+            )),
+        },
+        MapReject::TerminalParent => Error::TerminalWorkflow,
+    }
+}
+
+/// Everything an effect applier needs that the effect list does not carry.
+enum MapTask {
+    Activity(ActivityMapTask),
+    ChildWorkflow(ChildWorkflowMapTask),
+}
+
+impl MapTask {
+    fn kind(&self) -> MapKind {
+        match self {
+            Self::Activity(_) => MapKind::Activity,
+            Self::ChildWorkflow(_) => MapKind::ChildWorkflow,
+        }
     }
 
+    fn input_manifest(&self) -> &PayloadRef {
+        match self {
+            Self::Activity(task) => &task.input_manifest,
+            Self::ChildWorkflow(task) => &task.input_manifest,
+        }
+    }
+}
+
+/// Run one map transition: project the descriptor, ask the engine, apply the
+/// effects it returns inside the caller's transaction. Returns the parent
+/// event the transition appended, if any.
+fn step_map(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    state: &MapState,
+    namespace: &str,
+    task: &MapTask,
+    event: MapEvent,
+) -> Result<Option<EventId>> {
+    let effects = crate::map_engine::step(state, event)
+        .map_err(|reject| map_reject_error(state.kind, reject))?;
+    apply_map_effects(tx, config, &state.map_command_id, namespace, task, effects)
+}
+
+/// Apply an engine effect list in order. Each arm is one storage primitive; no
+/// arm decides anything the engine already decided.
+fn apply_map_effects(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_command_id: &CommandId,
+    namespace: &str,
+    task: &MapTask,
+    effects: Vec<MapEffect>,
+) -> Result<Option<EventId>> {
+    let key = map_command_key(map_command_id);
+    let mut appended = None;
+    for effect in effects {
+        match effect {
+            MapEffect::RecordItemOutcome { ordinal, outcome } => {
+                let outcome =
+                    normalize_child_workflow_map_outcome_for_storage(tx, config, outcome)?;
+                let blob = rmp_serde::to_vec_named(&outcome)
+                    .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                tx.execute(
+                    "insert or ignore into child_workflow_map_results
+                       (map_command_id, item_ordinal, outcome)
+                     values (?1, ?2, ?3)",
+                    params![key.as_str(), ordinal, blob],
+                )
+                .map_err(sqlite_error)?;
+            }
+            MapEffect::MaterializeItems {
+                first_ordinal,
+                count,
+            } => insert_map_item_batch(
+                tx,
+                config,
+                map_command_id,
+                namespace,
+                task,
+                first_ordinal,
+                count,
+            )?,
+            MapEffect::AdvanceDescriptor {
+                next_ordinal,
+                in_flight,
+            } => {
+                let table = match task.kind() {
+                    MapKind::Activity => "activity_maps",
+                    MapKind::ChildWorkflow => "child_workflow_maps",
+                };
+                tx.execute(
+                    &format!(
+                        "update {table}
+                         set next_ordinal = ?1, in_flight = ?2
+                         where map_command_id = ?3"
+                    ),
+                    params![next_ordinal, in_flight, key.as_str()],
+                )
+                .map_err(sqlite_error)?;
+            }
+            MapEffect::ScheduleItemRetry {
+                ordinal,
+                next_attempt,
+                visible_at_ms,
+                timeout_at_ms,
+            } => schedule_map_item_retry(
+                tx,
+                map_command_id,
+                ordinal,
+                next_attempt,
+                visible_at_ms,
+                timeout_at_ms,
+            )?,
+            MapEffect::CompleteMap { item_count } => {
+                appended = Some(complete_map(tx, config, map_command_id, task, item_count)?);
+            }
+            MapEffect::FailMap { failure } => {
+                appended = Some(fail_map(tx, config, map_command_id, task.kind(), failure)?);
+            }
+            MapEffect::AbandonPendingItems => {
+                abandon_pending_map_items(tx, map_command_id, task.kind())?;
+            }
+            MapEffect::CancelChildren { reason } => {
+                cancel_child_workflow_map_children(tx, map_command_id, &reason)?;
+            }
+            MapEffect::MarkDescriptorTerminal => {
+                let table = match task.kind() {
+                    MapKind::Activity => "activity_maps",
+                    MapKind::ChildWorkflow => "child_workflow_maps",
+                };
+                tx.execute(
+                    &format!(
+                        "update {table}
+                         set completed = 1, in_flight = 0
+                         where map_command_id = ?1"
+                    ),
+                    params![key.as_str()],
+                )
+                .map_err(sqlite_error)?;
+            }
+        }
+    }
+    Ok(appended)
+}
+
+/// Storage primitive behind [`MapEffect::MaterializeItems`]: read the manifest
+/// entries for `[first_ordinal, first_ordinal + count)` and insert one item
+/// activity task (activity map) or one child-start outbox row (child map) per
+/// ordinal. *How many* to admit is the engine's decision, never this
+/// function's.
+fn insert_map_item_batch(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    map_command_id: &CommandId,
+    namespace: &str,
+    task: &MapTask,
+    first_ordinal: u64,
+    count: u64,
+) -> Result<()> {
+    let manifest_payload = hydrate_activity_map_input_manifest_from_storage(
+        tx,
+        config,
+        task.input_manifest().clone(),
+    )?;
+    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
+    for item_ordinal in first_ordinal..first_ordinal.saturating_add(count) {
+        let input = activity_map_input_at(&manifest, item_ordinal)?;
+        match task {
+            MapTask::Activity(map_task) => {
+                let activity_id = ActivityId::map_item(map_command_id, item_ordinal);
+                let item_task = ActivityTask {
+                    activity_id: activity_id.clone(),
+                    run_id: map_command_id.run_id.clone(),
+                    command_id: map_command_id.clone(),
+                    activity_name: map_task.activity_name.clone(),
+                    task_queue: map_task.task_queue.clone(),
+                    retry_policy: map_task.retry_policy.clone(),
+                    start_to_close_timeout: map_task.start_to_close_timeout,
+                    heartbeat_timeout: map_task.heartbeat_timeout,
+                    attempt: 1,
+                    input,
+                    map_item: Some(ActivityMapItem {
+                        map_command_id: map_command_id.clone(),
+                        item_ordinal,
+                    }),
+                };
+                let item_task = normalize_activity_task_for_storage(tx, config, item_task)?;
+                let item_blob = rmp_serde::to_vec_named(&item_task)
+                    .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                tx.execute(
+                    "insert or ignore into activity_tasks
+                     (activity_id, namespace, run_id, activity_name, task_queue, task,
+                      claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
+                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
+                    params![
+                        activity_id.0,
+                        namespace,
+                        item_task.run_id.0,
+                        item_task.activity_name.0,
+                        item_task.task_queue.0,
+                        item_blob,
+                        None::<i64>,
+                    ],
+                )
+                .map_err(sqlite_error)?;
+            }
+            MapTask::ChildWorkflow(map_task) => {
+                let message = ChildStartOutboxMessage {
+                    command_id: map_command_id.clone(),
+                    workflow_type: map_task.workflow_type.clone(),
+                    workflow_id: WorkflowId::new(format!(
+                        "{}/{}",
+                        map_task.workflow_id_prefix, item_ordinal
+                    )),
+                    task_queue: map_task.task_queue.clone(),
+                    input,
+                    parent_close_policy: map_task.parent_close_policy,
+                    child_map_item: Some(ChildWorkflowMapItem {
+                        map_command_id: map_command_id.clone(),
+                        item_ordinal,
+                    }),
+                };
+                let message = normalize_child_start_message_for_storage(tx, config, message)?;
+                insert_child_outbox(tx, namespace, &message)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`MapEffect::ScheduleItemRetry`]: release the claim, clear both heartbeat
+/// fields, and restamp the deadlines of one item activity task.
+fn schedule_map_item_retry(
+    tx: &Transaction<'_>,
+    map_command_id: &CommandId,
+    ordinal: u64,
+    next_attempt: u32,
+    visible_at_ms: Option<i64>,
+    _timeout_at_ms: Option<i64>,
+) -> Result<()> {
+    let activity_id = ActivityId::map_item(map_command_id, ordinal);
+    let Some(task_blob) = tx
+        .query_row(
+            "select task from activity_tasks where activity_id = ?1",
+            params![activity_id.0],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+    else {
+        return Ok(());
+    };
+    let mut task: ActivityTask =
+        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
+    task.attempt = next_attempt;
+    let task_blob =
+        rmp_serde::to_vec_named(&task).map_err(|err| Error::PayloadEncode(err.to_string()))?;
     tx.execute(
-        "update activity_maps
-         set next_ordinal = ?1, in_flight = ?2
-         where map_command_id = ?3",
-        params![next_ordinal, in_flight, key.as_str()],
+        "update activity_tasks
+         set task = ?1,
+             claim_token = null,
+             visible_at_ms = ?2,
+             timeout_at_ms = null,
+             heartbeat_deadline_at_ms = null,
+             implicit_heartbeat_ms = null
+         where activity_id = ?3",
+        params![task_blob, visible_at_ms, activity_id.0],
     )
     .map_err(sqlite_error)?;
     Ok(())
 }
 
-fn materialize_child_workflow_map_items(
+/// [`MapEffect::AbandonPendingItems`]: tombstone every not-yet-terminal item
+/// task and every undispatched item start of a map that is over, so neither
+/// the claim path nor the timeout scanner can resurrect one. The claim-time
+/// guard that skips items of a completed map stays as well: a claim already in
+/// flight when the map ended must not change the answer.
+fn abandon_pending_map_items(
     tx: &Transaction<'_>,
-    config: &PayloadStorageConfig,
     map_command_id: &CommandId,
+    kind: MapKind,
 ) -> Result<()> {
-    let key = map_command_key(map_command_id);
-    let Some((namespace, task_blob, item_count, mut next_ordinal, mut in_flight, completed)) = tx
-        .query_row(
-            "select namespace, task, item_count, next_ordinal, in_flight, completed
-             from child_workflow_maps
-             where map_command_id = ?1",
-            params![key.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, u64>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, bool>(5)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sqlite_error)?
-    else {
-        return Ok(());
-    };
-    if completed {
-        return Ok(());
+    match kind {
+        MapKind::Activity => {
+            let map_prefix = format!("{}:map:%", ActivityId::new(map_command_id).0);
+            tx.execute(
+                "update activity_tasks
+                 set completed = 1,
+                     claim_token = null,
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
+                 where activity_id like ?1 and completed = 0",
+                params![map_prefix],
+            )
+            .map_err(sqlite_error)?;
+        }
+        MapKind::ChildWorkflow => {
+            tx.execute(
+                "update child_outbox
+                 set dispatched = 1
+                 where parent_run_id = ?1
+                   and command_seq = ?2
+                   and child_run_id is null",
+                params![map_command_id.run_id.0, map_command_id.seq.0],
+            )
+            .map_err(sqlite_error)?;
+        }
     }
-
-    let task: ChildWorkflowMapTask =
-        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let max_in_flight = u64::try_from(task.max_in_flight.max(1)).unwrap_or(u64::MAX);
-    let manifest_payload =
-        hydrate_activity_map_input_manifest_from_storage(tx, config, task.input_manifest.clone())?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
-
-    while in_flight < max_in_flight && next_ordinal < item_count {
-        let input = activity_map_input_at(&manifest, next_ordinal)?;
-        let child_map_item = ChildWorkflowMapItem {
-            map_command_id: map_command_id.clone(),
-            item_ordinal: next_ordinal,
-        };
-        let message = ChildStartOutboxMessage {
-            command_id: map_command_id.clone(),
-            workflow_type: task.workflow_type.clone(),
-            workflow_id: WorkflowId::new(format!("{}/{}", task.workflow_id_prefix, next_ordinal)),
-            task_queue: task.task_queue.clone(),
-            input,
-            parent_close_policy: task.parent_close_policy,
-            child_map_item: Some(child_map_item),
-        };
-        let message = normalize_child_start_message_for_storage(tx, config, message)?;
-        insert_child_outbox(tx, namespace.as_str(), &message)?;
-        next_ordinal = next_ordinal.saturating_add(1);
-        in_flight = in_flight.saturating_add(1);
-    }
-
-    tx.execute(
-        "update child_workflow_maps
-         set next_ordinal = ?1, in_flight = ?2
-         where map_command_id = ?3",
-        params![next_ordinal, in_flight, key.as_str()],
-    )
-    .map_err(sqlite_error)?;
     Ok(())
 }
 
@@ -4486,221 +4685,196 @@ fn complete_child_workflow_map_item(
     map_item: ChildWorkflowMapItem,
     outcome: ChildWorkflowMapItemOutcome,
 ) -> Result<()> {
-    let key = map_command_key(&map_item.map_command_id);
-    let Some((task_blob, item_count, completed)) = tx
+    let Some((state, namespace, map_task)) =
+        child_workflow_map_state(tx, &map_item.map_command_id)?
+    else {
+        // Missing descriptor means the parent run's terminal cleanup deleted
+        // it, exactly as a missing activity record does on `complete_activity`
+        // and `fail_activity`, and as a missing activity-map descriptor does on
+        // `fail_map_item`. It is not an error: under
+        // `ParentClosePolicy::Abandon` a child of a closed parent's map keeps
+        // running by design and still has to be able to *finish*. Raising here
+        // rolled the child's own terminal commit back, and every retry hit the
+        // same missing descriptor, so the child could never terminate.
+        return Ok(());
+    };
+    let already_recorded =
+        child_workflow_map_outcome_recorded(tx, &map_item.map_command_id, map_item.item_ordinal)?;
+    let parent_terminal = parent_run_terminal(tx, &map_item.map_command_id.run_id)?;
+    step_map(
+        tx,
+        config,
+        &state,
+        &namespace,
+        &MapTask::ChildWorkflow(map_task),
+        MapEvent::ItemCompleted {
+            ordinal: map_item.item_ordinal,
+            outcome,
+            already_recorded,
+            parent_terminal,
+        },
+    )?;
+    Ok(())
+}
+
+fn child_workflow_map_outcome_recorded(
+    tx: &Transaction<'_>,
+    map_command_id: &CommandId,
+    ordinal: u64,
+) -> Result<bool> {
+    Ok(tx
         .query_row(
-            "select task, item_count, completed
-             from child_workflow_maps
-             where map_command_id = ?1",
-            params![key.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
+            "select 1 from child_workflow_map_results
+             where map_command_id = ?1 and item_ordinal = ?2",
+            params![map_command_key(map_command_id), ordinal],
+            |_| Ok(()),
         )
         .optional()
         .map_err(sqlite_error)?
-    else {
-        return Err(Error::Backend(format!(
-            "child workflow map `{}`:{} not found",
-            map_item.map_command_id.run_id, map_item.map_command_id.seq.0
-        )));
-    };
-    if completed {
-        return Ok(());
-    }
-    if map_item.item_ordinal >= item_count {
-        return Err(Error::Backend(format!(
-            "child workflow map item ordinal {} out of bounds",
-            map_item.item_ordinal
-        )));
-    }
-
-    let map_task: ChildWorkflowMapTask =
-        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let outcome = normalize_child_workflow_map_outcome_for_storage(tx, config, outcome)?;
-    let outcome_blob =
-        rmp_serde::to_vec_named(&outcome).map_err(|err| Error::PayloadEncode(err.to_string()))?;
-    let inserted = tx
-        .execute(
-            "insert or ignore into child_workflow_map_results(map_command_id, item_ordinal, outcome)
-             values (?1, ?2, ?3)",
-            params![key.as_str(), map_item.item_ordinal, outcome_blob],
-        )
-        .map_err(sqlite_error)?;
-    if inserted == 0 {
-        return Ok(());
-    }
-
-    tx.execute(
-        "update child_workflow_maps
-         set in_flight = case when in_flight > 0 then in_flight - 1 else 0 end
-         where map_command_id = ?1",
-        params![key.as_str()],
-    )
-    .map_err(sqlite_error)?;
-
-    if map_task.failure_mode == ChildWorkflowMapFailureMode::FailFast {
-        let failure = match &outcome {
-            ChildWorkflowMapItemOutcome::Failed { failure } => Some(failure.clone()),
-            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
-                Some(crate::DurableFailure::non_retryable(
-                    "durust.child_workflow_cancelled",
-                    format!(
-                        "child workflow map item {} was cancelled: {reason}",
-                        map_item.item_ordinal
-                    ),
-                ))
-            }
-            ChildWorkflowMapItemOutcome::Succeeded { .. } => None,
-        };
-        if let Some(failure) = failure {
-            append_child_workflow_map_failed(tx, config, &map_item.map_command_id, failure)?;
-            cancel_child_workflow_map_children(tx, &map_item.map_command_id)?;
-            return Ok(());
-        }
-    }
-
-    let outcome_count = tx
-        .query_row(
-            "select count(*) from child_workflow_map_results where map_command_id = ?1",
-            params![key.as_str()],
-            |row| row.get::<_, u64>(0),
-        )
-        .map_err(sqlite_error)?;
-    if outcome_count < item_count {
-        materialize_child_workflow_map_items(tx, config, &map_item.map_command_id)?;
-        return Ok(());
-    }
-
-    let outcomes = child_workflow_map_outcomes(tx, key.as_str())?;
-    append_child_workflow_map_completed(tx, config, &map_task, item_count, outcomes)
+        .is_some())
 }
 
-fn append_child_workflow_map_completed(
+/// Whether the map's parent run is already closed. A missing run is an error
+/// rather than "closed": the descriptor exists, so the run should too.
+fn parent_run_terminal(tx: &Transaction<'_>, run_id: &RunId) -> Result<bool> {
+    let Some((_, terminal)) = parent_tail_and_terminal(tx, run_id)? else {
+        return Err(Error::RunNotFound(run_id.clone()));
+    };
+    Ok(terminal)
+}
+
+/// [`MapEffect::CompleteMap`]: assemble the result manifest in ascending
+/// ordinal order over the input manifest's page boundaries, append the
+/// terminal success fact to the parent, and wake it.
+fn complete_map(
     tx: &Transaction<'_>,
     config: &PayloadStorageConfig,
-    map_task: &ChildWorkflowMapTask,
+    map_command_id: &CommandId,
+    task: &MapTask,
     item_count: u64,
-    outcomes: Vec<ChildWorkflowMapItemOutcome>,
-) -> Result<()> {
+) -> Result<EventId> {
+    let key = map_command_key(map_command_id);
     let input_manifest_payload = hydrate_activity_map_input_manifest_from_storage(
         tx,
         config,
-        map_task.input_manifest.clone(),
+        task.input_manifest().clone(),
     )?;
     let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
-    let result_manifest = encode_child_workflow_map_result_manifest_with_codec(
-        map_task.result_manifest_name.clone(),
-        outcomes.clone(),
-        &input_manifest.page_lengths,
-        config.codec,
-    )?;
-    let result_manifest =
-        normalize_child_workflow_map_result_manifest_for_storage(tx, config, result_manifest)?;
-    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &map_task.map_command_id.run_id)?
-    else {
-        return Err(Error::RunNotFound(map_task.map_command_id.run_id.clone()));
+    let item_count = usize::try_from(item_count).unwrap_or(usize::MAX);
+    let (result_manifest, counts) = match task {
+        MapTask::Activity(map_task) => {
+            let result_refs = activity_map_results(tx, key.as_str())?;
+            let manifest = encode_activity_map_result_manifest_with_codec(
+                map_task.result_manifest_name.clone(),
+                result_refs,
+                &input_manifest.page_lengths,
+                config.codec,
+            )?;
+            (
+                normalize_activity_map_result_manifest_for_storage(tx, config, manifest)?,
+                activity_outcome_counts(item_count),
+            )
+        }
+        MapTask::ChildWorkflow(map_task) => {
+            let outcomes = child_workflow_map_outcomes(tx, key.as_str())?;
+            let counts = outcome_counts(&outcomes);
+            let manifest = encode_child_workflow_map_result_manifest_with_codec(
+                map_task.result_manifest_name.clone(),
+                outcomes,
+                &input_manifest.page_lengths,
+                config.codec,
+            )?;
+            (
+                normalize_child_workflow_map_result_manifest_for_storage(tx, config, manifest)?,
+                counts,
+            )
+        }
     };
-    if terminal {
-        return Ok(());
-    }
-    let event_id = EventId(tail).next();
-    let success_count = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Succeeded { .. }))
-        .count();
-    let failure_count = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Failed { .. }))
-        .count();
-    let cancellation_count = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, ChildWorkflowMapItemOutcome::Cancelled { .. }))
-        .count();
-    insert_history_event(
-        tx,
-        &map_task.map_command_id.run_id,
-        event_id,
-        HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
-            command_id: map_task.map_command_id.clone(),
-            result_manifest,
-            item_count: usize::try_from(item_count).unwrap_or(usize::MAX),
-            success_count,
-            failure_count,
-            cancellation_count,
-        }),
-    )?;
-    tx.execute(
-        "update child_workflow_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![map_command_key(&map_task.map_command_id)],
-    )
-    .map_err(sqlite_error)?;
-    set_workflow_ready(
-        tx,
-        &map_task.map_command_id.run_id,
-        event_id,
-        WorkflowTaskReason::ChildWorkflowMapCompleted,
-    )
+    let (data, reason) = match task.kind() {
+        MapKind::Activity => (
+            HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
+                command_id: map_command_id.clone(),
+                result_manifest,
+                item_count,
+                success_count: counts.success_count,
+                failure_count: counts.failure_count,
+            }),
+            WorkflowTaskReason::ActivityMapCompleted,
+        ),
+        MapKind::ChildWorkflow => (
+            HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
+                command_id: map_command_id.clone(),
+                result_manifest,
+                item_count,
+                success_count: counts.success_count,
+                failure_count: counts.failure_count,
+                cancellation_count: counts.cancellation_count,
+            }),
+            WorkflowTaskReason::ChildWorkflowMapCompleted,
+        ),
+    };
+    append_map_terminal_event(tx, &map_command_id.run_id, data, reason)
 }
 
-fn append_child_workflow_map_failed(
+/// [`MapEffect::FailMap`]: append the terminal failure fact to the parent and
+/// wake it.
+fn fail_map(
     tx: &Transaction<'_>,
     config: &PayloadStorageConfig,
     map_command_id: &CommandId,
+    kind: MapKind,
     failure: crate::DurableFailure,
-) -> Result<()> {
-    let Some((tail, terminal)) = parent_tail_and_terminal(tx, &map_command_id.run_id)? else {
-        return Err(Error::RunNotFound(map_command_id.run_id.clone()));
-    };
-    if terminal {
-        return Ok(());
-    }
-    let event_id = EventId(tail).next();
+) -> Result<EventId> {
     let failure = normalize_failure_for_storage(tx, config, failure)?;
-    insert_history_event(
-        tx,
-        &map_command_id.run_id,
-        event_id,
-        HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
-            command_id: map_command_id.clone(),
-            failure,
-        }),
-    )?;
-    tx.execute(
-        "update child_workflow_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![map_command_key(map_command_id)],
-    )
-    .map_err(sqlite_error)?;
-    set_workflow_ready(
-        tx,
-        &map_command_id.run_id,
-        event_id,
-        WorkflowTaskReason::ChildWorkflowMapFailed,
-    )
+    let (data, reason) = match kind {
+        MapKind::Activity => (
+            HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
+                command_id: map_command_id.clone(),
+                failure,
+            }),
+            WorkflowTaskReason::ActivityMapFailed,
+        ),
+        MapKind::ChildWorkflow => (
+            HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
+                command_id: map_command_id.clone(),
+                failure,
+            }),
+            WorkflowTaskReason::ChildWorkflowMapFailed,
+        ),
+    };
+    append_map_terminal_event(tx, &map_command_id.run_id, data, reason)
 }
 
+/// Append a terminal map fact to the parent and mark it ready. The engine has
+/// already rejected the closed-parent case, so reaching here with a terminal
+/// run would be an engine/provider disagreement, not a routine race.
+fn append_map_terminal_event(
+    tx: &Transaction<'_>,
+    run_id: &RunId,
+    data: HistoryEventData,
+    reason: WorkflowTaskReason,
+) -> Result<EventId> {
+    let Some((tail, terminal)) = parent_tail_and_terminal(tx, run_id)? else {
+        return Err(Error::RunNotFound(run_id.clone()));
+    };
+    if terminal {
+        return Err(Error::TerminalWorkflow);
+    }
+    let event_id = EventId(tail).next();
+    insert_history_event(tx, run_id, event_id, data)?;
+    set_workflow_ready(tx, run_id, event_id, reason)?;
+    Ok(event_id)
+}
+
+/// [`MapEffect::CancelChildren`]: cancel every already-running, not-yet-
+/// terminal child of this map with the engine's reason. Undispatched starts
+/// are tombstoned by [`MapEffect::AbandonPendingItems`], which the engine
+/// always emits first.
 fn cancel_child_workflow_map_children(
     tx: &Transaction<'_>,
     map_command_id: &CommandId,
+    reason: &str,
 ) -> Result<()> {
-    tx.execute(
-        "update child_outbox
-         set dispatched = 1
-         where parent_run_id = ?1
-           and command_seq = ?2
-           and child_run_id is null",
-        params![map_command_id.run_id.0, map_command_id.seq.0],
-    )
-    .map_err(sqlite_error)?;
-
     let children = {
         let mut stmt = tx
             .prepare(
@@ -4734,10 +4908,7 @@ fn cancel_child_workflow_map_children(
     };
     for (child_run_id, tail) in children {
         let terminal_event = HistoryEventData::WorkflowCancelled {
-            reason: format!(
-                "child workflow map `{}`:{} failed",
-                map_command_id.run_id, map_command_id.seq.0
-            ),
+            reason: reason.to_owned(),
         };
         let event_id = EventId(tail).next();
         insert_history_event(tx, &child_run_id, event_id, terminal_event)?;
@@ -4798,221 +4969,151 @@ fn complete_map_item(
     .map_err(sqlite_error)?;
 
     let key = map_command_key(&map_item.map_command_id);
-    let Some((task_blob, item_count, completed)) = tx
-        .query_row(
-            "select task, item_count, completed
-             from activity_maps
-             where map_command_id = ?1",
-            params![key.as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(sqlite_error)?
+    // Unlike `fail_map_item` and `complete_child_workflow_map_item`, a missing
+    // descriptor stays a hard error here, and the asymmetry is deliberate.
+    // Those two answer "already handled" because the state is reachable: a
+    // child run outlives its parent's cleanup under
+    // `ParentClosePolicy::Abandon`, and an item task can outlive its
+    // descriptor. An activity-map item cannot: the run's terminal cleanup
+    // deletes the item's own activity record and the descriptor together, and
+    // this path already returned `AlreadyCompleted` when that record was gone.
+    // So reaching here means a live item task with no descriptor — corruption,
+    // not a race — and this completion carries a *result* that answering
+    // "already handled" would silently discard.
+    let Some((state, namespace, map_task)) = activity_map_state(tx, &map_item.map_command_id)?
     else {
         return Err(Error::Backend(format!(
             "activity map `{}`:{} not found",
             map_item.map_command_id.run_id, map_item.map_command_id.seq.0
         )));
     };
-    if completed {
+    if state.completed {
         return Ok(CompleteActivityOutcome::AlreadyCompleted);
     }
-    if map_item.item_ordinal >= item_count {
-        return Err(Error::Backend(format!(
-            "activity map item ordinal {} out of bounds",
-            map_item.item_ordinal
-        )));
-    }
+    let parent_terminal = parent_run_terminal(tx, &task.run_id)?;
 
+    // An activity map's result row is its own storage primitive rather than an
+    // effect, so `already_recorded` is whether the row is already there.
     let result_blob =
         rmp_serde::to_vec_named(&result).map_err(|err| Error::PayloadEncode(err.to_string()))?;
-    tx.execute(
-        "insert or ignore into activity_map_results(map_command_id, item_ordinal, result)
-         values (?1, ?2, ?3)",
-        params![key.as_str(), map_item.item_ordinal, result_blob],
-    )
-    .map_err(sqlite_error)?;
-    tx.execute(
-        "update activity_maps
-         set in_flight = case when in_flight > 0 then in_flight - 1 else 0 end
-         where map_command_id = ?1",
-        params![key.as_str()],
-    )
-    .map_err(sqlite_error)?;
-
-    let success_count = tx
-        .query_row(
-            "select count(*) from activity_map_results where map_command_id = ?1",
-            params![key.as_str()],
-            |row| row.get::<_, u64>(0),
+    let inserted = tx
+        .execute(
+            "insert or ignore into activity_map_results(map_command_id, item_ordinal, result)
+             values (?1, ?2, ?3)",
+            params![key.as_str(), map_item.item_ordinal, result_blob],
         )
         .map_err(sqlite_error)?;
+    // `state.recorded_outcomes` was read before that insert, which is exactly
+    // the count the engine wants: the tally *excluding* this event's outcome.
+    let already_recorded = inserted == 0;
 
-    if success_count < item_count {
-        materialize_activity_map_items(tx, config, &map_item.map_command_id)?;
-        let tail = tx
-            .query_row(
+    let appended = step_map(
+        tx,
+        config,
+        &state,
+        &namespace,
+        &MapTask::Activity(map_task),
+        MapEvent::ItemCompleted {
+            ordinal: map_item.item_ordinal,
+            // The result payload rides the result table, not the outcome; the
+            // engine only needs to know this was a success.
+            outcome: ChildWorkflowMapItemOutcome::Succeeded { result },
+            already_recorded,
+            parent_terminal,
+        },
+    )?;
+
+    let event_id = match appended {
+        Some(event_id) => event_id,
+        None => EventId(
+            tx.query_row(
                 "select current_event_id from workflow_instances where run_id = ?1",
                 params![task.run_id.0],
                 |row| row.get::<_, u64>(0),
             )
-            .map_err(sqlite_error)?;
-        return Ok(CompleteActivityOutcome::Completed {
-            event_id: EventId(tail),
-        });
-    }
-
-    let map_task: ActivityMapTask =
-        rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    let input_manifest_payload = hydrate_activity_map_input_manifest_from_storage(
-        tx,
-        config,
-        map_task.input_manifest.clone(),
-    )?;
-    let input_manifest: ActivityMapInputManifest = crate::decode_payload(&input_manifest_payload)?;
-    let result_refs = activity_map_results(tx, key.as_str())?;
-    let result_manifest = encode_activity_map_result_manifest_with_codec(
-        map_task.result_manifest_name,
-        result_refs,
-        &input_manifest.page_lengths,
-        config.codec,
-    )?;
-    let Some((tail, terminal)) = tx
-        .query_row(
-            "select current_event_id, terminal from workflow_instances where run_id = ?1",
-            params![task.run_id.0],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, bool>(1)?)),
-        )
-        .optional()
-        .map_err(sqlite_error)?
-    else {
-        return Err(Error::RunNotFound(task.run_id));
+            .map_err(sqlite_error)?,
+        ),
     };
-    if terminal {
-        return Err(Error::TerminalWorkflow);
-    }
-    let event_id = EventId(tail).next();
-    let item_count_usize = usize::try_from(item_count).unwrap_or(usize::MAX);
-    let success_count_usize = usize::try_from(success_count).unwrap_or(usize::MAX);
-    let result_manifest =
-        normalize_activity_map_result_manifest_for_storage(tx, config, result_manifest)?;
-    insert_history_event(
-        tx,
-        &task.run_id,
-        event_id,
-        HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
-            command_id: map_item.map_command_id,
-            result_manifest,
-            item_count: item_count_usize,
-            success_count: success_count_usize,
-            failure_count: 0,
-        }),
-    )?;
-    tx.execute(
-        "update activity_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![key.as_str()],
-    )
-    .map_err(sqlite_error)?;
-    tx.execute(
-        "update workflow_instances
-         set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-         where run_id = ?3",
-        params![
-            event_id.0,
-            reason_to_str(&WorkflowTaskReason::ActivityMapCompleted),
-            task.run_id.0
-        ],
-    )
-    .map_err(sqlite_error)?;
     Ok(CompleteActivityOutcome::Completed { event_id })
 }
 
+/// One activity-map item attempt ended. `decision` is the shared activity
+/// retry verdict; the engine turns it into either a rescheduled attempt or the
+/// map's terminal failure.
+#[allow(clippy::too_many_arguments)]
 fn fail_map_item(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     task: ActivityTask,
     map_item: ActivityMapItem,
     failure: crate::DurableFailure,
-    activity_id: ActivityId,
+    kind: ItemAttemptFailureKind,
+    decision: ItemRetryDecision,
+    now: TimestampMs,
 ) -> Result<FailActivityOutcome> {
-    tx.execute(
-        "update activity_tasks
-         set completed = 1,
-             heartbeat_deadline_at_ms = null,
-             implicit_heartbeat_ms = null
-         where activity_id = ?1",
-        params![activity_id.0],
-    )
-    .map_err(sqlite_error)?;
-
-    let key = map_command_key(&map_item.map_command_id);
-    let completed = tx
-        .query_row(
-            "select completed from activity_maps where map_command_id = ?1",
-            params![key.as_str()],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()
-        .map_err(sqlite_error)?
-        .unwrap_or(false);
-    if completed {
+    let Some((state, namespace, map_task)) = activity_map_state(tx, &map_item.map_command_id)?
+    else {
+        return Ok(FailActivityOutcome::AlreadyCompleted);
+    };
+    if state.completed {
         return Ok(FailActivityOutcome::AlreadyCompleted);
     }
-
-    let Some((tail, terminal)) = tx
+    let already_recorded = tx
         .query_row(
-            "select current_event_id, terminal from workflow_instances where run_id = ?1",
-            params![task.run_id.0],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, bool>(1)?)),
+            "select 1 from activity_map_results
+             where map_command_id = ?1 and item_ordinal = ?2",
+            params![
+                map_command_key(&map_item.map_command_id),
+                map_item.item_ordinal
+            ],
+            |_| Ok(()),
         )
         .optional()
         .map_err(sqlite_error)?
-    else {
-        return Err(Error::RunNotFound(task.run_id));
-    };
-    if terminal {
-        return Err(Error::TerminalWorkflow);
-    }
-    let event_id = EventId(tail).next();
-    insert_history_event(
+        .is_some();
+    let parent_terminal = parent_run_terminal(tx, &task.run_id)?;
+    let appended = step_map(
         tx,
-        &task.run_id,
-        event_id,
-        HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
-            command_id: map_item.map_command_id,
+        config,
+        &state,
+        &namespace,
+        &MapTask::Activity(map_task),
+        MapEvent::ItemAttemptFailed {
+            ordinal: map_item.item_ordinal,
             failure,
-        }),
+            kind,
+            decision,
+            failed_attempt: task.attempt,
+            retry_policy: task.retry_policy.clone(),
+            start_to_close_timeout: task.start_to_close_timeout,
+            now,
+            already_recorded,
+            parent_terminal,
+        },
     )?;
-    tx.execute(
-        "update activity_maps
-         set completed = 1, in_flight = 0
-         where map_command_id = ?1",
-        params![key.as_str()],
-    )
-    .map_err(sqlite_error)?;
-    tx.execute(
-        "update workflow_instances
-         set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-         where run_id = ?3",
-        params![
-            event_id.0,
-            reason_to_str(&WorkflowTaskReason::ActivityMapFailed),
-            task.run_id.0
-        ],
-    )
-    .map_err(sqlite_error)?;
-    Ok(FailActivityOutcome::Failed { event_id })
+    match (decision, appended) {
+        // A timed-out attempt retries at once; a failed one waits out the
+        // policy's backoff, as `MapEffect::ScheduleItemRetry` schedules them.
+        (ItemRetryDecision::Retry { next_attempt }, _) => Ok(FailActivityOutcome::RetryScheduled {
+            next_attempt,
+            ready_at: if kind == ItemAttemptFailureKind::TimedOut {
+                now
+            } else {
+                retry_visible_at_ms(&task.retry_policy, task.attempt, now)
+                    .map(TimestampMs)
+                    .unwrap_or(now)
+            },
+        }),
+        (ItemRetryDecision::Exhausted, Some(event_id)) => {
+            Ok(FailActivityOutcome::Failed { event_id })
+        }
+        (ItemRetryDecision::Exhausted, None) => Ok(FailActivityOutcome::AlreadyCompleted),
+    }
 }
 
 fn timeout_activity(
     tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
     activity_id: ActivityId,
     now: TimestampMs,
 ) -> Result<bool> {
@@ -5056,10 +5157,44 @@ fn timeout_activity(
 
     let task: ActivityTask =
         rmp_serde::from_slice(&task_blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-    if let ActivityFailureDecision::Retry { next_attempt } = activity_timeout_decision(&task) {
-        // Timeout retries carry no backoff: the expired deadline already
-        // paced this attempt, and delaying crash recovery further would only
-        // add latency.
+    let decision = activity_timeout_decision(&task);
+
+    // A map item's lapsed deadline is an engine event, not a local reschedule:
+    // the engine owns both the retry and the map's terminal failure, and it is
+    // the only thing that knows whether the map is over.
+    if let Some(map_item) = task.map_item.clone() {
+        let outcome = fail_map_item(
+            tx,
+            config,
+            task.clone(),
+            map_item,
+            crate::DurableFailure::new(
+                "durust.activity_timed_out",
+                timeout_message(&activity_id, task.attempt, attribution),
+            ),
+            ItemAttemptFailureKind::TimedOut,
+            ItemRetryDecision::from(decision),
+            now,
+        )?;
+        if !matches!(outcome, FailActivityOutcome::RetryScheduled { .. }) {
+            tx.execute(
+                "update activity_tasks
+                 set completed = 1,
+                     heartbeat_deadline_at_ms = null,
+                     implicit_heartbeat_ms = null
+                 where activity_id = ?1",
+                params![activity_id.0],
+            )
+            .map_err(sqlite_error)?;
+        }
+        return Ok(true);
+    }
+
+    if let ActivityFailureDecision::Retry { next_attempt } = decision {
+        // The stored policy paces a timed-out attempt's retry the way it paces
+        // a failed one, and the start-to-close clock restarts when the retry
+        // becomes visible.
+        let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
         let mut retry_task = task.clone();
         retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -5068,16 +5203,12 @@ fn timeout_activity(
             "update activity_tasks
              set task = ?1,
                  claim_token = null,
-                 timeout_at_ms = ?2,
+                 timeout_at_ms = null,
                  heartbeat_deadline_at_ms = null,
                  implicit_heartbeat_ms = null,
-                 visible_at_ms = null
+                 visible_at_ms = ?2
              where activity_id = ?3",
-            params![
-                retry_blob,
-                activity_timeout_at_ms_from(now, retry_task.start_to_close_timeout),
-                activity_id.0
-            ],
+            params![retry_blob, visible_at_ms, activity_id.0],
         )
         .map_err(sqlite_error)?;
         return Ok(true);
@@ -5092,20 +5223,6 @@ fn timeout_activity(
         params![activity_id.0],
     )
     .map_err(sqlite_error)?;
-
-    if let Some(map_item) = task.map_item.clone() {
-        fail_map_item(
-            tx,
-            task.clone(),
-            map_item,
-            crate::DurableFailure::new(
-                "durust.activity_timed_out",
-                timeout_message(&activity_id, task.attempt, attribution),
-            ),
-            activity_id,
-        )?;
-        return Ok(true);
-    }
 
     let Some((tail, terminal)) = tx
         .query_row(
@@ -5131,17 +5248,12 @@ fn timeout_activity(
             message: timeout_message(&activity_id, task.attempt, attribution),
         }),
     )?;
-    tx.execute(
-        "update workflow_instances
-         set current_event_id = ?1, ready_reason = ?2, ready_at_ms = 0
-         where run_id = ?3",
-        params![
-            event_id.0,
-            reason_to_str(&WorkflowTaskReason::ActivityTimedOut),
-            task.run_id.0
-        ],
-    )
-    .map_err(sqlite_error)?;
+    set_workflow_ready(
+        tx,
+        &task.run_id,
+        event_id,
+        WorkflowTaskReason::ActivityTimedOut,
+    )?;
     Ok(true)
 }
 
@@ -5178,6 +5290,79 @@ fn activity_map_is_completed(tx: &Transaction<'_>, map_command_id: &CommandId) -
 
 fn map_command_key(command_id: &CommandId) -> String {
     format!("{}:{}", command_id.run_id, command_id.seq.0)
+}
+
+/// One descriptor's worth of [`SqliteBackend::repair_stalled_empty_maps`]. Every
+/// failure it can produce is the caller's to swallow, which is why it is a
+/// separate function rather than an inline block.
+fn repair_one_stalled_empty_map(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    kind: MapKind,
+    map_command_id: &CommandId,
+) -> Result<()> {
+    // Re-read under the write transaction: another process may have repaired
+    // the same descriptor between the probe and here, and the engine's own
+    // terminal-absorbing rule then makes this a no-op.
+    let stepped = match kind {
+        MapKind::Activity => activity_map_state(tx, map_command_id)?
+            .map(|(state, namespace, task)| (state, namespace, MapTask::Activity(task))),
+        MapKind::ChildWorkflow => child_workflow_map_state(tx, map_command_id)?
+            .map(|(state, namespace, task)| (state, namespace, MapTask::ChildWorkflow(task))),
+    };
+    let Some((state, namespace, task)) = stepped else {
+        return Ok(());
+    };
+    // A descriptor whose run row is gone is skipped, not raised. Neither schema
+    // carries a foreign key from a descriptor to `workflow_instances`, so
+    // ordinary retention pruning, a partial restore, or the external writer this
+    // provider already postulates elsewhere all produce an orphaned descriptor —
+    // and before this repair existed that row was inert, because nothing read
+    // it.
+    let Some((_, parent_terminal)) = parent_tail_and_terminal(tx, &map_command_id.run_id)? else {
+        return Ok(());
+    };
+    step_map(
+        tx,
+        config,
+        &state,
+        &namespace,
+        &task,
+        MapEvent::DescriptorCreated { parent_terminal },
+    )?;
+    Ok(())
+}
+
+/// `meta` key recording that the empty-map upgrade repair has already run
+/// against this database. Both SQL providers use the same key so the two
+/// repairs stay recognisably one mechanism.
+const EMPTY_MAP_REPAIR_MARKER: &str = "empty_map_repair_done";
+
+/// `meta` key counting descriptors the empty-map upgrade repair could not act
+/// on. The pass records itself either way, so it will not revisit them; the
+/// count is where an operator finds out that it did not.
+const EMPTY_MAP_REPAIR_SKIPPED: &str = "empty_map_repair_skipped";
+
+fn read_meta_counter(conn: &Connection, key: &str) -> Result<u64> {
+    Ok(conn
+        .query_row(
+            "select value from meta where key = ?1",
+            params![key],
+            |row| row.get::<_, u64>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?
+        .unwrap_or(0))
+}
+
+fn write_meta_counter(tx: &Transaction<'_>, key: &str, value: u64) -> Result<()> {
+    tx.execute(
+        "insert into meta(key, value) values (?1, ?2)
+         on conflict(key) do update set value = excluded.value",
+        params![key, value],
+    )
+    .map_err(sqlite_error)?;
+    Ok(())
 }
 
 fn next_counter(tx: &Transaction<'_>, key: &str) -> Result<u64> {
@@ -5328,6 +5513,7 @@ fn configure_journal_mode(conn: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Namespace, WorkflowTaskReason};
 
     #[test]
     fn sqlite_connections_set_default_busy_timeout() {
@@ -5338,6 +5524,404 @@ mod tests {
             .query_row("pragma busy_timeout", [], |row| row.get(0))
             .unwrap();
         assert_eq!(timeout_ms, DEFAULT_BUSY_TIMEOUT.as_millis() as u64);
+    }
+
+    /// Row 6G's upgrade half: a database written before empty input manifests
+    /// completed at descriptor creation keeps its stalled maps unless something
+    /// re-steps them, and `DescriptorCreated` is only stepped as a descriptor is
+    /// created. There is no operator recovery short of hand-writing the terminal
+    /// history event, so `open` repairs.
+    ///
+    /// The stalled state is reconstructed, not synthesized: an empty map is
+    /// scheduled through the ordinary commit path and only the *completion* is
+    /// undone, so the descriptor row is byte-for-byte the one a pre-upgrade
+    /// database holds.
+    #[test]
+    fn sqlite_open_repairs_a_pre_upgrade_stalled_empty_map() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("map-repair.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let (run_id, _map_command_id) =
+                schedule_stalled_empty_activity_map(&backend, "wf/map-repair", "map-repair-q")
+                    .await;
+            drop(backend);
+
+            let reopened = SqliteBackend::open(&path).unwrap();
+            let events = reopened
+                .stream_history(crate::StreamHistoryRequest {
+                    run_id: run_id.clone(),
+                    after_event_id: EventId::ZERO,
+                    up_to_event_id: EventId(100),
+                    max_events: 100,
+                    max_bytes: usize::MAX,
+                })
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.event_type())
+                    .collect::<Vec<_>>(),
+                vec![
+                    crate::HistoryEventType::WorkflowStarted,
+                    crate::HistoryEventType::ActivityMapScheduled,
+                    crate::HistoryEventType::ActivityMapCompleted,
+                ],
+            );
+            let woken = reopened
+                .claim_workflow_task(
+                    crate::WorkerId::new("map-repair-woken"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: Namespace::default(),
+                        task_queue: crate::TaskQueue::new("map-repair-q"),
+                        registered_workflow_types: vec![crate::WorkflowType::new(
+                            "tests.map-repair",
+                            1,
+                        )],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("the repaired map wakes its parent");
+            assert_eq!(woken.reason, WorkflowTaskReason::ActivityMapCompleted);
+            assert_eq!(woken.replay_target_event_id, EventId(3));
+
+            // One-shot: the repair records itself, so the unindexed probe never
+            // runs again against this database.
+            assert_eq!(
+                read_meta_counter(&reopened.connection().unwrap(), EMPTY_MAP_REPAIR_MARKER)
+                    .unwrap(),
+                1,
+            );
+        });
+    }
+
+    /// Schedule an empty activity map through the ordinary commit path, then
+    /// rewind only its *completion*, leaving the descriptor row byte-for-byte
+    /// the one a pre-upgrade database holds. Reconstruction, not synthesis: the
+    /// row is written by the same code either way.
+    async fn schedule_stalled_empty_activity_map(
+        backend: &SqliteBackend,
+        workflow_id: &str,
+        queue: &str,
+    ) -> (RunId, CommandId) {
+        let workflow_type = crate::WorkflowType::new("tests.map-repair", 1);
+        backend
+            .start_workflow(crate::StartWorkflowRequest {
+                namespace: Namespace::default(),
+                workflow_id: crate::WorkflowId::new(workflow_id),
+                workflow_type: workflow_type.clone(),
+                task_queue: crate::TaskQueue::new(queue),
+                input: crate::encode_payload(&0_u64).unwrap(),
+            })
+            .await
+            .unwrap();
+        let claimed = backend
+            .claim_workflow_task(
+                crate::WorkerId::new("map-repair-scheduler"),
+                ClaimWorkflowTaskOptions {
+                    namespace: Namespace::default(),
+                    task_queue: crate::TaskQueue::new(queue),
+                    registered_workflow_types: vec![workflow_type],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("claimable workflow task");
+        let run_id = claimed.run_id.clone();
+        let map_command_id = CommandId {
+            run_id: run_id.clone(),
+            seq: CommandSeq(1),
+        };
+        let empty_manifest = crate::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+        backend
+            .commit_workflow_task(
+                claimed.claim,
+                WorkflowTaskCommit {
+                    expected_tail_event_id: EventId(1),
+                    append_events: vec![crate::NewHistoryEvent::new(
+                        HistoryEventData::ActivityMapScheduled(crate::ActivityMapScheduled {
+                            command_id: map_command_id.clone(),
+                            activity_name: crate::ActivityName::new("tests.echo"),
+                            task_queue: crate::TaskQueue::new("map-repair-activities"),
+                            retry_policy: crate::RetryPolicy::none(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: empty_manifest.clone(),
+                            result_manifest_name: "empty".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint: crate::activity_map_fingerprint(
+                                crate::ActivityName::new("tests.echo"),
+                                crate::payload_digest(&empty_manifest),
+                                "empty".to_owned(),
+                                2,
+                                "sha256:test".to_owned(),
+                            ),
+                        }),
+                    )],
+                    schedule_activity_maps: vec![crate::ActivityMapTask {
+                        map_command_id: map_command_id.clone(),
+                        activity_name: crate::ActivityName::new("tests.echo"),
+                        task_queue: crate::TaskQueue::new("map-repair-activities"),
+                        retry_policy: crate::RetryPolicy::none(),
+                        start_to_close_timeout: None,
+                        heartbeat_timeout: None,
+                        input_manifest: empty_manifest,
+                        result_manifest_name: "empty".to_owned(),
+                        max_in_flight: 2,
+                    }],
+                    ..WorkflowTaskCommit::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let conn = backend.connection().unwrap();
+        conn.execute(
+            "delete from history_events
+             where run_id = ?1 and event_type = 'activity_map_completed'",
+            params![run_id.0],
+        )
+        .unwrap();
+        conn.execute(
+            "update workflow_instances
+             set current_event_id = 2, ready_reason = null
+             where run_id = ?1",
+            params![run_id.0],
+        )
+        .unwrap();
+        conn.execute(
+            "update activity_maps set completed = 0 where run_id = ?1",
+            params![run_id.0],
+        )
+        .unwrap();
+        // The repair marker is as much a part of the pre-upgrade shape as the
+        // missing terminal event: a database written by a binary that had no
+        // repair carries no record of having run one.
+        conn.execute(
+            "delete from meta where key = ?1",
+            params![EMPTY_MAP_REPAIR_MARKER],
+        )
+        .unwrap();
+        (run_id, map_command_id)
+    }
+
+    /// A descriptor this pass cannot interpret at all must not stop the process
+    /// from starting either.
+    ///
+    /// The orphan fix closed one instance; the doc comment claims the class. A
+    /// `task` blob that does not decode is the other half of it — and the
+    /// population this pass exists to process is by definition rows written by
+    /// an older binary, so cross-version serialization skew, a partial restore
+    /// or plain corruption all land here. The failure is unrecoverable without
+    /// hand-editing the database, because the process cannot start to fix
+    /// itself.
+    ///
+    /// The repairable descriptor beside it still gets repaired, which is what
+    /// makes this per-descriptor isolation rather than "give up on the first
+    /// error", and the skip is counted rather than discarded.
+    #[test]
+    fn sqlite_open_skips_an_undecodable_stalled_map_and_repairs_its_neighbour() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("map-repair-undecodable.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let (run_id, _map_command_id) =
+                schedule_stalled_empty_activity_map(&backend, "wf/map-undecodable", "map-undec-q")
+                    .await;
+
+            {
+                let conn = backend.connection().unwrap();
+                // A second stalled descriptor whose task blob is not an
+                // `ActivityMapTask`. Its run row exists, so it is not the orphan
+                // case: this one fails inside the pass, not before it.
+                conn.execute(
+                    "insert into activity_maps
+                     (map_command_id, namespace, run_id, command_seq, task, item_count,
+                      next_ordinal, in_flight, completed)
+                     values (?1, 'default', ?2, 9, ?3, 0, 0, 0, 0)",
+                    params![format!("{}:9", run_id.0), run_id.0, vec![0_u8],],
+                )
+                .unwrap();
+            }
+            drop(backend);
+
+            let reopened = SqliteBackend::open(&path)
+                .expect("an undecodable descriptor must not abort backend construction");
+            let events = reopened
+                .stream_history(crate::StreamHistoryRequest {
+                    run_id: run_id.clone(),
+                    after_event_id: EventId::ZERO,
+                    up_to_event_id: EventId(100),
+                    max_events: 100,
+                    max_bytes: usize::MAX,
+                })
+                .await
+                .unwrap()
+                .events;
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.event_type())
+                    .collect::<Vec<_>>(),
+                vec![
+                    crate::HistoryEventType::WorkflowStarted,
+                    crate::HistoryEventType::ActivityMapScheduled,
+                    crate::HistoryEventType::ActivityMapCompleted,
+                ],
+                "the repairable descriptor beside the bad one is still repaired",
+            );
+            let conn = reopened.connection().unwrap();
+            assert_eq!(
+                read_meta_counter(&conn, EMPTY_MAP_REPAIR_MARKER).unwrap(),
+                1,
+                "the pass still records itself, so it does not re-scan forever"
+            );
+            assert_eq!(
+                read_meta_counter(&conn, EMPTY_MAP_REPAIR_SKIPPED).unwrap(),
+                1,
+                "and what it could not act on is counted, not discarded"
+            );
+        });
+    }
+
+    /// A descriptor whose `workflow_instances` row is gone must not stop the
+    /// process from starting.
+    ///
+    /// Neither schema carries a foreign key from a descriptor to its run, so
+    /// ordinary retention pruning — `delete from workflow_instances where …`,
+    /// the most common maintenance anyone performs on a workflow store — leaves
+    /// exactly this orphan, as does a partial restore. Before the repair
+    /// existed the row was inert because nothing read it. Routing it through
+    /// `parent_run_terminal` raised `RunNotFound` from inside `open`: a total
+    /// startup outage, with no flag to skip it and every restart repeating it.
+    #[test]
+    fn sqlite_open_skips_an_orphaned_stalled_map_instead_of_refusing_to_start() {
+        futures::executor::block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("map-repair-orphan.sqlite3");
+            let backend = SqliteBackend::open(&path).unwrap();
+            let workflow_type = crate::WorkflowType::new("tests.map-repair-orphan", 1);
+            backend
+                .start_workflow(crate::StartWorkflowRequest {
+                    namespace: Namespace::default(),
+                    workflow_id: crate::WorkflowId::new("wf/map-repair-orphan"),
+                    workflow_type: workflow_type.clone(),
+                    task_queue: crate::TaskQueue::new("map-repair-orphan-q"),
+                    input: crate::encode_payload(&0_u64).unwrap(),
+                })
+                .await
+                .unwrap();
+            let claimed = backend
+                .claim_workflow_task(
+                    crate::WorkerId::new("map-repair-orphan-scheduler"),
+                    ClaimWorkflowTaskOptions {
+                        namespace: Namespace::default(),
+                        task_queue: crate::TaskQueue::new("map-repair-orphan-q"),
+                        registered_workflow_types: vec![workflow_type],
+                        lease_duration: Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap()
+                .expect("claimable workflow task");
+            let run_id = claimed.run_id.clone();
+            let map_command_id = CommandId {
+                run_id: run_id.clone(),
+                seq: CommandSeq(1),
+            };
+            let empty_manifest = crate::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+            backend
+                .commit_workflow_task(
+                    claimed.claim,
+                    WorkflowTaskCommit {
+                        expected_tail_event_id: EventId(1),
+                        append_events: vec![crate::NewHistoryEvent::new(
+                            HistoryEventData::ActivityMapScheduled(crate::ActivityMapScheduled {
+                                command_id: map_command_id.clone(),
+                                activity_name: crate::ActivityName::new("tests.echo"),
+                                task_queue: crate::TaskQueue::new("map-repair-orphan-activities"),
+                                retry_policy: crate::RetryPolicy::none(),
+                                start_to_close_timeout: None,
+                                heartbeat_timeout: None,
+                                input_manifest: empty_manifest.clone(),
+                                result_manifest_name: "empty".to_owned(),
+                                max_in_flight: 2,
+                                fingerprint: crate::activity_map_fingerprint(
+                                    crate::ActivityName::new("tests.echo"),
+                                    crate::payload_digest(&empty_manifest),
+                                    "empty".to_owned(),
+                                    2,
+                                    "sha256:test".to_owned(),
+                                ),
+                            }),
+                        )],
+                        schedule_activity_maps: vec![crate::ActivityMapTask {
+                            map_command_id,
+                            activity_name: crate::ActivityName::new("tests.echo"),
+                            task_queue: crate::TaskQueue::new("map-repair-orphan-activities"),
+                            retry_policy: crate::RetryPolicy::none(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: empty_manifest,
+                            result_manifest_name: "empty".to_owned(),
+                            max_in_flight: 2,
+                        }],
+                        ..WorkflowTaskCommit::default()
+                    },
+                )
+                .await
+                .unwrap();
+
+            // Pre-upgrade stall, then prune the run out from under it.
+            {
+                let conn = backend.connection().unwrap();
+                conn.execute(
+                    "delete from history_events
+                     where run_id = ?1 and event_type = 'activity_map_completed'",
+                    params![run_id.0],
+                )
+                .unwrap();
+                conn.execute(
+                    "update activity_maps set completed = 0 where run_id = ?1",
+                    params![run_id.0],
+                )
+                .unwrap();
+                conn.execute(
+                    "delete from meta where key = ?1",
+                    params![EMPTY_MAP_REPAIR_MARKER],
+                )
+                .unwrap();
+                conn.execute(
+                    "delete from workflow_instances where run_id = ?1",
+                    params![run_id.0],
+                )
+                .unwrap();
+            }
+            drop(backend);
+
+            let reopened = SqliteBackend::open(&path)
+                .expect("an orphaned descriptor must not abort backend construction");
+            // Started, and the orphan is left exactly as it was found.
+            let conn = reopened.connection().unwrap();
+            let completed: bool = conn
+                .query_row(
+                    "select completed from activity_maps where run_id = ?1",
+                    params![run_id.0],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!completed, "an unrepairable descriptor is left untouched");
+            assert_eq!(
+                read_meta_counter(&conn, EMPTY_MAP_REPAIR_MARKER).unwrap(),
+                1,
+                "the pass still completes, so it does not re-scan on every open"
+            );
+        });
     }
 
     #[test]
@@ -5391,6 +5975,9 @@ mod tests {
     // to the parent (silent replay corruption). Follows the Phase 2G legacy
     // reopen pattern: build the history, strip the column with a raw
     // connection, and reopen through `SqliteBackend::open`.
+    // The connection guard spans awaits on purpose: the test inspects rows
+    // through one handle while driving the provider.
+    #[allow(clippy::await_holding_lock)]
     #[test]
     fn sqlite_reopen_backfills_command_seq_and_preserves_child_terminal_dedup() {
         use futures::executor::block_on;
@@ -5466,7 +6053,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(dispatched.dispatched, 1);
+            // The commit already started the child.
+            assert_eq!(dispatched.dispatched, 0);
             let child_claim = backend
                 .claim_workflow_task(
                     WorkerId::new("backfill-child-worker"),
@@ -5598,6 +6186,9 @@ mod tests {
         });
     }
 
+    // The connection guard spans awaits on purpose: the test inspects rows
+    // through one handle while driving the provider.
+    #[allow(clippy::await_holding_lock)]
     #[test]
     fn terminal_cleanup_deletes_operational_rows_across_reopen() {
         use futures::executor::block_on;

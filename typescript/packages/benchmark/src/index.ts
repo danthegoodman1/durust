@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -51,6 +50,7 @@ import {
   type StreamHistoryRequest,
   type TimeoutDueActivitiesOutcome,
   type TimeoutDueActivitiesRequest,
+  type TimestampMs,
   type PayloadRef,
   type WorkflowHandle,
   type WorkflowTaskClaim,
@@ -60,13 +60,15 @@ import {
   type ClaimWorkflowBatchOptions,
   type ClaimWorkflowTaskOptions
 } from "@durust/core";
-import { LocalDirectoryBlobStore, PayloadBackend } from "@durust/payload";
+import { Client as PgClient } from "pg";
+import { NativeBackend, type NativePayloadOptions } from "@durust/native";
 import {
-  PostgresBackend,
+  PostgresStatsReader,
   type PostgresBackendStatsSnapshot,
   type PostgresStatementStatsSnapshot
-} from "@durust/postgres";
-import { SqliteBackend } from "@durust/sqlite";
+} from "./postgres-stats.js";
+
+export type { PostgresBackendStatsSnapshot, PostgresStatementStatsSnapshot } from "./postgres-stats.js";
 
 const WORKFLOW_QUEUE = "workflows";
 const ACTIVITY_QUEUE = "activities";
@@ -108,6 +110,9 @@ export interface BenchmarkOptions {
   readonly activation_prefetch_limit: number;
   readonly activity_completion_batch: number;
   readonly postgres_pool_size: number;
+  /** Server-wide maintenance, not a run. See {@link listStaleBenchmarkDatabases}. */
+  readonly list_stale: boolean;
+  readonly drop_stale: boolean;
 }
 
 export interface BenchmarkCounters {
@@ -167,6 +172,30 @@ export interface BackendMetricsReport {
 }
 
 export interface PostgresStatsReport {
+  /**
+   * **Cluster-wide, and not made exclusive by the per-run database.**
+   *
+   * These ten come from `pg_stat_wal`, which has **no database column**: it is
+   * a server-level view and includes writes made by every other database on
+   * the same Postgres instance. Unlike every other field in this type, running
+   * the benchmark in its own database does not make them exclusive.
+   *
+   * That asymmetry is new, and it is exactly when a reader is most likely to
+   * assume otherwise. Since the benchmark now creates and runs in
+   * `durust_tsbench_…`, every field here that *is* a database statistic —
+   * `xact*`, `rows*`, `blocks*`, `temp*`, `deadlocks`, and the
+   * `statementStats` group — is filtered to `current_database()` and belongs
+   * to this run alone. Someone who checks one of those and generalises will be
+   * wrong about `wal*` specifically. (`activeTimeMs` and `sessionTimeMs` are
+   * neither: they are hardcoded `0` and come from no view at all.)
+   *
+   * **Do not add a threshold key over a `wal*` field without first deciding
+   * how the gate behaves on a shared server.** There is no `wal*` threshold in
+   * {@link BenchmarkThresholds} today and that is deliberate, not an
+   * oversight. A runtime warning cannot cover this: it can only fire when
+   * foreign backends happen to be live, so it is silent on precisely the quiet
+   * machine where someone records a baseline and adds a gate.
+   */
   readonly walBytes: number;
   readonly walBytesPerSecond: number;
   readonly walRecords: number;
@@ -199,6 +228,13 @@ export interface PostgresStatsReport {
   readonly sessionTimeMs: number;
   readonly activeConnectionsAfter: number;
   readonly statementStats: PostgresStatementStatsReport | null;
+  /**
+   * Why {@link statementStats} is `null`, when the provider knew. See
+   * `PostgresBackendStatsSnapshot.statementStatsUnavailable`; this is that
+   * value carried into the benchmark result so a threshold failure can name
+   * its own cause instead of reporting `expected null not to be null`.
+   */
+  readonly statementStatsUnavailable: string | null;
 }
 
 export interface PostgresStatementStatsReport {
@@ -241,6 +277,15 @@ export interface BenchmarkResult {
   readonly postgres_stats: PostgresStatsReport | null;
   readonly resource_samples: null;
   readonly postgres_schema: string | null;
+  /**
+   * The per-run database, reported only under `--keep-db`.
+   *
+   * Without it `--keep-db` told you nothing for postgres: `db_path` is `null`
+   * for that backend, and the database name is generated, so a kept run left
+   * its data somewhere the operator could not name. `--list-stale` finds it
+   * too, but only while nothing is attached.
+   */
+  readonly postgres_database: string | null;
   readonly db_path: string | null;
   readonly db_bytes: number | null;
 }
@@ -269,7 +314,7 @@ export interface BenchmarkBaselineResult {
   readonly counters: Partial<BenchmarkCounters>;
   readonly processing_mixed_actions_per_second: number;
   readonly processing_workflows_per_second: number;
-  readonly workflow_task_commit_p95_ms: number;
+  readonly backend_metrics: BackendMetricsReport;
   readonly worker_stats?: Partial<WorkerStatsReport>;
   readonly operations: Record<string, BenchmarkBaselineOperation>;
   readonly postgres_stats?: BenchmarkBaselinePostgresStats;
@@ -418,8 +463,17 @@ interface BackendHandle {
   readonly backend: DurableBackend;
   readonly dbPath: string | null;
   readonly postgresSchema: string | null;
+  /** The per-run database this handle owns, for `--keep-db` and the report. */
+  readonly postgresDatabase?: string | null;
   readonly postgresStatsSnapshot: (() => Promise<PostgresBackendStatsSnapshot>) | null;
-  readonly cleanup: () => Promise<void>;
+  /**
+   * `propagateDropFailure` is set on the success path only. A run that
+   * completed must not exit 0 having leaked its database: without it, a failed
+   * `drop database` logged to stderr and the process still exited 0, so a CI
+   * gate consuming the JSON read a pass. On the *failure* path it stays unset,
+   * because a drop failure must not replace the error that caused the failure.
+   */
+  readonly cleanup: (options?: { readonly propagateDropFailure?: boolean }) => Promise<void>;
 }
 
 class BackendMetrics {
@@ -530,6 +584,10 @@ class MeasuredBackend implements DurableBackend {
         }
       };
     }
+  }
+
+  async currentTime(): Promise<TimestampMs> {
+    return this.inner.currentTime();
   }
 
   async startWorkflow(req: StartWorkflowRequest): Promise<StartWorkflowOutcome> {
@@ -890,6 +948,8 @@ export function defaultBenchmarkOptions(): BenchmarkOptions {
     max_rounds: DEFAULT_MAX_ROUNDS,
     json: false,
     keep_db: false,
+    list_stale: false,
+    drop_stale: false,
     activity_delay_ms: 0,
     workflow_offset: 0,
     child_map_items: 32,
@@ -975,6 +1035,12 @@ export function parseBenchmarkOptions(argv: readonly string[]): BenchmarkOptions
       case "--keep-db":
         parsed.keep_db = true;
         break;
+      case "--list-stale":
+        parsed.list_stale = true;
+        break;
+      case "--drop-stale":
+        parsed.drop_stale = true;
+        break;
       case "--help":
       case "-h":
         throw new UsageError(usage());
@@ -989,6 +1055,7 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
   const backendHandle = await openBackend(options);
   const metrics = new BackendMetrics();
   const backend = new MeasuredBackend(backendHandle.backend, metrics);
+  let cleaned = false;
   try {
     const setupStarted = performance.now();
     const registry = benchmarkRegistry();
@@ -1004,7 +1071,6 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
         workerId: `durust-benchmark-worker-${index}`,
         workflowTaskQueue: WORKFLOW_QUEUE,
         activityTaskQueue: ACTIVITY_QUEUE,
-        registeredSignalNames: options.mode === "write-ceiling" ? [] : ["finish"],
         activityCompletionBatchSize: options.activity_completion_batch,
         payloadCodec: "Json"
       })
@@ -1063,7 +1129,7 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
     const processingSeconds = Math.max(processingMs / 1000, Number.EPSILON);
     const activations = counters.workflow_tasks;
     const mixedActions = mixedActionCount(counters);
-    return {
+    const result: BenchmarkResult = {
       backend: options.backend,
       mode: options.mode,
       correct: true,
@@ -1095,11 +1161,26 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
           : null,
       resource_samples: null,
       postgres_schema: backendHandle.postgresSchema,
+      postgres_database: options.keep_db ? backendHandle.postgresDatabase ?? null : null,
       db_path: options.keep_db ? backendHandle.dbPath : null,
       db_bytes: options.keep_db && backendHandle.dbPath !== null ? dbBytes(backendHandle.dbPath) : null
     };
+    // Success path: clean up *here*, with the drop failure propagating. A run
+    // that produced a result and then failed to drop its database must not
+    // exit 0 — a CI gate consuming this JSON would read a pass while the
+    // server accumulated orphans. The `finally` below stays for the abnormal
+    // cases, where a drop failure must not replace the real error.
+    // Marked *before* the await, so a strict cleanup that throws is not
+    // retried by the `finally` below. Retrying it ran `destroy()` on an ended
+    // pool and the second failure ("Cannot use a pool after calling end on the
+    // pool") replaced the real one — cleanup must be attempted exactly once.
+    cleaned = true;
+    await backendHandle.cleanup({ propagateDropFailure: true });
+    return result;
   } finally {
-    await backendHandle.cleanup();
+    if (!cleaned) {
+      await backendHandle.cleanup();
+    }
   }
 }
 
@@ -1218,7 +1299,7 @@ export function compareBenchmarkToBaseline(
     pushAtMost(
       failures,
       "backend_metrics.workflowTaskCommitLatency.p95Ms",
-      baseline.result.workflow_task_commit_p95_ms * maxCommitRatio,
+      baseline.result.backend_metrics.workflowTaskCommitLatency.p95Ms * maxCommitRatio,
       result.backend_metrics.workflowTaskCommitLatency.p95Ms
     );
   }
@@ -1251,11 +1332,19 @@ export function compareBenchmarkToBaseline(
     (thresholds.require_postgres_statement_stats ?? false) &&
     result.postgres_stats?.statementStats == null
   ) {
+    // The reason, when the provider kept one. Without it this failure read
+    // "required but not reported", which names neither the cause — the server
+    // was not started with `shared_preload_libraries=pg_stat_statements` — nor
+    // the checked-in fixture that fixes it.
+    const reason = result.postgres_stats?.statementStatsUnavailable ?? null;
     failures.push({
       path: "postgres_stats.statementStats",
       expected: "present",
       actual: result.postgres_stats?.statementStats ?? null,
-      message: "Postgres statement stats were required but not reported"
+      message:
+        reason === null
+          ? "Postgres statement stats were required but not reported"
+          : `Postgres statement stats were required but not reported: ${reason}`
     });
   }
 
@@ -1382,7 +1471,8 @@ export function postgresStatsReportFromSnapshots(
     statementStats: postgresStatementStatsReportFromSnapshots(before, after, {
       mixedActions,
       workflows
-    })
+    }),
+    statementStatsUnavailable: after.statementStatsUnavailable ?? before.statementStatsUnavailable
   };
 }
 
@@ -1439,46 +1529,351 @@ function postgresStatementDelta(
   };
 }
 
-async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
-  const wrapPayloadBackend = (handle: BackendHandle): BackendHandle => {
-    if (options.mode !== "payload") {
-      return handle;
+/**
+ * Every generated benchmark database name starts with this, and
+ * {@link validateBenchmarkDatabaseName} refuses to create or drop anything
+ * that does not. `drop database` has unbounded blast radius; the guard exists
+ * so the only names this module can ever pass to it are ones it generated.
+ *
+ * Deliberately distinct from the Rust harness's `durust_benchdb_`, so someone
+ * reclaiming leaked databases by hand can tell which harness left which.
+ */
+const POSTGRES_BENCHMARK_DATABASE_PREFIX = "durust_tsbench_";
+
+let postgresDatabaseCounter = 0;
+
+export function postgresBenchmarkDatabase(): string {
+  const counter = postgresDatabaseCounter;
+  postgresDatabaseCounter += 1;
+  return `${POSTGRES_BENCHMARK_DATABASE_PREFIX}${process.pid}_${Date.now()}_${counter}`;
+}
+
+/**
+ * Defence in depth in front of `create database` and `drop database`.
+ *
+ * It stopped being *the* thing standing between this program and the wrong
+ * database when those two statements started quoting their identifier — see
+ * {@link quotePostgresIdentifier} — but it is still what proves a name came
+ * from {@link postgresBenchmarkDatabase}, which is the only claim the sweep can
+ * make about a name it found on a server.
+ *
+ * Two properties hold by accident rather than by design, recorded so the next
+ * person does not remove the accident:
+ *
+ * - **`[a-z0-9_]` is what makes the byte check sound.** Because the class is
+ *   ASCII-only, `Buffer.byteLength` and `.length` agree, so a multi-byte name
+ *   cannot slip past a 63-*byte* limit measured in UTF-16 code units. Widen the
+ *   class and that stops being true.
+ * - **JavaScript's `$` rejects a trailing newline here only because the `u`
+ *   flag is used without `m`.** In Python's `re` and Go's `regexp` the same
+ *   pattern would accept `"durust_tsbench_1\n"`. Do not port this validator to
+ *   another language by transcription.
+ */
+function validateBenchmarkDatabaseName(database: string): void {
+  const shaped =
+    database.startsWith(POSTGRES_BENCHMARK_DATABASE_PREFIX) &&
+    database.length > POSTGRES_BENCHMARK_DATABASE_PREFIX.length &&
+    Buffer.byteLength(database, "utf8") <= 63 &&
+    /^[a-z0-9_]+$/u.test(database);
+  if (!shaped) {
+    throw new Error(
+      `refusing to create or drop database \`${database}\`: this benchmark only ever touches ` +
+        `names it generated itself, which start with \`${POSTGRES_BENCHMARK_DATABASE_PREFIX}\`, ` +
+        "contain only [a-z0-9_], and fit in 63 bytes"
+    );
+  }
+}
+
+/**
+ * Rewrites the database component of a Postgres connection URL, keeping the
+ * scheme, credentials, host, port and query parameters.
+ *
+ * Two URLs are in play for one run, and they cannot be collapsed into one:
+ * `create database` cannot run inside a transaction, and `drop database`
+ * cannot run from a connection to the database being dropped. So the admin
+ * statements go to the URL as given and the workload goes to the rewritten
+ * one.
+ *
+ * The authority is everything up to the first `/`, `?` or `#`, which is what
+ * RFC 3986 says and what every in-spec Postgres URL satisfies. A password
+ * containing one of those characters **unescaped** would split in the wrong
+ * place; percent-encoding it, which the URL syntax requires anyway, parses
+ * correctly. Mirrors `postgres_url_with_database` in
+ * `benchtools/src/bin/durust-benchmark-workload.rs`.
+ */
+export function postgresUrlWithDatabase(databaseUrl: string, database: string): string {
+  const schemeEnd = databaseUrl.indexOf("://");
+  if (schemeEnd < 0) {
+    throw new Error(
+      "DURUST_POSTGRES_URL must be a `postgres://…` URL so the benchmark can run in its own " +
+        `database, got \`${databaseUrl}\``
+    );
+  }
+  const authorityStart = schemeEnd + 3;
+  const rest = databaseUrl.slice(authorityStart);
+  const authorityEndMatch = /[/?#]/u.exec(rest);
+  const authorityEnd = authorityEndMatch?.index ?? rest.length;
+  const tail = rest.slice(authorityEnd);
+  const queryStartMatch = /[?#]/u.exec(tail);
+  const queryStart = queryStartMatch?.index ?? tail.length;
+  return `${databaseUrl.slice(0, authorityStart)}${rest.slice(0, authorityEnd)}/${database}${tail.slice(queryStart)}`;
+}
+
+/**
+ * Quotes a Postgres identifier.
+ *
+ * `create database` and `drop database` interpolate a name into SQL, and an
+ * unquoted identifier is **case-folded to lowercase** by the server. Before
+ * this, correctness of those statements rested entirely on
+ * {@link validateBenchmarkDatabaseName} happening to forbid uppercase: a name
+ * that reached `drop database` unquoted and contained a capital would fold to a
+ * different name and, with `if exists`, silently succeed having dropped
+ * nothing. That coupling was invisible and load-bearing. Quoting removes it,
+ * leaving the validator as defence in depth rather than the only thing standing
+ * between the program and the wrong database.
+ *
+ * `benchtools/src/bin/durust-benchmark-workload.rs` quotes for the same reason.
+ * The two halves of one feature should not disagree about a hazard.
+ */
+function quotePostgresIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/gu, '""')}"`;
+}
+
+/** Whether a drop may evict live sessions. See {@link dropPostgresBenchmarkDatabase}. */
+type DropDisposition = "Owned" | "Foreign";
+
+async function withPostgresAdminClient<T>(
+  adminUrl: string,
+  fn: (client: PgClient) => Promise<T>
+): Promise<T> {
+  const client = new PgClient({ connectionString: adminUrl });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+function postgresErrorText(error: unknown): string {
+  const code = (error as { readonly code?: unknown } | null)?.code;
+  const message = error instanceof Error ? error.message : String(error);
+  return typeof code === "string" && code.length > 0 ? `${code}: ${message}` : message;
+}
+
+async function createPostgresBenchmarkDatabase(
+  adminUrl: string,
+  database: string
+): Promise<void> {
+  validateBenchmarkDatabaseName(database);
+  try {
+    await withPostgresAdminClient(adminUrl, async (client) => {
+      await client.query(`create database ${quotePostgresIdentifier(database)}`);
+    });
+  } catch (error) {
+    // The server's own error is the primary text, with its SQLSTATE, and
+    // CREATEDB is offered as *a* possible cause rather than asserted as the
+    // cause. Asserting it was wrong far more often than it was right: a
+    // password-less URL produced a SASL authentication failure reported as a
+    // missing CREATEDB privilege, and unreachable hosts, a busy `template1`
+    // and name collisions all got the same wrong advice. Same shape as
+    // `PG_STAT_STATEMENTS_PRELOAD_HINT` in `postgres-stats.ts`.
+    throw new Error(
+      `could not create the benchmark's own database \`${database}\`: ${postgresErrorText(error)}. ` +
+        "If this is a privilege error (SQLSTATE 42501), the role needs CREATEDB, which managed " +
+        "Postgres often withholds; without its own database the benchmark would have to share " +
+        "pg_stat_database with everything else on that server, which is what this exists to avoid"
+    );
+  }
+  // Printed the moment it exists, so an interrupted run has already said what
+  // to reclaim. No signal handler is installed: that is a process-wide side
+  // effect in a benchmark harness, it takes Ctrl-C away from the async work it
+  // supervises, and it would still miss SIGKILL, OOM and power loss. The answer
+  // is recovery, not interception — this line, `postgres_database` in the
+  // report, and `--drop-stale`.
+  console.error(`postgres benchmark: created database ${database}`);
+}
+
+/**
+ * Drops one benchmark database by exact name.
+ *
+ * `disposition` decides whether live sessions may be evicted, and it is the
+ * thing that closes the sweep's race:
+ *
+ * - `"Owned"` is the run's own database at the end of its own run. `with
+ *   (force)` (PostgreSQL 13+) with the plain form as fallback, because a
+ *   pooled connection outliving the run should not strand the database.
+ * - `"Foreign"` is a candidate the sweep found on the server. **Never**
+ *   `force`: the sweep's liveness check is a snapshot, so a session arriving
+ *   between the listing and the drop must survive. Postgres refuses with
+ *   `database "..." is being accessed by other users` and the caller leaves it
+ *   alone.
+ */
+async function dropPostgresBenchmarkDatabase(
+  adminUrl: string,
+  database: string,
+  disposition: DropDisposition
+): Promise<void> {
+  validateBenchmarkDatabaseName(database);
+  const quoted = quotePostgresIdentifier(database);
+  await withPostgresAdminClient(adminUrl, async (client) => {
+    if (disposition === "Foreign") {
+      await client.query(`drop database if exists ${quoted}`);
+      return;
     }
-    const blobRoot = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-payload-"));
-    const blobStore = new LocalDirectoryBlobStore({ root: blobRoot });
-    return {
-      backend: new PayloadBackend({
-        backend: handle.backend,
-        blobStore,
-        inlineThresholdBytes: 64
-      }),
-      dbPath: handle.dbPath,
-      postgresSchema: handle.postgresSchema,
-      postgresStatsSnapshot: handle.postgresStatsSnapshot,
-      cleanup: async () => {
-        try {
-          await handle.cleanup();
-        } finally {
-          rmSync(blobRoot, { recursive: true, force: true });
-        }
-      }
+    try {
+      await client.query(`drop database if exists ${quoted} with (force)`);
+      return;
+    } catch {
+      await client.query(`drop database if exists ${quoted}`);
+    }
+  });
+}
+
+/**
+ * Lists databases this program may have left behind **and that nobody is
+ * using**, without dropping anything.
+ *
+ * Three independent filters, and the third is what makes "stale" mean
+ * something:
+ *
+ * - `like` on the generated prefix. `_` is a wildcard in `like`, so both
+ *   underscores are escaped. This is a **listing** filter and nothing more: no
+ *   pattern is ever handed to `drop database`, and every candidate must still
+ *   pass the validator individually.
+ * - `datname <> current_database()`, so a sweep run from inside a benchmark
+ *   database never lists itself. Redundant given the liveness check — the
+ *   listing connection is itself a backend on `current_database()` — and kept
+ *   as a second barrier because the operation it guards is unrecoverable.
+ * - **`pg_stat_activity` must show no backend attached.** Without it, "stale"
+ *   is inferred from a name and nothing else, so a benchmark running right now
+ *   is listed as reclaimable — and a `force` drop would then delete a live
+ *   run's database out from under it. A name proves who created something;
+ *   only the server can say whether it is in use.
+ *
+ * The check is a snapshot, so something can connect between here and the drop.
+ * That race is closed on the other side by `"Foreign"` never using `force`.
+ */
+export async function listStaleBenchmarkDatabases(adminUrl: string): Promise<readonly string[]> {
+  return withPostgresAdminClient(adminUrl, async (client) => {
+    const result = await client.query(
+      String.raw`select datname from pg_database
+         where datname like 'durust\_tsbench\_%'
+           and datname <> current_database()
+           and not exists (
+             select 1 from pg_stat_activity a where a.datname = pg_database.datname
+           )
+         order by datname`
+    );
+    return result.rows.map((row) => String((row as { readonly datname: unknown }).datname));
+  });
+}
+
+/**
+ * Splits listed candidates into the ones this program can prove it generated
+ * and the ones it cannot.
+ *
+ * Pure, so the refusal path is testable without a server. A name that matched
+ * the listing filter but fails the validator is **kept**, not dropped, and
+ * reported — `drop database` is unrecoverable.
+ */
+export function partitionStaleBenchmarkDatabases(candidates: readonly string[]): {
+  readonly droppable: readonly string[];
+  readonly refused: readonly { readonly name: string; readonly reason: string }[];
+} {
+  const droppable: string[] = [];
+  const refused: { readonly name: string; readonly reason: string }[] = [];
+  for (const candidate of candidates) {
+    try {
+      validateBenchmarkDatabaseName(candidate);
+      droppable.push(candidate);
+    } catch (error) {
+      refused.push({
+        name: candidate,
+        reason: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  return { droppable, refused };
+}
+
+/**
+ * The decision half of the sweep, over a caller-supplied candidate list.
+ *
+ * Separate from the listing so it can be tested on named fixtures rather than
+ * on whatever the server happens to be holding. Every candidate is validated
+ * individually and dropped by exact name; nothing here takes a pattern.
+ */
+export async function sweepBenchmarkDatabases(
+  adminUrl: string,
+  candidates: readonly string[],
+  dropThem: boolean
+): Promise<void> {
+  const { droppable, refused } = partitionStaleBenchmarkDatabases(candidates);
+  for (const { name, reason } of refused) {
+    console.error(`leaving \`${name}\` alone: ${reason}`);
+  }
+  if (droppable.length === 0) {
+    console.log("no stale benchmark databases");
+  }
+  const failures: string[] = [];
+  for (const name of droppable) {
+    if (!dropThem) {
+      console.log(name);
+      continue;
+    }
+    try {
+      await dropPostgresBenchmarkDatabase(adminUrl, name, "Foreign");
+      console.log(`dropped ${name}`);
+    } catch (error) {
+      console.error(`could not drop \`${name}\`, leaving it: ${postgresErrorText(error)}`);
+      failures.push(name);
+    }
+  }
+  if (refused.length > 0) {
+    console.log(
+      `${refused.length} name(s) matched the listing filter but could not be proved generated ` +
+        "by this program; they were left in place"
+    );
+  }
+  if (failures.length > 0) {
+    throw new Error(
+      `${failures.length} database(s) could not be dropped and were left in place: ${failures.join(", ")}`
+    );
+  }
+}
+
+async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
+  // Payload mode offloads through the Rust payload backend into a temporary
+  // directory that the handle's cleanup removes.
+  let blobRoot: string | null = null;
+  let payload: { readonly payload?: NativePayloadOptions } = {};
+  if (options.mode === "payload") {
+    blobRoot = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-payload-"));
+    payload = {
+      payload: { inlineThresholdBytes: 64, blobStore: { kind: "LocalDirectory", root: blobRoot } }
     };
+  }
+  const removeBlobRoot = (): void => {
+    if (blobRoot !== null) {
+      rmSync(blobRoot, { recursive: true, force: true });
+    }
   };
 
   if (options.backend === "memory") {
-    return wrapPayloadBackend({
-      backend: new MemoryBackend(),
+    return {
+      backend: NativeBackend.memory(payload),
       dbPath: null,
       postgresSchema: null,
       postgresStatsSnapshot: null,
-      cleanup: async () => undefined
-    });
+      cleanup: async () => removeBlobRoot()
+    };
   }
   if (options.backend === "sqlite") {
     const root = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-sqlite-"));
     const dbPath = join(root, "durust.db");
-    const backend = new SqliteBackend({ path: dbPath });
-    return wrapPayloadBackend({
+    const backend = NativeBackend.sqlite(dbPath, payload);
+    return {
       backend,
       dbPath,
       postgresSchema: null,
@@ -1488,34 +1883,85 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
         if (!options.keep_db) {
           rmSync(root, { recursive: true, force: true });
         }
+        removeBlobRoot();
       }
-    });
+    };
   }
   const url = process.env.DURUST_POSTGRES_URL;
   if (!url) {
+    removeBlobRoot();
     throw new Error("set DURUST_POSTGRES_URL to run the Postgres benchmark workload");
   }
-  const tableName = `durust_ts_benchmark_${process.pid}_${Date.now()}`;
-  const backend = new PostgresBackend({
-    url,
-    tableName,
-    poolSize: options.postgres_pool_size
-  });
-  return wrapPayloadBackend({
-    backend,
-    dbPath: null,
-    postgresSchema: "normalized",
-    postgresStatsSnapshot: () => backend.statsSnapshot(),
-    cleanup: async () => {
-      if (options.keep_db) {
-        await backend.close();
-      } else {
-        await backend.destroy();
-      }
+  // The run gets its own database, not just its own schema, so the counters
+  // `statsSnapshot` reads from `pg_stat_database` and `pg_stat_statements`
+  // are this run's numbers alone.
+  const database = postgresBenchmarkDatabase();
+  const runUrl = postgresUrlWithDatabase(url, database);
+  await createPostgresBenchmarkDatabase(url, database);
+  const dropDatabase = async (): Promise<void> => {
+    if (options.keep_db) {
+      return;
     }
-  });
+    await dropPostgresBenchmarkDatabase(url, database, "Owned");
+  };
+  const dropDatabaseLoudly = async (): Promise<void> => {
+    try {
+      await dropDatabase();
+    } catch (error) {
+      console.error(
+        `postgres benchmark: could not drop its own database \`${database}\` ` +
+          `(${postgresErrorText(error)}); reclaim it with \`--drop-stale\``
+      );
+    }
+  };
+  try {
+    const schema = `durust_ts_benchmark_${process.pid}_${Date.now()}`;
+    const stats = new PostgresStatsReader(runUrl);
+    await stats.prepare();
+    const backend = await NativeBackend.postgres(runUrl, {
+      schema,
+      maxPoolSize: options.postgres_pool_size,
+      ...payload
+    });
+    return {
+      backend,
+      dbPath: null,
+      postgresSchema: schema,
+      postgresDatabase: database,
+      postgresStatsSnapshot: () => stats.snapshot(),
+      cleanup: async (cleanupOptions) => {
+        // `propagateDropFailure` is set on the success path only: a run that
+        // completed must not exit 0 having leaked its database, and on the
+        // failure path a drop failure must not replace the error that caused
+        // the failure.
+        const strict = cleanupOptions?.propagateDropFailure === true;
+        let closeError: unknown = null;
+        try {
+          if (options.keep_db) {
+            backend.close();
+          } else {
+            await backend.destroy();
+          }
+        } catch (error) {
+          closeError = error;
+        }
+        removeBlobRoot();
+        if (strict && closeError === null) {
+          await dropDatabase();
+          return;
+        }
+        await dropDatabaseLoudly();
+        if (closeError !== null) {
+          throw closeError;
+        }
+      }
+    };
+  } catch (error) {
+    removeBlobRoot();
+    await dropDatabaseLoudly();
+    throw error;
+  }
 }
-
 function benchmarkRegistry(): Registry {
   return new Registry()
     .registerWorkflow(benchmarkActivityParent)
@@ -2134,7 +2580,7 @@ function pushAtMost(
 function postgresStatsDelta(
   before: PostgresBackendStatsSnapshot,
   after: PostgresBackendStatsSnapshot,
-  key: Exclude<keyof PostgresBackendStatsSnapshot, "statements">
+  key: Exclude<keyof PostgresBackendStatsSnapshot, "statements" | "statementStatsUnavailable">
 ): number {
   return Math.max(0, after[key] - before[key]);
 }
@@ -2200,7 +2646,15 @@ function usage(): string {
     "usage: durust-benchmark-workload [--backend memory|sqlite|postgres]",
     "  [--mode mixed|activity|activity-heartbeat|signal|timer|child|activity-map|child-map|recovery|payload|write-ceiling]",
     "  [--workflows N] [--workers N] [--batch N]",
-    "  [--child-map-items N] [--child-map-max-in-flight N] [--json]"
+    "  [--child-map-items N] [--child-map-max-in-flight N] [--json] [--keep-db]",
+    "  [--list-stale] [--drop-stale]",
+    "",
+    "--list-stale lists unused databases this program generated and left behind;",
+    "--drop-stale reclaims them. Both are server-wide, not per-run: they consider",
+    "every durust_tsbench_ database on DURUST_POSTGRES_URL's server, not just this",
+    "process's. --drop-stale never evicts a session, but an idle --keep-db database",
+    "is indistinguishable from a leak and will be reclaimed. On a shared server run",
+    "--list-stale first."
   ].join("\n");
 }
 
@@ -2213,6 +2667,18 @@ type Mutable<T> = {
 async function main(): Promise<void> {
   try {
     const options = parseBenchmarkOptions(process.argv.slice(2));
+    if (options.list_stale || options.drop_stale) {
+      const adminUrl = process.env.DURUST_POSTGRES_URL;
+      if (!adminUrl) {
+        throw new Error("set DURUST_POSTGRES_URL to list or drop stale benchmark databases");
+      }
+      await sweepBenchmarkDatabases(
+        adminUrl,
+        await listStaleBenchmarkDatabases(adminUrl),
+        options.drop_stale
+      );
+      return;
+    }
     const result = await runBenchmark(options);
     if (options.json) {
       console.log(JSON.stringify(result, null, 2));
@@ -2232,6 +2698,9 @@ async function main(): Promise<void> {
 function printHumanResult(result: BenchmarkResult): void {
   console.log(`Durust TypeScript benchmark (${result.mode})`);
   console.log(`  backend: ${result.backend}`);
+  if (result.postgres_database !== null) {
+    console.log(`  postgres database (kept): ${result.postgres_database}`);
+  }
   console.log(`  workflows: ${result.completed_workflows}`);
   console.log(`  mixed actions: ${result.mixed_actions}`);
   console.log(`  elapsed ms: ${result.elapsed_ms.toFixed(2)}`);

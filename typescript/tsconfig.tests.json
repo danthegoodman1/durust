@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "ignoreDeprecations": "6.0",
+    "baseUrl": ".",
+    "paths": {
+      "@durust/benchmark": ["packages/benchmark/src/index.ts"],
+      "@durust/core": ["packages/core/src/index.ts"],
+      "@durust/eslint-plugin": ["packages/eslint-plugin/src/index.ts"],
+      "@durust/native": ["packages/native/src/index.ts"],
+      "@durust/testing": ["packages/testing/src/index.ts"]
+    }
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/test/**/*.ts"
+  ]
+}

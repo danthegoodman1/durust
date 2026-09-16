@@ -13,7 +13,7 @@ use durust::{
     CommitOutcome, CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId,
     FaultInjectingBackend, FaultPoint, FaultProfile, HistoryEvent, HistoryEventData, MemoryBackend,
     Namespace, NewHistoryEvent, RunId, SimFailure, SimRun, TaskQueue, Worker, WorkerId,
-    WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
+    WorkerRunStats, WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -173,6 +173,11 @@ fn build_worker(backend: &SimBackend, worker_id: &str) -> Worker<SimBackend> {
         .history_chunk_events(3)
         .workflow_task_lease_duration(Duration::from_secs(1))
         .activity_task_lease_duration(Duration::from_secs(1))
+        // Short enough that a poisoned task is claimable again inside the
+        // scenario's drain window, so `ensure_no_poisoned_workflow_tasks` sees
+        // divergence in the same seed that produced it instead of the seed
+        // ending in vague step exhaustion.
+        .nondeterminism_retry_backoff(Duration::from_millis(50))
         .register_workflow(sim_pipeline)
         .register_workflow(sim_lifecycle)
         .register_workflow(sim_chain)
@@ -240,6 +245,48 @@ fn tolerate_faults<T>(
         }
         Err(err) => Err(sim.failure("unexpected_worker_error", err.to_string())),
     }
+}
+
+// A workflow task that failed without committing is a *poisoned* task:
+// nondeterministic replay, a caught workflow panic, or a recorded version this
+// build cannot replay. No fault point injects any of those — the profile injects
+// backend errors, backpressure, and fencing rejections — so any occurrence here
+// is a real replay bug and must fail the seed naming its cause.
+//
+// This check exists because a poisoned task no longer errors its pass:
+// `run_workflow_batch_once` reports it as `Ok(0)`, which is indistinguishable
+// from an idle claim, and `run_until_idle` returns `Ok`. Without it
+// `tolerate_faults`/`drain_error` are dead for divergence and a cold-replay
+// regression degrades into "workflows did not complete", with no cause. The
+// stats counter is the remaining signal, so every drain asserts on it.
+fn ensure_no_poisoned_workflow_tasks<B>(
+    sim: &SimRun,
+    label: &str,
+    worker: &Worker<B>,
+    stats: &WorkerRunStats,
+) -> Result<(), SimFailure>
+where
+    B: durust::DurableBackend,
+{
+    // The worker's own metrics split the count by cause, so a failing seed
+    // names the defect class instead of leaving the reader to guess which of
+    // the three it was. They are cumulative across the scenario while `stats`
+    // covers one drain, so the drain's count is what gates and the metrics only
+    // describe.
+    let metrics = worker.metrics();
+    sim.ensure(
+        "no_poisoned_workflow_tasks",
+        stats.workflow_tasks_failed == 0,
+        format!(
+            "{label}: {} workflow task(s) failed without committing; worker totals: \
+             {} nondeterministic replay(s), {} workflow panic(s), {} unsupported recorded \
+             version(s)",
+            stats.workflow_tasks_failed,
+            metrics.workflow_tasks_nondeterministic,
+            metrics.workflow_tasks_panicked,
+            metrics.workflow_tasks_unsupported_version,
+        ),
+    )
 }
 
 // Durable-state invariants shared by every scenario: contiguous event ids,
@@ -408,7 +455,14 @@ fn run_storm(
                 worker = build_worker(&env.backend, "sim-storm-worker");
                 worker_rebuilds += 1;
             }
-            tolerate_faults(sim, block_on(worker.run_workflow_batch_once()))?;
+            // `run_workflow_once`, not `run_workflow_batch_once`: this worker
+            // sets no concurrency knobs, so the batch entry point delegates to
+            // this very call — but it also settles a poisoned task and reports
+            // `Ok(0)`, which is indistinguishable from an idle claim. The sim
+            // needs the per-task signal, because divergence is what this
+            // scenario exists to catch and `tolerate_faults` is where it is
+            // converted into a named seed failure.
+            tolerate_faults(sim, block_on(worker.run_workflow_once()))?;
             tolerate_faults(sim, block_on(worker.run_due_maintenance_once()))?;
             tolerate_faults(sim, block_on(worker.run_activity_batch_once()))?;
             if all_completed(&env.inner, runs) {
@@ -423,8 +477,11 @@ fn run_storm(
             return Ok(());
         }
         if let Some(round) = suffix(&step.label, "drain:") {
-            if let Err(err) = block_on(worker.run_until_idle()) {
-                return Err(sim.failure("drain_error", err.to_string()));
+            match block_on(worker.run_until_idle()) {
+                Ok(stats) => {
+                    ensure_no_poisoned_workflow_tasks(sim, "storm drain", &worker, &stats)?;
+                }
+                Err(err) => return Err(sim.failure("drain_error", err.to_string())),
             }
             if all_completed(&env.inner, runs) {
                 return Ok(());
@@ -525,8 +582,16 @@ fn crash_between_claim_and_commit_scenario(
         }
         if step.label == "drain" {
             let mut replacement = build_worker(&env.backend, "sim-crash-replacement");
-            if let Err(err) = block_on(replacement.run_until_idle()) {
-                return Err(sim.failure("post_crash_drain_error", err.to_string()));
+            match block_on(replacement.run_until_idle()) {
+                Ok(stats) => {
+                    ensure_no_poisoned_workflow_tasks(
+                        sim,
+                        "post-crash drain",
+                        &replacement,
+                        &stats,
+                    )?;
+                }
+                Err(err) => return Err(sim.failure("post_crash_drain_error", err.to_string())),
             }
             if is_completed(&env.inner, &run_id) {
                 return Ok(());
@@ -619,8 +684,11 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
         // Worker B reclaims the expired tail leases and completes the runs
         // through real execution.
         let mut worker_b = build_worker(&env.backend, "sim-stale-b");
-        if let Err(err) = block_on(worker_b.run_until_idle()) {
-            return Err(sim.failure("reclaim_drain_error", err.to_string()));
+        match block_on(worker_b.run_until_idle()) {
+            Ok(stats) => {
+                ensure_no_poisoned_workflow_tasks(sim, "reclaim drain", &worker_b, &stats)?;
+            }
+            Err(err) => return Err(sim.failure("reclaim_drain_error", err.to_string())),
         }
         for run in &runs[1..] {
             sim.ensure(
@@ -652,7 +720,7 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
             )?;
             let late_release = block_on(env.backend.release_workflow_task(
                 stale.claim.clone(),
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+                durust::WorkflowTaskRelease::immediate(),
             ));
             sim.ensure(
                 "late_release_fenced",
@@ -688,6 +756,100 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
     })?;
 
     scenario_outcome(sim, &env, &runs)
+}
+
+// The race only lease fencing rejects. Worker A claims, virtual time passes
+// its lease, worker B reclaims, and A's late commit arrives while B holds the
+// claim carrying the tail that is still current. A stale-tail check alone
+// accepts it; only the claim token can refuse it. B then commits normally.
+fn expired_lease_correct_tail_commit_is_fenced_scenario(
+    sim: &mut SimRun,
+) -> Result<(), SimFailure> {
+    let mut env = SimEnv::new(sim);
+    let client = Client::new(env.inner.clone());
+    let run_id =
+        block_on(client.start_workflow::<sim_pipeline>("wf/sim-fence", "sim-workflows", num(5)))
+            .expect("start workflow");
+    let claim_a = block_on(env.backend.claim_workflow_task(
+        WorkerId::new("sim-fence-a"),
+        workflow_claim_options("sim-workflows", "sim.pipeline"),
+    ))
+    .map_err(|err| sim.failure("claim_a_error", err.to_string()))?
+    .ok_or_else(|| sim.failure("claim_a", "the started run was not claimable"))?;
+
+    sim.schedule_after(Duration::from_millis(1_200), "reclaim");
+    sim.run_until_idle(100, |sim, step| {
+        env.sync_clock(sim);
+        if step.label != "reclaim" {
+            return Err(sim.failure("unknown_step", step.label));
+        }
+        let claim_b = block_on(env.backend.claim_workflow_task(
+            WorkerId::new("sim-fence-b"),
+            workflow_claim_options("sim-workflows", "sim.pipeline"),
+        ))
+        .map_err(|err| sim.failure("claim_b_error", err.to_string()))?
+        .ok_or_else(|| sim.failure("claim_b", "the expired lease was not reclaimable"))?;
+        sim.ensure(
+            "same_tail_for_both_claims",
+            claim_b.replay_target_event_id == claim_a.replay_target_event_id,
+            format!(
+                "a saw tail {:?}, b saw tail {:?}",
+                claim_a.replay_target_event_id, claim_b.replay_target_event_id
+            ),
+        )?;
+        let late = block_on(env.backend.commit_workflow_task(
+            claim_a.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: claim_a.replay_target_event_id,
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&999_u64).unwrap(),
+                })],
+                ..WorkflowTaskCommit::default()
+            },
+        ));
+        sim.ensure(
+            "late_correct_tail_commit_fenced",
+            matches!(late, Err(durust::Error::StaleLease)),
+            format!("a's late commit outcome {late:?}"),
+        )?;
+        let late_release = block_on(env.backend.release_workflow_task(
+            claim_a.claim.clone(),
+            durust::WorkflowTaskRelease::immediate(),
+        ));
+        sim.ensure(
+            "late_release_fenced",
+            matches!(late_release, Err(durust::Error::StaleLease)),
+            format!("a's late release outcome {late_release:?}"),
+        )?;
+        // B still holds the claim and commits normally.
+        let committed = block_on(env.backend.commit_workflow_task(
+            claim_b.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: claim_b.replay_target_event_id,
+                ..WorkflowTaskCommit::default()
+            },
+        ))
+        .map_err(|err| sim.failure("b_commit_error", err.to_string()))?;
+        sim.ensure(
+            "b_commit_lands_after_fenced_a",
+            matches!(committed, CommitOutcome::Committed { .. }),
+            format!("b's commit outcome {committed:?}"),
+        )?;
+        let history = run_history(&env.inner, &run_id);
+        sim.ensure(
+            "history_untouched_by_fenced_commit",
+            history.len() == 1
+                && matches!(history[0].data, HistoryEventData::WorkflowStarted { .. }),
+            format!(
+                "history {:?}",
+                history
+                    .iter()
+                    .map(|event| event.event_type())
+                    .collect::<Vec<_>>()
+            ),
+        )?;
+        Ok(())
+    })
 }
 
 // Scenario 2: cache eviction storm. Workflows progress across tasks while the
@@ -958,6 +1120,14 @@ fn real_worker_crash_between_claim_and_commit_completes_exactly_once() {
 fn real_worker_batch_prepare_exceeding_lease_fences_tail_commits() {
     run_many_seeds(0, 128, FaultProfile::None, |sim| {
         batch_prepare_exceeds_lease_scenario(sim).map(|_| ())
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+#[test]
+fn expired_lease_correct_tail_commit_is_fenced() {
+    run_many_seeds(0, 4, FaultProfile::None, |sim| {
+        expired_lease_correct_tail_commit_is_fenced_scenario(sim)
     })
     .unwrap_or_else(|failure| panic!("{failure}"));
 }

@@ -5,6 +5,10 @@ mod error;
 mod history;
 mod ids;
 mod manifest;
+/// The map fanout engine, exposed so `tests/map_transitions.rs` can replay
+/// the shared transition table; not part of the supported API.
+#[doc(hidden)]
+pub mod map_engine;
 mod memory;
 mod options;
 mod payload;

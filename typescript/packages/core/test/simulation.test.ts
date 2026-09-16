@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertLongSoakEnabledWhenRequired,
+  claimActivity,
+  claimWorkflow,
+  longSoakIsEnabled
+} from "@durust/testing";
+import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -14,18 +19,24 @@ import {
   decodeChildWorkflowMapSuccesses,
   encodePayload,
   eventId,
+  runId,
   signal,
   sleep,
   timestampMs,
   workflow,
   workflowId,
   type DurableBackend,
-  type WorkerMetricsSnapshot
+  type WorkerMetricsSnapshot,
+  RetryPolicy
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 const WORKFLOW_QUEUE = "workflows";
 const ACTIVITY_QUEUE = "activities";
-const LONG_SOAK_ENABLED = process.env.DURUST_LONG_SOAK === "1";
+const LONG_SOAK_ENABLED = longSoakIsEnabled();
+// Module scope on purpose: the soak lives in a `describe.skip`ped suite when
+// it is off, and a skipped suite runs no hooks. See the helper's own comment.
+assertLongSoakEnabledWhenRequired(LONG_SOAK_ENABLED);
 const LONG_SOAK_SEED_BASE = positiveIntEnv("DURUST_LONG_SOAK_SEED_BASE", 1_009);
 const LONG_SOAK_SEEDS = positiveIntEnv("DURUST_LONG_SOAK_SEEDS", 12);
 const LONG_SOAK_WORKFLOWS = positiveIntEnv("DURUST_LONG_SOAK_WORKFLOWS", 12);
@@ -44,6 +55,16 @@ interface SimOutput {
 
 type SimulationNoInput = {};
 
+/**
+ * A lapsed lease is an implicit heartbeat deadline: the timeout scan fails the
+ * attempt and the retry policy decides what follows, so an activity a crashed
+ * worker held needs attempts left for another worker to finish it.
+ */
+const SIM_ACTIVITY_OPTIONS = {
+  taskQueue: ACTIVITY_QUEUE,
+  retry: RetryPolicy.exponential({ initialIntervalMs: 0, maxIntervalMs: 0, maxAttempts: 4 })
+} as const;
+
 const simActivity = activity({
   name: "simulation.activity",
   handler: async (input: SimInput): Promise<SimOutput> => ({
@@ -58,7 +79,7 @@ const simChildWorkflow = workflow({
     const activityResult = await callActivity(
       simActivity,
       { value: input.value * 10 },
-      { taskQueue: ACTIVITY_QUEUE }
+      SIM_ACTIVITY_OPTIONS
     );
     return { value: activityResult.value };
   }
@@ -77,7 +98,7 @@ const activitySimulationWorkflow = workflow({
     return await callActivity(
       simActivity,
       { value: input.value },
-      { taskQueue: ACTIVITY_QUEUE }
+      SIM_ACTIVITY_OPTIONS
     );
   }
 });
@@ -96,7 +117,7 @@ const mixedSimulationWorkflow = workflow({
     const boot = await callActivity(
       simActivity,
       { value: input.value },
-      { taskQueue: ACTIVITY_QUEUE }
+      SIM_ACTIVITY_OPTIONS
     );
     const child = await childWorkflow(
       simChildWorkflow,
@@ -109,7 +130,7 @@ const mixedSimulationWorkflow = workflow({
     const finish = await callActivity(
       simActivity,
       { value: approval.value + childResult.value },
-      { taskQueue: ACTIVITY_QUEUE }
+      SIM_ACTIVITY_OPTIONS
     );
     return {
       boot: boot.value,
@@ -160,7 +181,7 @@ const childMapSimulationWorkflow = workflow({
 describe("seeded worker/provider simulations", () => {
   it("recovers a workflow task after a worker crashes with an uncommitted claim", async () => {
     let now = 1_000;
-    const backend = new MemoryBackend({ nowMs: () => now });
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const registry = simulationRegistry().registerWorkflow(echoSimulationWorkflow);
     const client = new Client(backend, { payloadCodec: "Json" });
     const handle = await client.startWorkflow(
@@ -170,13 +191,12 @@ describe("seeded worker/provider simulations", () => {
       { value: 7 }
     );
 
-    const crashedClaim = await backend.claimWorkflowTask("crashed-workflow-worker", {
+    const crashedClaim = await claimWorkflow(backend, "crashed-workflow-worker", {
+      workflowTypes: [echoSimulationWorkflow.workflowType],
       namespace: "default",
       taskQueue: WORKFLOW_QUEUE,
-      registeredWorkflowTypes: [echoSimulationWorkflow.workflowType],
       leaseDurationMs: 10
     });
-    expect(crashedClaim).not.toBeNull();
     await expect(
       workerFor(backend, registry, "replacement-workflow-worker").runWorkflowTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
@@ -197,9 +217,55 @@ describe("seeded worker/provider simulations", () => {
     ).rejects.toThrow("stale workflow task lease");
   });
 
+  it("fences a late commit whose tail is still current once its lease was reclaimed", async () => {
+    // The race only lease fencing rejects: worker A claims, its lease lapses,
+    // worker B reclaims, and A's late commit arrives while B holds the claim
+    // carrying the tail that is still current. A stale-tail check alone would
+    // accept it; only the claim token can refuse it.
+    let now = 1_000;
+    const backend = NativeBackend.memory({ nowMs: () => now });
+    const client = new Client(backend, { payloadCodec: "Json" });
+    const handle = await client.startWorkflow(
+      echoSimulationWorkflow,
+      workflowId("wf/simulation-fenced-late-commit"),
+      WORKFLOW_QUEUE,
+      { value: 7 }
+    );
+    const claimOptions = {
+      workflowTypes: [echoSimulationWorkflow.workflowType],
+      namespace: "default",
+      taskQueue: WORKFLOW_QUEUE,
+      leaseDurationMs: 10
+    };
+    const claimA = await claimWorkflow(backend, "worker-a", claimOptions);
+    now = 1_011;
+    const claimB = await claimWorkflow(backend, "worker-b", claimOptions);
+    expect(claimB).not.toBeNull();
+    expect(claimB!.replayTargetEventId).toBe(claimA!.replayTargetEventId);
+
+    // A's late commit arrives while B holds the claim; only the token refuses it.
+    await expect(
+      backend.commitWorkflowTask(claimA!.claim, {
+        expectedTailEventId: eventId(1),
+        appendEvents: [
+          {
+            data: {
+              kind: "WorkflowCompleted",
+              result: encodePayload({ value: 999 }, { codec: "Json" })
+            }
+          }
+        ]
+      })
+    ).rejects.toThrow("stale workflow task lease");
+    await expect(
+      backend.commitWorkflowTask(claimB!.claim, { expectedTailEventId: eventId(1) })
+    ).resolves.toMatchObject({ kind: "Committed" });
+    expect(await historyEventTypes(backend, String(handle.runId))).toEqual(["WorkflowStarted"]);
+  });
+
   it("recovers an activity task after a worker crashes with an uncompleted claim", async () => {
     let now = 2_000;
-    const backend = new MemoryBackend({ nowMs: () => now });
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const registry = simulationRegistry().registerWorkflow(activitySimulationWorkflow);
     const client = new Client(backend, { payloadCodec: "Json" });
     const handle = await client.startWorkflow(
@@ -213,18 +279,18 @@ describe("seeded worker/provider simulations", () => {
       kind: "Committed",
       outcome: { kind: "Committed" }
     });
-    const crashedClaim = await backend.claimActivityTask("crashed-activity-worker", {
+    const crashedClaim = await claimActivity(backend, "crashed-activity-worker", {
+      activityNames: [simActivity.name],
       namespace: "default",
       taskQueue: ACTIVITY_QUEUE,
-      registeredActivityNames: [simActivity.name],
       leaseDurationMs: 10
     });
-    expect(crashedClaim).not.toBeNull();
     await expect(
       activityWorkerFor(backend, registry, "replacement-activity-worker").runActivityTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
 
     now = 2_011;
+    await backend.timeoutDueActivities({ namespace: "default", now, limit: 8 });
     await expect(
       backend.completeActivity({
         claim: crashedClaim!.claim,
@@ -246,7 +312,7 @@ describe("seeded worker/provider simulations", () => {
 
   it("survives a replay-first fault soak with stale claims, duplicate signals, timers, and child recovery", async () => {
     let now = 5_000;
-    const backend = new MemoryBackend({ nowMs: () => now });
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const registry = simulationRegistry().registerWorkflow(mixedSimulationWorkflow);
     const client = new Client(backend, { payloadCodec: "Json" });
     const workflowKey = workflowId("wf/simulation-replay-fault-soak");
@@ -257,21 +323,20 @@ describe("seeded worker/provider simulations", () => {
       { value: 21 }
     );
 
-    const crashedWorkflowClaim = await backend.claimWorkflowTask("crashed-workflow-worker", {
+    const crashedWorkflowClaim = await claimWorkflow(backend, "crashed-workflow-worker", {
+      workflowTypes: [mixedSimulationWorkflow.workflowType],
       namespace: "default",
       taskQueue: WORKFLOW_QUEUE,
-      registeredWorkflowTypes: [mixedSimulationWorkflow.workflowType],
       leaseDurationMs: 5
     });
-    expect(crashedWorkflowClaim).not.toBeNull();
     await expect(
-      workerFor(backend, registry, "workflow-worker-before-expiry", ["approved"], 5)
+      workerFor(backend, registry, "workflow-worker-before-expiry", 5)
         .runWorkflowTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
 
     now += 6;
     await expect(
-      workerFor(backend, registry, "workflow-worker-after-expiry", ["approved"], 5)
+      workerFor(backend, registry, "workflow-worker-after-expiry", 5)
         .runWorkflowTaskOnce()
     ).resolves.toMatchObject({
       kind: "Committed",
@@ -284,19 +349,19 @@ describe("seeded worker/provider simulations", () => {
       })
     ).rejects.toThrow("stale workflow task lease");
 
-    const crashedActivityClaim = await backend.claimActivityTask("crashed-activity-worker", {
+    const crashedActivityClaim = await claimActivity(backend, "crashed-activity-worker", {
+      activityNames: [simActivity.name],
       namespace: "default",
       taskQueue: ACTIVITY_QUEUE,
-      registeredActivityNames: [simActivity.name],
       leaseDurationMs: 5
     });
-    expect(crashedActivityClaim).not.toBeNull();
     await expect(
       activityWorkerFor(backend, registry, "activity-worker-before-expiry", 5)
         .runActivityTaskOnce()
     ).resolves.toEqual({ kind: "NoTask" });
 
     now += 6;
+    await backend.timeoutDueActivities({ namespace: "default", now, limit: 8 });
     await expect(
       backend.completeActivity({
         claim: crashedActivityClaim!.claim,
@@ -367,7 +432,7 @@ describe("seeded worker/provider simulations", () => {
   it.each([1, 7, 19, 42])(
     "completes mixed activity/signal/timer/child interleavings for seed %i",
     async (seed) => {
-      const backend = new MemoryBackend();
+      const backend = NativeBackend.memory();
       const registry = simulationRegistry().registerWorkflow(mixedSimulationWorkflow);
       const client = new Client(backend, { payloadCodec: "Json" });
       const handle = await client.startWorkflow(
@@ -421,7 +486,7 @@ describe("seeded worker/provider simulations", () => {
   it.each([3, 11, 29])(
     "completes activity-map bounded materialization for seed %i",
     async (seed) => {
-      const backend = new MemoryBackend();
+      const backend = NativeBackend.memory();
       const registry = simulationRegistry().registerWorkflow(activityMapSimulationWorkflow);
       const client = new Client(backend, { payloadCodec: "Json" });
       const handle = await client.startWorkflow(
@@ -446,7 +511,7 @@ describe("seeded worker/provider simulations", () => {
   );
 
   it.each([5, 13, 31])("completes compact child-map fanout for seed %i", async (seed) => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = simulationRegistry().registerWorkflow(childMapSimulationWorkflow);
     const client = new Client(backend, { payloadCodec: "Json" });
     const handle = await client.startWorkflow(
@@ -470,7 +535,7 @@ describe("seeded worker/provider simulations", () => {
   });
 
   it("survives a cache-eviction replay soak across concurrent mixed workflows", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const streamRequests: Parameters<DurableBackend["streamHistory"]>[0][] = [];
     const backend = truncateWorkflowClaimPrefetch(inner, 1, streamRequests);
     const registry = simulationRegistry().registerWorkflow(mixedSimulationWorkflow);
@@ -606,7 +671,7 @@ async function runHotExecutionCacheSoakScenario(
   readonly streamRequestCount: number;
 }> {
   let now = 50_000 + scenarioSeed;
-  const inner = new MemoryBackend({ nowMs: () => now });
+  const inner = NativeBackend.memory({ nowMs: () => now });
   let conflictsRemaining = options.conflicts ?? 6;
   const conflicted = conflictWorkflowCompletions(
     inner,
@@ -731,7 +796,6 @@ function workerFor(
   backend: DurableBackend,
   registry: Registry,
   workerId: string,
-  signalNames: readonly string[] = [],
   leaseDurationMs = 30_000
 ): Worker {
   return new Worker({
@@ -740,7 +804,6 @@ function workerFor(
     workerId,
     workflowTaskQueue: WORKFLOW_QUEUE,
     activityTaskQueue: ACTIVITY_QUEUE,
-    registeredSignalNames: signalNames,
     leaseDurationMs,
     payloadCodec: "Json"
   });
@@ -777,16 +840,29 @@ class SimulationDriver {
     options: SimulationDriverOptions = {}
   ) {
     this.#rng = new SeededRng(seed);
+    // Under `exactOptionalPropertyTypes` an absent tuning knob and one present
+    // with the value `undefined` are different types, and `Worker` accepts only
+    // the absent form — so an unset knob is left off here rather than forwarded
+    // as `undefined`. Built once because both worker pools take the same set.
+    const tuning = {
+      ...(options.workflowHistoryCacheSize === undefined
+        ? {}
+        : { workflowHistoryCacheSize: options.workflowHistoryCacheSize }),
+      ...(options.workflowExecutionCacheSize === undefined
+        ? {}
+        : { workflowExecutionCacheSize: options.workflowExecutionCacheSize }),
+      ...(options.historyFetchMaxEvents === undefined
+        ? {}
+        : { historyFetchMaxEvents: options.historyFetchMaxEvents }),
+      ...(options.leaseDurationMs === undefined ? {} : { leaseDurationMs: options.leaseDurationMs })
+    };
     this.#workflowWorkers = Array.from({ length: options.workflowWorkerCount ?? 3 }, (_, index) => {
       const workerOptions = workerOptionsForSimulation({
         backend,
         registry,
         workerId: `simulation-workflow-worker-${seed}-${index}`,
         signalNames,
-        workflowHistoryCacheSize: options.workflowHistoryCacheSize,
-        workflowExecutionCacheSize: options.workflowExecutionCacheSize,
-        historyFetchMaxEvents: options.historyFetchMaxEvents,
-        leaseDurationMs: options.leaseDurationMs
+        ...tuning
       });
       return new Worker(workerOptions);
     });
@@ -796,10 +872,7 @@ class SimulationDriver {
         registry,
         workerId: `simulation-activity-worker-${seed}-${index}`,
         signalNames,
-        workflowHistoryCacheSize: options.workflowHistoryCacheSize,
-        workflowExecutionCacheSize: options.workflowExecutionCacheSize,
-        historyFetchMaxEvents: options.historyFetchMaxEvents,
-        leaseDurationMs: options.leaseDurationMs
+        ...tuning
       });
       return new Worker(workerOptions);
     });
@@ -868,19 +941,37 @@ class SimulationDriver {
     const action = this.#rng.nextInt(3);
     if (action === 0) {
       const worker = this.#workflowWorkers[this.#rng.nextInt(this.#workflowWorkers.length)];
+      // An empty pool would otherwise make every drawn workflow action a no-op,
+      // and a simulation whose actions do nothing still reaches its step budget
+      // and reports whatever the workflow started out as.
+      if (worker === undefined) {
+        throw new Error(`simulation seed ${this.seed} has no workflow workers`);
+      }
       const outcome = await worker.runWorkflowTaskOnce();
       this.record(`${step}: workflow ${outcome.kind}`);
       return;
     }
     if (action === 1) {
       const worker = this.#activityWorkers[this.#rng.nextInt(this.#activityWorkers.length)];
+      if (worker === undefined) {
+        throw new Error(`simulation seed ${this.seed} has no activity workers`);
+      }
       const outcome = await worker.runActivityTaskOnce();
       this.record(`${step}: activity ${outcome.kind}`);
       return;
     }
+    // Anchored to the provider's clock, because that is the clock the runtime
+    // now records timer deadlines against: a worker takes `now` from
+    // `backend.currentTime()` and `sleep(d)` records `now + d`. A fixed scan
+    // instant agreed with that only while every deadline was measured from the
+    // epoch — the defect this anchoring outlived. The offset keeps the
+    // property the fixed instant had, that every scheduled timer is already
+    // due when the driver scans, and keeps it marching forward per step.
     const fired = await this.backend.fireDueTimers({
       namespace: "default",
-      now: timestampMs(1_000_000 + this.seed * 1_000 + step * 100),
+      now: timestampMs(
+        Number(await this.backend.currentTime()) + 1_000_000 + this.seed * 1_000 + step * 100
+      ),
       limit: 16
     });
     this.record(`${step}: timers ${fired.fired}`);
@@ -941,7 +1032,6 @@ function workerOptionsForSimulation(options: {
     workerId: options.workerId,
     workflowTaskQueue: WORKFLOW_QUEUE,
     activityTaskQueue: ACTIVITY_QUEUE,
-    registeredSignalNames: options.signalNames,
     payloadCodec: "Json",
     ...(options.leaseDurationMs === undefined
       ? {}
@@ -1067,9 +1157,12 @@ async function isWorkflowTerminal(backend: DurableBackend, runId: string): Promi
   return last === "WorkflowCompleted" || last === "WorkflowFailed" || last === "WorkflowCancelled";
 }
 
-async function historyEventTypes(backend: DurableBackend, runId: string): Promise<readonly string[]> {
+// The driver carries run ids as plain strings — they key `Set`s and land in
+// trace lines — so the brand is rebuilt at the one boundary that needs it,
+// through the constructor `@durust/core` exports rather than a cast.
+async function historyEventTypes(backend: DurableBackend, id: string): Promise<readonly string[]> {
   const history = await backend.streamHistory({
-    runId,
+    runId: runId(id),
     afterEventId: eventId(0),
     upToEventId: eventId(Number.MAX_SAFE_INTEGER),
     maxEvents: 10_000,

@@ -1,12 +1,14 @@
-use crate::{ActivityName, PayloadRef, RunId, WorkflowType};
+use crate::{ActivityName, PayloadRef, RunId, WorkflowId, WorkflowType};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableFailure {
     pub error_type: String,
     pub message: String,
     pub non_retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<PayloadRef>,
 }
 
@@ -55,6 +57,9 @@ impl DurableFailure {
             Error::Nondeterminism(message) => {
                 Self::new("durust.nondeterminism", message.clone()).marked_non_retryable()
             }
+            Error::TaskPanic(message) => {
+                Self::new("durust.task_panic", message.clone()).marked_non_retryable()
+            }
             Error::UnsupportedWorkflowVersion {
                 change_id,
                 version,
@@ -95,6 +100,10 @@ impl DurableFailure {
             Error::RunNotFound(run_id) => {
                 Self::new("durust.run_not_found", run_id.to_string()).marked_non_retryable()
             }
+            Error::WorkflowNotFound(workflow_id) => {
+                Self::new("durust.workflow_not_found", workflow_id.to_string())
+                    .marked_non_retryable()
+            }
             Error::StaleLease => Self::new("durust.stale_lease", "stale lease token"),
             Error::TerminalWorkflow => {
                 Self::new("durust.terminal_workflow", "workflow is terminal").marked_non_retryable()
@@ -119,6 +128,7 @@ impl fmt::Display for DurableFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("activity `{0}` is not registered on this worker")]
     ActivityNotRegistered(ActivityName),
@@ -137,6 +147,11 @@ pub enum Error {
 
     #[error("workflow run `{0}` was not found")]
     RunNotFound(RunId),
+
+    /// A signal or cancellation named a workflow id the provider has never
+    /// started in that namespace.
+    #[error("workflow `{0}` was not found")]
+    WorkflowNotFound(WorkflowId),
 
     #[error("stale lease token")]
     StaleLease,
@@ -167,6 +182,28 @@ pub enum Error {
 
     #[error("nondeterministic replay: {0}")]
     Nondeterminism(String),
+
+    /// A panic caught inside a workflow task poll. Routed exactly like
+    /// [`Error::Nondeterminism`] — nothing is committed and the claim is
+    /// released for retry — because a panic raised while replaying an
+    /// already-progressed run carries no evidence that the recorded progress
+    /// was wrong, so committing `WorkflowFailed` would destroy it for a bug a
+    /// redeploy fixes. It is a distinct variant so a caller (or the worker's
+    /// own accounting) can tell a workflow bug from genuine history
+    /// divergence, which need different operator responses.
+    ///
+    /// The worker acts on that distinction: a panic increments
+    /// [`crate::WorkerMetrics::workflow_tasks_panicked`] while a divergence
+    /// increments [`crate::WorkerMetrics::workflow_tasks_nondeterministic`],
+    /// and both are reported through [`crate::WorkerEvent::WorkflowTaskFailed`]
+    /// carrying this error. The re-entrancy guard
+    /// (`durust durable APIs are not re-entrant`) reports by panicking, so it
+    /// arrives here too and is counted as the workflow bug it is.
+    ///
+    /// The message keeps the stable `workflow task panicked:` prefix, so it
+    /// stays greppable and countable without matching on the variant.
+    #[error("{0}")]
+    TaskPanic(String),
 
     #[error(
         "unsupported workflow version for `{change_id}`: recorded {version}, supported {min_supported}..={max_supported}"

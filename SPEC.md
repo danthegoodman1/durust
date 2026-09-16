@@ -70,6 +70,93 @@ Audit log
 
 The replay history is authoritative. The in-memory workflow future is only a cache, but it is an important performance cache: a running workflow should normally stay alive on the worker until it completes, fails, or is cancelled.
 
+## 1.2 What is normative, and what is language-local
+
+Durust has two implementations, Rust and TypeScript, and this specification is
+the contract between them. Exactly two things in it are normative.
+
+1. **The committed history.** Every field of the workflow task commit in §8.2:
+   the events it appends and their order; their command sequence numbers,
+   fingerprints, and payload encoding; the waits it upserts and deletes; the
+   activities, activity maps, child workflow maps, and child workflows it
+   schedules; the signals it consumes; the commands it cancels; the query
+   projection it publishes; and its visibility patch. Given the same workflow
+   program, the same input history, the same live signals, and the same
+   deterministic clock, both runtimes must produce the same commit. Where one
+   runtime has no representation for a field §8.2 lists, that absence is a gap
+   in that runtime, not a narrowing of this list.
+2. **The provider contract.** Section 8's backend surface: the operations, their
+   arguments, their outcomes, their atomicity, and the durable state each one is
+   obliged to leave behind.
+
+Everything else is *language-local mechanism*: how a runtime schedules the
+workflow's own code, where it holds the workflow's locals between tasks, how it
+represents a suspended durable call, and how it installs the workflow context.
+Rust polls futures; TypeScript keeps a promise chain alive. Section 4.2 records
+that divergence concretely. Neither implementation is obliged to imitate the
+other's mechanism, and neither may be changed to imitate it if doing so would
+change a commit.
+
+**The boundary is drawn by observability, not by module.** A difference is
+language-local only if it cannot be observed in the committed history or in the
+provider contract — neither in what a commit contains, nor in *whether it
+happens at all*. If it reaches either — a different event, a different order, a
+different fingerprint, a different wait, a different scheduled task, a different
+consumed signal, a different durable row, or the same rows never written — it is
+normative, and the divergence is a defect no matter which layer produced it.
+Three corollaries, each of which has been got wrong at least once:
+
+- **Living inside the execution machinery does not make a behavior local.** The
+  execution machinery is where commits are produced. "It is only how we run the
+  workflow" is not an argument; the question is whether the commit moves, **or
+  stops happening**. A change that leaves every commit it produces byte-identical
+  while producing fewer of them has not passed this test.
+- **Being a performance or memory change does not make a behavior local.** A
+  change that bounds replay memory is language-local exactly as long as the
+  commits it produces stay byte-identical to the unbounded one's, and it stops
+  being language-local the moment they do not.
+- **Being configuration does not make a behavior local.** A worker option may
+  change *when* durable work happens — its cadence, its batching. It may not
+  change *whether* durable work that some component is obliged to perform
+  happens at all. An opt-out is legitimate only when three things hold at once:
+  this specification names another component as the owner of **that specific
+  obligation** — not merely mentions a component that performs some adjacent
+  mechanism, and not a component whose scope this specification defines
+  narrowly elsewhere; the option's **safe state is its default**, so a
+  deployment that never reads this section still discharges the obligation; and
+  the option reaches only the work that other owner takes on, not whatever
+  happens to sit beside it in the same
+  loop. Section 11 is the model on all three counts — a timer service owns due
+  timers, a worker "may also scan for due timers, **and by default it does**",
+  and the opt-out covers the timer and activity-deadline scan and nothing
+  adjacent. An option whose legitimacy rests on a deployment fact this
+  specification does not state, and that the library cannot check, is a defect
+  in the option rather than an exercise of this section.
+
+**No divergence is specified.** The rule above makes a commit difference a
+defect, and the two that this section once carried as tracked exceptions have
+converged: a workflow-code fault (§4.2) and a durable API reached from the
+workflow output's conversion (§16) fail the task without committing in both
+runtimes, so the same program leaves both runtimes with the same open run.
+`PARITY.md` §3 records the convergence and the tests that pin it.
+
+This list may not grow by paragraph. An entry requires an explicit recorded
+decision — the same bar as a breaking history-format change — stating what
+diverges, which runtime is expected to move, and why convergence was rejected for
+now. Text added here without that decision is not a carve-out; it is an
+undocumented defect.
+
+This section grants no permission to skip durable work, to drop a durable
+obligation, to weaken a guarantee that a caller can observe, or to let the two
+runtimes settle on different committed histories for the same program. It states
+only that the *mechanism* of execution is unspecified. Nothing here may be cited
+as authority for a behavioral change; a behavioral change needs its own
+justification and its own test in both runtimes.
+
+`PARITY.md` records, for each cross-cutting invariant, the named test in each
+language that proves it, names the invariants proved in only one language, and
+lists the divergences the host languages force.
+
 ---
 
 # 2. Public DX Target
@@ -529,7 +616,22 @@ Eviction never loses durable state.
 A cache miss causes streaming replay.
 Replay happens on cache miss, not at every durable wait boundary.
 Keep non-terminal workflows resident while cache limits allow.
+Abandoned executions settle deterministically and never commit.
 ```
+
+A worker that drops a live workflow execution without committing it settles that
+execution. The causes are a rejected commit, a task that failed before commit,
+cache eviction, supersession by a cold replay, and a worker configured with no
+execution cache at all. In every case the dropped execution is disposed: its
+outstanding durable-API waiters settle, and it can never produce a commit
+afterwards. The run is re-claimed and replayed from durable history.
+
+Deterministic disposal is a property of the runtime, not of one language. The
+Rust runtime obtains it by dropping the boxed workflow future, which takes the
+whole tree of parked awaits with it. The TypeScript runtime cannot drop a pending
+promise chain, so it disposes the hot execution explicitly, raising a disposal
+error into every parked waiter and refusing every later commit from that
+execution.
 
 ## 4.2 Worker loop
 
@@ -546,6 +648,91 @@ Keep non-terminal workflows resident while cache limits allow.
 6. Commit generated commands/facts atomically.
 7. Keep future cached if still running.
 ```
+
+A failing workflow task fails that task, not the worker. Workflow code that
+panics in the Rust runtime, or throws in the TypeScript runtime, is caught by the
+runtime instead of escaping the worker loop. Nothing from the failed attempt is
+committed, and runs whose tasks were claimed in the same batch still commit.
+
+Some failures mean the attempt cannot be trusted rather than that the workflow is
+wrong: a detected nondeterministic command sequence, an unsupported workflow
+version, a re-entrant durable API call, a `sideEffect` callback returning a
+thenable, and a panic in Rust workflow code. These abort the task without
+appending `WorkflowFailed`. The worker releases the run with a worker-configured
+retry backoff, and the next claim replays it from durable history, so a redeploy
+that fixes the defect recovers the run.
+
+A durable API reached from a workflow's **output** conversion is on that list
+in both runtimes: Rust encodes the output under the context borrow, so the call
+trips the re-entrancy guard, and TypeScript's completion runs outside the
+workflow's context, so the call finds none. Either way the task fails without
+committing and the run keeps its progress (§16).
+
+A panic in particular can be raised while
+replaying a run that has already made durable progress; appending a terminal
+failure there would discard recorded progress — in-flight activities, pending
+timers, consumed signals — on the evidence of a defect that says nothing about
+whether that progress was correct.
+
+A workflow that intends to fail terminally reports it through its normal return
+path: a Rust workflow returns `Err(...)`, a TypeScript workflow throws a durable
+failure — a `WorkflowFailure`, a propagated activity or child failure, or any
+value with the `DurableFailure` shape. That is the path that appends
+`WorkflowFailed`. Any other rejection is a workflow-code fault in both runtimes:
+a Rust panic or a `PayloadEncode`/`PayloadDecode` error returned by a durable
+API for the workflow's own values, and a TypeScript throw of a plain `Error`
+(a `TypeError`, a failed assertion, a caller error raised by a durable API),
+fail the task without committing, and the worker releases the claim with the
+nondeterminism backoff (`Error::TaskPanic` or the faulted counter in Rust,
+`WorkflowCodeError` in TypeScript). Terminating a
+run on a replay-time bug is unrecoverable; releasing the task lets a fixed
+redeploy recover it.
+
+Panic isolation depends on unwinding, which is a deployment consideration for
+Rust binaries. A profile built with `panic = "abort"` gives `catch_unwind`
+nothing to catch, so a workflow or activity panic aborts the process and takes
+every cached run with it. This repository sets no `panic` profile key, so every
+profile here unwinds; a downstream crate that sets `panic = "abort"` is choosing
+process abort as its workflow-panic behavior.
+
+### The execution mechanism is language-local
+
+Step 5 above says "poll the workflow future". The two runtimes reach the same
+place by different means, and neither can adopt the other's. This is the
+concrete case §1.2 is about.
+
+**Rust polls.** A workflow is a `Pin<Box<dyn Future>>` held in the workflow
+cache. Every workflow task builds a *fresh* runtime context from the claim, the
+newly loaded history chunk, and the cursor state carried forward from the cached
+entry — the next command sequence number, the change-version map, and the ready
+events the previous task left unconsumed — installs it, polls the future until
+it blocks, and drops the context. A durable call that is still waiting returns
+`Pending`. The worker learns the task is over because the poll returned.
+
+**TypeScript keeps the chain hot.** A hot workflow execution constructs its
+runtime context once and invokes the handler once, inside an `AsyncLocalStorage`
+scope; the handler's promise chain then stays parked across workflow tasks, and
+the workflow's locals live in that parked chain. Every later task *mutates that
+same context in place* — new claim, new clock, new live signals, newly ingested
+events — and resolves the parked waiters. A durable call that is still waiting
+is a promise nobody has resolved yet. The worker learns the task is over because
+the execution reports quiescence.
+
+The host languages force this. Rust cannot resume a future without polling it,
+and JavaScript cannot poll a promise: a promise's continuation runs when it is
+resolved, and no caller can ask it to make progress. Rebuilding the TypeScript
+context per task would discard the workflow's locals, which exist only in the
+parked closure chain; parking a Rust future the way TypeScript parks a promise
+would require a scheduler the runtime does not own. Neither is a defect and
+neither will be converged.
+
+The divergence is invisible in the commit, which is the only reason it is
+allowed. Both mechanisms consume the same recorded facts in the same order,
+allocate the same command sequence numbers, and append the same events. Where a
+behavior *is* observable in the commit — command ordering, fingerprints, wait
+upserts and deletes, signal consumption, terminal detection — §1.2 applies and
+the two runtimes must agree, including when the disagreement originates inside
+this machinery.
 
 ## 4.3 Replay stream backpressure
 
@@ -575,6 +762,37 @@ enum PollOutcome {
 ```
 
 If replay needs more history, the driver fetches the next segment and polls again.
+
+### Synchronous change markers and the replay window reserve
+
+`NeedsMoreHistory` assumes the durable API that ran out of history can suspend.
+Most can. `get_version`, `patched`, and `deprecate_patch` cannot: they return
+plain values rather than futures, so a runtime whose durable APIs are promises
+— the TypeScript one — has no way to park them while a chunk is fetched.
+
+The replay window therefore keeps a **reserve** of recorded command events
+beyond whatever the current call needs, and every awaited durable call refills
+the window to at least that reserve. Synchronous markers spend from it. This
+gives one absolute limit, and it is the only limit chunked replay introduces:
+
+> A run of consecutive synchronous change-marker calls with no awaited durable
+> call between them may not exceed the replay window reserve.
+
+The reserve is `REPLAY_WINDOW_LOOKAHEAD_EVENTS` (128 by default, matched to the
+worker's default `historyFetchMaxEvents`). The effective limit is a floor rather
+than an exact number, because the last chunk loaded usually overshoots it.
+
+Exceeding it is refused, never mis-replayed: reading an unloaded window as "no
+recorded command" would append a duplicate marker that the rest of history
+contradicts. The refusal is recoverable rather than fatal — nothing has been
+committed when it is raised, and replay is deterministic — so the driver drops
+the execution and replays the run once more with no reserve limit, trading that
+one run's memory bound for completing the task. A worker does this
+automatically; the cost is one wasted replay and no provider contract change.
+
+Implementations that can suspend their marker APIs, or that carry a
+provider-maintained index of change markers, do not need the reserve and are not
+bound by this limit.
 
 ## 4.4 Worker registration and task queues
 
@@ -1030,6 +1248,20 @@ If emitted command fingerprint != recorded command fingerprint:
     raise NondeterminismError
 ```
 
+A fingerprint is a function of the workflow program and its inputs, and of
+nothing a worker is configured with. `options_digest` therefore hashes the
+options the *caller* supplied — including the in-workflow defaults §4.4 calls
+part of deterministic workflow execution — with this specification's own
+defaults filled in for the rest, and never a value resolved from the scheduling
+worker. The concrete case is the activity task queue: an activity that names no
+queue is *scheduled onto* the worker's activity task queue (§4.4), and its
+fingerprint hashes the default queue name regardless. Folding the resolved
+queue in instead makes a command's identity readable from worker configuration,
+so two workflow workers configured with different activity queues fingerprint
+the same unqueued call differently and a run scheduled by one fails replay on
+the other — a nondeterminism error caused by deployment topology rather than by
+a code change.
+
 When a workflow task raises nondeterminism, the worker must abort that task
 without appending `WorkflowFailed`. The worker releases the run with a
 worker-configured retry backoff so bad workflow code does not hot-loop. Providers
@@ -1064,8 +1296,9 @@ overrides before a recorded activity command is a nondeterministic replay change
 unless it is protected by a version marker.
 
 Activity liveness has three deadline sources. An explicit start-to-close
-timeout stamps the task's `timeout_at` when it is scheduled (restarting at
-retry visibility). An explicit heartbeat timeout starts an operational
+timeout stamps the task's `timeout_at` when an attempt is claimed, so a task
+waiting in the queue has no start-to-close deadline and a retry's clock starts
+at its next claim. An explicit heartbeat timeout starts an operational
 heartbeat deadline when the activity task is claimed; each accepted heartbeat
 refreshes it by the explicit interval. A task with neither timeout uses its
 claim lease as an implicit heartbeat interval: the claim stamps the heartbeat
@@ -1100,16 +1333,41 @@ Providers do not classify application errors; they only honor the generic
 the provider records the terminal activity failure immediately even when the
 stored retry policy has remaining attempts.
 
-Retry pacing is provider-enforced through delayed visibility. When a failed
-attempt is rescheduled under `RetryBackoff::Exponential`, the provider stamps
-the task with `visible_at = now + 1s * 2^(failed_attempt - 1)` (saturating)
-and claim queries skip tasks whose `visible_at` is in the future, so a
-fast-failing activity cannot hot-loop. The retry's start-to-close clock starts
-at the visibility instant, which keeps the timeout scanner from firing on a
-task that was never claimable. `RetryBackoff::None` retries are immediately
-visible. Timeout-driven retries carry no extra backoff: the expired deadline
-already paced the attempt, and delaying crash recovery further would only add
-latency.
+`error_type` is a durable contract: once a value reaches history, replay,
+audit, and retry classification read it. The runtime itself writes four:
+`durust.activity_panic` (the worker, for an activity that panicked or threw),
+`durust.activity_timed_out` (a provider, for a lapsed start-to-close or
+heartbeat deadline), `durust.child_workflow_cancelled` (a provider, for a
+`Cancel`-policy child closed with its parent), and
+`durust.child_workflow_id_conflict` (a provider, for a child whose workflow id
+already exists). A `WorkflowFailed` or `ActivityFailed` written from
+application code carries the application's own `error_type`, and a
+`durust::Error` the runtime converts carries the `durust.<variant>` name
+`src/error.rs` assigns it; those names are stable, and `durust::Error` is
+`#[non_exhaustive]` so a new variant is not a breaking change.
+
+Activity code that panics in the Rust runtime, or throws in the TypeScript
+runtime, fails that attempt through the same envelope. The worker records the
+panic or throw as a retryable `DurableFailure`, so the stored retry policy
+decides whether the activity runs again, exactly as for an activity that returned
+an error. A panicking activity is not a worker fault and does not disturb the
+other activities that worker has claimed.
+
+Retry pacing is provider-enforced through delayed visibility. A retry policy
+is `{ initial_interval, max_interval, max_attempts, backoff_coefficient,
+non_retryable_error_types }` in both runtimes, and the delay before the attempt
+after attempt `n` fails is `min(max_interval, round(initial_interval *
+backoff_coefficient^(n - 1)))`. When a failed attempt is rescheduled, the
+provider stamps the task with `visible_at = now + delay` (saturating) and claim
+queries skip tasks whose `visible_at` is in the future, so a fast-failing
+activity cannot hot-loop; a zero delay leaves the retry immediately visible.
+The retry's start-to-close clock starts at the visibility instant, which keeps
+the timeout scanner from firing on a task that was never claimable. A failure
+whose `error_type` is listed in `non_retryable_error_types` ends retries like a
+`non_retryable` failure. A plain activity's timed-out attempt is retried under
+the same pacing; a map item's timed-out attempt is retried at once, because the
+lapsed deadline already paced it and the map engine measures the restarted
+deadline from that instant.
 
 The durable future behaves like this:
 
@@ -1169,6 +1427,9 @@ Semantics:
 one durable command schedules one manifest-backed map operation
 the map command increments command_seq once
 the map fingerprint includes activity name, input_manifest digest/ref, result_manifest config, max_in_flight, and options digest
+max_in_flight must be at least 1; the scheduling boundary rejects a zero bound rather than clamping it, while providers read a persisted zero bound as 1 so an existing descriptor cannot stall
+an empty input manifest (item_count == 0) is terminal at descriptor creation: the provider writes an empty result manifest and appends the terminal map fact in the same commit that schedules the map
+the engine's descriptor-creation transition never rejects a commit: when that same commit also closes the run, the descriptor is closed with no result manifest and no terminal map fact, because the run's terminal cleanup deletes the descriptor and a map fact behind the run's own terminal event would corrupt its history
 workflow history records ActivityMapScheduled and terminal ActivityMapCompleted/Failed facts
 workflow history does not record one ActivityScheduled or ActivityCompleted fact per item
 the provider pages through the input manifest and materializes item tasks up to max_in_flight
@@ -1259,6 +1520,11 @@ Semantics:
 one durable command schedules one manifest-backed child workflow map
 the map command increments command_seq once
 the map fingerprint includes workflow type, input manifest digest/ref, result manifest config, workflow_id_prefix, task queue, max_in_flight, parent_close_policy, failure_mode, and options digest
+max_in_flight must be at least 1; the scheduling boundary rejects a zero bound rather than clamping it, while providers read a persisted zero bound as 1 so an existing descriptor cannot stall
+an empty input manifest (item_count == 0) is terminal at descriptor creation: the provider writes an empty result manifest and appends the terminal map fact in the same commit that schedules the map
+the engine's descriptor-creation transition never rejects a commit: when that same commit also closes the run, the descriptor is closed with no result manifest and no terminal map fact, because the run's terminal cleanup deletes the descriptor and a map fact behind the run's own terminal event would corrupt its history
+cancelling a live map command cancels the children it already started; a map whose parent run reaches a terminal event leaves its children to parent_close_policy
+a child of a closed parent's map answers a missing map descriptor as already handled, so an abandoned child can still reach a terminal state
 workflow history records ChildWorkflowMapScheduled and terminal ChildWorkflowMapCompleted/Failed facts
 workflow history does not record ChildWorkflowStarted, ChildWorkflowCompleted, ChildWorkflowFailed, or ChildWorkflowCancelled facts per map item
 the provider pages through the input manifest and materializes child starts up to max_in_flight
@@ -1485,6 +1751,16 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
 
 `read_signal_inbox` is a live-tail read for workflow code that reaches `signal(...)` after replay has caught up. It must return a bounded result, usually one record, and it must not mark the signal consumed. `read_signal_inboxes` is the provider-neutral batch form for multiple live signal requests produced by one workflow poll; it returns one optional record per request in request order and has the same non-consuming semantics. Consumption happens only through `commit_workflow_task.consume_signals` in the same atomic commit that appends the corresponding `SignalConsumed` replay fact.
 
+`release_workflow_task` hands a claimed task back without committing. The run
+keeps the wake reason it was claimed with, so the next claim reports what a
+fresh claim would have reported; `WorkflowTaskRelease` carries only the
+visibility delay. A release whose claim token has been superseded leaves the
+newer claim alone.
+
+`query_projection` answers `NotFound` when no workflow has that id in the
+namespace, `NoProjection` when the workflow exists and has published nothing,
+and `Found` otherwise.
+
 Claim options carry local worker capabilities so providers do not hand out tasks that the worker cannot execute:
 
 ```rust
@@ -1575,10 +1851,13 @@ pub struct WorkflowTaskCommit {
     pub cancel_commands: Vec<CommandId>,
 
     pub query_projection: Option<QueryProjectionUpdate>,
-
-    pub visibility_patch: VisibilityPatch,
 }
 ```
+
+`upsert_waits`, `delete_waits`, and `consume_signals` are fenced to the claimed
+run: a provider skips a wait record naming another run, and leaves a signal or
+wait that belongs to another run untouched, so no commit can act on state the
+claim does not own. The commit itself is still accepted.
 
 ```rust
 pub struct ActivityMapTask {
@@ -1912,6 +2191,39 @@ Replay validates `TimerStarted` and returns when `TimerFired` is reached.
 
 A pending timer is an active wait index row, not a future history row. Recovery streams `TimerStarted` and any committed `TimerFired` event at or below the claimed replay target. If the timer fires after that target while recovery is running, the timer service appends `TimerFired` as a later event; the current workflow task will catch it through a later wakeup or a commit conflict.
 
+A due-timer scan must never append `TimerFired` to a run that has reached a
+terminal event. §19.1 already requires the terminal transition to delete the
+run's waits in the same transaction, so a wait outliving its run is a defect
+rather than a state to handle; the scan checks anyway, because the failure mode
+is not a resurrected run — the next claim still refuses a closed run — but a
+history with an event past its terminal event, which every replay, audit and
+cleanup path assumes cannot exist. A wait skipped for this reason is skipped,
+not deleted: deleting it would hide the defect the cleanup is supposed to have
+prevented.
+
+Firing due timers is the timer service's obligation. A worker may also scan for
+due timers, and by default it does, but that is worker configuration rather than
+a durability guarantee: no run depends on any particular worker scanning, and a
+deployment may turn it off on every worker once a timer service is running.
+Because the guarantee does not rest on it, the scan is paced by elapsed time
+rather than by the worker's task rate, with per-worker jitter derived from the
+worker id so a fleet does not scan in lockstep. Timer latency is therefore
+bounded by the scan interval and not by how busy any worker is, and provider
+load from scanning is bounded by fleet size rather than by throughput. The same
+holds for reaping activities past their start-to-close deadline.
+
+This opt-out covers the due-timer and activity-deadline scan, and nothing else.
+It is legitimate only because a timer service discharges the obligation instead;
+it is not a general licence to disable maintenance. A worker's maintenance loop
+may carry other work that nothing else in a deployment performs — the Rust
+worker also drains a provider's child-workflow start outbox where one exists,
+and no timer service touches that hook — and such work is not optional. The
+built-in providers start children inside the commit that requests them, so
+their drain finds nothing; the hook stays for a provider whose child rows live
+across a transactional boundary. §1.2 states the general rule: an
+option may change *when* durable work happens, never *whether* work that nothing
+else discharges happens at all.
+
 For wall-clock schedules, require explicit timezone ambiguity policies:
 
 ```rust
@@ -1959,12 +2271,23 @@ future created by deterministic workflow-local spawn
 Semantics:
 
 ```text
-1. Branches are registered in lexical order.
-2. Each branch creates a deterministic command/wait.
-3. The selected winner's branch ordinal is recorded in history.
-4. Replay uses the recorded branch ordinal to evaluate the same branch body.
-5. Losing waits are cancelled or ignored according to policy.
+1. The select reserves its own command_seq before any branch registers, so a
+   two-branch select numbers select, branch, branch.
+2. The reservation happens on the select's first evaluation whether or not any
+   branch is ready, so a workflow task in which the select parks still consumes
+   the number.
+3. Branches are registered in lexical order.
+4. Each branch creates a deterministic command/wait.
+5. The selected winner's branch ordinal is recorded in history.
+6. Replay uses the recorded branch ordinal to evaluate the same branch body.
+7. Losing waits are cancelled or ignored according to policy.
 ```
+
+Rules 1 and 2 are normative rather than incidental. The command sequence is
+durable: a runtime that allocated the select's number after resolving a winner
+would number the same program's branches one lower and would burn nothing at
+all in a task that parked, so its histories and the other's could not be
+replayed across a select in either direction. Both runtimes reserve first.
 
 The value returned by `select!` is the value returned by the winning branch body. Branches should usually return an explicit enum when the caller needs to know which path won:
 
@@ -2043,14 +2366,25 @@ ChildWorkflowCompleted
 ChildWorkflowFailed
 ```
 
-Use outbox/inbox to avoid distributed transactions:
+A provider whose parent and child rows share one transaction starts the child
+inside the parent's commit, which is what every built-in provider does:
 
 ```text
 1. Parent workflow task appends ChildWorkflowStartRequested.
-2. Backend writes child-start outbox message.
-3. Dispatcher starts child idempotently.
-4. Dispatcher appends ChildWorkflowStarted to parent.
-5. Child completion appends ChildWorkflowCompleted to parent.
+2. The same commit starts the child idempotently and appends
+   ChildWorkflowStarted to the parent.
+3. Child completion appends ChildWorkflowCompleted to the parent.
+```
+
+A provider whose child rows live across a transactional boundary uses an
+outbox/inbox handoff instead of a distributed transaction:
+
+```text
+1. Parent workflow task appends ChildWorkflowStartRequested.
+2. The commit writes a child-start outbox message.
+3. A dispatcher (the worker's drain) starts the child idempotently.
+4. The dispatcher appends ChildWorkflowStarted to the parent.
+5. Child completion appends ChildWorkflowCompleted to the parent.
 ```
 
 `spawn().await` resolves after `ChildWorkflowStarted`.
@@ -2182,15 +2516,14 @@ If replay cursor is at tail:
 ```
 
 The marker is part of command history and participates in deterministic replay.
-Because `get_version` is a synchronous workflow API while recovery streams
-history in bounded chunks, workers preload the provider-maintained
-`workflow_change_versions` index for the claimed run. This index is bounded by
-the number of recorded change markers, not by history length. If a marker exists
-but its event has not been streamed yet, the runtime returns the indexed version
-and records that marker as pre-consumed; when the marker event later reaches the
-replay cursor, the runtime validates and skips it before matching subsequent
-commands. This preserves deterministic command order without loading full
-history.
+Markers are matched positionally like every other command, and one marker is
+recorded per call, so a change id consulted twice records two markers.
+`get_version` is a synchronous workflow API while recovery streams history in
+bounded chunks, so when the loaded window ends before the replay target at the
+point of a marker call, the call fails the poll and latches an overrun; the
+worker discards that poll and replays the run with its whole history loaded.
+Workflow code may catch the error, but the latch keeps the task from
+committing.
 
 Unsupported workflow versions and marker-order mismatches abort the workflow
 task. They must not append `WorkflowFailed`; the worker releases the task with a
@@ -2315,6 +2648,63 @@ durust::call_activity!(...)
 BTreeMap or sorted Vec
 ```
 
+Durable APIs are not re-entrant. In both runtimes a durable API fails the
+workflow task with an explicit error when it is called from inside a
+`side_effect`/`sideEffect` closure, from a `Serialize` impl, `toJSON()`,
+`valueOf()`, or schema `encode()` that a durable API invokes while converting
+user-supplied values, or from any other callback a durable API invokes. The Rust
+runtime rejects the same nesting for activity APIs called from inside an activity
+API's callback.
+
+The map-manifest builders are the exception, in both runtimes. They allocate no
+command and hold no context borrow across caller code, so the iterator adapters
+and item conversions the caller supplies run outside the guarded window. A
+durable API called from one of them is legal: its command is allocated and
+appended before the map command that consumes the manifest exists, in record and
+replay alike.
+
+Converting a workflow's returned output is not a durable API call, and the
+runtimes differ on it — sharply, and in the run's final outcome rather than in
+timing.
+
+TypeScript rejects a durable API called from the output's `toJSON()` or schema
+`encode()`, appends no marker, and **commits a terminal `WorkflowFailed`**. Note
+what that is not: this is *not* "failing the task" in the sense §4.2 defines,
+where nothing terminal is appended and the next claim replays the run. The run
+is over and cannot be recovered by a redeploy. The mechanism is also not the
+re-entrancy guard — output conversion runs in a continuation attached outside
+the workflow's `AsyncLocalStorage` scope, so the call finds no workflow context
+at all and fails as an unawaited durable call — but the observable contract this
+section fixes is the absence of a marker ahead of the terminal event, and that
+holds whichever mechanism enforces it.
+
+Rust rejects the same call by a different mechanism: the output is encoded
+under the context borrow (`encode_workflow_output`), so the nested durable API
+trips the re-entrancy guard and the task fails as `Error::TaskPanic` with
+nothing committed. Both runtimes leave the run open with its history intact;
+`PARITY.md` row 4 names the test on each side.
+
+Rejection everywhere else is forced by command order. A durable API allocates its
+command sequence number before it runs user code and appends its command event
+after, so a nested call appends ahead of the call that contains it:
+
+```text
+side_effect("make-id", || { patched("add-fee"); ... })
+
+    allocate command seq N          side effect
+    run closure
+        allocate command seq N+1    version marker
+        append VersionMarker(N+1)
+    append SideEffectMarker(N)
+
+recorded order: [VersionMarker(N+1), SideEffectMarker(N)]
+replay expects: [SideEffectMarker(N), VersionMarker(N+1)]
+```
+
+No replay of the same code can reproduce the recorded order, so the run would be
+permanently unreplayable. Compute the durable value first and call the durable
+API outside the callback.
+
 Strict mode is a fail-closed variant of the lint layer:
 
 ```rust
@@ -2357,10 +2747,10 @@ The lint is intentionally a guardrail, not the correctness mechanism. It may mis
 ## 17.1 Deterministic time
 
 ```rust
-let now = durust::now();
+let now = durust::now().await?;
 ```
 
-`durust::now()` returns deterministic workflow time derived from recorded workflow-task/event timestamps, not system time.
+`durust::now()` (TypeScript `now()`) returns deterministic workflow time: the provider clock the evaluating task observed, recorded as a `SideEffectMarker` under the key `durust.now`, so every replay returns the recorded value and each call records its own marker.
 
 ## 17.2 Side effect marker
 
@@ -2387,6 +2777,16 @@ ordinary payload-ref APIs.
 
 The closure may run again if the workflow task crashes before commit, so it must
 not perform external side effects. External side effects belong in activities.
+
+The closure is synchronous. The marker records the closure's return value at the
+moment the closure returns, so a closure returning a future or a promise would
+record that object rather than the value it resolves to, and every replay would
+return the recorded encoding of the unresolved object. Rust's `FnOnce() -> T`
+cannot be asynchronous by construction; the TypeScript runtime rejects a
+`sideEffect` callback that returns a thenable and fails the workflow task.
+Asynchronous work belongs in activities.
+
+Durable APIs are not re-entrant and must not be called from inside the closure.
 
 ---
 
@@ -2417,6 +2817,16 @@ pub enum PayloadRef {
     },
 }
 ```
+
+A `PayloadRef` that is itself stored inside a payload (a map manifest's pages,
+a page's items, a child map outcome's result or failure details) is encoded in
+one shape by both runtimes: a `kind`-tagged object with camelCase fields
+(`schemaFingerprint`, `encryption` as `null` when absent) and inline `bytes`
+as a byte string in MessagePack or an array of byte values in JSON. The
+`itemCount` and `pageLengths` manifest fields and the `errorType`,
+`nonRetryable`, and optional `details` failure fields follow the same
+convention, so a manifest written by one runtime is readable by the other's
+provider.
 
 Pipeline:
 
@@ -2792,7 +3202,9 @@ the inbox after the run closes. Consumed signal rows are the `signal_id`
 dedup record: a closed run (completed, failed, or cancelled) deletes them
 because those rows are then only reachable by retried sends against the
 closed run, which are rejected with `TerminalWorkflow` once the row is gone —
-no delivery can result either way. Continue-as-new keeps them because the
+no delivery can result either way. A signal or cancellation naming a
+workflow id the provider never started in that namespace answers
+`Error::WorkflowNotFound`. Continue-as-new keeps them because the
 next run continues to accept sends under the same workflow id. Undispatched
 child outbox rows also survive cleanup so an abandoned child can still start
 after its parent closes.

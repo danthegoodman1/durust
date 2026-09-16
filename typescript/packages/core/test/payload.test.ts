@@ -37,6 +37,14 @@ describe("payload refs", () => {
     const blob = toBlobRef(payload, "file:///payloads/value-7");
 
     expect(blob.kind).toBe("Blob");
+    // `toBlobRef` returns the `PayloadRef` union and passes an already-blob ref
+    // straight back, so the assertion above narrows nothing. Without this the
+    // `digest` read below would be a type error; with it, an inline ref coming
+    // back out of `toBlobRef` fails here instead of silently skipping the
+    // digest comparison.
+    if (blob.kind !== "Blob") {
+      throw new Error("expected toBlobRef to return a blob ref");
+    }
     expect(blob.digest).toBe(digestBytes(payload.kind === "Inline" ? payload.bytes : ""));
     expect(payloadDigest(blob)).not.toBe(inlineDigest);
   });

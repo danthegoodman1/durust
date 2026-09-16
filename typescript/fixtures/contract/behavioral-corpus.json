@@ -1,0 +1,2671 @@
+{
+  "cases": [
+    {
+      "input": {
+        "value": 21
+      },
+      "name": "an activity call commits one scheduled activity, and its completion closes the run",
+      "program": "corpus.activity-then-return",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:a9bbb89229e9eb8d11457eed9e2312eb5595c96744c25c530c863e881523ec7a",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:1",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 42
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 3,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/activity-then-return"
+    },
+    {
+      "input": {
+        "value": 10
+      },
+      "name": "a later command is appended past an unconsumed completion (hot execution)",
+      "program": "corpus.spawn-sleep-then-activity",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:49de4fc6bfbecdad7d40576967c8cd533a88ccd27e5e1caca113a5a93e17375d",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:1",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:244f26de46926466afce1f337fe64466ac41b3b79f88ca1b74da7bb6782a10fa",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 11
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:3",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 11
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "ActivityCompleted",
+            "TimerFired"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 42
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 7,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "ActivityCompleted",
+            "TimerFired",
+            "ActivityScheduled",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/spawn-sleep-hot"
+    },
+    {
+      "input": {
+        "value": 10
+      },
+      "name": "the same commits come out of a cold replay in one-event chunks",
+      "program": "corpus.spawn-sleep-then-activity",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:49de4fc6bfbecdad7d40576967c8cd533a88ccd27e5e1caca113a5a93e17375d",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:1",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "restartWorker",
+          "historyChunkEvents": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:244f26de46926466afce1f337fe64466ac41b3b79f88ca1b74da7bb6782a10fa",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 11
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:3",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 11
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "ActivityCompleted",
+            "TimerFired"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "restartWorker",
+          "historyChunkEvents": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 42
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 7,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "ActivityCompleted",
+            "TimerFired",
+            "ActivityScheduled",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/spawn-sleep-cold"
+    },
+    {
+      "input": {
+        "value": 60000
+      },
+      "name": "a signal that arrives first wins the select, and the losing timer wait is cancelled",
+      "program": "corpus.select-signal-or-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:60000"
+                },
+                "fireAtMs": 60000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 60000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "signal",
+          "name": "corpus.approve",
+          "signalId": "corpus-signal-1",
+          "who": "ada"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-1",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "signal:ada"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [
+              "corpus-signal-1"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "kind": "Signal"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 2,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/select-signal"
+    },
+    {
+      "input": {
+        "value": 1000
+      },
+      "name": "a timer that fires first wins the select, and the losing signal wait is cancelled",
+      "program": "corpus.select-signal-or-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "branchOrdinal": 1,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "timer"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "kind": "Signal"
+              }
+            ],
+            "expectedTailEventId": 3,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/select-timer"
+    },
+    {
+      "input": {
+        "value": 4
+      },
+      "name": "a select resolved with two ready branches takes the earlier ready event, not the earlier branch",
+      "program": "corpus.select-activity-or-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "branchOrdinal": 1,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 4
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "timer"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "TimerFired",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/select-two-ready-timer-first"
+    },
+    {
+      "input": {
+        "value": 4
+      },
+      "name": "the same select with the activity landing first takes the activity branch",
+      "program": "corpus.select-activity-or-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:8f9e31942b1d4e775e1911a8e72b42890d0e9eaa678e37f7c493f75830236f95",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 1000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 4
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 1000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 4
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "activity:8"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 5,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityScheduled",
+            "TimerStarted",
+            "ActivityCompleted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/select-two-ready-activity-first"
+    },
+    {
+      "input": {
+        "value": 5
+      },
+      "name": "a query projection is committed with the signal wait and again with its consumption",
+      "program": "corpus.signal-then-publish",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": {
+              "codec": "MessagePack",
+              "schemaFingerprint": "<schema-fingerprint>",
+              "value": {
+                "status": "waiting",
+                "value": 5
+              }
+            },
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "signal",
+          "name": "corpus.approve",
+          "signalId": "corpus-signal-2",
+          "who": "grace"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "grace"
+                  }
+                },
+                "signalId": "corpus-signal-2",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 6
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [
+              "corpus-signal-2"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "kind": "Signal"
+              }
+            ],
+            "expectedTailEventId": 1,
+            "queryProjection": {
+              "codec": "MessagePack",
+              "schemaFingerprint": "<schema-fingerprint>",
+              "value": {
+                "status": "grace",
+                "value": 6
+              }
+            },
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/signal-publish"
+    },
+    {
+      "input": {
+        "value": 7
+      },
+      "name": "a child workflow start is committed with the parent's task and its completion closes the parent",
+      "program": "corpus.child-await",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:9f5608f5a9239d21320b9381011bba58ece9dc72e1e53a93ac46458f569d0dfb",
+                  "kind": "ChildWorkflow",
+                  "name": "corpus.child-increment@1",
+                  "optionsDigest": "workflow_id=wf/corpus/child:task_queue=corpus-workflows:parent_close_policy=Cancel"
+                },
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 7
+                  }
+                },
+                "parentClosePolicy": "Cancel",
+                "taskQueue": "corpus-workflows",
+                "type": "ChildWorkflowStartRequested",
+                "workflowId": "wf/corpus/child",
+                "workflowType": {
+                  "name": "corpus.child-increment",
+                  "version": 1
+                }
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 7
+                  }
+                },
+                "parentClosePolicy": "Cancel",
+                "taskQueue": "corpus-workflows",
+                "workflowId": "wf/corpus/child",
+                "workflowType": {
+                  "name": "corpus.child-increment",
+                  "version": 1
+                }
+              }
+            ],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 3,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ChildWorkflowStartRequested",
+            "ChildWorkflowStarted"
+          ]
+        },
+        {
+          "action": "otherWorkflowTask"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 8
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ChildWorkflowStartRequested",
+            "ChildWorkflowStarted",
+            "ChildWorkflowCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/child-await"
+    },
+    {
+      "input": {
+        "value": 3
+      },
+      "name": "an activity map commits one scheduled map bounded by maxInFlight",
+      "program": "corpus.activity-map",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": "<manifest-digest>",
+                  "kind": "ActivityMap",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "inputManifest": {
+                  "itemCount": 3,
+                  "items": [
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 1
+                      }
+                    },
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 2
+                      }
+                    },
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 3
+                      }
+                    }
+                  ],
+                  "pageLengths": [
+                    3
+                  ]
+                },
+                "maxInFlight": 2,
+                "resultManifestName": "doubled",
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityMapScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [
+              {
+                "activityName": "corpus.double",
+                "heartbeatTimeoutMs": null,
+                "inputManifest": {
+                  "itemCount": 3,
+                  "items": [
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 1
+                      }
+                    },
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 2
+                      }
+                    },
+                    {
+                      "codec": "MessagePack",
+                      "schemaFingerprint": "<schema-fingerprint>",
+                      "value": {
+                        "value": 3
+                      }
+                    }
+                  ],
+                  "pageLengths": [
+                    3
+                  ]
+                },
+                "mapCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "maxInFlight": 2,
+                "resultManifestName": "doubled",
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 12
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 3,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "ActivityMapScheduled",
+            "ActivityMapCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/activity-map"
+    },
+    {
+      "input": {
+        "value": 1
+      },
+      "name": "a version marker, a side effect and a deprecated patch land in one commit with the result",
+      "program": "corpus.markers",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "changeId": "corpus.change",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "VersionMarker",
+                "version": 1
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "corpus.tag",
+                "type": "SideEffectMarker",
+                "value": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 101
+                  }
+                }
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "patchId": "corpus.retired",
+                "type": "DeprecatedPatchMarker"
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 102
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/markers"
+    },
+    {
+      "input": {
+        "remaining": 1,
+        "total": 5
+      },
+      "name": "continue-as-new commits the next run's input and nothing else",
+      "program": "corpus.continue-as-new",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "remaining": 0,
+                    "total": 6
+                  }
+                },
+                "type": "WorkflowContinuedAsNew"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "otherWorkflowTask"
+        }
+      ],
+      "workflowId": "wf/corpus/continue-as-new"
+    },
+    {
+      "input": {
+        "value": 1000
+      },
+      "name": "a timer scheduled after the clock has moved records its deadline relative to now",
+      "program": "corpus.sleep-after-signal",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 5000
+        },
+        {
+          "action": "signal",
+          "name": "corpus.approve",
+          "signalId": "corpus-signal-3",
+          "who": "ada"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-3",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:1000"
+                },
+                "fireAtMs": 6000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [
+              "corpus-signal-3"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "kind": "Signal"
+              }
+            ],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 6000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 1000
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 1003
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "SignalConsumed",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/sleep-after-signal"
+    },
+    {
+      "input": {
+        "value": 21
+      },
+      "name": "one change id consulted on both sides of a task boundary records two markers",
+      "program": "corpus.repeated-change-id",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "changeId": "corpus.repeat",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "VersionMarker",
+                "version": 1
+              },
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:a9bbb89229e9eb8d11457eed9e2312eb5595c96744c25c530c863e881523ec7a",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "changeId": "corpus.repeat",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "type": "VersionMarker",
+                "version": 1
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 44
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "VersionMarker",
+            "ActivityScheduled",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/repeated-change-id"
+    },
+    {
+      "input": {
+        "value": 60000
+      },
+      "name": "a signal that won a select whose timer registered later replays cold by command id",
+      "program": "corpus.signal-first-select-then-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:60000"
+                },
+                "fireAtMs": 60000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 60000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "signal",
+          "name": "corpus.approve",
+          "signalId": "corpus-signal-first-1",
+          "who": "ada"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-first-1",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 4
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:10"
+                },
+                "fireAtMs": 10,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [
+              "corpus-signal-first-1"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "kind": "Signal"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 2,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 4
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 10
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 10
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "signal:ada"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 6,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted",
+            "SignalConsumed",
+            "SelectWinner",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/signal-first-select"
+    },
+    {
+      "input": {
+        "value": 1
+      },
+      "name": "a workflow that fails on purpose commits WorkflowFailed with its own failure",
+      "program": "corpus.fails",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "failure": {
+                  "details": null,
+                  "errorType": "corpus.rejected",
+                  "message": "rejected on purpose",
+                  "nonRetryable": true
+                },
+                "type": "WorkflowFailed"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/fails"
+    },
+    {
+      "input": {
+        "value": 10
+      },
+      "name": "now() records the provider clock once per call and replays it as recorded",
+      "program": "corpus.now-twice",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "key": "durust.now",
+                "type": "SideEffectMarker",
+                "value": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": 0
+                }
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:10"
+                },
+                "fireAtMs": 10,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 10
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 10
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "durust.now",
+                "type": "SideEffectMarker",
+                "value": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": 10
+                }
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "SideEffectMarker",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/now-twice"
+    }
+  ],
+  "declaredDivergences": {
+    "count": 0,
+    "why": "How many `divergence` blocks this corpus holds, asserted for EQUALITY by both runners — a count, not a floor. It replaced a `count > 0` tripwire, which encoded the assumption that the corpus would always record at least one divergence; that assumption became wrong the moment the last one was converged away, and it would have had to be edited under exactly the pressure that makes a careless edit likely. It is 0 today: every divergence this corpus ever found has been closed by moving TypeScript onto Rust's answer, and the eight blocks that held the select command-seq numbering are now shared `expect`s. Zero is a real state, not a disabled check — the next genuine divergence must raise this number in the same change that records it, or both runners fail, and a block deleted rather than converged fails them too."
+  },
+  "declaredGaps": [
+    {
+      "what": "Double-await of a handle",
+      "why": "A three-way split, not a two-way one. Rust's ActivityHandle::result(self) takes self by value, so a second await does not compile at all. Rust's ChildWorkflowHandle::result(&self) borrows, so both a second concurrent await and a second sequential read compile — and take_child_completion removes the entry from the index, so the second await returns Poll::Pending forever and the workflow silently stalls. TypeScript allows a sequential re-read and rejects a concurrent one. Three behaviours across two runtimes and two handle kinds; no corpus case awaits a handle twice. No corpus case awaits a handle twice, so this is a gap rather than a projection: there is nothing here for the runners to normalise, only behaviour nobody looked at."
+    },
+    {
+      "what": "Offloaded (blob) payload refs",
+      "why": "Every payload in every case is inline. payload_json/payloadJson call decode_payload/decodePayload, which refuse a Blob ref, so a case that started offloading would fail loudly rather than under-assert — but nothing exercises the payload-offload layer, its digest/size/uri fields, or the hydration a provider must perform before replay. The corpus says nothing about offloaded payload parity in either direction."
+    },
+    {
+      "what": "Child workflow maps",
+      "why": "No case schedules one. commit_json and commitJson both refuse a commit whose scheduleChildWorkflowMaps is non-empty, so this cannot be reached accidentally, but the ChildWorkflowMapScheduled event, the ChildWorkflowMapTask, and the child-map result manifest have no behavioural coverage here. The Phase 6 map transition table covers the engine; this covers neither the scheduling commit nor the completion commit."
+    },
+    {
+      "what": "Workflow cancellation events",
+      "why": "No case cancels a run. `corpus.fails` covers the failure event: a workflow that fails on purpose commits `WorkflowFailed` with the failure it named in both runtimes, and a plain throw (TypeScript) or panic (Rust) commits nothing, which the runners cannot record because a released task produces no commit. Cancellation is still unreached."
+    },
+    {
+      "what": "Activity retries",
+      "why": "Every activity in the catalogue succeeds on its first attempt, so the corpus never observes a second attempt, a retry delay, or an ActivityTimedOut. That is partly deliberate — retry delay VALUES are a forced divergence and are excluded above — but the shape of a retry (attempt number, whether a new task is scheduled at all) is comparable and is not compared."
+    },
+    {
+      "what": "Terminal-with-leftover-command divergence detection",
+      "why": "The plan calls this out as one of the behaviours a vocabulary fixture cannot pin, and it is still not pinned. No case drives a workflow to a terminal event while a command event remains unconsumed at the replay cursor, so neither runtime's detection of that condition is compared against the other's."
+    },
+    {
+      "what": "The select tie-break between two branches ready at the same event id",
+      "why": "There are TWO implementations of the rule in Rust, not one: the select! macro expands its own comparison (durust-macros/src/lib.rs) and select_all carries a separate copy (src/runtime.rs). TypeScript has compareSelectReadyBranches. All three order ready branches by ready event id and then by branch ordinal. The event-id half is pinned for the macro path and for TypeScript by the two-ready-branch cases, in both orders, and reversing either implementation fails them. What this corpus does NOT pin: the select_all copy, which no case reaches — pre-existing replay_core tests do cover it, so it is untested by the corpus rather than untested outright — and the ordinal half of the rule, for any implementation. The ordinal half appears unreachable through the public API: every ready branch resolves from a distinct history event — a TimerFired, an activity completion, or the SignalConsumed the task is about to append — so two ready branches cannot share a ready event id, and a comparator reading 'lowest event id, then HIGHEST ordinal' passes both cases here. It is recorded as a gap rather than claimed as an assertion, because a future change that let two branches share an event id would land on untested code."
+    },
+    {
+      "what": "Providers other than the two in-memory ones",
+      "why": "Every case runs against MemoryBackend. That is less single-provider than it sounds — Rust and TypeScript have entirely independent MemoryBackend implementations, so the corpus is implicitly cross-checking two providers as well as two runtimes — but neither SQLite nor Postgres executes a single corpus case in either language, and provider-specific commit handling is covered only by the separate conformance suites."
+    }
+  ],
+  "exclusions": [
+    {
+      "kind": "Projection",
+      "what": "PayloadRef.schemaFingerprint",
+      "why": "Rust hashes std::any::type_name::<T>(); TypeScript hashes a SchemaAdapter fingerprint, or the literal string \"unknown\" when no adapter is supplied. Neither derivation can produce the other's value for the same logical payload, and there is no API on the Rust side that lets a caller override it. Every payload in this corpus is therefore projected to {codec, schemaFingerprint: \"<schema-fingerprint>\", value: <decoded>}: the codec and the decoded content are asserted, the fingerprint is not."
+    },
+    {
+      "kind": "Projection",
+      "what": "CommandFingerprint.optionsDigest for the Activity and ActivityMap kinds",
+      "why": "Rust computes it as sha256(rmp_serde::to_vec_named(&ActivityOptions)) over snake_case field names with Duration encoded as {secs, nanos}; TypeScript computes sha256(JSON.stringify({taskQueue, retryPolicy, startToCloseTimeoutMs, heartbeatTimeoutMs})) over camelCase numbers. The two are different serialisations of different structs and can never agree. The options themselves are still asserted, field by field, on the ActivityScheduled/ActivityMapScheduled event and on the scheduled task. The Timer, Signal, ChildWorkflow, ChildWorkflowMap and VersionMarker option digests are plain formatted strings that do agree, and those are asserted for real."
+    },
+    {
+      "kind": "Projection",
+      "what": "RetryPolicy beyond maxAttempts, including every retry delay value",
+      "why": "The two runtimes model retry differently and share no field but the attempt cap: Rust carries {backoff: None|Exponential, max_attempts}, TypeScript carries {initialIntervalMs, maxIntervalMs, maxAttempts, backoffCoefficient, nonRetryableErrorTypes}. There is no lossless mapping in either direction, so numeric parity is impossible rather than merely unmet, and the plan already records retry delay values as a forced divergence. maxAttempts is common to both and is asserted."
+    },
+    {
+      "kind": "Projection",
+      "what": "SelectWinner.branchesDigest",
+      "why": "Rust's select! is positional and records the literal string \"select:{n}\" (\"select_all:{n}\" for select_all); TypeScript's select takes a named record and records sha256(JSON.stringify({kind: \"select\", branches: [...keys]})), over key names Rust's positional macro does not have. What the corpus asserts instead is the winner itself: branchOrdinal and winningEventId are compared exactly. That claim is only worth anything if some case resolves a select with MORE THAN ONE ready branch — with a single ready branch every comparator returns the same winner and the assertion cannot fail — so the corpus carries `a select resolved with two ready branches takes the lower ready event id`, in which the signal and the timer are both ready in the same task and the recorded winner is the one with the lower ready event id. Reversing either half of compareSelectReadyBranches fails that case. The ordinal half of the rule is a declared gap, not an assertion: see declaredGaps."
+    },
+    {
+      "kind": "Projection",
+      "what": "WaitId string format",
+      "why": "Rust formats a wait id as \"{runId}:{seq}:timer\" / \"{runId}:{seq}:signal\"; TypeScript formats the same wait as \"{runId}:timer:{seq}\" / \"{runId}:signal:{seq}\". The id is an opaque provider key within one store, so neither format is wrong, but they are not interchangeable and a store written by one runtime could not have its waits deleted by the other. The corpus asserts what the id stands for — kind plus command id — for both upserted and deleted waits, each runner parsing its own format back into that neutral triple. This is a real divergence discovered while building the corpus, not a language-forced one."
+    },
+    {
+      "kind": "Projection",
+      "what": "The activity-map manifest wire encoding",
+      "why": "An input manifest is itself an encoded payload whose contents are nested PayloadRefs. Rust serialises {item_count, page_lengths, pages} in snake_case with an externally tagged PayloadRef ({\"Inline\": {...}}), TypeScript serialises {itemCount, pageLengths, pages} in camelCase with an internally tagged one ({\"kind\": \"Inline\", ...}), so the manifest bytes cannot match even when every item value does. The corpus asserts the manifest by content instead: item count, page lengths, and the decoded value of every item, each runner reading the manifest with its own decoder."
+    },
+    {
+      "kind": "Assertion",
+      "what": "WorkflowTaskCommit.cancelCommands and the ParentCancelled event",
+      "why": "Both runtimes carry the field — cancel_commands in Rust, cancelCommands in TypeScript — both raise ParentCancelled from it, and both now write it from the same producer: a select branch that loses while still holding a scheduled activity, which Rust withdraws in ActivityFuture::__durust_cancel_branch and TypeScript in cancelActivityBranch. It stays excluded because no corpus case reaches that state — every select here races a timer against a signal, or races branches that have both already produced a value — and not because either runtime is unable to produce it. Both runners assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
+    },
+    {
+      "kind": "Scope",
+      "what": "The execution mechanism",
+      "why": "Rust polls futures and rebuilds a RuntimeContext per task; TypeScript keeps a long-lived hot promise chain (HotWorkflowExecution) and mutates its context in place through AsyncLocalStorage. Neither can adopt the other and the corpus does not try: it names no execution-internal state and asserts only the committed history and the provider contract. What it does assert is that the choice is unobservable through that contract — the hot/cold case pairs below run the same script with and without a cached execution and require byte-identical commits."
+    }
+  ],
+  "note": [
+    "The shared BEHAVIOURAL corpus. One artefact, two runners:",
+    "tests/behavioral_corpus.rs and",
+    "typescript/packages/core/test/behavioral-corpus.test.ts.",
+    "",
+    "core-events.json, provider-io.json and benchmark-output.json pin VOCABULARY:",
+    "event type names, fingerprint helpers, payload-ref shapes, provider request",
+    "and outcome names. Two runtimes can agree on every one of those and still",
+    "disagree about what a workflow task DOES. This file pins that. Each case is",
+    "(workflow program, input history, live signals, now) -> commit, and both",
+    "runtimes must reproduce the commit by executing the case through their real",
+    "worker, with the commit captured by a recording provider rather than rebuilt",
+    "from runtime state.",
+    "",
+    "SCHEMA",
+    "",
+    "  `program`   names an entry in a catalogue that exists once per language",
+    "              with the same observable behaviour. The corpus never carries",
+    "              code.",
+    "  `steps`     are provider-level actions — run a workflow task, run an",
+    "              activity, advance the virtual clock, fire due timers, send a",
+    "              signal, restart the worker with a given replay chunk size — so",
+    "              the input history is produced the same way on both sides.",
+    "  `historyBefore` pins that input history as literal data, read from the",
+    "              provider immediately before the task is claimed.",
+    "  `expect`    is the neutral projection of the WorkflowTaskCommit, asserted",
+    "              by BOTH runners.",
+    "  `divergence` replaces `expect` where the two runtimes genuinely behave",
+    "              differently. It holds `what` (why they differ and which way the",
+    "              convergence should go) plus BOTH observed commits, `rust` and",
+    "              `typescript`; each runner asserts its own side. Recording both",
+    "              is the point: a divergence that is normalised away stops being",
+    "              visible, and one that is merely omitted stops being tracked.",
+    "              Both runners refuse a divergence whose two sides are equal.",
+    "              There are none today — see `declaredDivergences` — but the",
+    "              mechanism stays, because the next one has to be recordable in",
+    "              the change that finds it rather than in the change that fixes",
+    "              it.",
+    "",
+    "              The two diff implementations agree on every structural shape —",
+    "              nested objects, arrays of differing length, null against an",
+    "              absent key, object against scalar, key ordering, deep key-set",
+    "              mismatch — and disagree on exactly one class: numeric",
+    "              REPRESENTATION. Rust compares serde_json::Number, which",
+    "              distinguishes 1.0 from 1, -0.0 from 0, and 9007199254740993",
+    "              from 9007199254740992; TypeScript compares JSON.stringify after",
+    "              JSON.parse has already collapsed each of those pairs, so it",
+    "              reports no difference. Rust's path set is therefore a superset",
+    "              in every disagreement, which is why this cannot fail silently:",
+    "              declare the extra path and TypeScript rejects it as spurious,",
+    "              omit it and Rust rejects the omission. One runner always goes",
+    "              red, and check:fixtures and CI both run both. Unreachable",
+    "              today — every number in every commit is an integer inside the",
+    "              double-safe range — so it is recorded rather than fixed.",
+    "",
+    "  `declaredDivergences.count` is how many `divergence` blocks the corpus",
+    "              claims to hold, asserted for EQUALITY by both runners. It",
+    "              replaced a `count > 0` tripwire, which asserted that the",
+    "              corpus would always record at least one divergence — an",
+    "              assumption that becomes wrong the moment the last one is",
+    "              converged away. Equality is loud in both directions: delete a",
+    "              block and both runners fail, find a new divergence and forget",
+    "              to declare it and both runners fail, and 0 — the value today —",
+    "              is a real state rather than a disabled check. Zero is reachable",
+    "              only by editing this number on purpose.",
+    "",
+    "  `exclusions` are the projections `expect` applies before comparing, each",
+    "              with the reason it cannot be compared directly. Both runners",
+    "              assert the exclusion list itself, in order, so an exclusion",
+    "              cannot be quietly widened or dropped.",
+    "",
+    "  `workerStartJitter` is not a commit; see its own note.",
+    "",
+    "AUTHORING",
+    "",
+    "  The `expect` blocks were produced by the Rust runner under",
+    "  DURUST_CORPUS_REGENERATE=1 and are checked in. The TypeScript runner has no",
+    "  regeneration path at all: it can satisfy the file or fail. That asymmetry",
+    "  is what makes the corpus a cross-implementation assertion rather than a",
+    "  snapshot of one implementation — every shared `expect` here is a value one",
+    "  runtime produced and the other had to match without having seen it.",
+    "  DURUST_CORPUS_PRINT=1 makes the TypeScript runner report what it observed,",
+    "  for filling in a `divergence.typescript` block; it never writes this file.",
+    "",
+    "FOUND WHILE BUILDING THIS",
+    "",
+    "  Four differences turned up that nothing had recorded before. All four are",
+    "  now closed, every one of them by moving TypeScript onto Rust's answer, and",
+    "  each entry below keeps what the corpus saw as well as where it landed,",
+    "  because a finding that leaves no trace once it is fixed cannot be audited.",
+    "",
+    "  1. TypeScript never cancelled a losing select branch's operational state.",
+    "     CLOSED. It was recorded as a `divergence` on the two select-resolution",
+    "     steps whose `deleteWaits` lengths differed, with the observable",
+    "     consequence being a TimerFired appended after the terminal event.",
+    "     TypeScript now cancels every branch that loses without producing a",
+    "     value, so both runtimes delete the same waits, and those two steps",
+    "     differ only by (2) below. The corpus reaches the timer and signal branch",
+    "     kinds; the activity branch — which Rust withdraws through",
+    "     `cancel_commands` rather than a wait — is not reached by any case here",
+    "     and is covered by the `WorkflowTaskCommit.cancelCommands` exclusion.",
+    "  2. A `select` allocated its own command sequence number before polling its",
+    "     branches in Rust and after resolving a winner in TypeScript, which",
+    "     shifted every branch's command seq by one, so neither runtime could",
+    "     replay the other's history across a select. CLOSED, by moving",
+    "     TypeScript: `SelectDurablePromise.then` and its `selectAll` twin now",
+    "     reserve the select's command id after the replay-history gate and",
+    "     BEFORE registering any branch, and a task in which no branch is ready",
+    "     burns the number just as Rust's macro does. TypeScript moved because",
+    "     every other durable command in both runtimes already allocates at",
+    "     initiation; the exception was an artefact of `then()` inheriting the",
+    "     readiness condition, not a decision. It was recorded as a `divergence`",
+    "     on all eight steps of the four select cases, and those eight blocks are",
+    "     now shared `expect`s that both runners satisfy — which is the proof the",
+    "     convergence landed, since the recorded commits are Rust's and",
+    "     TypeScript had to reproduce them without having produced them.",
+    "  3. The TypeScript worker never supplied PrepareWorkflowTaskOptions.nowMs,",
+    "     so a timer scheduled after the clock had moved recorded a deadline",
+    "     measured from the epoch. CLOSED. `DurableBackend.currentTime()` now",
+    "     exists in TypeScript as it always has in Rust, the worker reads it once",
+    "     per prepared workflow task, and `a timer scheduled after the clock has",
+    "     moved` is a shared expectation with both runtimes recording 6000. This",
+    "     was an exclusion in the first draft, which was wrong: `fireAt` is",
+    "     perfectly comparable, the runtimes simply differed, and an exclusion",
+    "     would have hidden that behind a projection the runners do not perform.",
+    "  4. WorkerOptions.activityTaskQueue in TypeScript was used only for CLAIMING",
+    "     activity tasks — the worker never passed defaultActivityTaskQueue into",
+    "     HotWorkflowExecution — so a callActivity() with no explicit taskQueue",
+    "     scheduled onto the literal queue \"default\" and the worker that scheduled",
+    "     it would never claim it. CLOSED, by giving the runtime the worker's",
+    "     configured queue as its fallback exactly as Rust does. It could not be",
+    "     expressed as a case at all: every program in this corpus names its task",
+    "     queue explicitly, which is why the corpus ran green either way, and a",
+    "     case that omitted the queue would be asserting a worker configuration",
+    "     rather than a workflow behaviour."
+  ],
+  "workerStartJitter": {
+    "cases": [
+      {
+        "seed": 2166136261,
+        "unitsScaled": [
+          2625274932,
+          2119670693,
+          3324411561,
+          1770755366,
+          3488654967,
+          245707362
+        ],
+        "workerId": ""
+      },
+      {
+        "seed": 3826002220,
+        "unitsScaled": [
+          2670119670,
+          1323809741,
+          1575654966,
+          2556090870,
+          3826730733,
+          2780608687
+        ],
+        "workerId": "a"
+      },
+      {
+        "seed": 2751036861,
+        "unitsScaled": [
+          247304904,
+          371536217,
+          555264696,
+          505344335,
+          2888239183,
+          1995001904
+        ],
+        "workerId": "worker-a"
+      },
+      {
+        "seed": 2700704004,
+        "unitsScaled": [
+          391992078,
+          1558625758,
+          2058065582,
+          2615046258,
+          2884503206,
+          2076830666
+        ],
+        "workerId": "worker-b"
+      },
+      {
+        "seed": 3164144991,
+        "unitsScaled": [
+          3212021755,
+          2566478557,
+          46990309,
+          629450181,
+          1479813370,
+          875823090
+        ],
+        "workerId": "durust-worker-abcdef"
+      },
+      {
+        "seed": 1023584700,
+        "unitsScaled": [
+          2381327734,
+          2093634370,
+          4140619526,
+          4291144007,
+          550319038,
+          2319465759
+        ],
+        "workerId": "wörker"
+      },
+      {
+        "seed": 1131670609,
+        "unitsScaled": [
+          2209320794,
+          3633644801,
+          554461869,
+          2759000139,
+          2059652591,
+          1622848149
+        ],
+        "workerId": "worker-🙂"
+      }
+    ],
+    "note": [
+      "The maintenance-scan jitter stream: FNV-1a-32 over the worker id's UTF-16",
+      "code units seeds mulberry32, and each call yields a unit value in [0, 1).",
+      "Verified identical across the two runtimes by hand during Phase 2 and",
+      "pinned here so nothing can drift.",
+      "",
+      "`seed` is the FNV-1a-32 state before the first draw. `unitsScaled` are the",
+      "first six draws multiplied by 2^32 — that is, the raw 32-bit mulberry32",
+      "outputs, before the single exact division each runtime performs. Integers,",
+      "not decimals, deliberately: the division by 2^32 is exact in both runtimes,",
+      "so the integer form loses nothing, while decimal text does not survive the",
+      "round trip. serde_json parses 0.09126776782795787 to a double one ULP away",
+      "from what f64::from_str returns for the same text, which would have made a",
+      "decimal table fail in Rust for a reason that has nothing to do with jitter.",
+      "",
+      "The DELAY these units are scaled into is NOT pinned: Rust keeps",
+      "sub-millisecond precision in a Duration, TypeScript rounds to whole",
+      "milliseconds. The stream is the shared part.",
+      "",
+      "worker-🙂 is in the table on purpose: an astral character is two",
+      "UTF-16 code units and one four-byte UTF-8 sequence, so a runtime that",
+      "hashed bytes instead of code units would agree on every ASCII id here and",
+      "fail only on this one.",
+      "",
+      "Rust asserts this table from src/worker.rs's unit tests, because",
+      "MaintenanceJitter is private to that module and a tests/ integration test",
+      "cannot name it; TypeScript asserts it from the corpus runner, which imports",
+      "the worker module directly."
+    ]
+  }
+}

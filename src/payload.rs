@@ -27,17 +27,24 @@ pub enum CompressionId {
 pub struct SchemaFingerprint(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EncryptionMetadata {
     pub key_id: String,
 }
 
+/// A payload reference, serialized in the shape both runtimes store inside
+/// payloads that embed other payloads (map manifests and pages):
+/// `{ kind: "Inline" | "Blob", codec, schemaFingerprint, compression,
+/// encryption, ... }`, with inline bytes as a byte string.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all_fields = "camelCase")]
 pub enum PayloadRef {
     Inline {
         codec: CodecId,
         schema_fingerprint: SchemaFingerprint,
         compression: CompressionId,
         encryption: Option<EncryptionMetadata>,
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     Blob {
@@ -273,7 +280,34 @@ pub(crate) fn validate_side_effect_marker(marker: &SideEffectMarker) -> Result<(
 }
 
 pub fn type_fingerprint<T: ?Sized>() -> String {
-    type_name_fingerprint(std::any::type_name::<T>())
+    cached_type_name_fingerprint(std::any::type_name::<T>()).to_owned()
+}
+
+/// Fingerprints are computed once per type. `type_name` returns one static
+/// string per type within a binary, so its address is the key, and the
+/// fingerprint is leaked once so a hit borrows it: the per-type set is
+/// bounded by the program's types, and every encode used to pay a SHA-256,
+/// a hex encode, and two allocations for a value that never changes.
+fn cached_type_name_fingerprint(type_name: &'static str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+    static CACHE: RwLock<Option<HashMap<usize, &'static str>>> = RwLock::new(None);
+    let key = type_name.as_ptr() as usize;
+    if let Some(cached) = CACHE
+        .read()
+        .expect("fingerprint cache poisoned")
+        .as_ref()
+        .and_then(|cache| cache.get(&key).copied())
+    {
+        return cached;
+    }
+    let fingerprint: &'static str = Box::leak(type_name_fingerprint(type_name).into_boxed_str());
+    CACHE
+        .write()
+        .expect("fingerprint cache poisoned")
+        .get_or_insert_with(HashMap::new)
+        .entry(key)
+        .or_insert(fingerprint)
 }
 
 pub fn type_name_fingerprint(type_name: &str) -> String {
@@ -639,7 +673,27 @@ pub(crate) async fn rewrite_history_event_payloads<R: PayloadRewrite>(
             validate_side_effect_marker(&marker)?;
             HistoryEventData::SideEffectMarker(marker)
         }
-        other => other,
+        // The payload-free variants, listed rather than swept up by a
+        // `other => other` catch-all. The catch-all was the asymmetry: its
+        // synchronous twin `map_history_event_payloads` is exhaustive, so a new
+        // payload-bearing variant fails that build immediately, while here it
+        // matched `other` and passed through **unnormalized** on the Postgres
+        // and `payload_backend` paths — a silent storage bug rather than a
+        // compile error. Spelled out, the compiler now stops both.
+        //
+        // The arms below are pass-through, exactly as the catch-all was; the
+        // set of variants this function rewrites is unchanged. A new variant
+        // belongs in this list only once it is known to carry no payload.
+        data @ (HistoryEventData::WorkflowCancelled { reason: _ }
+        | HistoryEventData::WorkflowTaskStarted
+        | HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_)) => data,
     })
 }
 
@@ -737,6 +791,348 @@ where
 {
     signal.payload = map_payload(signal.payload)?;
     Ok(signal)
+}
+
+// ---- one payload traversal ---------------------------------------------------
+//
+// Every collector over stored payloads (roots for the decorator's garbage
+// collector, reachability for a provider's own blob table, the decorator's
+// walk over its external store) is built from the two pieces below: the one
+// exhaustive match over a history event's payload fields, and one walk over a
+// manifest and its pages that lets the caller load each container from
+// whichever store holds it.
+
+/// What a manifest's bytes describe, which decides how its pages decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ManifestKind {
+    ActivityMapInput,
+    ActivityMapResult,
+    ChildWorkflowMapResult,
+}
+
+impl ManifestKind {
+    pub(crate) fn root(self, payload: PayloadRef) -> crate::PayloadRootRef {
+        match self {
+            Self::ActivityMapInput => crate::PayloadRootRef::ActivityMapInputManifest(payload),
+            Self::ActivityMapResult => crate::PayloadRootRef::ActivityMapResultManifest(payload),
+            Self::ChildWorkflowMapResult => {
+                crate::PayloadRootRef::ChildWorkflowMapResultManifest(payload)
+            }
+        }
+    }
+}
+
+impl crate::PayloadRootRef {
+    /// The manifest kind of a container root, or `None` for a plain payload.
+    pub(crate) fn manifest_kind(&self) -> Option<ManifestKind> {
+        match self {
+            Self::Payload(_) => None,
+            Self::ActivityMapInputManifest(_) => Some(ManifestKind::ActivityMapInput),
+            Self::ActivityMapResultManifest(_) => Some(ManifestKind::ActivityMapResult),
+            Self::ChildWorkflowMapResultManifest(_) => Some(ManifestKind::ChildWorkflowMapResult),
+        }
+    }
+}
+
+/// A payload-bearing field of a history event, tagged by what its bytes hold.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PayloadSlot<'a> {
+    Payload(&'a PayloadRef),
+    Manifest(ManifestKind, &'a PayloadRef),
+}
+
+/// Calls `visit` with every payload slot of `data`, in field order, after
+/// validating a `SideEffectMarker`'s inline bound. Events without payloads
+/// yield nothing.
+pub(crate) fn history_event_payload_slots<'a>(
+    data: &'a HistoryEventData,
+    visit: &mut dyn FnMut(PayloadSlot<'a>),
+) -> Result<()> {
+    let mut payload = |payload: &'a PayloadRef| visit(PayloadSlot::Payload(payload));
+    match data {
+        HistoryEventData::WorkflowStarted { input, .. }
+        | HistoryEventData::WorkflowContinuedAsNew { input } => payload(input),
+        HistoryEventData::WorkflowCompleted { result } => payload(result),
+        HistoryEventData::WorkflowFailed { failure } => {
+            if let Some(details) = failure_payload(failure) {
+                payload(details);
+            }
+        }
+        HistoryEventData::ActivityScheduled(scheduled) => payload(&scheduled.input),
+        HistoryEventData::ActivityMapScheduled(scheduled) => visit(PayloadSlot::Manifest(
+            ManifestKind::ActivityMapInput,
+            &scheduled.input_manifest,
+        )),
+        HistoryEventData::ActivityMapCompleted(completed) => visit(PayloadSlot::Manifest(
+            ManifestKind::ActivityMapResult,
+            &completed.result_manifest,
+        )),
+        HistoryEventData::ActivityMapFailed(failed) => {
+            if let Some(details) = failure_payload(&failed.failure) {
+                payload(details);
+            }
+        }
+        HistoryEventData::ActivityCompleted(completed) => payload(&completed.result),
+        HistoryEventData::ActivityFailed(failed) => {
+            if let Some(details) = failure_payload(&failed.failure) {
+                payload(details);
+            }
+        }
+        HistoryEventData::ChildWorkflowStartRequested(requested) => payload(&requested.input),
+        HistoryEventData::ChildWorkflowCompleted(completed) => payload(&completed.result),
+        HistoryEventData::ChildWorkflowFailed(failed) => {
+            if let Some(details) = failure_payload(&failed.failure) {
+                payload(details);
+            }
+        }
+        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => visit(PayloadSlot::Manifest(
+            ManifestKind::ActivityMapInput,
+            &scheduled.input_manifest,
+        )),
+        HistoryEventData::ChildWorkflowMapCompleted(completed) => visit(PayloadSlot::Manifest(
+            ManifestKind::ChildWorkflowMapResult,
+            &completed.result_manifest,
+        )),
+        HistoryEventData::ChildWorkflowMapFailed(failed) => {
+            if let Some(details) = failure_payload(&failed.failure) {
+                payload(details);
+            }
+        }
+        HistoryEventData::SignalConsumed(signal) => payload(&signal.payload),
+        HistoryEventData::SideEffectMarker(marker) => validate_side_effect_marker(marker)?,
+        HistoryEventData::WorkflowCancelled { .. }
+        | HistoryEventData::WorkflowTaskStarted
+        | HistoryEventData::ActivityTimedOut(_)
+        | HistoryEventData::ChildWorkflowStarted(_)
+        | HistoryEventData::ChildWorkflowCancelled(_)
+        | HistoryEventData::TimerStarted(_)
+        | HistoryEventData::TimerFired(_)
+        | HistoryEventData::SelectWinner(_)
+        | HistoryEventData::VersionMarker(_)
+        | HistoryEventData::DeprecatedPatchMarker(_) => {}
+    }
+    Ok(())
+}
+
+pub(crate) fn failure_payload(failure: &DurableFailure) -> Option<&PayloadRef> {
+    failure.details.as_ref()
+}
+
+pub(crate) fn child_workflow_map_outcome_payload(
+    outcome: &crate::ChildWorkflowMapItemOutcome,
+) -> Option<&PayloadRef> {
+    match outcome {
+        crate::ChildWorkflowMapItemOutcome::Succeeded { result } => Some(result),
+        crate::ChildWorkflowMapItemOutcome::Failed { failure } => failure_payload(failure),
+        crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestLevel {
+    Manifest,
+    Page,
+}
+
+/// A walk over a manifest, its pages, and the refs inside them, driven by the
+/// caller: `next_container` names the container whose bytes are needed, the
+/// caller loads them from whichever store holds them and answers with
+/// `provide` (or `skip` when the store is not one it reads), and `into_refs`
+/// returns every ref the walk met, containers included, in manifest order.
+pub(crate) struct ManifestWalk {
+    kind: ManifestKind,
+    pending: std::collections::VecDeque<(ManifestLevel, PayloadRef)>,
+    current: Option<ManifestLevel>,
+    refs: Vec<PayloadRef>,
+}
+
+impl ManifestWalk {
+    pub(crate) fn new(kind: ManifestKind, manifest: PayloadRef) -> Self {
+        Self {
+            kind,
+            pending: std::collections::VecDeque::from([(
+                ManifestLevel::Manifest,
+                manifest.clone(),
+            )]),
+            current: None,
+            refs: vec![manifest],
+        }
+    }
+
+    /// A walk that starts below an already decoded activity-map input
+    /// manifest, at its pages.
+    pub(crate) fn from_input_pages(pages: impl IntoIterator<Item = PayloadRef>) -> Self {
+        let pages: Vec<PayloadRef> = pages.into_iter().collect();
+        Self {
+            kind: ManifestKind::ActivityMapInput,
+            pending: pages
+                .iter()
+                .cloned()
+                .map(|page| (ManifestLevel::Page, page))
+                .collect(),
+            current: None,
+            refs: pages,
+        }
+    }
+
+    /// The next container whose bytes the walk needs, or `None` when done.
+    pub(crate) fn next_container(&mut self) -> Option<PayloadRef> {
+        let (level, container) = self.pending.pop_front()?;
+        self.current = Some(level);
+        Some(container)
+    }
+
+    /// Names the container `next_container` returned, for error messages.
+    pub(crate) fn context(&self) -> &'static str {
+        match (self.kind, self.current) {
+            (ManifestKind::ActivityMapInput, Some(ManifestLevel::Page)) => {
+                "activity map input manifest page"
+            }
+            (ManifestKind::ActivityMapInput, _) => "activity map input manifest root",
+            (ManifestKind::ActivityMapResult, Some(ManifestLevel::Page)) => {
+                "activity map result manifest page"
+            }
+            (ManifestKind::ActivityMapResult, _) => "activity map result manifest root",
+            (ManifestKind::ChildWorkflowMapResult, Some(ManifestLevel::Page)) => {
+                "child workflow map result manifest page"
+            }
+            (ManifestKind::ChildWorkflowMapResult, _) => "child workflow map result manifest root",
+        }
+    }
+
+    /// Answers `next_container` with the container's inline bytes: a manifest
+    /// queues its pages, a page adds the refs it holds.
+    pub(crate) fn provide(&mut self, hydrated: &PayloadRef) -> Result<()> {
+        let level = self.current.take().unwrap_or(ManifestLevel::Manifest);
+        match (self.kind, level) {
+            (ManifestKind::ActivityMapInput, ManifestLevel::Manifest) => {
+                let manifest: ActivityMapInputManifest = decode_payload(hydrated)?;
+                self.queue_pages(manifest.pages);
+            }
+            (ManifestKind::ActivityMapInput, ManifestLevel::Page) => {
+                let page: ActivityMapInputPage = decode_payload(hydrated)?;
+                self.refs.extend(page.items);
+            }
+            (ManifestKind::ActivityMapResult, ManifestLevel::Manifest) => {
+                let manifest: ActivityMapResultManifest = decode_payload(hydrated)?;
+                self.queue_pages(manifest.pages);
+            }
+            (ManifestKind::ActivityMapResult, ManifestLevel::Page) => {
+                let page: ActivityMapResultPage = decode_payload(hydrated)?;
+                self.refs.extend(page.results);
+            }
+            (ManifestKind::ChildWorkflowMapResult, ManifestLevel::Manifest) => {
+                let manifest: crate::ChildWorkflowMapResultManifest = decode_payload(hydrated)?;
+                self.queue_pages(manifest.pages);
+            }
+            (ManifestKind::ChildWorkflowMapResult, ManifestLevel::Page) => {
+                let page: crate::ChildWorkflowMapResultPage = decode_payload(hydrated)?;
+                self.refs.extend(
+                    page.outcomes
+                        .iter()
+                        .filter_map(child_workflow_map_outcome_payload)
+                        .cloned(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Answers `next_container` by leaving the container unopened.
+    pub(crate) fn skip(&mut self) {
+        self.current = None;
+    }
+
+    fn queue_pages(&mut self, pages: Vec<PayloadRef>) {
+        for page in pages {
+            self.refs.push(page.clone());
+            self.pending.push_back((ManifestLevel::Page, page));
+        }
+    }
+
+    pub(crate) fn into_refs(self) -> Vec<PayloadRef> {
+        self.refs
+    }
+}
+
+/// Every ref a manifest reaches, loading containers through `load`, which
+/// answers `None` for a container held in a store this caller does not read.
+pub(crate) fn manifest_refs(
+    kind: ManifestKind,
+    manifest: &PayloadRef,
+    load: &mut dyn FnMut(&PayloadRef) -> Result<Option<PayloadRef>>,
+) -> Result<Vec<PayloadRef>> {
+    let mut walk = ManifestWalk::new(kind, manifest.clone());
+    drive_manifest_walk(&mut walk, load)?;
+    Ok(walk.into_refs())
+}
+
+/// Every ref below an already decoded activity-map input manifest.
+pub(crate) fn input_manifest_page_refs(
+    manifest: &ActivityMapInputManifest,
+    load: &mut dyn FnMut(&PayloadRef) -> Result<Option<PayloadRef>>,
+) -> Result<Vec<PayloadRef>> {
+    let mut walk = ManifestWalk::from_input_pages(manifest.pages.iter().cloned());
+    drive_manifest_walk(&mut walk, load)?;
+    Ok(walk.into_refs())
+}
+
+fn drive_manifest_walk(
+    walk: &mut ManifestWalk,
+    load: &mut dyn FnMut(&PayloadRef) -> Result<Option<PayloadRef>>,
+) -> Result<()> {
+    while let Some(container) = walk.next_container() {
+        match load(&container)? {
+            Some(hydrated) => walk.provide(&hydrated)?,
+            None => walk.skip(),
+        }
+    }
+    Ok(())
+}
+
+/// The payload roots of one history event: plain refs as they are, and each
+/// manifest through `hydrate_manifest`, which returns the manifest with its
+/// bytes in place when this store holds them and the ref unchanged otherwise.
+pub(crate) fn history_event_payload_roots(
+    data: &HistoryEventData,
+    roots: &mut Vec<crate::PayloadRootRef>,
+    hydrate_manifest: &mut dyn FnMut(ManifestKind, &PayloadRef) -> Result<PayloadRef>,
+) -> Result<()> {
+    let mut slots = Vec::new();
+    history_event_payload_slots(data, &mut |slot| slots.push(slot))?;
+    for slot in slots {
+        match slot {
+            PayloadSlot::Payload(payload) => {
+                roots.push(crate::PayloadRootRef::Payload(payload.clone()));
+            }
+            PayloadSlot::Manifest(kind, manifest) => {
+                roots.push(kind.root(hydrate_manifest(kind, manifest)?));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every ref one history event reaches: plain refs directly, and each
+/// manifest with everything inside it, containers loaded through `load`.
+pub(crate) fn history_event_payload_refs(
+    data: &HistoryEventData,
+    load: &mut dyn FnMut(&PayloadRef) -> Result<Option<PayloadRef>>,
+    visit: &mut dyn FnMut(&PayloadRef) -> Result<()>,
+) -> Result<()> {
+    let mut slots = Vec::new();
+    history_event_payload_slots(data, &mut |slot| slots.push(slot))?;
+    for slot in slots {
+        match slot {
+            PayloadSlot::Payload(payload) => visit(payload)?,
+            PayloadSlot::Manifest(kind, manifest) => {
+                for payload in manifest_refs(kind, manifest, load)? {
+                    visit(&payload)?;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

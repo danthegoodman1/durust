@@ -1,17 +1,8 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  Client,
-  MemoryBackend,
-  Registry,
-  Worker,
-  activity,
-  callActivity,
-  eventId,
-  workflow
-} from "@durust/core";
-import { LocalDirectoryBlobStore, PayloadBackend } from "@durust/payload";
+import { Client, Registry, Worker, activity, callActivity, workflow } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface PayloadOffloadInput {
   readonly noteId: string;
@@ -37,13 +28,10 @@ interface PayloadOffloadOutput {
 
 interface PayloadOffloadExampleResult {
   readonly output: PayloadOffloadOutput;
+  /** Files in the blob directory: content-addressed, so equal bytes share one. */
   readonly blobCount: number;
-  readonly payloadKinds: {
-    readonly workflowInput: "Blob" | "Inline";
-    readonly activityInput: "Blob" | "Inline";
-    readonly activityResult: "Blob" | "Inline";
-    readonly workflowResult: "Blob" | "Inline";
-  };
+  /** Payload roots the provider holds as blob references rather than inline. */
+  readonly offloadedPayloads: number;
 }
 
 const summarizeNote = activity({
@@ -70,18 +58,19 @@ const payloadOffloadWorkflow = workflow({
   }
 });
 
+/**
+ * Payload offload is a provider option: payloads over `inlineThresholdBytes`
+ * go to the blob store, and the worker and client see them inline again on
+ * every read. The workflow code above knows nothing about it.
+ */
 export async function runMemoryPayloadOffloadExample(): Promise<PayloadOffloadExampleResult> {
   const root = await mkdtemp(join(tmpdir(), "durust-example-payload-"));
   try {
-    const inner = new MemoryBackend();
-    const blobStore = new LocalDirectoryBlobStore({
-      root,
-      prefix: "objects"
-    });
-    const backend = new PayloadBackend({
-      backend: inner,
-      blobStore,
-      inlineThresholdBytes: 64
+    const backend = NativeBackend.memory({
+      payload: {
+        inlineThresholdBytes: 64,
+        blobStore: { kind: "LocalDirectory", root, prefix: "objects" }
+      }
     });
     const registry = new Registry()
       .registerWorkflow(payloadOffloadWorkflow)
@@ -111,44 +100,16 @@ export async function runMemoryPayloadOffloadExample(): Promise<PayloadOffloadEx
     await expectCommitted(worker.runWorkflowTaskOnce());
 
     const output = await handle.result();
-    const history = await inner.streamHistory({
-      runId: handle.runId,
-      afterEventId: eventId(0),
-      upToEventId: eventId(Number.MAX_SAFE_INTEGER),
-      maxEvents: Number.MAX_SAFE_INTEGER,
-      maxBytes: Number.MAX_SAFE_INTEGER
-    });
-    const payloadKinds = payloadKindsFromHistory(history.events);
+    const roots = (await backend.payloadRoots()) as readonly { readonly kind: string }[];
 
     return {
       output,
-      blobCount: (await blobStore.list()).length,
-      payloadKinds
+      blobCount: (await readdir(join(root, "objects"))).length,
+      offloadedPayloads: roots.filter((payload) => payload.kind === "Blob").length
     };
   } finally {
     await rm(root, { recursive: true, force: true });
   }
-}
-
-function payloadKindsFromHistory(events: Awaited<ReturnType<MemoryBackend["streamHistory"]>>["events"]): PayloadOffloadExampleResult["payloadKinds"] {
-  const started = events.find((event) => event.data.kind === "WorkflowStarted")?.data;
-  const activityScheduled = events.find((event) => event.data.kind === "ActivityScheduled")?.data;
-  const activityCompleted = events.find((event) => event.data.kind === "ActivityCompleted")?.data;
-  const workflowCompleted = events.find((event) => event.data.kind === "WorkflowCompleted")?.data;
-  if (
-    started?.kind !== "WorkflowStarted" ||
-    activityScheduled?.kind !== "ActivityScheduled" ||
-    activityCompleted?.kind !== "ActivityCompleted" ||
-    workflowCompleted?.kind !== "WorkflowCompleted"
-  ) {
-    throw new Error("expected payload offload history events");
-  }
-  return {
-    workflowInput: started.input.kind,
-    activityInput: activityScheduled.scheduled.input.kind,
-    activityResult: activityCompleted.completed.result.kind,
-    workflowResult: workflowCompleted.result.kind
-  };
 }
 
 async function expectCommitted(

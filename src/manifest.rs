@@ -61,9 +61,7 @@ pub fn exported_manifest() -> DurableManifest {
         }
     }
 
-    manifest
-        .workflows
-        .sort_by(|left, right| workflow_key(left).cmp(&workflow_key(right)));
+    manifest.workflows.sort_by_key(workflow_key);
     manifest
         .activities
         .sort_by(|left, right| left.name.cmp(&right.name));

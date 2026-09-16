@@ -7,7 +7,7 @@
   },
   "references": [
     { "path": "../core" },
-    { "path": "../payload" }
+    { "path": "../native" }
   ],
   "include": [
     "src/**/*.ts"

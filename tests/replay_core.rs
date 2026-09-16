@@ -1,7 +1,8 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
+    HistoryEventType, MemoryBackend, Namespace, PayloadRef, PayloadStorageConfig, SqliteBackend,
+    TaskQueue, Worker, WorkerId, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -10,7 +11,6 @@ use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(feature = "postgres")]
-use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(feature = "postgres")]
@@ -18,10 +18,48 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static FLAKY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 static SIDE_EFFECT_COUNTER: Mutex<u64> = Mutex::new(0);
+static PANICKING_ACTIVITY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 
+/// The URL of the Postgres test database, or `None` when this run is not
+/// expected to have one.
+///
+/// Every Postgres test here is environment-gated, and libtest **captures**
+/// `eprintln!` on a passing test, so with `DURUST_POSTGRES_URL` unset the whole
+/// Postgres suite reports `ok` and its skip notices are invisible unless the
+/// run also passes `--nocapture`. That is how these tests ran vacuously in CI.
+///
+/// `DURUST_REQUIRE_POSTGRES` closes the hole: when it is set, a missing URL is
+/// a panic instead of a skip, so a run that is *supposed* to exercise Postgres
+/// fails loudly if the database or the variable goes away. CI sets it next to
+/// its service container; a developer with no database leaves it unset and
+/// still gets the skip.
 #[cfg(feature = "postgres")]
-fn postgres_url_from_env() -> Option<String> {
-    env::var("DURUST_POSTGRES_URL").ok()
+fn postgres_url_or_skip(what: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
+    }
+    assert!(
+        !postgres_is_required(),
+        "DURUST_REQUIRE_POSTGRES is set, so `{what}` must run, \
+         but DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping {what}; set DURUST_POSTGRES_URL");
+    None
+}
+
+/// `DURUST_REQUIRE_POSTGRES` is on for any value except empty, `0` and
+/// `false`, so `=1` reads the obvious way and `=0` is a usable off switch.
+#[cfg(feature = "postgres")]
+fn postgres_is_required() -> bool {
+    match std::env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -133,6 +171,17 @@ async fn non_retryable_activity(_: UnitInput) -> durust::Result<u64> {
     ))
 }
 
+// Panics on every attempt. The panic sits in a branch so the handler body is
+// not `!`-typed, matching how a real bug reaches this state.
+#[durust::activity(name = "tests.panicking")]
+async fn panicking_activity(input: NumberInput) -> durust::Result<u64> {
+    *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap() += 1;
+    if input.value == 0 {
+        panic!("activity panicked on purpose");
+    }
+    Ok(input.value)
+}
+
 #[durust::activity(name = "tests.flaky")]
 async fn flaky_activity(_: UnitInput) -> durust::Result<u64> {
     let mut attempts = FLAKY_ATTEMPTS.lock().unwrap();
@@ -208,6 +257,19 @@ async fn version_min_two(_: UnitInput) -> durust::Result<String> {
     durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
+}
+
+// One change id consulted twice, on either side of a task boundary. Each call
+// records its own marker, so the history carries two `VersionMarker`s for
+// `repeat`, which is what the TypeScript runtime commits for the same program.
+#[durust::workflow(name = "tests.version-repeated", version = 1)]
+async fn version_repeated(input: NumberInput) -> durust::Result<u64> {
+    let first = durust::patched("repeat")?;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let second = durust::patched("repeat")?;
+    Ok(doubled + u64::from(first) + u64::from(second))
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
@@ -394,6 +456,44 @@ async fn oversized_side_effect_workflow(_: UnitInput) -> durust::Result<()> {
     })
     .await?;
     Ok(())
+}
+
+// Emits a side-effect marker, an activity schedule, and a timer wait, then
+// panics. Every one of those commands is still uncommitted in the runtime
+// context when the panic unwinds, so none of them may reach history.
+#[durust::workflow(name = "tests.commands-then-panic", version = 1)]
+async fn commands_then_panic_workflow(input: NumberInput) -> durust::Result<u64> {
+    let tag: u64 = durust::side_effect("pre-panic-marker", || 7).await?;
+    let _handle = durust::call_activity!(double(NumberInput { value: tag }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    if input.value == 0 {
+        panic!("workflow panicked after emitting commands");
+    }
+    Ok(tag)
+}
+
+// The re-entrancy regression: a durable API called from inside a `side_effect`
+// closure. `with_context` parks a borrow sentinel for the duration of the
+// closure, so the nested `patched` panics instead of allocating the next
+// command seq and pushing its `VersionMarker` ahead of the outer
+// `SideEffectMarker`.
+#[durust::workflow(name = "tests.durable-api-inside-side-effect", version = 1)]
+async fn durable_api_inside_side_effect_workflow(_: UnitInput) -> durust::Result<bool> {
+    let flag: bool = durust::side_effect("nested-durable-call", || {
+        durust::patched("nested-change").unwrap_or(false)
+    })
+    .await?;
+    Ok(flag)
+}
+
+#[durust::workflow(name = "tests.panicking-activity", version = 1)]
+async fn panicking_activity_workflow(_: UnitInput) -> durust::Result<u64> {
+    durust::call_activity!(panicking_activity(number(0)))
+        .task_queue("activities")
+        .retry(durust::RetryPolicy::none().max_attempts(2))
+        .await
 }
 
 #[durust::workflow(name = "tests.select-all-activity-handles", version = 1)]
@@ -945,6 +1045,105 @@ async fn sleep_then_return(input: NumberInput) -> durust::Result<u64> {
 #[durust::workflow(name = "tests.await-signal", version = 1)]
 async fn await_signal(_: UnitInput) -> durust::Result<String> {
     durust::signal::<String>("ready").await
+}
+
+/// Builds an activity map without its input manifest, catches the rejection,
+/// and then schedules an ordinary activity.
+///
+/// The rejected builder still allocates a command seq — the seq is allocated
+/// before the per-kind work that fails — so the activity that follows is
+/// recorded at seq 2, not seq 1. That is a property of every history already
+/// committed, which is why it is pinned here rather than changed.
+#[durust::workflow(name = "tests.rejected-builder-then-activity", version = 1)]
+async fn rejected_builder_then_activity(input: NumberInput) -> durust::Result<u64> {
+    let rejected = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .max_in_flight(2)
+        .result_manifest("doubled")
+        .spawn()
+        .await;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    Ok(if rejected.is_err() { doubled } else { 0 })
+}
+
+/// Row 6G's user-reachable stall, driven through the ordinary DSL: an activity
+/// map and a child-workflow map over `std::iter::empty()`. Both awaits used to
+/// block forever, because nothing was materialized and so nothing could ever
+/// reach the completion check.
+#[durust::workflow(name = "tests.empty-map-manifests", version = 1)]
+async fn empty_map_manifests(_: UnitInput) -> durust::Result<u64> {
+    let mapped = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .input_manifest(durust::activity_map_manifest(std::iter::empty::<
+            NumberInput,
+        >())?)
+        .max_in_flight(2)
+        .result_manifest("doubled")
+        .spawn()
+        .await?;
+    let result_refs = durust::decode_activity_map_result_refs(&mapped.result_manifest().await?)?;
+    let child_mapped = durust::child_workflow_map::<double_plus_one>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/empty-map/item")
+        .input_manifest(durust::child_workflow_map_manifest(std::iter::empty::<
+            NumberInput,
+        >())?)
+        .max_in_flight(2)
+        .result_manifest("child-doubled")
+        .spawn()
+        .await?;
+    let outcomes =
+        durust::decode_child_workflow_map_outcomes(&child_mapped.result_manifest().await?)?;
+    Ok((result_refs.len() + outcomes.len()) as u64)
+}
+
+/// Both map builders with `max_in_flight(0)`, which the scheduling boundary
+/// rejects instead of clamping to one, then an ordinary activity so the test
+/// can see which command seq the rejections left behind.
+#[durust::workflow(name = "tests.zero-bound-map-rejections", version = 1)]
+async fn zero_bound_map_rejections(_: UnitInput) -> durust::Result<String> {
+    let activity_map_error = durust::activity_map(map_double)
+        .task_queue("map-activities")
+        .input_manifest(durust::activity_map_manifest([NumberInput { value: 1 }])?)
+        .max_in_flight(0)
+        .result_manifest("doubled")
+        .spawn()
+        .await
+        .expect_err("a zero activity-map bound must be rejected, not clamped");
+    let child_map_error = durust::child_workflow_map::<double_plus_one>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/zero-bound/item")
+        .input_manifest(durust::child_workflow_map_manifest([NumberInput {
+            value: 1,
+        }])?)
+        .max_in_flight(0)
+        .result_manifest("child-doubled")
+        .spawn()
+        .await
+        .expect_err("a zero child-map bound must be rejected, not clamped");
+    let doubled = durust::call_activity!(double(NumberInput { value: 21 }))
+        .task_queue("activities")
+        .await?;
+    Ok(format!(
+        "{}|{}|{doubled}",
+        rejection_shape(activity_map_error),
+        rejection_shape(child_map_error)
+    ))
+}
+
+/// Renders the structured failure rather than `Display`, so the test pins the
+/// machine-readable `error_type` and the non-retryable flag a caller would
+/// actually match on, not a rendering.
+fn rejection_shape(err: durust::Error) -> String {
+    match err {
+        durust::Error::Application(failure) => format!(
+            "{}/{}/{}",
+            failure.error_type, failure.message, failure.non_retryable
+        ),
+        other => format!("unexpected error kind: {other:?}"),
+    }
 }
 
 #[durust::workflow(name = "tests.activity-map-sum", version = 1)]
@@ -1685,8 +1884,11 @@ fn side_effect_replays_recorded_marker_without_rerunning_closure() {
     });
 }
 
+// An oversized side-effect payload is refused by the durable API, which is a
+// workflow-code fault: the task fails without committing (no marker, no
+// terminal event) and the run keeps its history for a fixed redeploy.
 #[test]
-fn oversized_side_effect_fails_without_recording_marker() {
+fn oversized_side_effect_fails_the_task_without_committing() {
     block_on(async {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
@@ -1704,20 +1906,198 @@ fn oversized_side_effect_fails_without_recording_marker() {
             .register_workflow(oversized_side_effect_workflow)
             .build();
 
-        let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.workflow_tasks, 1);
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(
+            matches!(&err, durust::Error::PayloadEncode(message) if message.contains("side effect payload")),
+            "{err:?}"
+        );
+        assert_eq!(worker.metrics().workflow_tasks_faulted, 1);
 
         let history = stream_all(&backend, &run_id).await;
-        assert!(
-            !history
+        assert_eq!(
+            history
                 .iter()
-                .any(|event| matches!(event.data, HistoryEventData::SideEffectMarker(_)))
+                .map(|event| event.data.event_type())
+                .collect::<Vec<_>>(),
+            vec![HistoryEventType::WorkflowStarted]
         );
-        let HistoryEventData::WorkflowFailed { failure } = &history[1].data else {
-            panic!("oversized side effect should fail the workflow task");
+    });
+}
+
+// No partial commit: a workflow that emits a side-effect marker, an activity
+// schedule, and a timer wait and *then* panics must commit none of them. The
+// caught panic returns before `prepare_workflow_poll` reads the context, so the
+// whole in-progress attempt is dropped and history is byte-for-byte unchanged.
+#[test]
+fn panicking_workflow_commits_nothing_from_the_failed_attempt() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<commands_then_panic_workflow>(
+                "wf/commands-then-panic",
+                "workflows",
+                number(0),
+            )
+            .await
+            .unwrap();
+        let before = stream_all(&backend, &run_id).await;
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("commands-then-panic-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(commands_then_panic_workflow)
+            .register_activity(double)
+            .build();
+
+        let err = worker.run_workflow_once().await.unwrap_err();
+        // `TaskPanic`, not `Nondeterminism`: routed identically (nothing
+        // committed, claim released with the retry backoff) but distinguishable
+        // from genuine history divergence, which needs a different operator
+        // response than a workflow bug.
+        let durust::Error::TaskPanic(message) = &err else {
+            panic!("a workflow panic must fail the task, got {err:?}");
         };
-        assert_eq!(failure.error_type, "durust.payload_encode");
-        assert!(failure.message.contains("side effect payload"));
+        assert!(
+            message.contains("workflow task panicked")
+                && message.contains("workflow panicked after emitting commands"),
+            "{message}"
+        );
+
+        // History is unchanged: no marker, no schedule, no terminal event.
+        let after = stream_all(&backend, &run_id).await;
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 1);
+        assert!(matches!(
+            after[0].data,
+            HistoryEventData::WorkflowStarted { .. }
+        ));
+        // The activity the panicking attempt spawned was never scheduled, so
+        // no worker can claim it.
+        assert!(!worker.run_activity_once().await.unwrap());
+        // The future is in an unknown state after the unwind, so the cache
+        // must not hold it; the next attempt cold-replays from history.
+        assert_eq!(worker.cached_workflow_count(), 0);
+    });
+}
+
+// Phase 1 re-entrancy regression: a durable API called from inside a
+// `side_effect` closure fails the task and records nothing. Before the
+// `with_context` borrow guard this committed the out-of-order pair
+// `[VersionMarker(seq N+1), SideEffectMarker(seq N)]`, which poisons replay of
+// the side effect forever; before the workflow-poll `catch_unwind` the guard's
+// panic killed `Worker::run` instead of failing the task.
+#[test]
+fn durable_api_inside_side_effect_fails_the_task_without_recording_markers() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<durable_api_inside_side_effect_workflow>(
+                "wf/nested-durable-call",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let before = stream_all(&backend, &run_id).await;
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("nested-durable-call-worker")
+            .workflow_task_queue("workflows")
+            .register_workflow(durable_api_inside_side_effect_workflow)
+            .build();
+
+        let err = worker.run_workflow_once().await.unwrap_err();
+        // The re-entrancy guard reports by panicking, so this arrives through
+        // the workflow-poll `catch_unwind` as `TaskPanic`. Both contract
+        // strings survive that reclassification.
+        let durust::Error::TaskPanic(message) = &err else {
+            panic!("a nested durable API call must fail the task, got {err:?}");
+        };
+        assert!(
+            message.contains("workflow task panicked")
+                && message.contains("durable APIs are not re-entrant"),
+            "{message}"
+        );
+
+        let after = stream_all(&backend, &run_id).await;
+        assert_eq!(after, before);
+        assert_eq!(after.len(), 1);
+        // Neither half of the out-of-order pair reached history.
+        assert!(!after.iter().any(|event| matches!(
+            event.data,
+            HistoryEventData::VersionMarker(_) | HistoryEventData::SideEffectMarker(_)
+        )));
+        assert!(
+            backend
+                .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                    namespace: Namespace::default(),
+                    workflow_id: None,
+                    run_id: Some(run_id),
+                    change_id: Some("nested-change".to_owned()),
+                })
+                .await
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert_eq!(worker.cached_workflow_count(), 0);
+    });
+}
+
+// A panicking activity fails that attempt with a retryable failure, so the
+// stored retry policy decides the outcome: two attempts, then one terminal
+// `ActivityFailed` carrying the panic message for the operator.
+#[test]
+fn panicking_activity_exhausts_its_retry_policy_and_records_the_panic_message() {
+    block_on(async {
+        *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap() = 0;
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<panicking_activity_workflow>(
+                "wf/panicking-activity",
+                "workflows",
+                unit(),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .worker_id("panicking-activity-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(panicking_activity_workflow)
+            .register_activity(panicking_activity)
+            .build();
+
+        worker.run_until_idle().await.unwrap();
+
+        assert_eq!(
+            *PANICKING_ACTIVITY_ATTEMPTS.lock().unwrap(),
+            2,
+            "the panic must consume exactly the policy's attempt budget"
+        );
+        let history = stream_all(&backend, &run_id).await;
+        let failed = history
+            .iter()
+            .find_map(|event| match &event.data {
+                HistoryEventData::ActivityFailed(failed) => Some(failed),
+                _ => None,
+            })
+            .expect("the exhausted activity must record one failure");
+        assert_eq!(failed.failure.error_type, "durust.activity_panic");
+        assert!(
+            failed
+                .failure
+                .message
+                .contains("activity panicked on purpose"),
+            "{}",
+            failed.failure.message
+        );
+        let HistoryEventData::WorkflowFailed { failure } = &history[history.len() - 1].data else {
+            panic!("the workflow must observe the failed activity: {history:?}");
+        };
+        assert!(failure.message.contains("activity panicked on purpose"));
     });
 }
 
@@ -1783,7 +2163,8 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&backend, &run_id).await;
         assert!(history.iter().any(|event| {
@@ -1812,8 +2193,7 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
 #[test]
 fn postgres_inline_child_wake_does_not_advance_cache_past_unobserved_events_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres inline child cache regression; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres inline child cache regression") else {
             return;
         };
         let schema = postgres_test_schema("inline_child_cache");
@@ -1994,7 +2374,8 @@ fn child_workflow_result_can_win_select() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&backend, &run_id).await;
         assert!(
@@ -2038,7 +2419,8 @@ fn losing_child_workflow_result_select_branch_does_not_cancel_child() {
             .build();
 
         let stats = parent_worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let parent_history = stream_all(&backend, &run_id).await;
         let HistoryEventData::WorkflowCompleted { result } =
@@ -2257,7 +2639,8 @@ fn select_all_can_mix_activity_child_and_timer_branches() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
         assert!(stats.timers_fired >= 1);
 
         let history = stream_all(&backend, &run_id).await;
@@ -2344,16 +2727,18 @@ fn replay_skips_child_start_consumed_out_of_order_before_later_timer_command() {
             })
             .await
             .unwrap();
-        assert_eq!(worker.run_child_workflow_starts_once().await.unwrap(), 1);
+        assert_eq!(worker.run_child_workflow_starts_once().await.unwrap(), 0);
 
+        // The child started inside the commit that requested it, so its
+        // start precedes the activity's completion in history.
         let history = stream_all(&backend, &run_id).await;
         assert!(matches!(
             history[3].data,
-            HistoryEventData::ActivityCompleted(_)
+            HistoryEventData::ChildWorkflowStarted(_)
         ));
         assert!(matches!(
             history[4].data,
-            HistoryEventData::ChildWorkflowStarted(_)
+            HistoryEventData::ActivityCompleted(_)
         ));
 
         assert!(worker.run_workflow_once().await.unwrap());
@@ -2420,18 +2805,20 @@ fn replay_skips_child_completion_consumed_out_of_order_before_later_timer_comman
                 .run_child_workflow_starts_once()
                 .await
                 .unwrap(),
-            1
+            0
         );
         assert!(child_worker.run_workflow_once().await.unwrap());
 
+        // The child started inside the commit that requested it, so its
+        // start precedes the activity's completion in history.
         let history = stream_all(&backend, &run_id).await;
         assert!(matches!(
             history[3].data,
-            HistoryEventData::ActivityCompleted(_)
+            HistoryEventData::ChildWorkflowStarted(_)
         ));
         assert!(matches!(
             history[4].data,
-            HistoryEventData::ChildWorkflowStarted(_)
+            HistoryEventData::ActivityCompleted(_)
         ));
         assert!(matches!(
             history[5].data,
@@ -2524,6 +2911,27 @@ fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
     });
 }
 
+// A recorded command event must be *matched* on the following replay, never
+// re-appended. Asserting only that the first task appended it leaves the
+// matcher's replay branch uncovered for that kind — an always-append mutation
+// of the matcher survives it.
+fn assert_command_event_recorded_once(
+    history: &[durust::HistoryEvent],
+    label: &str,
+    is_kind: impl Fn(&HistoryEventData) -> bool,
+) {
+    let count = history.iter().filter(|event| is_kind(&event.data)).count();
+    assert_eq!(
+        count,
+        1,
+        "the recorded {label} command must be matched on replay, not re-appended; history: {:?}",
+        history
+            .iter()
+            .map(|event| event.event_type())
+            .collect::<Vec<_>>()
+    );
+}
+
 fn out_of_order_worker<W>(
     backend: MemoryBackend,
     workflow: W,
@@ -2599,11 +3007,23 @@ async fn run_spawn_sleep_sleep_out_of_order_case(cold_chunk_events: Option<usize
     let history = stream_all(&backend, &run_id).await;
     assert!(matches!(history[5].data, HistoryEventData::TimerStarted(_)));
 
+    // Cold-replay both recorded TimerStarted events past the unconsumed
+    // completion.
+    drop(worker);
+    let mut worker = out_of_order_worker(backend.clone(), spawn_sleep_sleep_workflow, Some(1));
     backend.advance_time(Duration::from_secs(1));
     assert_eq!(worker.run_timers_once().await.unwrap(), 1);
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::TimerStarted(_)))
+            .count(),
+        2,
+        "both recorded timer commands must be matched on replay, not re-appended"
+    );
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-sleep workflow did not complete");
     };
@@ -2656,10 +3076,24 @@ async fn run_out_of_order_completion_before_new_activity_case(cold_chunk_events:
         HistoryEventData::ActivityScheduled(_)
     ));
 
+    // Cold-replay the two recorded ActivityScheduled events past the still
+    // unconsumed first completion, so the matcher's replay branch is covered
+    // for this kind and not just its append branch.
+    drop(worker);
+    let mut worker =
+        out_of_order_worker(backend.clone(), spawn_sleep_then_activity_workflow, Some(1));
     assert!(worker.run_activity_once().await.unwrap());
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|event| matches!(event.data, HistoryEventData::ActivityScheduled(_)))
+            .count(),
+        2,
+        "both recorded activity commands must be matched on replay, not re-appended"
+    );
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-activity workflow did not complete");
     };
@@ -2712,6 +3146,9 @@ async fn run_out_of_order_completion_before_side_effect_case(cold_chunk_events: 
         history[5].data,
         HistoryEventData::SideEffectMarker(_)
     ));
+    assert_command_event_recorded_once(&history, "side effect", |data| {
+        matches!(data, HistoryEventData::SideEffectMarker(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-side-effect workflow did not complete");
     };
@@ -2762,11 +3199,18 @@ async fn run_out_of_order_completion_before_version_marker_case(cold_chunk_event
     ));
     assert!(matches!(history[6].data, HistoryEventData::TimerStarted(_)));
 
+    // Cold-replay the recorded VersionMarker past the unconsumed completion.
+    drop(worker);
+    let mut worker =
+        out_of_order_worker(backend.clone(), spawn_sleep_then_version_workflow, Some(1));
     backend.advance_time(Duration::from_secs(1));
     assert_eq!(worker.run_timers_once().await.unwrap(), 1);
     assert!(worker.run_workflow_once().await.unwrap());
 
     let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "version marker", |data| {
+        matches!(data, HistoryEventData::VersionMarker(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-version workflow did not complete");
     };
@@ -2786,11 +3230,12 @@ fn out_of_order_completion_before_version_marker_cold_multi_chunk() {
     ));
 }
 
-// Crashes after the version marker committed, so the cold replay preconsumes
-// the marker from the provider's change-version index while an out-of-order
-// completion sits at the cursor head and the marker event is still unloaded.
+// Crashes after the version marker committed, so the single-event chunks of
+// the cold replay end before the marker while an out-of-order completion sits
+// at the cursor head: `get_version` overruns the window, the worker replays
+// with the full history, and the recorded version is matched positionally.
 #[test]
-fn recorded_version_marker_preconsumes_past_out_of_order_completion_on_cold_replay() {
+fn recorded_version_marker_beyond_loaded_window_replays_with_full_history() {
     block_on(async {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
@@ -2860,10 +3305,19 @@ async fn run_out_of_order_completion_before_child_spawn_case(cold_chunk_events: 
         HistoryEventData::ChildWorkflowStartRequested(_)
     ));
 
+    // Cold-replay the recorded ChildWorkflowStartRequested past the still
+    // unconsumed activity completion. Without this the case only proves the
+    // append branch, which is why plain ChildWorkflow sat at one covering test.
+    drop(worker);
+    let mut worker = build_worker(Some(1));
     let stats = worker.run_until_idle().await.unwrap();
-    assert!(stats.child_workflow_starts_dispatched >= 1);
+    // Children start inside the commit that requests them; the drain finds none.
+    assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
     let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "child workflow start", |data| {
+        matches!(data, HistoryEventData::ChildWorkflowStartRequested(_))
+    });
     let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
         panic!("spawn-sleep-then-child workflow did not complete");
     };
@@ -4562,6 +5016,318 @@ fn patched_records_marker_and_takes_new_branch_for_new_history() {
     });
 }
 
+// `durust::now()` records the provider clock as a side-effect marker, so the
+// value a task observed is the value every replay returns, and a later call
+// records its own marker with the later clock.
+#[durust::workflow(name = "tests.now-twice", version = 1)]
+async fn now_twice_workflow(input: NumberInput) -> durust::Result<Vec<i64>> {
+    let first = durust::now().await?;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let second = durust::now().await?;
+    Ok(vec![first.0, second.0, doubled as i64])
+}
+
+#[test]
+fn now_is_recorded_once_per_call_and_stable_across_cold_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<now_twice_workflow>("wf/now-twice", "workflows", number(3))
+            .await
+            .unwrap();
+        let mut worker = out_of_order_worker(backend.clone(), now_twice_workflow, None);
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        backend.advance_time(Duration::from_secs(5));
+        drop(worker);
+        let mut replay_worker = out_of_order_worker(backend.clone(), now_twice_workflow, Some(1));
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let kinds = history
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                HistoryEventType::WorkflowStarted,
+                HistoryEventType::SideEffectMarker,
+                HistoryEventType::ActivityScheduled,
+                HistoryEventType::ActivityCompleted,
+                HistoryEventType::SideEffectMarker,
+                HistoryEventType::WorkflowCompleted,
+            ]
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("expected WorkflowCompleted");
+        };
+        let values = durust::decode_payload::<Vec<i64>>(result).unwrap();
+        assert_eq!(values[2], 6);
+        assert_eq!(
+            values[1] - values[0],
+            5_000,
+            "the second call observed the advanced clock"
+        );
+        // The recorded markers carry exactly the values the workflow returned.
+        let recorded = history
+            .iter()
+            .filter_map(|event| match &event.data {
+                HistoryEventData::SideEffectMarker(marker) => Some(
+                    durust::decode_payload::<durust::TimestampMs>(&marker.value)
+                        .unwrap()
+                        .0,
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, vec![values[0], values[1]]);
+    });
+}
+
+// A durable API refusing the workflow's own value is a workflow-code fault,
+// as it is in TypeScript: the task fails without committing and the run
+// keeps its history.
+#[durust::workflow(name = "tests.empty-side-effect-key", version = 1)]
+async fn empty_side_effect_key_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = durust::side_effect("", move || input.value).await?;
+    Ok(value)
+}
+
+#[test]
+fn durable_api_refusing_a_value_fails_the_task_without_committing() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<empty_side_effect_key_workflow>(
+                "wf/empty-side-effect-key",
+                "workflows",
+                number(4),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(empty_side_effect_key_workflow)
+            .build();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::PayloadEncode(_)), "{err:?}");
+        let metrics = worker.metrics();
+        assert_eq!(metrics.workflow_tasks_faulted, 1);
+        assert_eq!(metrics.workflow_tasks_committed, 0);
+        let kinds = stream_all(&backend, &run_id)
+            .await
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec![HistoryEventType::WorkflowStarted]);
+    });
+}
+
+// A marker that sits just past the first chunk of a recovery replay overruns
+// the window and the worker reloads the whole history. The reload gets a
+// fresh recovery budget: with the first attempt's chunks still charged, a
+// history that fits the budget deferred on every claim.
+#[durust::workflow(name = "tests.marker-after-activity-then-timer", version = 1)]
+async fn marker_after_activity_then_timer_workflow(input: NumberInput) -> durust::Result<u64> {
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let bumped = durust::patched("after-activity")?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    Ok(doubled + u64::from(bumped))
+}
+
+#[test]
+fn budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<marker_after_activity_then_timer_workflow>(
+                "wf/budgeted-overrun",
+                "workflows",
+                number(5),
+            )
+            .await
+            .unwrap();
+        let mut worker = out_of_order_worker(
+            backend.clone(),
+            marker_after_activity_then_timer_workflow,
+            None,
+        );
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_secs(1));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        drop(worker);
+
+        // Six events of history, three-event chunks, a six-event budget: the
+        // marker is event four, first past the first chunk.
+        let mut recovery_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(3)
+            .recovery_replay_event_budget(6)
+            .recovery_defer_delay(Duration::from_millis(1))
+            .register_workflow(marker_after_activity_then_timer_workflow)
+            .register_activity(double)
+            .build();
+        assert!(
+            recovery_worker.run_workflow_once().await.unwrap(),
+            "the recovery replay must commit, not defer"
+        );
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!(
+                "expected WorkflowCompleted, found {:?}",
+                history.last().unwrap().data
+            );
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 11);
+    });
+}
+
+// The output's `Serialize` impl reaches a durable API. Rust encodes the
+// output under the context borrow, so the call trips the re-entrancy guard:
+// the task fails without committing and the run keeps its history, which is
+// what TypeScript commits for the same program.
+#[derive(Clone, Debug, Deserialize)]
+struct ReentrantOutput {
+    value: u64,
+}
+
+impl Serialize for ReentrantOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bumped = if durust::patched("output-reentrant").unwrap_or(false) {
+            self.value + 1
+        } else {
+            self.value
+        };
+        serializer.serialize_u64(bumped)
+    }
+}
+
+#[durust::workflow(name = "tests.output-reentrant", version = 1)]
+async fn output_reentrant_workflow(input: NumberInput) -> durust::Result<ReentrantOutput> {
+    Ok(ReentrantOutput { value: input.value })
+}
+
+#[test]
+fn durable_call_from_output_serialize_fails_the_task_without_committing() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<output_reentrant_workflow>(
+                "wf/output-reentrant",
+                "workflows",
+                number(4),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(output_reentrant_workflow)
+            .build();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(
+            matches!(err, durust::Error::TaskPanic(ref message) if message.contains("not re-entrant")),
+            "expected the re-entrancy guard, found {err:?}"
+        );
+        let metrics = worker.metrics();
+        assert_eq!(metrics.workflow_tasks_panicked, 1);
+        assert_eq!(metrics.workflow_tasks_committed, 0);
+        let kinds = stream_all(&backend, &run_id)
+            .await
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec![HistoryEventType::WorkflowStarted]);
+    });
+}
+
+async fn run_repeated_change_id_case(replay_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<version_repeated>("wf/version-repeated", "workflows", number(10))
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(backend.clone(), version_repeated, None);
+    assert!(worker.run_workflow_once().await.unwrap());
+    assert!(worker.run_activity_once().await.unwrap());
+    if let Some(chunk_events) = replay_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(backend.clone(), version_repeated, Some(chunk_events));
+    }
+    assert!(worker.run_workflow_once().await.unwrap());
+    let metrics = worker.metrics();
+    assert_eq!(metrics.workflow_tasks_nondeterministic, 0);
+    assert_eq!(metrics.workflow_tasks_panicked, 0);
+
+    let history = stream_all(&backend, &run_id).await;
+    let kinds = history
+        .iter()
+        .map(|event| event.data.event_type())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            HistoryEventType::WorkflowStarted,
+            HistoryEventType::VersionMarker,
+            HistoryEventType::ActivityScheduled,
+            HistoryEventType::ActivityCompleted,
+            HistoryEventType::VersionMarker,
+            HistoryEventType::WorkflowCompleted,
+        ]
+    );
+    let markers = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::VersionMarker(marker) => Some((
+                marker.change_id.as_str(),
+                marker.command_id.seq.0,
+                marker.version,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(markers, vec![("repeat", 1, 1), ("repeat", 3, 1)]);
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("expected WorkflowCompleted");
+    };
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 22);
+}
+
+#[test]
+fn repeated_change_id_across_task_boundary_cached() {
+    block_on(run_repeated_change_id_case(None));
+}
+
+#[test]
+fn repeated_change_id_across_task_boundary_cold() {
+    block_on(run_repeated_change_id_case(Some(usize::MAX)));
+}
+
+// Chunk size one puts the second marker's position at the end of every
+// loaded window, so the replay overruns, reloads the full history, and still
+// commits the same second marker.
+#[test]
+fn repeated_change_id_across_task_boundary_cold_single_event_chunks() {
+    block_on(run_repeated_change_id_case(Some(1)));
+}
+
 #[test]
 fn recorded_version_is_stable_across_streamed_replay() {
     block_on(async {
@@ -4961,10 +5727,7 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
             .expect("committed projection");
         assert_eq!(still_committed.status, "started");
         backend
-            .release_workflow_task(
-                claimed.claim,
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
-            )
+            .release_workflow_task(claimed.claim, durust::WorkflowTaskRelease::immediate())
             .await
             .unwrap();
 
@@ -5271,7 +6034,7 @@ fn parent_waits_for_child_that_continues_as_new() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.child_workflow_starts_dispatched, 1);
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
         assert!(stats.workflow_tasks >= 4);
 
         let parent_history = stream_all(&backend, &parent_run_id).await;
@@ -5495,6 +6258,21 @@ fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
             .build();
 
         assert!(worker.run_workflow_once().await.unwrap());
+        // Start-to-close is measured from the claim, so the attempt is claimed
+        // (and left running) before its deadline can lapse.
+        backend
+            .claim_activity_task(
+                WorkerId::new("timeout-holder"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
         backend.advance_time(Duration::from_millis(9));
         assert_eq!(worker.run_activity_timeouts_once().await.unwrap(), 0);
         backend.advance_time(Duration::from_millis(1));
@@ -5884,12 +6662,13 @@ async fn assert_child_workflow_map_replay_change_is_nondeterministic<W>(
         HistoryEventData::ChildWorkflowMapScheduled(_)
     ));
 
+    // Both admitted children started inside the scheduling commit.
     assert_eq!(
         original_worker
             .run_child_workflow_starts_once()
             .await
             .unwrap(),
-        2
+        0
     );
     drop(original_worker);
 
@@ -6397,10 +7176,7 @@ fn claim_is_released_when_current_time_fails_before_prepare() {
             .unwrap()
             .expect("claim released by failed prepare");
         backend
-            .release_workflow_task(
-                reclaimed.claim,
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
-            )
+            .release_workflow_task(reclaimed.claim, durust::WorkflowTaskRelease::immediate())
             .await
             .unwrap();
 
@@ -6420,8 +7196,12 @@ fn claim_is_released_when_current_time_fails_before_prepare() {
 async fn cold_recovery_error_releases_claim_and_recovery_slot(
     inject: impl FnOnce(&RecordingBackend),
     chunk_events: usize,
+    claim_prefetch: bool,
 ) {
-    let backend = RecordingBackend::new(MemoryBackend::new());
+    let mut backend = RecordingBackend::new(MemoryBackend::new());
+    if !claim_prefetch {
+        backend = backend.without_claim_prefetch();
+    }
     let client = Client::new(backend.clone());
     let run_id = client
         .start_workflow::<double_plus_one>("wf/cold-recovery-error", "workflows", number(9))
@@ -6463,13 +7243,14 @@ async fn cold_recovery_error_releases_claim_and_recovery_slot(
 }
 
 #[test]
-fn cold_recovery_change_versions_error_releases_claim_and_recovery_slot() {
+fn cold_recovery_stream_error_releases_claim_and_recovery_slot() {
     block_on(async {
-        // A one-event chunk keeps `has_more` true so the prepare pipeline
-        // queries the change-version index, which is where the fault fires.
+        // Without claim prefetch every chunk is streamed, so the fault fires
+        // on the first history read of the cold recovery.
         cold_recovery_error_releases_claim_and_recovery_slot(
-            |backend| backend.fail_next_change_versions(),
+            |backend| backend.fail_next_replay_stream(),
             1,
+            false,
         )
         .await;
     });
@@ -6481,6 +7262,7 @@ fn cold_recovery_hydrate_error_releases_claim_and_recovery_slot() {
         cold_recovery_error_releases_claim_and_recovery_slot(
             |backend| backend.fail_hydrate_payload_calls(1),
             128,
+            true,
         )
         .await;
     });
@@ -7052,7 +7834,7 @@ fn sqlite_child_workflow_map_recovers_after_close_and_reopen() {
 }
 
 #[test]
-fn sqlite_child_outbox_recovers_after_close_and_reopen() {
+fn sqlite_child_started_by_a_commit_survives_close_and_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("durust-child.sqlite3");
@@ -7085,7 +7867,8 @@ fn sqlite_child_outbox_recovers_after_close_and_reopen() {
             .register_workflow(child_double_workflow)
             .build();
         let stats = recovered_worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&reopened, &run_id).await;
         let HistoryEventData::WorkflowCompleted { result } =
@@ -7157,6 +7940,201 @@ fn worker_drops_cache_and_retries_after_workflow_task_commit_conflict() {
             panic!("workflow did not complete after retry");
         };
         assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 23);
+    });
+}
+
+// A command builder that is rejected after its seq is allocated leaves a gap
+// in the run's command seqs, and that gap is part of the recorded history: the
+// activity scheduled after the rejection carries seq 2.
+//
+// The gap is deliberate and is preserved, not fixed. It is deterministic —
+// every replay re-executes the same builder, fails it in the same place, and
+// burns the same seq — and moving the allocation after the fallible per-kind
+// work would renumber every command that follows a caught builder error,
+// which no history already committed could replay. This test pins both
+// halves: the recorded seq, and that a **cold** replay with no cached future
+// reproduces it exactly.
+#[test]
+fn a_rejected_command_builder_burns_its_seq_and_replays_identically() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<rejected_builder_then_activity>(
+                "wf/rejected-builder",
+                "workflows",
+                number(21),
+            )
+            .await
+            .unwrap();
+
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(rejected_builder_then_activity)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+
+        // First task: the map builder is rejected, its seq is gone, and the
+        // activity that follows takes the next one.
+        assert!(worker.run_workflow_once().await.unwrap());
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("the activity after the rejected builder was not scheduled");
+        };
+        assert_eq!(
+            scheduled.command_id.seq.0, 2,
+            "the rejected builder consumed command seq 1, so the activity must be recorded at 2"
+        );
+
+        assert_eq!(worker.run_activity_batch_once().await.unwrap(), 1);
+
+        // Drop the worker so nothing is cached, then finish the run from
+        // durable history alone: the replay re-executes the rejected builder,
+        // burns the same seq, and must match the recorded seq 2.
+        drop(worker);
+        let mut cold = Worker::builder(backend.clone())
+            .worker_id("cold-replay-worker")
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(rejected_builder_then_activity)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        let stats = cold.run_until_idle().await.unwrap();
+        assert_eq!(stats.workflow_tasks, 1);
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the cold replay did not complete the run");
+        };
+        assert_eq!(
+            durust::decode_payload::<u64>(result).unwrap(),
+            42,
+            "the run must complete through the rejected-builder branch"
+        );
+    });
+}
+
+// Row 6G: an empty input manifest is a normal, user-reachable DSL call, and
+// awaiting its result must finish rather than block forever.
+//
+// `activity_map_manifest(std::iter::empty())` yields `item_count: 0`, nothing
+// is materialized, and before this fix no later event could reach the
+// completion check on any provider: the commit succeeded, the descriptor was
+// inserted, no terminal fact was ever appended, and the parent was never woken
+// again. Silent and permanent. `DescriptorCreated` now completes such a map,
+// which is what TypeScript already did.
+//
+// Driven through the real `Worker` on both map kinds, because the conformance
+// case builds its map task by hand and this is the path a user actually takes.
+#[test]
+fn an_empty_map_manifest_completes_instead_of_stalling_the_parent() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<empty_map_manifests>("wf/empty-maps", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(empty_map_manifests)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        assert_eq!(
+            history
+                .iter()
+                .map(|event| event.event_type())
+                .collect::<Vec<_>>(),
+            vec![
+                durust::HistoryEventType::WorkflowStarted,
+                durust::HistoryEventType::ActivityMapScheduled,
+                durust::HistoryEventType::ActivityMapCompleted,
+                durust::HistoryEventType::ChildWorkflowMapScheduled,
+                durust::HistoryEventType::ChildWorkflowMapCompleted,
+                durust::HistoryEventType::WorkflowCompleted,
+            ],
+            "both empty maps must complete and the run must finish"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the empty-map run did not complete");
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 0);
+    });
+}
+
+// Row 6J: `max_in_flight(0)` is rejected at the scheduling boundary rather
+// than silently clamped to one.
+//
+// Clamping made a caller typo cost three to four orders of magnitude of
+// throughput while the map still produced correct results, so nothing ever
+// reported it. TypeScript rejects at both DSL entry points; Rust is the runtime
+// that moved. The providers deliberately keep clamping
+// (`MapState::slot_limit`, pinned by
+// `*_activity_map_zero_max_in_flight_admits_one_item`) so a descriptor already
+// persisted with a zero bound cannot stall — the rejection belongs where the
+// value is still the caller's.
+//
+// The rejection runs *before* the command seq is allocated, unlike the
+// input-manifest rejection pinned by
+// `a_rejected_command_builder_burns_its_seq_and_replays_identically`: nothing
+// committed depends on this one, and running it before allocation is the order
+// TypeScript's `assertMapOptions` uses. Both halves are asserted, because "is
+// rejected" and "is rejected without disturbing the command numbering" are
+// different claims.
+#[test]
+fn a_zero_max_in_flight_map_bound_is_rejected_at_the_scheduling_boundary() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<zero_bound_map_rejections>("wf/zero-bound", "workflows", unit())
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(zero_bound_map_rejections)
+            .register_activity(double)
+            .register_activity(map_double)
+            .build();
+        worker.run_until_idle().await.unwrap();
+
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::ActivityScheduled(scheduled) = &history[1].data else {
+            panic!("the activity after the rejected map builders was not scheduled");
+        };
+        assert_eq!(
+            scheduled.command_id.seq.0, 1,
+            "a bound rejected before the seq is allocated must not renumber later commands"
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history[history.len() - 1].data
+        else {
+            panic!("the zero-bound run did not complete");
+        };
+        assert_eq!(
+            durust::decode_payload::<String>(result).unwrap(),
+            "durust.invalid_map_options/activity_map max_in_flight must be a positive integer/true|\
+             durust.invalid_map_options/child_workflow_map max_in_flight must be a positive integer/true|42",
+        );
+        assert!(
+            !history.iter().any(|event| matches!(
+                event.data,
+                HistoryEventData::ActivityMapScheduled(_)
+                    | HistoryEventData::ChildWorkflowMapScheduled(_)
+            )),
+            "a rejected bound must schedule no map at all"
+        );
     });
 }
 
@@ -7332,7 +8310,7 @@ struct RecordingBackend {
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
     fail_next_current_time: Arc<Mutex<bool>>,
-    fail_next_change_versions: Arc<Mutex<bool>>,
+    fail_next_replay_stream: Arc<Mutex<bool>>,
     hydrate_failures_remaining: Arc<Mutex<u32>>,
     fail_next_commit_batch: Arc<Mutex<bool>>,
     conflict_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
@@ -7349,7 +8327,7 @@ impl RecordingBackend {
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
             fail_next_current_time: Arc::new(Mutex::new(false)),
-            fail_next_change_versions: Arc::new(Mutex::new(false)),
+            fail_next_replay_stream: Arc::new(Mutex::new(false)),
             hydrate_failures_remaining: Arc::new(Mutex::new(0)),
             fail_next_commit_batch: Arc::new(Mutex::new(false)),
             conflict_batch_commit_run: Arc::new(Mutex::new(None)),
@@ -7387,8 +8365,8 @@ impl RecordingBackend {
         *self.fail_next_current_time.lock().unwrap() = true;
     }
 
-    fn fail_next_change_versions(&self) {
-        *self.fail_next_change_versions.lock().unwrap() = true;
+    fn fail_next_replay_stream(&self) {
+        *self.fail_next_replay_stream.lock().unwrap() = true;
     }
 
     fn fail_hydrate_payload_calls(&self, count: u32) {
@@ -7451,10 +8429,8 @@ impl DurableBackend for RecordingBackend {
         let inner = self.inner.clone();
         Box::pin(async move {
             let mut claimed = inner.claim_workflow_task(worker_id, opts).await?;
-            if !prefetch_enabled {
-                if let Some(claimed) = &mut claimed {
-                    claimed.prefetched_history.clear();
-                }
+            if !prefetch_enabled && let Some(claimed) = &mut claimed {
+                claimed.prefetched_history.clear();
             }
             Ok(claimed)
         })
@@ -7491,6 +8467,13 @@ impl DurableBackend for RecordingBackend {
         req: durust::StreamHistoryRequest,
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
+        if Self::take_flag(&self.fail_next_replay_stream) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected replay stream failure".to_owned(),
+                ))
+            });
+        }
         let retry_after = self.backpressure_next_replay_stream.lock().unwrap().take();
         if let Some(retry_after) = retry_after {
             return Box::pin(async move {
@@ -7518,12 +8501,7 @@ impl DurableBackend for RecordingBackend {
             let inner = self.inner.clone();
             return Box::pin(async move {
                 inner
-                    .release_workflow_task(
-                        claim,
-                        durust::WorkflowTaskRelease::immediate(
-                            durust::WorkflowTaskReason::CacheEvicted,
-                        ),
-                    )
+                    .release_workflow_task(claim, durust::WorkflowTaskRelease::immediate())
                     .await?;
                 Ok(durust::CommitOutcome::Conflict)
             });
@@ -7558,9 +8536,7 @@ impl DurableBackend for RecordingBackend {
                         .inner
                         .release_workflow_task(
                             claim.clone(),
-                            durust::WorkflowTaskRelease::immediate(
-                                durust::WorkflowTaskReason::CacheEvicted,
-                            ),
+                            durust::WorkflowTaskRelease::immediate(),
                         )
                         .await?;
                     results.push(durust::WorkflowTaskCommitBatchResult {
@@ -7688,13 +8664,6 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: durust::WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
-        if Self::take_flag(&self.fail_next_change_versions) {
-            return Box::pin(async {
-                Err(durust::Error::Backend(
-                    "injected change versions failure".to_owned(),
-                ))
-            });
-        }
         self.inner.workflow_change_versions(req)
     }
 
@@ -7708,4 +8677,544 @@ impl DurableBackend for RecordingBackend {
     ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
         self.inner.gc_payload_blobs(req)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 row 3A/3B: the consolidated command matcher under unfavorable replay
+// orderings, and the borrow-based match on payload-carrying command events.
+//
+// `spawn_sleep_sleep_workflow`, `spawn_sleep_then_activity_workflow`,
+// `spawn_sleep_then_side_effect_workflow`, `spawn_sleep_then_version_workflow`
+// and `spawn_sleep_then_child_workflow` above already drive the timer,
+// activity, side effect, version marker and child spawn kinds past an
+// unconsumed completion sitting at the replay cursor head. The two map kinds
+// go through the same matcher and had no such case, so they get one here.
+// ---------------------------------------------------------------------------
+
+#[durust::workflow(name = "tests.spawn-sleep-then-activity-map", version = 1)]
+async fn spawn_sleep_then_activity_map_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let input_manifest = durust::activity_map_manifest(vec![
+        NumberInput { value: value + 1 },
+        NumberInput { value: value + 2 },
+    ])?;
+    let mapped = durust::activity_map(double)
+        .task_queue("activities")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("post-sleep-mapped")
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
+    })?;
+    let first = handle.result().await?;
+    Ok(first + mapped_sum)
+}
+
+#[durust::workflow(name = "tests.spawn-sleep-then-child-workflow-map", version = 1)]
+async fn spawn_sleep_then_child_workflow_map_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = input.value;
+    let handle = durust::call_activity!(double(NumberInput { value }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let input_manifest = durust::child_workflow_map_manifest(vec![
+        NumberInput { value: value + 1 },
+        NumberInput { value: value + 2 },
+    ])?;
+    let mapped = durust::child_workflow_map::<child_double_workflow>()
+        .task_queue("workflows")
+        .workflow_id_prefix("wf/spawn-sleep-then-child-map/item")
+        .input_manifest(input_manifest)
+        .max_in_flight(2)
+        .result_manifest("post-sleep-child-mapped")
+        .parent_close_policy(durust::ParentClosePolicy::Cancel)
+        .failure_mode(durust::ChildWorkflowMapFailureMode::FailFast)
+        .spawn()
+        .await?;
+    let result_manifest = mapped.result_manifest().await?;
+    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
+        Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
+    })?;
+    let first = handle.result().await?;
+    Ok(first + mapped_sum)
+}
+
+async fn run_out_of_order_completion_before_activity_map_case(cold_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_activity_map_workflow>(
+            "wf/spawn-sleep-then-activity-map",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(
+        backend.clone(),
+        spawn_sleep_then_activity_map_workflow,
+        None,
+    );
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(
+            backend.clone(),
+            spawn_sleep_then_activity_map_workflow,
+            Some(chunk_events),
+        );
+    }
+
+    // The critical task: ActivityMapScheduled must be allocated and appended
+    // past the unconsumed ActivityCompleted at the replay cursor head instead
+    // of matching against it.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ActivityMapScheduled(_)
+    ));
+
+    // Now drive the recorded ActivityMapScheduled back through the matcher:
+    // dropping the worker makes the remaining tasks cold-replay it in
+    // one-event chunks, and the spawned activity's completion is still
+    // unconsumed ahead of it at the cursor head, so the map command has to be
+    // matched past a ready event rather than re-appended.
+    drop(worker);
+    let mut worker = out_of_order_worker(
+        backend.clone(),
+        spawn_sleep_then_activity_map_workflow,
+        Some(1),
+    );
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "activity map", |data| {
+        matches!(data, HistoryEventData::ActivityMapScheduled(_))
+    });
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "spawn-sleep-then-activity-map workflow did not complete; history: {:?}",
+            history
+                .iter()
+                .map(|event| event.event_type())
+                .collect::<Vec<_>>()
+        );
+    };
+    // 2*10 from the spawned activity plus 2*11 + 2*12 from the map.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 66);
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cached() {
+    block_on(run_out_of_order_completion_before_activity_map_case(None));
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cold() {
+    block_on(run_out_of_order_completion_before_activity_map_case(Some(
+        100,
+    )));
+}
+
+#[test]
+fn out_of_order_completion_before_activity_map_schedule_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_activity_map_case(Some(
+        1,
+    )));
+}
+
+async fn run_out_of_order_completion_before_child_workflow_map_case(
+    cold_chunk_events: Option<usize>,
+) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<spawn_sleep_then_child_workflow_map_workflow>(
+            "wf/spawn-sleep-then-child-workflow-map",
+            "workflows",
+            number(10),
+        )
+        .await
+        .unwrap();
+    let build_worker = |chunk_events: Option<usize>| {
+        let mut builder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(spawn_sleep_then_child_workflow_map_workflow)
+            .register_workflow(child_double_workflow)
+            .register_activity(double);
+        if let Some(chunk_events) = chunk_events {
+            builder = builder.history_chunk_events(chunk_events);
+        }
+        builder.build()
+    };
+    let mut worker = build_worker(None);
+    drive_completion_before_timer_fired(&backend, &mut worker, &run_id).await;
+    if let Some(chunk_events) = cold_chunk_events {
+        drop(worker);
+        worker = build_worker(Some(chunk_events));
+    }
+
+    // Same critical task for the child-map kind.
+    assert!(worker.run_workflow_once().await.unwrap());
+    let history = stream_all(&backend, &run_id).await;
+    assert!(matches!(
+        history[5].data,
+        HistoryEventData::ChildWorkflowMapScheduled(_)
+    ));
+
+    // As above: cold-replay the recorded ChildWorkflowMapScheduled past the
+    // still-unconsumed activity completion.
+    drop(worker);
+    let mut worker = build_worker(Some(1));
+    worker.run_until_idle().await.unwrap();
+
+    let history = stream_all(&backend, &run_id).await;
+    assert_command_event_recorded_once(&history, "child workflow map", |data| {
+        matches!(data, HistoryEventData::ChildWorkflowMapScheduled(_))
+    });
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!(
+            "spawn-sleep-then-child-workflow-map workflow did not complete; history: {:?}",
+            history
+                .iter()
+                .map(|event| event.event_type())
+                .collect::<Vec<_>>()
+        );
+    };
+    // 2*10 from the spawned activity plus 2*11 + 2*12 from the child map.
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 66);
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cached() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        None,
+    ));
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cold() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        Some(100),
+    ));
+}
+
+#[test]
+fn out_of_order_completion_before_child_workflow_map_schedule_cold_multi_chunk() {
+    block_on(run_out_of_order_completion_before_child_workflow_map_case(
+        Some(1),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Row 3B: the command matcher borrows the recorded event instead of cloning
+// it, so the recorded `ActivityScheduled.input`, `SideEffectMarker.value` and
+// `ChildWorkflowStartRequested.input` are never duplicated to read a seq and a
+// fingerprint. A deep clone of an immutable event is not itself observable, so
+// what this pins is the correctness of the borrow-based comparison on the
+// events that actually carry bulk payloads: every one of them must still match
+// (never re-append) across cached and cold multi-chunk replay, and the
+// recorded payloads must survive byte-for-byte.
+// ---------------------------------------------------------------------------
+
+const LARGE_INLINE_COMMAND_PAYLOAD_BYTES: usize = 128 * 1024;
+// Just under `MAX_SIDE_EFFECT_PAYLOAD_BYTES` (8 KiB), which the marker
+// validator hard caps and which no backend configuration can raise.
+const LARGE_INLINE_SIDE_EFFECT_BYTES: usize = 7 * 1024;
+// `PayloadStorageConfig::inline_threshold_bytes` defaults to 8 KiB, so at the
+// default the 128 KiB inputs below would reach replay as blob refs and this
+// suite would silently stop testing what it names. Raising the threshold is
+// what makes them genuinely inline; `assert_command_payloads_are_inline`
+// re-checks that on the recorded events so a future default change cannot
+// quietly hollow these cases out again.
+const LARGE_INLINE_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BulkInput {
+    tag: String,
+    bytes: Vec<u8>,
+}
+
+fn bulk_input(seed: u8) -> BulkInput {
+    BulkInput {
+        tag: format!("bulk-{seed}"),
+        bytes: (0..LARGE_INLINE_COMMAND_PAYLOAD_BYTES)
+            .map(|index| (index as u8).wrapping_add(seed))
+            .collect(),
+    }
+}
+
+#[durust::activity(name = "tests.bulk-activity")]
+async fn bulk_activity(input: BulkInput) -> durust::Result<u64> {
+    Ok(input.bytes.len() as u64)
+}
+
+#[durust::workflow(name = "tests.bulk-child", version = 1)]
+async fn bulk_child_workflow(input: BulkInput) -> durust::Result<u64> {
+    Ok(input.bytes.len() as u64)
+}
+
+// One command of each payload-carrying kind, separated by a timer so the
+// following task must replay them rather than append them.
+#[durust::workflow(name = "tests.large-inline-command-payloads", version = 1)]
+async fn large_inline_command_payloads_workflow(_: UnitInput) -> durust::Result<u64> {
+    let activity_len = durust::call_activity!(bulk_activity(bulk_input(1)))
+        .task_queue("activities")
+        .await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    let marker: String =
+        durust::side_effect("bulk-marker", || "m".repeat(LARGE_INLINE_SIDE_EFFECT_BYTES)).await?;
+    let child = durust::child!(bulk_child_workflow(bulk_input(2)))
+        .workflow_id("wf/large-inline-command-payloads/child")
+        .spawn()
+        .await?;
+    let child_len = child.result().await?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    Ok(activity_len + child_len + marker.len() as u64)
+}
+
+// `cold_chunk_events = None` keeps one worker for the whole run; `Some(n)`
+// drops the worker before every pass, so each task cold-replays the whole
+// prefix — including all three bulk command events — in n-event chunks.
+async fn drive_large_inline_command_payload_run(
+    workflow_id: &str,
+    cold_chunk_events: Option<usize>,
+) -> (u64, Vec<durust::HistoryEvent>) {
+    let backend = MemoryBackend::with_payload_storage(
+        PayloadStorageConfig::new().inline_threshold_bytes(LARGE_INLINE_THRESHOLD_BYTES),
+    );
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<large_inline_command_payloads_workflow>(workflow_id, "workflows", unit())
+        .await
+        .unwrap();
+    let build_worker = || {
+        let mut builder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(large_inline_command_payloads_workflow)
+            .register_workflow(bulk_child_workflow)
+            .register_activity(bulk_activity);
+        if let Some(chunk_events) = cold_chunk_events {
+            builder = builder.history_chunk_events(chunk_events);
+        }
+        builder.build()
+    };
+
+    let mut worker = build_worker();
+    for _ in 0..40 {
+        let mut progressed = worker.run_workflow_once().await.unwrap();
+        progressed |= worker.run_activity_once().await.unwrap();
+        progressed |= worker.run_child_workflow_starts_once().await.unwrap() > 0;
+        if !progressed {
+            backend.advance_time(Duration::from_secs(1));
+            if worker.run_timers_once().await.unwrap() == 0 {
+                break;
+            }
+        }
+        if cold_chunk_events.is_some() {
+            drop(worker);
+            worker = build_worker();
+        }
+    }
+
+    assert_replay_command_payloads_are_inline(&backend, &run_id).await;
+    let history = stream_all(&backend, &run_id).await;
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("large inline command payload workflow did not complete: {history:#?}");
+    };
+    (durust::decode_payload::<u64>(result).unwrap(), history)
+}
+
+fn assert_large_inline_command_payloads(history: &[durust::HistoryEvent]) {
+    let scheduled: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ActivityScheduled(scheduled) => Some(scheduled),
+            _ => None,
+        })
+        .collect();
+    let markers: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::SideEffectMarker(marker) => Some(marker),
+            _ => None,
+        })
+        .collect();
+    let requested: Vec<_> = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::ChildWorkflowStartRequested(requested) => Some(requested),
+            _ => None,
+        })
+        .collect();
+
+    // Exactly one of each: a matcher that failed to recognise its own recorded
+    // command event would append a second copy instead of replaying it.
+    assert_eq!(scheduled.len(), 1, "expected one ActivityScheduled");
+    assert_eq!(markers.len(), 1, "expected one SideEffectMarker");
+    assert_eq!(
+        requested.len(),
+        1,
+        "expected one ChildWorkflowStartRequested"
+    );
+
+    assert_eq!(
+        durust::decode_payload::<BulkInput>(&scheduled[0].input).unwrap(),
+        bulk_input(1)
+    );
+    assert_eq!(
+        durust::decode_payload::<BulkInput>(&requested[0].input).unwrap(),
+        bulk_input(2)
+    );
+    assert_eq!(
+        durust::decode_payload::<String>(&markers[0].value)
+            .unwrap()
+            .len(),
+        LARGE_INLINE_SIDE_EFFECT_BYTES
+    );
+}
+
+// The point of these cases is that the matcher steps over command events whose
+// payloads are genuinely inline and genuinely large.
+//
+// This has to read `stream_history_for_replay`, not `stream_history`. The
+// hydrating read that `stream_all` uses turns a blob ref back into an inline
+// payload, so it reports "inline" whatever the backend actually stored; the
+// replay path takes the non-hydrating variant and is what the matcher sees.
+async fn assert_replay_command_payloads_are_inline<B>(backend: &B, run_id: &durust::RunId)
+where
+    B: DurableBackend,
+{
+    let events = backend
+        .stream_history_for_replay(durust::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(1_000_000),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap()
+        .events;
+    let mut checked = 0;
+    for event in &events {
+        let (label, payload) = match &event.data {
+            HistoryEventData::ActivityScheduled(scheduled) => ("activity input", &scheduled.input),
+            HistoryEventData::ChildWorkflowStartRequested(requested) => {
+                ("child workflow input", &requested.input)
+            }
+            _ => continue,
+        };
+        let PayloadRef::Inline { bytes, .. } = payload else {
+            panic!(
+                "{label} reaches replay as a blob ref, not a large inline payload, so this case \
+                 exercises the hydration path instead of the command matcher"
+            );
+        };
+        assert!(
+            bytes.len() > durust::DEFAULT_INLINE_THRESHOLD_BYTES,
+            "{label} is {} bytes, below the {} byte default inline threshold",
+            bytes.len(),
+            durust::DEFAULT_INLINE_THRESHOLD_BYTES
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 2, "expected one activity and one child command");
+}
+
+fn large_inline_command_payload_result() -> u64 {
+    (LARGE_INLINE_COMMAND_PAYLOAD_BYTES * 2 + LARGE_INLINE_SIDE_EFFECT_BYTES) as u64
+}
+
+#[test]
+fn large_inline_command_payloads_replay_from_cache() {
+    block_on(async {
+        let (result, history) =
+            drive_large_inline_command_payload_run("wf/large-inline-cached", None).await;
+        assert_eq!(result, large_inline_command_payload_result());
+        assert_large_inline_command_payloads(&history);
+    });
+}
+
+#[test]
+fn large_inline_command_payloads_replay_cold_multi_chunk() {
+    block_on(async {
+        let (result, history) =
+            drive_large_inline_command_payload_run("wf/large-inline-cold", Some(1)).await;
+        assert_eq!(result, large_inline_command_payload_result());
+        assert_large_inline_command_payloads(&history);
+    });
+}
+
+// Cold multi-chunk replay must produce the same history shape and the same
+// recorded command payloads as the cached drive; only the run-scoped ids
+// differ between the two runs.
+#[test]
+fn large_inline_command_payload_history_is_identical_cached_and_cold() {
+    block_on(async {
+        let (cached_result, cached) =
+            drive_large_inline_command_payload_run("wf/large-inline-compare-cached", None).await;
+        let (cold_result, cold) =
+            drive_large_inline_command_payload_run("wf/large-inline-compare-cold", Some(1)).await;
+
+        assert_eq!(cached_result, cold_result);
+        assert_eq!(
+            cached
+                .iter()
+                .map(|event| (event.event_id, event.event_type()))
+                .collect::<Vec<_>>(),
+            cold.iter()
+                .map(|event| (event.event_id, event.event_type()))
+                .collect::<Vec<_>>()
+        );
+        for (cached_event, cold_event) in cached.iter().zip(cold.iter()) {
+            match (&cached_event.data, &cold_event.data) {
+                (
+                    HistoryEventData::ActivityScheduled(cached_scheduled),
+                    HistoryEventData::ActivityScheduled(cold_scheduled),
+                ) => {
+                    assert_eq!(cached_scheduled.input, cold_scheduled.input);
+                    assert_eq!(cached_scheduled.fingerprint, cold_scheduled.fingerprint);
+                    assert_eq!(
+                        cached_scheduled.command_id.seq,
+                        cold_scheduled.command_id.seq
+                    );
+                }
+                (
+                    HistoryEventData::SideEffectMarker(cached_marker),
+                    HistoryEventData::SideEffectMarker(cold_marker),
+                ) => {
+                    assert_eq!(cached_marker.key, cold_marker.key);
+                    assert_eq!(cached_marker.value, cold_marker.value);
+                    assert_eq!(cached_marker.command_id.seq, cold_marker.command_id.seq);
+                }
+                (
+                    HistoryEventData::ChildWorkflowStartRequested(cached_requested),
+                    HistoryEventData::ChildWorkflowStartRequested(cold_requested),
+                ) => {
+                    assert_eq!(cached_requested.input, cold_requested.input);
+                    assert_eq!(cached_requested.fingerprint, cold_requested.fingerprint);
+                    assert_eq!(
+                        cached_requested.command_id.seq,
+                        cold_requested.command_id.seq
+                    );
+                }
+                _ => {}
+            }
+        }
+    });
 }

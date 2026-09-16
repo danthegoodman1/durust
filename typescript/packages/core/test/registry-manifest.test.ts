@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   Client,
-  MemoryBackend,
   Registry,
   activity,
   activityMap,
@@ -19,6 +18,7 @@ import {
   signal,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import type { SchemaAdapter } from "@durust/core";
 import { runManifestCli } from "../src/manifest-cli.js";
 
@@ -292,7 +292,7 @@ describe("registry and manifest", () => {
         return { ok: true };
       }
     });
-    const client = new Client(new MemoryBackend());
+    const client = new Client(NativeBackend.memory());
     const approved = signal<Input>("runtime-approved");
 
     expect(() => callActivity(quote, "sku-1" as unknown as Input)).toThrow(
@@ -361,7 +361,13 @@ describe("registry and manifest", () => {
     expect(manifest.pageLengths).toEqual([1, 1]);
     expect(firstItem.codec).toBe("Json");
     expect(firstItem.schemaFingerprint).toBe("sha256:map-item");
-    expect(decodePayload<{ readonly wire_value: string }>(firstItem)).toEqual({
+    // Decoded without the item schema on purpose: the stored bytes hold the
+    // wire shape `itemSchema.encode` produced, which does not overlap the
+    // `Input` that `firstItem` is statically a ref to. The type argument is
+    // therefore `unknown` — naming the wire type here would be a claim
+    // `decodePayload` cannot honour — and the `toEqual` is what pins the wire
+    // shape. The line below pins the schema-decoded shape from the same ref.
+    expect(decodePayload<unknown>(firstItem)).toEqual({
       wire_value: "one"
     });
     expect(decodePayload(firstItem, itemSchema)).toEqual({ value: "one" });

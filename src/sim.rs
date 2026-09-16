@@ -145,8 +145,8 @@ impl FaultProfile {
     fn should_inject(self, rng: &mut XorShift64, point: FaultPoint) -> bool {
         match self {
             Self::None => false,
-            Self::Moderate => rng.next() % point.moderate_denominator() == 0,
-            Self::Aggressive => rng.next() % point.aggressive_denominator() == 0,
+            Self::Moderate => rng.next().is_multiple_of(point.moderate_denominator()),
+            Self::Aggressive => rng.next().is_multiple_of(point.aggressive_denominator()),
         }
     }
 }
@@ -1392,8 +1392,9 @@ mod tests {
                 return Ok(());
             }
 
-            if !state.apply_counts.contains_key(&message) {
-                state.apply_counts.insert(message, 1);
+            if let std::collections::btree_map::Entry::Vacant(e) = state.apply_counts.entry(message)
+            {
+                e.insert(1);
                 sim.record("target_apply", format!("message={message}"));
             }
             if fault_budget

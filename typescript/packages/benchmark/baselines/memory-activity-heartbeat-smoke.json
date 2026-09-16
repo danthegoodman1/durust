@@ -9,8 +9,45 @@
     "batch": 8
   },
   "result": {
+    "backend": "memory",
+    "mode": "activity-heartbeat",
+    "correct": true,
+    "options": {
+      "backend": "memory",
+      "mode": "activity-heartbeat",
+      "workflows": 4,
+      "workers": 1,
+      "batch": 8,
+      "max_rounds": 10000,
+      "json": false,
+      "keep_db": false,
+      "list_stale": false,
+      "drop_stale": false,
+      "activity_delay_ms": 0,
+      "workflow_offset": 0,
+      "child_map_items": 32,
+      "child_map_max_in_flight": 8,
+      "shards": 1,
+      "physical_partitions": 1,
+      "activation_concurrency": 1,
+      "activation_prefetch_limit": 1,
+      "activity_completion_batch": 1,
+      "postgres_pool_size": 10
+    },
+    "elapsed_ms": 2.813,
+    "setup_ms": 0.174,
+    "processing_ms": 2.491,
+    "verify_ms": 0.147,
+    "rounds": 5,
+    "activations": 8,
     "completed_workflows": 4,
     "mixed_actions": 12,
+    "activations_per_second": 2843.993,
+    "mixed_actions_per_second": 4265.99,
+    "workflows_per_second": 1421.997,
+    "processing_activations_per_second": 3211.132,
+    "processing_mixed_actions_per_second": 4816.699,
+    "processing_workflows_per_second": 1605.566,
     "counters": {
       "workflow_starts": 4,
       "signals": 0,
@@ -20,9 +57,16 @@
       "boot_activities": 4,
       "activity_heartbeats": 4,
       "child_activities": 0,
-      "finish_activities": 0
+      "finish_activities": 0,
+      "workflow_tasks": 8,
+      "activity_tasks": 4,
+      "timers_fired": 0,
+      "activities_timed_out": 0,
+      "child_workflow_starts_dispatched": 0
     },
     "worker_stats": {
+      "workflowTasks": 8,
+      "activityTasks": 4,
       "workflowHistoryCacheHits": 0,
       "workflowHistoryCacheMisses": 4,
       "workflowHistoryCacheEvictions": 0,
@@ -30,29 +74,148 @@
       "workflowExecutionCacheMisses": 4,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
-      "historyStreamEvents": 0
+      "historyStreamEvents": 0,
+      "timersFired": 0,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 0
     },
-    "processing_mixed_actions_per_second": 798.102,
-    "processing_workflows_per_second": 266.034,
-    "workflow_task_commit_p95_ms": 0.116,
-    "operations": {
-      "claimWorkflowTask": {
-        "calls": 8,
-        "errors": 0
+    "backend_metrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 8,
+        "p50Ms": 0.038,
+        "p95Ms": 0.052,
+        "p99Ms": 0.052,
+        "maxMs": 0.052
       },
-      "commitWorkflowTask": {
-        "calls": 8,
-        "errors": 0
-      },
-      "completeActivity": {
-        "calls": 4,
-        "errors": 0
-      },
-      "heartbeatActivity": {
-        "calls": 4,
-        "errors": 0
+      "operations": {
+        "claimActivityTask": {
+          "calls": 5,
+          "errors": 0,
+          "items": 5,
+          "totalMs": 0.168,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 29760.488,
+          "latency": {
+            "samples": 5,
+            "p50Ms": 0.029,
+            "p95Ms": 0.062,
+            "p99Ms": 0.062,
+            "maxMs": 0.062
+          }
+        },
+        "claimWorkflowTask": {
+          "calls": 5,
+          "errors": 0,
+          "items": 8,
+          "totalMs": 0.312,
+          "itemsPerCall": 1.6,
+          "itemsPerSecond": 25643.656,
+          "latency": {
+            "samples": 5,
+            "p50Ms": 0.06,
+            "p95Ms": 0.08,
+            "p99Ms": 0.08,
+            "maxMs": 0.08
+          }
+        },
+        "commitWorkflowTask": {
+          "calls": 8,
+          "errors": 0,
+          "items": 8,
+          "totalMs": 0.319,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 25096.701,
+          "latency": {
+            "samples": 8,
+            "p50Ms": 0.038,
+            "p95Ms": 0.052,
+            "p99Ms": 0.052,
+            "maxMs": 0.052
+          }
+        },
+        "completeActivity": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.081,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 49193.836,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.02,
+            "p95Ms": 0.022,
+            "p99Ms": 0.022,
+            "maxMs": 0.022
+          }
+        },
+        "fireDueTimers": {
+          "calls": 5,
+          "errors": 0,
+          "items": 40,
+          "totalMs": 0.083,
+          "itemsPerCall": 8,
+          "itemsPerSecond": 483155.975,
+          "latency": {
+            "samples": 5,
+            "p50Ms": 0.016,
+            "p95Ms": 0.017,
+            "p99Ms": 0.017,
+            "maxMs": 0.017
+          }
+        },
+        "heartbeatActivity": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.088,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 45526.975,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.017,
+            "p95Ms": 0.038,
+            "p99Ms": 0.038,
+            "maxMs": 0.038
+          }
+        },
+        "startWorkflow": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.108,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 37191.658,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.021,
+            "p95Ms": 0.041,
+            "p99Ms": 0.041,
+            "maxMs": 0.041
+          }
+        },
+        "streamHistory": {
+          "calls": 24,
+          "errors": 0,
+          "items": 24,
+          "totalMs": 0.976,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 24590.265,
+          "latency": {
+            "samples": 24,
+            "p50Ms": 0.037,
+            "p95Ms": 0.054,
+            "p99Ms": 0.055,
+            "maxMs": 0.055
+          }
+        }
       }
-    }
+    },
+    "postgres_stats": null,
+    "resource_samples": null,
+    "postgres_schema": null,
+    "postgres_database": null,
+    "db_path": null,
+    "db_bytes": null
   },
   "thresholds": {
     "require_correct": true,

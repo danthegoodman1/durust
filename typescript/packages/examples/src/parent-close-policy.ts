@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   childWorkflow,
@@ -8,6 +7,7 @@ import {
   runId,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface ParentInput {
   readonly orderId: string;
@@ -75,7 +75,7 @@ const abandonParent = workflow({
 });
 
 export async function runMemoryParentClosePolicyExample(): Promise<ParentClosePolicyExampleResult> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(cancelParent)
     .registerWorkflow(abandonParent)
@@ -119,7 +119,7 @@ export async function runMemoryParentClosePolicyExample(): Promise<ParentClosePo
 }
 
 async function eventTypes(
-  backend: MemoryBackend,
+  backend: NativeBackend,
   childRunId: string
 ): Promise<readonly string[]> {
   const history = await backend.streamHistory({

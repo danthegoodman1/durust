@@ -1,8 +1,37 @@
 name: CI
 
+# `push` is restricted to `main`; `pull_request` covers everything else. A bare
+# `push` alongside `pull_request` ran this entire workflow — both containers, the
+# full test suite, the Garage conformance step — **twice** for every push to a
+# branch with an open PR. Same commit, same result, double the minutes.
+#
+# `push` cannot simply be dropped, and this is the trap: `release.yml` triggers
+# on `workflow_run` of this workflow and gates on
+# `github.event.workflow_run.event == 'push'` and `head_branch == 'main'`.
+# Removing the push trigger, or filtering `main` out of it, silently stops every
+# release while leaving CI green.
 on:
   pull_request:
   push:
+    branches:
+      - main
+
+# Cancellation is scoped to pull requests, because on `main` a cancelled run is a
+# *skipped release*: `release.yml` keys off this workflow's conclusion, and a
+# release's version bump is derived from that one commit, so losing the run loses
+# the bump rather than deferring it.
+#
+# `cancel-in-progress: false` is **not** sufficient on its own, which is why the
+# group key differs by event. That setting governs only runs already executing; a
+# run queued into an occupied group becomes *pending*, and GitHub cancels a
+# previously pending run in the group regardless. With a single `ci-refs/heads/main`
+# group, three pushes to `main` inside one CI duration would cancel the middle
+# one and silently skip its release. Keying pushes by commit sha gives each its
+# own group, so they queue independently; pull requests keep a per-ref group so
+# that superseding a PR push still cancels the run it replaces.
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.ref) || format('ci-push-{0}', github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -10,6 +39,40 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # Both runtimes' Postgres suites are environment-gated, and before this
+    # container neither of them ran here: Rust's 55 gated tests executed and
+    # skipped (libtest captures the skip notice, so they reported plain `ok`),
+    # and TypeScript's 123 never executed at all, because the only script that
+    # invokes them — `check:postgres` — hangs off `check:release`, which no
+    # workflow calls. The container plus `DURUST_REQUIRE_POSTGRES` below turns
+    # "no database" from a silent pass into a failure.
+    #
+    # The image tracks the local development container so a CI-only Postgres
+    # version difference cannot be the reason a test disagrees with a laptop.
+    # The port is the in-container default; only the local fixture uses 5433.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: durust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d durust"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    # `DURUST_POSTGRES_URL` is deliberately set per step rather than for the
+    # whole job. `vitest.config.ts` includes `packages/*/test/**/*.test.ts`, so
+    # a job-level variable would also switch on the env-gated Postgres cases in
+    # `packages/benchmark/test/thresholds.test.ts` inside `npm run check` — and
+    # those are throughput comparisons against baselines recorded on one
+    # developer machine. See the benchmark-threshold note below.
+
     steps:
       - uses: actions/checkout@v4
 
@@ -31,20 +94,184 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Check feature matrix
+      - name: Clippy
+        # `result_large_err` is allowed on purpose: `durust::Error` carries a
+        # payload, and boxing it would change the public `Result` alias.
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings -A clippy::result_large_err
+
+      # This step was named "Check feature matrix" and ran two lines, one of
+      # which was redundant: `default = ["sqlite"]`, so `--features postgres,s3`
+      # *also* enables sqlite and is therefore identical to `--all-features` —
+      # which the "Run tests" step below already builds and, unlike `cargo
+      # check`, actually runs. The name claimed a matrix that neither line
+      # covered.
+      #
+      # What is genuinely distinct is the sqlite-free half: a dependent taking
+      # durust with only Postgres, or only S3, gets a crate this workflow never
+      # compiled. All four combinations below pass today — the point of pinning
+      # them is that a `rusqlite` type leaking into a non-sqlite code path now
+      # fails here rather than at a user's `cargo build`.
+      #
+      # Library only, deliberately. `--no-default-features --all-targets`
+      # currently produces 70 errors, because the test suite's helpers construct
+      # `SqliteBackend` unguarded. That is a real gap, recorded here rather than
+      # hidden: putting thousands of lines of test code behind
+      # `#[cfg(feature = "sqlite")]` is a larger change than this step should
+      # smuggle in, and a `cargo check` that silently covered only the lib while
+      # being named for the whole matrix is how the previous version misled.
+      - name: Check library across sqlite-free feature combinations
         run: |
           cargo check --locked --no-default-features
-          cargo check --locked --features postgres,s3
+          cargo check --locked --no-default-features --features postgres
+          cargo check --locked --no-default-features --features s3
+          cargo check --locked --no-default-features --features postgres,s3
 
+      # `DURUST_REQUIRE_POSTGRES` turns every Postgres skip site in the Rust
+      # suite into a panic, so this step fails if the service container, the
+      # URL, or the database goes away. Without it the same command reports
+      # `ok` for 55 tests that never touched a database.
       - name: Run tests
+        env:
+          DURUST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/durust
+          DURUST_REQUIRE_POSTGRES: "1"
         run: cargo test --locked --workspace --all-features
 
+      # Every TypeScript provider is the Rust core behind `@durust/native`, so
+      # the workspace's tests need the `durust-node` addon built first; `npm
+      # run check` does not build it. Release builds come from the platform
+      # matrix in `release.yml`; this is the from-source path.
+      - name: Build the durust-node addon
+        run: npm --prefix typescript run build:native --workspace @durust/native
+
+      # The four platform packages under `packages/native/npm` must agree with
+      # the facade on name, version, and the addon file each ships.
+      - name: Check the native platform packages
+        run: node scripts/check-native-packages.mjs
+
+      # `npm run check` includes `check:fixtures`, the TypeScript half of every
+      # shared fixture; the Rust half ran in `cargo test --workspace` above.
       - name: Run TypeScript checks
         run: npm run check --prefix typescript
+
+      # Every test `PARITY.md` cites must still exist on both sides.
+      - name: Check PARITY.md test citations
+        run: node scripts/check-parity-names.mjs
+
+      # `npm run check` runs `npm run test`, which *does* collect this file —
+      # `vitest.config.ts` includes `packages/*/test/**/*.test.ts`. It reaches
+      # it and skips it, because the suite is `describe.skip` without
+      # `DURUST_POSTGRES_URL`, and a fully skipped file still exits 0. So the
+      # cases were never executed in CI, and the only script that would have
+      # executed them, `check:postgres`, hangs off `check:release`, which no
+      # workflow invokes. Same for the hot-cache soak below.
+      #
+      # This runs the conformance file directly rather than `npm run
+      # check:postgres`, because that script also runs
+      # `test:benchmark-thresholds` — see the note below it.
+      #
+      # `DURUST_REQUIRE_POSTGRES` is the same flag the Rust suite uses, and the
+      # TypeScript side honours it: both files below call
+      # `assertPostgresAvailableWhenRequired` at module scope, which throws on
+      # a missing URL. The conformance file runs the shared cases over the
+      # Rust Postgres provider through `@durust/native`.
+      #
+      # The `test -n` guard stays, and is not redundant, because it covers the
+      # one case the assertion cannot. Delete this `env:` block and
+      # `DURUST_REQUIRE_POSTGRES` goes with it — so the assertion sees "not
+      # required", skips quietly, and the step is green. The guard fires on
+      # exactly that edit. It is narrow, and that narrowness is the point;
+      # it is not the general protection it used to be described as.
+      #
+      # `database-guard.test.ts` is listed because nothing else in CI ran it.
+      # `npm run check` collects it and skips it (no URL at job level, by
+      # design — see the note at the top), the conformance step named only the
+      # other file, and `check:postgres` is not invoked here at all. That left
+      # its seven cases — the guard in front of `drop database`, the only
+      # unrecoverable statement this repository issues — ungated, while its
+      # Rust twin in `benchtools` ran on every push.
+      - name: Run TypeScript Postgres conformance and database guard
+        env:
+          DURUST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/durust
+          DURUST_REQUIRE_POSTGRES: "1"
+        run: |
+          test -n "$DURUST_POSTGRES_URL" || {
+            echo "DURUST_POSTGRES_URL must be set: without it every case in these files is skipped and the step still passes"
+            exit 1
+          }
+          npm run test --prefix typescript -- \
+            packages/native/test/native-conformance.test.ts \
+            packages/benchmark/test/database-guard.test.ts
+
+      # `DURUST_LONG_SOAK=1` adds exactly one case to the simulation suite
+      # (16 tests instead of 15 passed + 1 skipped) and costs ~90 ms of the
+      # run's 0.6 s wall clock, measured. There is no reason for something that
+      # cheap to live outside CI.
+      #
+      # `DURUST_REQUIRE_LONG_SOAK` is set *here* rather than in `test:soak`,
+      # which supplies `DURUST_LONG_SOAK`. Two sources, so the check can catch
+      # something: if the script ever stops enabling the soak, this step fails
+      # instead of quietly reporting `1 skipped` and exiting 0.
+      - name: Run TypeScript hot execution cache soak
+        env:
+          DURUST_REQUIRE_LONG_SOAK: "1"
+        run: npm run test:soak --prefix typescript
+
+      # Deliberately **not** run here, and this is the decision rather than an
+      # omission: `npm run test:benchmark-thresholds` compares measured
+      # throughput and latency against baselines recorded on one developer
+      # machine. Performance baselines belong on a controlled machine; they
+      # stay in `npm run check:postgres` for that use. Its accepted-baseline
+      # case asserts `postgres_stats.statementStats` only when
+      # `DURUST_REQUIRE_POSTGRES_STATEMENT_STATS=1`, because that needs a
+      # server started with `shared_preload_libraries=pg_stat_statements`,
+      # which a GitHub service container cannot supply (`services:` cannot
+      # override the image's command).
+      #
+      # The controlled machine is what `tests/fixtures/postgres.compose.yml` is
+      # for, and it was the only file in the repository nothing referenced by
+      # name. It is the *only* Postgres in this project started with
+      # `shared_preload_libraries=pg_stat_statements`, which is precisely the
+      # setting a `services:` container cannot supply — so it is the supported
+      # way to run the step this block declines to run:
+      #
+      #   docker compose -f tests/fixtures/postgres.compose.yml up -d
+      #   DURUST_POSTGRES_URL=postgres://durable:durable@localhost:55432/durable \
+      #     npm run check:postgres --prefix typescript
+      #
+      # Note the port and credentials: `55432` and `durable/durable/durable`,
+      # which match neither this workflow nor the `5433` /
+      # `postgres/postgres/durust` container used for ordinary local runs. That
+      # is deliberate — it is a separate, benchmark-only database — but it is
+      # easy to mistake for the everyday one, so the full URL is spelled out
+      # above rather than left to be inferred.
 
       - name: Start Garage
         run: docker compose -f tests/fixtures/garage.compose.yml up -d
 
+      # `DURUST_REQUIRE_GARAGE` is to this step what `DURUST_REQUIRE_POSTGRES`
+      # is to the two above: without it the conformance case skips on missing
+      # variables and reports `ok. 1 passed`, so the step's greenness never
+      # depended on Garage being reachable. The compose service and the six
+      # variables below meant it did genuinely run — but a container that fails
+      # to become ready, or one dropped variable, would have gone unnoticed.
+      #
+      # The filter is the substring `garage`, not the full test name it used to
+      # be. `cargo test` with a filter that matches nothing prints `0 passed`
+      # and exits 0, so naming a single test meant that dropping `--features
+      # s3`, or renaming that test, left this step green having run nothing at
+      # all. `garage` also matches
+      # `garage_s3_feature_is_enabled_when_garage_is_required`, which is
+      # compiled unconditionally — so the filter can never match zero tests,
+      # and the missing-feature case now fails here instead of passing.
+      #
+      # `--all-features` rather than `--features s3`, purely for build cost:
+      # `--features s3` also enables the default `sqlite` but *not* `postgres`,
+      # so it is a different feature set from the "Run tests" step above and
+      # forced a full rebuild of the crate and the 9,600-line conformance test
+      # binary. Measured with `-- --list`, both feature sets select exactly the
+      # same two tests — `garage_s3_feature_is_enabled_when_garage_is_required`
+      # and `payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured`
+      # — so this reuses the earlier build and runs identical coverage.
       - name: Run Garage S3 conformance
         env:
           DURUST_GARAGE_ENDPOINT: http://127.0.0.1:3900
@@ -53,16 +280,50 @@ jobs:
           DURUST_GARAGE_PREFIX: ci/${{ github.run_id }}/${{ github.run_attempt }}
           DURUST_GARAGE_ACCESS_KEY_ID: GK0123456789abcdef0123456789abcdef
           DURUST_GARAGE_SECRET_ACCESS_KEY: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        run: cargo test --locked --features s3 --test provider_conformance payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured -- --nocapture
+          DURUST_REQUIRE_GARAGE: "1"
+        run: cargo test --locked --all-features --test provider_conformance garage -- --nocapture
 
       - name: Stop Garage
         if: always()
         run: docker compose -f tests/fixtures/garage.compose.yml down -v
 
+      # Every example is a compiled, running document (`SPEC.md` §22.7).
       - name: Run examples
         run: |
-          cargo run --locked --example hello_activity
-          cargo run --locked --example worker_registration
+          for example in examples/*.rs; do
+            cargo run --locked --all-features --example "$(basename "${example%.rs}")"
+          done
 
       - name: Build benchmarks
         run: cargo bench --locked --no-run
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly with Miri
+        run: rustup toolchain install nightly --profile minimal --component miri
+
+      # Gates one invariant: `with_context` / `with_activity_context` never
+      # produce two live borrows of a runtime context, and always restore the
+      # thread-local slot, including when the guarded call unwinds. Aliasing
+      # there is unobservable without Miri and the crate's most safety-critical
+      # unsafe block depends on it. This job does not claim the rest of the
+      # crate is free of undefined behavior.
+      #
+      # The scope is deliberate, not a placeholder:
+      #   - `--no-default-features` drops `sqlite`, because rusqlite is C FFI
+      #     and Miri cannot execute foreign functions.
+      #   - The filter stays on `runtime::tests` because the whole lib test
+      #     binary does not finish. Under Miri's default isolation it aborts in
+      #     `payload_backend::tests`, which reaches `SystemTime::now()` through
+      #     `provider_util::unix_epoch_millis` (`src/provider_util.rs:312`) —
+      #     an unsupported `clock_gettime` operation, not undefined behavior.
+      #     With `-Zmiri-disable-isolation` it clears that and then spends
+      #     unbounded time interpreting the many-seed `sim::tests` scenarios
+      #     (still running after 25 minutes locally).
+      - name: Run Miri over the runtime context-borrow tests
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: cargo +nightly miri test --locked --lib --no-default-features -- runtime::tests

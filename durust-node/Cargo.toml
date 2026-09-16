@@ -1,0 +1,22 @@
+[package]
+name = "durust-node"
+version = "0.2.1"
+edition = "2024"
+description = "Node binding for the Durust durability providers."
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+durust = { path = "..", default-features = false, features = ["sqlite", "postgres", "s3"] }
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
+napi-derive = "3"
+futures = "0.3"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+
+[build-dependencies]
+napi-build = "2"

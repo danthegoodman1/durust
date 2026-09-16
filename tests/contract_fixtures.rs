@@ -406,7 +406,10 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     );
     assert_fail_activity_outcome(
         &fixture["activityCompletion"]["retryScheduled"],
-        durust::FailActivityOutcome::RetryScheduled { next_attempt: 2 },
+        durust::FailActivityOutcome::RetryScheduled {
+            next_attempt: 2,
+            ready_at: durust::TimestampMs(0),
+        },
     );
 
     let timer_request = fire_due_timers_request_from_fixture(&fixture["timers"]["request"]);
@@ -870,7 +873,7 @@ fn assert_fail_activity_outcome(value: &Value, expected: durust::FailActivityOut
         ("Failed", durust::FailActivityOutcome::Failed { event_id }) => {
             assert_eq!(durust::EventId(u64_field(value, "eventId")), event_id);
         }
-        ("RetryScheduled", durust::FailActivityOutcome::RetryScheduled { next_attempt }) => {
+        ("RetryScheduled", durust::FailActivityOutcome::RetryScheduled { next_attempt, .. }) => {
             assert_eq!(u32_field(value, "attempt"), next_attempt);
         }
         ("AlreadyCompleted", durust::FailActivityOutcome::AlreadyCompleted) => {}
@@ -990,7 +993,6 @@ fn history_event_from_fixture(value: &Value) -> durust::HistoryEvent {
     let data = history_event_data_from_fixture(&value["data"]);
     durust::HistoryEvent {
         event_id: durust::EventId(u64_field(value, "eventId")),
-        event_type: data.event_type(),
         data,
     }
 }
@@ -1058,54 +1060,15 @@ fn fingerprint_fixture_json(fingerprint: durust::CommandFingerprint) -> Value {
     })
 }
 
-fn durable_failure_from_fixture_json(value: &Value) -> durust::DurableFailure {
-    durust::DurableFailure {
-        error_type: value["errorType"]
-            .as_str()
-            .expect("failure errorType")
-            .to_owned(),
-        message: value["message"]
-            .as_str()
-            .expect("failure message")
-            .to_owned(),
-        non_retryable: value["nonRetryable"]
-            .as_bool()
-            .expect("failure nonRetryable"),
-        details: value.get("details").map(payload_ref_from_fixture_json),
-    }
+/// The fixture's payload refs and failures are the canonical serde form of
+/// the Rust types (`kind`-tagged, camelCase, bytes as an array of byte
+/// values in JSON), so they deserialize directly.
+fn payload_ref_from_fixture_json(value: &Value) -> durust::PayloadRef {
+    serde_json::from_value(value.clone()).expect("fixture payload ref should deserialize")
 }
 
-fn payload_ref_from_fixture_json(value: &Value) -> durust::PayloadRef {
-    let codec = codec_from_fixture(value["codec"].as_str().expect("payload codec"));
-    let schema_fingerprint = durust::SchemaFingerprint(
-        value["schemaFingerprint"]
-            .as_str()
-            .expect("payload schemaFingerprint")
-            .to_owned(),
-    );
-    let compression =
-        compression_from_fixture(value["compression"].as_str().expect("payload compression"));
-    assert!(value["encryption"].is_null());
-
-    match value["kind"].as_str().expect("payload kind") {
-        "Inline" => durust::PayloadRef::Inline {
-            codec,
-            schema_fingerprint,
-            compression,
-            encryption: None,
-            bytes: bytes_from_fixture_json(&value["bytes"]),
-        },
-        "Blob" => durust::PayloadRef::Blob {
-            codec,
-            schema_fingerprint,
-            compression,
-            encryption: None,
-            digest: value["digest"].as_str().expect("blob digest").to_owned(),
-            size: value["size"].as_u64().expect("blob size"),
-            uri: value["uri"].as_str().expect("blob uri").to_owned(),
-        },
-        other => panic!("unsupported payload fixture kind {other}"),
-    }
+fn durable_failure_from_fixture_json(value: &Value) -> durust::DurableFailure {
+    serde_json::from_value(value.clone()).expect("fixture durable failure should deserialize")
 }
 
 fn decode_json_payload_value(value: &Value) -> Value {
@@ -1117,33 +1080,6 @@ fn decode_checkout_from_payload_value(value: &Value) -> CheckoutInput {
     let payload = payload_ref_from_fixture_json(value);
     durust::decode_payload::<CheckoutInput>(&payload)
         .expect("fixture checkout payload should decode")
-}
-
-fn codec_from_fixture(value: &str) -> durust::CodecId {
-    match value {
-        "MessagePack" => durust::CodecId::MessagePack,
-        "Json" => durust::CodecId::Json,
-        other => panic!("unsupported fixture codec {other}"),
-    }
-}
-
-fn compression_from_fixture(value: &str) -> durust::CompressionId {
-    match value {
-        "None" => durust::CompressionId::None,
-        other => panic!("unsupported fixture compression {other}"),
-    }
-}
-
-fn bytes_from_fixture_json(value: &Value) -> Vec<u8> {
-    value
-        .as_array()
-        .expect("fixture bytes should be an array")
-        .iter()
-        .map(|byte| {
-            u8::try_from(byte.as_u64().expect("fixture byte should be an integer"))
-                .expect("fixture byte should fit in u8")
-        })
-        .collect()
 }
 
 fn string_field(value: &Value, field: &str) -> String {

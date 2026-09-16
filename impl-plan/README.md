@@ -25,6 +25,8 @@ affected plan file.
 13. [`0014-typescript-parity.md`](0014-typescript-parity.md)
 14. [`0015-review-remediation.md`](0015-review-remediation.md)
 15. [`0016-typescript-remediation.md`](0016-typescript-remediation.md)
+16. [`0017-architecture-hot-path-remediation.md`](0017-architecture-hot-path-remediation.md)
+17. [`0018-simplification-and-core-consolidation.md`](0018-simplification-and-core-consolidation.md)
 
 ## Shared Gate
 

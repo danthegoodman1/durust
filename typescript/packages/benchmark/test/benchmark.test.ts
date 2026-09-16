@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   defaultBenchmarkOptions,
   parseBenchmarkOptions,
-  runBenchmark
+  runBenchmark,
+  type BackendMetricsReport,
+  type BackendOperationReport
 } from "@durust/benchmark";
 
 describe("TypeScript benchmark workload", () => {
@@ -77,8 +79,8 @@ describe("TypeScript benchmark workload", () => {
     expect(result.worker_stats.historyStreamChunks).toBe(0);
     expect(result.worker_stats.historyStreamEvents).toBe(0);
     expect(result.backend_metrics.workflowTaskCommitLatency.samples).toBeGreaterThan(0);
-    expect(result.backend_metrics.operations.commitWorkflowTask.calls).toBeGreaterThan(0);
-    expect(result.backend_metrics.operations.completeActivities.calls).toBeGreaterThan(0);
+    expect(backendOperation(result.backend_metrics, "commitWorkflowTask").calls).toBeGreaterThan(0);
+    expect(backendOperation(result.backend_metrics, "completeActivities").calls).toBeGreaterThan(0);
   });
 
   it("runs the memory child-map workload with bounded fanout", async () => {
@@ -132,15 +134,44 @@ describe("TypeScript benchmark workload", () => {
       workflow_starts: 2,
       ...expectedCounters
     });
-    expect(result.backend_metrics.operations.claimWorkflowTask.calls).toBeGreaterThan(0);
-    expect(result.backend_metrics.operations.commitWorkflowTask.calls).toBeGreaterThan(0);
+    expect(backendOperation(result.backend_metrics, "claimWorkflowTask").calls).toBeGreaterThan(0);
+    expect(backendOperation(result.backend_metrics, "commitWorkflowTask").calls).toBeGreaterThan(0);
     if (mode === "write-ceiling") {
       expect(result.backend_metrics.operations.claimActivityTask).toBeUndefined();
       expect(result.backend_metrics.operations.fireDueTimers).toBeUndefined();
       expect(result.backend_metrics.operations.readSignalInbox).toBeUndefined();
     }
     if (mode === "activity-heartbeat") {
-      expect(result.backend_metrics.operations.heartbeatActivity?.calls).toBe(2);
+      expect(backendOperation(result.backend_metrics, "heartbeatActivity").calls).toBe(2);
     }
   });
 });
+
+/**
+ * Resolve one recorded backend operation, or throw naming the one that is gone.
+ *
+ * `backend_metrics.operations` is a `Record<string, …>`, so an operation the
+ * benchmark stopped recording reads back as `undefined`, and every reachable
+ * shorthand for that turns a disappeared operation into a quieter signal than
+ * it should be: `operations.x!.calls` asserts an invariant nothing checks, and
+ * `operations.x?.calls` hands `toBeGreaterThan` an `undefined` whose failure
+ * message ("expected undefined to be greater than 0") names neither the
+ * operation nor the fact that it vanished. The three `toBeUndefined()`
+ * assertions in the write-ceiling branch deliberately stay as direct index
+ * reads: those want the absent case and already fail loudly on presence.
+ */
+function backendOperation(
+  metrics: BackendMetricsReport,
+  name: string
+): BackendOperationReport {
+  const operation = metrics.operations[name];
+  if (operation === undefined) {
+    const recorded = Object.keys(metrics.operations).sort().join(", ");
+    throw new Error(
+      `benchmark recorded no "${name}" backend operation, so this test can no longer say ` +
+        `anything about it: the benchmark stopped exercising "${name}", or it was renamed. ` +
+        `Recorded operations: ${recorded.length === 0 ? "(none)" : recorded}`
+    );
+  }
+  return operation;
+}

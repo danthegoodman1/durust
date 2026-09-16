@@ -1,3 +1,26 @@
+# The benchmark-threshold database. Distinct from the everyday local container
+# (`durust-pg`, port 5433) and from CI's `services:` container: this is the only
+# Postgres here started with `shared_preload_libraries=pg_stat_statements`, which
+# `packages/benchmark/test/thresholds.test.ts` requires and a GitHub service
+# container cannot provide. Usage is documented in `.github/workflows/ci.yml`,
+# above the step that explains why benchmark thresholds do not run in CI.
+#
+# The image stays on 16-alpine, deliberately, and **must not** be bumped to match
+# CI or the everyday local container without re-recording the baselines first.
+#
+# `packages/benchmark/baselines/postgres-mixed-accepted.json` records
+# `metadata.postgres = "PostgreSQL 16.11 …"` and `metadata.notes` naming this
+# file. Those baselines are what `npm run test:benchmark-thresholds` compares
+# measured throughput, latency and transaction ratios against. Moving the server
+# to a different major version without re-recording does not remove a
+# version-difference-mistaken-for-a-regression — it manufactures one, in the one
+# configuration whose entire job is to make performance comparable run to run.
+#
+# This was bumped to 17-alpine earlier in this pass on the reasoning that CI
+# claims its image "tracks the local development container". That claim is about
+# CI's own service container; this file is a third database with a different port,
+# different credentials and a `pg_stat_statements` preload none of the others
+# have, and its version is pinned by the recorded baseline rather than by CI.
 services:
   postgres:
     image: postgres:16-alpine

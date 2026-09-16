@@ -12,7 +12,7 @@ if (typeof postgresUrl !== "string" || postgresUrl.trim().length === 0) {
 const steps = [
   {
     name: "Postgres provider conformance",
-    args: ["run", "test", "--", "packages/postgres/test/postgres-conformance.test.ts"]
+    args: ["run", "test", "--", "packages/native/test/native-conformance.test.ts"]
   },
   {
     name: "Benchmark thresholds including Postgres smoke",

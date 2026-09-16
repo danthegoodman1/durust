@@ -191,6 +191,48 @@ const LARGE_HISTORY_TIMERS: u64 = 64;
 const HELD_HANDLE_SLEEPS: u64 = 16;
 const CHILD_FANOUT_CHILDREN: u64 = 8;
 
+// Replay of command events that carry bulk inline payloads. `crash_replay`'s
+// two histories are payload-free (one small activity; 64 empty timers), so
+// neither of them prices the command matcher stepping over a payload.
+//
+// `PayloadStorageConfig::inline_threshold_bytes` defaults to 8 KiB, so at the
+// default these inputs would reach replay as blob refs and this bench would
+// measure the opposite of its name. `large_inline_command_worker` raises the
+// threshold; `setup_large_inline_command_replay` asserts the recorded input is
+// still `Inline` so a future default change cannot hollow the bench out.
+const LARGE_INLINE_COMMANDS: u64 = 16;
+const LARGE_INLINE_COMMAND_BYTES: usize = 16 * 1024;
+const LARGE_INLINE_THRESHOLD_BYTES: usize = 1024 * 1024;
+
+#[durust::activity(name = "bench.bulk")]
+async fn bulk(input: LargePayload) -> durust::Result<usize> {
+    Ok(input.body.len())
+}
+
+#[durust::workflow(name = "bench.large-inline-commands", version = 1)]
+async fn large_inline_commands(input: BenchInput) -> durust::Result<usize> {
+    let seed = input.value;
+    let mut handles = Vec::new();
+    for offset in 0..LARGE_INLINE_COMMANDS {
+        let handle = durust::call_activity!(bulk(LargePayload {
+            body: "b".repeat(LARGE_INLINE_COMMAND_BYTES) + &(seed + offset).to_string(),
+        }))
+        .task_queue("activities")
+        .spawn()
+        .await?;
+        handles.push(handle);
+    }
+    // Splits the run into a scheduling task and a replaying task, so the
+    // measured task has to match all `LARGE_INLINE_COMMANDS` recorded
+    // `ActivityScheduled` events before it can drain their completions.
+    durust::sleep(Duration::ZERO).await?;
+    let mut total = 0;
+    for handle in handles {
+        total += handle.result().await?;
+    }
+    Ok(total)
+}
+
 #[durust::workflow(name = "bench.timer-loop-then-signal", version = 1)]
 async fn timer_loop_then_signal(input: BenchInput) -> durust::Result<String> {
     let _input = input.value;
@@ -370,6 +412,19 @@ fn crash_replay(c: &mut Criterion) {
             |backend| {
                 block_on(async {
                     let mut recovered = large_history_worker(backend);
+                    assert!(recovered.run_workflow_once().await.unwrap());
+                });
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    c.bench_function("workflow_replay_large_inline_payload_memory", |b| {
+        b.iter_batched(
+            setup_large_inline_command_replay,
+            |backend| {
+                block_on(async {
+                    let mut recovered = large_inline_command_worker(backend);
                     assert!(recovered.run_workflow_once().await.unwrap());
                 });
             },
@@ -1401,6 +1456,12 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
 }
 
 fn payload_codec(c: &mut Criterion) {
+    // A payload the size of a typical activity input, where the type
+    // fingerprint rather than the bytes dominates the encode.
+    let small = bench_input(21);
+    c.bench_function("payload_encode_messagepack_small", |b| {
+        b.iter(|| durust::encode_payload(black_box(&small)).unwrap());
+    });
     let payload = large_payload();
     c.bench_function("payload_encode_messagepack_64kb", |b| {
         b.iter(|| durust::encode_payload(black_box(&payload)).unwrap());
@@ -1419,31 +1480,6 @@ fn payload_codec(c: &mut Criterion) {
     c.bench_function("payload_decode_json_64kb", |b| {
         b.iter(|| black_box(&json).decode_json::<LargePayload>().unwrap());
     });
-}
-
-fn payload_compression(c: &mut Criterion) {
-    let repetitive = encoded_payload_bytes(&large_payload());
-    let mixed = encoded_payload_bytes(&mixed_large_payload());
-    let repetitive_compressed = zstd::bulk::compress(&repetitive, 3).unwrap();
-    let mixed_compressed = zstd::bulk::compress(&mixed, 3).unwrap();
-
-    let mut group = c.benchmark_group("payload_compression_64kb");
-    group.throughput(Throughput::Bytes(repetitive.len() as u64));
-    group.bench_function("zstd_compress_repetitive_messagepack", |b| {
-        b.iter(|| zstd::bulk::compress(black_box(&repetitive), 3).unwrap());
-    });
-    group.bench_function("zstd_decompress_repetitive_messagepack", |b| {
-        b.iter(|| {
-            zstd::bulk::decompress(black_box(&repetitive_compressed), repetitive.len()).unwrap()
-        });
-    });
-    group.bench_function("zstd_compress_mixed_messagepack", |b| {
-        b.iter(|| zstd::bulk::compress(black_box(&mixed), 3).unwrap());
-    });
-    group.bench_function("zstd_decompress_mixed_messagepack", |b| {
-        b.iter(|| zstd::bulk::decompress(black_box(&mixed_compressed), mixed.len()).unwrap());
-    });
-    group.finish();
 }
 
 #[cfg(feature = "s3")]
@@ -1712,6 +1748,75 @@ fn large_history_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
     Worker::builder(backend)
         .workflow_task_queue("workflows")
         .register_workflow(timer_loop_then_signal)
+        .build()
+}
+
+// Leaves the run one workflow task short of completing, with every bulk
+// `ActivityScheduled` and its completion already committed, so the measured
+// task cold-replays all of them.
+fn setup_large_inline_command_replay() -> MemoryBackend {
+    block_on(async {
+        let backend = MemoryBackend::with_payload_storage(
+            PayloadStorageConfig::new().inline_threshold_bytes(LARGE_INLINE_THRESHOLD_BYTES),
+        );
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<large_inline_commands>(
+                "bench/large-inline-commands",
+                "workflows",
+                bench_input(1),
+            )
+            .await
+            .unwrap();
+        let mut worker = large_inline_command_worker(backend.clone());
+        assert!(worker.run_workflow_once().await.unwrap());
+        let mut completed = 0;
+        loop {
+            let batch = worker.run_activity_batch_once().await.unwrap();
+            if batch == 0 {
+                break;
+            }
+            completed += batch;
+        }
+        assert_eq!(completed, LARGE_INLINE_COMMANDS as usize);
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        drop(worker);
+        // `stream_history_for_replay`, not `stream_history`: the hydrating read
+        // turns a blob ref back into an inline payload and would report
+        // "inline" whatever the backend stored. The replay path takes this
+        // variant, so this is the surface the matcher sees.
+        let scheduled = backend
+            .stream_history_for_replay(durust::StreamHistoryRequest {
+                run_id: run_id.clone(),
+                after_event_id: EventId::ZERO,
+                up_to_event_id: EventId(1_000_000),
+                max_events: 1_000,
+                max_bytes: usize::MAX,
+            })
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .find_map(|event| match event.data {
+                HistoryEventData::ActivityScheduled(scheduled) => Some(scheduled.input),
+                _ => None,
+            })
+            .expect("the replayed history records a scheduled activity");
+        assert!(
+            matches!(scheduled, durust::PayloadRef::Inline { .. }),
+            "the bench payload must reach replay inline; as a blob ref the matcher copies \
+             nothing payload-sized and this bench measures the wrong thing"
+        );
+        backend
+    })
+}
+
+fn large_inline_command_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(large_inline_commands)
+        .register_activity(bulk)
         .build()
 }
 
@@ -2475,16 +2580,6 @@ fn large_payload() -> LargePayload {
     }
 }
 
-fn mixed_large_payload() -> LargePayload {
-    let mut state = 0x1234_5678_u32;
-    let mut body = String::with_capacity(64 * 1024);
-    for _ in 0..64 * 1024 {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        body.push(char::from(b' ' + (state % 95) as u8));
-    }
-    LargePayload { body }
-}
-
 fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
     durust::encode_payload(payload)
         .unwrap()
@@ -2757,9 +2852,35 @@ struct PostgresBenchFixture {
     backend: PostgresBackend,
 }
 
+/// Mirrors `postgres_url_or_skip` in the test suites; see there for why an
+/// unset variable must be able to fail rather than only skip.
+///
+/// This file has no `#[test]`, so a silent skip here cannot produce a green
+/// run of zero coverage the way it could in the suites — and CI only builds
+/// benchmarks (`cargo bench --no-run`), so nothing here executes there today.
+/// It honours the flag anyway so that one variable governs every Postgres
+/// entry point in the workspace, rather than most of them.
 #[cfg(feature = "postgres")]
 fn postgres_benchmark_url() -> Option<String> {
-    env::var("DURUST_POSTGRES_URL").ok()
+    if let Ok(url) = env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
+    }
+    let required = match env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    };
+    assert!(
+        !required,
+        "DURUST_REQUIRE_POSTGRES is set, so the Postgres benchmarks must run, but \
+         DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping Postgres provider benchmarks; set DURUST_POSTGRES_URL");
+    None
 }
 
 #[cfg(feature = "postgres")]
@@ -3405,7 +3526,6 @@ criterion_group!(
     postgres_provider_hot_paths,
     activity_heartbeat,
     payload_codec,
-    payload_compression,
     payload_garage_object_store,
     payload_provider_refs,
     payload_replay,

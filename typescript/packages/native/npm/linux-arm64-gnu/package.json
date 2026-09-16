@@ -1,0 +1,30 @@
+{
+  "name": "@durust/native-linux-arm64-gnu",
+  "version": "0.2.1",
+  "description": "The durust-node addon for linux-arm64-gnu: a platform package of @durust/native.",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "durust-node.linux-arm64-gnu.node",
+  "files": [
+    "durust-node.linux-arm64-gnu.node"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danthegoodman1/durust",
+    "directory": "typescript/packages/native"
+  }
+}

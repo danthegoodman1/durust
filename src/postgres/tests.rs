@@ -1,8 +1,44 @@
 use super::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn postgres_url_from_env() -> Option<String> {
-    std::env::var("DURUST_POSTGRES_URL").ok()
+/// The URL of the Postgres test database, or `None` when this run is not
+/// expected to have one.
+///
+/// Every Postgres test here is environment-gated, and libtest **captures**
+/// `eprintln!` on a passing test, so with `DURUST_POSTGRES_URL` unset the whole
+/// Postgres suite reports `ok` and its skip notices are invisible unless the
+/// run also passes `--nocapture`. That is how these tests ran vacuously in CI.
+///
+/// `DURUST_REQUIRE_POSTGRES` closes the hole: when it is set, a missing URL is
+/// a panic instead of a skip, so a run that is *supposed* to exercise Postgres
+/// fails loudly if the database or the variable goes away. CI sets it next to
+/// its service container; a developer with no database leaves it unset and
+/// still gets the skip.
+fn postgres_url_or_skip(what: &str) -> Option<String> {
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
+    }
+    assert!(
+        !postgres_is_required(),
+        "DURUST_REQUIRE_POSTGRES is set, so `{what}` must run, \
+         but DURUST_POSTGRES_URL is unset or empty"
+    );
+    eprintln!("skipping {what}; set DURUST_POSTGRES_URL");
+    None
+}
+
+/// `DURUST_REQUIRE_POSTGRES` is on for any value except empty, `0` and
+/// `false`, so `=1` reads the obvious way and `=0` is a usable off switch.
+fn postgres_is_required() -> bool {
+    match std::env::var("DURUST_REQUIRE_POSTGRES") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
 }
 
 fn test_schema(prefix: &str) -> String {
@@ -236,8 +272,7 @@ async fn force_terminal_for_tests(backend: &PostgresBackend, schema: &str, run_i
 #[test]
 fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres terminal guard test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres terminal guard test") else {
             return;
         };
         // Every terminal transition clears the workflow claim, so the guard is
@@ -339,15 +374,14 @@ fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when
             );
         }
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_schema_migration_runs_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres schema migration test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres schema migration test") else {
             return;
         };
         let schema = test_schema("schema_migration");
@@ -358,7 +392,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .unwrap();
         assert_eq!(backend.schema(), schema);
         assert_eq!(backend.schema_version().await.unwrap(), 6);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -383,8 +417,7 @@ fn postgres_shard_key_uses_namespace() {
 #[test]
 fn postgres_batch_shard_lease_refresh_preserves_epoch_for_same_owner() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch lease refresh test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres batch lease refresh test") else {
             return;
         };
         let schema = test_schema("batch_lease_refresh");
@@ -481,15 +514,14 @@ fn postgres_batch_shard_lease_refresh_preserves_epoch_for_same_owner() {
             assert_eq!(owner_id.as_deref(), Some("lease-competitor"));
             assert_eq!(*lease_epoch, 2);
         }
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_shard_metadata_is_validated_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres shard metadata test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres shard metadata test") else {
             return;
         };
         let schema = test_schema("shard_metadata");
@@ -542,15 +574,14 @@ fn postgres_shard_metadata_is_validated_when_configured() {
                 .contains("metadata mismatch for `logical_shards`"),
             "unexpected error: {err}"
         );
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_hot_path_ids_use_sequences_without_meta_counters() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres sequence counter test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres sequence counter test") else {
             return;
         };
         let schema = test_schema("hot_path_sequences");
@@ -642,15 +673,14 @@ fn postgres_hot_path_ids_use_sequences_without_meta_counters() {
             .unwrap()
             .get(0);
         assert!(claim_sequence_value > 0);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_claim_honors_shard_filter_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres shard-filter claim test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres shard-filter claim test") else {
             return;
         };
         let schema = test_schema("shard_filter");
@@ -709,15 +739,14 @@ fn postgres_batch_claim_honors_shard_filter_when_configured() {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].workflow_id, target_workflow_id);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_empty_shard_filtered_claim_does_not_acquire_leases() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres empty shard-filter claim test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres empty shard-filter claim test") else {
             return;
         };
         let schema = test_schema("empty_shard_filter");
@@ -755,15 +784,14 @@ fn postgres_empty_shard_filtered_claim_does_not_acquire_leases() {
             assert_eq!(lease_epoch, 0);
             assert_eq!(lease_until_ms, None);
         }
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_stale_shard_owner_cannot_commit_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres stale shard owner test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres stale shard owner test") else {
             return;
         };
         let schema = test_schema("stale_shard_owner");
@@ -845,15 +873,14 @@ fn postgres_stale_shard_owner_cannot_commit_when_configured() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::StaleLease));
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres unfiltered shard lease test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres unfiltered shard lease test") else {
             return;
         };
         let schema = test_schema("unfiltered_shard_claim");
@@ -920,15 +947,14 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
         let leases = shard_leases_for_tests(&backend, &schema, &[shard_id]).await;
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].1.as_deref(), Some("unfiltered-shard-worker"));
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch shard commit test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres batch shard commit test") else {
             return;
         };
         let schema = test_schema("batch_shard_commit");
@@ -1039,15 +1065,14 @@ fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].1.as_deref(), Some("batch-journal-worker"));
         assert_eq!(leases[0].2, acquired_lease_epoch);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_rejects_incompatible_schema_version_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres incompatible schema test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres incompatible schema test") else {
             return;
         };
         let schema = test_schema("schema_version_mismatch");
@@ -1067,7 +1092,7 @@ fn postgres_rejects_incompatible_schema_version_when_configured() {
             err.to_string().contains("has version 999"),
             "unexpected error: {err}"
         );
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1086,8 +1111,7 @@ fn postgres_schema_identifier_is_validated() {
 #[test]
 fn postgres_core_workflow_visibility_round_trip_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres core workflow test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres core workflow test") else {
             return;
         };
         let schema = test_schema("core_workflow");
@@ -1200,22 +1224,54 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             .unwrap();
         assert!(double_claim.is_none());
 
+        // The hidden claim proves a delayed release hides the task only while
+        // the claim round trip fits inside the delay, so the delay has to be
+        // sized from the measured cost of that round trip. Instrumented here
+        // and run across the full lib suite at default parallelism: p50
+        // 1.22 ms, p90 1.57 ms, max 9.13 ms over 12 runs; review measured
+        // 0.79-1.84 ms over 8. Budget is the worst observation rounded up to
+        // ~8x, the same rule the reconnect test below uses, which puts it at
+        // 100 ms and puts the diagnostic threshold at 50 ms — about 5x the
+        // worst value ever seen here, so it is reachable on a slower machine
+        // rather than green by construction.
+        //
+        // An earlier version of this comment set 500 ms and justified it by
+        // claiming suite parallelism pushes the claim above 25 ms. Measurement
+        // contradicts that outright: under load the claim is *faster* than the
+        // unloaded standalone figure, and the original 25 ms budget already had
+        // several times the headroom it needed. The number moved for
+        // uniformity with the reconnect test, not because 25 ms was failing.
+        //
+        // Sleeping to a deadline derived from `released_at` rather than a flat
+        // 40 ms keeps the visible half correct for any delay: the release
+        // committed `ready_at_ms` no later than `released_at`, so this wakes
+        // strictly after the row becomes claimable.
+        const VISIBILITY_DELAY: Duration = Duration::from_millis(100);
+        const VISIBILITY_MARGIN: Duration = Duration::from_millis(100);
         backend
             .release_workflow_task(
                 claimed.claim,
-                crate::WorkflowTaskRelease::delayed(
-                    WorkflowTaskReason::CacheEvicted,
-                    Duration::from_millis(25),
-                ),
+                crate::WorkflowTaskRelease::delayed(VISIBILITY_DELAY),
             )
             .await
             .unwrap();
+        let released_at = std::time::Instant::now();
         let hidden = backend
             .claim_workflow_task(WorkerId::new("postgres-core-worker-c"), claim_opts.clone())
             .await
             .unwrap();
+        let hidden_took = released_at.elapsed();
+        assert!(
+            hidden_took * 2 < VISIBILITY_DELAY,
+            "the claim after a delayed release took {hidden_took:?}, over half the \
+             {VISIBILITY_DELAY:?} delay, so this run measured claim latency rather than delayed \
+             visibility and the hidden assertion below proves nothing"
+        );
         assert!(hidden.is_none());
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(
+            VISIBILITY_DELAY.saturating_sub(released_at.elapsed()) + VISIBILITY_MARGIN,
+        )
+        .await;
         let visible = backend
             .claim_workflow_task(WorkerId::new("postgres-core-worker-d"), claim_opts.clone())
             .await
@@ -1608,15 +1664,14 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             WorkflowChangeVersionStatus::Closed
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_child_start_is_inline_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres child start test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres child start test") else {
             return;
         };
         let schema = test_schema("child_start_inline");
@@ -1786,15 +1841,14 @@ fn postgres_child_start_is_inline_when_configured() {
             child_input_value
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_child_start_conflict_records_failure_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres child conflict test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres child conflict test") else {
             return;
         };
         let schema = test_schema("child_start_conflict");
@@ -1915,15 +1969,14 @@ fn postgres_child_start_conflict_records_failure_when_configured() {
         );
         assert!(failed.failure.non_retryable);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_child_completion_routes_to_parent_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres child completion test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres child completion test") else {
             return;
         };
         let schema = test_schema("child_completion");
@@ -1998,15 +2051,14 @@ fn postgres_child_completion_routes_to_parent_when_configured() {
             child_result
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_parent_close_policy_is_applied_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres parent close test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres parent close test") else {
             return;
         };
         let schema = test_schema("parent_close_policy");
@@ -2129,15 +2181,14 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
             .expect("abandoned child remains claimable");
         assert_eq!(abandoned_child.run_id, abandon_child_run_id);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres cancellation test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres cancellation test") else {
             return;
         };
         let schema = test_schema("cancel_workflow");
@@ -2346,15 +2397,14 @@ fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
             HistoryEventData::WorkflowCancelled { .. }
         ));
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_payload_roots_and_gc_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres payload GC test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres payload GC test") else {
             return;
         };
         let schema = test_schema("payload_gc");
@@ -2495,7 +2545,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         };
         assert_eq!(crate::decode_payload::<String>(input).unwrap(), input_value);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2509,8 +2559,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
 #[test]
 fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres dedup GC refresh test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres dedup GC refresh test") else {
             return;
         };
         let schema = test_schema("dedup_refresh");
@@ -2735,15 +2784,14 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             .unwrap();
         assert_eq!(collected.deleted_blobs, 1);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_cancel_commands_clean_activity_state_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres cancel command test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres cancel command test") else {
             return;
         };
         let schema = test_schema("cancel_commands");
@@ -2920,15 +2968,14 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
             CompleteActivityOutcome::AlreadyCompleted
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres continue-as-new test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres continue-as-new test") else {
             return;
         };
         let schema = test_schema("continue_as_new");
@@ -3029,15 +3076,14 @@ fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
             next_input_value
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres activity map test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres activity map test") else {
             return;
         };
         let schema = test_schema("activity_map");
@@ -3257,15 +3303,14 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
             .collect::<Vec<_>>();
         assert_eq!(results, vec![10, 20, 30]);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_delayed_visibility_survives_reconnect_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres delayed reconnect test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres delayed reconnect test") else {
             return;
         };
         let schema = test_schema("delayed_reconnect");
@@ -3299,16 +3344,36 @@ fn postgres_delayed_visibility_survives_reconnect_when_configured() {
             .await
             .unwrap()
             .expect("workflow task");
+        // Same rule as the round-trip test above: budget is ~8x the worst
+        // observed cost of what must fit inside the window. Here that window
+        // contains a whole `connect_with_config`, which runs the schema
+        // migration. Instrumented in this test across the full lib suite:
+        // min 44.6 ms, p50 49.8 ms, max 53.0 ms over 15 runs, and review
+        // measured a 61.41 ms maximum. Against the previous 75 ms budget that
+        // is 1.22x, which is not a budget — one slow reconnect and the test
+        // failed as a bare `hidden.is_none()` with nothing to say it had
+        // measured connect latency instead; review measured the old budget
+        // failing 6 of 8 loaded runs. 500 ms is ~8x the worst observation and
+        // puts the diagnostic threshold at 250 ms, ~4x it.
+        //
+        // Those multiples are **unloaded**, and the loaded ones are much
+        // tighter. Quoting one condition throughout: under 24 CPU spinners,
+        // the worst anyone has produced here, the reconnect reached 167.9 ms —
+        // 1.49x the 250 ms diagnostic threshold and 2.98x the 500 ms budget.
+        // (A hosted-runner proxy gave 135 ms, 1.85x and 3.70x.) So the
+        // diagnostic is genuinely reachable on CI-class hardware rather than
+        // green by construction, and the budget still clears the worst
+        // observation by ~3x.
+        const VISIBILITY_DELAY: Duration = Duration::from_millis(500);
+        const VISIBILITY_MARGIN: Duration = Duration::from_millis(100);
         backend
             .release_workflow_task(
                 claimed.claim,
-                crate::WorkflowTaskRelease::delayed(
-                    WorkflowTaskReason::CacheEvicted,
-                    Duration::from_millis(75),
-                ),
+                crate::WorkflowTaskRelease::delayed(VISIBILITY_DELAY),
             )
             .await
             .unwrap();
+        let released_at = std::time::Instant::now();
         drop(backend);
 
         let restarted = PostgresBackend::connect_with_config(
@@ -3322,24 +3387,34 @@ fn postgres_delayed_visibility_survives_reconnect_when_configured() {
             .claim_workflow_task(WorkerId::new("postgres-delayed-hidden"), claim_opts.clone())
             .await
             .unwrap();
+        let reconnect_took = released_at.elapsed();
+        assert!(
+            reconnect_took * 2 < VISIBILITY_DELAY,
+            "reconnecting and claiming took {reconnect_took:?}, over half the {VISIBILITY_DELAY:?} \
+             delay, so this run measured connect latency rather than delayed visibility and the \
+             hidden assertion below proves nothing"
+        );
         assert!(hidden.is_none());
-        tokio::time::sleep(Duration::from_millis(90)).await;
+        tokio::time::sleep(
+            VISIBILITY_DELAY.saturating_sub(released_at.elapsed()) + VISIBILITY_MARGIN,
+        )
+        .await;
         let visible = restarted
             .claim_workflow_task(WorkerId::new("postgres-delayed-visible"), claim_opts)
             .await
             .unwrap()
             .expect("workflow task visible after reconnect delay");
-        assert_eq!(visible.reason, WorkflowTaskReason::CacheEvicted);
+        // A release keeps the wake reason the claim carried.
+        assert_eq!(visible.reason, WorkflowTaskReason::WorkflowStarted);
 
-        restarted.drop_schema_for_tests().await.unwrap();
+        restarted.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres reconnect recovery test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres reconnect recovery test") else {
             return;
         };
         let schema = test_schema("reconnect_recovery");
@@ -3524,15 +3599,14 @@ fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured(
             activity_input
         );
 
-        restarted.drop_schema_for_tests().await.unwrap();
+        restarted.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres concurrent claim test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres concurrent claim test") else {
             return;
         };
         let schema = test_schema("concurrent_claims");
@@ -3602,7 +3676,7 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
         backend
             .release_workflow_task(
                 stale_claim.claim.clone(),
-                crate::WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted),
+                crate::WorkflowTaskRelease::immediate(),
             )
             .await
             .unwrap();
@@ -3643,15 +3717,14 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
             }
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch activity claim test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres batch activity claim test") else {
             return;
         };
         let schema = test_schema("batch_activity_claim");
@@ -3819,15 +3892,14 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
                 .is_empty()
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch workflow fast path test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres batch workflow fast path test") else {
             return;
         };
         let schema = test_schema("batch_workflow_fast_path");
@@ -4016,17 +4088,14 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
             .expect("scheduled activity");
         assert_eq!(activity.task.run_id, activity_run);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!(
-                "skipping Postgres batch terminal child fast path test; set DURUST_POSTGRES_URL"
-            );
+        let Some(url) = postgres_url_or_skip("Postgres batch terminal child fast path test") else {
             return;
         };
         let schema = test_schema("batch_workflow_fast_terminal_child");
@@ -4155,17 +4224,14 @@ fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when
             child_result
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!(
-                "skipping Postgres batch child start fast path test; set DURUST_POSTGRES_URL"
-            );
+        let Some(url) = postgres_url_or_skip("Postgres batch child start fast path test") else {
             return;
         };
         let schema = test_schema("batch_workflow_fast_child_start");
@@ -4346,17 +4412,14 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
             child_run_ids
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!(
-                "skipping Postgres batch workflow stale fast path test; set DURUST_POSTGRES_URL"
-            );
+        let Some(url) = postgres_url_or_skip("Postgres batch workflow stale fast path test") else {
             return;
         };
         let schema = test_schema("batch_workflow_fast_stale");
@@ -4415,7 +4478,7 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
         backend
             .release_workflow_task(
                 stale_claim.claim.clone(),
-                crate::WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted),
+                crate::WorkflowTaskRelease::immediate(),
             )
             .await
             .unwrap();
@@ -4479,15 +4542,14 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
             .events;
         assert_eq!(stale_history.len(), 1);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres bulk history test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres bulk history test") else {
             return;
         };
         let schema = test_schema("bulk_history");
@@ -4622,15 +4684,14 @@ fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_config
         assert_eq!(versions.records[1].version, 7);
         assert_eq!(versions.records[1].first_event_id, EventId(2));
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres batch activity completion test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres batch activity completion test") else {
             return;
         };
         let schema = test_schema("batch_activity_completion");
@@ -4783,15 +4844,14 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
         assert_eq!(ready.replay_target_event_id, EventId(5));
         assert_eq!(ready.reason, WorkflowTaskReason::ActivityCompleted);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres multi-run batch completion test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres multi-run batch completion test") else {
             return;
         };
         let schema = test_schema("batch_activity_completion_runs");
@@ -4931,15 +4991,14 @@ fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
             ));
         }
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_batch_activity_completion_preserves_mixed_result_order() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres mixed batch completion test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres mixed batch completion test") else {
             return;
         };
         let schema = test_schema("batch_activity_completion_mixed");
@@ -5092,15 +5151,14 @@ fn postgres_batch_activity_completion_preserves_mixed_result_order() {
             }
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
 #[test]
 fn postgres_activity_retry_failure_and_timeout_when_configured() {
     block_on_tokio(async {
-        let Some(url) = postgres_url_from_env() else {
-            eprintln!("skipping Postgres activity lifecycle test; set DURUST_POSTGRES_URL");
+        let Some(url) = postgres_url_or_skip("Postgres activity lifecycle test") else {
             return;
         };
         let schema = test_schema("activity_lifecycle");
@@ -5218,7 +5276,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             .expect("retry activity first attempt");
         assert_eq!(first.task.activity_id, ActivityId::new(&retry_command_id));
         assert_eq!(first.task.attempt, 1);
-        assert_eq!(
+        assert!(matches!(
             backend
                 .fail_activity(FailActivityRequest {
                     claim: first.claim.clone(),
@@ -5226,8 +5284,11 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
                 })
                 .await
                 .unwrap(),
-            FailActivityOutcome::RetryScheduled { next_attempt: 2 }
-        );
+            FailActivityOutcome::RetryScheduled {
+                next_attempt: 2,
+                ..
+            }
+        ));
         assert!(matches!(
             backend
                 .fail_activity(FailActivityRequest {
@@ -5289,6 +5350,21 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             }
         );
 
+        // Start-to-close is measured from the claim, so the attempt has to be
+        // running before its deadline can lapse.
+        backend
+            .claim_activity_task(
+                WorkerId::new("postgres-timeout-worker"),
+                ClaimActivityOptions {
+                    namespace: crate::Namespace::default(),
+                    task_queue: activity_queue.clone(),
+                    registered_activity_names: vec![crate::ActivityName::new("postgres.timeout")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("timeout activity first attempt");
         let timeout_outcome = backend
             .timeout_due_activities(TimeoutDueActivitiesRequest {
                 namespace: crate::Namespace::default(),
@@ -5331,7 +5407,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
         };
         assert_eq!(timed_out.command_id, timeout_command_id);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -5347,4 +5423,139 @@ fn postgres_transaction_abort_retry_classifier_matches_only_abort_sqlstates() {
         "postgres error SQLSTATE 23505: duplicate key value violates unique constraint".to_owned()
     )));
     assert!(!is_retryable_postgres_transaction_abort(&Error::StaleLease));
+}
+
+/// `InlineChildStartOutcome::Vanished` must be an error at every site, and the
+/// two child shapes must name themselves differently.
+///
+/// This is the shared raise point for all three producers — the scalar commit
+/// path, the batched commit path, and child-map materialization — so pinning it
+/// here covers the batch path, which no integration test drives into this
+/// state. Before the variant was split out it shared a name with "this child
+/// event already exists" and both were dropped by one arm, leaving a plain
+/// child start with no `ChildWorkflowStarted`, no `ChildWorkflowFailed` and no
+/// outbox fallback: the parent waited forever.
+#[test]
+fn a_vanished_child_start_is_an_error_naming_the_child() {
+    let command_id = CommandId {
+        run_id: RunId::new("run-7"),
+        seq: crate::CommandSeq(3),
+    };
+    let plain = ChildStartOutboxMessage {
+        command_id: command_id.clone(),
+        workflow_type: WorkflowType::new("tests.child", 1),
+        workflow_id: crate::WorkflowId::new("wf/child"),
+        task_queue: crate::TaskQueue::new("children"),
+        input: crate::encode_payload(&1_u64).unwrap(),
+        parent_close_policy: ParentClosePolicy::Cancel,
+        child_map_item: None,
+    };
+    let map_item = ChildStartOutboxMessage {
+        child_map_item: Some(ChildWorkflowMapItem {
+            map_command_id: command_id,
+            item_ordinal: 4,
+        }),
+        workflow_id: crate::WorkflowId::new("wf/child/4"),
+        ..plain.clone()
+    };
+
+    for (message, expected) in [
+        (
+            &plain,
+            "child workflow `run-7`:3 could not be started: \
+             workflow instance `wf/child` was deleted mid-transaction",
+        ),
+        (
+            &map_item,
+            "child workflow map `run-7`:3 item 4 could not be started: \
+             workflow instance `wf/child/4` was deleted mid-transaction",
+        ),
+    ] {
+        match child_start_outcome_event_and_reason(message, InlineChildStartOutcome::Vanished) {
+            Err(Error::Backend(actual)) => assert_eq!(actual, expected),
+            other => panic!("a vanished child start must raise, got {other:?}"),
+        }
+    }
+
+    // The ordinary outcomes still produce their events, so the arm above is a
+    // guard rather than a blanket rejection.
+    assert!(matches!(
+        child_start_outcome_event_and_reason(
+            &plain,
+            InlineChildStartOutcome::Started(RunId::new("run-8"))
+        ),
+        Ok((HistoryEventData::ChildWorkflowStarted(_), _))
+    ));
+}
+
+#[test]
+fn postgres_child_map_child_lookup_is_served_by_an_index_when_configured() {
+    block_on_tokio(async {
+        let Some(url) = postgres_url_or_skip("Postgres parent-index plan test") else {
+            return;
+        };
+        // `cancel_child_workflow_map_children_tx` and the fail-fast map effect
+        // applier both find a map's children by parent link. With no index on
+        // those columns that is a sequential scan of every workflow instance —
+        // 8.637 ms at 100k rows against 0.193 ms with the index — so this
+        // asserts the plan, not merely that the index exists: an index the
+        // planner will not use is the same defect wearing a disguise.
+        let schema = test_schema("parent_index");
+        let backend = PostgresBackend::connect_with_config(
+            PostgresBackendConfig::new(url).schema(schema.clone()),
+        )
+        .await
+        .unwrap();
+        let client = backend.client().await.unwrap();
+        let quoted = quote_ident(&schema);
+        // Enough rows that a sequential scan is genuinely the cheaper plan for
+        // a planner with no index to use, so choosing the index is a real
+        // choice rather than an artifact of an empty table.
+        client
+            .batch_execute(&format!(
+                "insert into {quoted}.workflow_instances
+                    (namespace, workflow_id, run_id, workflow_name, workflow_version,
+                     task_queue, current_event_id, terminal, parent_run_id,
+                     parent_command_seq, parent_child_map_ordinal)
+                 select 'default', 'wf/' || i, 'run-' || i, 'w', 1, 'q', 1, false,
+                        case when i <= 20 then 'parent-run' else 'other-' || i end,
+                        case when i <= 20 then 7 else 99 end,
+                        case when i <= 20 then i else null end
+                 from generate_series(1, 4000) i;
+                 analyze {quoted}.workflow_instances;"
+            ))
+            .await
+            .unwrap();
+        let plan = client
+            .query(
+                &format!(
+                    "explain select run_id, current_event_id
+                     from {quoted}.workflow_instances
+                     where parent_run_id = $1
+                       and parent_command_seq = $2
+                       and parent_child_map_ordinal is not null
+                       and terminal = false
+                     order by run_id asc"
+                ),
+                &[&"parent-run", &7_i64],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("idx_workflow_instances_parent"),
+            "finding a map's children must be served by idx_workflow_instances_parent; \
+             without it this query scans every workflow instance and its cost grows with the \
+             database. Plan was:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on workflow_instances"),
+            "the child lookup fell back to a sequential scan. Plan was:\n{plan}"
+        );
+
+        backend.drop_schema().await.unwrap();
+    });
 }
