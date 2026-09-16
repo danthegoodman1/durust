@@ -16,14 +16,38 @@ import { assertPostgresAvailableWhenRequired, postgresUrlFromEnv } from "@durust
 const postgresUrl = postgresUrlFromEnv();
 const postgresStatementStatsRequired = process.env.DURUST_REQUIRE_POSTGRES_STATEMENT_STATS === "1";
 
-// Every accepted baseline below gates throughput through its own
-// `min_processing_*_per_second_ratio`, which is 0.1 — a machine ten times
-// slower than the one that recorded it still passes. Vitest's default 5 s
-// case timeout is a *tighter* wall-clock gate than that, so on a loaded CI
-// runner the clock fired before the comparison ran and reported "Test timed
-// out" instead of the threshold that was actually missed. This is large
-// enough that the baseline comparison stays the thing that fails.
+// The accepted baselines run a full benchmark — 100 to 1000 workflows — so on
+// a loaded runner they need more than Vitest's 5 s default case timeout. This
+// is loose enough that the baseline comparison is what fails.
 const ACCEPTED_BASELINE_TIMEOUT_MS = 120_000;
+
+// Throughput and commit-latency gates measure the host as much as the code.
+// Every baseline here was recorded on a developer machine, and a shared CI
+// runner reaches a fraction of it: one run measured 69.9 mixed actions/s for
+// the sqlite 1-worker profile, where that baseline's 0.1 ratio demands 165.9
+// against the 1659.4 it recorded. Set `DURUST_BENCHMARK_SKIP_SPEED_THRESHOLDS=1`
+// on such a host and every other gate in the baseline still runs —
+// correctness, exact counters, worker stats, operation names, operation errors
+// — while the speed comparison waits for the controlled machine described in
+// `.github/workflows/ci.yml`. `scripts/check-postgres.mjs` refuses to start
+// with this set, so the controlled run cannot silently lose the gate it exists
+// to apply.
+const speedThresholdsSkipped = process.env.DURUST_BENCHMARK_SKIP_SPEED_THRESHOLDS === "1";
+
+/** The baseline with its host-speed gates lifted, for a host that is no performance reference. */
+function withoutSpeedThresholds(baseline: BenchmarkBaseline): BenchmarkBaseline {
+  // The Postgres `*_per_mixed_action*` gates stay. They count statements and
+  // transactions per action, which is work the code chooses and a slow host
+  // does not change.
+  const {
+    min_processing_mixed_actions_per_second_ratio: _minMixedRatio,
+    min_processing_workflows_per_second_ratio: _minWorkflowRatio,
+    max_workflow_task_commit_p95_ratio: _maxCommitRatio,
+    max_workflow_task_commit_p95_ms: _maxCommitMs,
+    ...thresholds
+  } = baseline.thresholds;
+  return { ...baseline, thresholds };
+}
 
 /** The baseline with its statement-statistics gates lifted, for a server that has none. */
 function withoutStatementStatsThresholds(baseline: BenchmarkBaseline): BenchmarkBaseline {
@@ -72,7 +96,7 @@ afterAll(() => {
 
 describe("benchmark threshold comparison", () => {
   it("passes the memory mixed smoke baseline", async () => {
-    const baseline = loadBaseline("memory-mixed-smoke.json");
+    const baseline = loadMeasuredBaseline("memory-mixed-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "memory",
@@ -91,7 +115,7 @@ describe("benchmark threshold comparison", () => {
   });
 
   it("passes the memory child-map smoke baseline", async () => {
-    const baseline = loadBaseline("memory-child-map-smoke.json");
+    const baseline = loadMeasuredBaseline("memory-child-map-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "memory",
@@ -112,7 +136,7 @@ describe("benchmark threshold comparison", () => {
   });
 
   it("passes the memory activity-heartbeat smoke baseline", async () => {
-    const baseline = loadBaseline("memory-activity-heartbeat-smoke.json");
+    const baseline = loadMeasuredBaseline("memory-activity-heartbeat-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "memory",
@@ -131,7 +155,7 @@ describe("benchmark threshold comparison", () => {
   });
 
   it("passes the memory write-ceiling smoke baseline", async () => {
-    const baseline = loadBaseline("memory-write-ceiling-smoke.json");
+    const baseline = loadMeasuredBaseline("memory-write-ceiling-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "memory",
@@ -150,7 +174,7 @@ describe("benchmark threshold comparison", () => {
   });
 
   it("passes the memory mixed accepted-local baseline", async () => {
-    const baseline = loadBaseline("memory-mixed-local-4-worker.json");
+    const baseline = loadMeasuredBaseline("memory-mixed-local-4-worker.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "memory",
@@ -172,7 +196,7 @@ describe("benchmark threshold comparison", () => {
     ["sqlite-mixed-local-1-worker.json", 1],
     ["sqlite-mixed-local-4-worker.json", 4]
   ] as const)("passes the %s accepted baseline", async (baselineName, workers) => {
-    const baseline = loadBaseline(baselineName);
+    const baseline = loadMeasuredBaseline(baselineName);
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "sqlite",
@@ -194,7 +218,7 @@ describe("benchmark threshold comparison", () => {
 
   itPostgres("passes the env-gated Postgres mixed smoke baseline", async () => {
     executedPostgresCases += 1;
-    const baseline = loadBaseline("postgres-mixed-smoke.json");
+    const baseline = loadMeasuredBaseline("postgres-mixed-smoke.json");
     const result = await runBenchmark({
       ...defaultBenchmarkOptions(),
       backend: "postgres",
@@ -223,7 +247,7 @@ describe("benchmark threshold comparison", () => {
     "passes the env-gated Postgres mixed accepted baseline",
     async () => {
       executedPostgresCases += 1;
-      const baseline = loadBaseline("postgres-mixed-accepted.json");
+      const baseline = loadMeasuredBaseline("postgres-mixed-accepted.json");
       const result = await runBenchmark({
         ...defaultBenchmarkOptions(),
         backend: "postgres",
@@ -541,6 +565,16 @@ function loadBaseline(name: string): BenchmarkBaseline {
   return JSON.parse(
     readFileSync(new URL(`../baselines/${name}`, import.meta.url), "utf8")
   ) as BenchmarkBaseline;
+}
+
+/**
+ * The baseline for a case that compares numbers this host measured. Cases that
+ * inject a regression into a result take `loadBaseline` instead: they assert
+ * what the comparison reports, so their gates hold on any host.
+ */
+function loadMeasuredBaseline(name: string): BenchmarkBaseline {
+  const baseline = loadBaseline(name);
+  return speedThresholdsSkipped ? withoutSpeedThresholds(baseline) : baseline;
 }
 
 function postgresSnapshot(
