@@ -3,17 +3,17 @@ use crate::map_engine::{
     MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
     map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
+use crate::payload::ManifestKind;
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
-    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
-    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
-    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
-    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
-    compression_to_str, decode_encryption_metadata, encode_encryption_metadata,
-    event_type_from_str, event_type_to_str, marker_kind_from_str, marker_kind_to_str,
-    parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
-    unix_epoch_millis, wait_kind_to_str,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms_from,
+    activity_timeout_attribution, activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
+    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
+    decode_encryption_metadata, encode_encryption_metadata, event_type_to_str,
+    marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
+    post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
+    retry_visible_at_ms, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityId, ActivityMapInputManifest, ActivityMapInputPage, ActivityMapItem,
@@ -39,8 +39,6 @@ use futures::future::{BoxFuture, ready};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -52,6 +50,9 @@ pub struct SqliteBackend {
     path: PathBuf,
     payload_config: PayloadStorageConfig,
     conn: Arc<Mutex<Connection>>,
+    /// Read for every lease, deadline, and `current_time`; blob and marker
+    /// index timestamps stay on the wall clock.
+    clock: crate::ProviderClock,
 }
 
 impl fmt::Debug for SqliteBackend {
@@ -72,6 +73,14 @@ impl SqliteBackend {
         path: impl AsRef<Path>,
         payload_config: PayloadStorageConfig,
     ) -> Result<Self> {
+        Self::open_with_clock(path, payload_config, crate::ProviderClock::System)
+    }
+
+    pub fn open_with_clock(
+        path: impl AsRef<Path>,
+        payload_config: PayloadStorageConfig,
+        clock: crate::ProviderClock,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let conn = open_sqlite_connection(&path)?;
         configure_journal_mode(&conn)?;
@@ -80,6 +89,7 @@ impl SqliteBackend {
             path,
             payload_config,
             conn: Arc::new(Mutex::new(conn)),
+            clock,
         };
         backend.repair_stalled_empty_maps()?;
         Ok(backend)
@@ -200,6 +210,46 @@ impl SqliteBackend {
         Ok(sqlite_blobs + external_blobs)
     }
 
+    /// The first unconsumed inbox record of every signal name the run holds,
+    /// in received order: what a claim carries in the TypeScript contract.
+    pub fn live_signals(&self, run_id: &RunId) -> Result<Vec<SignalInboxRecord>> {
+        let conn = self.connection()?;
+        let mut stmt = conn
+            .prepare(
+                "select signal_id, signal_name, payload
+                 from signals
+                 where run_id = ?1 and consumed = 0
+                 order by received_sequence asc",
+            )
+            .map_err(sqlite_error)?;
+        let rows = stmt
+            .query_map(params![run_id.0], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(sqlite_error)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let mut records = Vec::new();
+        for row in rows {
+            let (signal_id, signal_name, payload) = row.map_err(sqlite_error)?;
+            if !seen.insert(signal_name.clone()) {
+                continue;
+            }
+            let payload: PayloadRef = rmp_serde::from_slice(&payload)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            let payload = hydrate_payload_from_storage(&conn, &self.payload_config, payload)?;
+            records.push(SignalInboxRecord {
+                signal_id: crate::SignalId::new(signal_id),
+                signal_name: crate::SignalName::new(signal_name),
+                payload,
+            });
+        }
+        Ok(records)
+    }
+
     fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn
             .lock()
@@ -232,7 +282,11 @@ impl SqliteBackend {
             .map_err(sqlite_error)?;
         let rows = stmt
             .query_map(
-                params![req.run_id.0, req.after_event_id.0, req.up_to_event_id.0],
+                params![
+                    req.run_id.0,
+                    i64::try_from(req.after_event_id.0).unwrap_or(i64::MAX),
+                    i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX)
+                ],
                 |row| {
                     Ok((
                         row.get::<_, u64>(0)?,
@@ -246,7 +300,7 @@ impl SqliteBackend {
         let mut events = Vec::new();
         let mut bytes = 0usize;
         for row in rows {
-            let (event_id, event_type, data) = row.map_err(sqlite_error)?;
+            let (event_id, _event_type, data) = row.map_err(sqlite_error)?;
             let mut data: HistoryEventData = rmp_serde::from_slice(&data)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
             let event_bytes = event_payload_len(&data).max(1);
@@ -260,7 +314,6 @@ impl SqliteBackend {
             bytes += event_bytes;
             events.push(HistoryEvent {
                 event_id: EventId(event_id),
-                event_type: event_type_from_str(&event_type)?,
                 data,
             });
             if events.len() >= max_events {
@@ -277,7 +330,11 @@ impl SqliteBackend {
                 "select 1 from history_events
                  where run_id = ?1 and event_id > ?2 and event_id <= ?3
                  limit 1",
-                params![req.run_id.0, last_event_id.0, req.up_to_event_id.0],
+                params![
+                    req.run_id.0,
+                    i64::try_from(last_event_id.0).unwrap_or(i64::MAX),
+                    i64::try_from(req.up_to_event_id.0).unwrap_or(i64::MAX)
+                ],
                 |_| Ok(()),
             )
             .optional()
@@ -385,10 +442,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "workflow `{}` was not found",
-                    req.workflow_id.0
-                )));
+                return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
             };
             if terminal {
                 tx.commit().map_err(sqlite_error)?;
@@ -418,7 +472,7 @@ impl DurableBackend for SqliteBackend {
     }
 
     fn current_time(&self) -> BoxFuture<'static, Result<TimestampMs>> {
-        Box::pin(ready(Ok(TimestampMs(unix_epoch_millis()))))
+        Box::pin(ready(Ok(self.clock.now())))
     }
 
     fn claim_workflow_task(
@@ -431,7 +485,7 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let now_ms = unix_epoch_millis();
+            let now_ms = self.clock.now().0;
             // A held claim blocks reclaiming only while its lease is unexpired.
             // A held claim with a null lease (only possible for rows claimed
             // before the lease column existed) stays unclaimable, failing safe.
@@ -659,22 +713,22 @@ impl DurableBackend for SqliteBackend {
                 insert_history_event(&tx, &claim.run_id, next_event_id, event.data)?;
             }
             for task in schedule_activities {
-                let timeout_at_ms = activity_timeout_at_ms(task.start_to_close_timeout);
                 let task_blob = rmp_serde::to_vec_named(&task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?;
+                // `timeout_at_ms` is stamped by the claim: start-to-close is
+                // measured from the attempt's start.
                 tx.execute(
                     "insert into activity_tasks
                      (activity_id, namespace, run_id, activity_name, task_queue, task,
                       claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
-                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, ?7, null)",
+                     values (?1, ?2, ?3, ?4, ?5, ?6, null, 0, null, null)",
                     params![
                         task.activity_id.0,
                         namespace.as_str(),
                         task.run_id.0,
                         task.activity_name.0,
                         task.task_queue.0,
-                        task_blob,
-                        timeout_at_ms
+                        task_blob
                     ],
                 )
                 .map_err(sqlite_error)?;
@@ -744,7 +798,11 @@ impl DurableBackend for SqliteBackend {
             for message in start_child_workflows {
                 insert_child_outbox(&tx, namespace.as_str(), &message)?;
             }
+            // Fenced to the claimed run, as in the memory provider.
             for wait in batch.upsert_waits {
+                if wait.run_id != claim.run_id {
+                    continue;
+                }
                 tx.execute(
                     "insert into active_waits
                      (wait_id, run_id, command_seq, kind, wait_key, ready_at_ms)
@@ -768,15 +826,15 @@ impl DurableBackend for SqliteBackend {
             }
             for signal_id in batch.consume_signals {
                 tx.execute(
-                    "update signals set consumed = 1 where signal_id = ?1",
-                    params![signal_id.0],
+                    "update signals set consumed = 1 where signal_id = ?1 and run_id = ?2",
+                    params![signal_id.0, claim.run_id.0],
                 )
                 .map_err(sqlite_error)?;
             }
             for wait_id in batch.delete_waits {
                 tx.execute(
-                    "delete from active_waits where wait_id = ?1",
-                    params![wait_id.0],
+                    "delete from active_waits where wait_id = ?1 and run_id = ?2",
+                    params![wait_id.0, claim.run_id.0],
                 )
                 .map_err(sqlite_error)?;
             }
@@ -815,6 +873,10 @@ impl DurableBackend for SqliteBackend {
                     terminal_event.clone()
                 {
                     continue_run_as_new(&tx, &claim.run_id, event)?;
+                    // The commit starts the children it requested and the map items it
+                    // admitted before it commits, as the Postgres provider does; the
+                    // returned tail predates their `ChildWorkflowStarted` events.
+                    dispatch_pending_child_starts(&tx, &config, namespace.as_str(), usize::MAX)?;
                     tx.commit().map_err(sqlite_error)?;
                     return Ok(CommitOutcome::Committed {
                         new_tail_event_id: next_event_id,
@@ -852,9 +914,22 @@ impl DurableBackend for SqliteBackend {
                 ],
             )
             .map_err(sqlite_error)?;
+            // The commit starts the children it requested and the map items it
+            // admitted before it commits, as the Postgres provider does; the
+            // returned tail predates their `ChildWorkflowStarted` events.
+            dispatch_pending_child_starts(&tx, &config, namespace.as_str(), usize::MAX)?;
+            // The tail the caller learns includes what the dispatch appended,
+            // as it does on Postgres.
+            let new_tail_event_id: u64 = tx
+                .query_row(
+                    "select current_event_id from workflow_instances where run_id = ?1",
+                    params![claim.run_id.0],
+                    |row| row.get(0),
+                )
+                .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)?;
             Ok(CommitOutcome::Committed {
-                new_tail_event_id: next_event_id,
+                new_tail_event_id: EventId(new_tail_event_id),
             })
         })();
         Box::pin(ready(result))
@@ -884,7 +959,6 @@ impl DurableBackend for SqliteBackend {
             if claim_token != Some(claim.token) {
                 return Err(Error::StaleLease);
             }
-            let ready_reason = (!terminal).then(|| reason_to_str(&release.reason));
             let ready_at_ms = if terminal {
                 0
             } else {
@@ -892,9 +966,11 @@ impl DurableBackend for SqliteBackend {
             };
             tx.execute(
                 "update workflow_instances
-                 set workflow_claim_token = null, ready_reason = ?1, ready_at_ms = ?2
-                 where run_id = ?3",
-                params![ready_reason, ready_at_ms, claim.run_id.0],
+                 set workflow_claim_token = null,
+                     ready_reason = case when terminal then null else ready_reason end,
+                     ready_at_ms = ?1
+                 where run_id = ?2",
+                params![ready_at_ms, claim.run_id.0],
             )
             .map_err(sqlite_error)?;
             tx.commit().map_err(sqlite_error)
@@ -936,10 +1012,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                return Err(Error::Backend(format!(
-                    "workflow `{}` was not found",
-                    req.workflow_id.0
-                )));
+                return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
             };
             if terminal {
                 return Err(Error::TerminalWorkflow);
@@ -1035,8 +1108,8 @@ impl DurableBackend for SqliteBackend {
                 .prepare(
                     "select w.wait_id, w.run_id, w.command_seq
                      from active_waits w
-                     join workflow_instances i on i.run_id = w.run_id
-                     where i.namespace = ?1
+                     left join workflow_instances i on i.run_id = w.run_id
+                     where (i.namespace = ?1 or i.run_id is null)
                        and w.kind = ?2
                        and w.ready_at_ms is not null
                        and w.ready_at_ms <= ?3
@@ -1209,7 +1282,7 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let now = TimestampMs(unix_epoch_millis());
+            let now = self.clock.now();
             let mut stmt = tx
                 .prepare(
                     "select a.activity_id, a.activity_name, a.task
@@ -1219,7 +1292,6 @@ impl DurableBackend for SqliteBackend {
                        and a.task_queue = ?2
                        and a.completed = 0
                        and a.claim_token is null
-                       and (a.timeout_at_ms is null or a.timeout_at_ms > ?3)
                        and (a.visible_at_ms is null or a.visible_at_ms <= ?3)
                        and i.terminal = 0
                      order by a.rowid asc",
@@ -1245,19 +1317,19 @@ impl DurableBackend for SqliteBackend {
                     let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                         .map_err(|err| Error::PayloadDecode(err.to_string()))?;
                     let task = hydrate_activity_task_from_storage(&tx, &self.payload_config, task)?;
-                    if let Some(map_item) = &task.map_item {
-                        if activity_map_is_completed(&tx, &map_item.map_command_id)? {
-                            tx.execute(
-                                "update activity_tasks
+                    if let Some(map_item) = &task.map_item
+                        && activity_map_is_completed(&tx, &map_item.map_command_id)?
+                    {
+                        tx.execute(
+                            "update activity_tasks
                                  set completed = 1,
                                      heartbeat_deadline_at_ms = null,
                                      implicit_heartbeat_ms = null
                                  where activity_id = ?1",
-                                params![activity_id],
-                            )
-                            .map_err(sqlite_error)?;
-                            continue;
-                        }
+                            params![activity_id],
+                        )
+                        .map_err(sqlite_error)?;
+                        continue;
                     }
                     selected = Some((ActivityId(activity_id), task));
                     break;
@@ -1270,9 +1342,9 @@ impl DurableBackend for SqliteBackend {
                 return Ok(None);
             };
             let token = next_counter(&tx, "claim")?;
-            // Tasks without explicit timeouts get the lease as an implicit
-            // heartbeat interval; explicit deadlines stay authoritative and
-            // the stored timeout_at_ms is untouched by the claim.
+            // Start-to-close is measured from the claim, so the deadline is
+            // stamped here; tasks without explicit timeouts get the lease as
+            // an implicit heartbeat interval instead.
             let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
                 task.start_to_close_timeout,
                 task.heartbeat_timeout,
@@ -1281,11 +1353,13 @@ impl DurableBackend for SqliteBackend {
             tx.execute(
                 "update activity_tasks
                  set claim_token = ?1,
-                     heartbeat_deadline_at_ms = ?2,
-                     implicit_heartbeat_ms = ?3
-                 where activity_id = ?4",
+                     timeout_at_ms = ?2,
+                     heartbeat_deadline_at_ms = ?3,
+                     implicit_heartbeat_ms = ?4
+                 where activity_id = ?5",
                 params![
                     token,
+                    activity_timeout_at_ms_from(now, task.start_to_close_timeout),
                     activity_heartbeat_deadline_at_ms(
                         now,
                         task.heartbeat_timeout,
@@ -1336,8 +1410,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Activity rows exist until their run's terminal cleanup
-                // deletes them, so a missing row is a completed activity.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted);
             };
@@ -1357,7 +1430,7 @@ impl DurableBackend for SqliteBackend {
                  where activity_id = ?2",
                 params![
                     activity_heartbeat_deadline_at_ms(
-                        TimestampMs(unix_epoch_millis()),
+                        self.clock.now(),
                         task.heartbeat_timeout,
                         implicit_heartbeat_ms
                     ),
@@ -1395,7 +1468,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Missing row means the run's terminal cleanup deleted it.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(CompleteActivityOutcome::AlreadyCompleted);
             };
@@ -1490,7 +1563,7 @@ impl DurableBackend for SqliteBackend {
                 .optional()
                 .map_err(sqlite_error)?
             else {
-                // Missing row means the run's terminal cleanup deleted it.
+                missing_activity_outcome(&tx, &req.claim.activity_id)?;
                 tx.commit().map_err(sqlite_error)?;
                 return Ok(FailActivityOutcome::AlreadyCompleted);
             };
@@ -1503,7 +1576,7 @@ impl DurableBackend for SqliteBackend {
             }
             let task: ActivityTask = rmp_serde::from_slice(&task_blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            let decision = activity_failure_decision(&task, req.failure.non_retryable);
+            let decision = activity_failure_decision(&task, &req.failure);
 
             // Map items take the engine route for *both* verdicts: a retry of
             // an item whose map already ended must not reschedule anything,
@@ -1517,7 +1590,7 @@ impl DurableBackend for SqliteBackend {
                 } else {
                     req.failure
                 };
-                let now = TimestampMs(unix_epoch_millis());
+                let now = self.clock.now();
                 let outcome = fail_map_item(
                     &tx,
                     &self.payload_config,
@@ -1551,31 +1624,25 @@ impl DurableBackend for SqliteBackend {
                 // The retry backoff delays visibility; the start-to-close
                 // clock restarts at the visibility instant so the timeout
                 // scanner cannot fire on a task that was never claimable.
-                let now = TimestampMs(unix_epoch_millis());
+                let now = self.clock.now();
                 let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
-                let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
                 tx.execute(
                     "update activity_tasks
                      set task = ?1,
                          claim_token = null,
-                         timeout_at_ms = ?2,
+                         timeout_at_ms = null,
                          heartbeat_deadline_at_ms = null,
                          implicit_heartbeat_ms = null,
-                         visible_at_ms = ?3
-                     where activity_id = ?4",
-                    params![
-                        retry_blob,
-                        activity_timeout_at_ms_from(
-                            visible_from,
-                            retry_task.start_to_close_timeout
-                        ),
-                        visible_at_ms,
-                        req.claim.activity_id.0
-                    ],
+                         visible_at_ms = ?2
+                     where activity_id = ?3",
+                    params![retry_blob, visible_at_ms, req.claim.activity_id.0],
                 )
                 .map_err(sqlite_error)?;
                 tx.commit().map_err(sqlite_error)?;
-                return Ok(FailActivityOutcome::RetryScheduled { next_attempt });
+                return Ok(FailActivityOutcome::RetryScheduled {
+                    next_attempt,
+                    ready_at: visible_at_ms.map(TimestampMs).unwrap_or(now),
+                });
             }
             let failure = normalize_failure_for_storage(&tx, &self.payload_config, req.failure)?;
             let Some((tail, terminal)) = tx
@@ -1632,30 +1699,12 @@ impl DurableBackend for SqliteBackend {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(sqlite_error)?;
-            let limit = req.limit.max(1);
-            let outbox_ids = {
-                let mut stmt = tx
-                    .prepare(
-                        "select outbox_id
-                         from child_outbox
-                         where namespace = ?1 and dispatched = 0
-                         order by outbox_id asc
-                         limit ?2",
-                    )
-                    .map_err(sqlite_error)?;
-                let rows = stmt
-                    .query_map(params![req.namespace.0, limit as i64], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .map_err(sqlite_error)?;
-                rows.collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(sqlite_error)?
-            };
-            let mut dispatched = 0usize;
-            for outbox_id in outbox_ids {
-                dispatch_child_start(&tx, &self.payload_config, &outbox_id)?;
-                dispatched += 1;
-            }
+            let dispatched = dispatch_pending_child_starts(
+                &tx,
+                &self.payload_config,
+                &req.namespace.0,
+                req.limit,
+            )?;
             tx.commit().map_err(sqlite_error)?;
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
         })();
@@ -1695,7 +1744,26 @@ impl DurableBackend for SqliteBackend {
                 })
             })
             .transpose()
-            .map(|outcome| outcome.unwrap_or(crate::QueryProjectionOutcome::NotFound))
+            .and_then(|outcome| match outcome {
+                Some(outcome) => Ok(outcome),
+                None => {
+                    let exists = conn
+                        .query_row(
+                            "select 1 from workflow_instances
+                             where namespace = ?1 and workflow_id = ?2",
+                            params![req.namespace.0, req.workflow_id.0],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(sqlite_error)?
+                        .is_some();
+                    Ok(if exists {
+                        crate::QueryProjectionOutcome::NoProjection
+                    } else {
+                        crate::QueryProjectionOutcome::NotFound
+                    })
+                }
+            })
         })();
         Box::pin(ready(result))
     }
@@ -1819,6 +1887,9 @@ impl DurableBackend for SqliteBackend {
             // makes them reachable commits, so an unreachable-but-young blob
             // may belong to an in-flight commit. Only blobs older than the
             // grace period are garbage.
+            // Blob ages are wall-clock readings, file modified times and the stamps
+            // on `payload_blobs` rows, so the grace period is measured on that clock
+            // rather than on the provider's, which a caller may drive.
             let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
             let mut all_blobs: BTreeMap<String, i64> = {
                 let mut stmt = tx
@@ -1975,7 +2046,12 @@ fn collect_activity_map_payload_roots(
         let task: ActivityMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
         roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+            hydrate_manifest_root(
+                conn,
+                config,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+            )?,
         ));
     }
     drop(stmt);
@@ -2013,7 +2089,12 @@ fn collect_child_workflow_map_payload_roots(
         let task: ChildWorkflowMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
         roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(conn, config, &task.input_manifest)?,
+            hydrate_manifest_root(
+                conn,
+                config,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+            )?,
         ));
     }
     drop(stmt);
@@ -2031,24 +2112,11 @@ fn collect_child_workflow_map_payload_roots(
         let blob = row.map_err(sqlite_error)?;
         let outcome: ChildWorkflowMapItemOutcome =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_child_workflow_map_outcome_payload_roots(&outcome, roots);
+        if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+            roots.push(PayloadRootRef::Payload(payload.clone()));
+        }
     }
     Ok(())
-}
-
-fn collect_child_workflow_map_outcome_payload_roots(
-    outcome: &ChildWorkflowMapItemOutcome,
-    roots: &mut Vec<PayloadRootRef>,
-) {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
-        }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_roots(failure, roots);
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-    }
 }
 
 fn collect_child_outbox_payload_roots(
@@ -2111,118 +2179,62 @@ fn collect_history_event_payload_roots(
     data: &HistoryEventData,
     roots: &mut Vec<PayloadRootRef>,
 ) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            roots.push(PayloadRootRef::Payload(input.clone()));
+    crate::payload::history_event_payload_roots(data, roots, &mut |kind, payload| {
+        hydrate_manifest_root(conn, config, kind, payload)
+    })
+}
+
+/// A manifest root with its bytes in place when this provider holds them.
+fn hydrate_manifest_root(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    kind: ManifestKind,
+    payload: &PayloadRef,
+) -> Result<PayloadRef> {
+    if is_external_payload_ref(config, payload) {
+        return Ok(payload.clone());
+    }
+    match kind {
+        ManifestKind::ActivityMapInput => {
+            hydrate_activity_map_input_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::WorkflowCompleted { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
+        ManifestKind::ActivityMapResult => {
+            hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_roots(failure, roots);
+        ManifestKind::ChildWorkflowMapResult => {
+            hydrate_child_workflow_map_result_manifest_from_storage(conn, config, payload.clone())
         }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ActivityMapResultManifest(
-                activity_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(conn, config, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
-                child_workflow_map_result_root_for_roots(conn, config, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            roots.push(PayloadRootRef::Payload(requested.input.clone()));
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            roots.push(PayloadRootRef::Payload(signal.payload.clone()));
-        }
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)?;
-        }
-        HistoryEventData::WorkflowCancelled { .. }
-        | HistoryEventData::WorkflowTaskStarted
-        | HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => {}
+    }
+}
+
+/// A manifest container's bytes when this provider holds them; `None` leaves
+/// a container in another store unopened.
+fn load_manifest_container(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    payload: &PayloadRef,
+) -> Result<Option<PayloadRef>> {
+    if is_external_payload_ref(config, payload) {
+        Ok(None)
+    } else {
+        hydrate_payload_from_storage(conn, config, payload.clone()).map(Some)
+    }
+}
+
+/// Marks every ref a manifest reaches, the manifest and its pages included.
+fn collect_manifest_refs(
+    conn: &Connection,
+    config: &PayloadStorageConfig,
+    kind: ManifestKind,
+    payload: &PayloadRef,
+    reachable: &mut BTreeSet<String>,
+) -> Result<()> {
+    for payload in crate::payload::manifest_refs(kind, payload, &mut |container| {
+        load_manifest_container(conn, config, container)
+    })? {
+        collect_payload_blob_ref(conn, config, &payload, reachable)?;
     }
     Ok(())
-}
-
-fn collect_failure_payload_roots(failure: &crate::DurableFailure, roots: &mut Vec<PayloadRootRef>) {
-    if let Some(details) = &failure.details {
-        roots.push(PayloadRootRef::Payload(details.clone()));
-    }
-}
-
-fn activity_map_input_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_activity_map_input_manifest_from_storage(conn, config, payload.clone())
-}
-
-fn activity_map_result_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_activity_map_result_manifest_from_storage(conn, config, payload.clone())
-}
-
-fn child_workflow_map_result_root_for_roots(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_child_workflow_map_result_manifest_from_storage(conn, config, payload.clone())
 }
 
 fn collect_history_payload_blobs(
@@ -2280,7 +2292,13 @@ fn collect_activity_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ActivityMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
+        collect_manifest_refs(
+            conn,
+            config,
+            ManifestKind::ActivityMapInput,
+            &task.input_manifest,
+            reachable,
+        )?;
     }
     drop(stmt);
 
@@ -2316,7 +2334,13 @@ fn collect_child_workflow_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let task: ChildWorkflowMapTask =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_activity_map_input_manifest_ref(conn, config, &task.input_manifest, reachable)?;
+        collect_manifest_refs(
+            conn,
+            config,
+            ManifestKind::ActivityMapInput,
+            &task.input_manifest,
+            reachable,
+        )?;
     }
     drop(stmt);
 
@@ -2333,25 +2357,9 @@ fn collect_child_workflow_map_payload_blobs(
         let blob = row.map_err(sqlite_error)?;
         let outcome: ChildWorkflowMapItemOutcome =
             rmp_serde::from_slice(&blob).map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        collect_child_workflow_map_outcome_payload_blobs(conn, config, &outcome, reachable)?;
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_outcome_payload_blobs(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    outcome: &ChildWorkflowMapItemOutcome,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            collect_payload_blob_ref(conn, config, result, reachable)?;
+        if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+            collect_payload_blob_ref(conn, config, payload, reachable)?;
         }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_blobs(conn, config, failure, reachable)?;
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
     }
     Ok(())
 }
@@ -2422,103 +2430,11 @@ fn collect_history_event_payload_blobs(
     data: &HistoryEventData,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            collect_payload_blob_ref(conn, config, input, reachable)
-        }
-        HistoryEventData::WorkflowCompleted { result } => {
-            collect_payload_blob_ref(conn, config, result, reachable)
-        }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_blobs(conn, config, failure, reachable)
-        }
-        HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
-            Ok(())
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            collect_payload_blob_ref(conn, config, &scheduled.input, reachable)
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(
-                conn,
-                config,
-                &scheduled.input_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            collect_activity_map_result_manifest_ref(
-                conn,
-                config,
-                &completed.result_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(
-                conn,
-                config,
-                &scheduled.input_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            collect_child_workflow_map_result_manifest_ref(
-                conn,
-                config,
-                &completed.result_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            collect_payload_blob_ref(conn, config, &completed.result, reachable)
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            collect_payload_blob_ref(conn, config, &requested.input, reachable)
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            collect_payload_blob_ref(conn, config, &completed.result, reachable)
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_blobs(conn, config, &failed.failure, reachable)
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            collect_payload_blob_ref(conn, config, &signal.payload, reachable)
-        }
-    }
-}
-
-fn collect_failure_payload_blobs(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    failure: &crate::DurableFailure,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    if let Some(details) = &failure.details {
-        collect_payload_blob_ref(conn, config, details, reachable)?;
-    }
-    Ok(())
+    crate::payload::history_event_payload_refs(
+        data,
+        &mut |container| load_manifest_container(conn, config, container),
+        &mut |payload| collect_payload_blob_ref(conn, config, payload, reachable),
+    )
 }
 
 fn collect_payload_blob_ref(
@@ -2528,96 +2444,10 @@ fn collect_payload_blob_ref(
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let PayloadRef::Blob { digest, uri, .. } = payload {
-        if is_sqlite_payload_uri(uri) {
+        if is_sqlite_payload_uri(config, uri) {
             load_payload_blob(conn, config, payload, false)?;
         }
         reachable.insert(digest.clone());
-    }
-    Ok(())
-}
-
-fn collect_activity_map_input_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
-        for item in &page.items {
-            collect_payload_blob_ref(conn, config, item, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_activity_map_result_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
-        for result in &page.results {
-            collect_payload_blob_ref(conn, config, result, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_result_manifest_ref(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(conn, config, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(conn, config, payload.clone())?;
-    let manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(conn, config, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(conn, config, page.clone())?;
-        let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
-        for outcome in &page.outcomes {
-            match outcome {
-                crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                    collect_payload_blob_ref(conn, config, result, reachable)?;
-                }
-                crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
-                    collect_failure_payload_blobs(conn, config, failure, reachable)?;
-                }
-                crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-            }
-        }
     }
     Ok(())
 }
@@ -2629,7 +2459,7 @@ fn normalize_history_event_for_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
                     conn,
                     config,
@@ -2639,7 +2469,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest = normalize_activity_map_result_manifest_for_storage(
                     conn,
                     config,
@@ -2649,7 +2479,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = normalize_activity_map_input_manifest_for_storage(
                     conn,
                     config,
@@ -2659,7 +2489,7 @@ fn normalize_history_event_for_storage(
             Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
         }
         HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest =
                     normalize_child_workflow_map_result_manifest_for_storage(
                         conn,
@@ -2682,7 +2512,7 @@ fn hydrate_history_event_from_storage(
 ) -> Result<HistoryEventData> {
     match data {
         HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
                     conn,
                     config,
@@ -2692,7 +2522,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ActivityMapScheduled(scheduled))
         }
         HistoryEventData::ActivityMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
                     conn,
                     config,
@@ -2702,7 +2532,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ActivityMapCompleted(completed))
         }
         HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(&scheduled.input_manifest) {
+            if !is_external_payload_ref(config, &scheduled.input_manifest) {
                 scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
                     conn,
                     config,
@@ -2712,7 +2542,7 @@ fn hydrate_history_event_from_storage(
             Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
         }
         HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            if !is_external_payload_ref(&completed.result_manifest) {
+            if !is_external_payload_ref(config, &completed.result_manifest) {
                 completed.result_manifest =
                     hydrate_child_workflow_map_result_manifest_from_storage(
                         conn,
@@ -2814,7 +2644,7 @@ fn normalize_activity_map_input_manifest_for_storage(
             // owning layer normalized its items before this commit, so it
             // passes through untouched (mirroring the reachability
             // collectors' external-page skip).
-            if is_external_payload_ref(&page) {
+            if is_external_payload_ref(config, &page) {
                 return Ok(page);
             }
             let page = hydrate_payload_from_storage(conn, config, page)?;
@@ -3064,7 +2894,8 @@ fn normalize_payload_for_storage(
         payload @ PayloadRef::Blob { .. } => {
             // Only refs with this provider's schemes are validated against its
             // stores; every other scheme is opaque and persists unchanged.
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(uri)) {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if is_sqlite_payload_uri(config, uri))
+            {
                 load_payload_blob(conn, config, &payload, true)?;
             }
             Ok(payload)
@@ -3080,7 +2911,8 @@ fn hydrate_payload_from_storage(
     match payload {
         payload @ PayloadRef::Inline { .. } => Ok(payload),
         payload @ PayloadRef::Blob { .. } => {
-            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri)) {
+            if matches!(&payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(config, uri))
+            {
                 return Ok(payload);
             }
             let PayloadRef::Blob {
@@ -3193,76 +3025,23 @@ fn load_payload_blob(
     Ok(blob)
 }
 
+fn local_blob_store(config: &PayloadStorageConfig) -> Option<crate::LocalDirectoryBlobStore> {
+    config
+        .blob_store
+        .as_ref()
+        .map(|BlobStoreConfig::LocalDirectory { root, prefix }| {
+            crate::LocalDirectoryBlobStore::new(root.clone(), prefix)
+        })
+}
+
 fn store_external_payload_blob(
     config: &PayloadStorageConfig,
     digest: &str,
     bytes: &[u8],
 ) -> Result<Option<String>> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(None);
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let dir = local_blob_dir(root, prefix);
-            fs::create_dir_all(&dir).map_err(|err| {
-                Error::Backend(format!(
-                    "failed to create local payload blob directory `{}`: {err}",
-                    dir.display()
-                ))
-            })?;
-            let path = dir.join(digest);
-            if path.exists() {
-                let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                let metadata = fs::metadata(&path).map_err(|err| {
-                    Error::Backend(format!(
-                        "failed to inspect local payload blob `{}`: {err}",
-                        path.display()
-                    ))
-                })?;
-                if metadata.len() != expected_size {
-                    return Err(Error::PayloadDecode(format!(
-                        "payload blob size mismatch: expected {expected_size}, got {}",
-                        metadata.len()
-                    )));
-                }
-                // Refresh the mtime so the GC grace period keeps protecting a
-                // blob that this in-flight commit is about to reference; the
-                // digest is re-validated on every read.
-                fs::File::options()
-                    .write(true)
-                    .open(&path)
-                    .and_then(|file| file.set_modified(std::time::SystemTime::now()))
-                    .map_err(|err| {
-                        Error::Backend(format!(
-                            "failed to refresh local payload blob `{}`: {err}",
-                            path.display()
-                        ))
-                    })?;
-                return Ok(Some(local_blob_uri(digest)));
-            }
-            let tmp_path = dir.join(format!("{digest}.tmp-{}", std::process::id()));
-            fs::write(&tmp_path, bytes).map_err(|err| {
-                Error::Backend(format!(
-                    "failed to write local payload blob `{}`: {err}",
-                    tmp_path.display()
-                ))
-            })?;
-            match fs::rename(&tmp_path, &path) {
-                Ok(()) => {}
-                Err(_) if path.exists() => {
-                    let _ = fs::remove_file(&tmp_path);
-                }
-                Err(err) => {
-                    let _ = fs::remove_file(&tmp_path);
-                    return Err(Error::Backend(format!(
-                        "failed to commit local payload blob `{}`: {err}",
-                        path.display()
-                    )));
-                }
-            }
-            Ok(Some(local_blob_uri(digest)))
-        }
-    }
+    local_blob_store(config)
+        .map(|store| store.put_sync(digest, bytes))
+        .transpose()
 }
 
 fn load_external_payload_blob(
@@ -3270,140 +3049,63 @@ fn load_external_payload_blob(
     digest: &str,
     expected_size: &u64,
 ) -> Result<Vec<u8>> {
-    let Some(blob_store) = &config.blob_store else {
+    let Some(store) = local_blob_store(config) else {
         return Err(Error::PayloadDecode(format!(
             "missing payload blob `{digest}`"
         )));
     };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let path = local_blob_path(root, prefix, digest);
-            let bytes = fs::read(&path).map_err(|err| match err.kind() {
-                ErrorKind::NotFound => {
-                    Error::PayloadDecode(format!("missing payload blob `{digest}`"))
-                }
-                _ => Error::PayloadDecode(format!(
-                    "failed to read local payload blob `{}`: {err}",
-                    path.display()
-                )),
-            })?;
-            let actual_digest = digest_bytes(&bytes);
-            if actual_digest != digest {
-                return Err(Error::PayloadDecode(format!(
-                    "payload blob digest mismatch: expected `{digest}`, got `{actual_digest}`"
-                )));
-            }
-            let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-            if actual_size != *expected_size {
-                return Err(Error::PayloadDecode(format!(
-                    "payload blob size mismatch: expected {expected_size}, got {actual_size}"
-                )));
-            }
-            Ok(bytes)
-        }
+    let bytes = store.get_sync(digest)?;
+    let actual_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if actual_size != *expected_size {
+        return Err(Error::PayloadDecode(format!(
+            "payload blob size mismatch: expected {expected_size}, got {actual_size}"
+        )));
     }
+    Ok(bytes)
 }
 
 fn external_blob_listings(config: &PayloadStorageConfig) -> Result<BTreeMap<String, TimestampMs>> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(BTreeMap::new());
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let dir = local_blob_dir(root, prefix);
-            let mut blobs = BTreeMap::new();
-            match fs::read_dir(&dir) {
-                Ok(entries) => {
-                    for entry in entries {
-                        let entry = entry.map_err(|err| {
-                            Error::Backend(format!(
-                                "failed to list local payload blob directory `{}`: {err}",
-                                dir.display()
-                            ))
-                        })?;
-                        let metadata = entry.metadata().map_err(|err| {
-                            Error::Backend(format!(
-                                "failed to inspect local payload blob `{}`: {err}",
-                                entry.path().display()
-                            ))
-                        })?;
-                        if !metadata.is_file() {
-                            continue;
-                        }
-                        let name = entry.file_name().to_string_lossy().into_owned();
-                        if name.contains(".tmp-") {
-                            continue;
-                        }
-                        // A file without a readable mtime counts as brand new
-                        // so GC retains rather than deletes when unsure.
-                        let last_modified = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|modified| {
-                                modified.duration_since(std::time::UNIX_EPOCH).ok()
-                            })
-                            .map(|since_epoch| {
-                                i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
-                            })
-                            .unwrap_or_else(unix_epoch_millis);
-                        blobs.insert(name, TimestampMs(last_modified));
-                    }
-                    Ok(blobs)
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(blobs),
-                Err(err) => Err(Error::Backend(format!(
-                    "failed to list local payload blob directory `{}`: {err}",
-                    dir.display()
-                ))),
-            }
-        }
-    }
+    local_blob_store(config).map_or_else(|| Ok(BTreeMap::new()), |store| store.list_sync())
 }
 
 fn delete_external_blob(config: &PayloadStorageConfig, digest: &str) -> Result<()> {
-    let Some(blob_store) = &config.blob_store else {
-        return Ok(());
-    };
-    match blob_store {
-        BlobStoreConfig::LocalDirectory { root, prefix } => {
-            let path = local_blob_path(root, prefix, digest);
-            match fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(Error::Backend(format!(
-                    "failed to delete local payload blob `{}`: {err}",
-                    path.display()
-                ))),
-            }
-        }
-    }
+    local_blob_store(config).map_or(Ok(()), |store| store.delete_sync(digest))
 }
 
-fn local_blob_dir(root: &Path, prefix: &str) -> PathBuf {
-    if prefix.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(prefix)
-    }
-}
-
-fn local_blob_path(root: &Path, prefix: &str, digest: &str) -> PathBuf {
-    local_blob_dir(root, prefix).join(digest)
-}
-
-fn local_blob_uri(digest: &str) -> String {
-    format!("local://payload/{digest}")
-}
-
-fn is_sqlite_payload_uri(uri: &str) -> bool {
-    uri.starts_with("sqlite://payload/") || uri.starts_with("local://payload/")
+/// Whether this database stores the blob behind a reference: its own
+/// `sqlite://` blobs always, and `local://` blobs only when it was opened with
+/// a local directory store. A `local://` reference with no store configured
+/// belongs to a `PayloadBackend` wrapping this provider, which hydrates it.
+fn is_sqlite_payload_uri(config: &PayloadStorageConfig, uri: &str) -> bool {
+    uri.starts_with("sqlite://payload/")
+        || (config.blob_store.is_some() && uri.starts_with("local://payload/"))
 }
 
 // Every blob ref this provider did not mint is opaque: it belongs to whatever
 // layer owns its scheme (a `PayloadBackend` blob store), so the provider never
 // hydrates, validates, or garbage-collects it.
-fn is_external_payload_ref(payload: &PayloadRef) -> bool {
-    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(uri))
+fn is_external_payload_ref(config: &PayloadStorageConfig, payload: &PayloadRef) -> bool {
+    matches!(payload, PayloadRef::Blob { uri, .. } if !is_sqlite_payload_uri(config, uri))
+}
+
+/// A late call for an activity row that is gone: terminal cleanup deleted it,
+/// so the activity is over, unless the id names a run this database never
+/// held.
+fn missing_activity_outcome(conn: &Connection, activity_id: &ActivityId) -> Result<()> {
+    let run_id = crate::provider_util::activity_run_id(activity_id);
+    let known = conn
+        .query_row(
+            "select 1 from workflow_instances where run_id = ?1",
+            params![run_id.0],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    if known.is_some() {
+        Ok(())
+    } else {
+        Err(Error::RunNotFound(run_id))
+    }
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -4215,6 +3917,51 @@ fn insert_child_outbox(
     Ok(())
 }
 
+/// Starts every undispatched child of the namespace's runs, at most `limit`
+/// of them, and returns how many it started. A commit calls this before it
+/// commits, so the outbox only carries what a later drain may still need.
+fn dispatch_pending_child_starts(
+    tx: &Transaction<'_>,
+    config: &PayloadStorageConfig,
+    namespace: &str,
+    limit: usize,
+) -> Result<usize> {
+    let limit = limit.max(1);
+    let mut dispatched = 0usize;
+    while dispatched < limit {
+        let outbox_ids = {
+            let mut stmt = tx
+                .prepare(
+                    "select outbox_id
+                     from child_outbox
+                     where namespace = ?1 and dispatched = 0
+                     order by outbox_id asc
+                     limit ?2",
+                )
+                .map_err(sqlite_error)?;
+            let rows = stmt
+                .query_map(
+                    params![
+                        namespace,
+                        i64::try_from(limit - dispatched).unwrap_or(i64::MAX)
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(sqlite_error)?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(sqlite_error)?
+        };
+        if outbox_ids.is_empty() {
+            break;
+        }
+        for outbox_id in outbox_ids {
+            dispatch_child_start(tx, config, &outbox_id)?;
+            dispatched += 1;
+        }
+    }
+    Ok(dispatched)
+}
+
 fn dispatch_child_start(
     tx: &Transaction<'_>,
     config: &PayloadStorageConfig,
@@ -4282,7 +4029,7 @@ fn dispatch_child_start(
             if !same_child {
                 let failure = crate::DurableFailure::non_retryable(
                     "durust.child_workflow_id_conflict",
-                    format!("workflow id `{}` is already started", message.workflow_id),
+                    format!("child workflow id already exists: {}", message.workflow_id),
                 );
                 if let Some(item) = message.child_map_item.clone() {
                     complete_child_workflow_map_item(
@@ -4822,7 +4569,7 @@ fn insert_map_item_batch(
                         item_task.activity_name.0,
                         item_task.task_queue.0,
                         item_blob,
-                        activity_timeout_at_ms(item_task.start_to_close_timeout),
+                        None::<i64>,
                     ],
                 )
                 .map_err(sqlite_error)?;
@@ -4859,7 +4606,7 @@ fn schedule_map_item_retry(
     ordinal: u64,
     next_attempt: u32,
     visible_at_ms: Option<i64>,
-    timeout_at_ms: Option<i64>,
+    _timeout_at_ms: Option<i64>,
 ) -> Result<()> {
     let activity_id = ActivityId::map_item(map_command_id, ordinal);
     let Some(task_blob) = tx
@@ -4883,11 +4630,11 @@ fn schedule_map_item_retry(
          set task = ?1,
              claim_token = null,
              visible_at_ms = ?2,
-             timeout_at_ms = ?3,
+             timeout_at_ms = null,
              heartbeat_deadline_at_ms = null,
              implicit_heartbeat_ms = null
-         where activity_id = ?4",
-        params![task_blob, visible_at_ms, timeout_at_ms, activity_id.0],
+         where activity_id = ?3",
+        params![task_blob, visible_at_ms, activity_id.0],
     )
     .map_err(sqlite_error)?;
     Ok(())
@@ -5345,9 +5092,18 @@ fn fail_map_item(
         },
     )?;
     match (decision, appended) {
-        (ItemRetryDecision::Retry { next_attempt }, _) => {
-            Ok(FailActivityOutcome::RetryScheduled { next_attempt })
-        }
+        // A timed-out attempt retries at once; a failed one waits out the
+        // policy's backoff, as `MapEffect::ScheduleItemRetry` schedules them.
+        (ItemRetryDecision::Retry { next_attempt }, _) => Ok(FailActivityOutcome::RetryScheduled {
+            next_attempt,
+            ready_at: if kind == ItemAttemptFailureKind::TimedOut {
+                now
+            } else {
+                retry_visible_at_ms(&task.retry_policy, task.attempt, now)
+                    .map(TimestampMs)
+                    .unwrap_or(now)
+            },
+        }),
         (ItemRetryDecision::Exhausted, Some(event_id)) => {
             Ok(FailActivityOutcome::Failed { event_id })
         }
@@ -5435,9 +5191,10 @@ fn timeout_activity(
     }
 
     if let ActivityFailureDecision::Retry { next_attempt } = decision {
-        // Timeout retries carry no backoff: the expired deadline already
-        // paced this attempt, and delaying crash recovery further would only
-        // add latency.
+        // The stored policy paces a timed-out attempt's retry the way it paces
+        // a failed one, and the start-to-close clock restarts when the retry
+        // becomes visible.
+        let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
         let mut retry_task = task.clone();
         retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -5446,16 +5203,12 @@ fn timeout_activity(
             "update activity_tasks
              set task = ?1,
                  claim_token = null,
-                 timeout_at_ms = ?2,
+                 timeout_at_ms = null,
                  heartbeat_deadline_at_ms = null,
                  implicit_heartbeat_ms = null,
-                 visible_at_ms = null
+                 visible_at_ms = ?2
              where activity_id = ?3",
-            params![
-                retry_blob,
-                activity_timeout_at_ms_from(now, retry_task.start_to_close_timeout),
-                activity_id.0
-            ],
+            params![retry_blob, visible_at_ms, activity_id.0],
         )
         .map_err(sqlite_error)?;
         return Ok(true);
@@ -5809,7 +5562,7 @@ mod tests {
             assert_eq!(
                 events
                     .iter()
-                    .map(|event| event.event_type)
+                    .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
                     crate::HistoryEventType::WorkflowStarted,
@@ -6013,7 +5766,7 @@ mod tests {
             assert_eq!(
                 events
                     .iter()
-                    .map(|event| event.event_type)
+                    .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
                     crate::HistoryEventType::WorkflowStarted,
@@ -6222,6 +5975,9 @@ mod tests {
     // to the parent (silent replay corruption). Follows the Phase 2G legacy
     // reopen pattern: build the history, strip the column with a raw
     // connection, and reopen through `SqliteBackend::open`.
+    // The connection guard spans awaits on purpose: the test inspects rows
+    // through one handle while driving the provider.
+    #[allow(clippy::await_holding_lock)]
     #[test]
     fn sqlite_reopen_backfills_command_seq_and_preserves_child_terminal_dedup() {
         use futures::executor::block_on;
@@ -6297,7 +6053,8 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(dispatched.dispatched, 1);
+            // The commit already started the child.
+            assert_eq!(dispatched.dispatched, 0);
             let child_claim = backend
                 .claim_workflow_task(
                     WorkerId::new("backfill-child-worker"),
@@ -6429,6 +6186,9 @@ mod tests {
         });
     }
 
+    // The connection guard spans awaits on purpose: the test inspects rows
+    // through one handle while driving the provider.
+    #[allow(clippy::await_holding_lock)]
     #[test]
     fn terminal_cleanup_deletes_operational_rows_across_reopen() {
         use futures::executor::block_on;

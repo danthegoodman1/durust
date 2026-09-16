@@ -3,7 +3,6 @@ import { Writable } from "node:stream";
 import { types } from "node:util";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
-  MemoryBackend,
   decodePayload,
   encodePayload,
   eventId,
@@ -16,6 +15,7 @@ import {
   type ClaimedWorkflowTask,
   type PayloadRef
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import {
   HotWorkflowExecution,
   installNondeterminismGuards,
@@ -80,7 +80,8 @@ const fakeClaimed: ClaimedWorkflowTask = {
         input: encodePayload({}, { codec: "Json" })
       }
     }
-  ]
+  ],
+  liveSignals: []
 };
 
 async function runToCommit(
@@ -568,7 +569,7 @@ describe("nondeterminism guard uninstall", () => {
         return Date.now();
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/mid-flight-uninstall"),
       workflowType: reminder.workflowType,

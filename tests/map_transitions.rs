@@ -5,23 +5,16 @@
 //! `typescript/packages/core/test/map-engine.test.ts` — so the Rust and
 //! TypeScript map engines cannot drift apart silently.
 //!
-//! **What this runner asserts, and what it does not.** The table's
-//! `transitions` section is single-step engine cases: descriptor state plus one
-//! event in, an ordered effect list out. This file cannot assert them.
-//! `src/map_engine.rs` is a private module (`mod map_engine;` in `src/lib.rs`,
-//! with `pub(crate)` items) and a Cargo integration test only sees the crate's
-//! public API, so `map_engine::step` is not nameable from here. Exposing it —
-//! a test-only re-export in `src/lib.rs` — turns this file into the same table
-//! walk the TypeScript runner already performs; the fixture records that as
-//! `rustRunnerBlocker`.
-//!
-//! What is asserted here by execution is the table's `fanouts` section: whole
-//! fanouts scripted purely in terms of the public provider API, which the
-//! TypeScript runner replays against `MemoryBackend` too. Those cases pin the
-//! parts of the machine both runtimes must agree on and both can reach — the
-//! `max_in_flight` admission sequence, one replacement admitted per released
-//! slot, and a failed map that abandons its siblings rather than leaving them
-//! completable.
+//! Both sections are asserted. The `transitions` section is single-step engine
+//! cases, descriptor state plus one event in and an ordered effect list out,
+//! replayed through `durust::map_engine::step` (a `#[doc(hidden)]` module
+//! exposed for this runner) with the same projection the TypeScript runner
+//! applies. The `fanouts` section is whole fanouts scripted purely in terms of
+//! the public provider API, which the TypeScript runner replays against
+//! `MemoryBackend` too. Those cases pin the parts of the machine both runtimes
+//! must agree on and both can reach — the `max_in_flight` admission sequence,
+//! one replacement admitted per released slot, and a failed map that abandons
+//! its siblings rather than leaving them completable.
 //!
 //! Deliberately excluded, and asserted to stay excluded: retry delay *values*
 //! (the two runtimes have different policy models) and `ParentCancelled`
@@ -226,6 +219,194 @@ fn shared_table_asserts_the_retired_descriptor_created_predicate() {
         "the table must assert the DescriptorCreated predicate it stopped excluding, \
          for a closed parent as well as an open one"
     );
+}
+
+/// One engine step per table case, projected onto the fields the table
+/// declares normative exactly as `tableEffect` does in
+/// `typescript/packages/core/test/map-engine.test.ts`: payloads, failures, and
+/// reasons are dropped, and the two retry instants reduce to whether they are
+/// set.
+#[test]
+fn shared_table_transitions_replay_through_the_engine() {
+    use durust::map_engine::{
+        ItemAttemptFailureKind, ItemRetryDecision, MapEffect, MapEvent, MapKind, MapReject,
+        MapState, step,
+    };
+    use serde_json::{Value, json};
+
+    let table = load_table();
+    assert_eq!(table.transitions.len(), SHARED_TABLE_TRANSITIONS);
+    let map_command_id = durust::command_id(&durust::RunId::new("run-1"), 7);
+    let failure = durust::DurableFailure::non_retryable("table.item", "item failed");
+    let now = durust::TimestampMs(1_700_000_000_000);
+
+    let outcome = |value: &Value| match value["kind"].as_str().expect("outcome kind") {
+        "Succeeded" => durust::ChildWorkflowMapItemOutcome::Succeeded {
+            result: durust::encode_payload(&1_u64).unwrap(),
+        },
+        "Failed" => durust::ChildWorkflowMapItemOutcome::Failed {
+            failure: failure.clone(),
+        },
+        "Cancelled" => durust::ChildWorkflowMapItemOutcome::Cancelled {
+            reason: "cancelled".to_owned(),
+        },
+        other => panic!("unknown outcome kind `{other}`"),
+    };
+    let project = |effect: &MapEffect| -> Value {
+        match effect {
+            MapEffect::RecordItemOutcome { ordinal, outcome } => json!({
+                "kind": "RecordItemOutcome",
+                "ordinal": ordinal,
+                "outcome": { "kind": match outcome {
+                    durust::ChildWorkflowMapItemOutcome::Succeeded { .. } => "Succeeded",
+                    durust::ChildWorkflowMapItemOutcome::Failed { .. } => "Failed",
+                    durust::ChildWorkflowMapItemOutcome::Cancelled { .. } => "Cancelled",
+                } },
+            }),
+            MapEffect::MaterializeItems {
+                first_ordinal,
+                count,
+            } => json!({
+                "kind": "MaterializeItems", "firstOrdinal": first_ordinal, "count": count,
+            }),
+            MapEffect::AdvanceDescriptor {
+                next_ordinal,
+                in_flight,
+            } => json!({
+                "kind": "AdvanceDescriptor", "nextOrdinal": next_ordinal, "inFlight": in_flight,
+            }),
+            MapEffect::ScheduleItemRetry {
+                ordinal,
+                next_attempt,
+                visible_at_ms,
+                timeout_at_ms,
+            } => {
+                json!({
+                    "kind": "ScheduleItemRetry",
+                    "ordinal": ordinal,
+                    "nextAttempt": next_attempt,
+                    "visibleAtMs": if visible_at_ms.is_some() { "Deferred" } else { "Null" },
+                    "timeoutAtMs": if timeout_at_ms.is_some() { "Present" } else { "Null" },
+                })
+            }
+            MapEffect::CompleteMap { item_count } => json!({
+                "kind": "CompleteMap", "itemCount": item_count,
+            }),
+            MapEffect::FailMap { .. } => json!({ "kind": "FailMap" }),
+            MapEffect::AbandonPendingItems => json!({ "kind": "AbandonPendingItems" }),
+            MapEffect::CancelChildren { .. } => json!({ "kind": "CancelChildren" }),
+            MapEffect::MarkDescriptorTerminal => json!({ "kind": "MarkDescriptorTerminal" }),
+        }
+    };
+
+    for case in &table.transitions {
+        let name = case["name"].as_str().expect("case name");
+        let state_json = &case["state"];
+        let state = MapState {
+            map_command_id: map_command_id.clone(),
+            kind: match state_json["kind"].as_str().expect("state kind") {
+                "Activity" => MapKind::Activity,
+                "ChildWorkflow" => MapKind::ChildWorkflow,
+                other => panic!("{name}: unknown map kind `{other}`"),
+            },
+            failure_mode: match state_json["failureMode"].as_str().expect("failure mode") {
+                "FailFast" => durust::ChildWorkflowMapFailureMode::FailFast,
+                "CollectAll" => durust::ChildWorkflowMapFailureMode::CollectAll,
+                other => panic!("{name}: unknown failure mode `{other}`"),
+            },
+            item_count: state_json["itemCount"].as_u64().expect("itemCount"),
+            next_ordinal: state_json["nextOrdinal"].as_u64().expect("nextOrdinal"),
+            in_flight: state_json["inFlight"].as_u64().expect("inFlight"),
+            max_in_flight: state_json["maxInFlight"].as_u64().expect("maxInFlight") as usize,
+            recorded_outcomes: state_json["recordedOutcomes"]
+                .as_u64()
+                .expect("recordedOutcomes"),
+            completed: state_json["completed"].as_bool().expect("completed"),
+        };
+        let event_json = &case["event"];
+        let event = match event_json["kind"].as_str().expect("event kind") {
+            "DescriptorCreated" => MapEvent::DescriptorCreated {
+                parent_terminal: event_json["parentTerminal"]
+                    .as_bool()
+                    .expect("parentTerminal"),
+            },
+            "ItemCompleted" => MapEvent::ItemCompleted {
+                ordinal: event_json["ordinal"].as_u64().expect("ordinal"),
+                outcome: outcome(&event_json["outcome"]),
+                already_recorded: event_json["alreadyRecorded"]
+                    .as_bool()
+                    .expect("alreadyRecorded"),
+                parent_terminal: event_json["parentTerminal"]
+                    .as_bool()
+                    .expect("parentTerminal"),
+            },
+            "ItemAttemptFailed" => MapEvent::ItemAttemptFailed {
+                ordinal: event_json["ordinal"].as_u64().expect("ordinal"),
+                failure: failure.clone(),
+                kind: match event_json["attemptFailure"]
+                    .as_str()
+                    .expect("attemptFailure")
+                {
+                    "Failed" => ItemAttemptFailureKind::Failed,
+                    "TimedOut" => ItemAttemptFailureKind::TimedOut,
+                    other => panic!("{name}: unknown attempt failure `{other}`"),
+                },
+                decision: match event_json["decision"]["kind"]
+                    .as_str()
+                    .expect("decision kind")
+                {
+                    "Retry" => ItemRetryDecision::Retry {
+                        next_attempt: event_json["decision"]["nextAttempt"]
+                            .as_u64()
+                            .expect("nextAttempt") as u32,
+                    },
+                    "Exhausted" => ItemRetryDecision::Exhausted,
+                    other => panic!("{name}: unknown decision `{other}`"),
+                },
+                failed_attempt: event_json["failedAttempt"].as_u64().expect("failedAttempt") as u32,
+                retry_policy: match event_json["retryBackoff"].as_str().expect("retryBackoff") {
+                    "Immediate" => durust::RetryPolicy::none().max_attempts(9),
+                    "Deferred" => durust::RetryPolicy::exponential().max_attempts(9),
+                    other => panic!("{name}: unknown backoff `{other}`"),
+                },
+                start_to_close_timeout: match event_json["startToCloseTimeout"]
+                    .as_str()
+                    .expect("startToCloseTimeout")
+                {
+                    "Present" => Some(Duration::from_millis(30_000)),
+                    "Null" => None,
+                    other => panic!("{name}: unknown timeout marker `{other}`"),
+                },
+                now,
+                already_recorded: event_json["alreadyRecorded"]
+                    .as_bool()
+                    .expect("alreadyRecorded"),
+                parent_terminal: event_json["parentTerminal"]
+                    .as_bool()
+                    .expect("parentTerminal"),
+            },
+            other => panic!("{name}: the shared table excludes the {other} event"),
+        };
+
+        let expect = &case["expect"];
+        match step(&state, event) {
+            Ok(effects) => {
+                assert_eq!(expect["kind"], "Effects", "{name}: expected a rejection");
+                let projected = effects.iter().map(project).collect::<Vec<_>>();
+                assert_eq!(Value::Array(projected), expect["effects"], "{name}");
+            }
+            Err(reject) => {
+                assert_eq!(expect["kind"], "Reject", "{name}: expected effects");
+                let projected = match reject {
+                    MapReject::OutOfBounds { ordinal } => {
+                        json!({ "kind": "OutOfBounds", "ordinal": ordinal })
+                    }
+                    MapReject::TerminalParent => json!({ "kind": "TerminalParent" }),
+                };
+                assert_eq!(projected, expect["reject"], "{name}");
+            }
+        }
+    }
 }
 
 #[test]

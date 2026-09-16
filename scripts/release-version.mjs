@@ -4,21 +4,22 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
-const rustManifests = ["Cargo.toml", "durust-macros/Cargo.toml", "benchtools/Cargo.toml"];
+const rustManifests = ["Cargo.toml", "durust-macros/Cargo.toml", "benchtools/Cargo.toml", "durust-node/Cargo.toml"];
 const rustPackageNames = new Map([
   ["Cargo.toml", "durust"],
   ["durust-macros/Cargo.toml", "durust-macros"],
-  ["benchtools/Cargo.toml", "durust-benchtools"]
+  ["benchtools/Cargo.toml", "durust-benchtools"],
+  ["durust-node/Cargo.toml", "durust-node"]
 ]);
 const typescriptPackagesRoot = join(repoRoot, "typescript/packages");
 const publishableNpmPackages = [
   "@durust/core",
-  "@durust/payload",
-  "@durust/sqlite",
-  "@durust/postgres",
+  "@durust/native",
   "@durust/testing",
   "@durust/eslint-plugin"
 ];
+/** The platform packages that ship the addon, versioned with everything else. */
+const nativePlatformPackagesRoot = join(typescriptPackagesRoot, "native/npm");
 
 const [command, ...args] = process.argv.slice(2);
 
@@ -114,6 +115,11 @@ function checkVersion(version) {
         }
       }
     }
+    for (const [name, range] of Object.entries(packageJson.optionalDependencies ?? {})) {
+      if (name.startsWith("@durust/native-") && range !== version) {
+        fail(`${packageJson.name} optionalDependencies.${name} is ${range}, expected ${version}`);
+      }
+    }
   }
 }
 
@@ -167,14 +173,24 @@ function updateTypescriptPackage(packageJsonPath, version) {
       }
     }
   }
+  // A platform package must match the facade exactly: the loader trusts the
+  // addon it finds, so a range here could pair a facade with an older ABI.
+  for (const name of Object.keys(packageJson.optionalDependencies ?? {})) {
+    if (name.startsWith("@durust/native-")) {
+      packageJson.optionalDependencies[name] = version;
+    }
+  }
   writeJson(packageJsonPath, packageJson);
 }
 
 function typescriptPackageJsonPaths() {
-  return readdirSync(typescriptPackagesRoot, { withFileTypes: true })
+  const workspacePackages = readdirSync(typescriptPackagesRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
-    .map((entry) => join(typescriptPackagesRoot, entry.name, "package.json"))
-    .sort();
+    .map((entry) => join(typescriptPackagesRoot, entry.name, "package.json"));
+  const platformPackages = readdirSync(nativePlatformPackagesRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => join(nativePlatformPackagesRoot, entry.name, "package.json"));
+  return [...workspacePackages, ...platformPackages].sort();
 }
 
 function matchPackageBlock(contents, manifest) {

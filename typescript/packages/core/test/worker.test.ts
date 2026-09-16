@@ -3,13 +3,14 @@ import vm from "node:vm";
 import { describe, expect, it, vi } from "vitest";
 import {
   Client,
-  MemoryBackend,
   ActivityFailureError,
   ChildWorkflowFailureError,
   ChildWorkflowMapFailureError,
   Registry,
   WorkflowFailureError,
   Worker,
+  WorkflowCodeError,
+  WorkflowFailure,
   activity,
   activityMap,
   activityMapManifest,
@@ -22,16 +23,21 @@ import {
   eventId,
   getVersion,
   heartbeat,
+  join,
   namespace,
+  now,
   runId,
+  select,
   signal,
   sleep,
   workflow,
   workflowId,
   type DurableBackend,
   type HistoryEvent,
-  type WorkerEvent
+  type WorkerEvent,
+  timestampMs
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import {
   HotWorkflowExecutionDisposedError,
   REPLAY_WINDOW_LOOKAHEAD_EVENTS
@@ -278,6 +284,14 @@ const throwsWorkflow = workflow({
   }
 });
 
+const failsWorkflow = workflow({
+  name: "worker.fails",
+  version: 1,
+  handler: async (_input: {}): Promise<void> => {
+    throw new WorkflowFailure("order rejected", { errorType: "OrderRejected" });
+  }
+});
+
 const parentWorkflow = workflow({
   name: "worker.parent",
   version: 1,
@@ -411,7 +425,7 @@ const timerWorkflow = workflow({
 
 describe("Worker", () => {
   it("claims and commits one immediate workflow task", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
@@ -441,7 +455,7 @@ describe("Worker", () => {
       handler: async (input: { readonly sku: string }): Promise<{ readonly cents: number }> =>
         await callActivity(quoteActivity, { sku: input.sku })
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(unqueuedWorkflow)
       .registerActivity(quoteActivity);
@@ -483,7 +497,7 @@ describe("Worker", () => {
     // as already due. Rust's worker takes `now` from `backend.current_time()`
     // once per prepared workflow task.
     let now = 5_000;
-    const backend = new MemoryBackend({ nowMs: () => now });
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const sleeper = workflow({
       name: "worker.clock-relative-timer",
       version: 1,
@@ -527,7 +541,7 @@ describe("Worker", () => {
   });
 
   it("runs workflow and activity polling in a stoppable loop", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -558,7 +572,7 @@ describe("Worker", () => {
   });
 
   it("allows activity handlers to record heartbeats through worker context", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(heartbeatQuoteWorkflow)
       .registerActivity(heartbeatQuoteActivity);
@@ -595,7 +609,7 @@ describe("Worker", () => {
   });
 
   it("resumes workflow with ActivityFailureError after activity start-to-close timeout", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(catchesActivityTimeoutWorkflow)
       .registerActivity(quoteActivity);
@@ -632,7 +646,7 @@ describe("Worker", () => {
   });
 
   it("records structured events and cumulative worker metrics", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const events: WorkerEvent[] = [];
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -680,7 +694,7 @@ describe("Worker", () => {
   });
 
   it("isolates event sink failures from durable processing", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -710,7 +724,7 @@ describe("Worker", () => {
   });
 
   it("batches successful activity completions from the worker loop", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const batchSizes: number[] = [];
     const backend = recordActivityCompletionBatches(inner, batchSizes);
     const registry = new Registry()
@@ -746,8 +760,8 @@ describe("Worker", () => {
     await expect(handle.result()).resolves.toEqual({ cents: 6 });
   });
 
-  it("stops a batched activity loop before claiming another activity after abort", async () => {
-    const inner = new MemoryBackend();
+  it("finishes every activity a batch claimed and claims no more after abort", async () => {
+    const inner = NativeBackend.memory();
     const batchSizes: number[] = [];
     const backend = recordActivityCompletionBatches(inner, batchSizes);
     const registry = new Registry()
@@ -787,33 +801,36 @@ describe("Worker", () => {
     });
     const stopped = await worker.run({
       signal: controller.signal,
-      maxIterations: 4,
+      maxIterations: 64,
       idleBackoffMs: 0,
       errorBackoffMs: 0
     });
 
+    // One batch claim took both activities before the first one's event
+    // raised the abort; both run under the lease the worker holds, and no
+    // further claim follows.
     expect(stopped).toMatchObject({
       stopReason: "abort",
-      activityTasks: 1,
+      activityTasks: 2,
       workflowTasks: 0,
       errors: 0
     });
-    expect(claimedActivityIds).toHaveLength(1);
-    expect(batchSizes).toEqual([1]);
+    expect(claimedActivityIds).toHaveLength(2);
+    expect(batchSizes).toEqual([2]);
 
     await expect(recoveryWorker.run({
-      maxIterations: 4,
+      maxIterations: 64,
       idleBackoffMs: 0,
       errorBackoffMs: 0
     })).resolves.toMatchObject({
-      activityTasks: 1,
+      activityTasks: 0,
       workflowTasks: expect.any(Number)
     });
     await expect(handle.result()).resolves.toEqual({ cents: 6 });
   });
 
   it("stops a batched activity loop after a failed activity without dropping flushed completions", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const batchSizes: number[] = [];
     const backend = recordActivityCompletionBatches(inner, batchSizes);
     const registry = new Registry()
@@ -854,29 +871,36 @@ describe("Worker", () => {
     });
     const stopped = await worker.run({
       signal: controller.signal,
-      maxIterations: 4,
+      maxIterations: 64,
       idleBackoffMs: 0,
       errorBackoffMs: 0
     });
 
+    // The batch claim took all three activities; the failure in the middle
+    // raised the abort, the last one still ran, and both successes reached
+    // the provider in one flush.
     expect(stopped).toMatchObject({
       stopReason: "abort",
-      activityTasks: 2,
-      workflowTasks: 0,
+      activityTasks: 3,
       errors: 0
     });
+    // The workflow loop runs beside the activity loop and may commit the
+    // woken workflow task before the abort reaches it.
+    expect(stopped.workflowTasks).toBeLessThanOrEqual(1);
     expect(events.map((event) => event.kind)).toEqual(
       expect.arrayContaining(["ActivityCompletionBatchFlushed", "ActivityTaskFailed"])
     );
-    expect(events.filter((event) => event.kind === "ActivityTaskClaimed")).toHaveLength(2);
-    expect(batchSizes).toEqual([1]);
+    expect(events.filter((event) => event.kind === "ActivityTaskClaimed")).toHaveLength(3);
+    // How the provider splits the three claims across batch claims is its
+    // own; every success reaches it through a flush, and the failure does not.
+    expect(batchSizes.reduce((sum, size) => sum + size, 0)).toBe(2);
 
     await expect(recoveryWorker.run({
-      maxIterations: 6,
+      maxIterations: 64,
       idleBackoffMs: 0,
       errorBackoffMs: 0
     })).resolves.toMatchObject({
-      activityTasks: 1,
+      activityTasks: 0,
       workflowTasks: expect.any(Number)
     });
     await expect(handle.result()).resolves.toEqual({
@@ -886,7 +910,7 @@ describe("Worker", () => {
   });
 
   it("runs due timer maintenance from the worker loop", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(timerWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
@@ -918,7 +942,7 @@ describe("Worker", () => {
   });
 
   it("stops the worker loop when aborted during idle backoff", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
@@ -935,7 +959,7 @@ describe("Worker", () => {
   });
 
   it("does not poll when the worker loop starts with an already-aborted signal", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
@@ -977,10 +1001,11 @@ describe("Worker", () => {
   });
 
   it("does not start activity polling after aborting during the workflow phase", async () => {
-    const backend = new MemoryBackend();
+    const controller = new AbortController();
+    const afterAbort: string[] = [];
+    const backend = recordCallsAfterAbort(NativeBackend.memory(), controller.signal, afterAbort);
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const controller = new AbortController();
     const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
       activityTaskQueue: "activities",
@@ -1010,22 +1035,27 @@ describe("Worker", () => {
       errorBackoffMs: 0
     });
 
+    // The activity loop runs beside the workflow loop, so it may already hold
+    // the activity the commit scheduled when the abort lands; it finishes that
+    // one and starts no other claim.
     expect(stopped).toMatchObject({
       stopReason: "abort",
       workflowTasks: 1,
-      activityTasks: 0,
       timersFired: 0,
       errors: 0
     });
+    expect(stopped.activityTasks).toBeLessThanOrEqual(1);
+    expect(afterAbort.filter((call) => call.startsWith("claim"))).toEqual([]);
     expect(worker.metrics()).toMatchObject({
       workflowTaskCommits: 1,
-      activityTaskClaims: 0,
+      activityTaskClaims: stopped.activityTasks,
       timersFired: 0
     });
-    await expect(activityWorker.runActivityTaskOnce()).resolves.toMatchObject({
-      kind: "Completed",
-      outcome: { kind: "Completed" }
-    });
+    await expect(activityWorker.runActivityTaskOnce()).resolves.toMatchObject(
+      stopped.activityTasks === 0
+        ? { kind: "Completed", outcome: { kind: "Completed" } }
+        : { kind: "NoTask" }
+    );
     await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({
       kind: "Committed",
       outcome: { kind: "Committed" }
@@ -1034,7 +1064,9 @@ describe("Worker", () => {
   });
 
   it("does not run timer maintenance after aborting during the activity phase", async () => {
-    const backend = new MemoryBackend();
+    const controller = new AbortController();
+    const afterAbort: string[] = [];
+    const backend = recordCallsAfterAbort(NativeBackend.memory(), controller.signal, afterAbort);
     const registry = new Registry()
       .registerWorkflow(quoteWorkflow)
       .registerWorkflow(timerWorkflow)
@@ -1067,7 +1099,6 @@ describe("Worker", () => {
       outcome: { kind: "Committed" }
     });
 
-    const controller = new AbortController();
     const loopWorker = workerFixture(backend, registry, {
       workerId: "loop-worker",
       activityTaskQueue: "activities",
@@ -1086,34 +1117,31 @@ describe("Worker", () => {
       timerMaintenanceLimit: 8
     });
 
+    // The maintenance loop runs beside the activity loop, so the timer may
+    // already have fired when the abort lands; after it, no scan runs.
     expect(stopped).toMatchObject({
       stopReason: "abort",
-      workflowTasks: 0,
       activityTasks: 1,
-      timersFired: 0,
       errors: 0
     });
+    expect(stopped.timersFired).toBeLessThanOrEqual(1);
+    expect(
+      afterAbort.filter((call) => call === "fireDueTimers" || call === "timeoutDueActivities")
+    ).toEqual([]);
     expect(loopWorker.metrics()).toMatchObject({
       activityTaskCompletions: 1,
-      timersFired: 0
+      timersFired: stopped.timersFired
     });
 
     await expect(backend.fireDueTimers({ namespace: namespace(), now: Date.now() + 60_000, limit: 8 }))
-      .resolves.toEqual({ fired: 1 });
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+      .resolves.toEqual({ fired: 1 - stopped.timersFired });
+    await drainWorkflowTasks(setupWorker, 2 - stopped.workflowTasks);
     await expect(timerHandle.result()).resolves.toEqual({ fired: true });
     await expect(quoteHandle.result()).resolves.toEqual({ cents: 5 });
   });
 
   it("does not run activity timeout maintenance after aborting during timer maintenance", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(timerWorkflow)
       .registerWorkflow(catchesActivityTimeoutWorkflow)
@@ -1179,14 +1207,7 @@ describe("Worker", () => {
     await expect(
       backend.timeoutDueActivities({ namespace: namespace(), now: Date.now(), limit: 8 })
     ).resolves.toEqual({ timedOut: 1 });
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
-    await expect(setupWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await drainWorkflowTasks(setupWorker, 2 - stopped.workflowTasks);
     await expect(timerHandle.result()).resolves.toEqual({ fired: true });
     await expect(timeoutHandle.result()).resolves.toMatchObject({
       errorType: "ActivityTimedOut"
@@ -1209,7 +1230,7 @@ describe("Worker", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(abortResumeWorkflow)
       .registerActivity(quoteActivity);
@@ -1291,7 +1312,7 @@ describe("Worker", () => {
           return { cents: quote.cents };
         }
       });
-      const backend = new MemoryBackend();
+      const backend = NativeBackend.memory();
       const registry = new Registry()
         .registerWorkflow(parkedWorkflow)
         .registerActivity(quoteActivity);
@@ -1353,7 +1374,7 @@ describe("Worker", () => {
   });
 
   it("backs off and continues after a transient worker-loop error", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const backend = failFirstWorkflowClaim(inner);
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -1382,7 +1403,7 @@ describe("Worker", () => {
   });
 
   it("stops the worker loop when onError aborts immediately", async () => {
-    const backend = failFirstWorkflowClaim(new MemoryBackend());
+    const backend = failFirstWorkflowClaim(NativeBackend.memory());
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
@@ -1416,7 +1437,7 @@ describe("Worker", () => {
   });
 
   it("stops the worker loop when aborted during error backoff", async () => {
-    const backend = failFirstWorkflowClaim(new MemoryBackend());
+    const backend = failFirstWorkflowClaim(NativeBackend.memory());
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
     const controller = new AbortController();
@@ -1449,12 +1470,11 @@ describe("Worker", () => {
   });
 
   it("hydrates registered signal payloads before polling workflow code", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(signalWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
       workerId: "worker-a",
-      registeredSignalNames: ["approved"],
       payloadCodec: "Json"
     });
     const handle = await client.startWorkflow(
@@ -1478,7 +1498,7 @@ describe("Worker", () => {
   });
 
   it("replays activity completion and commits workflow completion", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -1508,7 +1528,7 @@ describe("Worker", () => {
   });
 
   it("uses cached replay history before streaming missing workflow claim prefetch", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const streamRequests: Parameters<DurableBackend["streamHistory"]>[0][] = [];
     const backend = truncateWorkflowClaimPrefetch(inner, 1, streamRequests);
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
@@ -1553,7 +1573,7 @@ describe("Worker", () => {
   });
 
   it("evicts cached replay history when the workflow history cache is full", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const streamRequests: Parameters<DurableBackend["streamHistory"]>[0][] = [];
     const backend = truncateWorkflowClaimPrefetch(inner, 1, streamRequests);
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
@@ -1624,7 +1644,7 @@ describe("Worker", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(hotQuoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -1677,7 +1697,7 @@ describe("Worker", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(restartWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const firstWorker = workerFixture(backend, registry, {
@@ -1728,7 +1748,7 @@ describe("Worker", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(hotEvictionWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -1774,7 +1794,7 @@ describe("Worker", () => {
 
   it("invalidates a hot workflow execution after a provider commit conflict", async () => {
     let nowMs = 0;
-    const inner = new MemoryBackend({ nowMs: () => nowMs });
+    const inner = NativeBackend.memory({ nowMs: () => nowMs });
     let conflictsRemaining = 1;
     const backend = conflictWorkflowCompletionOnce(inner, () => conflictsRemaining-- > 0);
     const trace: string[] = [];
@@ -1830,7 +1850,7 @@ describe("Worker", () => {
 
   it("disposes a parked hot workflow execution after a commit conflict", async () => {
     let nowMs = 0;
-    const inner = new MemoryBackend({ nowMs: () => nowMs });
+    const inner = NativeBackend.memory({ nowMs: () => nowMs });
     let conflictsRemaining = 1;
     const backend = conflictActivitySchedulingOnce(inner, () => conflictsRemaining-- > 0);
     const trace: string[] = [];
@@ -1901,7 +1921,7 @@ describe("Worker", () => {
   });
 
   it("disposes a parked hot workflow execution after a failed workflow task", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     let failuresRemaining = 1;
     const backend = failActivitySchedulingCommitOnce(inner, () => failuresRemaining-- > 0);
     const trace: string[] = [];
@@ -1965,7 +1985,7 @@ describe("Worker", () => {
   });
 
   it("disposes a parked hot workflow execution evicted from a full execution cache", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const trace: string[] = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
@@ -2039,7 +2059,7 @@ describe("Worker", () => {
   });
 
   it("disposes a parked hot workflow execution when the execution cache is disabled", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const trace: string[] = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
@@ -2108,7 +2128,7 @@ describe("Worker", () => {
   });
 
   it("disposes a hot workflow execution superseded by a cold replay", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const trace: string[] = [];
     const unhandledRejections: unknown[] = [];
     const onUnhandledRejection = (reason: unknown): void => {
@@ -2218,7 +2238,7 @@ describe("Worker", () => {
   });
 
   it("does not run local activity preference after aborting during a workflow task", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -2277,13 +2297,14 @@ describe("Worker", () => {
   });
 
   it("stops local activity preference before the next local claim after abort", async () => {
-    const backend = new MemoryBackend();
+    const controller = new AbortController();
+    const afterAbort: string[] = [];
+    const backend = recordCallsAfterAbort(NativeBackend.memory(), controller.signal, afterAbort);
     const registry = new Registry()
       .registerWorkflow(twoQuoteWorkflow)
       .registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const controller = new AbortController();
     const localCompleted: string[] = [];
     const workflowWorker = workerFixture(backend, registry, {
       workerId: "workflow-local-abort-between-activities",
@@ -2316,32 +2337,35 @@ describe("Worker", () => {
       errorBackoffMs: 0
     });
 
+    // The local preference may have started the second activity before the
+    // abort landed; whichever it completed, the remote worker takes the rest
+    // and no local claim starts after the abort.
     expect(stopped).toMatchObject({
       stopReason: "abort",
       workflowTasks: 1,
-      activityTasks: 1,
       timersFired: 0,
       errors: 0
     });
-    expect(localCompleted).toHaveLength(1);
+    expect(stopped.activityTasks).toBeGreaterThanOrEqual(1);
+    expect(stopped.activityTasks).toBeLessThanOrEqual(2);
+    expect(afterAbort.filter((call) => call.startsWith("claim"))).toEqual([]);
+    expect(localCompleted).toHaveLength(stopped.activityTasks);
     expect(workflowWorker.metrics()).toMatchObject({
       workflowTaskCommits: 1,
-      activityTaskClaims: 1,
-      activityTaskCompletions: 1
+      activityTaskClaims: stopped.activityTasks,
+      activityTaskCompletions: stopped.activityTasks
     });
-    await expect(remoteWorker.runActivityTaskOnce()).resolves.toMatchObject({
-      kind: "Completed",
-      outcome: { kind: "Completed" }
-    });
-    await expect(workflowWorker.runWorkflowTaskOnce()).resolves.toMatchObject({
-      kind: "Committed",
-      outcome: { kind: "Committed" }
-    });
+    await expect(remoteWorker.runActivityTaskOnce()).resolves.toMatchObject(
+      stopped.activityTasks === 1
+        ? { kind: "Completed", outcome: { kind: "Completed" } }
+        : { kind: "NoTask" }
+    );
+    await drainWorkflowTasks(workflowWorker, 1);
     await expect(handle.result()).resolves.toEqual({ cents: 6 });
   });
 
   it("prefers locally registered activities after a workflow task commit", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -2386,7 +2410,7 @@ describe("Worker", () => {
   });
 
   it("falls back to remote activity workers when local capacity is zero", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const remoteRegistry = new Registry().registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -2432,7 +2456,7 @@ describe("Worker", () => {
   });
 
   it("runs an activity map with bounded provider-owned item state", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteMapWorkflow).registerActivity(quoteActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -2479,7 +2503,7 @@ describe("Worker", () => {
   });
 
   it("fails an activity map compactly when a map item fails", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(failingMapWorkflow).registerActivity(failingActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -2518,7 +2542,7 @@ describe("Worker", () => {
   });
 
   it("persists activity handler failures and replays them into workflow code", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(catchesFailureWorkflow)
       .registerActivity(failingActivity);
@@ -2548,7 +2572,7 @@ describe("Worker", () => {
   });
 
   it("runs a child workflow and routes its result back to the parent", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(parentWorkflow)
       .registerWorkflow(childEchoWorkflow);
@@ -2580,14 +2604,48 @@ describe("Worker", () => {
     await expect(handle.result()).resolves.toEqual({ value: "order-1/child" });
   });
 
-  it("persists uncaught workflow handler errors as workflow failures", async () => {
-    const backend = new MemoryBackend();
+  it("releases a workflow task whose handler threw a plain error and keeps the run", async () => {
+    // A plain throw is a workflow-code fault, as a panic is in Rust: nothing
+    // commits, the claim is released with the nondeterminism backoff, and the
+    // next claim replays the run, so a redeploy recovers it.
+    let now = 1_000;
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const registry = new Registry().registerWorkflow(throwsWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
-    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
+    const worker = workerFixture(backend, registry, {
+      workerId: "worker-a",
+      payloadCodec: "Json",
+      nondeterminismRetryBackoffMs: 5_000
+    });
     const handle = await client.startWorkflow(
       throwsWorkflow,
       workflowId("wf/worker-throws"),
+      "workflows",
+      {}
+    );
+
+    const firstAttempt = worker.runWorkflowTaskOnce();
+    await expect(firstAttempt).rejects.toThrow(WorkflowCodeError);
+    await expect(firstAttempt).rejects.toThrow("workflow task threw: workflow exploded");
+    const history = await readHistory(backend, handle.runId, 10);
+    expect(history.events.map((event) => event.eventType)).toEqual(["WorkflowStarted"]);
+
+    // Released with the backoff: not claimable until it elapses, then the
+    // same code replays the run and fails the task again.
+    await expect(worker.runWorkflowTaskOnce()).resolves.toEqual({ kind: "NoTask" });
+    now += 5_000;
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow(WorkflowCodeError);
+    expect((await readHistory(backend, handle.runId, 10)).events).toHaveLength(1);
+  });
+
+  it("commits WorkflowFailed for a handler that throws a durable failure", async () => {
+    const backend = NativeBackend.memory();
+    const registry = new Registry().registerWorkflow(failsWorkflow);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
+    const handle = await client.startWorkflow(
+      failsWorkflow,
+      workflowId("wf/worker-fails"),
       "workflows",
       {}
     );
@@ -2599,8 +2657,9 @@ describe("Worker", () => {
     await expect(handle.result()).rejects.toMatchObject({
       name: "WorkflowFailureError",
       failure: {
-        errorType: "Error",
-        message: "workflow exploded"
+        errorType: "OrderRejected",
+        message: "order rejected",
+        nonRetryable: true
       }
     } satisfies DeepPartial<WorkflowFailureError>);
 
@@ -2612,7 +2671,7 @@ describe("Worker", () => {
   });
 
   it("surfaces child workflow id conflicts to parent replay", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(childConflictParentWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
@@ -2643,7 +2702,7 @@ describe("Worker", () => {
   });
 
   it("runs a child workflow map with compact parent history and ordered results", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(childMapWorkflow)
       .registerWorkflow(childEchoWorkflow);
@@ -2690,7 +2749,7 @@ describe("Worker", () => {
   });
 
   it("materializes child workflow map items up to maxInFlight", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(childMapWorkflow)
       .registerWorkflow(childEchoWorkflow);
@@ -2730,7 +2789,7 @@ describe("Worker", () => {
   });
 
   it("fails a child workflow map compactly when a child workflow id conflicts", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(childMapConflictWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, { workerId: "worker-a", payloadCodec: "Json" });
@@ -2769,7 +2828,7 @@ describe("Worker", () => {
   });
 
   it("cancels running children when the parent closes with Cancel policy", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(parentCancelWorkflow)
       .registerWorkflow(childEchoWorkflow);
@@ -2795,7 +2854,7 @@ describe("Worker", () => {
   });
 
   it("leaves running children claimable when the parent closes with Abandon policy", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(parentAbandonWorkflow)
       .registerWorkflow(childEchoWorkflow);
@@ -2826,7 +2885,7 @@ describe("Worker", () => {
 
 describe("Worker claim release on error paths", () => {
   it("releases workflow claims when workflow registry lookup fails", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const backend = forceWorkflowClaimTypes(inner, [echoWorkflow.workflowType]);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-missing-workflow"), "workflows", {
@@ -2855,7 +2914,7 @@ describe("Worker claim release on error paths", () => {
       version: 1,
       handler: async (input: EchoInput): Promise<EchoOutput> => input
     });
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     // The wrapper claims both types so the unregistered workflow (started
     // first, so claimed first) fails registry lookup inside the batch drain
     // while its echo neighbors remain independently processable.
@@ -2907,21 +2966,22 @@ describe("Worker claim release on error paths", () => {
     expect(reclaimed?.reason).toBe("WorkflowStarted");
   });
 
-  it("releases workflow claims when live signal reads fail", async () => {
-    const inner = new MemoryBackend();
-    const backend = failBackendCall(inner, "readSignalInbox", new Error("signal read failed"));
+  it("releases workflow claims when the clock read fails", async () => {
+    // The provider clock is read once per prepared task, after the claim and
+    // before any execution is built; its failure must hand the claim back.
+    const inner = NativeBackend.memory();
+    const backend = failBackendCall(inner, "currentTime", new Error("clock read failed"));
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-signal-read"), "workflows", {
       value: "ok"
     });
     const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "worker-a",
-      registeredSignalNames: ["approval"],
       leaseDurationMs: 30_000,
       payloadCodec: "Json"
     });
 
-    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("signal read failed");
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow("clock read failed");
 
     const reclaimed = await inner.claimWorkflowTask("worker-b", {
       namespace: namespace(),
@@ -2933,7 +2993,7 @@ describe("Worker claim release on error paths", () => {
   });
 
   it("releases workflow claims when replay history streaming fails", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const truncated = truncateWorkflowClaimPrefetch(inner, 0, []);
     const backend = failBackendCall(truncated, "streamHistory", new Error("stream failed"));
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -2959,7 +3019,7 @@ describe("Worker claim release on error paths", () => {
   });
 
   it("releases workflow claims when commit fails", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const backend = failBackendCall(inner, "commitWorkflowTask", new Error("commit failed"));
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     await client.startWorkflow(echoWorkflow, workflowId("wf/release-commit"), "workflows", {
@@ -2984,7 +3044,7 @@ describe("Worker claim release on error paths", () => {
 
   it("delays released workflow claims after nondeterminism errors", async () => {
     let now = 1_000;
-    const backend = new MemoryBackend({ nowMs: () => now });
+    const backend = NativeBackend.memory({ nowMs: () => now });
     const nondeterministicWorkflow = workflow({
       name: "worker.nondeterministic-release",
       version: 1,
@@ -3031,7 +3091,7 @@ describe("Worker claim release on error paths", () => {
   });
 
   it("fails unregistered activity claims instead of dropping them until lease expiry", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const backend = forceActivityClaimNames(inner, [quoteActivity.name]);
     const registry = new Registry().registerWorkflow(quoteWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
@@ -3096,7 +3156,7 @@ describe("Worker run loops", () => {
       }
     });
 
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(parkedWorkflow)
       .registerWorkflow(echoWorkflow)
@@ -3167,7 +3227,7 @@ describe("Worker run loops", () => {
   });
 
   it("completes an activity while every workflow claim fails", async () => {
-    const inner = new MemoryBackend();
+    const inner = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(quoteWorkflow).registerActivity(quoteActivity);
     const client = new Client(inner, { namespace: namespace(), payloadCodec: "Json" });
     const setupWorker = workerFixture(inner, registry, {
@@ -3241,7 +3301,7 @@ describe("Worker run loops", () => {
     const maintenanceIntervalMs = 100;
     const timerScans: number[] = [];
     const timeoutScans: number[] = [];
-    const backend = recordMaintenanceScans(new MemoryBackend(), timerScans, timeoutScans);
+    const backend = recordMaintenanceScans(NativeBackend.memory(), timerScans, timeoutScans);
     const registry = new Registry().registerWorkflow(echoWorkflow);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const controller = new AbortController();
@@ -3306,7 +3366,7 @@ describe("Worker run loops", () => {
   });
 
   it("polls activities while the workflow loop is saturated with back-to-back tasks", async () => {
-    // MemoryBackend settles every call on the microtask queue, so a loop that
+    // NativeBackend settles every call on the microtask queue, so a loop that
     // makes progress every pass holds the thread unless it yields deliberately.
     // This is the converse of the parked-activity test: there the busy loop
     // awaits a real promise and yields for free.
@@ -3327,7 +3387,7 @@ describe("Worker run loops", () => {
   });
 
   const runSaturatedWorkflowLoopScenario = async (): Promise<void> => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(echoWorkflow)
       .registerWorkflow(quoteWorkflow)
@@ -3408,7 +3468,7 @@ describe("Worker run loops", () => {
     try {
       const scheduleFor = async (workerIdValue: string): Promise<readonly number[]> => {
         const scans: number[] = [];
-        const backend = recordMaintenanceScans(new MemoryBackend(), scans, []);
+        const backend = idleBackend(scans);
         const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
           workerId: workerIdValue,
           payloadCodec: "Json"
@@ -3478,7 +3538,7 @@ describe("Worker run loops", () => {
       });
 
       const calls: string[] = [];
-      const backend = recordBackendCalls(new MemoryBackend(), calls);
+      const backend = recordBackendCalls(NativeBackend.memory(), calls);
       const registry = new Registry()
         .registerWorkflow(parkedWorkflow)
         .registerActivity(parkedActivity);
@@ -3574,7 +3634,7 @@ describe("Worker run loops", () => {
         }
       });
 
-      const inner = new MemoryBackend();
+      const inner = NativeBackend.memory();
       const registry = new Registry()
         .registerWorkflow(parkedWorkflow)
         .registerActivity(parkedActivity);
@@ -3660,7 +3720,7 @@ describe("Worker run loops", () => {
         }
       });
 
-      const inner = new MemoryBackend();
+      const inner = NativeBackend.memory();
       const registry = new Registry()
         .registerWorkflow(parkedWorkflow)
         .registerActivity(parkedActivity);
@@ -3744,7 +3804,7 @@ describe("Worker run loops", () => {
       // cancel an outstanding backend call, so the workflow loop still reaches
       // its own rethrowing `onError` afterwards.
       const backend = failBackendCallAfter(
-        failBackendCall(new MemoryBackend(), "fireDueTimers", new Error("timers exploded")),
+        failBackendCall(NativeBackend.memory(), "fireDueTimers", new Error("timers exploded")),
         "claimWorkflowTask",
         new Error("workflow claim exploded"),
         30
@@ -3782,7 +3842,7 @@ describe("Worker run loops", () => {
       },
       {
         name: "runWorkflowTaskBatchOnce",
-        claim: "claimWorkflowTask",
+        claim: "claimWorkflowTasks",
         foreignClaim: "claimActivityTask",
         drive: async (worker: Worker) => await worker.runWorkflowTaskBatchOnce(1)
       },
@@ -3794,7 +3854,7 @@ describe("Worker run loops", () => {
       },
       {
         name: "runActivityTaskBatchOnce",
-        claim: "claimActivityTask",
+        claim: "claimActivityTasks",
         foreignClaim: "claimWorkflowTask",
         drive: async (worker: Worker) => await worker.runActivityTaskBatchOnce(1)
       }
@@ -3802,7 +3862,7 @@ describe("Worker run loops", () => {
 
     for (const testCase of cases) {
       const calls: string[] = [];
-      const backend = recordBackendCalls(new MemoryBackend(), calls);
+      const backend = recordBackendCalls(NativeBackend.memory(), calls);
       const registry = new Registry()
         .registerWorkflow(quoteWorkflow)
         .registerActivity(quoteActivity);
@@ -3843,7 +3903,7 @@ describe("Worker run loops", () => {
 
   it("keeps runActivityTimeoutMaintenanceOnce to a single timeout scan", async () => {
     const calls: string[] = [];
-    const backend = recordBackendCalls(new MemoryBackend(), calls);
+    const backend = recordBackendCalls(NativeBackend.memory(), calls);
     const worker = workerFixture(backend, new Registry().registerWorkflow(echoWorkflow), {
       workerId: "one-shot-timeout-maintenance",
       payloadCodec: "Json"
@@ -3886,7 +3946,7 @@ describe("Worker hot join settlement", () => {
   });
 
   it("settles a joinAll whose branches complete in separate hot tasks", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(joinWorkflow).registerActivity(joinQuote);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const worker = workerFixture(backend, registry, {
@@ -3973,7 +4033,7 @@ describe("Worker replay window reserve", () => {
     historyFetchMaxEvents: number
   ): Promise<readonly string[]> {
     const definition = markerStormWorkflow(`worker.marker-storm-${label}`, markers, swallow);
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry().registerWorkflow(definition).registerActivity(markerActivity);
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const recorder = workerFixture(backend, registry, {
@@ -4097,11 +4157,11 @@ describe("Worker replay memory", () => {
   // Builds a long real history, then leaves the final workflow task unrun so a
   // fresh worker has to cold-replay all of it.
   async function buildLongHistory(steps: number, runs = 1): Promise<{
-    readonly backend: MemoryBackend;
+    readonly backend: NativeBackend;
     readonly registry: Registry;
     readonly historyEvents: number;
   }> {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const registry = new Registry()
       .registerWorkflow(memoryWorkflow)
       .registerActivity(memoryActivity);
@@ -4227,7 +4287,10 @@ describe("Worker replay memory", () => {
     // window back up to the reserve, so a correct replay is always holding at
     // least that much. Without this the assertions above would also pass on a
     // measurement that had collapsed to nothing.
-    const reserveFloorBytes = 2 * REPLAY_WINDOW_LOOKAHEAD_EVENTS * memoryPayloadBytes * 0.8;
+    // Events reach the worker decoded from the addon's msgpack, which retains
+    // less per event than the old in-process provider's shared objects did, so
+    // the floor only proves the window holds a real share of its lookahead.
+    const reserveFloorBytes = 2 * REPLAY_WINDOW_LOOKAHEAD_EVENTS * memoryPayloadBytes * 0.2;
     expect(retainedSmall).toBeGreaterThan(reserveFloorBytes);
     expect(retainedLarge).toBeGreaterThan(reserveFloorBytes);
 
@@ -4306,7 +4369,7 @@ describe("Worker replay memory", () => {
     expect(historyBytes).toBeGreaterThan(cacheBudget * 2);
     // Floor: the cache really did retain something, so the measurement is live
     // rather than collapsed.
-    expect(cacheRetained).toBeGreaterThan(cacheBudget * 0.25);
+    expect(cacheRetained).toBeGreaterThan(cacheBudget * 0.05);
     // Ceiling: and it stayed inside its budget, with room for the per-entry
     // bookkeeping the budget does not count.
     expect(cacheRetained).toBeLessThan(cacheBudget * 2);
@@ -4708,6 +4771,70 @@ function failBackendCallAfter<K extends keyof DurableBackend>(
 
 // Records the wall-clock instant of every maintenance scan so a test can assert
 // the cadence itself, not just the call count.
+/**
+ * Runs `worker.runWorkflowTaskOnce()` until it finds nothing, asserting each
+ * task committed and that at least `atLeast` did: the loops run beside each
+ * other, so how many tasks an aborted run already took is not fixed.
+ */
+async function drainWorkflowTasks(worker: Worker, atLeast: number): Promise<void> {
+  let committed = 0;
+  for (;;) {
+    const outcome = await worker.runWorkflowTaskOnce();
+    if (outcome.kind === "NoTask") {
+      break;
+    }
+    expect(outcome).toMatchObject({ kind: "Committed", outcome: { kind: "Committed" } });
+    committed += 1;
+  }
+  expect(committed).toBeGreaterThanOrEqual(atLeast);
+}
+
+/**
+ * A backend with nothing to hand out, answering on the microtask queue, for
+ * tests that measure the worker's own scheduling under fake timers: every
+ * timer scan records when it ran.
+ */
+function idleBackend(timerScans: number[]): DurableBackend {
+  const idle = {
+    currentTime: async () => timestampMs(Date.now()),
+    claimWorkflowTask: async () => null,
+    claimActivityTask: async () => null,
+    fireDueTimers: async () => {
+      timerScans.push(Date.now());
+      return { fired: 0 };
+    },
+    timeoutDueActivities: async () => ({ timedOut: 0 })
+  };
+  return idle as unknown as DurableBackend;
+}
+
+/**
+ * Records, by name, every provider call that starts after `signal` aborts.
+ * A call that began before the abort and returns after it is not recorded,
+ * which is the line the loops are held to: finish what is in flight, start
+ * nothing new.
+ */
+function recordCallsAfterAbort(
+  inner: DurableBackend,
+  signal: AbortSignal,
+  afterAbort: string[]
+): DurableBackend {
+  return new Proxy(inner, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function" || typeof property !== "string") {
+        return value;
+      }
+      return (...args: unknown[]) => {
+        if (signal.aborted) {
+          afterAbort.push(property);
+        }
+        return (value as (...callArgs: unknown[]) => unknown).apply(target, args);
+      };
+    }
+  }) as DurableBackend;
+}
+
 function recordMaintenanceScans(
   inner: DurableBackend,
   timerScans: number[],
@@ -4787,3 +4914,153 @@ async function flushUnhandledRejectionTurn(): Promise<void> {
   await Promise.resolve();
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
+
+describe("signal branches replay by command id", () => {
+  // A signal's `SignalConsumed` is recorded under the wait's command id when
+  // the signal arrives, which can be many commands after the wait registered.
+  // Matching it at the replay cursor wedged every `select` or `join` whose
+  // signal branch registered before a timer on cold replay: the timer's
+  // command event sat at the cursor, the signal branch re-registered a wait,
+  // and the recorded consumption behind it was never handed out. Both cache
+  // sizes run so the hot path and the cold path commit the same history.
+  interface Approval {
+    readonly id: string;
+  }
+  const approved = signal<Approval>("approved");
+  const kinds = ["select-signal-first", "select-timer-first", "join-signal-first"] as const;
+
+  for (const kind of kinds) {
+    for (const cacheSize of [1024, 0]) {
+      it(`${kind} completes with workflowExecutionCacheSize ${cacheSize}`, async () => {
+        const branchWorkflow = workflow({
+          name: `signals.${kind}`,
+          version: 1,
+          handler: async (_input: {}): Promise<{ readonly branch: string }> => {
+            let branch: string;
+            if (kind === "select-signal-first") {
+              branch = (await select({ approval: approved, timeout: sleep(60_000) })).branch;
+            } else if (kind === "select-timer-first") {
+              branch = (await select({ timeout: sleep(60_000), approval: approved })).branch;
+            } else {
+              branch = `join:${(await join({ approval: approved, tick: sleep(5) })).approval.id}`;
+            }
+            // A later task replays the select or join above.
+            await sleep(10);
+            return { branch };
+          }
+        });
+        let now = 1_000;
+        const backend = NativeBackend.memory({ nowMs: () => now });
+        const registry = new Registry().registerWorkflow(branchWorkflow);
+        const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+        const worker = workerFixture(backend, registry, {
+          workerId: "worker-a",
+          payloadCodec: "Json",
+          workflowExecutionCacheSize: cacheSize
+        });
+        const id = workflowId(`wf/${kind}/${cacheSize}`);
+        const handle = await client.startWorkflow(branchWorkflow, id, "workflows", {});
+
+        await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+        await client.sendSignal({ workflowId: id, signal: approved, payload: { id: "a1" } });
+        await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+        now += 6;
+        await backend.fireDueTimers({ namespace: namespace(), now, limit: 16 });
+        await worker.runWorkflowTaskOnce();
+        now += 20;
+        await backend.fireDueTimers({ namespace: namespace(), now, limit: 16 });
+        await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+
+        const expected = kind === "join-signal-first" ? "join:a1" : "approval";
+        await expect(handle.result()).resolves.toEqual({ branch: expected });
+        const history = await readHistory(backend, handle.runId, 64);
+        expect(history.events.at(-1)?.eventType).toBe("WorkflowCompleted");
+      });
+    }
+  }
+});
+
+describe("now()", () => {
+  it("records the observed clock once per call and replays it cold", async () => {
+    // Two calls across a task boundary record two side-effect markers; the
+    // second observes the advanced clock and a cold replay returns both
+    // recorded values unchanged.
+    let clock = 1_000;
+    const backend = NativeBackend.memory({ nowMs: () => clock });
+    const nowWorkflow = workflow({
+      name: "clock.now-twice",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly first: number; readonly second: number }> => {
+        const first = await now();
+        await sleep(10);
+        const second = await now();
+        return { first, second };
+      }
+    });
+    const registry = new Registry().registerWorkflow(nowWorkflow);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = workerFixture(backend, registry, {
+      workerId: "worker-a",
+      payloadCodec: "Json",
+      workflowExecutionCacheSize: 0
+    });
+    const handle = await client.startWorkflow(nowWorkflow, workflowId("wf/now-twice"), "workflows", {});
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    clock = 6_000;
+    await backend.fireDueTimers({ namespace: namespace(), now: clock, limit: 16 });
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    await expect(handle.result()).resolves.toEqual({ first: 1_000, second: 6_000 });
+    const history = await readHistory(backend, handle.runId, 16);
+    expect(history.events.map((event) => event.eventType)).toEqual([
+      "WorkflowStarted",
+      "SideEffectMarker",
+      "TimerStarted",
+      "TimerFired",
+      "SideEffectMarker",
+      "WorkflowCompleted"
+    ]);
+  });
+});
+
+describe("workflow execution cache after a failed task", () => {
+  it("evicts and disposes the cached execution when its next task throws", async () => {
+    // The cached frame is past the point the released claim replays from, so
+    // serving it again would commit against the wrong position. The entry
+    // must go with the failure, and the retry must replay cold.
+    let attempt = 0;
+    const flakyWorkflow = workflow({
+      name: "cache.flaky-second-task",
+      version: 1,
+      handler: async (_input: {}): Promise<{ readonly attempt: number }> => {
+        await sleep(10);
+        attempt += 1;
+        if (attempt === 1) {
+          throw new Error("second task exploded once");
+        }
+        return { attempt };
+      }
+    });
+    let now = 1_000;
+    const backend = NativeBackend.memory({ nowMs: () => now });
+    const registry = new Registry().registerWorkflow(flakyWorkflow);
+    const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
+    const worker = workerFixture(backend, registry, {
+      workerId: "worker-a",
+      payloadCodec: "Json",
+      nondeterminismRetryBackoffMs: 100
+    });
+    const handle = await client.startWorkflow(flakyWorkflow, workflowId("wf/cache-flaky"), "workflows", {});
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    now += 20;
+    await backend.fireDueTimers({ namespace: namespace(), now, limit: 16 });
+    await expect(worker.runWorkflowTaskOnce()).rejects.toThrow(WorkflowCodeError);
+    const afterFailure = worker.metrics();
+    expect(afterFailure.workflowExecutionCacheHits).toBe(1);
+
+    now += 200;
+    await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
+    const afterRetry = worker.metrics();
+    expect(afterRetry.workflowExecutionCacheMisses).toBe(afterFailure.workflowExecutionCacheMisses + 1);
+    await expect(handle.result()).resolves.toEqual({ attempt: 2 });
+  });
+});

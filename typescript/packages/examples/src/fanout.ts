@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -11,6 +10,7 @@ import {
   decodeChildWorkflowMapSuccesses,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface FanoutInput {
   readonly runName: string;
@@ -109,7 +109,7 @@ const fanoutSummary = workflow({
 });
 
 export async function runMemoryFanoutExample(): Promise<FanoutOutput> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(fanoutSummary)
     .registerWorkflow(squareNumber)

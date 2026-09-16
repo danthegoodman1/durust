@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -62,13 +61,14 @@ import {
   type ClaimWorkflowTaskOptions
 } from "@durust/core";
 import { Client as PgClient } from "pg";
-import { LocalDirectoryBlobStore, PayloadBackend } from "@durust/payload";
+import { NativeBackend, type NativePayloadOptions } from "@durust/native";
 import {
-  PostgresBackend,
+  PostgresStatsReader,
   type PostgresBackendStatsSnapshot,
   type PostgresStatementStatsSnapshot
-} from "@durust/postgres";
-import { SqliteBackend } from "@durust/sqlite";
+} from "./postgres-stats.js";
+
+export type { PostgresBackendStatsSnapshot, PostgresStatementStatsSnapshot } from "./postgres-stats.js";
 
 const WORKFLOW_QUEUE = "workflows";
 const ACTIVITY_QUEUE = "activities";
@@ -314,7 +314,7 @@ export interface BenchmarkBaselineResult {
   readonly counters: Partial<BenchmarkCounters>;
   readonly processing_mixed_actions_per_second: number;
   readonly processing_workflows_per_second: number;
-  readonly workflow_task_commit_p95_ms: number;
+  readonly backend_metrics: BackendMetricsReport;
   readonly worker_stats?: Partial<WorkerStatsReport>;
   readonly operations: Record<string, BenchmarkBaselineOperation>;
   readonly postgres_stats?: BenchmarkBaselinePostgresStats;
@@ -1071,7 +1071,6 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<Benchmark
         workerId: `durust-benchmark-worker-${index}`,
         workflowTaskQueue: WORKFLOW_QUEUE,
         activityTaskQueue: ACTIVITY_QUEUE,
-        registeredSignalNames: options.mode === "write-ceiling" ? [] : ["finish"],
         activityCompletionBatchSize: options.activity_completion_batch,
         payloadCodec: "Json"
       })
@@ -1300,7 +1299,7 @@ export function compareBenchmarkToBaseline(
     pushAtMost(
       failures,
       "backend_metrics.workflowTaskCommitLatency.p95Ms",
-      baseline.result.workflow_task_commit_p95_ms * maxCommitRatio,
+      baseline.result.backend_metrics.workflowTaskCommitLatency.p95Ms * maxCommitRatio,
       result.backend_metrics.workflowTaskCommitLatency.p95Ms
     );
   }
@@ -1678,7 +1677,7 @@ async function createPostgresBenchmarkDatabase(
     // password-less URL produced a SASL authentication failure reported as a
     // missing CREATEDB privilege, and unreachable hosts, a busy `template1`
     // and name collisions all got the same wrong advice. Same shape as
-    // `PG_STAT_STATEMENTS_PRELOAD_HINT` in `@durust/postgres`.
+    // `PG_STAT_STATEMENTS_PRELOAD_HINT` in `postgres-stats.ts`.
     throw new Error(
       `could not create the benchmark's own database \`${database}\`: ${postgresErrorText(error)}. ` +
         "If this is a privilege error (SQLSTATE 42501), the role needs CREATEDB, which managed " +
@@ -1845,46 +1844,36 @@ export async function sweepBenchmarkDatabases(
 }
 
 async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
-  const wrapPayloadBackend = (handle: BackendHandle): BackendHandle => {
-    if (options.mode !== "payload") {
-      return handle;
-    }
-    const blobRoot = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-payload-"));
-    const blobStore = new LocalDirectoryBlobStore({ root: blobRoot });
-    return {
-      backend: new PayloadBackend({
-        backend: handle.backend,
-        blobStore,
-        inlineThresholdBytes: 64
-      }),
-      dbPath: handle.dbPath,
-      postgresSchema: handle.postgresSchema,
-      postgresDatabase: handle.postgresDatabase ?? null,
-      postgresStatsSnapshot: handle.postgresStatsSnapshot,
-      cleanup: async (cleanupOptions) => {
-        try {
-          await handle.cleanup(cleanupOptions);
-        } finally {
-          rmSync(blobRoot, { recursive: true, force: true });
-        }
-      }
+  // Payload mode offloads through the Rust payload backend into a temporary
+  // directory that the handle's cleanup removes.
+  let blobRoot: string | null = null;
+  let payload: { readonly payload?: NativePayloadOptions } = {};
+  if (options.mode === "payload") {
+    blobRoot = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-payload-"));
+    payload = {
+      payload: { inlineThresholdBytes: 64, blobStore: { kind: "LocalDirectory", root: blobRoot } }
     };
+  }
+  const removeBlobRoot = (): void => {
+    if (blobRoot !== null) {
+      rmSync(blobRoot, { recursive: true, force: true });
+    }
   };
 
   if (options.backend === "memory") {
-    return wrapPayloadBackend({
-      backend: new MemoryBackend(),
+    return {
+      backend: NativeBackend.memory(payload),
       dbPath: null,
       postgresSchema: null,
       postgresStatsSnapshot: null,
-      cleanup: async () => undefined
-    });
+      cleanup: async () => removeBlobRoot()
+    };
   }
   if (options.backend === "sqlite") {
     const root = mkdtempSync(join(tmpdir(), "durust-ts-benchmark-sqlite-"));
     const dbPath = join(root, "durust.db");
-    const backend = new SqliteBackend({ path: dbPath });
-    return wrapPayloadBackend({
+    const backend = NativeBackend.sqlite(dbPath, payload);
+    return {
       backend,
       dbPath,
       postgresSchema: null,
@@ -1894,33 +1883,21 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
         if (!options.keep_db) {
           rmSync(root, { recursive: true, force: true });
         }
+        removeBlobRoot();
       }
-    });
+    };
   }
   const url = process.env.DURUST_POSTGRES_URL;
   if (!url) {
+    removeBlobRoot();
     throw new Error("set DURUST_POSTGRES_URL to run the Postgres benchmark workload");
   }
-  // The run gets its own database, not just its own table prefix. This is what
-  // makes `statsSnapshot` correct by construction rather than merely tidy:
-  // `pg_stat_database where datname = current_database()` and
-  // `pg_stat_statements where dbid = current_database()` are only this run's
-  // numbers if nothing else is connected to that database. Sharing
-  // `DURUST_POSTGRES_URL` with the conformance suites, a psql session, or
-  // another benchmark made both predicates a lie, and `transactionsPerMixedAction`
-  // — which `postgres-mixed-accepted.json` gates on — absorbed every foreign
-  // transaction. The Rust harness measured 77.5 against a ceiling of 1.2 under
-  // 60,000 foreign transactions, versus 2.5 isolated.
-  //
-  // `pg_stat_wal` is the one exception and stays contaminated, because it has
-  // no database column at all. See the note on `PostgresStatsReport.walBytes`.
+  // The run gets its own database, not just its own schema, so the counters
+  // `statsSnapshot` reads from `pg_stat_database` and `pg_stat_statements`
+  // are this run's numbers alone.
   const database = postgresBenchmarkDatabase();
-  // Validated *before* the database exists. `postgresUrlWithDatabase` throws on
-  // a URL with no `://`, and it used to run on the line after the create, so a
-  // malformed `DURUST_POSTGRES_URL` left an orphan behind on its way out.
   const runUrl = postgresUrlWithDatabase(url, database);
   await createPostgresBenchmarkDatabase(url, database);
-
   const dropDatabase = async (): Promise<void> => {
     if (options.keep_db) {
       return;
@@ -1937,48 +1914,38 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
       );
     }
   };
-
-  // Everything from here to the returned handle is guarded, not just the
-  // `PostgresBackend` constructor. The narrower guard was the right diagnosis
-  // with the wrong scope: `wrapPayloadBackend` calls `mkdtempSync` when
-  // `--mode payload`, which is outside a constructor-only `try`, and
-  // `runBenchmark` installs its `finally { cleanup() }` only *after*
-  // `openBackend` returns. Measured with a nonexistent `TMPDIR`:
-  // `--backend postgres --mode payload` exited 1 on the ENOENT and orphaned the
-  // database silently. A read-only or full `TMPDIR` in CI reaches the same path
-  // without a contrived variable.
   try {
-    const backend = new PostgresBackend({
-      url: runUrl,
-      tableName: `durust_ts_benchmark_${process.pid}_${Date.now()}`,
-      poolSize: options.postgres_pool_size
+    const schema = `durust_ts_benchmark_${process.pid}_${Date.now()}`;
+    const stats = new PostgresStatsReader(runUrl);
+    await stats.prepare();
+    const backend = await NativeBackend.postgres(runUrl, {
+      schema,
+      maxPoolSize: options.postgres_pool_size,
+      ...payload
     });
-    return wrapPayloadBackend({
+    return {
       backend,
       dbPath: null,
-      postgresSchema: "normalized",
+      postgresSchema: schema,
       postgresDatabase: database,
-      // Both snapshots run against `runUrl`, because the backend they ask is
-      // the one connected to it. That is the whole point: `current_database()`
-      // is now this run's database in both of the predicates above.
-      postgresStatsSnapshot: () => backend.statsSnapshot(),
+      postgresStatsSnapshot: () => stats.snapshot(),
       cleanup: async (cleanupOptions) => {
+        // `propagateDropFailure` is set on the success path only: a run that
+        // completed must not exit 0 having leaked its database, and on the
+        // failure path a drop failure must not replace the error that caused
+        // the failure.
         const strict = cleanupOptions?.propagateDropFailure === true;
         let closeError: unknown = null;
         try {
           if (options.keep_db) {
-            await backend.close();
+            backend.close();
           } else {
-            // `destroy()` drops the run's tables. Redundant now that the whole
-            // database goes, but it also ends the pool, and `drop database`
-            // cannot run while a connection to it is open.
             await backend.destroy();
           }
         } catch (error) {
           closeError = error;
         }
-        // The drop runs whether or not close/destroy worked, but a close
-        // failure is the more informative error and keeps priority.
+        removeBlobRoot();
         if (strict && closeError === null) {
           await dropDatabase();
           return;
@@ -1988,13 +1955,13 @@ async function openBackend(options: BenchmarkOptions): Promise<BackendHandle> {
           throw closeError;
         }
       }
-    });
+    };
   } catch (error) {
+    removeBlobRoot();
     await dropDatabaseLoudly();
     throw error;
   }
 }
-
 function benchmarkRegistry(): Registry {
   return new Registry()
     .registerWorkflow(benchmarkActivityParent)

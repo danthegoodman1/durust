@@ -4,7 +4,7 @@
 //! silently diverging.
 
 use crate::{
-    ActivityId, ActivityTask, ChildWorkflowMapItemOutcome, CommandId, HistoryEventData,
+    ActivityId, ActivityTask, ChildWorkflowMapItemOutcome, CommandId, HistoryEventData, RunId,
     TimestampMs, WorkflowTaskCommit, WorkflowTaskReason,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -13,6 +13,17 @@ use crate::{
     WaitKind, WorkflowChangeMarkerKind,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The run an activity id belongs to. Ids are `{run_id}:{seq}` for plain
+/// activities and `{run_id}:{seq}:map:{ordinal}` for map items, and run ids
+/// carry no colon, so the run is everything before the first one. A late
+/// activity call whose row is gone uses this to tell a run that terminal
+/// cleanup emptied (`AlreadyCompleted`) from one the provider never had
+/// (`RunNotFound`).
+pub(crate) fn activity_run_id(activity_id: &ActivityId) -> RunId {
+    let text = activity_id.0.as_str();
+    RunId::new(text.split_once(':').map_or(text, |(run_id, _)| run_id))
+}
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub(crate) fn codec_to_str(codec: CodecId) -> &'static str {
@@ -142,7 +153,7 @@ pub(crate) fn timeout_message(
     match attribution {
         ActivityTimeoutAttribution::StartToClose => {
             format!(
-                "activity `{}` timed out on attempt {attempt}",
+                "activity `{}` start-to-close timed out on attempt {attempt}",
                 activity_id.0
             )
         }
@@ -161,31 +172,21 @@ pub(crate) fn should_retry_activity(task: &ActivityTask) -> bool {
     task.attempt < task.retry_policy.max_attempts.max(1)
 }
 
-/// Base delay before the first exponential retry; every further failed
-/// attempt doubles it.
-pub(crate) const RETRY_BACKOFF_BASE_MS: i64 = 1_000;
-
 /// Visibility deadline for the retry scheduled after `failed_attempt` failed
-/// (attempts are 1-based). `None` means the retry is immediately claimable
-/// (`RetryBackoff::None`); `RetryBackoff::Exponential` yields
-/// `now + base * 2^(failed_attempt - 1)`, saturating instead of overflowing so
-/// absurd attempt counts push visibility to the far future rather than
-/// wrapping into the past. Backoff paces explicit activity failures only;
-/// timeout retries are already paced by the timeout deadline itself.
+/// (attempts are 1-based). `None` means the retry is immediately claimable;
+/// otherwise the policy's delay is added to `now`, saturating rather than
+/// wrapping. Failed and timed-out plain attempts are paced alike; a map
+/// item's timed-out attempt is retried at once by the map engine.
 pub(crate) fn retry_visible_at_ms(
     policy: &crate::RetryPolicy,
     failed_attempt: u32,
     now: TimestampMs,
 ) -> Option<i64> {
-    match policy.backoff {
-        crate::RetryBackoff::None => None,
-        crate::RetryBackoff::Exponential => {
-            let exponent = failed_attempt.saturating_sub(1).min(62);
-            let factor = 1_i64 << exponent;
-            let delay = RETRY_BACKOFF_BASE_MS.saturating_mul(factor);
-            Some(now.0.saturating_add(delay))
-        }
-    }
+    let delay = policy.retry_delay_ms(failed_attempt);
+    (delay > 0).then(|| {
+        now.0
+            .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))
+    })
 }
 
 pub(crate) enum ActivityFailureDecision {
@@ -193,25 +194,32 @@ pub(crate) enum ActivityFailureDecision {
     Fail,
 }
 
-/// Single retry-versus-fail decision for a failed activity attempt. Providers
-/// honor the generic `non_retryable` flag before the stored retry policy, so a
-/// non-retryable failure records the terminal outcome even with attempts left.
+/// Single retry-versus-fail decision for a failed activity attempt. The
+/// failure's own `non_retryable` flag and the policy's non-retryable error
+/// types both end retries early, so such a failure records the terminal
+/// outcome even with attempts left.
 pub(crate) fn activity_failure_decision(
     task: &ActivityTask,
-    non_retryable: bool,
+    failure: &crate::DurableFailure,
 ) -> ActivityFailureDecision {
-    if !non_retryable && should_retry_activity(task) {
+    let retryable =
+        !failure.non_retryable && task.retry_policy.allows_retry_of(&failure.error_type);
+    retry_or_fail(task, retryable)
+}
+
+/// Timeouts are always retryable up to the stored policy's attempt budget.
+pub(crate) fn activity_timeout_decision(task: &ActivityTask) -> ActivityFailureDecision {
+    retry_or_fail(task, true)
+}
+
+fn retry_or_fail(task: &ActivityTask, retryable: bool) -> ActivityFailureDecision {
+    if retryable && should_retry_activity(task) {
         ActivityFailureDecision::Retry {
             next_attempt: task.attempt.saturating_add(1),
         }
     } else {
         ActivityFailureDecision::Fail
     }
-}
-
-/// Timeouts are always retryable up to the stored policy's attempt budget.
-pub(crate) fn activity_timeout_decision(task: &ActivityTask) -> ActivityFailureDecision {
-    activity_failure_decision(task, false)
 }
 
 /// True when a commit carries any workflow-visible mutation. A terminal run
@@ -330,11 +338,6 @@ pub(crate) fn ready_at_ms_for_delay(delay: Duration) -> i64 {
 /// which is the pre-grace-period behavior tests use to force collection.
 pub(crate) fn payload_gc_cutoff_ms(now_ms: i64, min_age: Duration) -> i64 {
     now_ms.saturating_sub(duration_millis_i64(min_age))
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn activity_timeout_at_ms(timeout: Option<Duration>) -> Option<i64> {
-    activity_timeout_at_ms_from(TimestampMs(unix_epoch_millis()), timeout)
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
@@ -471,7 +474,8 @@ pub(crate) fn event_type_to_str(event_type: &HistoryEventType) -> &'static str {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
+#[cfg(test)]
+fn event_type_from_str(value: &str) -> Result<HistoryEventType> {
     match value {
         "workflow_started" => Ok(HistoryEventType::WorkflowStarted),
         "workflow_completed" => Ok(HistoryEventType::WorkflowCompleted),
@@ -797,11 +801,12 @@ mod tests {
     #[test]
     fn timeout_messages_are_pinned() {
         // These strings are persisted in history (`ActivityTimedOut` events
-        // and map-item failures); existing text is append-only.
+        // and map-item failures) and name the deadline that lapsed, which is
+        // what the shared provider conformance cases look for.
         let activity_id = ActivityId("act".to_owned());
         assert_eq!(
             timeout_message(&activity_id, 2, ActivityTimeoutAttribution::StartToClose),
-            "activity `act` timed out on attempt 2"
+            "activity `act` start-to-close timed out on attempt 2"
         );
         assert_eq!(
             timeout_message(&activity_id, 2, ActivityTimeoutAttribution::MissedHeartbeat),
@@ -814,7 +819,7 @@ mod tests {
         // Attempt 0 reports as attempt 1 rather than underflowing.
         assert_eq!(
             timeout_message(&activity_id, 0, ActivityTimeoutAttribution::StartToClose),
-            "activity `act` timed out on attempt 1"
+            "activity `act` start-to-close timed out on attempt 1"
         );
     }
 
@@ -1039,26 +1044,26 @@ mod tests {
         // base * 2^(failed_attempt - 1): 1s, 2s, 4s, ...
         assert_eq!(
             retry_visible_at_ms(&exponential, 1, now),
-            Some(10_000 + RETRY_BACKOFF_BASE_MS)
+            Some(10_000 + 1_000)
         );
         assert_eq!(
             retry_visible_at_ms(&exponential, 2, now),
-            Some(10_000 + 2 * RETRY_BACKOFF_BASE_MS)
+            Some(10_000 + 2 * 1_000)
         );
         assert_eq!(
             retry_visible_at_ms(&exponential, 3, now),
-            Some(10_000 + 4 * RETRY_BACKOFF_BASE_MS)
+            Some(10_000 + 4 * 1_000)
         );
         // Attempt 0 is treated as attempt 1 rather than underflowing.
         assert_eq!(
             retry_visible_at_ms(&exponential, 0, now),
-            Some(10_000 + RETRY_BACKOFF_BASE_MS)
+            Some(10_000 + 1_000)
         );
-        // Huge attempt counts and a now near the epoch ceiling saturate
-        // instead of wrapping into the past.
+        // Huge attempt counts cap at the policy's max interval, and a now
+        // near the epoch ceiling saturates instead of wrapping into the past.
         assert_eq!(
             retry_visible_at_ms(&exponential, u32::MAX, now),
-            Some(i64::MAX)
+            Some(10_000 + 60_000)
         );
         assert_eq!(
             retry_visible_at_ms(&exponential, 1, TimestampMs(i64::MAX)),
@@ -1072,16 +1077,19 @@ mod tests {
         // attempt; non-retryable failures and exhausted budgets fail.
         let retryable = test_activity_task(1, 3);
         assert!(matches!(
-            activity_failure_decision(&retryable, false),
+            activity_failure_decision(&retryable, &crate::DurableFailure::new("kind", "boom")),
             ActivityFailureDecision::Retry { next_attempt: 2 }
         ));
         assert!(matches!(
-            activity_failure_decision(&retryable, true),
+            activity_failure_decision(
+                &retryable,
+                &crate::DurableFailure::non_retryable("kind", "boom")
+            ),
             ActivityFailureDecision::Fail
         ));
         let exhausted = test_activity_task(3, 3);
         assert!(matches!(
-            activity_failure_decision(&exhausted, false),
+            activity_failure_decision(&exhausted, &crate::DurableFailure::new("kind", "boom")),
             ActivityFailureDecision::Fail
         ));
         assert!(matches!(

@@ -17,8 +17,45 @@
     "activity_completion_batch": 1
   },
   "result": {
+    "backend": "sqlite",
+    "mode": "mixed",
+    "correct": true,
+    "options": {
+      "backend": "sqlite",
+      "mode": "mixed",
+      "workflows": 100,
+      "workers": 1,
+      "batch": 32,
+      "max_rounds": 10000,
+      "json": false,
+      "keep_db": false,
+      "list_stale": false,
+      "drop_stale": false,
+      "activity_delay_ms": 0,
+      "workflow_offset": 0,
+      "child_map_items": 32,
+      "child_map_max_in_flight": 8,
+      "shards": 1,
+      "physical_partitions": 1,
+      "activation_concurrency": 1,
+      "activation_prefetch_limit": 1,
+      "activity_completion_batch": 1,
+      "postgres_pool_size": 10
+    },
+    "elapsed_ms": 505.334,
+    "setup_ms": 11.294,
+    "processing_ms": 482.097,
+    "verify_ms": 11.944,
+    "rounds": 301,
+    "activations": 800,
     "completed_workflows": 100,
     "mixed_actions": 800,
+    "activations_per_second": 1583.111,
+    "mixed_actions_per_second": 1583.111,
+    "workflows_per_second": 197.889,
+    "processing_activations_per_second": 1659.418,
+    "processing_mixed_actions_per_second": 1659.418,
+    "processing_workflows_per_second": 207.427,
     "counters": {
       "workflow_starts": 100,
       "signals": 100,
@@ -36,6 +73,8 @@
       "child_workflow_starts_dispatched": 0
     },
     "worker_stats": {
+      "workflowTasks": 800,
+      "activityTasks": 300,
       "workflowHistoryCacheHits": 0,
       "workflowHistoryCacheMisses": 200,
       "workflowHistoryCacheEvictions": 0,
@@ -43,49 +82,148 @@
       "workflowExecutionCacheMisses": 200,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
-      "historyStreamEvents": 0
+      "historyStreamEvents": 0,
+      "timersFired": 100,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 0
     },
-    "processing_mixed_actions_per_second": 832.243,
-    "processing_workflows_per_second": 104.03,
-    "workflow_task_commit_p95_ms": 2.796,
-    "operations": {
-      "claimActivityTask": {
-        "calls": 301,
-        "errors": 0
+    "backend_metrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 800,
+        "p50Ms": 0.201,
+        "p95Ms": 0.445,
+        "p99Ms": 0.551,
+        "maxMs": 0.783
       },
-      "claimWorkflowTask": {
-        "calls": 1098,
-        "errors": 0
-      },
-      "commitWorkflowTask": {
-        "calls": 800,
-        "errors": 0
-      },
-      "completeActivity": {
-        "calls": 300,
-        "errors": 0
-      },
-      "fireDueTimers": {
-        "calls": 301,
-        "errors": 0
-      },
-      "readSignalInbox": {
-        "calls": 800,
-        "errors": 0
-      },
-      "signalWorkflow": {
-        "calls": 100,
-        "errors": 0
-      },
-      "startWorkflow": {
-        "calls": 100,
-        "errors": 0
-      },
-      "streamHistory": {
-        "calls": 100,
-        "errors": 0
+      "operations": {
+        "claimActivityTask": {
+          "calls": 301,
+          "errors": 0,
+          "items": 301,
+          "totalMs": 58.774,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 5121.336,
+          "latency": {
+            "samples": 301,
+            "p50Ms": 0.173,
+            "p95Ms": 0.381,
+            "p99Ms": 0.521,
+            "maxMs": 0.609
+          }
+        },
+        "claimWorkflowTask": {
+          "calls": 301,
+          "errors": 0,
+          "items": 800,
+          "totalMs": 106.859,
+          "itemsPerCall": 2.658,
+          "itemsPerSecond": 7486.535,
+          "latency": {
+            "samples": 301,
+            "p50Ms": 0.304,
+            "p95Ms": 0.678,
+            "p99Ms": 0.947,
+            "maxMs": 2.831
+          }
+        },
+        "commitWorkflowTask": {
+          "calls": 800,
+          "errors": 0,
+          "items": 800,
+          "totalMs": 178.348,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 4485.611,
+          "latency": {
+            "samples": 800,
+            "p50Ms": 0.201,
+            "p95Ms": 0.445,
+            "p99Ms": 0.551,
+            "maxMs": 0.783
+          }
+        },
+        "completeActivity": {
+          "calls": 300,
+          "errors": 0,
+          "items": 300,
+          "totalMs": 50.758,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 5910.362,
+          "latency": {
+            "samples": 300,
+            "p50Ms": 0.112,
+            "p95Ms": 0.358,
+            "p99Ms": 0.455,
+            "maxMs": 4.309
+          }
+        },
+        "fireDueTimers": {
+          "calls": 301,
+          "errors": 0,
+          "items": 9632,
+          "totalMs": 28.275,
+          "itemsPerCall": 32,
+          "itemsPerSecond": 340658.83,
+          "latency": {
+            "samples": 301,
+            "p50Ms": 0.065,
+            "p95Ms": 0.277,
+            "p99Ms": 0.38,
+            "maxMs": 0.476
+          }
+        },
+        "signalWorkflow": {
+          "calls": 100,
+          "errors": 0,
+          "items": 100,
+          "totalMs": 5.092,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 19639.729,
+          "latency": {
+            "samples": 100,
+            "p50Ms": 0.039,
+            "p95Ms": 0.147,
+            "p99Ms": 0.283,
+            "maxMs": 0.294
+          }
+        },
+        "startWorkflow": {
+          "calls": 100,
+          "errors": 0,
+          "items": 100,
+          "totalMs": 5.49,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 18215.401,
+          "latency": {
+            "samples": 100,
+            "p50Ms": 0.042,
+            "p95Ms": 0.121,
+            "p99Ms": 0.284,
+            "maxMs": 0.375
+          }
+        },
+        "streamHistory": {
+          "calls": 100,
+          "errors": 0,
+          "items": 100,
+          "totalMs": 11.666,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 8571.639,
+          "latency": {
+            "samples": 100,
+            "p50Ms": 0.065,
+            "p95Ms": 0.281,
+            "p99Ms": 0.58,
+            "maxMs": 1.251
+          }
+        }
       }
-    }
+    },
+    "postgres_stats": null,
+    "resource_samples": null,
+    "postgres_schema": null,
+    "postgres_database": null,
+    "db_path": null,
+    "db_bytes": null
   },
   "thresholds": {
     "require_correct": true,
@@ -124,7 +262,6 @@
       "commitWorkflowTask",
       "completeActivity",
       "fireDueTimers",
-      "readSignalInbox",
       "signalWorkflow",
       "startWorkflow",
       "streamHistory"

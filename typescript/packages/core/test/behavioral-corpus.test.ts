@@ -38,8 +38,11 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  now,
+  patched,
+  WorkflowFailure,
   Client,
-  MemoryBackend,
+  type DurableBackend,
   Registry,
   Worker,
   activity,
@@ -81,6 +84,7 @@ import {
   type WorkflowTaskCommit,
   type CommitOutcome
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import { fnv1a32, maintenanceJitterSource } from "../src/worker.js";
 import { workerFixture } from "./support.js";
 
@@ -266,6 +270,55 @@ const corpusMarkers = workflow({
   }
 });
 
+const corpusRepeatedChangeId = workflow({
+  name: "corpus.repeated-change-id",
+  version: 1,
+  handler: async (input: Value1): Promise<Value1> => {
+    const first = patched("corpus.repeat");
+    const doubled = await callActivity(corpusDouble, { value: input.value }, {
+      taskQueue: CORPUS_ACTIVITY_QUEUE
+    });
+    const second = patched("corpus.repeat");
+    return { value: doubled.value + Number(first) + Number(second) };
+  }
+});
+
+const corpusSignalFirstSelectThenTimer = workflow({
+  name: "corpus.signal-first-select-then-timer",
+  version: 1,
+  handler: async (input: Value1): Promise<Text1> => {
+    const winner = await select({
+      approved: corpusApproveSignal,
+      elapsed: sleep(input.value)
+    });
+    const text = winner.branch === "approved" ? `signal:${(winner.value as Approval).who}` : "timer";
+    await sleep(10);
+    return { text };
+  }
+});
+
+const corpusFails = workflow({
+  name: "corpus.fails",
+  version: 1,
+  handler: async (input: Value1): Promise<Value1> => {
+    if (input.value > 0) {
+      throw new WorkflowFailure("rejected on purpose", { errorType: "corpus.rejected" });
+    }
+    return input;
+  }
+});
+
+const corpusNowTwice = workflow({
+  name: "corpus.now-twice",
+  version: 1,
+  handler: async (input: Value1): Promise<Value1> => {
+    const first = await now();
+    await sleep(input.value);
+    const second = await now();
+    return { value: second - first };
+  }
+});
+
 const corpusContinueAsNew = workflow({
   name: "corpus.continue-as-new",
   version: 1,
@@ -294,7 +347,11 @@ const PROGRAMS = new Map<string, WorkflowDefinition<any, any, any, string>>([
   ["corpus.child-await", corpusChildAwait],
   ["corpus.activity-map", corpusActivityMap],
   ["corpus.markers", corpusMarkers],
-  ["corpus.continue-as-new", corpusContinueAsNew]
+  ["corpus.continue-as-new", corpusContinueAsNew],
+  ["corpus.repeated-change-id", corpusRepeatedChangeId],
+  ["corpus.signal-first-select-then-timer", corpusSignalFirstSelectThenTimer],
+  ["corpus.fails", corpusFails],
+  ["corpus.now-twice", corpusNowTwice]
 ]);
 
 // ---------------------------------------------------------------------------
@@ -592,20 +649,36 @@ class VirtualClock {
   }
 }
 
-class RecordingBackend extends MemoryBackend {
-  readonly commits: WorkflowTaskCommit[] = [];
+type RecordingBackend = DurableBackend & { takeCommits(): WorkflowTaskCommit[] };
 
-  override async commitWorkflowTask(
-    claim: WorkflowTaskClaim,
-    commit: WorkflowTaskCommit
-  ): Promise<CommitOutcome> {
-    this.commits.push(commit);
-    return super.commitWorkflowTask(claim, commit);
-  }
+/**
+ * Any provider, with every `commitWorkflowTask` payload captured. A Proxy
+ * rather than a subclass so the same corpus runs over the TypeScript memory
+ * provider and, with `DURUST_CORPUS_BACKEND=native`, over the Rust memory
+ * provider behind `@durust/native`; both take the virtual clock.
+ */
+function recordingBackend(inner: DurableBackend): RecordingBackend {
+  const commits: WorkflowTaskCommit[] = [];
+  return new Proxy(inner, {
+    get(target, property) {
+      if (property === "takeCommits") {
+        return () => commits.splice(0, commits.length);
+      }
+      if (property === "commitWorkflowTask") {
+        return async (claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<CommitOutcome> => {
+          commits.push(commit);
+          return target.commitWorkflowTask(claim, commit);
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    }
+  }) as RecordingBackend;
+}
 
-  takeCommits(): WorkflowTaskCommit[] {
-    return this.commits.splice(0, this.commits.length);
-  }
+function corpusBackend(clock: VirtualClock): RecordingBackend {
+  const nowMs = () => clock.nowMs;
+  return recordingBackend(NativeBackend.memory({ nowMs }));
 }
 
 // ---------------------------------------------------------------------------
@@ -704,18 +777,22 @@ const DECLARED_CASES = [
   "a select resolved with two ready branches takes the earlier ready event, not the earlier branch",
   "the same select with the activity landing first takes the activity branch",
   "a query projection is committed with the signal wait and again with its consumption",
-  "a child workflow start is committed to the outbox and its completion closes the parent",
+  "a child workflow start is committed with the parent's task and its completion closes the parent",
   "an activity map commits one scheduled map bounded by maxInFlight",
   "a version marker, a side effect and a deprecated patch land in one commit with the result",
   "continue-as-new commits the next run's input and nothing else",
-  "a timer scheduled after the clock has moved records its deadline relative to now"
+  "a timer scheduled after the clock has moved records its deadline relative to now",
+  "one change id consulted on both sides of a task boundary records two markers",
+  "a signal that won a select whose timer registered later replays cold by command id",
+  "a workflow that fails on purpose commits WorkflowFailed with its own failure",
+  "now() records the provider clock once per call and replays it as recorded"
 ];
 
 const DECLARED_GAPS = [
   "Double-await of a handle",
   "Offloaded (blob) payload refs",
   "Child workflow maps",
-  "Workflow failure and cancellation events",
+  "Workflow cancellation events",
   "Activity retries",
   "Terminal-with-leftover-command divergence detection",
   "The select tie-break between two branches ready at the same event id",
@@ -788,7 +865,6 @@ function buildWorker(backend: RecordingBackend, historyChunkEvents?: number): Wo
     workerId: "corpus-worker",
     workflowTaskQueue: CORPUS_WORKFLOW_QUEUE,
     activityTaskQueue: CORPUS_ACTIVITY_QUEUE,
-    registeredSignalNames: ["corpus.approve"],
     ...(historyChunkEvents === undefined ? {} : { historyFetchMaxEvents: historyChunkEvents })
   });
 }
@@ -806,7 +882,7 @@ async function historyTypes(backend: RecordingBackend, runId: RunId): Promise<st
 
 async function runCase(corpusCase: CorpusCase): Promise<void> {
   const clock = new VirtualClock();
-  const backend = new RecordingBackend({ nowMs: () => clock.nowMs });
+  const backend = corpusBackend(clock);
   const client = new Client(backend, { namespace: namespace() });
   const definition = PROGRAMS.get(corpusCase.program);
   if (definition === undefined) {
@@ -860,13 +936,6 @@ async function runCase(corpusCase: CorpusCase): Promise<void> {
       case "runActivity": {
         const outcome = await worker.runActivityTaskOnce();
         expect(outcome.kind, `${where}: expected a claimable activity task`).toBe("Completed");
-        break;
-      }
-      case "dispatchChildStarts": {
-        // Rust queues child starts in a provider outbox that a worker loop
-        // drains; TypeScript starts them inside the commit, so there is
-        // nothing to dispatch. The step exists so the two scripts stay
-        // identical.
         break;
       }
       case "advanceTime": {

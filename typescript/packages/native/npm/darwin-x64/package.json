@@ -1,0 +1,27 @@
+{
+  "name": "@durust/native-darwin-x64",
+  "version": "0.2.1",
+  "description": "The durust-node addon for darwin-x64: a platform package of @durust/native.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "durust-node.darwin-x64.node",
+  "files": [
+    "durust-node.darwin-x64.node"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danthegoodman1/durust",
+    "directory": "typescript/packages/native"
+  }
+}

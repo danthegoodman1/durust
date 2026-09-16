@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -9,6 +8,7 @@ import {
   heartbeat,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface HeartbeatExampleInput {
   readonly assetId: string;
@@ -68,7 +68,7 @@ const heartbeatWorkflow = workflow({
 
 export async function runMemoryHeartbeatExample(): Promise<HeartbeatExampleResult> {
   heartbeatOutcome = null;
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(heartbeatWorkflow)
     .registerActivity(transcodeAsset);

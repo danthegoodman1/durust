@@ -23,7 +23,7 @@
 //! affects no other suite, and it holds exactly one `#[test]` so the counters
 //! are never shared with a concurrently running test.
 
-use durust::{Client, MemoryBackend, PayloadStorageConfig, Worker};
+use durust::{Client, DurableBranchExt, MemoryBackend, PayloadStorageConfig, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -341,6 +341,78 @@ fn measure_cached_marker_tasks(markers: usize) -> Cost {
 /// `ActivityScheduled` event and once in the scheduled activity task — which
 /// is what says the delta is the commit clone and not something else. 5.00
 /// sits midway.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct WaiterInput {
+    waiters: usize,
+    rounds: usize,
+}
+
+// `waiters` signal waits that never resolve, joined with `rounds` spawned
+// activities: every completion wakes the cached run, and the join polls each
+// pending waiter once per wake, which is the per-waiter cost being measured.
+#[durust::workflow(name = "hot-path-budget.waiters", version = 1)]
+async fn waiter_workflow(input: WaiterInput) -> durust::Result<u64> {
+    let mut branches: Vec<durust::BoxSelectBranch<u64>> = Vec::new();
+    for index in 0..input.waiters {
+        branches.push(durust::signal::<u64>(format!("never-{index}")).boxed());
+    }
+    for _ in 0..input.rounds {
+        let handle = durust::call_activity!(tick(UnitInput {}))
+            .task_queue("activities")
+            .spawn()
+            .await?;
+        branches.push(handle.result().boxed());
+    }
+    let values = durust::join_all(branches).await?;
+    Ok(values.into_iter().sum())
+}
+
+fn waiter_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
+    Worker::builder(backend)
+        .worker_id("hot-path-budget-waiters")
+        .workflow_task_queue("workflows")
+        .activity_task_queue("activities")
+        .register_workflow(waiter_workflow)
+        .register_activity(tick)
+        .build()
+}
+
+const WAITER_ROUNDS: usize = 6;
+const FEW_WAITERS: usize = 2;
+const MANY_WAITERS: usize = 10;
+
+fn measure_cached_signal_waiter_wakes(waiters: usize) -> Cost {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        client
+            .start_workflow::<waiter_workflow>(
+                "hot-path-budget/waiters",
+                "workflows",
+                WaiterInput {
+                    waiters,
+                    rounds: WAITER_ROUNDS + 1,
+                },
+            )
+            .await
+            .unwrap();
+        let mut worker = waiter_worker(backend.clone());
+        assert!(worker.run_workflow_once().await.unwrap());
+        // One completion primes the cache so the measured wakes are all hot.
+        assert!(worker.run_activity_once().await.unwrap());
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert_eq!(worker.cached_workflow_count(), 1);
+
+        record(|| async {
+            for _ in 0..WAITER_ROUNDS {
+                assert!(worker.run_activity_once().await.unwrap());
+                assert!(worker.run_workflow_once().await.unwrap());
+            }
+        })
+        .await
+    })
+}
+
 const MAX_COMMIT_PAYLOAD_COPIES_PER_TASK: f64 = 5.0;
 
 /// Payload copies per completed activity one cached wake may cost when its
@@ -372,6 +444,16 @@ const MAX_REJECTED_PREFETCH_PAYLOAD_COPIES: f64 = 4.0;
 /// budget's real guarantee is "one extra copy of the marker index per task is
 /// caught"; anything cheaper than that would not be.
 const MAX_ALLOCATIONS_PER_MARKER_PER_TASK: f64 = 3.0;
+
+/// Allocations a pending signal waiter may add to each cached wake it is
+/// polled through. Measured at 8.2 while the waiting poll cloned its command
+/// id and name and built a fingerprint before it knew whether anything had
+/// arrived, and 4.2 once those went. What remains is the inbox read each
+/// waiter still makes on every wake: the request's owned name and run id and
+/// the provider's answer. Gating those reads on the claim reason measured
+/// under 1 but changes the commit for a signal that arrived before an
+/// activity completion, which TypeScript consumes in that task.
+const MAX_ALLOCATIONS_PER_SIGNAL_WAITER_PER_WAKE: f64 = 5.0;
 
 const BUDGET_RATIONALE: &str = "\
 Every budget in this file was set by measuring the same work with and without \
@@ -457,5 +539,22 @@ fn worker_hot_path_holds_its_per_task_allocation_budgets() {
          {BUDGET_RATIONALE}",
         few.allocations,
         many.allocations,
+    );
+
+    let few_waiters = measure_cached_signal_waiter_wakes(FEW_WAITERS);
+    let many_waiters = measure_cached_signal_waiter_wakes(MANY_WAITERS);
+    let per_waiter_per_wake = (many_waiters
+        .allocations
+        .saturating_sub(few_waiters.allocations)) as f64
+        / ((MANY_WAITERS - FEW_WAITERS) * WAITER_ROUNDS) as f64;
+    assert!(
+        per_waiter_per_wake < MAX_ALLOCATIONS_PER_SIGNAL_WAITER_PER_WAKE,
+        "each pending signal waiter cost {per_waiter_per_wake:.1} allocations per cached wake, \
+         over the budget of {MAX_ALLOCATIONS_PER_SIGNAL_WAITER_PER_WAKE}.\n\
+         {FEW_WAITERS} waiters: {} allocations over {WAITER_ROUNDS} wakes\n\
+         {MANY_WAITERS} waiters: {} allocations over {WAITER_ROUNDS} wakes\n\
+         {BUDGET_RATIONALE}",
+        few_waiters.allocations,
+        many_waiters.allocations,
     );
 }

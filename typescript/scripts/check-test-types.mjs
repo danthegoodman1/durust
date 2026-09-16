@@ -51,9 +51,7 @@ const EXPECTED_TEST_PACKAGES = [
   "core",
   "eslint-plugin",
   "examples",
-  "payload",
-  "postgres",
-  "sqlite",
+  "native",
   "testing"
 ];
 

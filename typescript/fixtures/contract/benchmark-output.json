@@ -21,7 +21,9 @@
       "activation_concurrency": 1,
       "activation_prefetch_limit": 1,
       "activity_completion_batch": 1,
-      "postgres_pool_size": 24
+      "postgres_pool_size": 24,
+      "list_stale": false,
+      "drop_stale": false
     },
     "elapsed_ms": 20,
     "setup_ms": 5,
@@ -128,7 +130,8 @@
     "resource_samples": null,
     "postgres_schema": null,
     "db_path": null,
-    "db_bytes": null
+    "db_bytes": null,
+    "postgres_database": null
   },
   "typescriptBaseline": {
     "name": "contract-memory-mixed",
@@ -166,7 +169,6 @@
       },
       "processing_mixed_actions_per_second": 3200,
       "processing_workflows_per_second": 400,
-      "workflow_task_commit_p95_ms": 0.05,
       "operations": {
         "claimWorkflowTask": {
           "calls": 32,
@@ -180,6 +182,16 @@
           "calls": 12,
           "errors": 0
         }
+      },
+      "backend_metrics": {
+        "workflowTaskCommitLatency": {
+          "samples": 32,
+          "p50Ms": 0.01,
+          "p95Ms": 0.05,
+          "p99Ms": 0.08,
+          "maxMs": 0.1
+        },
+        "operations": {}
       }
     },
     "thresholds": {
@@ -303,7 +315,10 @@
       "childMapMaxInFlight": 2,
       "maxRounds": 200,
       "keepDb": false,
-      "json": true
+      "json": true,
+      "signalBatchWidth": 8,
+      "listStale": false,
+      "dropStale": false
     },
     "elapsedMs": 20,
     "setupMs": 5,
@@ -365,7 +380,10 @@
             "p95Ms": 0.04,
             "p99Ms": 0.05,
             "maxMs": 0.06
-          }
+          },
+          "callsPerMixedAction": 0.1875,
+          "itemsPerMixedAction": 0.375,
+          "totalMsPerMixedAction": 0.0480210625
         },
         "commit_workflow_tasks": {
           "calls": 32,
@@ -380,7 +398,10 @@
             "p95Ms": 0.05,
             "p99Ms": 0.08,
             "maxMs": 0.1
-          }
+          },
+          "callsPerMixedAction": 0.1875,
+          "itemsPerMixedAction": 0.375,
+          "totalMsPerMixedAction": 0.0480210625
         },
         "complete_activity": {
           "calls": 12,
@@ -395,8 +416,16 @@
             "p95Ms": 0.03,
             "p99Ms": 0.04,
             "maxMs": 0.05
-          }
+          },
+          "callsPerMixedAction": 0.1875,
+          "itemsPerMixedAction": 0.375,
+          "totalMsPerMixedAction": 0.0480210625
         }
+      },
+      "workflowTaskCommitShapes": {
+        "postgresSimpleEligible": 32,
+        "postgresSimpleTerminalEvent": 8,
+        "total": 32
       }
     },
     "postgresStats": {
@@ -454,7 +483,59 @@
     },
     "postgresSchema": "fixture_schema",
     "dbPath": null,
-    "dbBytes": null
+    "dbBytes": null,
+    "processingBackendMetrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 32,
+        "p50Ms": 0.116643,
+        "p95Ms": 0.207643,
+        "p99Ms": 0.255753,
+        "maxMs": 0.255753
+      },
+      "operations": {
+        "claim_activity_tasks": {
+          "calls": 6,
+          "errors": 0,
+          "items": 12,
+          "totalMs": 1.536674,
+          "itemsPerCall": 2.0,
+          "itemsPerSecond": 7809.073362339703,
+          "callsPerMixedAction": 0.1875,
+          "itemsPerMixedAction": 0.375,
+          "totalMsPerMixedAction": 0.0480210625,
+          "latency": {
+            "samples": 6,
+            "p50Ms": 0.065051,
+            "p95Ms": 0.636603,
+            "p99Ms": 0.636603,
+            "maxMs": 0.636603
+          }
+        },
+        "claim_workflow_task": {
+          "calls": 36,
+          "errors": 0,
+          "items": 32,
+          "totalMs": 2.801178,
+          "itemsPerCall": 0.8888888888888888,
+          "itemsPerSecond": 11423.765287318407,
+          "callsPerMixedAction": 1.125,
+          "itemsPerMixedAction": 1.0,
+          "totalMsPerMixedAction": 0.0875368125,
+          "latency": {
+            "samples": 36,
+            "p50Ms": 0.053738,
+            "p95Ms": 0.201628,
+            "p99Ms": 0.289555,
+            "maxMs": 0.289555
+          }
+        }
+      },
+      "workflowTaskCommitShapes": {
+        "postgresSimpleEligible": 32,
+        "postgresSimpleTerminalEvent": 8,
+        "total": 32
+      }
+    }
   },
   "rustComparison": {
     "dimensions": {

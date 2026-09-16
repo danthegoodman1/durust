@@ -1,3 +1,9 @@
+# Required repository setup:
+# - CARGO_REGISTRY_TOKEN must allow publishing the durust-macros and durust crates.
+# - npm trusted publishing must trust this workflow for every public @durust/*
+#   package, including the four @durust/native-<target> platform packages.
+# - Branch protection must allow github-actions[bot] to push the release commit
+#   to main.
 name: Release
 
 on:
@@ -30,9 +36,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) }}
+  prepare:
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository) }}
     runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.eligibility.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.release_ref.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,27 +66,6 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Install Rust
-        if: steps.eligibility.outputs.release == 'true'
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Use Rust stable
-        if: steps.eligibility.outputs.release == 'true'
-        run: rustup default stable
-
-      - uses: actions/setup-node@v4
-        if: steps.eligibility.outputs.release == 'true'
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: typescript/package-lock.json
-
-      - name: Configure Git author
-        if: steps.eligibility.outputs.release == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
       - name: Determine release version
         if: steps.eligibility.outputs.release == 'true'
         id: version
@@ -88,35 +77,194 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Releasing $version"
 
-      - name: Apply lockstep version
+      - name: Record release source
         if: steps.eligibility.outputs.release == 'true'
+        id: release_ref
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # The addon is built once per platform, on that platform. Linux builds run in
+  # manylinux 2.34 containers so the shipped binaries link no newer glibc than
+  # the floor `@durust/native` documents.
+  build-linux-native:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64-gnu
+            uname_arch: x86_64
+            container_image: quay.io/pypa/manylinux_2_34_x86_64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64-gnu
+            uname_arch: aarch64
+            container_image: quay.io/pypa/manylinux_2_34_aarch64
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install Rust
         run: |
-          node scripts/release-version.mjs apply "${{ steps.version.outputs.version }}"
-          cargo update -w
-          npm install --prefix typescript --package-lock-only --ignore-scripts
-          node scripts/release-version.mjs check "${{ steps.version.outputs.version }}"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
       - name: Install TypeScript dependencies
-        if: steps.eligibility.outputs.release == 'true'
         run: npm ci --prefix typescript
 
+      - name: Verify the build environment's glibc
+        run: test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.34"
+
+      - name: Build the addon
+        run: npm --prefix typescript run build:native --workspace @durust/native
+
+      - name: Load the addon
+        run: |
+          test "$(uname -m)" = "${{ matrix.uname_arch }}"
+          node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: typescript/packages/native/durust-node.${{ matrix.target }}.node
+          if-no-files-found: error
+
+  build-macos-native:
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: darwin-x64
+            uname_arch: x86_64
+          - os: macos-15
+            target: darwin-arm64
+            uname_arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install TypeScript dependencies
+        run: npm ci --prefix typescript
+
+      - name: Build the addon
+        run: npm --prefix typescript run build:native --workspace @durust/native
+
+      - name: Load the addon
+        run: |
+          test "$(uname -m)" = "${{ matrix.uname_arch }}"
+          node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: typescript/packages/native/durust-node.${{ matrix.target }}.node
+          if-no-files-found: error
+
+  publish:
+    needs:
+      - prepare
+      - build-linux-native
+      - build-macos-native
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+          cache-dependency-path: typescript/package-lock.json
+
+      - name: Configure Git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Apply lockstep version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          node scripts/release-version.mjs apply "${VERSION}"
+          cargo update -w
+          # The platform packages are optional dependencies of the facade at
+          # the new version, which nothing has published yet; their lockfile
+          # entries come from the manifests, so the install below resolves
+          # nothing from the registry for them.
+          node scripts/write-native-lockfile.mjs
+          npm install --prefix typescript --package-lock-only --ignore-scripts
+          node scripts/release-version.mjs check "${VERSION}"
+
+      - name: Install TypeScript dependencies
+        run: npm ci --prefix typescript
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-artifacts
+          merge-multiple: true
+
+      - name: Assemble the platform packages
+        run: |
+          set -euo pipefail
+          for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu; do
+            binary="durust-node.${target}.node"
+            test -f "native-artifacts/${binary}" || { echo "missing ${binary}" >&2; exit 1; }
+            cp "native-artifacts/${binary}" "typescript/packages/native/npm/${target}/${binary}"
+          done
+          node scripts/check-native-packages.mjs --require-binaries
+          # With the addons in place the packed tarballs are the ones about to
+          # be published, so the lockfile can carry their integrity.
+          node scripts/write-native-lockfile.mjs --integrity
+          node scripts/release-version.mjs check "${{ needs.prepare.outputs.version }}"
+
+      - name: Build the TypeScript packages
+        run: npm run build --prefix typescript
+
       - name: Commit and push release version
-        if: steps.eligibility.outputs.release == 'true'
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           git diff --check
           if git diff --quiet; then
             echo "No release version changes to commit"
             exit 0
           fi
-          git add Cargo.toml Cargo.lock durust-macros/Cargo.toml benchtools/Cargo.toml typescript/package-lock.json typescript/packages
-          git commit -m "chore(release): ${{ steps.version.outputs.version }} [skip release]"
+          git add Cargo.toml Cargo.lock durust-macros/Cargo.toml benchtools/Cargo.toml durust-node/Cargo.toml typescript/package-lock.json typescript/packages
+          git commit -m "chore(release): ${VERSION} [skip release]"
           git push origin HEAD:main
 
       - name: Publish crates
-        if: steps.eligibility.outputs.release == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
 
@@ -149,10 +297,12 @@ jobs:
 
           publish_crate durust
 
+      # The platform packages go first: the facade's optional dependencies
+      # resolve them at install time, so a facade published ahead of its addon
+      # would install with nothing to load.
       - name: Publish npm packages
-        if: steps.eligibility.outputs.release == 'true'
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
           npm --version
@@ -160,6 +310,21 @@ jobs:
             echo "GitHub OIDC request environment is missing" >&2
             exit 1
           fi
+
+          publish_dir() {
+            local dir="$1"
+            local package
+            package="$(node -p "require('./${dir}/package.json').name")"
+            if npm view "${package}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${package} ${VERSION} is already published"
+              return
+            fi
+            npm publish "./${dir}" --access public
+          }
+
+          for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu; do
+            publish_dir "typescript/packages/native/npm/${target}"
+          done
 
           publish_package() {
             local package="$1"
@@ -171,8 +336,6 @@ jobs:
           }
 
           publish_package @durust/core
-          publish_package @durust/payload
-          publish_package @durust/sqlite
-          publish_package @durust/postgres
+          publish_package @durust/native
           publish_package @durust/testing
           publish_package @durust/eslint-plugin

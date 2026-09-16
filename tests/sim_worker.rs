@@ -720,7 +720,7 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
             )?;
             let late_release = block_on(env.backend.release_workflow_task(
                 stale.claim.clone(),
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
+                durust::WorkflowTaskRelease::immediate(),
             ));
             sim.ensure(
                 "late_release_fenced",
@@ -756,6 +756,100 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
     })?;
 
     scenario_outcome(sim, &env, &runs)
+}
+
+// The race only lease fencing rejects. Worker A claims, virtual time passes
+// its lease, worker B reclaims, and A's late commit arrives while B holds the
+// claim carrying the tail that is still current. A stale-tail check alone
+// accepts it; only the claim token can refuse it. B then commits normally.
+fn expired_lease_correct_tail_commit_is_fenced_scenario(
+    sim: &mut SimRun,
+) -> Result<(), SimFailure> {
+    let mut env = SimEnv::new(sim);
+    let client = Client::new(env.inner.clone());
+    let run_id =
+        block_on(client.start_workflow::<sim_pipeline>("wf/sim-fence", "sim-workflows", num(5)))
+            .expect("start workflow");
+    let claim_a = block_on(env.backend.claim_workflow_task(
+        WorkerId::new("sim-fence-a"),
+        workflow_claim_options("sim-workflows", "sim.pipeline"),
+    ))
+    .map_err(|err| sim.failure("claim_a_error", err.to_string()))?
+    .ok_or_else(|| sim.failure("claim_a", "the started run was not claimable"))?;
+
+    sim.schedule_after(Duration::from_millis(1_200), "reclaim");
+    sim.run_until_idle(100, |sim, step| {
+        env.sync_clock(sim);
+        if step.label != "reclaim" {
+            return Err(sim.failure("unknown_step", step.label));
+        }
+        let claim_b = block_on(env.backend.claim_workflow_task(
+            WorkerId::new("sim-fence-b"),
+            workflow_claim_options("sim-workflows", "sim.pipeline"),
+        ))
+        .map_err(|err| sim.failure("claim_b_error", err.to_string()))?
+        .ok_or_else(|| sim.failure("claim_b", "the expired lease was not reclaimable"))?;
+        sim.ensure(
+            "same_tail_for_both_claims",
+            claim_b.replay_target_event_id == claim_a.replay_target_event_id,
+            format!(
+                "a saw tail {:?}, b saw tail {:?}",
+                claim_a.replay_target_event_id, claim_b.replay_target_event_id
+            ),
+        )?;
+        let late = block_on(env.backend.commit_workflow_task(
+            claim_a.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: claim_a.replay_target_event_id,
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    result: durust::encode_payload(&999_u64).unwrap(),
+                })],
+                ..WorkflowTaskCommit::default()
+            },
+        ));
+        sim.ensure(
+            "late_correct_tail_commit_fenced",
+            matches!(late, Err(durust::Error::StaleLease)),
+            format!("a's late commit outcome {late:?}"),
+        )?;
+        let late_release = block_on(env.backend.release_workflow_task(
+            claim_a.claim.clone(),
+            durust::WorkflowTaskRelease::immediate(),
+        ));
+        sim.ensure(
+            "late_release_fenced",
+            matches!(late_release, Err(durust::Error::StaleLease)),
+            format!("a's late release outcome {late_release:?}"),
+        )?;
+        // B still holds the claim and commits normally.
+        let committed = block_on(env.backend.commit_workflow_task(
+            claim_b.claim.clone(),
+            WorkflowTaskCommit {
+                expected_tail_event_id: claim_b.replay_target_event_id,
+                ..WorkflowTaskCommit::default()
+            },
+        ))
+        .map_err(|err| sim.failure("b_commit_error", err.to_string()))?;
+        sim.ensure(
+            "b_commit_lands_after_fenced_a",
+            matches!(committed, CommitOutcome::Committed { .. }),
+            format!("b's commit outcome {committed:?}"),
+        )?;
+        let history = run_history(&env.inner, &run_id);
+        sim.ensure(
+            "history_untouched_by_fenced_commit",
+            history.len() == 1
+                && matches!(history[0].data, HistoryEventData::WorkflowStarted { .. }),
+            format!(
+                "history {:?}",
+                history
+                    .iter()
+                    .map(|event| event.event_type())
+                    .collect::<Vec<_>>()
+            ),
+        )?;
+        Ok(())
+    })
 }
 
 // Scenario 2: cache eviction storm. Workflows progress across tasks while the
@@ -1026,6 +1120,14 @@ fn real_worker_crash_between_claim_and_commit_completes_exactly_once() {
 fn real_worker_batch_prepare_exceeding_lease_fences_tail_commits() {
     run_many_seeds(0, 128, FaultProfile::None, |sim| {
         batch_prepare_exceeds_lease_scenario(sim).map(|_| ())
+    })
+    .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+#[test]
+fn expired_lease_correct_tail_commit_is_fenced() {
+    run_many_seeds(0, 4, FaultProfile::None, |sim| {
+        expired_lease_correct_tail_commit_is_fenced_scenario(sim)
     })
     .unwrap_or_else(|failure| panic!("{failure}"));
 }

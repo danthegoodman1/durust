@@ -313,10 +313,14 @@ heartbeating — a hung or crashed worker — is reclaimed and retried one lease
 after its last heartbeat.
 
 `RetryPolicy::exponential()` paces retries with provider-enforced backoff: a
-failed attempt's retry becomes claimable `1s * 2^(failed_attempt - 1)` after
-the failure, so a fast-failing activity cannot hot-loop. `RetryPolicy::none()`
-disables both retries and pacing. Timeout-driven retries are re-claimable
-immediately because the expired deadline already paced the attempt.
+failed attempt's retry becomes claimable
+`min(max_interval, initial_interval * backoff_coefficient^(failed_attempt - 1))`
+after the failure (one second doubling up to a minute by default), so a
+fast-failing activity cannot hot-loop; `.initial_interval(..)`,
+`.max_interval(..)`, `.backoff_coefficient(..)`, and
+`.non_retryable_error_types(..)` tune it, and the same fields drive the
+TypeScript runtime. `RetryPolicy::none()` disables both retries and pacing. A
+timed-out attempt's retry is paced the same way.
 
 Activities return serializable Durust errors. A retry policy is skipped when the
 activity returns a non-retryable application error:
@@ -381,14 +385,15 @@ activity completions are idempotent and do not append workflow failure history.
 Workflow code reads deterministic time from Durust:
 
 ```rust
-let started_at = durust::now();
-let deadline = started_at + Duration::from_minutes(30);
+let started_at = durust::now().await?;
+let deadline = TimestampMs(started_at.0 + 30 * 60 * 1_000);
 
 durust::sleep_until(deadline).await;
 ```
 
-`durust::now()` is workflow time. It is recorded in durable history and returns
-the same value during replay. Use `durust::sleep(...)` or
+`durust::now()` is workflow time: the provider clock as the task observed it,
+recorded in durable history as a side-effect marker so replay returns the same
+value. Each call records its own marker. Use `durust::sleep(...)` or
 `durust::sleep_until(...)` for timers.
 
 ### Bounded Fanout With Join
@@ -843,7 +848,7 @@ workflow and activity leases
 signal inboxes
 activity map state
 child workflow map state
-child workflow outbox and parent notifications
+child workflow starts and parent notifications
 query projections
 payload refs
 idempotency
@@ -1087,7 +1092,10 @@ packages. It bumps the patch version by default, or bumps the minor or major
 version when the triggering commit message contains `#minor` or `#major`. It
 commits the updated manifests and lockfiles back to `main` with
 `[skip release]`, then publishes `durust-macros`, `durust`, and the public
-`@durust/*` npm packages.
+`@durust/*` npm packages. The `durust-node` addon behind `@durust/native` is
+built on four platform runners (Linux x64 and arm64 in manylinux 2.34
+containers, macOS x64 and arm64) and shipped as one `@durust/native-<target>`
+package each, published before the facade that depends on them.
 
 Manual dispatch can publish the `current` checked-in version without creating a
 new version commit. This is only for recovering a partially published release.

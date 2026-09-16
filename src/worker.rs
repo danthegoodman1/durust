@@ -4,9 +4,8 @@ use crate::{
     Error, EventId, FailActivityRequest, FireDueTimersRequest, HistoryEvent, HistoryEventData,
     Namespace, NewHistoryEvent, ReadSignalInboxRequest, ReadSignalInboxesRequest, Registry, Result,
     RunDueMaintenanceRequest, RunId, ShardId, StartWorkflowRequest, TaskQueue,
-    TimeoutDueActivitiesRequest, WaitForReadyRequest, WorkerId, Workflow, WorkflowChangeMarkerKind,
-    WorkflowChangeVersionsRequest, WorkflowId, WorkflowTaskCommit, WorkflowTaskReason,
-    WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
+    TimeoutDueActivitiesRequest, WaitForReadyRequest, WorkerId, Workflow, WorkflowId,
+    WorkflowTaskCommit, WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -181,6 +180,10 @@ pub struct WorkerMetrics {
     /// Workflow tasks that failed because history records a change version this
     /// build cannot replay ([`Error::UnsupportedWorkflowVersion`]).
     pub workflow_tasks_unsupported_version: u64,
+    /// Workflow tasks a durable API refused for the workflow's own values: a
+    /// payload that would not encode or decode, or an empty side-effect key.
+    /// Released for retry like a panic, never committed as `WorkflowFailed`.
+    pub workflow_tasks_faulted: u64,
     /// Workflow tasks released for a later attempt without being replayed.
     pub workflow_tasks_deferred: u64,
     pub activity_tasks_completed: u64,
@@ -209,6 +212,7 @@ struct WorkerMetricsState {
     workflow_tasks_panicked: AtomicU64,
     workflow_tasks_nondeterministic: AtomicU64,
     workflow_tasks_unsupported_version: AtomicU64,
+    workflow_tasks_faulted: AtomicU64,
     workflow_tasks_deferred: AtomicU64,
     activity_tasks_completed: AtomicU64,
     activity_tasks_failed: AtomicU64,
@@ -234,6 +238,7 @@ impl WorkerMetricsState {
             workflow_tasks_unsupported_version: self
                 .workflow_tasks_unsupported_version
                 .load(Ordering::Relaxed),
+            workflow_tasks_faulted: self.workflow_tasks_faulted.load(Ordering::Relaxed),
             workflow_tasks_deferred: self.workflow_tasks_deferred.load(Ordering::Relaxed),
             activity_tasks_completed: self.activity_tasks_completed.load(Ordering::Relaxed),
             activity_tasks_failed: self.activity_tasks_failed.load(Ordering::Relaxed),
@@ -467,7 +472,8 @@ where
             crate::QueryProjectionOutcome::Found { payload, .. } => {
                 Ok(Some(crate::decode_payload::<W::QueryState>(&payload)?))
             }
-            crate::QueryProjectionOutcome::NotFound => Ok(None),
+            crate::QueryProjectionOutcome::NotFound
+            | crate::QueryProjectionOutcome::NoProjection => Ok(None),
         }
     }
 }
@@ -579,10 +585,6 @@ struct CachedWorkflow {
     last_event_id: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
-    // The run's change markers, shared with every task that replayed them.
-    // Held as the deduplicated index the runtime actually reads, so a task
-    // whose chunk adds no marker hands the same allocation straight back.
-    change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
     // Ready events the committed task left unconsumed (for example a spawned
     // handle's completion the workflow has not awaited yet). They seed the
     // next task's context so the run stays cached; the next chunk starts
@@ -694,6 +696,9 @@ impl RecoveryReplayBudget {
     }
 }
 
+// One value per prepared task: boxing the prepared side would trade a
+// per-task allocation for the lint.
+#[allow(clippy::large_enum_variant)]
 enum PreparedWorkflowTaskOutcome {
     Prepared(PreparedWorkflowTask),
     Deferred,
@@ -707,8 +712,6 @@ struct PreparedWorkflowTask {
     runtime_appended_tail: EventId,
     next_command_seq: u64,
     default_activity_options: crate::ActivityOptions,
-    change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
-    appended_change_marker: bool,
     unconsumed_indexes: crate::runtime::ReadyEventIndexes,
     terminal: bool,
 }
@@ -1230,6 +1233,9 @@ where
             Error::UnsupportedWorkflowVersion { .. } => {
                 &self.metrics.workflow_tasks_unsupported_version
             }
+            Error::PayloadEncode(_) | Error::PayloadDecode(_) => {
+                &self.metrics.workflow_tasks_faulted
+            }
             other => {
                 // Everything else is a stage-level error the loop counts and
                 // backs off from instead. The assertion keeps this split from
@@ -1279,11 +1285,9 @@ where
     ) -> Result<Option<CachedWorkflow>> {
         let runtime_appended_tail = prepared.runtime_appended_tail;
         let terminal = prepared.terminal;
-        let appended_change_marker = prepared.appended_change_marker;
         let unconsumed_indexes = prepared.unconsumed_indexes;
         let next_command_seq = prepared.next_command_seq;
-        let default_activity_options = prepared.default_activity_options.clone();
-        let change_markers = Arc::clone(&prepared.change_markers);
+        let default_activity_options = prepared.default_activity_options;
         let future = prepared.future;
         // Moved, not cloned: the run id is only needed for accounting, and
         // cloning one per committed task would put an allocation on the commit
@@ -1301,23 +1305,15 @@ where
             return Ok(None);
         };
         self.record_workflow_task_committed(&run_id);
-
-        // Provider-appended events past the runtime's tail (for example
-        // inline child starts) are invisible to the cached future, so the
-        // next task must cold-replay to pick them up.
-        if terminal || appended_change_marker || last_event_id > runtime_appended_tail {
-            return Ok(None);
-        }
-
-        Ok(Some(CachedWorkflow {
-            future,
+        Ok(cache_entry_after_commit(
+            terminal,
+            runtime_appended_tail,
             last_event_id,
+            future,
             next_command_seq,
             default_activity_options,
-            change_markers,
             unconsumed_indexes,
-            last_accessed_seq: 0,
-        }))
+        ))
     }
 
     // Releases a claim whose commit failed, swallowing backpressure (the task will
@@ -1336,20 +1332,14 @@ where
             self.record_workflow_task_deferred(&claim.run_id);
             let _ = self
                 .backend
-                .release_workflow_task(
-                    claim,
-                    WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
-                )
+                .release_workflow_task(claim, WorkflowTaskRelease::delayed(delay))
                 .await;
             return Ok(());
         }
         let release = if fails_workflow_task_without_committing(&err) {
-            WorkflowTaskRelease::delayed(
-                WorkflowTaskReason::CacheEvicted,
-                self.nondeterminism_retry_backoff,
-            )
+            WorkflowTaskRelease::delayed(self.nondeterminism_retry_backoff)
         } else {
-            WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted)
+            WorkflowTaskRelease::immediate()
         };
         self.record_workflow_task_failure(&claim.run_id, &err);
         let _ = self.backend.release_workflow_task(claim, release).await;
@@ -1781,11 +1771,17 @@ where
             let poll = poll_cached(future, context)?;
             let signal_requests = context.take_signal_requests();
             if !signal_requests.is_empty() {
+                // The names move into the inbox requests; only the command ids
+                // are kept to hand the records back.
+                let mut command_ids = Vec::with_capacity(signal_requests.len());
                 let inbox_requests = signal_requests
-                    .iter()
-                    .map(|request| ReadSignalInboxRequest {
-                        run_id: run_id.clone(),
-                        signal_name: request.signal_name.clone(),
+                    .into_iter()
+                    .map(|request| {
+                        command_ids.push(request.command_id);
+                        ReadSignalInboxRequest {
+                            run_id: run_id.clone(),
+                            signal_name: request.signal_name,
+                        }
                     })
                     .collect::<Vec<_>>();
                 let signals = self
@@ -1794,11 +1790,11 @@ where
                         requests: inbox_requests,
                     })
                     .await?;
-                if signals.len() != signal_requests.len() {
+                if signals.len() != command_ids.len() {
                     return Err(Error::Backend(format!(
                         "backend returned {} signal inbox records for {} requests",
                         signals.len(),
-                        signal_requests.len()
+                        command_ids.len()
                     )));
                 }
                 // Only an accepted record counts as progress: the runtime
@@ -1806,13 +1802,13 @@ where
                 // task, and re-polling on a rejected record would re-request
                 // and re-read the same record forever.
                 let mut fulfilled = false;
-                for (request, signal) in signal_requests.into_iter().zip(signals) {
+                for (command_id, signal) in command_ids.into_iter().zip(signals) {
                     let signal = signal.map(|signal| crate::runtime::SignalInboxRecordForRuntime {
                         signal_id: signal.signal_id,
                         signal_name: signal.signal_name,
                         payload: signal.payload,
                     });
-                    fulfilled |= context.fulfill_signal_request(request.command_id, signal);
+                    fulfilled |= context.fulfill_signal_request(command_id, signal);
                 }
                 if fulfilled {
                     continue;
@@ -1880,10 +1876,7 @@ where
     ) -> Result<()> {
         self.record_workflow_task_deferred(&claim.run_id);
         self.backend
-            .release_workflow_task(
-                claim,
-                WorkflowTaskRelease::delayed(WorkflowTaskReason::CacheEvicted, delay),
-            )
+            .release_workflow_task(claim, WorkflowTaskRelease::delayed(delay))
             .await
     }
 
@@ -1925,45 +1918,12 @@ where
         Ok(payload)
     }
 
-    // The run's change markers for this task, merged into whatever the last
-    // task left cached instead of rebuilt from a cloned record vector.
-    //
-    // The `has_more` arm cannot merge: markers past the loaded window exist
-    // only in the provider, so the whole set is re-read and re-indexed there.
-    async fn change_markers_for_loaded_history(
-        &self,
-        claimed: &crate::ClaimedWorkflowTask,
-        chunk: &crate::HistoryChunk,
-        cached: Option<Arc<crate::runtime::ChangeMarkerIndex>>,
-    ) -> Result<Arc<crate::runtime::ChangeMarkerIndex>> {
-        if chunk.has_more {
-            let records = self
-                .backend
-                .workflow_change_versions(WorkflowChangeVersionsRequest {
-                    namespace: self.namespace.clone(),
-                    workflow_id: None,
-                    run_id: Some(claimed.run_id.clone()),
-                    change_id: None,
-                })
-                .await?
-                .records;
-            return Ok(Arc::new(
-                crate::runtime::RuntimeChangeMarker::index_from_records(records),
-            ));
-        }
-
-        let mut markers = cached.unwrap_or_default();
-        merge_change_markers_from_history(&claimed.run_id, &chunk.events, &mut markers);
-        Ok(markers)
-    }
-
     async fn prepare_workflow_poll(
         &self,
         claimed: crate::ClaimedWorkflowTask,
         future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
         mut context: crate::runtime::RuntimeContext,
         poll: Poll<Result<crate::PayloadRef>>,
-        change_markers: Arc<crate::runtime::ChangeMarkerIndex>,
     ) -> Result<PreparedWorkflowTask> {
         let poll_reached_terminal_state = match &poll {
             Poll::Pending => false,
@@ -2011,13 +1971,6 @@ where
                 .0
                 .saturating_add(u64::try_from(append_events.len()).unwrap_or(u64::MAX)),
         );
-        let appended_change_marker = append_events.iter().any(|event| {
-            matches!(
-                event.data,
-                HistoryEventData::VersionMarker(_) | HistoryEventData::DeprecatedPatchMarker(_)
-            )
-        });
-
         Ok(PreparedWorkflowTask {
             run_id: claimed.run_id,
             claim: claimed.claim,
@@ -2038,8 +1991,6 @@ where
             runtime_appended_tail,
             next_command_seq,
             default_activity_options,
-            change_markers,
-            appended_change_marker,
             unconsumed_indexes,
             terminal,
         })
@@ -2250,7 +2201,7 @@ where
                     break;
                 }
             };
-            for (task, result) in prepared[start..end].iter_mut().zip(results.into_iter()) {
+            for (task, result) in prepared[start..end].iter_mut().zip(results) {
                 let last_event_id = match result.result {
                     Ok(crate::CommitOutcome::Committed { new_tail_event_id }) => new_tail_event_id,
                     // The provider released the claim as part of reporting the
@@ -2272,30 +2223,23 @@ where
                 };
                 committed += 1;
                 self.shared.record_workflow_task_committed(&task.run_id);
-                // Mirrors `commit_prepared_workflow_task`'s cache decision.
-                if task.terminal
-                    || task.appended_change_marker
-                    || last_event_id > task.runtime_appended_tail
-                {
-                    continue;
-                }
                 let future = std::mem::replace(
                     &mut task.future,
                     Box::pin(std::future::ready(Err(Error::Backend(
                         "committed workflow future was already moved".to_owned(),
                     )))),
                 );
-                let run_id = task.run_id.clone();
-                let entry = CachedWorkflow {
-                    future,
+                if let Some(entry) = cache_entry_after_commit(
+                    task.terminal,
+                    task.runtime_appended_tail,
                     last_event_id,
-                    next_command_seq: task.next_command_seq,
-                    default_activity_options: task.default_activity_options.clone(),
-                    change_markers: Arc::clone(&task.change_markers),
-                    unconsumed_indexes: std::mem::take(&mut task.unconsumed_indexes),
-                    last_accessed_seq: 0,
-                };
-                self.insert_cached_workflow(run_id, entry);
+                    future,
+                    task.next_command_seq,
+                    std::mem::take(&mut task.default_activity_options),
+                    std::mem::take(&mut task.unconsumed_indexes),
+                ) {
+                    self.insert_cached_workflow(task.run_id.clone(), entry);
+                }
             }
             start = end;
         }
@@ -2379,14 +2323,11 @@ where
         let cached = self.remove_cached_workflow(&claimed.run_id);
         let now = self.shared.backend.current_time().await?;
 
+        let mut load_full_history = false;
         if let Some(mut cached) = cached {
             let chunk = self
                 .shared
                 .claim_history_chunk(&claimed, cached.last_event_id)
-                .await?;
-            let change_markers = self
-                .shared
-                .change_markers_for_loaded_history(&claimed, &chunk, Some(cached.change_markers))
                 .await?;
             let mut context = crate::runtime::RuntimeContext::new(
                 claimed.run_id.clone(),
@@ -2399,7 +2340,6 @@ where
                 cached.next_command_seq,
                 chunk.last_event_id,
                 claimed.replay_target_event_id,
-                Arc::clone(&change_markers),
                 cached.unconsumed_indexes,
             );
             let poll = self
@@ -2413,12 +2353,20 @@ where
                     None,
                 )
                 .await?;
-            return match poll {
-                WorkflowPollOutcome::Ready(poll) => self
-                    .shared
-                    .prepare_workflow_poll(claimed, cached.future, context, poll, change_markers)
-                    .await
-                    .map(PreparedWorkflowTaskOutcome::Prepared),
+            match poll {
+                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
+                    // A change-marker API ran past the loaded window, so the
+                    // cached future's state is unusable: the run cold-replays
+                    // below with its whole history loaded.
+                    load_full_history = true;
+                }
+                WorkflowPollOutcome::Ready(poll) => {
+                    return self
+                        .shared
+                        .prepare_workflow_poll(claimed, cached.future, context, poll)
+                        .await
+                        .map(PreparedWorkflowTaskOutcome::Prepared);
+                }
                 WorkflowPollOutcome::Deferred => {
                     // Deferred is only produced under a recovery budget and the
                     // cached path polls without one; if a budget is ever added
@@ -2429,9 +2377,9 @@ where
                         false,
                         "cached-path workflow poll deferred without a recovery budget"
                     );
-                    Ok(PreparedWorkflowTaskOutcome::Deferred)
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
                 }
-            };
+            }
         }
 
         let is_recovery = claimed.replay_target_event_id > EventId(1);
@@ -2451,74 +2399,133 @@ where
         };
         let mut recovery_budget =
             is_recovery.then(|| RecoveryReplayBudget::new(self.shared.recovery_flow_control));
-        let first_chunk = match recovery_budget.as_mut() {
-            Some(budget) => {
-                self.shared
-                    .claim_recovery_history_chunk(&claimed, EventId::ZERO, budget)
-                    .await?
-            }
-            None => Some(
-                self.shared
-                    .claim_history_chunk(&claimed, EventId::ZERO)
-                    .await?,
-            ),
-        };
-        let Some(first_chunk) = first_chunk else {
-            self.shared
-                .defer_workflow_task(claimed.claim, self.shared.recovery_flow_control.defer_delay)
-                .await?;
-            return Ok(PreparedWorkflowTaskOutcome::Deferred);
-        };
-        let last_loaded_event_id = first_chunk.last_event_id;
-        let change_markers = self
-            .shared
-            .change_markers_for_loaded_history(&claimed, &first_chunk, None)
-            .await?;
-        let (input, replay_events) = split_start_event(first_chunk.events)?;
-        let input = self.shared.hydrate_payload_for_decode(input).await?;
         let Some(registration) = self.shared.registry.workflow(&claimed.workflow_type) else {
             return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
         };
-        let mut future = registration.run(input, self.shared.payload_codec);
-        let mut context = crate::runtime::RuntimeContext::new(
-            claimed.run_id.clone(),
-            self.shared.workflow_task_queue.clone(),
-            self.shared.activity_task_queue.clone(),
-            self.shared.payload_codec,
-            now,
-            replay_events,
-            crate::ActivityOptions::default(),
-            0,
-            last_loaded_event_id,
-            claimed.replay_target_event_id,
-            Arc::clone(&change_markers),
-            crate::runtime::ReadyEventIndexes::default(),
-        );
-        let poll = self
-            .shared
-            .poll_until_history_blocked_or_ready(
-                &claimed.run_id,
-                &claimed,
-                &mut future,
-                &mut context,
+        loop {
+            let mut first_chunk = match self
+                .load_cold_history(&claimed, load_full_history, recovery_budget.as_mut())
+                .await?
+            {
+                Some(chunk) => chunk,
+                None => {
+                    self.shared
+                        .defer_workflow_task(
+                            claimed.claim,
+                            self.shared.recovery_flow_control.defer_delay,
+                        )
+                        .await?;
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+            };
+            let last_loaded_event_id = first_chunk.last_event_id;
+            let (input, replay_events) =
+                split_start_event(std::mem::take(&mut first_chunk.events))?;
+            let input = self.shared.hydrate_payload_for_decode(input).await?;
+            let mut future = registration.run(input, self.shared.payload_codec);
+            let mut context = crate::runtime::RuntimeContext::new(
+                claimed.run_id.clone(),
+                self.shared.workflow_task_queue.clone(),
+                self.shared.activity_task_queue.clone(),
+                self.shared.payload_codec,
+                now,
+                replay_events,
+                crate::ActivityOptions::default(),
+                0,
+                last_loaded_event_id,
                 claimed.replay_target_event_id,
-                recovery_budget.as_mut(),
-            )
-            .await?;
-        match poll {
-            WorkflowPollOutcome::Ready(poll) => self
+                crate::runtime::ReadyEventIndexes::default(),
+            );
+            let poll = self
                 .shared
-                .prepare_workflow_poll(claimed, future, context, poll, change_markers)
-                .await
-                .map(PreparedWorkflowTaskOutcome::Prepared),
-            WorkflowPollOutcome::Deferred => {
-                self.shared
-                    .defer_workflow_task(
-                        claimed.claim,
-                        self.shared.recovery_flow_control.defer_delay,
-                    )
-                    .await?;
-                Ok(PreparedWorkflowTaskOutcome::Deferred)
+                .poll_until_history_blocked_or_ready(
+                    &claimed.run_id,
+                    &claimed,
+                    &mut future,
+                    &mut context,
+                    claimed.replay_target_event_id,
+                    recovery_budget.as_mut(),
+                )
+                .await?;
+            match poll {
+                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
+                    if load_full_history {
+                        return Err(Error::Backend(format!(
+                            "replay of run {} overran a fully loaded history window",
+                            claimed.run_id
+                        )));
+                    }
+                    load_full_history = true;
+                    // The reload starts from event zero and the first attempt's
+                    // chunks are discarded, so it gets a fresh budget: charging
+                    // both would defer a run whose whole history fits the
+                    // budget on every claim.
+                    recovery_budget = is_recovery
+                        .then(|| RecoveryReplayBudget::new(self.shared.recovery_flow_control));
+                }
+                WorkflowPollOutcome::Ready(poll) => {
+                    return self
+                        .shared
+                        .prepare_workflow_poll(claimed, future, context, poll)
+                        .await
+                        .map(PreparedWorkflowTaskOutcome::Prepared);
+                }
+                WorkflowPollOutcome::Deferred => {
+                    self.shared
+                        .defer_workflow_task(
+                            claimed.claim,
+                            self.shared.recovery_flow_control.defer_delay,
+                        )
+                        .await?;
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+            }
+        }
+    }
+
+    // The history a cold replay starts from: the first chunk, or every chunk
+    // up to the replay target when a change-marker API overran a partial
+    // window. `None` means the recovery budget ran out and the task defers.
+    async fn load_cold_history(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        load_full_history: bool,
+        mut recovery_budget: Option<&mut RecoveryReplayBudget>,
+    ) -> Result<Option<crate::HistoryChunk>> {
+        let mut loaded = crate::HistoryChunk {
+            events: Vec::new(),
+            last_event_id: EventId::ZERO,
+            has_more: true,
+        };
+        loop {
+            let chunk = match recovery_budget.as_deref_mut() {
+                Some(budget) => {
+                    let Some(chunk) = self
+                        .shared
+                        .claim_recovery_history_chunk(claimed, loaded.last_event_id, budget)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    chunk
+                }
+                None => {
+                    self.shared
+                        .claim_history_chunk(claimed, loaded.last_event_id)
+                        .await?
+                }
+            };
+            if chunk.events.is_empty() && loaded.last_event_id < claimed.replay_target_event_id {
+                return Err(Error::Backend(format!(
+                    "history stream ended at event {} before replay target {}",
+                    loaded.last_event_id, claimed.replay_target_event_id
+                )));
+            }
+            loaded.events.extend(chunk.events);
+            loaded.last_event_id = chunk.last_event_id;
+            loaded.has_more = chunk.has_more;
+            if !load_full_history || loaded.last_event_id >= claimed.replay_target_event_id {
+                return Ok(Some(loaded));
             }
         }
     }
@@ -2662,10 +2669,21 @@ where
 //
 // One predicate rather than a `matches!` copied to each site, so a variant
 // added to this class cannot be routed at some sites and missed at others.
+// A workflow-code fault: nothing is committed, the claim is released with the
+// nondeterminism backoff, and the next claim replays the run, so a fixed
+// redeploy recovers it. `PayloadEncode` and `PayloadDecode` are here because
+// a durable API raises them for the workflow's own values (a payload that
+// will not encode or decode, an empty side-effect key), which TypeScript
+// routes the same way; committing `WorkflowFailed` for them would destroy a
+// run over a deploy mismatch.
 fn fails_workflow_task_without_committing(err: &Error) -> bool {
     matches!(
         err,
-        Error::Nondeterminism(_) | Error::TaskPanic(_) | Error::UnsupportedWorkflowVersion { .. }
+        Error::Nondeterminism(_)
+            | Error::TaskPanic(_)
+            | Error::UnsupportedWorkflowVersion { .. }
+            | Error::PayloadEncode(_)
+            | Error::PayloadDecode(_)
     )
 }
 
@@ -2717,6 +2735,33 @@ fn poll_cached(
             "workflow task panicked: {}",
             panic_message(payload.as_ref())
         ))
+    })
+}
+
+// The one cache decision for a committed task, shared by the single-task and
+// batch commit paths. A terminal run has nothing to cache, and provider
+// appended events past the runtime's tail (for example inline child starts)
+// are invisible to the cached future, so the next task must cold-replay to
+// pick them up.
+fn cache_entry_after_commit(
+    terminal: bool,
+    runtime_appended_tail: EventId,
+    last_event_id: EventId,
+    future: Pin<Box<dyn Future<Output = Result<crate::PayloadRef>> + Send>>,
+    next_command_seq: u64,
+    default_activity_options: crate::ActivityOptions,
+    unconsumed_indexes: crate::runtime::ReadyEventIndexes,
+) -> Option<CachedWorkflow> {
+    if terminal || last_event_id > runtime_appended_tail {
+        return None;
+    }
+    Some(CachedWorkflow {
+        future,
+        last_event_id,
+        next_command_seq,
+        default_activity_options,
+        unconsumed_indexes,
+        last_accessed_seq: 0,
     })
 }
 
@@ -2834,48 +2879,6 @@ fn split_start_event(
         ));
     };
     Ok((input, events))
-}
-
-// Folds the change markers a freshly loaded chunk carries into the run's
-// shared marker index.
-//
-// Incremental by construction: a chunk with no marker event touches nothing,
-// so the overwhelmingly common task keeps the previous task's `Arc` and copies
-// no records at all. `Arc::make_mut` copies the index exactly once, on the
-// first marker in a chunk that has one — and a task that appends a marker is
-// already forced to cold-replay next time (`appended_change_marker`), so this
-// path is only reached by a chunk replaying markers another task recorded.
-//
-// Later markers win over earlier ones for the same change id, and a marker in
-// the chunk wins over the carried index, which is the order the rebuilt
-// `BTreeMap` this replaced produced.
-fn merge_change_markers_from_history(
-    run_id: &RunId,
-    events: &[HistoryEvent],
-    markers: &mut Arc<crate::runtime::ChangeMarkerIndex>,
-) {
-    for event in events {
-        let marker = match &event.data {
-            HistoryEventData::VersionMarker(marker) => crate::runtime::RuntimeChangeMarker {
-                command_id: crate::command_id(run_id, marker.command_id.seq.0),
-                change_id: marker.change_id.clone(),
-                version: marker.version,
-                marker_kind: WorkflowChangeMarkerKind::Version,
-                event_id: event.event_id,
-            },
-            HistoryEventData::DeprecatedPatchMarker(marker) => {
-                crate::runtime::RuntimeChangeMarker {
-                    command_id: crate::command_id(run_id, marker.command_id.seq.0),
-                    change_id: marker.patch_id.clone(),
-                    version: 1,
-                    marker_kind: WorkflowChangeMarkerKind::DeprecatedPatch,
-                    event_id: event.event_id,
-                }
-            }
-            _ => continue,
-        };
-        Arc::make_mut(markers).insert(marker.change_id.clone(), marker);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3406,14 +3409,12 @@ where
 mod tests {
     use super::*;
     use crate::{
-        ClaimedWorkflowTask, HistoryEvent, HistoryEventData, HistoryEventType, WorkflowTaskClaim,
-        WorkflowTaskReason,
+        ClaimedWorkflowTask, HistoryEvent, HistoryEventData, WorkflowTaskClaim, WorkflowTaskReason,
     };
 
     fn event(event_id: u64) -> HistoryEvent {
         HistoryEvent {
             event_id: EventId(event_id),
-            event_type: HistoryEventType::WorkflowTaskStarted,
             data: HistoryEventData::WorkflowTaskStarted,
         }
     }
@@ -3488,7 +3489,6 @@ mod tests {
     fn split_start_event_moves_the_tail_and_reports_a_missing_or_wrong_head() {
         let started = HistoryEvent {
             event_id: EventId(1),
-            event_type: HistoryEventType::WorkflowStarted,
             data: HistoryEventData::WorkflowStarted {
                 workflow_type: crate::WorkflowType::new("test.workflow", 1),
                 input: crate::PayloadRef::inline_messagepack(&7u64).unwrap(),
@@ -3524,7 +3524,6 @@ mod tests {
             last_event_id: EventId(1),
             next_command_seq: 0,
             default_activity_options: crate::ActivityOptions::default(),
-            change_markers: Arc::default(),
             unconsumed_indexes: crate::runtime::ReadyEventIndexes::default(),
             last_accessed_seq: 0,
         }
@@ -3632,15 +3631,11 @@ mod tests {
         fn measure(bound: usize) -> EvictionCost {
             let mut worker = cache_worker(bound);
             let mut workflow = worker.workflow_worker();
-            // One shared marker index: a separate `Arc::default()` per entry
-            // would measure the setup, not the eviction.
-            let markers: Arc<crate::runtime::ChangeMarkerIndex> = Arc::default();
             let entry = || CachedWorkflow {
                 future: Box::pin(std::future::pending()),
                 last_event_id: EventId(1),
                 next_command_seq: 0,
                 default_activity_options: crate::ActivityOptions::default(),
-                change_markers: Arc::clone(&markers),
                 unconsumed_indexes: crate::runtime::ReadyEventIndexes::default(),
                 last_accessed_seq: 0,
             };

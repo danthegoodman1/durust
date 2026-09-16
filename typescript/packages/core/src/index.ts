@@ -3,13 +3,12 @@ export * from "./backend.js";
 export * from "./fingerprint.js";
 export * from "./history.js";
 export * from "./manifest.js";
-export * from "./map-engine.js";
 export * from "./map-manifest.js";
 export * from "./options.js";
 export * from "./payload.js";
-// The pure helpers a durable provider needs. Exported for the same reason the
-// map engine is: `@durust/sqlite` and `@durust/postgres` are separate packages,
-// so anything they must not disagree about has to be reachable from here.
+export * from "./provider-error.js";
+// Pure helpers over identifiers and history that the runtime, the worker,
+// and the shared conformance cases read.
 export * from "./provider-util.js";
 export * from "./registry.js";
 export {
@@ -21,6 +20,8 @@ export {
   HotWorkflowExecution,
   UnsupportedWorkflowVersionError,
   WorkflowCancelledError,
+  WorkflowCodeError,
+  WorkflowFailure,
   WorkflowFailureError,
   continueAsNew,
   deprecatePatch,
@@ -28,6 +29,7 @@ export {
   installNondeterminismGuards,
   patched,
   publish,
+  now,
   sideEffect,
   uninstallNondeterminismGuards
 } from "./runtime.js";

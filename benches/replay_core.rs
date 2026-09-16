@@ -1456,6 +1456,12 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
 }
 
 fn payload_codec(c: &mut Criterion) {
+    // A payload the size of a typical activity input, where the type
+    // fingerprint rather than the bytes dominates the encode.
+    let small = bench_input(21);
+    c.bench_function("payload_encode_messagepack_small", |b| {
+        b.iter(|| durust::encode_payload(black_box(&small)).unwrap());
+    });
     let payload = large_payload();
     c.bench_function("payload_encode_messagepack_64kb", |b| {
         b.iter(|| durust::encode_payload(black_box(&payload)).unwrap());
@@ -1474,31 +1480,6 @@ fn payload_codec(c: &mut Criterion) {
     c.bench_function("payload_decode_json_64kb", |b| {
         b.iter(|| black_box(&json).decode_json::<LargePayload>().unwrap());
     });
-}
-
-fn payload_compression(c: &mut Criterion) {
-    let repetitive = encoded_payload_bytes(&large_payload());
-    let mixed = encoded_payload_bytes(&mixed_large_payload());
-    let repetitive_compressed = zstd::bulk::compress(&repetitive, 3).unwrap();
-    let mixed_compressed = zstd::bulk::compress(&mixed, 3).unwrap();
-
-    let mut group = c.benchmark_group("payload_compression_64kb");
-    group.throughput(Throughput::Bytes(repetitive.len() as u64));
-    group.bench_function("zstd_compress_repetitive_messagepack", |b| {
-        b.iter(|| zstd::bulk::compress(black_box(&repetitive), 3).unwrap());
-    });
-    group.bench_function("zstd_decompress_repetitive_messagepack", |b| {
-        b.iter(|| {
-            zstd::bulk::decompress(black_box(&repetitive_compressed), repetitive.len()).unwrap()
-        });
-    });
-    group.bench_function("zstd_compress_mixed_messagepack", |b| {
-        b.iter(|| zstd::bulk::compress(black_box(&mixed), 3).unwrap());
-    });
-    group.bench_function("zstd_decompress_mixed_messagepack", |b| {
-        b.iter(|| zstd::bulk::decompress(black_box(&mixed_compressed), mixed.len()).unwrap());
-    });
-    group.finish();
 }
 
 #[cfg(feature = "s3")]
@@ -2599,16 +2580,6 @@ fn large_payload() -> LargePayload {
     }
 }
 
-fn mixed_large_payload() -> LargePayload {
-    let mut state = 0x1234_5678_u32;
-    let mut body = String::with_capacity(64 * 1024);
-    for _ in 0..64 * 1024 {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        body.push(char::from(b' ' + (state % 95) as u8));
-    }
-    LargePayload { body }
-}
-
 fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
     durust::encode_payload(payload)
         .unwrap()
@@ -2891,10 +2862,10 @@ struct PostgresBenchFixture {
 /// entry point in the workspace, rather than most of them.
 #[cfg(feature = "postgres")]
 fn postgres_benchmark_url() -> Option<String> {
-    if let Ok(url) = env::var("DURUST_POSTGRES_URL") {
-        if !url.trim().is_empty() {
-            return Some(url);
-        }
+    if let Ok(url) = env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
     }
     let required = match env::var("DURUST_REQUIRE_POSTGRES") {
         Ok(value) => {
@@ -3555,7 +3526,6 @@ criterion_group!(
     postgres_provider_hot_paths,
     activity_heartbeat,
     payload_codec,
-    payload_compression,
     payload_garage_object_store,
     payload_provider_refs,
     payload_replay,

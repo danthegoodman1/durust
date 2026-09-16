@@ -1,8 +1,8 @@
 use durust::{
     ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
     CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    MemoryBackend, Namespace, PayloadRef, PayloadStorageConfig, SqliteBackend, TaskQueue, Worker,
-    WorkerId, WorkflowType,
+    HistoryEventType, MemoryBackend, Namespace, PayloadRef, PayloadStorageConfig, SqliteBackend,
+    TaskQueue, Worker, WorkerId, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -35,10 +35,10 @@ static PANICKING_ACTIVITY_ATTEMPTS: Mutex<u32> = Mutex::new(0);
 /// still gets the skip.
 #[cfg(feature = "postgres")]
 fn postgres_url_or_skip(what: &str) -> Option<String> {
-    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
-        if !url.trim().is_empty() {
-            return Some(url);
-        }
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
     }
     assert!(
         !postgres_is_required(),
@@ -257,6 +257,19 @@ async fn version_min_two(_: UnitInput) -> durust::Result<String> {
     durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
+}
+
+// One change id consulted twice, on either side of a task boundary. Each call
+// records its own marker, so the history carries two `VersionMarker`s for
+// `repeat`, which is what the TypeScript runtime commits for the same program.
+#[durust::workflow(name = "tests.version-repeated", version = 1)]
+async fn version_repeated(input: NumberInput) -> durust::Result<u64> {
+    let first = durust::patched("repeat")?;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let second = durust::patched("repeat")?;
+    Ok(doubled + u64::from(first) + u64::from(second))
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
@@ -1871,8 +1884,11 @@ fn side_effect_replays_recorded_marker_without_rerunning_closure() {
     });
 }
 
+// An oversized side-effect payload is refused by the durable API, which is a
+// workflow-code fault: the task fails without committing (no marker, no
+// terminal event) and the run keeps its history for a fixed redeploy.
 #[test]
-fn oversized_side_effect_fails_without_recording_marker() {
+fn oversized_side_effect_fails_the_task_without_committing() {
     block_on(async {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
@@ -1890,20 +1906,21 @@ fn oversized_side_effect_fails_without_recording_marker() {
             .register_workflow(oversized_side_effect_workflow)
             .build();
 
-        let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.workflow_tasks, 1);
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(
+            matches!(&err, durust::Error::PayloadEncode(message) if message.contains("side effect payload")),
+            "{err:?}"
+        );
+        assert_eq!(worker.metrics().workflow_tasks_faulted, 1);
 
         let history = stream_all(&backend, &run_id).await;
-        assert!(
-            !history
+        assert_eq!(
+            history
                 .iter()
-                .any(|event| matches!(event.data, HistoryEventData::SideEffectMarker(_)))
+                .map(|event| event.data.event_type())
+                .collect::<Vec<_>>(),
+            vec![HistoryEventType::WorkflowStarted]
         );
-        let HistoryEventData::WorkflowFailed { failure } = &history[1].data else {
-            panic!("oversized side effect should fail the workflow task");
-        };
-        assert_eq!(failure.error_type, "durust.payload_encode");
-        assert!(failure.message.contains("side effect payload"));
     });
 }
 
@@ -2146,7 +2163,8 @@ fn child_workflow_spawn_and_wait_completes_from_public_api() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&backend, &run_id).await;
         assert!(history.iter().any(|event| {
@@ -2356,7 +2374,8 @@ fn child_workflow_result_can_win_select() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&backend, &run_id).await;
         assert!(
@@ -2400,7 +2419,8 @@ fn losing_child_workflow_result_select_branch_does_not_cancel_child() {
             .build();
 
         let stats = parent_worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let parent_history = stream_all(&backend, &run_id).await;
         let HistoryEventData::WorkflowCompleted { result } =
@@ -2619,7 +2639,8 @@ fn select_all_can_mix_activity_child_and_timer_branches() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
         assert!(stats.timers_fired >= 1);
 
         let history = stream_all(&backend, &run_id).await;
@@ -2706,16 +2727,18 @@ fn replay_skips_child_start_consumed_out_of_order_before_later_timer_command() {
             })
             .await
             .unwrap();
-        assert_eq!(worker.run_child_workflow_starts_once().await.unwrap(), 1);
+        assert_eq!(worker.run_child_workflow_starts_once().await.unwrap(), 0);
 
+        // The child started inside the commit that requested it, so its
+        // start precedes the activity's completion in history.
         let history = stream_all(&backend, &run_id).await;
         assert!(matches!(
             history[3].data,
-            HistoryEventData::ActivityCompleted(_)
+            HistoryEventData::ChildWorkflowStarted(_)
         ));
         assert!(matches!(
             history[4].data,
-            HistoryEventData::ChildWorkflowStarted(_)
+            HistoryEventData::ActivityCompleted(_)
         ));
 
         assert!(worker.run_workflow_once().await.unwrap());
@@ -2782,18 +2805,20 @@ fn replay_skips_child_completion_consumed_out_of_order_before_later_timer_comman
                 .run_child_workflow_starts_once()
                 .await
                 .unwrap(),
-            1
+            0
         );
         assert!(child_worker.run_workflow_once().await.unwrap());
 
+        // The child started inside the commit that requested it, so its
+        // start precedes the activity's completion in history.
         let history = stream_all(&backend, &run_id).await;
         assert!(matches!(
             history[3].data,
-            HistoryEventData::ActivityCompleted(_)
+            HistoryEventData::ChildWorkflowStarted(_)
         ));
         assert!(matches!(
             history[4].data,
-            HistoryEventData::ChildWorkflowStarted(_)
+            HistoryEventData::ActivityCompleted(_)
         ));
         assert!(matches!(
             history[5].data,
@@ -2902,7 +2927,7 @@ fn assert_command_event_recorded_once(
         "the recorded {label} command must be matched on replay, not re-appended; history: {:?}",
         history
             .iter()
-            .map(|event| event.event_type)
+            .map(|event| event.event_type())
             .collect::<Vec<_>>()
     );
 }
@@ -3205,11 +3230,12 @@ fn out_of_order_completion_before_version_marker_cold_multi_chunk() {
     ));
 }
 
-// Crashes after the version marker committed, so the cold replay preconsumes
-// the marker from the provider's change-version index while an out-of-order
-// completion sits at the cursor head and the marker event is still unloaded.
+// Crashes after the version marker committed, so the single-event chunks of
+// the cold replay end before the marker while an out-of-order completion sits
+// at the cursor head: `get_version` overruns the window, the worker replays
+// with the full history, and the recorded version is matched positionally.
 #[test]
-fn recorded_version_marker_preconsumes_past_out_of_order_completion_on_cold_replay() {
+fn recorded_version_marker_beyond_loaded_window_replays_with_full_history() {
     block_on(async {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
@@ -3285,7 +3311,8 @@ async fn run_out_of_order_completion_before_child_spawn_case(cold_chunk_events: 
     drop(worker);
     let mut worker = build_worker(Some(1));
     let stats = worker.run_until_idle().await.unwrap();
-    assert!(stats.child_workflow_starts_dispatched >= 1);
+    // Children start inside the commit that requests them; the drain finds none.
+    assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
     let history = stream_all(&backend, &run_id).await;
     assert_command_event_recorded_once(&history, "child workflow start", |data| {
@@ -4989,6 +5016,318 @@ fn patched_records_marker_and_takes_new_branch_for_new_history() {
     });
 }
 
+// `durust::now()` records the provider clock as a side-effect marker, so the
+// value a task observed is the value every replay returns, and a later call
+// records its own marker with the later clock.
+#[durust::workflow(name = "tests.now-twice", version = 1)]
+async fn now_twice_workflow(input: NumberInput) -> durust::Result<Vec<i64>> {
+    let first = durust::now().await?;
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let second = durust::now().await?;
+    Ok(vec![first.0, second.0, doubled as i64])
+}
+
+#[test]
+fn now_is_recorded_once_per_call_and_stable_across_cold_replay() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<now_twice_workflow>("wf/now-twice", "workflows", number(3))
+            .await
+            .unwrap();
+        let mut worker = out_of_order_worker(backend.clone(), now_twice_workflow, None);
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        backend.advance_time(Duration::from_secs(5));
+        drop(worker);
+        let mut replay_worker = out_of_order_worker(backend.clone(), now_twice_workflow, Some(1));
+        assert!(replay_worker.run_workflow_once().await.unwrap());
+
+        let history = stream_all(&backend, &run_id).await;
+        let kinds = history
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                HistoryEventType::WorkflowStarted,
+                HistoryEventType::SideEffectMarker,
+                HistoryEventType::ActivityScheduled,
+                HistoryEventType::ActivityCompleted,
+                HistoryEventType::SideEffectMarker,
+                HistoryEventType::WorkflowCompleted,
+            ]
+        );
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!("expected WorkflowCompleted");
+        };
+        let values = durust::decode_payload::<Vec<i64>>(result).unwrap();
+        assert_eq!(values[2], 6);
+        assert_eq!(
+            values[1] - values[0],
+            5_000,
+            "the second call observed the advanced clock"
+        );
+        // The recorded markers carry exactly the values the workflow returned.
+        let recorded = history
+            .iter()
+            .filter_map(|event| match &event.data {
+                HistoryEventData::SideEffectMarker(marker) => Some(
+                    durust::decode_payload::<durust::TimestampMs>(&marker.value)
+                        .unwrap()
+                        .0,
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, vec![values[0], values[1]]);
+    });
+}
+
+// A durable API refusing the workflow's own value is a workflow-code fault,
+// as it is in TypeScript: the task fails without committing and the run
+// keeps its history.
+#[durust::workflow(name = "tests.empty-side-effect-key", version = 1)]
+async fn empty_side_effect_key_workflow(input: NumberInput) -> durust::Result<u64> {
+    let value = durust::side_effect("", move || input.value).await?;
+    Ok(value)
+}
+
+#[test]
+fn durable_api_refusing_a_value_fails_the_task_without_committing() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<empty_side_effect_key_workflow>(
+                "wf/empty-side-effect-key",
+                "workflows",
+                number(4),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(empty_side_effect_key_workflow)
+            .build();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(matches!(err, durust::Error::PayloadEncode(_)), "{err:?}");
+        let metrics = worker.metrics();
+        assert_eq!(metrics.workflow_tasks_faulted, 1);
+        assert_eq!(metrics.workflow_tasks_committed, 0);
+        let kinds = stream_all(&backend, &run_id)
+            .await
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec![HistoryEventType::WorkflowStarted]);
+    });
+}
+
+// A marker that sits just past the first chunk of a recovery replay overruns
+// the window and the worker reloads the whole history. The reload gets a
+// fresh recovery budget: with the first attempt's chunks still charged, a
+// history that fits the budget deferred on every claim.
+#[durust::workflow(name = "tests.marker-after-activity-then-timer", version = 1)]
+async fn marker_after_activity_then_timer_workflow(input: NumberInput) -> durust::Result<u64> {
+    let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
+        .task_queue("activities")
+        .await?;
+    let bumped = durust::patched("after-activity")?;
+    durust::sleep(Duration::from_secs(1)).await?;
+    Ok(doubled + u64::from(bumped))
+}
+
+#[test]
+fn budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<marker_after_activity_then_timer_workflow>(
+                "wf/budgeted-overrun",
+                "workflows",
+                number(5),
+            )
+            .await
+            .unwrap();
+        let mut worker = out_of_order_worker(
+            backend.clone(),
+            marker_after_activity_then_timer_workflow,
+            None,
+        );
+        assert!(worker.run_workflow_once().await.unwrap());
+        assert!(worker.run_activity_once().await.unwrap());
+        assert!(worker.run_workflow_once().await.unwrap());
+        backend.advance_time(Duration::from_secs(1));
+        assert_eq!(worker.run_timers_once().await.unwrap(), 1);
+        drop(worker);
+
+        // Six events of history, three-event chunks, a six-event budget: the
+        // marker is event four, first past the first chunk.
+        let mut recovery_worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(3)
+            .recovery_replay_event_budget(6)
+            .recovery_defer_delay(Duration::from_millis(1))
+            .register_workflow(marker_after_activity_then_timer_workflow)
+            .register_activity(double)
+            .build();
+        assert!(
+            recovery_worker.run_workflow_once().await.unwrap(),
+            "the recovery replay must commit, not defer"
+        );
+        let history = stream_all(&backend, &run_id).await;
+        let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+            panic!(
+                "expected WorkflowCompleted, found {:?}",
+                history.last().unwrap().data
+            );
+        };
+        assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 11);
+    });
+}
+
+// The output's `Serialize` impl reaches a durable API. Rust encodes the
+// output under the context borrow, so the call trips the re-entrancy guard:
+// the task fails without committing and the run keeps its history, which is
+// what TypeScript commits for the same program.
+#[derive(Clone, Debug, Deserialize)]
+struct ReentrantOutput {
+    value: u64,
+}
+
+impl Serialize for ReentrantOutput {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let bumped = if durust::patched("output-reentrant").unwrap_or(false) {
+            self.value + 1
+        } else {
+            self.value
+        };
+        serializer.serialize_u64(bumped)
+    }
+}
+
+#[durust::workflow(name = "tests.output-reentrant", version = 1)]
+async fn output_reentrant_workflow(input: NumberInput) -> durust::Result<ReentrantOutput> {
+    Ok(ReentrantOutput { value: input.value })
+}
+
+#[test]
+fn durable_call_from_output_serialize_fails_the_task_without_committing() {
+    block_on(async {
+        let backend = MemoryBackend::new();
+        let client = Client::new(backend.clone());
+        let run_id = client
+            .start_workflow::<output_reentrant_workflow>(
+                "wf/output-reentrant",
+                "workflows",
+                number(4),
+            )
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(output_reentrant_workflow)
+            .build();
+        let err = worker.run_workflow_once().await.unwrap_err();
+        assert!(
+            matches!(err, durust::Error::TaskPanic(ref message) if message.contains("not re-entrant")),
+            "expected the re-entrancy guard, found {err:?}"
+        );
+        let metrics = worker.metrics();
+        assert_eq!(metrics.workflow_tasks_panicked, 1);
+        assert_eq!(metrics.workflow_tasks_committed, 0);
+        let kinds = stream_all(&backend, &run_id)
+            .await
+            .iter()
+            .map(|event| event.data.event_type())
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, vec![HistoryEventType::WorkflowStarted]);
+    });
+}
+
+async fn run_repeated_change_id_case(replay_chunk_events: Option<usize>) {
+    let backend = MemoryBackend::new();
+    let client = Client::new(backend.clone());
+    let run_id = client
+        .start_workflow::<version_repeated>("wf/version-repeated", "workflows", number(10))
+        .await
+        .unwrap();
+    let mut worker = out_of_order_worker(backend.clone(), version_repeated, None);
+    assert!(worker.run_workflow_once().await.unwrap());
+    assert!(worker.run_activity_once().await.unwrap());
+    if let Some(chunk_events) = replay_chunk_events {
+        drop(worker);
+        worker = out_of_order_worker(backend.clone(), version_repeated, Some(chunk_events));
+    }
+    assert!(worker.run_workflow_once().await.unwrap());
+    let metrics = worker.metrics();
+    assert_eq!(metrics.workflow_tasks_nondeterministic, 0);
+    assert_eq!(metrics.workflow_tasks_panicked, 0);
+
+    let history = stream_all(&backend, &run_id).await;
+    let kinds = history
+        .iter()
+        .map(|event| event.data.event_type())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            HistoryEventType::WorkflowStarted,
+            HistoryEventType::VersionMarker,
+            HistoryEventType::ActivityScheduled,
+            HistoryEventType::ActivityCompleted,
+            HistoryEventType::VersionMarker,
+            HistoryEventType::WorkflowCompleted,
+        ]
+    );
+    let markers = history
+        .iter()
+        .filter_map(|event| match &event.data {
+            HistoryEventData::VersionMarker(marker) => Some((
+                marker.change_id.as_str(),
+                marker.command_id.seq.0,
+                marker.version,
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(markers, vec![("repeat", 1, 1), ("repeat", 3, 1)]);
+    let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
+        panic!("expected WorkflowCompleted");
+    };
+    assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 22);
+}
+
+#[test]
+fn repeated_change_id_across_task_boundary_cached() {
+    block_on(run_repeated_change_id_case(None));
+}
+
+#[test]
+fn repeated_change_id_across_task_boundary_cold() {
+    block_on(run_repeated_change_id_case(Some(usize::MAX)));
+}
+
+// Chunk size one puts the second marker's position at the end of every
+// loaded window, so the replay overruns, reloads the full history, and still
+// commits the same second marker.
+#[test]
+fn repeated_change_id_across_task_boundary_cold_single_event_chunks() {
+    block_on(run_repeated_change_id_case(Some(1)));
+}
+
 #[test]
 fn recorded_version_is_stable_across_streamed_replay() {
     block_on(async {
@@ -5388,10 +5727,7 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
             .expect("committed projection");
         assert_eq!(still_committed.status, "started");
         backend
-            .release_workflow_task(
-                claimed.claim,
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
-            )
+            .release_workflow_task(claimed.claim, durust::WorkflowTaskRelease::immediate())
             .await
             .unwrap();
 
@@ -5698,7 +6034,7 @@ fn parent_waits_for_child_that_continues_as_new() {
             .build();
 
         let stats = worker.run_until_idle().await.unwrap();
-        assert_eq!(stats.child_workflow_starts_dispatched, 1);
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
         assert!(stats.workflow_tasks >= 4);
 
         let parent_history = stream_all(&backend, &parent_run_id).await;
@@ -5922,6 +6258,21 @@ fn activity_timeout_records_timeout_and_fails_workflow_on_replay() {
             .build();
 
         assert!(worker.run_workflow_once().await.unwrap());
+        // Start-to-close is measured from the claim, so the attempt is claimed
+        // (and left running) before its deadline can lapse.
+        backend
+            .claim_activity_task(
+                WorkerId::new("timeout-holder"),
+                ClaimActivityOptions {
+                    namespace: Namespace::default(),
+                    task_queue: TaskQueue::new("activities"),
+                    registered_activity_names: vec![ActivityName::new("tests.double")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("scheduled activity");
         backend.advance_time(Duration::from_millis(9));
         assert_eq!(worker.run_activity_timeouts_once().await.unwrap(), 0);
         backend.advance_time(Duration::from_millis(1));
@@ -6311,12 +6662,13 @@ async fn assert_child_workflow_map_replay_change_is_nondeterministic<W>(
         HistoryEventData::ChildWorkflowMapScheduled(_)
     ));
 
+    // Both admitted children started inside the scheduling commit.
     assert_eq!(
         original_worker
             .run_child_workflow_starts_once()
             .await
             .unwrap(),
-        2
+        0
     );
     drop(original_worker);
 
@@ -6824,10 +7176,7 @@ fn claim_is_released_when_current_time_fails_before_prepare() {
             .unwrap()
             .expect("claim released by failed prepare");
         backend
-            .release_workflow_task(
-                reclaimed.claim,
-                durust::WorkflowTaskRelease::immediate(durust::WorkflowTaskReason::CacheEvicted),
-            )
+            .release_workflow_task(reclaimed.claim, durust::WorkflowTaskRelease::immediate())
             .await
             .unwrap();
 
@@ -6847,8 +7196,12 @@ fn claim_is_released_when_current_time_fails_before_prepare() {
 async fn cold_recovery_error_releases_claim_and_recovery_slot(
     inject: impl FnOnce(&RecordingBackend),
     chunk_events: usize,
+    claim_prefetch: bool,
 ) {
-    let backend = RecordingBackend::new(MemoryBackend::new());
+    let mut backend = RecordingBackend::new(MemoryBackend::new());
+    if !claim_prefetch {
+        backend = backend.without_claim_prefetch();
+    }
     let client = Client::new(backend.clone());
     let run_id = client
         .start_workflow::<double_plus_one>("wf/cold-recovery-error", "workflows", number(9))
@@ -6890,13 +7243,14 @@ async fn cold_recovery_error_releases_claim_and_recovery_slot(
 }
 
 #[test]
-fn cold_recovery_change_versions_error_releases_claim_and_recovery_slot() {
+fn cold_recovery_stream_error_releases_claim_and_recovery_slot() {
     block_on(async {
-        // A one-event chunk keeps `has_more` true so the prepare pipeline
-        // queries the change-version index, which is where the fault fires.
+        // Without claim prefetch every chunk is streamed, so the fault fires
+        // on the first history read of the cold recovery.
         cold_recovery_error_releases_claim_and_recovery_slot(
-            |backend| backend.fail_next_change_versions(),
+            |backend| backend.fail_next_replay_stream(),
             1,
+            false,
         )
         .await;
     });
@@ -6908,6 +7262,7 @@ fn cold_recovery_hydrate_error_releases_claim_and_recovery_slot() {
         cold_recovery_error_releases_claim_and_recovery_slot(
             |backend| backend.fail_hydrate_payload_calls(1),
             128,
+            true,
         )
         .await;
     });
@@ -7479,7 +7834,7 @@ fn sqlite_child_workflow_map_recovers_after_close_and_reopen() {
 }
 
 #[test]
-fn sqlite_child_outbox_recovers_after_close_and_reopen() {
+fn sqlite_child_started_by_a_commit_survives_close_and_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("durust-child.sqlite3");
@@ -7512,7 +7867,8 @@ fn sqlite_child_outbox_recovers_after_close_and_reopen() {
             .register_workflow(child_double_workflow)
             .build();
         let stats = recovered_worker.run_until_idle().await.unwrap();
-        assert!(stats.child_workflow_starts_dispatched >= 1);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(stats.child_workflow_starts_dispatched, 0);
 
         let history = stream_all(&reopened, &run_id).await;
         let HistoryEventData::WorkflowCompleted { result } =
@@ -7697,7 +8053,7 @@ fn an_empty_map_manifest_completes_instead_of_stalling_the_parent() {
         assert_eq!(
             history
                 .iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type())
                 .collect::<Vec<_>>(),
             vec![
                 durust::HistoryEventType::WorkflowStarted,
@@ -7954,7 +8310,7 @@ struct RecordingBackend {
     conflict_next_commit: Arc<Mutex<bool>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
     fail_next_current_time: Arc<Mutex<bool>>,
-    fail_next_change_versions: Arc<Mutex<bool>>,
+    fail_next_replay_stream: Arc<Mutex<bool>>,
     hydrate_failures_remaining: Arc<Mutex<u32>>,
     fail_next_commit_batch: Arc<Mutex<bool>>,
     conflict_batch_commit_run: Arc<Mutex<Option<durust::RunId>>>,
@@ -7971,7 +8327,7 @@ impl RecordingBackend {
             conflict_next_commit: Arc::new(Mutex::new(false)),
             backpressure_next_replay_stream: Arc::new(Mutex::new(None)),
             fail_next_current_time: Arc::new(Mutex::new(false)),
-            fail_next_change_versions: Arc::new(Mutex::new(false)),
+            fail_next_replay_stream: Arc::new(Mutex::new(false)),
             hydrate_failures_remaining: Arc::new(Mutex::new(0)),
             fail_next_commit_batch: Arc::new(Mutex::new(false)),
             conflict_batch_commit_run: Arc::new(Mutex::new(None)),
@@ -8009,8 +8365,8 @@ impl RecordingBackend {
         *self.fail_next_current_time.lock().unwrap() = true;
     }
 
-    fn fail_next_change_versions(&self) {
-        *self.fail_next_change_versions.lock().unwrap() = true;
+    fn fail_next_replay_stream(&self) {
+        *self.fail_next_replay_stream.lock().unwrap() = true;
     }
 
     fn fail_hydrate_payload_calls(&self, count: u32) {
@@ -8073,10 +8429,8 @@ impl DurableBackend for RecordingBackend {
         let inner = self.inner.clone();
         Box::pin(async move {
             let mut claimed = inner.claim_workflow_task(worker_id, opts).await?;
-            if !prefetch_enabled {
-                if let Some(claimed) = &mut claimed {
-                    claimed.prefetched_history.clear();
-                }
+            if !prefetch_enabled && let Some(claimed) = &mut claimed {
+                claimed.prefetched_history.clear();
             }
             Ok(claimed)
         })
@@ -8113,6 +8467,13 @@ impl DurableBackend for RecordingBackend {
         req: durust::StreamHistoryRequest,
     ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
+        if Self::take_flag(&self.fail_next_replay_stream) {
+            return Box::pin(async {
+                Err(durust::Error::Backend(
+                    "injected replay stream failure".to_owned(),
+                ))
+            });
+        }
         let retry_after = self.backpressure_next_replay_stream.lock().unwrap().take();
         if let Some(retry_after) = retry_after {
             return Box::pin(async move {
@@ -8140,12 +8501,7 @@ impl DurableBackend for RecordingBackend {
             let inner = self.inner.clone();
             return Box::pin(async move {
                 inner
-                    .release_workflow_task(
-                        claim,
-                        durust::WorkflowTaskRelease::immediate(
-                            durust::WorkflowTaskReason::CacheEvicted,
-                        ),
-                    )
+                    .release_workflow_task(claim, durust::WorkflowTaskRelease::immediate())
                     .await?;
                 Ok(durust::CommitOutcome::Conflict)
             });
@@ -8180,9 +8536,7 @@ impl DurableBackend for RecordingBackend {
                         .inner
                         .release_workflow_task(
                             claim.clone(),
-                            durust::WorkflowTaskRelease::immediate(
-                                durust::WorkflowTaskReason::CacheEvicted,
-                            ),
+                            durust::WorkflowTaskRelease::immediate(),
                         )
                         .await?;
                     results.push(durust::WorkflowTaskCommitBatchResult {
@@ -8310,13 +8664,6 @@ impl DurableBackend for RecordingBackend {
         &self,
         req: durust::WorkflowChangeVersionsRequest,
     ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
-        if Self::take_flag(&self.fail_next_change_versions) {
-            return Box::pin(async {
-                Err(durust::Error::Backend(
-                    "injected change versions failure".to_owned(),
-                ))
-            });
-        }
         self.inner.workflow_change_versions(req)
     }
 
@@ -8461,7 +8808,7 @@ async fn run_out_of_order_completion_before_activity_map_case(cold_chunk_events:
             "spawn-sleep-then-activity-map workflow did not complete; history: {:?}",
             history
                 .iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type())
                 .collect::<Vec<_>>()
         );
     };
@@ -8543,7 +8890,7 @@ async fn run_out_of_order_completion_before_child_workflow_map_case(
             "spawn-sleep-then-child-workflow-map workflow did not complete; history: {:?}",
             history
                 .iter()
-                .map(|event| event.event_type)
+                .map(|event| event.event_type())
                 .collect::<Vec<_>>()
         );
     };
@@ -8828,10 +9175,10 @@ fn large_inline_command_payload_history_is_identical_cached_and_cold() {
         assert_eq!(
             cached
                 .iter()
-                .map(|event| (event.event_id, event.event_type))
+                .map(|event| (event.event_id, event.event_type()))
                 .collect::<Vec<_>>(),
             cold.iter()
-                .map(|event| (event.event_id, event.event_type))
+                .map(|event| (event.event_id, event.event_type()))
                 .collect::<Vec<_>>()
         );
         for (cached_event, cold_event) in cached.iter().zip(cold.iter()) {

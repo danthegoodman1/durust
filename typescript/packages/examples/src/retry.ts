@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   RetryPolicy,
   Worker,
@@ -9,6 +8,7 @@ import {
   eventId,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface RetryExampleInput {
   readonly requestId: string;
@@ -78,7 +78,7 @@ const retryWorkflow = workflow({
 export async function runMemoryRetryExample(): Promise<RetryExampleResult> {
   flakyChargeAttempts = 0;
   let now = 1_000;
-  const backend = new MemoryBackend({ nowMs: () => now });
+  const backend = NativeBackend.memory({ nowMs: () => now });
   const registry = new Registry()
     .registerWorkflow(retryWorkflow)
     .registerActivity(flakyCharge);

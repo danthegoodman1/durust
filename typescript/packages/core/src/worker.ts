@@ -4,6 +4,7 @@ import type {
   CommitOutcome,
   CompleteActivityItemOutcome,
   CompleteActivityOutcome,
+  FailActivityOutcome,
   CompleteActivityRequest,
   DurableBackend,
   HistoryChunk,
@@ -20,6 +21,7 @@ import {
   HotWorkflowExecution,
   REPLAY_WINDOW_LOOKAHEAD_EVENTS,
   UnsupportedWorkflowVersionError,
+  WorkflowCodeError,
   durableFailureFromUnknown,
   isReplayCommandEvent
 } from "./runtime.js";
@@ -29,7 +31,6 @@ import {
   type EventId,
   type Namespace,
   type RunId,
-  type SignalName,
   type TaskQueue,
   type WorkerId,
   type WorkflowType
@@ -53,7 +54,6 @@ export interface WorkerOptions {
    * which is also Rust's `TaskQueue::default()`.
    */
   readonly activityTaskQueue?: TaskQueue | string;
-  readonly registeredSignalNames?: readonly (SignalName | string)[];
   readonly leaseDurationMs?: number;
   readonly payloadCodec?: CodecId;
   readonly maxLocalActivitiesPerWorkflowTask?: number;
@@ -298,7 +298,6 @@ export class Worker {
   readonly #workerId: WorkerId | string;
   readonly #workflowTaskQueue: TaskQueue | string;
   readonly #activityTaskQueue: TaskQueue | string | null;
-  readonly #registeredSignalNames: readonly (SignalName | string)[];
   readonly #leaseDurationMs: number;
   readonly #payloadCodec: CodecId;
   readonly #maxLocalActivitiesPerWorkflowTask: number;
@@ -333,7 +332,6 @@ export class Worker {
     this.#workerId = options.workerId;
     this.#workflowTaskQueue = options.workflowTaskQueue;
     this.#activityTaskQueue = options.activityTaskQueue ?? null;
-    this.#registeredSignalNames = options.registeredSignalNames ?? [];
     this.#leaseDurationMs = options.leaseDurationMs ?? 30_000;
     this.#payloadCodec = options.payloadCodec ?? "MessagePack";
     this.#maxLocalActivitiesPerWorkflowTask = Math.max(
@@ -696,7 +694,6 @@ export class Worker {
       namespace: this.#namespace,
       taskQueue: this.#workflowTaskQueue,
       registeredWorkflowTypes: this.#registeredWorkflowTypes(),
-      registeredSignalNames: this.#registeredSignalNames,
       leaseDurationMs: this.#leaseDurationMs
     });
     if (!claimed) {
@@ -712,7 +709,6 @@ export class Worker {
       namespace: this.#namespace,
       taskQueue: this.#workflowTaskQueue,
       registeredWorkflowTypes: this.#registeredWorkflowTypes(),
-      registeredSignalNames: this.#registeredSignalNames,
       leaseDurationMs: this.#leaseDurationMs,
       limit: Math.max(1, Math.trunc(limit))
     });
@@ -749,7 +745,7 @@ export class Worker {
         );
       }
 
-      const liveSignals = claimed.liveSignals ?? await this.#liveSignalsForClaim(claimed.runId);
+      const liveSignals = claimed.liveSignals;
       prepared = await this.#prepareWorkflowTaskFromCacheOrReplay(
         definition,
         claimed,
@@ -834,28 +830,54 @@ export class Worker {
       return { kind: "NoTask" };
     }
     this.#metrics.activityTaskClaims += 1;
+    const outcome = await this.#runClaimedActivity(claimed, false, null);
+    switch (outcome.kind) {
+      case "Completed":
+        return { kind: "Completed", activityId: claimed.task.activityId, outcome: outcome.outcome };
+      case "Failed":
+        return { kind: "Failed", activityId: claimed.task.activityId, outcome: outcome.outcome };
+      case "Batched":
+        throw new Error("a single activity task is never batched");
+    }
+  }
+
+  /**
+   * One execution path for a claimed activity: emit the claim, decode, run
+   * the handler under its heartbeat context, then either complete it (through
+   * the batch when one is being collected) or fail it. The three drivers,
+   * single, batch, and sequential batch, differ only in how they claim.
+   */
+  async #runClaimedActivity(
+    claimed: ClaimedActivityTask,
+    batched: boolean,
+    completions: CompleteActivityRequest[] | null
+  ): Promise<
+    | { readonly kind: "Completed"; readonly outcome: CompleteActivityOutcome }
+    | { readonly kind: "Failed"; readonly outcome: FailActivityOutcome }
+    | { readonly kind: "Batched" }
+  > {
     await this.#emit({
       kind: "ActivityTaskClaimed",
       activityId: claimed.task.activityId,
       activityName: String(claimed.task.activityName),
       attempt: claimed.task.attempt,
-      batched: false
+      batched
     });
-
     const definition = this.#registry.activity(String(claimed.task.activityName));
     if (!definition) {
+      if (completions !== null) {
+        await this.#flushActivityCompletionBatch(completions);
+        completions.length = 0;
+      }
       const outcome = await this.#failClaimedActivity(
         claimed,
         new Error(`activity is not registered: ${claimed.task.activityName}`),
-        false
+        batched
       );
-      return { kind: "Failed", activityId: claimed.task.activityId, outcome };
+      return { kind: "Failed", outcome };
     }
-
-    const input = decodePayload(
-      claimed.task.input as PayloadRef<unknown>,
-      definition.inputSchema
-    );
+    const input = decodePayload(claimed.task.input as PayloadRef<unknown>, definition.inputSchema);
+    let result: PayloadRef;
     try {
       const output = await runWithActivityExecutionContext(
         {
@@ -864,36 +886,31 @@ export class Worker {
         },
         () => Promise.resolve(definition.handler(input))
       );
-      const result = encodePayload(output, {
+      result = encodePayload(output, {
         codec: this.#payloadCodec,
         ...(definition.outputSchema === undefined ? {} : { schema: definition.outputSchema })
       });
-      const outcome = await this.#backend.completeActivity({
-        claim: claimed.claim,
-        result
-      });
-      this.#metrics.activityTaskCompletions += 1;
-      await this.#emit({
-        kind: "ActivityTaskCompleted",
-        activityId: claimed.task.activityId,
-        outcome,
-        batched: false
-      });
-      return { kind: "Completed", activityId: claimed.task.activityId, outcome };
     } catch (error) {
-      const outcome = await this.#backend.failActivity({
-        claim: claimed.claim,
-        failure: durableFailureFromUnknown(error)
-      });
-      this.#metrics.activityTaskFailures += 1;
-      await this.#emit({
-        kind: "ActivityTaskFailed",
-        activityId: claimed.task.activityId,
-        outcome,
-        batched: false
-      });
-      return { kind: "Failed", activityId: claimed.task.activityId, outcome };
+      if (completions !== null) {
+        await this.#flushActivityCompletionBatch(completions);
+        completions.length = 0;
+      }
+      const outcome = await this.#failClaimedActivity(claimed, error, batched);
+      return { kind: "Failed", outcome };
     }
+    if (completions !== null) {
+      completions.push({ claim: claimed.claim, result });
+      return { kind: "Batched" };
+    }
+    const outcome = await this.#backend.completeActivity({ claim: claimed.claim, result });
+    this.#metrics.activityTaskCompletions += 1;
+    await this.#emit({
+      kind: "ActivityTaskCompleted",
+      activityId: claimed.task.activityId,
+      outcome,
+      batched
+    });
+    return { kind: "Completed", outcome };
   }
 
   async #failClaimedActivity(
@@ -948,17 +965,6 @@ export class Worker {
     return this.#registry.activities().map((definition) => definition.name);
   }
 
-  async #liveSignalsForClaim(runId: RunId): Promise<readonly SignalInboxRecord[]> {
-    const records: SignalInboxRecord[] = [];
-    for (const signalName of this.#registeredSignalNames) {
-      const record = await this.#backend.readSignalInbox({ runId, signalName });
-      if (record !== null) {
-        records.push(record);
-      }
-    }
-    return records;
-  }
-
   async #prepareWorkflowTaskFromCacheOrReplay(
     definition: WorkflowDefinition<any, any, any, string>,
     claimed: ClaimedWorkflowTask,
@@ -983,7 +989,18 @@ export class Worker {
       const hotClaim = await this.#claimWithHotWakeHistory(cached, claimed);
       if (hotClaim.prefetchedHistory.every(isHotWorkflowWakeEvent)) {
         this.#metrics.workflowExecutionCacheHits += 1;
-        const commit = await cached.execution.advance(hotClaim, { liveSignals, nowMs });
+        let commit: WorkflowTaskCommit;
+        try {
+          commit = await cached.execution.advance(hotClaim, { liveSignals, nowMs });
+        } catch (error: unknown) {
+          // The execution's frame is past the point the claim will be retried
+          // from, so the entry must not serve the next claim: evict and
+          // dispose it here rather than leaving a poisoned entry for the
+          // release path to trip over.
+          this.#workflowExecutionCache.delete(cacheKey);
+          cached.execution.dispose("task failed before commit");
+          throw error;
+        }
         return {
           cacheKey,
           execution: cached.execution,
@@ -1034,6 +1051,7 @@ export class Worker {
       // the recorded command it skipped — so the error that surfaces is not
       // reliably the overrun. The latch is.
       if (execution.replayWindowOverrun() === null) {
+        execution.dispose("task failed before commit");
         throw error;
       }
       // A workflow whose synchronous markers outran the replay window's
@@ -1551,71 +1569,15 @@ export class Worker {
     if (claimedBatch.length === 0) {
       return 0;
     }
+    // Every task in the batch runs, abort or not: the claims are held under
+    // this worker's lease and nothing releases an activity claim, so a task
+    // left unrun here would sit until its lease lapsed. The abort stops the
+    // next claim, in the loop above.
     const completions: CompleteActivityRequest[] = [];
     let processedTasks = 0;
     for (const claimed of claimedBatch) {
-      await this.#emit({
-        kind: "ActivityTaskClaimed",
-        activityId: claimed.task.activityId,
-        activityName: String(claimed.task.activityName),
-        attempt: claimed.task.attempt,
-        batched: true
-      });
-
-      const definition = this.#registry.activity(String(claimed.task.activityName));
-      if (!definition) {
-        await this.#flushActivityCompletionBatch(completions);
-        completions.length = 0;
-        await this.#failClaimedActivity(
-          claimed,
-          new Error(`activity is not registered: ${claimed.task.activityName}`),
-          true
-        );
-        processedTasks += 1;
-        if (signal?.aborted) {
-          break;
-        }
-        continue;
-      }
-
-      const input = decodePayload(
-        claimed.task.input as PayloadRef<unknown>,
-        definition.inputSchema
-      );
-      try {
-        const output = await runWithActivityExecutionContext(
-          {
-            heartbeat: (request) => this.#backend.heartbeatActivity(request),
-            heartbeatRequest: { claim: claimed.claim }
-          },
-          () => Promise.resolve(definition.handler(input))
-        );
-        completions.push({
-          claim: claimed.claim,
-          result: encodePayload(output, {
-            codec: this.#payloadCodec,
-            ...(definition.outputSchema === undefined ? {} : { schema: definition.outputSchema })
-          })
-        });
-      } catch (error) {
-        await this.#flushActivityCompletionBatch(completions);
-        completions.length = 0;
-        const outcome = await this.#backend.failActivity({
-          claim: claimed.claim,
-          failure: durableFailureFromUnknown(error)
-        });
-        this.#metrics.activityTaskFailures += 1;
-        await this.#emit({
-          kind: "ActivityTaskFailed",
-          activityId: claimed.task.activityId,
-          outcome,
-          batched: true
-        });
-      }
+      await this.#runClaimedActivity(claimed, true, completions);
       processedTasks += 1;
-      if (signal?.aborted) {
-        break;
-      }
     }
 
     await this.#flushActivityCompletionBatch(completions);
@@ -1643,63 +1605,7 @@ export class Worker {
       }
       claimedTasks += 1;
       this.#metrics.activityTaskClaims += 1;
-      await this.#emit({
-        kind: "ActivityTaskClaimed",
-        activityId: claimed.task.activityId,
-        activityName: String(claimed.task.activityName),
-        attempt: claimed.task.attempt,
-        batched: true
-      });
-
-      const definition = this.#registry.activity(String(claimed.task.activityName));
-      if (!definition) {
-        await this.#flushActivityCompletionBatch(completions);
-        completions.length = 0;
-        await this.#failClaimedActivity(
-          claimed,
-          new Error(`activity is not registered: ${claimed.task.activityName}`),
-          true
-        );
-        if (signal?.aborted) {
-          break;
-        }
-        continue;
-      }
-
-      const input = decodePayload(
-        claimed.task.input as PayloadRef<unknown>,
-        definition.inputSchema
-      );
-      try {
-        const output = await runWithActivityExecutionContext(
-          {
-            heartbeat: (request) => this.#backend.heartbeatActivity(request),
-            heartbeatRequest: { claim: claimed.claim }
-          },
-          () => Promise.resolve(definition.handler(input))
-        );
-        completions.push({
-          claim: claimed.claim,
-          result: encodePayload(output, {
-            codec: this.#payloadCodec,
-            ...(definition.outputSchema === undefined ? {} : { schema: definition.outputSchema })
-          })
-        });
-      } catch (error) {
-        await this.#flushActivityCompletionBatch(completions);
-        completions.length = 0;
-        const outcome = await this.#backend.failActivity({
-          claim: claimed.claim,
-          failure: durableFailureFromUnknown(error)
-        });
-        this.#metrics.activityTaskFailures += 1;
-        await this.#emit({
-          kind: "ActivityTaskFailed",
-          activityId: claimed.task.activityId,
-          outcome,
-          batched: true
-        });
-      }
+      await this.#runClaimedActivity(claimed, true, completions);
       if (signal?.aborted) {
         break;
       }
@@ -2042,9 +1948,12 @@ function workerErrorInfo(error: unknown): WorkerErrorInfo {
   };
 }
 
+// Task failures that leave the run intact and replay it later: the claim is
+// released with the nondeterminism backoff rather than immediately.
 function isNondeterminismError(error: unknown): boolean {
   return (
     error instanceof UnsupportedWorkflowVersionError ||
+    error instanceof WorkflowCodeError ||
     (error instanceof Error && error.message.startsWith("nondeterminism:"))
   );
 }

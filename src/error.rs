@@ -1,12 +1,14 @@
-use crate::{ActivityName, PayloadRef, RunId, WorkflowType};
+use crate::{ActivityName, PayloadRef, RunId, WorkflowId, WorkflowType};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableFailure {
     pub error_type: String,
     pub message: String,
     pub non_retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<PayloadRef>,
 }
 
@@ -98,6 +100,10 @@ impl DurableFailure {
             Error::RunNotFound(run_id) => {
                 Self::new("durust.run_not_found", run_id.to_string()).marked_non_retryable()
             }
+            Error::WorkflowNotFound(workflow_id) => {
+                Self::new("durust.workflow_not_found", workflow_id.to_string())
+                    .marked_non_retryable()
+            }
             Error::StaleLease => Self::new("durust.stale_lease", "stale lease token"),
             Error::TerminalWorkflow => {
                 Self::new("durust.terminal_workflow", "workflow is terminal").marked_non_retryable()
@@ -122,6 +128,7 @@ impl fmt::Display for DurableFailure {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("activity `{0}` is not registered on this worker")]
     ActivityNotRegistered(ActivityName),
@@ -140,6 +147,11 @@ pub enum Error {
 
     #[error("workflow run `{0}` was not found")]
     RunNotFound(RunId),
+
+    /// A signal or cancellation named a workflow id the provider has never
+    /// started in that namespace.
+    #[error("workflow `{0}` was not found")]
+    WorkflowNotFound(WorkflowId),
 
     #[error("stale lease token")]
     StaleLease,

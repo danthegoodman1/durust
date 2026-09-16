@@ -6,17 +6,15 @@ use crate::{
     DeprecatedPatchMarker, Error, HistoryEvent, HistoryEventData, NewHistoryEvent,
     ParentClosePolicy, PayloadRef, Result, RunId, SelectWinner, SideEffectMarker, SignalConsumed,
     SignalId, SignalName, TaskQueue, TimerFired, TimerStarted, TimestampMs, VersionMarker, WaitId,
-    WaitKind, WaitRecord, Workflow, WorkflowChangeMarkerKind, WorkflowChangeVersionRecord,
-    WorkflowId, activity_fingerprint, activity_map_fingerprint, child_workflow_fingerprint,
-    child_workflow_map_fingerprint, command_id, payload_digest, signal_fingerprint,
-    timer_fingerprint,
+    WaitKind, WaitRecord, Workflow, WorkflowId, activity_fingerprint, activity_map_fingerprint,
+    child_workflow_fingerprint, child_workflow_map_fingerprint, command_id, payload_digest,
+    signal_fingerprint, timer_fingerprint,
 };
 use futures::future::BoxFuture;
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -116,6 +114,19 @@ where
     })
 }
 
+/// Encodes a workflow's output under the context borrow, so a durable API
+/// reached from the output's `Serialize` impl trips the re-entrancy guard and
+/// fails the task without committing, as TypeScript's completion frame does.
+/// Outside the borrow the nested call would succeed and append its marker
+/// ahead of `WorkflowCompleted`, and the two runtimes would commit different
+/// histories for the same program.
+pub(crate) fn encode_workflow_output<T>(output: &T, codec: crate::CodecId) -> Result<PayloadRef>
+where
+    T: serde::Serialize + ?Sized,
+{
+    with_context(|_| crate::encode_payload_with_codec(output, codec))
+}
+
 fn with_context<T>(f: impl FnOnce(&mut RuntimeContext) -> T) -> T {
     CURRENT_CONTEXT.with(|slot| {
         let ptr = slot.get();
@@ -201,7 +212,6 @@ pub(crate) struct RuntimeContext {
     replay_cursor: usize,
     last_loaded_event_id: crate::EventId,
     replay_target_event_id: crate::EventId,
-    consumed_replay_event_ids: BTreeSet<crate::EventId>,
     needs_more_history: bool,
     last_ready_event_id: Option<crate::EventId>,
     next_command_seq: u64,
@@ -209,8 +219,7 @@ pub(crate) struct RuntimeContext {
     live_signals: BTreeMap<CommandSeq, SignalInboxRecordForRuntime>,
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
     hydrated_payloads: BTreeMap<String, PayloadRef>,
-    change_markers: Arc<ChangeMarkerIndex>,
-    preconsumed_change_markers: BTreeMap<CommandSeq, RuntimeChangeMarker>,
+    replay_window_overrun: bool,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
     upsert_waits: Vec<WaitRecord>,
@@ -249,82 +258,76 @@ pub(crate) struct ReadyEventIndexes {
 }
 
 impl ReadyEventIndexes {
-    /// Indexes every ready event in one pass over the chunk. Must run on both
-    /// the initial history and every appended chunk so out-of-order arrivals
-    /// stay claimable through the indexes.
-    fn index_events(&mut self, events: &[HistoryEvent]) {
+    /// Partitions one chunk: ready events move into the per-command indexes
+    /// and the command events come back for the replay window. Ready events
+    /// never enter the window, so the cursor only ever sees commands and the
+    /// indexes hold each ready payload exactly once, without a copy. Must run
+    /// on both the initial history and every appended chunk so out-of-order
+    /// arrivals stay claimable through the indexes.
+    fn partition_events(&mut self, events: Vec<HistoryEvent>) -> Vec<HistoryEvent> {
+        let mut commands = Vec::with_capacity(events.len());
         for event in events {
             let event_id = event.event_id;
-            match &event.data {
+            match event.data {
                 HistoryEventData::ActivityCompleted(completed) => {
-                    self.completions.insert(
-                        completed.command_id.seq,
-                        (event_id, completed.result.clone()),
-                    );
+                    self.completions
+                        .insert(completed.command_id.seq, (event_id, completed.result));
                 }
                 HistoryEventData::ActivityFailed(failed) => {
                     self.failures.insert(
                         failed.command_id.seq,
-                        (
-                            event_id,
-                            ActivityTerminalError::Failed(failed.failure.clone()),
-                        ),
+                        (event_id, ActivityTerminalError::Failed(failed.failure)),
                     );
                 }
                 HistoryEventData::ActivityTimedOut(timed_out) => {
                     self.failures.insert(
                         timed_out.command_id.seq,
-                        (
-                            event_id,
-                            ActivityTerminalError::TimedOut(timed_out.message.clone()),
-                        ),
+                        (event_id, ActivityTerminalError::TimedOut(timed_out.message)),
                     );
                 }
                 HistoryEventData::ActivityMapCompleted(completed) => {
                     self.map_completions
-                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                        .insert(completed.command_id.seq, (event_id, completed));
                 }
                 HistoryEventData::ActivityMapFailed(failed) => {
                     self.map_failures
-                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                        .insert(failed.command_id.seq, (event_id, failed.failure));
                 }
                 HistoryEventData::ChildWorkflowMapCompleted(completed) => {
                     self.child_map_completions
-                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                        .insert(completed.command_id.seq, (event_id, completed));
                 }
                 HistoryEventData::ChildWorkflowMapFailed(failed) => {
                     self.child_map_failures
-                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                        .insert(failed.command_id.seq, (event_id, failed.failure));
                 }
                 HistoryEventData::ChildWorkflowStarted(started) => {
                     self.child_starts
-                        .insert(started.command_id.seq, (event_id, started.clone()));
+                        .insert(started.command_id.seq, (event_id, started));
                 }
                 HistoryEventData::ChildWorkflowCompleted(completed) => {
                     self.child_completions
-                        .insert(completed.command_id.seq, (event_id, completed.clone()));
+                        .insert(completed.command_id.seq, (event_id, completed));
                 }
                 HistoryEventData::ChildWorkflowFailed(failed) => {
                     self.child_failures
-                        .insert(failed.command_id.seq, (event_id, failed.failure.clone()));
+                        .insert(failed.command_id.seq, (event_id, failed.failure));
                 }
                 HistoryEventData::ChildWorkflowCancelled(cancelled) => {
-                    self.child_cancellations.insert(
-                        cancelled.command_id.seq,
-                        (event_id, cancelled.reason.clone()),
-                    );
+                    self.child_cancellations
+                        .insert(cancelled.command_id.seq, (event_id, cancelled.reason));
                 }
                 HistoryEventData::TimerFired(fired) => {
-                    self.timers
-                        .insert(fired.command_id.seq, (event_id, fired.clone()));
+                    self.timers.insert(fired.command_id.seq, (event_id, fired));
                 }
                 HistoryEventData::SignalConsumed(consumed) => {
                     self.consumed_signals
-                        .insert(consumed.command_id.seq, (event_id, consumed.clone()));
+                        .insert(consumed.command_id.seq, (event_id, consumed));
                 }
-                _ => {}
+                data => commands.push(HistoryEvent { data, ..event }),
             }
         }
+        commands
     }
 }
 
@@ -410,50 +413,6 @@ enum CommandDisposition {
     /// No recorded command event remained, so the command event and its side
     /// effect were appended.
     Appended,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RuntimeChangeMarker {
-    pub command_id: CommandId,
-    pub change_id: String,
-    pub version: i32,
-    pub marker_kind: WorkflowChangeMarkerKind,
-    pub event_id: crate::EventId,
-}
-
-/// Every change marker this run has recorded, keyed by change id.
-///
-/// Built once per cached run rather than once per task: the context only ever
-/// reads it, so tasks share one `Arc` and a task whose chunk carries no new
-/// marker copies nothing. The worker holds the same `Arc` on `CachedWorkflow`
-/// and folds new markers in with `Arc::make_mut`, so the copy happens exactly
-/// when the set actually changes.
-pub(crate) type ChangeMarkerIndex = BTreeMap<String, RuntimeChangeMarker>;
-
-impl RuntimeChangeMarker {
-    fn from_record(record: WorkflowChangeVersionRecord) -> Self {
-        Self {
-            command_id: command_id(&record.run_id, record.command_seq.0),
-            change_id: record.change_id,
-            version: record.version,
-            marker_kind: record.marker_kind,
-            event_id: record.first_event_id,
-        }
-    }
-
-    /// The provider's full record set, folded into the shared index. Used on
-    /// the one path that cannot merge incrementally: a partially loaded
-    /// history, where the markers ahead of the loaded window are only
-    /// knowable from the provider.
-    pub(crate) fn index_from_records(
-        records: Vec<WorkflowChangeVersionRecord>,
-    ) -> ChangeMarkerIndex {
-        records
-            .into_iter()
-            .map(Self::from_record)
-            .map(|marker| (marker.change_id.clone(), marker))
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -557,14 +516,13 @@ impl RuntimeContext {
         next_command_seq: u64,
         last_loaded_event_id: crate::EventId,
         replay_target_event_id: crate::EventId,
-        change_markers: Arc<ChangeMarkerIndex>,
         carried_indexes: ReadyEventIndexes,
     ) -> Self {
         // Carried entries all precede this task's chunk (their events were
         // loaded and committed by an earlier task), so indexing the new chunk
         // on top cannot collide with them.
         let mut indexes = carried_indexes;
-        indexes.index_events(&replay_events);
+        let replay_events = indexes.partition_events(replay_events);
 
         Self {
             run_id,
@@ -577,7 +535,6 @@ impl RuntimeContext {
             replay_cursor: 0,
             last_loaded_event_id,
             replay_target_event_id,
-            consumed_replay_event_ids: BTreeSet::new(),
             needs_more_history: false,
             last_ready_event_id: None,
             next_command_seq,
@@ -585,8 +542,7 @@ impl RuntimeContext {
             live_signals: BTreeMap::new(),
             payload_hydration_requests: BTreeMap::new(),
             hydrated_payloads: BTreeMap::new(),
-            change_markers,
-            preconsumed_change_markers: BTreeMap::new(),
+            replay_window_overrun: false,
             signal_requests: Vec::new(),
             append_events: Vec::new(),
             upsert_waits: Vec::new(),
@@ -654,8 +610,8 @@ impl RuntimeContext {
             self.replay_events.drain(..self.replay_cursor);
             self.replay_cursor = 0;
         }
-        self.indexes.index_events(&events);
-        self.replay_events.extend(events);
+        let commands = self.indexes.partition_events(events);
+        self.replay_events.extend(commands);
         self.last_loaded_event_id = last_loaded_event_id;
     }
 
@@ -739,80 +695,11 @@ impl RuntimeContext {
         }
     }
 
-    /// Peeks the next replay event that can match a new command, skipping
-    /// ready events (activity/timer/signal/child/map completions and facts)
-    /// that valid histories interleave ahead of command events. Skipped
-    /// events are not consumed: they stay claimable through the per-command
-    /// index maps, and `record_indexed_ready_event_id` only tracks ids the
-    /// cursor has not passed, so every event is handed out exactly once.
+    /// Peeks the next replay command event. Ready events never enter the
+    /// window (`ReadyEventIndexes::partition_events`), so the event at the
+    /// cursor is always a command event or nothing.
     fn peek_replay_command_event(&mut self) -> Option<&HistoryEvent> {
-        loop {
-            self.skip_consumed_replay_events();
-            let event = self.replay_events.get(self.replay_cursor)?;
-            if !is_index_consumable_ready_event(&event.data) {
-                break;
-            }
-            self.replay_cursor += 1;
-        }
         self.replay_events.get(self.replay_cursor)
-    }
-
-    fn skip_consumed_replay_events(&mut self) {
-        loop {
-            let start = self.replay_cursor;
-            self.skip_consumed_indexed_events();
-            self.skip_preconsumed_change_markers();
-            if self.replay_cursor == start {
-                break;
-            }
-        }
-    }
-
-    fn skip_consumed_indexed_events(&mut self) {
-        while let Some(event) = self.replay_events.get(self.replay_cursor) {
-            if !self.consumed_replay_event_ids.remove(&event.event_id) {
-                break;
-            }
-            self.replay_cursor += 1;
-        }
-    }
-
-    fn skip_preconsumed_change_markers(&mut self) {
-        while let Some(event) = self.replay_events.get(self.replay_cursor) {
-            let marker = match &event.data {
-                HistoryEventData::VersionMarker(marker) => Some((
-                    marker.command_id.seq,
-                    marker.command_id.clone(),
-                    marker.change_id.as_str(),
-                    marker.version,
-                    WorkflowChangeMarkerKind::Version,
-                )),
-                HistoryEventData::DeprecatedPatchMarker(marker) => Some((
-                    marker.command_id.seq,
-                    marker.command_id.clone(),
-                    marker.patch_id.as_str(),
-                    1,
-                    WorkflowChangeMarkerKind::DeprecatedPatch,
-                )),
-                _ => None,
-            };
-            let Some((seq, command_id, change_id, version, marker_kind)) = marker else {
-                break;
-            };
-            let Some(preconsumed) = self.preconsumed_change_markers.get(&seq) else {
-                break;
-            };
-            let matches = preconsumed.command_id == command_id
-                && preconsumed.change_id == change_id
-                && preconsumed.version == version
-                && preconsumed.marker_kind == marker_kind
-                && preconsumed.event_id == event.event_id;
-            if !matches {
-                break;
-            }
-            self.preconsumed_change_markers.remove(&seq);
-            self.replay_cursor += 1;
-        }
     }
 
     fn at_replay_tail(&self) -> bool {
@@ -821,14 +708,14 @@ impl RuntimeContext {
     }
 
     /// The next un-replayed command event still sitting in loaded history.
-    /// Unconsumed ready events are legal at any point (fire-and-forget), so
-    /// the peek skips them without consuming; a command event left behind
-    /// when the workflow reaches a terminal state is divergence.
+    /// Ready events never enter the window, so an unconsumed one (a spawned
+    /// handle nobody awaited) cannot be left behind here; a command event
+    /// left behind when the workflow reaches a terminal state is divergence.
     pub(crate) fn unreplayed_command_event(
         &mut self,
     ) -> Option<(crate::EventId, crate::HistoryEventType)> {
         self.peek_replay_command_event()
-            .map(|event| (event.event_id, event.event_type))
+            .map(|event| (event.event_id, event.event_type()))
     }
 
     /// Where loading must resume when events up to the replay target are not
@@ -888,7 +775,7 @@ impl RuntimeContext {
 
         if let Some(event) = self.peek_replay_command_event() {
             let Some((recorded_seq, recorded_fingerprint)) = kind.recorded(&event.data) else {
-                let found = event.event_type;
+                let found = event.event_type();
                 return Poll::Ready(Err(Error::Nondeterminism(format!(
                     "expected {} for command {}, found {:?}",
                     kind.event_name(),
@@ -915,21 +802,6 @@ impl RuntimeContext {
 
         append(self, &command_id, fingerprint, prepared);
         Poll::Ready(Ok((command_id, CommandDisposition::Appended)))
-    }
-
-    fn record_indexed_ready_event_id(&mut self, event_id: crate::EventId) {
-        // Only remember ids the cursor has not passed yet. The cursor skips
-        // ready events without consuming them, so an id behind the cursor will
-        // never be encountered again and would otherwise accumulate in the
-        // consumed set for the lifetime of the cached context.
-        let cursor_before_event = self
-            .replay_events
-            .get(self.replay_cursor)
-            .is_some_and(|event| event_id >= event.event_id);
-        if cursor_before_event {
-            self.consumed_replay_event_ids.insert(event_id);
-        }
-        self.record_ready_event_id(event_id);
     }
 
     /// True once every loaded replay event has been matched, consumed, or
@@ -970,10 +842,10 @@ impl RuntimeContext {
         Err(payload)
     }
 
-    /// Consumes an indexed ready event exactly once. Every ready event is
-    /// collected into its per-command-seq index map at chunk load, so the
-    /// index is the single consumption path; the replay cursor only skips
-    /// ready events and never hands them out. The entry is removed before
+    /// Consumes an indexed ready event exactly once. Every ready event moves
+    /// into its per-command-seq index map at chunk load and never enters the
+    /// replay window, so the index is the single consumption path. The entry
+    /// is removed before
     /// hydration and re-filed through `Err` when hydration is still pending,
     /// so a later poll can retry without ever cloning the value.
     fn take_indexed<V>(
@@ -985,7 +857,7 @@ impl RuntimeContext {
         let (event_id, value) = index(&mut self.indexes).remove(&command_id.seq)?;
         match hydrate(self, value) {
             Ok(value) => {
-                self.record_indexed_ready_event_id(event_id);
+                self.record_ready_event_id(event_id);
                 Some(value)
             }
             Err(value) => {
@@ -1156,21 +1028,27 @@ impl RuntimeContext {
         self.indexes.consumed_signals.contains_key(&command_id.seq)
     }
 
-    fn request_signal(&mut self, command_id: CommandId, signal_name: SignalName) {
+    fn request_signal(&mut self, command_id: &CommandId, signal_name: &SignalName) {
         // Requesting a live inbox record before replay is drained could hand
         // the waiter a fresh record while its recorded consumption still sits
         // in a not-yet-loaded chunk, consuming two records for one wait.
         if !self.replay_drained_for_live_events() {
             return;
         }
+        // Every pending waiter reads its inbox on every wake, whatever woke
+        // the run: a signal that arrived before an activity completion is
+        // consumed in that task, which is the commit TypeScript produces for
+        // the same input. Gating the read on the claim reason was measured
+        // and rejected for that reason.
+        // Cloned only when the request is new to this poll.
         if !self
             .signal_requests
             .iter()
             .any(|request| request.command_id.seq == command_id.seq)
         {
             self.signal_requests.push(LiveSignalRequest {
-                command_id,
-                signal_name,
+                command_id: command_id.clone(),
+                signal_name: signal_name.clone(),
             });
         }
     }
@@ -1273,7 +1151,7 @@ impl RuntimeContext {
 
         // Borrowed, not cloned: matching a marker only needs its change id,
         // recorded seq, and version.
-        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
+        let recorded = match self.peek_marker_or_overrun("get_version", &change_id)? {
             Some(HistoryEventData::VersionMarker(marker)) => {
                 if marker.change_id != change_id {
                     return Err(Error::Nondeterminism(format!(
@@ -1290,12 +1168,12 @@ impl RuntimeContext {
                 )));
             }
             Some(_) => {
-                if self.change_markers.contains_key(&change_id) {
-                    return Err(Error::Nondeterminism(format!(
-                        "version marker `{change_id}` moved relative to command history"
-                    )));
-                }
-                None
+                return validate_recorded_version(
+                    change_id,
+                    DEFAULT_VERSION,
+                    min_supported,
+                    max_supported,
+                );
             }
             None => None,
         };
@@ -1311,43 +1189,24 @@ impl RuntimeContext {
             );
         }
 
-        if let Some(marker) = self.change_markers.get(&change_id).cloned() {
-            if marker.marker_kind != WorkflowChangeMarkerKind::Version {
-                return Err(Error::Nondeterminism(format!(
-                    "expected VersionMarker `{change_id}`, found DeprecatedPatchMarker"
-                )));
-            }
-            self.preconsume_marker(&change_id, &marker)?;
-            return validate_recorded_version(
-                change_id,
-                marker.version,
-                min_supported,
-                max_supported,
-            );
-        }
-
-        if self.at_replay_tail() {
-            let command_id = self.next_command_id();
-            let marker = VersionMarker {
-                command_id,
-                change_id,
-                version: max_supported,
-            };
-            self.append_events
-                .push(NewHistoryEvent::new(HistoryEventData::VersionMarker(
-                    marker,
-                )));
-            return Ok(max_supported);
-        }
-
-        validate_recorded_version(change_id, DEFAULT_VERSION, min_supported, max_supported)
+        let command_id = self.next_command_id();
+        let marker = VersionMarker {
+            command_id,
+            change_id,
+            version: max_supported,
+        };
+        self.append_events
+            .push(NewHistoryEvent::new(HistoryEventData::VersionMarker(
+                marker,
+            )));
+        Ok(max_supported)
     }
 
     fn deprecate_patch(&mut self, patch_id: String) -> Result<()> {
         // Borrowed, not cloned, as in `get_version`. `Some(version)` carries a
         // recorded `VersionMarker` whose version still needs the bridge check;
         // `None` inside `Some(..)` carries a recorded `DeprecatedPatchMarker`.
-        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
+        let recorded = match self.peek_marker_or_overrun("deprecate_patch", &patch_id)? {
             Some(HistoryEventData::VersionMarker(marker)) => {
                 if marker.change_id != patch_id {
                     return Err(Error::Nondeterminism(format!(
@@ -1366,14 +1225,7 @@ impl RuntimeContext {
                 }
                 Some((marker.command_id.seq, None))
             }
-            Some(_) => {
-                if self.change_markers.contains_key(&patch_id) {
-                    return Err(Error::Nondeterminism(format!(
-                        "patch marker `{patch_id}` moved relative to command history"
-                    )));
-                }
-                None
-            }
+            Some(_) => return Ok(()),
             None => None,
         };
         if let Some((recorded_seq, recorded_version)) = recorded {
@@ -1393,48 +1245,44 @@ impl RuntimeContext {
             return Ok(());
         }
 
-        if let Some(marker) = self.change_markers.get(&patch_id).cloned() {
-            match marker.marker_kind {
-                WorkflowChangeMarkerKind::Version => {
-                    if marker.version <= DEFAULT_VERSION {
-                        return Err(Error::UnsupportedWorkflowVersion {
-                            change_id: patch_id,
-                            version: marker.version,
-                            min_supported: 1,
-                            max_supported: i32::MAX,
-                        });
-                    }
-                }
-                WorkflowChangeMarkerKind::DeprecatedPatch => {}
-            }
-            self.preconsume_marker(&patch_id, &marker)?;
-            return Ok(());
-        }
-
-        if self.at_replay_tail() {
-            let command_id = self.next_command_id();
-            self.append_events.push(NewHistoryEvent::new(
-                HistoryEventData::DeprecatedPatchMarker(DeprecatedPatchMarker {
-                    command_id,
-                    patch_id,
-                }),
-            ));
-        }
-
+        let command_id = self.next_command_id();
+        self.append_events.push(NewHistoryEvent::new(
+            HistoryEventData::DeprecatedPatchMarker(DeprecatedPatchMarker {
+                command_id,
+                patch_id,
+            }),
+        ));
         Ok(())
     }
 
-    fn preconsume_marker(&mut self, change_id: &str, marker: &RuntimeChangeMarker) -> Result<()> {
-        if marker.event_id <= self.last_loaded_event_id {
+    /// The replay event a change-marker API matches against, or `None` at the
+    /// replay tail where the marker is appended instead.
+    ///
+    /// Markers are matched positionally like every other command, so the
+    /// answer needs the event at the cursor to be loaded. `get_version` and
+    /// `deprecate_patch` are synchronous and cannot park until the next chunk
+    /// arrives, so when the loaded window ends before the replay target the
+    /// call latches an overrun and fails: the worker discards this poll and
+    /// replays the run with its whole history loaded. Workflow code may catch
+    /// the error; the latch is what stops the task from committing.
+    fn peek_marker_or_overrun(
+        &mut self,
+        api: &str,
+        change_id: &str,
+    ) -> Result<Option<&HistoryEventData>> {
+        if self.peek_replay_command_event().is_none() && !self.at_replay_tail() {
+            self.replay_window_overrun = true;
             return Err(Error::Nondeterminism(format!(
-                "change marker `{change_id}` was indexed before loaded history cursor"
+                "{api}(`{change_id}`) reached the end of the loaded history window; the task replays with full history"
             )));
         }
-        let command_id = self.next_command_id();
-        validate_marker_command(change_id, &command_id, marker.command_id.seq)?;
-        self.preconsumed_change_markers
-            .insert(command_id.seq, marker.clone());
-        Ok(())
+        Ok(self.peek_replay_command_event().map(|event| &event.data))
+    }
+
+    /// Whether a change-marker API hit the end of a partially loaded window
+    /// during this poll. The worker must not commit such a poll.
+    pub(crate) fn replay_window_overrun(&self) -> bool {
+        self.replay_window_overrun
     }
 }
 
@@ -1529,6 +1377,14 @@ where
     Err(Error::ContinueAsNew { input })
 }
 
+/// Deterministic workflow time: the provider clock as observed by the task
+/// that first evaluates this call, recorded as a side-effect marker so every
+/// replay returns the same value. Each call records its own marker.
+pub fn now() -> SideEffectFuture<TimestampMs, impl FnOnce() -> TimestampMs> {
+    let observed = with_context(|runtime| runtime.now);
+    side_effect("durust.now", move || observed)
+}
+
 pub fn side_effect<T, F>(key: impl Into<String>, effect: F) -> SideEffectFuture<T, F>
 where
     T: serde::Serialize + serde::de::DeserializeOwned,
@@ -1600,7 +1456,8 @@ where
                     _ => {
                         return Poll::Ready(Err(Error::Nondeterminism(format!(
                             "expected SideEffectMarker `{}`, found {:?}",
-                            self.key, event.event_type
+                            self.key,
+                            event.event_type()
                         ))));
                     }
                 },
@@ -2065,10 +1922,11 @@ where
             }
             Poll::Ready(Ok(())) => {
                 for index in 0..self.branches.len() {
-                    if index != winner_index && self.outputs[index].is_none() {
-                        if let Some(branch) = self.branches[index].as_ref() {
-                            branch.__durust_cancel_branch();
-                        }
+                    if index != winner_index
+                        && self.outputs[index].is_none()
+                        && let Some(branch) = self.branches[index].as_ref()
+                    {
+                        branch.__durust_cancel_branch();
                     }
                 }
                 self.done = true;
@@ -2137,35 +1995,35 @@ fn record_select_winner(
     with_context(|runtime| {
         // Borrowed, not cloned: the recorded winner is only ever compared
         // field by field against what the select just observed.
-        if let Some(event) = runtime.peek_replay_command_event() {
-            if let HistoryEventData::SelectWinner(winner) = &event.data {
-                if winner.select_command_id.seq != select_command_id.seq {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "expected SelectWinner command {}, found {}",
-                        select_command_id.seq.0, winner.select_command_id.seq.0
-                    ))));
-                }
-                if winner.branches_digest != branches_digest {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "select branch set changed for command {}: recorded digest `{}`, current `{}`",
-                        select_command_id.seq.0, winner.branches_digest, branches_digest
-                    ))));
-                }
-                if winner.branch_ordinal != branch_ordinal {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "select winner changed for command {}: recorded {}, observed {}",
-                        select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
-                    ))));
-                }
-                if winner.winning_event_id != winning_event_id {
-                    return Poll::Ready(Err(Error::Nondeterminism(format!(
-                        "select winning event changed for command {}: recorded {}, observed {}",
-                        select_command_id.seq.0, winner.winning_event_id, winning_event_id
-                    ))));
-                }
-                runtime.advance_replay();
-                return Poll::Ready(Ok(()));
+        if let Some(event) = runtime.peek_replay_command_event()
+            && let HistoryEventData::SelectWinner(winner) = &event.data
+        {
+            if winner.select_command_id.seq != select_command_id.seq {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "expected SelectWinner command {}, found {}",
+                    select_command_id.seq.0, winner.select_command_id.seq.0
+                ))));
             }
+            if winner.branches_digest != branches_digest {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "select branch set changed for command {}: recorded digest `{}`, current `{}`",
+                    select_command_id.seq.0, winner.branches_digest, branches_digest
+                ))));
+            }
+            if winner.branch_ordinal != branch_ordinal {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "select winner changed for command {}: recorded {}, observed {}",
+                    select_command_id.seq.0, winner.branch_ordinal, branch_ordinal
+                ))));
+            }
+            if winner.winning_event_id != winning_event_id {
+                return Poll::Ready(Err(Error::Nondeterminism(format!(
+                    "select winning event changed for command {}: recorded {}, observed {}",
+                    select_command_id.seq.0, winner.winning_event_id, winning_event_id
+                ))));
+            }
+            runtime.advance_replay();
+            return Poll::Ready(Ok(()));
         }
         if runtime.request_more_history_if_available() {
             return Poll::Pending;
@@ -2182,30 +2040,6 @@ fn record_select_winner(
             )));
         Poll::Ready(Ok(()))
     })
-}
-
-/// Ready events are facts about futures (completions, failures, timer fires,
-/// consumed signals, child lifecycle) that valid histories interleave ahead of
-/// command events. All of them are collected into the replay index maps at
-/// chunk load, so the cursor can skip past them and their waiters can still
-/// claim them through the indexes.
-fn is_index_consumable_ready_event(data: &HistoryEventData) -> bool {
-    matches!(
-        data,
-        HistoryEventData::ActivityCompleted(_)
-            | HistoryEventData::ActivityFailed(_)
-            | HistoryEventData::ActivityTimedOut(_)
-            | HistoryEventData::ActivityMapCompleted(_)
-            | HistoryEventData::ActivityMapFailed(_)
-            | HistoryEventData::ChildWorkflowMapCompleted(_)
-            | HistoryEventData::ChildWorkflowMapFailed(_)
-            | HistoryEventData::ChildWorkflowStarted(_)
-            | HistoryEventData::ChildWorkflowCompleted(_)
-            | HistoryEventData::ChildWorkflowFailed(_)
-            | HistoryEventData::ChildWorkflowCancelled(_)
-            | HistoryEventData::TimerFired(_)
-            | HistoryEventData::SignalConsumed(_)
-    )
 }
 
 pub struct ActivityFuture<A>
@@ -3561,16 +3395,27 @@ where
     type Output = Result<T>;
 
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        with_context(|runtime| match &self.state {
-            SignalFutureState::Init => self.poll_init(runtime),
-            SignalFutureState::Waiting(command_id) => {
-                let command_id = command_id.clone();
-                self.poll_waiting(runtime, &command_id)
-            }
-            SignalFutureState::Done => Poll::Ready(Err(Error::Nondeterminism(
-                "signal future polled after completion".to_owned(),
-            ))),
-        })
+        with_context(
+            |runtime| match std::mem::replace(&mut self.state, SignalFutureState::Done) {
+                SignalFutureState::Init => {
+                    self.state = SignalFutureState::Init;
+                    self.poll_init(runtime)
+                }
+                SignalFutureState::Waiting(command_id) => {
+                    // Taken, not cloned: a waiter is polled on every wake of its
+                    // run, and the id goes back into the state when it stays
+                    // pending.
+                    let poll = self.poll_waiting(runtime, &command_id);
+                    if poll.is_pending() {
+                        self.state = SignalFutureState::Waiting(command_id);
+                    }
+                    poll
+                }
+                SignalFutureState::Done => Poll::Ready(Err(Error::Nondeterminism(
+                    "signal future polled after completion".to_owned(),
+                ))),
+            },
+        )
     }
 }
 
@@ -3630,9 +3475,12 @@ where
         runtime: &mut RuntimeContext,
         command_id: &CommandId,
     ) -> Poll<Result<T>> {
-        let fingerprint = signal_fingerprint(self.signal_name.clone());
+        // The fingerprint is built only once something arrived: a pending
+        // waiter is polled on every wake of its run, and most polls find
+        // nothing.
         if let Some(consumed) = runtime.take_consumed_signal(command_id) {
             self.state = SignalFutureState::Done;
+            let fingerprint = signal_fingerprint(self.signal_name.clone());
             return Poll::Ready(decode_consumed_signal(
                 command_id.seq,
                 &fingerprint,
@@ -3655,7 +3503,7 @@ where
                         signal_id: signal.signal_id,
                         signal_name: signal.signal_name,
                         payload: signal.payload.clone(),
-                        fingerprint,
+                        fingerprint: signal_fingerprint(self.signal_name.clone()),
                     },
                 )));
             runtime.record_next_appended_ready_event_id();
@@ -3663,7 +3511,7 @@ where
             return Poll::Ready(crate::decode_payload::<T>(&signal.payload));
         }
 
-        runtime.request_signal(command_id.clone(), self.signal_name.clone());
+        runtime.request_signal(command_id, &self.signal_name);
         runtime.request_more_history_if_available();
         Poll::Pending
     }
@@ -3677,7 +3525,7 @@ where
             key: self.signal_name.0.clone(),
             ready_at: None,
         });
-        runtime.request_signal(command_id.clone(), self.signal_name.clone());
+        runtime.request_signal(command_id, &self.signal_name);
     }
 }
 
@@ -3799,7 +3647,7 @@ mod tests {
         ActivityCompleted, ActivityFailed, ActivityMapCompleted, ActivityMapFailed,
         ActivityTimedOut, ChildWorkflowCancelled, ChildWorkflowCompleted, ChildWorkflowFailed,
         ChildWorkflowMapFailed, ChildWorkflowStarted, CodecId, DurableFailure, EventId,
-        HistoryEventType, TimerStarted,
+        TimerStarted,
     };
 
     #[test]
@@ -3845,7 +3693,6 @@ mod tests {
                 .map(|event| event.data.event_type())
                 .collect::<Vec<_>>()
         );
-        assert!(context.change_markers.is_empty());
         // The side effect allocated command seq 1 before invoking the closure.
         // That allocation dies with the context because the task never commits,
         // so the burned seq is never observable in history.
@@ -4391,7 +4238,6 @@ mod tests {
             0,
             EventId(1),
             EventId(3),
-            Arc::default(),
             ReadyEventIndexes::default(),
         );
         runtime.append_replay_events(
@@ -4416,7 +4262,7 @@ mod tests {
         assert!(
             matches!(next.data, HistoryEventData::TimerStarted(_)),
             "{case_name} should continue at the next unconsumed event, found {:?}",
-            next.event_type
+            next.event_type()
         );
         assert_eq!(next.event_id, EventId(3));
     }
@@ -4487,7 +4333,7 @@ mod tests {
         assert!(
             matches!(next.data, HistoryEventData::TimerStarted(_)),
             "{case_name} should skip consumed ready event and continue at the next unconsumed event, found {:?}",
-            next.event_type
+            next.event_type()
         );
         assert_eq!(next.event_id, EventId(3));
     }
@@ -4568,7 +4414,6 @@ mod tests {
             0,
             EventId(1),
             EventId(1),
-            Arc::default(),
             ReadyEventIndexes::default(),
         )
     }
@@ -4585,16 +4430,13 @@ mod tests {
             0,
             EventId(3),
             EventId(3),
-            Arc::default(),
             ReadyEventIndexes::default(),
         )
     }
 
     fn event(event_id: u64, data: HistoryEventData) -> HistoryEvent {
-        let event_type: HistoryEventType = data.event_type();
         HistoryEvent {
             event_id: EventId(event_id),
-            event_type,
             data,
         }
     }

@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@durust/core": "^0.2.1",
-    "@durust/payload": "^0.2.1"
+    "@durust/native": "^0.2.1"
   },
   "license": "MIT",
   "repository": {

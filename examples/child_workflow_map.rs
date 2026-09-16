@@ -74,10 +74,7 @@ fn main() -> durust::Result<()> {
                 "example workflow did not complete".to_owned(),
             ));
         };
-        println!(
-            "sum of squares: {}",
-            durust::decode_payload::<u64>(&result)?
-        );
+        println!("sum of squares: {}", durust::decode_payload::<u64>(result)?);
         Ok(())
     })
 }

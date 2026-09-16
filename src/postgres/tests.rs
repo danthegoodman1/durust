@@ -15,10 +15,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// its service container; a developer with no database leaves it unset and
 /// still gets the skip.
 fn postgres_url_or_skip(what: &str) -> Option<String> {
-    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
-        if !url.trim().is_empty() {
-            return Some(url);
-        }
+    if let Ok(url) = std::env::var("DURUST_POSTGRES_URL")
+        && !url.trim().is_empty()
+    {
+        return Some(url);
     }
     assert!(
         !postgres_is_required(),
@@ -374,7 +374,7 @@ fn postgres_terminal_run_with_live_claim_rejects_every_mutating_commit_kind_when
             );
         }
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -392,7 +392,7 @@ fn postgres_schema_migration_runs_when_configured() {
         .unwrap();
         assert_eq!(backend.schema(), schema);
         assert_eq!(backend.schema_version().await.unwrap(), 6);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -514,7 +514,7 @@ fn postgres_batch_shard_lease_refresh_preserves_epoch_for_same_owner() {
             assert_eq!(owner_id.as_deref(), Some("lease-competitor"));
             assert_eq!(*lease_epoch, 2);
         }
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -574,7 +574,7 @@ fn postgres_shard_metadata_is_validated_when_configured() {
                 .contains("metadata mismatch for `logical_shards`"),
             "unexpected error: {err}"
         );
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -673,7 +673,7 @@ fn postgres_hot_path_ids_use_sequences_without_meta_counters() {
             .unwrap()
             .get(0);
         assert!(claim_sequence_value > 0);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -739,7 +739,7 @@ fn postgres_batch_claim_honors_shard_filter_when_configured() {
             .unwrap();
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].workflow_id, target_workflow_id);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -784,7 +784,7 @@ fn postgres_empty_shard_filtered_claim_does_not_acquire_leases() {
             assert_eq!(lease_epoch, 0);
             assert_eq!(lease_until_ms, None);
         }
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -873,7 +873,7 @@ fn postgres_stale_shard_owner_cannot_commit_when_configured() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::StaleLease));
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -947,7 +947,7 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
         let leases = shard_leases_for_tests(&backend, &schema, &[shard_id]).await;
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].1.as_deref(), Some("unfiltered-shard-worker"));
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1065,7 +1065,7 @@ fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].1.as_deref(), Some("batch-journal-worker"));
         assert_eq!(leases[0].2, acquired_lease_epoch);
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1092,7 +1092,7 @@ fn postgres_rejects_incompatible_schema_version_when_configured() {
             err.to_string().contains("has version 999"),
             "unexpected error: {err}"
         );
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1251,10 +1251,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
         backend
             .release_workflow_task(
                 claimed.claim,
-                crate::WorkflowTaskRelease::delayed(
-                    WorkflowTaskReason::CacheEvicted,
-                    VISIBILITY_DELAY,
-                ),
+                crate::WorkflowTaskRelease::delayed(VISIBILITY_DELAY),
             )
             .await
             .unwrap();
@@ -1667,7 +1664,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             WorkflowChangeVersionStatus::Closed
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1844,7 +1841,7 @@ fn postgres_child_start_is_inline_when_configured() {
             child_input_value
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -1972,7 +1969,7 @@ fn postgres_child_start_conflict_records_failure_when_configured() {
         );
         assert!(failed.failure.non_retryable);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2054,7 +2051,7 @@ fn postgres_child_completion_routes_to_parent_when_configured() {
             child_result
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2184,7 +2181,7 @@ fn postgres_parent_close_policy_is_applied_when_configured() {
             .expect("abandoned child remains claimable");
         assert_eq!(abandoned_child.run_id, abandon_child_run_id);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2400,7 +2397,7 @@ fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
             HistoryEventData::WorkflowCancelled { .. }
         ));
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2548,7 +2545,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         };
         assert_eq!(crate::decode_payload::<String>(input).unwrap(), input_value);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2787,7 +2784,7 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             .unwrap();
         assert_eq!(collected.deleted_blobs, 1);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -2971,7 +2968,7 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
             CompleteActivityOutcome::AlreadyCompleted
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -3079,7 +3076,7 @@ fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
             next_input_value
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -3306,7 +3303,7 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
             .collect::<Vec<_>>();
         assert_eq!(results, vec![10, 20, 30]);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -3372,10 +3369,7 @@ fn postgres_delayed_visibility_survives_reconnect_when_configured() {
         backend
             .release_workflow_task(
                 claimed.claim,
-                crate::WorkflowTaskRelease::delayed(
-                    WorkflowTaskReason::CacheEvicted,
-                    VISIBILITY_DELAY,
-                ),
+                crate::WorkflowTaskRelease::delayed(VISIBILITY_DELAY),
             )
             .await
             .unwrap();
@@ -3410,9 +3404,10 @@ fn postgres_delayed_visibility_survives_reconnect_when_configured() {
             .await
             .unwrap()
             .expect("workflow task visible after reconnect delay");
-        assert_eq!(visible.reason, WorkflowTaskReason::CacheEvicted);
+        // A release keeps the wake reason the claim carried.
+        assert_eq!(visible.reason, WorkflowTaskReason::WorkflowStarted);
 
-        restarted.drop_schema_for_tests().await.unwrap();
+        restarted.drop_schema().await.unwrap();
     });
 }
 
@@ -3604,7 +3599,7 @@ fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured(
             activity_input
         );
 
-        restarted.drop_schema_for_tests().await.unwrap();
+        restarted.drop_schema().await.unwrap();
     });
 }
 
@@ -3681,7 +3676,7 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
         backend
             .release_workflow_task(
                 stale_claim.claim.clone(),
-                crate::WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted),
+                crate::WorkflowTaskRelease::immediate(),
             )
             .await
             .unwrap();
@@ -3722,7 +3717,7 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
             }
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -3897,7 +3892,7 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
                 .is_empty()
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4093,7 +4088,7 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
             .expect("scheduled activity");
         assert_eq!(activity.task.run_id, activity_run);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4229,7 +4224,7 @@ fn postgres_batch_workflow_commit_fast_path_routes_terminal_child_to_parent_when
             child_result
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4417,7 +4412,7 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
             child_run_ids
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4483,7 +4478,7 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
         backend
             .release_workflow_task(
                 stale_claim.claim.clone(),
-                crate::WorkflowTaskRelease::immediate(WorkflowTaskReason::CacheEvicted),
+                crate::WorkflowTaskRelease::immediate(),
             )
             .await
             .unwrap();
@@ -4547,7 +4542,7 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
             .events;
         assert_eq!(stale_history.len(), 1);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4689,7 +4684,7 @@ fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_config
         assert_eq!(versions.records[1].version, 7);
         assert_eq!(versions.records[1].first_event_id, EventId(2));
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4849,7 +4844,7 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
         assert_eq!(ready.replay_target_event_id, EventId(5));
         assert_eq!(ready.reason, WorkflowTaskReason::ActivityCompleted);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -4996,7 +4991,7 @@ fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
             ));
         }
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -5156,7 +5151,7 @@ fn postgres_batch_activity_completion_preserves_mixed_result_order() {
             }
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -5281,7 +5276,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             .expect("retry activity first attempt");
         assert_eq!(first.task.activity_id, ActivityId::new(&retry_command_id));
         assert_eq!(first.task.attempt, 1);
-        assert_eq!(
+        assert!(matches!(
             backend
                 .fail_activity(FailActivityRequest {
                     claim: first.claim.clone(),
@@ -5289,8 +5284,11 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
                 })
                 .await
                 .unwrap(),
-            FailActivityOutcome::RetryScheduled { next_attempt: 2 }
-        );
+            FailActivityOutcome::RetryScheduled {
+                next_attempt: 2,
+                ..
+            }
+        ));
         assert!(matches!(
             backend
                 .fail_activity(FailActivityRequest {
@@ -5352,6 +5350,21 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             }
         );
 
+        // Start-to-close is measured from the claim, so the attempt has to be
+        // running before its deadline can lapse.
+        backend
+            .claim_activity_task(
+                WorkerId::new("postgres-timeout-worker"),
+                ClaimActivityOptions {
+                    namespace: crate::Namespace::default(),
+                    task_queue: activity_queue.clone(),
+                    registered_activity_names: vec![crate::ActivityName::new("postgres.timeout")],
+                    lease_duration: Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("timeout activity first attempt");
         let timeout_outcome = backend
             .timeout_due_activities(TimeoutDueActivitiesRequest {
                 namespace: crate::Namespace::default(),
@@ -5394,7 +5407,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
         };
         assert_eq!(timed_out.command_id, timeout_command_id);
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }
 
@@ -5543,6 +5556,6 @@ fn postgres_child_map_child_lookup_is_served_by_an_index_when_configured() {
             "the child lookup fell back to a sequential scan. Plan was:\n{plan}"
         );
 
-        backend.drop_schema_for_tests().await.unwrap();
+        backend.drop_schema().await.unwrap();
     });
 }

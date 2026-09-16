@@ -269,6 +269,63 @@ async fn corpus_markers(input: Value1) -> durust::Result<Value1> {
     })
 }
 
+/// One change id consulted on both sides of a task boundary: each call records
+/// its own marker, so the second task appends a second `VersionMarker`.
+#[durust::workflow(name = "corpus.repeated-change-id", version = 1)]
+async fn corpus_repeated_change_id(input: Value1) -> durust::Result<Value1> {
+    let first = durust::patched("corpus.repeat")?;
+    let doubled = durust::call_activity!(corpus_double(Value1 { value: input.value }))
+        .task_queue(CORPUS_ACTIVITY_QUEUE)
+        .await?;
+    let second = durust::patched("corpus.repeat")?;
+    Ok(Value1 {
+        value: doubled.value + u64::from(first) + u64::from(second),
+    })
+}
+
+/// The signal branch registers before the timer, and a later task replays the
+/// settled select: the recorded `SignalConsumed` sits behind the timer's
+/// command event, so it must be matched by command id, not by position.
+#[durust::workflow(name = "corpus.signal-first-select-then-timer", version = 1)]
+async fn corpus_signal_first_select_then_timer(input: Value1) -> durust::Result<Text1> {
+    let text = durust::select! {
+        approved = durust::signal::<Approval>("corpus.approve") => {
+            format!("signal:{}", approved?.who)
+        }
+        elapsed = durust::sleep(Duration::from_millis(input.value)) => {
+            elapsed?;
+            "timer".to_owned()
+        }
+    };
+    durust::sleep(Duration::from_millis(10)).await?;
+    Ok(Text1 { text })
+}
+
+/// A workflow that fails on purpose commits `WorkflowFailed` with the failure
+/// it named; both runtimes record the same terminal event.
+#[durust::workflow(name = "corpus.fails", version = 1)]
+async fn corpus_fails(input: Value1) -> durust::Result<Value1> {
+    if input.value > 0 {
+        return Err(durust::Error::non_retryable(
+            "corpus.rejected",
+            "rejected on purpose",
+        ));
+    }
+    Ok(input)
+}
+
+/// `now()` records the provider clock as a side-effect marker; the second call
+/// observes the advanced clock and both values are replayed as recorded.
+#[durust::workflow(name = "corpus.now-twice", version = 1)]
+async fn corpus_now_twice(input: Value1) -> durust::Result<Value1> {
+    let first = durust::now().await?;
+    durust::sleep(Duration::from_millis(input.value)).await?;
+    let second = durust::now().await?;
+    Ok(Value1 {
+        value: u64::try_from(second.0 - first.0).unwrap_or(0),
+    })
+}
+
 #[durust::workflow(name = "corpus.continue-as-new", version = 1)]
 async fn corpus_continue_as_new(input: Continue1) -> durust::Result<Value1> {
     if input.remaining > 0 {
@@ -816,7 +873,7 @@ const DECLARED_GAPS: [&str; 8] = [
     "Double-await of a handle",
     "Offloaded (blob) payload refs",
     "Child workflow maps",
-    "Workflow failure and cancellation events",
+    "Workflow cancellation events",
     "Activity retries",
     "Terminal-with-leftover-command divergence detection",
     "The select tie-break between two branches ready at the same event id",
@@ -877,7 +934,7 @@ fn corpus_declares_its_gaps_separately_from_its_exclusions() {
 /// the ones whose convergence this corpus was extended to pin. A case that can
 /// be deleted without failing anything is a case that is not protecting
 /// anything.
-const DECLARED_CASES: [&str; 13] = [
+const DECLARED_CASES: [&str; 17] = [
     "an activity call commits one scheduled activity, and its completion closes the run",
     "a later command is appended past an unconsumed completion (hot execution)",
     "the same commits come out of a cold replay in one-event chunks",
@@ -886,11 +943,15 @@ const DECLARED_CASES: [&str; 13] = [
     "a select resolved with two ready branches takes the earlier ready event, not the earlier branch",
     "the same select with the activity landing first takes the activity branch",
     "a query projection is committed with the signal wait and again with its consumption",
-    "a child workflow start is committed to the outbox and its completion closes the parent",
+    "a child workflow start is committed with the parent's task and its completion closes the parent",
     "an activity map commits one scheduled map bounded by maxInFlight",
     "a version marker, a side effect and a deprecated patch land in one commit with the result",
     "continue-as-new commits the next run's input and nothing else",
     "a timer scheduled after the clock has moved records its deadline relative to now",
+    "one change id consulted on both sides of a task boundary records two markers",
+    "a signal that won a select whose timer registered later replays cold by command id",
+    "a workflow that fails on purpose commits WorkflowFailed with its own failure",
+    "now() records the provider clock once per call and replays it as recorded",
 ];
 
 #[test]
@@ -988,6 +1049,7 @@ fn corpus_cases_assert_something() {
             "VersionMarker",
             "WorkflowCompleted",
             "WorkflowContinuedAsNew",
+            "WorkflowFailed",
         ],
     );
 }
@@ -1152,6 +1214,10 @@ fn build_worker(
         .register_workflow(corpus_activity_map)
         .register_workflow(corpus_markers)
         .register_workflow(corpus_continue_as_new)
+        .register_workflow(corpus_repeated_change_id)
+        .register_workflow(corpus_signal_first_select_then_timer)
+        .register_workflow(corpus_fails)
+        .register_workflow(corpus_now_twice)
         .register_activity(corpus_double);
     if let Some(chunk_events) = history_chunk_events {
         builder = builder.history_chunk_events(chunk_events);
@@ -1239,6 +1305,42 @@ async fn start_case(backend: &RecordingBackend, case: &Value) -> durust::RunId {
         "corpus.markers" => {
             client
                 .start_workflow::<corpus_markers>(
+                    workflow_id,
+                    CORPUS_WORKFLOW_QUEUE,
+                    serde_json::from_value(input.clone()).expect("Value1 input"),
+                )
+                .await
+        }
+        "corpus.repeated-change-id" => {
+            client
+                .start_workflow::<corpus_repeated_change_id>(
+                    workflow_id,
+                    CORPUS_WORKFLOW_QUEUE,
+                    serde_json::from_value(input.clone()).expect("Value1 input"),
+                )
+                .await
+        }
+        "corpus.signal-first-select-then-timer" => {
+            client
+                .start_workflow::<corpus_signal_first_select_then_timer>(
+                    workflow_id,
+                    CORPUS_WORKFLOW_QUEUE,
+                    serde_json::from_value(input.clone()).expect("Value1 input"),
+                )
+                .await
+        }
+        "corpus.now-twice" => {
+            client
+                .start_workflow::<corpus_now_twice>(
+                    workflow_id,
+                    CORPUS_WORKFLOW_QUEUE,
+                    serde_json::from_value(input.clone()).expect("Value1 input"),
+                )
+                .await
+        }
+        "corpus.fails" => {
+            client
+                .start_workflow::<corpus_fails>(
                     workflow_id,
                     CORPUS_WORKFLOW_QUEUE,
                     serde_json::from_value(input.clone()).expect("Value1 input"),
@@ -1346,21 +1448,6 @@ async fn run_case(case: &Value, observed: &mut Vec<ObservedTask>, regenerate: bo
                 assert!(
                     worker.run_activity_once().await.expect("activity task"),
                     "{where_}: expected a claimable activity task"
-                );
-            }
-            "dispatchChildStarts" => {
-                // Rust queues child starts in a provider outbox that a worker
-                // loop drains; TypeScript starts them inside the commit. The
-                // step exists so the two scripts stay identical, and is a
-                // no-op in the TypeScript runner.
-                let started = worker
-                    .run_child_workflow_starts_once()
-                    .await
-                    .expect("child starts");
-                assert_eq!(
-                    started,
-                    step["count"].as_u64().expect("count") as usize,
-                    "{where_}: dispatched child starts"
                 );
             }
             "advanceTime" => {

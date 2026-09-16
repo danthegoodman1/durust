@@ -9,8 +9,45 @@
     "batch": 8
   },
   "result": {
+    "backend": "memory",
+    "mode": "write-ceiling",
+    "correct": true,
+    "options": {
+      "backend": "memory",
+      "mode": "write-ceiling",
+      "workflows": 4,
+      "workers": 1,
+      "batch": 8,
+      "max_rounds": 10000,
+      "json": false,
+      "keep_db": false,
+      "list_stale": false,
+      "drop_stale": false,
+      "activity_delay_ms": 0,
+      "workflow_offset": 0,
+      "child_map_items": 32,
+      "child_map_max_in_flight": 8,
+      "shards": 1,
+      "physical_partitions": 1,
+      "activation_concurrency": 1,
+      "activation_prefetch_limit": 1,
+      "activity_completion_batch": 1,
+      "postgres_pool_size": 10
+    },
+    "elapsed_ms": 0.651,
+    "setup_ms": 0.156,
+    "processing_ms": 0.378,
+    "verify_ms": 0.117,
+    "rounds": 1,
+    "activations": 4,
     "completed_workflows": 4,
     "mixed_actions": 4,
+    "activations_per_second": 6148.88,
+    "mixed_actions_per_second": 6148.88,
+    "workflows_per_second": 6148.88,
+    "processing_activations_per_second": 10590.247,
+    "processing_mixed_actions_per_second": 10590.247,
+    "processing_workflows_per_second": 10590.247,
     "counters": {
       "workflow_starts": 4,
       "signals": 0,
@@ -18,10 +55,18 @@
       "child_completions": 0,
       "timer_handlers": 0,
       "boot_activities": 0,
+      "activity_heartbeats": 0,
       "child_activities": 0,
-      "finish_activities": 0
+      "finish_activities": 0,
+      "workflow_tasks": 4,
+      "activity_tasks": 0,
+      "timers_fired": 0,
+      "activities_timed_out": 0,
+      "child_workflow_starts_dispatched": 0
     },
     "worker_stats": {
+      "workflowTasks": 4,
+      "activityTasks": 0,
       "workflowHistoryCacheHits": 0,
       "workflowHistoryCacheMisses": 4,
       "workflowHistoryCacheEvictions": 0,
@@ -29,25 +74,88 @@
       "workflowExecutionCacheMisses": 4,
       "workflowExecutionCacheEvictions": 0,
       "historyStreamChunks": 0,
-      "historyStreamEvents": 0
+      "historyStreamEvents": 0,
+      "timersFired": 0,
+      "activitiesTimedOut": 0,
+      "childWorkflowStartsDispatched": 0
     },
-    "processing_mixed_actions_per_second": 434.668,
-    "processing_workflows_per_second": 434.668,
-    "workflow_task_commit_p95_ms": 0.107,
-    "operations": {
-      "claimWorkflowTask": {
-        "calls": 8,
-        "errors": 0
+    "backend_metrics": {
+      "workflowTaskCommitLatency": {
+        "samples": 4,
+        "p50Ms": 0.028,
+        "p95Ms": 0.033,
+        "p99Ms": 0.033,
+        "maxMs": 0.033
       },
-      "commitWorkflowTask": {
-        "calls": 4,
-        "errors": 0
-      },
-      "startWorkflow": {
-        "calls": 4,
-        "errors": 0
+      "operations": {
+        "claimWorkflowTask": {
+          "calls": 1,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.066,
+          "itemsPerCall": 4,
+          "itemsPerSecond": 60845.756,
+          "latency": {
+            "samples": 1,
+            "p50Ms": 0.066,
+            "p95Ms": 0.066,
+            "p99Ms": 0.066,
+            "maxMs": 0.066
+          }
+        },
+        "commitWorkflowTask": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.115,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 34849.884,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.028,
+            "p95Ms": 0.033,
+            "p99Ms": 0.033,
+            "maxMs": 0.033
+          }
+        },
+        "startWorkflow": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.105,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 37991.395,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.022,
+            "p95Ms": 0.037,
+            "p99Ms": 0.037,
+            "maxMs": 0.037
+          }
+        },
+        "streamHistory": {
+          "calls": 4,
+          "errors": 0,
+          "items": 4,
+          "totalMs": 0.104,
+          "itemsPerCall": 1,
+          "itemsPerSecond": 38591.786,
+          "latency": {
+            "samples": 4,
+            "p50Ms": 0.024,
+            "p95Ms": 0.032,
+            "p99Ms": 0.032,
+            "maxMs": 0.032
+          }
+        }
       }
-    }
+    },
+    "postgres_stats": null,
+    "resource_samples": null,
+    "postgres_schema": null,
+    "postgres_database": null,
+    "db_path": null,
+    "db_bytes": null
   },
   "thresholds": {
     "require_correct": true,

@@ -8,9 +8,7 @@
       "@durust/benchmark": ["packages/benchmark/src/index.ts"],
       "@durust/core": ["packages/core/src/index.ts"],
       "@durust/eslint-plugin": ["packages/eslint-plugin/src/index.ts"],
-      "@durust/payload": ["packages/payload/src/index.ts"],
-      "@durust/postgres": ["packages/postgres/src/index.ts"],
-      "@durust/sqlite": ["packages/sqlite/src/index.ts"],
+      "@durust/native": ["packages/native/src/index.ts"],
       "@durust/testing": ["packages/testing/src/index.ts"]
     }
   },

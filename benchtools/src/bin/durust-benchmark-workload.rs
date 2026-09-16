@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
     Arc, Mutex,
@@ -1760,6 +1760,7 @@ fn run_postgres_benchmark(mut options: BenchmarkOptions) -> Result<BenchmarkResu
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn postgres_stats_report(
     before: PostgresStatsSnapshot,
     after: PostgresStatsSnapshot,
@@ -2936,10 +2937,10 @@ fn percentile_duration(samples: &[Duration], percentile: f64) -> Duration {
     samples[index]
 }
 
-fn sqlite_store_bytes(path: &PathBuf) -> std::io::Result<u64> {
+fn sqlite_store_bytes(path: &Path) -> std::io::Result<u64> {
     let mut total = 0;
     for path in [
-        path.clone(),
+        path.to_path_buf(),
         path.with_extension("sqlite3-wal"),
         path.with_extension("sqlite3-shm"),
     ] {
@@ -3071,20 +3072,16 @@ fn postgres_benchmark_database() -> String {
     )
 }
 
-fn postgres_admin_client(
-    database_url: String,
-) -> impl std::future::Future<Output = Result<tokio_postgres::Client, String>> {
-    async move {
-        let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
-            .await
-            .map_err(|err| err.to_string())?;
-        tokio::spawn(async move {
-            if let Err(err) = connection.await {
-                eprintln!("postgres benchmark admin connection error: {err}");
-            }
-        });
-        Ok(client)
-    }
+async fn postgres_admin_client(database_url: String) -> Result<tokio_postgres::Client, String> {
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .map_err(|err| err.to_string())?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("postgres benchmark admin connection error: {err}");
+        }
+    });
+    Ok(client)
 }
 
 /// Drops the run's database when it goes out of scope, panic included.
@@ -3998,10 +3995,10 @@ mod tests {
     }
 
     fn probe_postgres_url_or_skip() -> Option<String> {
-        if let Ok(url) = std::env::var("DURUST_POSTGRES_URL") {
-            if !url.trim().is_empty() {
-                return Some(url);
-            }
+        if let Ok(url) = std::env::var("DURUST_POSTGRES_URL")
+            && !url.trim().is_empty()
+        {
+            return Some(url);
         }
         let required = match std::env::var("DURUST_REQUIRE_POSTGRES") {
             Ok(value) => {
@@ -4569,6 +4566,67 @@ mod tests {
         assert!(err.contains("does not fit usize") || err.contains("overflowed"));
     }
 
+    /// Every key this runner emits, at every object level, must be in the
+    /// shared `benchmark-output.json` fixture's `rustResult`, so a field added
+    /// on one runtime is added to the vocabulary both runtimes read.
+    fn assert_result_keys_are_in_the_shared_fixture(result: &BenchmarkResult) {
+        let fixture: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../typescript/fixtures/contract/benchmark-output.json"
+            ))
+            .expect("shared benchmark fixture"),
+        )
+        .expect("shared benchmark fixture is JSON");
+        let emitted = serde_json::to_value(result).expect("benchmark result serializes");
+        let mut missing = Vec::new();
+        collect_keys_missing_from(&emitted, &fixture["rustResult"], "rustResult", &mut missing);
+        assert!(
+            missing.is_empty(),
+            "benchmark output keys absent from typescript/fixtures/contract/benchmark-output.json: {missing:?}"
+        );
+    }
+
+    fn collect_keys_missing_from(
+        emitted: &serde_json::Value,
+        fixture: &serde_json::Value,
+        path: &str,
+        missing: &mut Vec<String>,
+    ) {
+        let (Some(emitted), Some(fixture)) = (emitted.as_object(), fixture.as_object()) else {
+            return;
+        };
+        for (key, value) in emitted {
+            // `operations` is keyed by operation name; every entry shares
+            // one shape, which any fixture entry pins.
+            if key == "operations" {
+                let Some(sample) = fixture
+                    .get(key)
+                    .and_then(|ops| ops.as_object())
+                    .and_then(|ops| ops.values().next())
+                else {
+                    missing.push(format!("{path}.{key}"));
+                    continue;
+                };
+                for (name, entry) in value.as_object().into_iter().flatten() {
+                    collect_keys_missing_from(
+                        entry,
+                        sample,
+                        &format!("{path}.{key}.{name}"),
+                        missing,
+                    );
+                }
+                continue;
+            }
+            match fixture.get(key) {
+                None => missing.push(format!("{path}.{key}")),
+                Some(expected) => {
+                    collect_keys_missing_from(value, expected, &format!("{path}.{key}"), missing)
+                }
+            }
+        }
+    }
+
     #[test]
     fn memory_mixed_workload_completes() {
         let mut options = default_options();
@@ -4580,6 +4638,7 @@ mod tests {
 
         let result = run_memory_benchmark(options).unwrap();
         assert!(result.correct);
+        assert_result_keys_are_in_the_shared_fixture(&result);
         assert_eq!(result.completed_workflows, 4);
         assert_eq!(result.counters.workflow_starts, 4);
         assert_eq!(result.counters.signals, 4);
@@ -4592,7 +4651,8 @@ mod tests {
         assert_eq!(result.mixed_actions, 32);
         assert_eq!(result.worker_stats.workflow_tasks, 32);
         assert!(result.worker_stats.activity_tasks >= 12);
-        assert!(result.worker_stats.child_workflow_starts_dispatched >= 4);
+        // Children start inside the commit that requests them; the drain finds none.
+        assert_eq!(result.worker_stats.child_workflow_starts_dispatched, 0);
         assert!(result.worker_stats.timers_fired >= 4);
         assert!(
             result

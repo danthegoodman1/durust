@@ -3,17 +3,17 @@ use crate::map_engine::{
     MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
     map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
+use crate::payload::{ManifestKind, ManifestWalk, PayloadSlot};
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
-    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms,
-    activity_timeout_at_ms_from, activity_timeout_attribution, activity_timeout_decision,
-    child_terminal_event_data_and_reason, child_terminal_map_item_outcome, claim_lease_until_ms,
-    codec_from_str, codec_to_str, commit_has_workflow_visible_mutations, compression_from_str,
-    compression_to_str, decode_encryption_metadata, duration_millis_i64,
-    encode_encryption_metadata, event_type_from_str, event_type_to_str, marker_kind_from_str,
-    marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms, post_commit_ready_reason,
-    ready_at_ms_for_delay, reason_from_str, reason_to_str, retry_visible_at_ms, timeout_message,
-    unix_epoch_millis, wait_kind_to_str,
+    activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms_from,
+    activity_timeout_attribution, activity_timeout_decision, child_terminal_event_data_and_reason,
+    child_terminal_map_item_outcome, claim_lease_until_ms, codec_from_str, codec_to_str,
+    commit_has_workflow_visible_mutations, compression_from_str, compression_to_str,
+    decode_encryption_metadata, duration_millis_i64, encode_encryption_metadata, event_type_to_str,
+    marker_kind_from_str, marker_kind_to_str, parent_close_policy_to_str, payload_gc_cutoff_ms,
+    post_commit_ready_reason, ready_at_ms_for_delay, reason_from_str, reason_to_str,
+    retry_visible_at_ms, timeout_message, unix_epoch_millis, wait_kind_to_str,
 };
 use crate::{
     ActivityFailed, ActivityHeartbeatOutcome, ActivityHeartbeatRequest, ActivityId,
@@ -179,6 +179,7 @@ pub struct PostgresBackendConfig {
     physical_partitions: u32,
     statement_timeout: Duration,
     lock_timeout: Duration,
+    clock: crate::ProviderClock,
 }
 
 impl PostgresBackendConfig {
@@ -192,7 +193,15 @@ impl PostgresBackendConfig {
             physical_partitions: DEFAULT_PHYSICAL_PARTITIONS,
             statement_timeout: DEFAULT_STATEMENT_TIMEOUT,
             lock_timeout: DEFAULT_LOCK_TIMEOUT,
+            clock: crate::ProviderClock::System,
         }
+    }
+
+    /// The clock leases, deadlines, retries, and due scans read; the system
+    /// clock unless a caller drives one.
+    pub fn clock(mut self, clock: crate::ProviderClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     pub fn schema(mut self, schema: impl Into<String>) -> Self {
@@ -240,6 +249,7 @@ pub struct PostgresBackend {
     physical_partitions: u32,
     statement_timeout: Duration,
     lock_timeout: Duration,
+    clock: crate::ProviderClock,
 }
 
 impl PostgresBackend {
@@ -290,6 +300,7 @@ impl PostgresBackend {
             physical_partitions: config.physical_partitions.max(1),
             statement_timeout: config.statement_timeout,
             lock_timeout: config.lock_timeout,
+            clock: config.clock,
         };
         let empty_map_repair_done = backend.migrate().await?;
         if !empty_map_repair_done {
@@ -486,13 +497,13 @@ impl PostgresBackend {
         };
         let empty_map_repair_done = meta_value(EMPTY_MAP_REPAIR_MARKER).unwrap_or(0) > 0;
         let existing = meta_value("schema_version");
-        if let Some(version) = existing {
-            if version != POSTGRES_SCHEMA_VERSION {
-                return Err(Error::Backend(format!(
-                    "postgres schema `{}` has version {version}, expected {POSTGRES_SCHEMA_VERSION}",
-                    self.schema
-                )));
-            }
+        if let Some(version) = existing
+            && version != POSTGRES_SCHEMA_VERSION
+        {
+            return Err(Error::Backend(format!(
+                "postgres schema `{}` has version {version}, expected {POSTGRES_SCHEMA_VERSION}",
+                self.schema
+            )));
         }
 
         client
@@ -932,7 +943,7 @@ impl PostgresBackend {
             return Ok(0);
         }
         let schema = self.schema_sql();
-        let now_ms = unix_epoch_millis();
+        let now_ms = self.clock.now().0;
         let Some(row) = tx
             .query_opt(
                 &format!(
@@ -974,7 +985,7 @@ impl PostgresBackend {
                 .collect::<BTreeMap<_, _>>());
         }
         let schema = self.schema_sql();
-        let now_ms = unix_epoch_millis();
+        let now_ms = self.clock.now().0;
         let shard_ids = lease_keys
             .iter()
             .map(|(_, shard_id)| *shard_id)
@@ -1032,8 +1043,9 @@ impl PostgresBackend {
         Ok(())
     }
 
-    #[cfg(test)]
-    async fn drop_schema_for_tests(&self) -> Result<()> {
+    /// Drops this backend's schema with every table in it. Test and
+    /// benchmark teardown; there is no way back from it.
+    pub async fn drop_schema(&self) -> Result<()> {
         let client = self.client().await?;
         client
             .batch_execute(&format!(
@@ -1067,7 +1079,7 @@ impl DurableBackend for PostgresBackend {
     }
 
     fn current_time(&self) -> BoxFuture<'static, Result<TimestampMs>> {
-        Box::pin(ready(Ok(TimestampMs(unix_epoch_millis()))))
+        Box::pin(ready(Ok(TimestampMs(self.clock.now().0))))
     }
 
     fn claim_workflow_task(
@@ -1361,13 +1373,14 @@ impl PostgresBackend {
             workflow_type: req.workflow_type.clone(),
             input,
         };
-        tx.execute(
+        let inserted = tx.execute(
             &format!(
                 "insert into {schema}.workflow_instances
                  (namespace, workflow_id, run_id, shard_id, workflow_name, workflow_version, task_queue,
                   current_event_id, ready_reason, ready_at_ms, workflow_claim_token, terminal,
                   parent_run_id, parent_command_seq, parent_close_policy)
-                 values ($1, $2, $3, $4, $5, $6, $7, 1, $8, 0, null, false, null, null, null)"
+                 values ($1, $2, $3, $4, $5, $6, $7, 1, $8, 0, null, false, null, null, null)
+                 on conflict (namespace, workflow_id) do nothing"
             ),
             &[
                 &req.namespace.0,
@@ -1382,6 +1395,23 @@ impl PostgresBackend {
         )
         .await
         .map_err(postgres_error)?;
+        if inserted == 0 {
+            // A concurrent start of the same workflow id committed between
+            // the lookup above and this insert; it owns the run.
+            tx.rollback().await.map_err(postgres_error)?;
+            let row = client
+                .query_one(
+                    &format!(
+                        "select run_id from {schema}.workflow_instances where namespace = $1 and workflow_id = $2"
+                    ),
+                    &[&req.namespace.0, &req.workflow_id.0],
+                )
+                .await
+                .map_err(postgres_error)?;
+            return Ok(StartWorkflowOutcome::AlreadyStarted {
+                run_id: RunId::new(row.get::<_, String>(0)),
+            });
+        }
         insert_history_event(&tx, &schema, &run_id, EventId(1), start).await?;
         tx.commit().await.map_err(postgres_error)?;
         Ok(StartWorkflowOutcome::Started { run_id })
@@ -1418,10 +1448,7 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            return Err(Error::Backend(format!(
-                "workflow `{}` was not found",
-                req.workflow_id.0
-            )));
+            return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
         };
         let run_id = RunId::new(row.get::<_, String>(0));
         let tail = EventId(u64::try_from(row.get::<_, i64>(1)).unwrap_or(u64::MAX));
@@ -1499,7 +1526,7 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let now_ms = unix_epoch_millis();
+        let now_ms = self.clock.now().0;
         let shard_ids = match opts.shard_filter {
             Some(shards) => {
                 if shards.is_empty() {
@@ -1663,7 +1690,7 @@ impl PostgresBackend {
 
         let mut claimed = Vec::with_capacity(selected.len());
         for ((run_id, workflow_id, workflow_type, tail, reason, _), token) in
-            selected.into_iter().zip(tokens.into_iter())
+            selected.into_iter().zip(tokens)
         {
             let prefetched_history = prefetched_histories
                 .get(&run_id)
@@ -1728,7 +1755,7 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let now_ms = unix_epoch_millis();
+        let now_ms = self.clock.now().0;
         let shard_ids = match shard_filter {
             Some(shards) => {
                 if shards.is_empty() {
@@ -1887,7 +1914,6 @@ impl PostgresBackend {
         let mut consumed_rows = 0usize;
         for row in &rows {
             let event_id = EventId(row.get::<_, i64>(0).try_into().unwrap_or(u64::MAX));
-            let event_type = row.get::<_, String>(1);
             let blob = row.get::<_, Vec<u8>>(2);
             let mut data: HistoryEventData = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
@@ -1901,11 +1927,7 @@ impl PostgresBackend {
                 data = self.hydrate_history_event_from_storage(data).await?;
             }
             bytes += event_bytes;
-            events.push(HistoryEvent {
-                event_id,
-                event_type: event_type_from_str(&event_type)?,
-                data,
-            });
+            events.push(HistoryEvent { event_id, data });
             if events.len() >= max_events {
                 break;
             }
@@ -1975,18 +1997,13 @@ impl PostgresBackend {
         for row in rows {
             let run_id = RunId::new(row.get::<_, String>(0));
             let event_id = EventId(row.get::<_, i64>(1).try_into().unwrap_or(u64::MAX));
-            let event_type = row.get::<_, String>(2);
             let blob = row.get::<_, Vec<u8>>(3);
             let data: HistoryEventData = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
             let event_bytes = event_payload_len(&data).max(1);
             let events = by_run.entry(run_id.clone()).or_default();
             let bytes = bytes_by_run.entry(run_id).or_default();
-            events.push(HistoryEvent {
-                event_id,
-                event_type: event_type_from_str(&event_type)?,
-                data,
-            });
+            events.push(HistoryEvent { event_id, data });
             *bytes = bytes.saturating_add(event_bytes);
         }
 
@@ -2042,7 +2059,6 @@ impl PostgresBackend {
         if claim_token != Some(i64::try_from(claim.token).unwrap_or(i64::MAX)) {
             return Err(Error::StaleLease);
         }
-        let ready_reason = (!terminal).then(|| reason_to_str(&release.reason));
         let ready_at_ms = if terminal {
             0
         } else {
@@ -2051,10 +2067,12 @@ impl PostgresBackend {
         tx.execute(
             &format!(
                 "update {schema}.workflow_instances
-                 set workflow_claim_token = null, ready_reason = $1, ready_at_ms = $2
-                 where run_id = $3"
+                 set workflow_claim_token = null,
+                     ready_reason = case when terminal then null else ready_reason end,
+                     ready_at_ms = $1
+                 where run_id = $2"
             ),
-            &[&ready_reason, &ready_at_ms, &claim.run_id.0],
+            &[&ready_at_ms, &claim.run_id.0],
         )
         .await
         .map_err(postgres_error)?;
@@ -2154,6 +2172,12 @@ impl PostgresBackend {
                 continue;
             }
             let claim = input.claim.clone();
+            // One savepoint per item: the applier can fail after it has
+            // written history or activity rows, and without the rollback
+            // those rows would commit with the rest of the batch.
+            tx.batch_execute("savepoint durust_workflow_commit_item")
+                .await
+                .map_err(postgres_error)?;
             match self
                 .apply_workflow_task_commit_tx(
                     &tx,
@@ -2165,10 +2189,24 @@ impl PostgresBackend {
                 .await
             {
                 Ok(outcome) => {
+                    tx.batch_execute("release savepoint durust_workflow_commit_item")
+                        .await
+                        .map_err(postgres_error)?;
                     results[index] = Some(Ok(outcome));
                 }
-                Err(err @ Error::Backend(_)) => return Err(err),
+                Err(err @ Error::Backend(_)) => {
+                    let _ = tx
+                        .batch_execute("rollback to savepoint durust_workflow_commit_item")
+                        .await;
+                    return Err(err);
+                }
                 Err(err) => {
+                    tx.batch_execute("rollback to savepoint durust_workflow_commit_item")
+                        .await
+                        .map_err(postgres_error)?;
+                    tx.batch_execute("release savepoint durust_workflow_commit_item")
+                        .await
+                        .map_err(postgres_error)?;
                     results[index] = Some(Err(err));
                 }
             }
@@ -2444,7 +2482,7 @@ impl PostgresBackend {
                     InlineChildStartOutcome::Failed(DurableFailure::non_retryable(
                         "durust.child_workflow_id_conflict",
                         format!(
-                            "workflow id `{}` is already started",
+                            "child workflow id already exists: {}",
                             start.message.workflow_id
                         ),
                     ))
@@ -2756,7 +2794,7 @@ impl PostgresBackend {
         schema: &str,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-        mut lease_epoch_cache: Option<&mut BTreeMap<(WorkerId, i32), i64>>,
+        lease_epoch_cache: Option<&mut BTreeMap<(WorkerId, i32), i64>>,
     ) -> Result<CommitOutcome> {
         let Some(row) = tx
             .query_opt(
@@ -2788,7 +2826,7 @@ impl PostgresBackend {
         // Shard-lease fencing: the verification must run even though its
         // epoch has no consumer; the per-batch cache avoids re-verifying one
         // (worker, shard) pair per item.
-        match lease_epoch_cache.as_deref_mut() {
+        match lease_epoch_cache {
             Some(cache) => {
                 let key = (claim.worker_id.clone(), shard_id);
                 // The entry API cannot hold a borrow across the verify await.
@@ -2830,21 +2868,21 @@ impl PostgresBackend {
         let mut append_events = Vec::with_capacity(batch.append_events.len());
         for event in batch.append_events {
             append_events.push(crate::NewHistoryEvent::new(
-                self.normalize_history_event_for_storage_tx(&tx, event.data)
+                self.normalize_history_event_for_storage_tx(tx, event.data)
                     .await?,
             ));
         }
         let mut schedule_activities = Vec::with_capacity(batch.schedule_activities.len());
         for task in batch.schedule_activities {
             schedule_activities.push(
-                self.normalize_activity_task_for_storage_tx(&tx, task)
+                self.normalize_activity_task_for_storage_tx(tx, task)
                     .await?,
             );
         }
         let mut schedule_activity_maps = Vec::with_capacity(batch.schedule_activity_maps.len());
         for task in batch.schedule_activity_maps {
             schedule_activity_maps.push(
-                self.normalize_activity_map_task_for_storage_tx(&tx, task)
+                self.normalize_activity_map_task_for_storage_tx(tx, task)
                     .await?,
             );
         }
@@ -2852,19 +2890,19 @@ impl PostgresBackend {
             Vec::with_capacity(batch.schedule_child_workflow_maps.len());
         for task in batch.schedule_child_workflow_maps {
             schedule_child_workflow_maps.push(
-                self.normalize_child_workflow_map_task_for_storage_tx(&tx, task)
+                self.normalize_child_workflow_map_task_for_storage_tx(tx, task)
                     .await?,
             );
         }
         let mut start_child_workflows = Vec::with_capacity(batch.start_child_workflows.len());
         for message in batch.start_child_workflows {
             start_child_workflows.push(
-                self.normalize_child_start_message_for_storage_tx(&tx, message)
+                self.normalize_child_start_message_for_storage_tx(tx, message)
                     .await?,
             );
         }
         let query_projection = match batch.query_projection {
-            Some(payload) => Some(self.normalize_payload_for_storage_tx(&tx, payload).await?),
+            Some(payload) => Some(self.normalize_payload_for_storage_tx(tx, payload).await?),
             None => None,
         };
 
@@ -2881,7 +2919,7 @@ impl PostgresBackend {
             }
             append_history.push((next_event_id, event.data));
         }
-        insert_history_events(&tx, schema, &claim.run_id, &append_history).await?;
+        insert_history_events(tx, schema, &claim.run_id, &append_history).await?;
         let marker_context = WorkflowChangeMarkerContext {
             namespace: &namespace,
             workflow_id: &workflow_id,
@@ -2890,7 +2928,7 @@ impl PostgresBackend {
         };
         for (event_id, data) in &append_history {
             index_workflow_change_marker_with_context(
-                &tx,
+                tx,
                 schema,
                 &claim.run_id,
                 *event_id,
@@ -2911,7 +2949,7 @@ impl PostgresBackend {
             // variant that also means "the row vanished mid-transaction", and
             // the two were then dropped by the same arm — so the unreachable
             // one was silent.
-            if child_event_exists_tx(&tx, &schema, &message.command_id).await? {
+            if child_event_exists_tx(tx, schema, &message.command_id).await? {
                 continue;
             }
             let child_shard_id = i32::try_from(
@@ -2920,7 +2958,7 @@ impl PostgresBackend {
             )
             .unwrap_or(i32::MAX);
             let child_start =
-                start_child_workflow_inline_tx(&tx, &schema, &namespace, child_shard_id, &message)
+                start_child_workflow_inline_tx(tx, schema, &namespace, child_shard_id, &message)
                     .await?;
             if terminal || became_terminal {
                 continue;
@@ -2939,7 +2977,7 @@ impl PostgresBackend {
                     "insert into {schema}.activity_tasks
                      (activity_id, namespace, run_id, activity_name, task_queue, task,
                       claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
-                     values ($1, $2, $3, $4, $5, $6, null, false, $7, null)"
+                     values ($1, $2, $3, $4, $5, $6, null, false, null, null)"
                 ),
                 &[
                     &task.activity_id.0,
@@ -2948,7 +2986,6 @@ impl PostgresBackend {
                     &task.activity_name.0,
                     &task.task_queue.0,
                     &task_blob,
-                    &activity_timeout_at_ms(task.start_to_close_timeout),
                 ],
             )
             .await
@@ -2964,7 +3001,7 @@ impl PostgresBackend {
         let mut commit_tail_published = false;
 
         for map_task in schedule_activity_maps {
-            insert_activity_map_tx(self, &tx, &schema, &namespace, &map_task).await?;
+            insert_activity_map_tx(self, tx, schema, &namespace, &map_task).await?;
             if let Some((state, map_namespace, task)) =
                 activity_map_state_tx(tx, schema, &map_task.map_command_id).await?
             {
@@ -2973,14 +3010,13 @@ impl PostgresBackend {
                     schema,
                     &claim.run_id,
                     next_event_id,
-                    &state,
                     &mut commit_tail_published,
                 )
                 .await?;
                 if let Some(event_id) = step_map_tx(
                     self,
-                    &tx,
-                    &schema,
+                    tx,
+                    schema,
                     &state,
                     &map_namespace,
                     &MapTask::Activity(task),
@@ -2997,7 +3033,7 @@ impl PostgresBackend {
         }
 
         for map_task in schedule_child_workflow_maps {
-            insert_child_workflow_map_tx(self, &tx, &schema, &namespace, &map_task).await?;
+            insert_child_workflow_map_tx(self, tx, schema, &namespace, &map_task).await?;
             if let Some((state, map_namespace, task)) =
                 child_workflow_map_state_tx(tx, schema, &map_task.map_command_id).await?
             {
@@ -3011,14 +3047,13 @@ impl PostgresBackend {
                     schema,
                     &claim.run_id,
                     next_event_id,
-                    &state,
                     &mut commit_tail_published,
                 )
                 .await?;
                 if let Some(event_id) = step_map_tx(
                     self,
-                    &tx,
-                    &schema,
+                    tx,
+                    schema,
                     &state,
                     &map_namespace,
                     &MapTask::ChildWorkflow(task),
@@ -3034,7 +3069,38 @@ impl PostgresBackend {
             }
         }
 
+        // A child map's items start inside the step above, and an item whose
+        // id collides fails the map right there, through the nested item
+        // completion: that append moves the run's tail and wake reason in
+        // the instance row, out of this function's view. Read them back so
+        // the closing update below keeps the nested event and its reason.
+        if commit_tail_published {
+            let row = tx
+                .query_one(
+                    &format!(
+                        "select current_event_id, ready_reason
+                         from {schema}.workflow_instances
+                         where run_id = $1"
+                    ),
+                    &[&claim.run_id.0],
+                )
+                .await
+                .map_err(postgres_error)?;
+            let published_tail = EventId(u64::try_from(row.get::<_, i64>(0)).unwrap_or(u64::MAX));
+            if published_tail > next_event_id {
+                next_event_id = published_tail;
+                ready_after_commit = row
+                    .get::<_, Option<String>>(1)
+                    .map(|reason| reason_from_str(&reason))
+                    .transpose()?;
+            }
+        }
+
+        // Fenced to the claimed run, as in the memory provider.
         for wait in batch.upsert_waits {
+            if wait.run_id != claim.run_id {
+                continue;
+            }
             tx.execute(
                 &format!(
                     "insert into {schema}.active_waits
@@ -3064,8 +3130,10 @@ impl PostgresBackend {
 
         for signal_id in batch.consume_signals {
             tx.execute(
-                &format!("update {schema}.signals set consumed = true where signal_id = $1"),
-                &[&signal_id.0],
+                &format!(
+                    "update {schema}.signals set consumed = true where signal_id = $1 and run_id = $2"
+                ),
+                &[&signal_id.0, &claim.run_id.0],
             )
             .await
             .map_err(postgres_error)?;
@@ -3073,15 +3141,15 @@ impl PostgresBackend {
 
         for wait_id in batch.delete_waits {
             tx.execute(
-                &format!("delete from {schema}.active_waits where wait_id = $1"),
-                &[&wait_id.0],
+                &format!("delete from {schema}.active_waits where wait_id = $1 and run_id = $2"),
+                &[&wait_id.0, &claim.run_id.0],
             )
             .await
             .map_err(postgres_error)?;
         }
 
         for command_id in batch.cancel_commands {
-            cancel_command_operational_state_tx(self, &tx, &schema, &command_id).await?;
+            cancel_command_operational_state_tx(self, tx, schema, &command_id).await?;
         }
 
         if let Some(payload) = query_projection {
@@ -3115,17 +3183,17 @@ impl PostgresBackend {
                 .as_ref()
                 .map(TerminalCleanup::for_terminal_event)
                 .unwrap_or(TerminalCleanup::Closed);
-            cleanup_run_operational_state_tx(&tx, &schema, &claim.run_id, cleanup).await?;
+            cleanup_run_operational_state_tx(tx, schema, &claim.run_id, cleanup).await?;
             if let Some(event @ HistoryEventData::WorkflowContinuedAsNew { .. }) =
                 terminal_event.clone()
             {
-                continue_run_as_new_tx(&tx, &schema, &claim.run_id, event).await?;
+                continue_run_as_new_tx(tx, schema, &claim.run_id, event).await?;
                 return Ok(CommitOutcome::Committed {
                     new_tail_event_id: next_event_id,
                 });
             }
             if let Some(event) = terminal_event {
-                handle_terminal_run_tx(self, &tx, &schema, &claim.run_id, &event).await?;
+                handle_terminal_run_tx(self, tx, schema, &claim.run_id, &event).await?;
             }
         }
         // Recompute signal readiness now that this commit's wait upserts,
@@ -3133,7 +3201,7 @@ impl PostgresBackend {
         // while the task was claimed must re-mark the run instead of being
         // erased by this update.
         let signal_ready =
-            !terminal_after_commit && signal_wait_ready(&tx, schema, &claim.run_id).await?;
+            !terminal_after_commit && signal_wait_ready(tx, schema, &claim.run_id).await?;
         let ready_reason =
             post_commit_ready_reason(terminal_after_commit, ready_after_commit, signal_ready);
         let ready_reason = ready_reason.as_ref().map(reason_to_str);
@@ -3205,10 +3273,7 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            return Err(Error::Backend(format!(
-                "workflow `{}` was not found",
-                req.workflow_id.0
-            )));
+            return Err(Error::WorkflowNotFound(req.workflow_id.clone()));
         };
         let run_id = RunId::new(row.get::<_, String>(0));
         let terminal: bool = row.get(1);
@@ -3222,23 +3287,31 @@ impl PostgresBackend {
             .await?;
         let payload = rmp_serde::to_vec_named(&payload_ref)
             .map_err(|err| Error::PayloadEncode(err.to_string()))?;
-        tx.execute(
-            &format!(
-                "insert into {schema}.signals
-                 (signal_id, namespace, run_id, signal_name, payload, received_sequence, consumed)
-                 values ($1, $2, $3, $4, $5, $6, false)"
-            ),
-            &[
-                &req.signal_id.0,
-                &req.namespace.0,
-                &run_id.0,
-                &req.signal_name.0,
-                &payload,
-                &i64::try_from(received_sequence).unwrap_or(i64::MAX),
-            ],
-        )
-        .await
-        .map_err(postgres_error)?;
+        let inserted = tx
+            .execute(
+                &format!(
+                    "insert into {schema}.signals
+                     (signal_id, namespace, run_id, signal_name, payload, received_sequence, consumed)
+                     values ($1, $2, $3, $4, $5, $6, false)
+                     on conflict (signal_id) do nothing"
+                ),
+                &[
+                    &req.signal_id.0,
+                    &req.namespace.0,
+                    &run_id.0,
+                    &req.signal_name.0,
+                    &payload,
+                    &i64::try_from(received_sequence).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(postgres_error)?;
+        if inserted == 0 {
+            // A concurrent delivery of the same signal id committed between
+            // the lookup above and this insert.
+            tx.rollback().await.map_err(postgres_error)?;
+            return Ok(SignalWorkflowOutcome::Duplicate);
+        }
 
         if signal_wait_ready(&tx, &schema, &run_id).await? {
             tx.execute(
@@ -3258,6 +3331,45 @@ impl PostgresBackend {
 
         tx.commit().await.map_err(postgres_error)?;
         Ok(SignalWorkflowOutcome::Accepted)
+    }
+
+    /// Every undelivered signal of a run, one record per signal name in
+    /// arrival order: the snapshot a claimed workflow task carries to the
+    /// worker.
+    pub async fn live_signals(&self, run_id: &RunId) -> Result<Vec<SignalInboxRecord>> {
+        let schema = self.schema_sql();
+        let rows = {
+            let client = self.client().await?;
+            client
+                .query(
+                    &format!(
+                        "select signal_id, signal_name, payload
+                         from {schema}.signals
+                         where run_id = $1 and consumed = false
+                         order by received_sequence asc"
+                    ),
+                    &[&run_id.0],
+                )
+                .await
+                .map_err(postgres_error)?
+        };
+        let mut seen = BTreeSet::new();
+        let mut records = Vec::new();
+        for row in rows {
+            let signal_name: String = row.get(1);
+            if !seen.insert(signal_name.clone()) {
+                continue;
+            }
+            let payload: Vec<u8> = row.get(2);
+            let payload: PayloadRef = rmp_serde::from_slice(&payload)
+                .map_err(|err| Error::PayloadDecode(err.to_string()))?;
+            records.push(SignalInboxRecord {
+                signal_id: crate::SignalId::new(row.get::<_, String>(0)),
+                signal_name: crate::SignalName::new(signal_name),
+                payload: self.hydrate_payload_from_storage(payload).await?,
+            });
+        }
+        Ok(records)
     }
 
     async fn read_signal_inbox_inner(
@@ -3503,7 +3615,7 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let now = unix_epoch_millis();
+        let now = self.clock.now().0;
         let registered_activity_names = opts
             .registered_activity_names
             .iter()
@@ -3519,7 +3631,6 @@ impl PostgresBackend {
                        and activity_name = any($3::text[])
                        and completed = false
                        and claim_token is null
-                       and (timeout_at_ms is null or timeout_at_ms > $4)
                        and (visible_at_ms is null or visible_at_ms <= $4)
                      order by activity_id asc
                      limit 1
@@ -3546,9 +3657,9 @@ impl PostgresBackend {
             .hydrate_activity_task_from_storage_tx(&tx, task)
             .await?;
         let token = next_claim_token(&tx, &schema).await?;
-        // Tasks without explicit timeouts get the lease as an implicit
-        // heartbeat interval; explicit deadlines stay authoritative and the
-        // stored timeout_at_ms is untouched by the claim.
+        // Start-to-close is measured from the claim, so the deadline is
+        // stamped here; tasks without explicit timeouts get the lease as an
+        // implicit heartbeat interval instead.
         let implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
             task.start_to_close_timeout,
             task.heartbeat_timeout,
@@ -3558,12 +3669,14 @@ impl PostgresBackend {
             &format!(
                 "update {schema}.activity_tasks
                  set claim_token = $1,
-                     heartbeat_deadline_at_ms = $2,
-                     implicit_heartbeat_ms = $3
-                 where activity_id = $4"
+                     timeout_at_ms = $2,
+                     heartbeat_deadline_at_ms = $3,
+                     implicit_heartbeat_ms = $4
+                 where activity_id = $5"
             ),
             &[
                 &i64::try_from(token).unwrap_or(i64::MAX),
+                &activity_timeout_at_ms_from(TimestampMs(now), task.start_to_close_timeout),
                 &activity_heartbeat_deadline_at_ms(
                     TimestampMs(now),
                     task.heartbeat_timeout,
@@ -3611,7 +3724,7 @@ impl PostgresBackend {
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
-        let now = unix_epoch_millis();
+        let now = self.clock.now().0;
         let registered_activity_names = opts
             .claim
             .registered_activity_names
@@ -3628,7 +3741,6 @@ impl PostgresBackend {
                        and activity_name = any($3::text[])
                        and completed = false
                        and claim_token is null
-                       and (timeout_at_ms is null or timeout_at_ms > $4)
                        and (visible_at_ms is null or visible_at_ms <= $4)
                      order by activity_id asc
                      limit $5
@@ -3692,10 +3804,17 @@ impl PostgresBackend {
             .iter()
             .map(|token| i64::try_from(*token).unwrap_or(i64::MAX))
             .collect::<Vec<_>>();
-        // Tasks without explicit timeouts get the lease as an implicit
-        // heartbeat interval; explicit deadlines stay authoritative and the
-        // stored timeout_at_ms is untouched by the claim (-1 marks "none" in
-        // the unnest arrays).
+        // Start-to-close is measured from the claim, so each deadline is
+        // stamped here; tasks without explicit timeouts get the lease as an
+        // implicit heartbeat interval instead (-1 marks "none" in the unnest
+        // arrays).
+        let timeout_deadlines = tasks
+            .iter()
+            .map(|(_, task)| {
+                activity_timeout_at_ms_from(TimestampMs(now), task.start_to_close_timeout)
+                    .unwrap_or(-1)
+            })
+            .collect::<Vec<_>>();
         let implicit_heartbeats = tasks
             .iter()
             .map(|(_, task)| {
@@ -3723,15 +3842,17 @@ impl PostgresBackend {
             &format!(
                 "update {schema}.activity_tasks tasks
                  set claim_token = claimed.claim_token,
+                     timeout_at_ms = nullif(claimed.timeout_at_ms, -1),
                      heartbeat_deadline_at_ms = nullif(claimed.heartbeat_deadline_at_ms, -1),
                      implicit_heartbeat_ms = nullif(claimed.implicit_heartbeat_ms, -1)
-                 from unnest($1::text[], $2::bigint[], $3::bigint[], $4::bigint[])
-                      as claimed(activity_id, claim_token, heartbeat_deadline_at_ms, implicit_heartbeat_ms)
+                 from unnest($1::text[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[])
+                      as claimed(activity_id, claim_token, timeout_at_ms, heartbeat_deadline_at_ms, implicit_heartbeat_ms)
                  where tasks.activity_id = claimed.activity_id"
             ),
             &[
                 &activity_ids,
                 &token_values,
+                &timeout_deadlines,
                 &heartbeat_deadlines,
                 &implicit_heartbeats,
             ],
@@ -3742,7 +3863,7 @@ impl PostgresBackend {
 
         Ok(tasks
             .into_iter()
-            .zip(tokens.into_iter())
+            .zip(tokens)
             .map(|((activity_id, task), token)| ClaimedActivityTask {
                 task,
                 claim: ActivityTaskClaim {
@@ -3765,6 +3886,29 @@ impl PostgresBackend {
         .await
     }
 
+    /// A late call for an activity row that is gone: terminal cleanup deleted
+    /// it, so the activity is over, unless the id names a run this schema
+    /// never held.
+    async fn missing_activity_outcome(
+        tx: &Transaction<'_>,
+        schema: &str,
+        activity_id: &ActivityId,
+    ) -> Result<()> {
+        let run_id = crate::provider_util::activity_run_id(activity_id);
+        let known = tx
+            .query_opt(
+                &format!("select 1 from {schema}.workflow_instances where run_id = $1"),
+                &[&run_id.0],
+            )
+            .await
+            .map_err(postgres_error)?;
+        if known.is_some() {
+            Ok(())
+        } else {
+            Err(Error::RunNotFound(run_id))
+        }
+    }
+
     async fn heartbeat_activity_once(
         &self,
         req: ActivityHeartbeatRequest,
@@ -3785,8 +3929,7 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            // Activity rows exist until their run's terminal cleanup deletes
-            // them, so a missing row is a completed activity.
+            Self::missing_activity_outcome(&tx, &schema, &req.claim.activity_id).await?;
             tx.commit().await.map_err(postgres_error)?;
             return Ok(ActivityHeartbeatOutcome::AlreadyCompleted);
         };
@@ -3812,7 +3955,7 @@ impl PostgresBackend {
             ),
             &[
                 &activity_heartbeat_deadline_at_ms(
-                    TimestampMs(unix_epoch_millis()),
+                    TimestampMs(self.clock.now().0),
                     task.heartbeat_timeout,
                     implicit_heartbeat_ms,
                 ),
@@ -3921,8 +4064,11 @@ impl PostgresBackend {
 
         for (index, completion) in req.completions.iter().enumerate() {
             let Some(row) = locked.get(&completion.claim.activity_id.0) else {
-                // Missing row means the run's terminal cleanup deleted it.
-                result_slots[index] = Some(Ok(CompleteActivityOutcome::AlreadyCompleted));
+                result_slots[index] = Some(
+                    Self::missing_activity_outcome(&tx, &schema, &completion.claim.activity_id)
+                        .await
+                        .map(|()| CompleteActivityOutcome::AlreadyCompleted),
+                );
                 continue;
             };
             if row.completed {
@@ -4175,7 +4321,7 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            // Missing row means the run's terminal cleanup deleted it.
+            Self::missing_activity_outcome(tx, schema, &req.claim.activity_id).await?;
             return Ok(CompleteActivityOutcome::AlreadyCompleted);
         };
         let task_blob: Vec<u8> = row.get(0);
@@ -4191,12 +4337,12 @@ impl PostgresBackend {
             .map_err(|err| Error::PayloadDecode(err.to_string()))?;
         if let Some(map_item) = task.map_item.clone() {
             let result = self
-                .normalize_payload_for_storage_tx(&tx, req.result)
+                .normalize_payload_for_storage_tx(tx, req.result)
                 .await?;
             let outcome = complete_map_item_tx(
                 self,
-                &tx,
-                &schema,
+                tx,
+                schema,
                 task,
                 map_item,
                 result,
@@ -4206,7 +4352,7 @@ impl PostgresBackend {
             return Ok(outcome);
         }
         let result = self
-            .normalize_payload_for_storage_tx(&tx, req.result)
+            .normalize_payload_for_storage_tx(tx, req.result)
             .await?;
         let Some(run_row) = tx
             .query_opt(
@@ -4230,8 +4376,8 @@ impl PostgresBackend {
         }
         let event_id = tail.next();
         insert_history_event(
-            &tx,
-            &schema,
+            tx,
+            schema,
             &task.run_id,
             event_id,
             HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
@@ -4288,7 +4434,7 @@ impl PostgresBackend {
             .await
             .map_err(postgres_error)?
         else {
-            // Missing row means the run's terminal cleanup deleted it.
+            Self::missing_activity_outcome(&tx, &schema, &req.claim.activity_id).await?;
             tx.commit().await.map_err(postgres_error)?;
             return Ok(FailActivityOutcome::AlreadyCompleted);
         };
@@ -4304,7 +4450,7 @@ impl PostgresBackend {
         }
         let task: ActivityTask = rmp_serde::from_slice(&task_blob)
             .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-        let decision = activity_failure_decision(&task, req.failure.non_retryable);
+        let decision = activity_failure_decision(&task, &req.failure);
 
         // Map items take the engine route for *both* verdicts: a retry of an
         // item whose map already ended must not reschedule anything, and only
@@ -4319,7 +4465,7 @@ impl PostgresBackend {
             } else {
                 req.failure
             };
-            let now = TimestampMs(unix_epoch_millis());
+            let now = TimestampMs(self.clock.now().0);
             let outcome = fail_map_item_tx(
                 self,
                 &tx,
@@ -4356,33 +4502,29 @@ impl PostgresBackend {
             let retry_blob = rmp_serde::to_vec_named(&retry_task)
                 .map_err(|err| Error::PayloadEncode(err.to_string()))?;
             // The retry backoff delays visibility; the start-to-close clock
-            // restarts at the visibility instant so the timeout scanner
-            // cannot fire on a task that was never claimable.
-            let now = TimestampMs(unix_epoch_millis());
+            // starts at the retry's next claim.
+            let now = TimestampMs(self.clock.now().0);
             let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
-            let visible_from = visible_at_ms.map(TimestampMs).unwrap_or(now);
             tx.execute(
                 &format!(
                     "update {schema}.activity_tasks
                      set task = $1,
                          claim_token = null,
-                         timeout_at_ms = $2,
+                         timeout_at_ms = null,
                          heartbeat_deadline_at_ms = null,
                          implicit_heartbeat_ms = null,
-                         visible_at_ms = $3
-                     where activity_id = $4"
+                         visible_at_ms = $2
+                     where activity_id = $3"
                 ),
-                &[
-                    &retry_blob,
-                    &activity_timeout_at_ms_from(visible_from, retry_task.start_to_close_timeout),
-                    &visible_at_ms,
-                    &req.claim.activity_id.0,
-                ],
+                &[&retry_blob, &visible_at_ms, &req.claim.activity_id.0],
             )
             .await
             .map_err(postgres_error)?;
             tx.commit().await.map_err(postgres_error)?;
-            return Ok(FailActivityOutcome::RetryScheduled { next_attempt });
+            return Ok(FailActivityOutcome::RetryScheduled {
+                next_attempt,
+                ready_at: visible_at_ms.map(TimestampMs).unwrap_or(now),
+            });
         }
 
         let failure = self
@@ -4464,7 +4606,23 @@ impl PostgresBackend {
                 .map_err(postgres_error)?
         };
         let Some(row) = row else {
-            return Ok(QueryProjectionOutcome::NotFound);
+            let client = self.client().await?;
+            let exists = client
+                .query_opt(
+                    &format!(
+                        "select 1 from {schema}.workflow_instances
+                         where namespace = $1 and workflow_id = $2"
+                    ),
+                    &[&req.namespace.0, &req.workflow_id.0],
+                )
+                .await
+                .map_err(postgres_error)?
+                .is_some();
+            return Ok(if exists {
+                QueryProjectionOutcome::NoProjection
+            } else {
+                QueryProjectionOutcome::NotFound
+            });
         };
         let payload_blob: Vec<u8> = row.get(2);
         let payload: PayloadRef = rmp_serde::from_slice(&payload_blob)
@@ -4565,7 +4723,7 @@ impl PostgresBackend {
         // delete's timestamp predicate re-evaluates under the row lock the
         // reusing commit's `on conflict do update` touch takes, so a blob
         // touched between the scan and the delete survives.
-        let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
+        let cutoff = payload_gc_cutoff_ms(self.clock.now().0, req.min_age);
         let rows = tx
             .query(
                 &format!(
@@ -4662,8 +4820,12 @@ impl PostgresBackend {
             let task: ActivityMapTask = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
             roots.push(PayloadRootRef::ActivityMapInputManifest(
-                self.activity_map_input_root_for_roots_tx(tx, task.input_manifest)
-                    .await?,
+                self.hydrate_manifest_root_tx(
+                    tx,
+                    ManifestKind::ActivityMapInput,
+                    task.input_manifest,
+                )
+                .await?,
             ));
         }
 
@@ -4699,8 +4861,12 @@ impl PostgresBackend {
             let task: ChildWorkflowMapTask = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
             roots.push(PayloadRootRef::ActivityMapInputManifest(
-                self.activity_map_input_root_for_roots_tx(tx, task.input_manifest)
-                    .await?,
+                self.hydrate_manifest_root_tx(
+                    tx,
+                    ManifestKind::ActivityMapInput,
+                    task.input_manifest,
+                )
+                .await?,
             ));
         }
 
@@ -4719,7 +4885,9 @@ impl PostgresBackend {
             let blob: Vec<u8> = row.get(0);
             let outcome: ChildWorkflowMapItemOutcome = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            collect_child_workflow_map_outcome_payload_roots(&outcome, &mut roots);
+            if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+                roots.push(PayloadRootRef::Payload(payload.clone()));
+            }
         }
 
         let rows = tx
@@ -4806,8 +4974,13 @@ impl PostgresBackend {
             let blob: Vec<u8> = row.get(0);
             let task: ActivityMapTask = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            self.collect_activity_map_input_manifest_ref_tx(tx, &task.input_manifest, reachable)
-                .await?;
+            self.collect_manifest_refs_tx(
+                tx,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+                reachable,
+            )
+            .await?;
         }
 
         let rows = tx
@@ -4842,8 +5015,13 @@ impl PostgresBackend {
             let blob: Vec<u8> = row.get(0);
             let task: ChildWorkflowMapTask = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            self.collect_activity_map_input_manifest_ref_tx(tx, &task.input_manifest, reachable)
-                .await?;
+            self.collect_manifest_refs_tx(
+                tx,
+                ManifestKind::ActivityMapInput,
+                &task.input_manifest,
+                reachable,
+            )
+            .await?;
         }
 
         let rows = tx
@@ -4861,8 +5039,10 @@ impl PostgresBackend {
             let blob: Vec<u8> = row.get(0);
             let outcome: ChildWorkflowMapItemOutcome = rmp_serde::from_slice(&blob)
                 .map_err(|err| Error::PayloadDecode(err.to_string()))?;
-            self.collect_child_workflow_map_outcome_payload_blobs_tx(tx, &outcome, reachable)
-                .await?;
+            if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(&outcome) {
+                self.collect_payload_blob_ref_tx(tx, payload, reachable)
+                    .await?;
+            }
         }
 
         let rows = tx
@@ -4908,87 +5088,71 @@ impl PostgresBackend {
         data: &HistoryEventData,
         roots: &mut Vec<PayloadRootRef>,
     ) -> Result<()> {
-        match data {
-            HistoryEventData::WorkflowStarted { input, .. }
-            | HistoryEventData::WorkflowContinuedAsNew { input } => {
-                roots.push(PayloadRootRef::Payload(input.clone()));
+        let mut slots = Vec::new();
+        crate::payload::history_event_payload_slots(data, &mut |slot| slots.push(slot))?;
+        for slot in slots {
+            match slot {
+                PayloadSlot::Payload(payload) => {
+                    roots.push(PayloadRootRef::Payload(payload.clone()));
+                }
+                PayloadSlot::Manifest(kind, manifest) => {
+                    let hydrated = self
+                        .hydrate_manifest_root_tx(tx, kind, manifest.clone())
+                        .await?;
+                    roots.push(kind.root(hydrated));
+                }
             }
-            HistoryEventData::WorkflowCompleted { result } => {
-                roots.push(PayloadRootRef::Payload(result.clone()));
+        }
+        Ok(())
+    }
+
+    /// A manifest root with its bytes in place when this provider holds them.
+    async fn hydrate_manifest_root_tx(
+        &self,
+        tx: &Transaction<'_>,
+        kind: ManifestKind,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        if is_external_payload_ref(&payload) {
+            return Ok(payload);
+        }
+        match kind {
+            ManifestKind::ActivityMapInput => {
+                self.hydrate_activity_map_input_manifest_from_storage_tx(tx, payload)
+                    .await
             }
-            HistoryEventData::WorkflowFailed { failure } => {
-                collect_failure_payload_roots(failure, roots);
+            ManifestKind::ActivityMapResult => {
+                self.hydrate_activity_map_result_manifest_from_storage_tx(tx, payload)
+                    .await
             }
-            HistoryEventData::ActivityScheduled(scheduled) => {
-                roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
+            ManifestKind::ChildWorkflowMapResult => {
+                self.hydrate_child_workflow_map_result_manifest_from_storage_tx(tx, payload)
+                    .await
             }
-            HistoryEventData::ActivityMapScheduled(scheduled) => {
-                roots.push(PayloadRootRef::ActivityMapInputManifest(
-                    self.activity_map_input_root_for_roots_tx(tx, scheduled.input_manifest.clone())
-                        .await?,
-                ));
+        }
+    }
+
+    /// Marks every ref a manifest reaches, the manifest and its pages
+    /// included, loading the containers this provider holds.
+    async fn collect_manifest_refs_tx(
+        &self,
+        tx: &Transaction<'_>,
+        kind: ManifestKind,
+        payload: &PayloadRef,
+        reachable: &mut BTreeSet<String>,
+    ) -> Result<()> {
+        let mut walk = ManifestWalk::new(kind, payload.clone());
+        while let Some(container) = walk.next_container() {
+            if is_external_payload_ref(&container) {
+                walk.skip();
+                continue;
             }
-            HistoryEventData::ActivityMapCompleted(completed) => {
-                roots.push(PayloadRootRef::ActivityMapResultManifest(
-                    self.activity_map_result_root_for_roots_tx(
-                        tx,
-                        completed.result_manifest.clone(),
-                    )
-                    .await?,
-                ));
-            }
-            HistoryEventData::ActivityMapFailed(failed) => {
-                collect_failure_payload_roots(&failed.failure, roots);
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-                roots.push(PayloadRootRef::ActivityMapInputManifest(
-                    self.activity_map_input_root_for_roots_tx(tx, scheduled.input_manifest.clone())
-                        .await?,
-                ));
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-                roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
-                    self.child_workflow_map_result_root_for_roots_tx(
-                        tx,
-                        completed.result_manifest.clone(),
-                    )
-                    .await?,
-                ));
-            }
-            HistoryEventData::ChildWorkflowMapFailed(failed) => {
-                collect_failure_payload_roots(&failed.failure, roots);
-            }
-            HistoryEventData::ActivityCompleted(completed) => {
-                roots.push(PayloadRootRef::Payload(completed.result.clone()));
-            }
-            HistoryEventData::ActivityFailed(failed) => {
-                collect_failure_payload_roots(&failed.failure, roots);
-            }
-            HistoryEventData::ChildWorkflowStartRequested(requested) => {
-                roots.push(PayloadRootRef::Payload(requested.input.clone()));
-            }
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                roots.push(PayloadRootRef::Payload(completed.result.clone()));
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => {
-                collect_failure_payload_roots(&failed.failure, roots);
-            }
-            HistoryEventData::SignalConsumed(signal) => {
-                roots.push(PayloadRootRef::Payload(signal.payload.clone()));
-            }
-            HistoryEventData::SideEffectMarker(marker) => {
-                crate::payload::validate_side_effect_marker(marker)?;
-            }
-            HistoryEventData::WorkflowCancelled { .. }
-            | HistoryEventData::WorkflowTaskStarted
-            | HistoryEventData::ActivityTimedOut(_)
-            | HistoryEventData::ChildWorkflowStarted(_)
-            | HistoryEventData::ChildWorkflowCancelled(_)
-            | HistoryEventData::TimerStarted(_)
-            | HistoryEventData::TimerFired(_)
-            | HistoryEventData::SelectWinner(_)
-            | HistoryEventData::VersionMarker(_)
-            | HistoryEventData::DeprecatedPatchMarker(_) => {}
+            let hydrated = self.hydrate_payload_from_storage_tx(tx, container).await?;
+            walk.provide(&hydrated)?;
+        }
+        for payload in walk.into_refs() {
+            self.collect_payload_blob_ref_tx(tx, &payload, reachable)
+                .await?;
         }
         Ok(())
     }
@@ -4999,112 +5163,19 @@ impl PostgresBackend {
         data: &HistoryEventData,
         reachable: &mut BTreeSet<String>,
     ) -> Result<()> {
-        match data {
-            HistoryEventData::WorkflowStarted { input, .. }
-            | HistoryEventData::WorkflowContinuedAsNew { input } => {
-                self.collect_payload_blob_ref_tx(tx, input, reachable).await
+        let mut slots = Vec::new();
+        crate::payload::history_event_payload_slots(data, &mut |slot| slots.push(slot))?;
+        for slot in slots {
+            match slot {
+                PayloadSlot::Payload(payload) => {
+                    self.collect_payload_blob_ref_tx(tx, payload, reachable)
+                        .await?;
+                }
+                PayloadSlot::Manifest(kind, manifest) => {
+                    self.collect_manifest_refs_tx(tx, kind, manifest, reachable)
+                        .await?;
+                }
             }
-            HistoryEventData::WorkflowCompleted { result } => {
-                self.collect_payload_blob_ref_tx(tx, result, reachable)
-                    .await
-            }
-            HistoryEventData::WorkflowFailed { failure } => {
-                self.collect_failure_payload_blobs_tx(tx, failure, reachable)
-                    .await
-            }
-            HistoryEventData::ActivityScheduled(scheduled) => {
-                self.collect_payload_blob_ref_tx(tx, &scheduled.input, reachable)
-                    .await
-            }
-            HistoryEventData::ActivityMapScheduled(scheduled) => {
-                self.collect_activity_map_input_manifest_ref_tx(
-                    tx,
-                    &scheduled.input_manifest,
-                    reachable,
-                )
-                .await
-            }
-            HistoryEventData::ActivityMapCompleted(completed) => {
-                self.collect_activity_map_result_manifest_ref_tx(
-                    tx,
-                    &completed.result_manifest,
-                    reachable,
-                )
-                .await
-            }
-            HistoryEventData::ActivityMapFailed(failed) => {
-                self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
-                    .await
-            }
-            HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-                self.collect_activity_map_input_manifest_ref_tx(
-                    tx,
-                    &scheduled.input_manifest,
-                    reachable,
-                )
-                .await
-            }
-            HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-                self.collect_child_workflow_map_result_manifest_ref_tx(
-                    tx,
-                    &completed.result_manifest,
-                    reachable,
-                )
-                .await
-            }
-            HistoryEventData::ChildWorkflowMapFailed(failed) => {
-                self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
-                    .await
-            }
-            HistoryEventData::ActivityCompleted(completed) => {
-                self.collect_payload_blob_ref_tx(tx, &completed.result, reachable)
-                    .await
-            }
-            HistoryEventData::ActivityFailed(failed) => {
-                self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
-                    .await
-            }
-            HistoryEventData::ChildWorkflowStartRequested(requested) => {
-                self.collect_payload_blob_ref_tx(tx, &requested.input, reachable)
-                    .await
-            }
-            HistoryEventData::ChildWorkflowCompleted(completed) => {
-                self.collect_payload_blob_ref_tx(tx, &completed.result, reachable)
-                    .await
-            }
-            HistoryEventData::ChildWorkflowFailed(failed) => {
-                self.collect_failure_payload_blobs_tx(tx, &failed.failure, reachable)
-                    .await
-            }
-            HistoryEventData::SignalConsumed(signal) => {
-                self.collect_payload_blob_ref_tx(tx, &signal.payload, reachable)
-                    .await
-            }
-            HistoryEventData::SideEffectMarker(marker) => {
-                crate::payload::validate_side_effect_marker(marker)
-            }
-            HistoryEventData::WorkflowCancelled { .. }
-            | HistoryEventData::WorkflowTaskStarted
-            | HistoryEventData::ActivityTimedOut(_)
-            | HistoryEventData::ChildWorkflowStarted(_)
-            | HistoryEventData::ChildWorkflowCancelled(_)
-            | HistoryEventData::TimerStarted(_)
-            | HistoryEventData::TimerFired(_)
-            | HistoryEventData::SelectWinner(_)
-            | HistoryEventData::VersionMarker(_)
-            | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
-        }
-    }
-
-    async fn collect_failure_payload_blobs_tx(
-        &self,
-        tx: &Transaction<'_>,
-        failure: &DurableFailure,
-        reachable: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        if let Some(details) = &failure.details {
-            self.collect_payload_blob_ref_tx(tx, details, reachable)
-                .await?;
         }
         Ok(())
     }
@@ -5122,165 +5193,6 @@ impl PostgresBackend {
             self.load_payload_blob_tx(tx, payload, false).await?;
         }
         reachable.insert(digest.clone());
-        Ok(())
-    }
-
-    async fn activity_map_input_root_for_roots_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: PayloadRef,
-    ) -> Result<PayloadRef> {
-        if is_external_payload_ref(&payload) {
-            return Ok(payload);
-        }
-        self.hydrate_activity_map_input_manifest_from_storage_tx(tx, payload)
-            .await
-    }
-
-    async fn activity_map_result_root_for_roots_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: PayloadRef,
-    ) -> Result<PayloadRef> {
-        if is_external_payload_ref(&payload) {
-            return Ok(payload);
-        }
-        self.hydrate_activity_map_result_manifest_from_storage_tx(tx, payload)
-            .await
-    }
-
-    async fn child_workflow_map_result_root_for_roots_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: PayloadRef,
-    ) -> Result<PayloadRef> {
-        if is_external_payload_ref(&payload) {
-            return Ok(payload);
-        }
-        self.hydrate_child_workflow_map_result_manifest_from_storage_tx(tx, payload)
-            .await
-    }
-
-    async fn collect_activity_map_input_manifest_ref_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: &PayloadRef,
-        reachable: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        self.collect_payload_blob_ref_tx(tx, payload, reachable)
-            .await?;
-        if is_external_payload_ref(payload) {
-            return Ok(());
-        }
-        let manifest_payload = self
-            .hydrate_payload_from_storage_tx(tx, payload.clone())
-            .await?;
-        let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
-        for page in manifest.pages {
-            self.collect_payload_blob_ref_tx(tx, &page, reachable)
-                .await?;
-            if is_external_payload_ref(&page) {
-                continue;
-            }
-            let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
-            let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
-            for item in page.items {
-                self.collect_payload_blob_ref_tx(tx, &item, reachable)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn collect_activity_map_result_manifest_ref_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: &PayloadRef,
-        reachable: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        self.collect_payload_blob_ref_tx(tx, payload, reachable)
-            .await?;
-        if is_external_payload_ref(payload) {
-            return Ok(());
-        }
-        let manifest_payload = self
-            .hydrate_payload_from_storage_tx(tx, payload.clone())
-            .await?;
-        let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
-        for page in manifest.pages {
-            self.collect_payload_blob_ref_tx(tx, &page, reachable)
-                .await?;
-            if is_external_payload_ref(&page) {
-                continue;
-            }
-            let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
-            let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
-            for result in page.results {
-                self.collect_payload_blob_ref_tx(tx, &result, reachable)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn collect_child_workflow_map_result_manifest_ref_tx(
-        &self,
-        tx: &Transaction<'_>,
-        payload: &PayloadRef,
-        reachable: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        self.collect_payload_blob_ref_tx(tx, payload, reachable)
-            .await?;
-        if is_external_payload_ref(payload) {
-            return Ok(());
-        }
-        let manifest_payload = self
-            .hydrate_payload_from_storage_tx(tx, payload.clone())
-            .await?;
-        let manifest: crate::ChildWorkflowMapResultManifest =
-            crate::decode_payload(&manifest_payload)?;
-        for page in manifest.pages {
-            self.collect_payload_blob_ref_tx(tx, &page, reachable)
-                .await?;
-            if is_external_payload_ref(&page) {
-                continue;
-            }
-            let page_payload = self.hydrate_payload_from_storage_tx(tx, page).await?;
-            let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
-            for outcome in page.outcomes {
-                match outcome {
-                    crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                        self.collect_payload_blob_ref_tx(tx, &result, reachable)
-                            .await?;
-                    }
-                    crate::ChildWorkflowMapItemOutcome::Failed { failure } => {
-                        self.collect_failure_payload_blobs_tx(tx, &failure, reachable)
-                            .await?;
-                    }
-                    crate::ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn collect_child_workflow_map_outcome_payload_blobs_tx(
-        &self,
-        tx: &Transaction<'_>,
-        outcome: &ChildWorkflowMapItemOutcome,
-        reachable: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        match outcome {
-            ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                self.collect_payload_blob_ref_tx(tx, result, reachable)
-                    .await?;
-            }
-            ChildWorkflowMapItemOutcome::Failed { failure } => {
-                self.collect_failure_payload_blobs_tx(tx, failure, reachable)
-                    .await?;
-            }
-            ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-        }
         Ok(())
     }
 
@@ -5323,7 +5235,7 @@ impl PostgresBackend {
                         &encryption_blob,
                         &i64::try_from(size).unwrap_or(i64::MAX),
                         &bytes,
-                        &unix_epoch_millis(),
+                        &self.clock.now().0,
                     ],
                 )
                 .await
@@ -6609,18 +6521,24 @@ async fn cancel_command_operational_state_tx(
     Ok(())
 }
 
-/// Postgres half of `sqlite::publish_commit_tail_before_map_append`; see there
-/// for why this is conditional on the engine's completion predicate rather than
-/// on a map merely being scheduled.
+/// Publishes the tail this commit has reached so far before a map is stepped.
+///
+/// A map terminal fact produced during the scheduling commit goes through
+/// [`append_map_terminal_event_tx`], which reads the run's tail from
+/// `workflow_instances.current_event_id`, a column this commit otherwise
+/// writes only at its end. Without this the fact would reuse an event id the
+/// commit already inserted and fail on the history primary key. Unlike the
+/// SQLite provider, which starts a map's children after its tail update, this
+/// provider starts them inside the step, and an item whose id collides fails
+/// the map right there, so every scheduled map publishes, once per commit.
 async fn publish_commit_tail_before_map_append_tx(
     tx: &Transaction<'_>,
     schema: &str,
     run_id: &RunId,
     tail: EventId,
-    state: &MapState,
     published: &mut bool,
 ) -> Result<()> {
-    if *published || state.recorded_outcomes < state.item_count {
+    if *published {
         return Ok(());
     }
     tx.execute(
@@ -6941,7 +6859,6 @@ async fn insert_activity_task_rows_for_simple_commits_tx(
     let mut activity_names = Vec::new();
     let mut task_queues = Vec::new();
     let mut task_blobs = Vec::new();
-    let mut timeout_at_ms = Vec::new();
     for commit in commits {
         for task in &commit.schedule_activities {
             activity_ids.push(task.activity_id.0.clone());
@@ -6953,7 +6870,6 @@ async fn insert_activity_task_rows_for_simple_commits_tx(
                 rmp_serde::to_vec_named(task)
                     .map_err(|err| Error::PayloadEncode(err.to_string()))?,
             );
-            timeout_at_ms.push(activity_timeout_at_ms(task.start_to_close_timeout));
         }
     }
     if activity_ids.is_empty() {
@@ -6965,11 +6881,10 @@ async fn insert_activity_task_rows_for_simple_commits_tx(
              (activity_id, namespace, run_id, activity_name, task_queue, task,
               claim_token, completed, timeout_at_ms, heartbeat_deadline_at_ms)
              select activity_id, namespace, run_id, activity_name, task_queue, task,
-                    null, false, timeout_at_ms, null
+                    null, false, null, null
              from unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
-                         $6::bytea[], $7::bigint[])
-                  as task_rows(activity_id, namespace, run_id, activity_name, task_queue, task,
-                               timeout_at_ms)"
+                         $6::bytea[])
+                  as task_rows(activity_id, namespace, run_id, activity_name, task_queue, task)"
         ),
         &[
             &activity_ids,
@@ -6978,7 +6893,6 @@ async fn insert_activity_task_rows_for_simple_commits_tx(
             &activity_names,
             &task_queues,
             &task_blobs,
-            &timeout_at_ms,
         ],
     )
     .await
@@ -7000,6 +6914,10 @@ async fn upsert_wait_rows_for_simple_commits_tx(
     let mut ready_at_ms = Vec::new();
     for commit in commits {
         for wait in &commit.upsert_waits {
+            // Fenced to the claimed run, as in the scalar path.
+            if wait.run_id != commit.claim.run_id {
+                continue;
+            }
             wait_ids.push(wait.wait_id.0.clone());
             namespaces.push(commit.namespace.clone());
             run_ids.push(wait.run_id.0.clone());
@@ -7049,21 +6967,25 @@ async fn mark_signal_rows_consumed_for_simple_commits_tx(
     schema: &str,
     commits: &[PreparedSimpleWorkflowCommit],
 ) -> Result<()> {
-    let signal_ids = commits
-        .iter()
-        .flat_map(|commit| {
-            commit
-                .consume_signals
-                .iter()
-                .map(|signal_id| signal_id.0.clone())
-        })
-        .collect::<Vec<_>>();
+    let mut signal_ids = Vec::new();
+    let mut run_ids = Vec::new();
+    for commit in commits {
+        for signal_id in &commit.consume_signals {
+            signal_ids.push(signal_id.0.clone());
+            run_ids.push(commit.claim.run_id.0.clone());
+        }
+    }
     if signal_ids.is_empty() {
         return Ok(());
     }
+    // Fenced to each item's claimed run, as in the scalar path.
     tx.execute(
-        &format!("update {schema}.signals set consumed = true where signal_id = any($1::text[])"),
-        &[&signal_ids],
+        &format!(
+            "update {schema}.signals as signals set consumed = true
+             from unnest($1::text[], $2::text[]) as fence(signal_id, run_id)
+             where signals.signal_id = fence.signal_id and signals.run_id = fence.run_id"
+        ),
+        &[&signal_ids, &run_ids],
     )
     .await
     .map_err(postgres_error)?;
@@ -7075,16 +6997,24 @@ async fn delete_wait_rows_for_simple_commits_tx(
     schema: &str,
     commits: &[PreparedSimpleWorkflowCommit],
 ) -> Result<()> {
-    let wait_ids = commits
-        .iter()
-        .flat_map(|commit| commit.delete_waits.iter().map(|wait_id| wait_id.0.clone()))
-        .collect::<Vec<_>>();
+    let mut wait_ids = Vec::new();
+    let mut run_ids = Vec::new();
+    for commit in commits {
+        for wait_id in &commit.delete_waits {
+            wait_ids.push(wait_id.0.clone());
+            run_ids.push(commit.claim.run_id.0.clone());
+        }
+    }
     if wait_ids.is_empty() {
         return Ok(());
     }
     tx.execute(
-        &format!("delete from {schema}.active_waits where wait_id = any($1::text[])"),
-        &[&wait_ids],
+        &format!(
+            "delete from {schema}.active_waits as waits
+             using unnest($1::text[], $2::text[]) as fence(wait_id, run_id)
+             where waits.wait_id = fence.wait_id and waits.run_id = fence.run_id"
+        ),
+        &[&wait_ids, &run_ids],
     )
     .await
     .map_err(postgres_error)?;
@@ -7398,7 +7328,7 @@ async fn start_child_workflow_inline_tx(
     Ok(InlineChildStartOutcome::Failed(
         DurableFailure::non_retryable(
             "durust.child_workflow_id_conflict",
-            format!("workflow id `{}` is already started", message.workflow_id),
+            format!("child workflow id already exists: {}", message.workflow_id),
         ),
     ))
 }
@@ -7866,7 +7796,7 @@ async fn insert_map_item_batch_tx(
                     &map_command_id.run_id.0,
                     &map_task.activity_name.0,
                     &map_task.task_queue.0,
-                    &activity_timeout_at_ms(map_task.start_to_close_timeout),
+                    &None::<i64>,
                     &activity_ids,
                     &task_blobs,
                 ],
@@ -7913,6 +7843,12 @@ async fn insert_map_item_batch_tx(
                     InlineChildStartOutcome::Started(_) => {}
                     InlineChildStartOutcome::Failed(failure) => {
                         conflicts.push((item_ordinal, failure));
+                        // A fail-fast map ends at its first collision, so the
+                        // ordinals after it never start; the memory and SQLite
+                        // providers stop their dispatch the same way.
+                        if map_task.failure_mode == crate::ChildWorkflowMapFailureMode::FailFast {
+                            break;
+                        }
                     }
                     // Materialization has already taken this ordinal's slot
                     // (D7), so ignoring the outcome would leave an ordinal with
@@ -7939,7 +7875,7 @@ async fn schedule_map_item_retry_tx(
     ordinal: u64,
     next_attempt: u32,
     visible_at_ms: Option<i64>,
-    timeout_at_ms: Option<i64>,
+    _timeout_at_ms: Option<i64>,
 ) -> Result<()> {
     let activity_id = ActivityId::map_item(map_command_id, ordinal);
     let Some(row) = tx
@@ -7964,12 +7900,12 @@ async fn schedule_map_item_retry_tx(
              set task = $1,
                  claim_token = null,
                  visible_at_ms = $2,
-                 timeout_at_ms = $3,
+                 timeout_at_ms = null,
                  heartbeat_deadline_at_ms = null,
                  implicit_heartbeat_ms = null
-             where activity_id = $4"
+             where activity_id = $3"
         ),
-        &[&task_blob, &visible_at_ms, &timeout_at_ms, &activity_id.0],
+        &[&task_blob, &visible_at_ms, &activity_id.0],
     )
     .await
     .map_err(postgres_error)?;
@@ -8561,9 +8497,18 @@ async fn fail_map_item_tx(
     )
     .await?;
     match (decision, appended) {
-        (ItemRetryDecision::Retry { next_attempt }, _) => {
-            Ok(FailActivityOutcome::RetryScheduled { next_attempt })
-        }
+        // A timed-out attempt retries at once; a failed one waits out the
+        // policy's backoff, as `MapEffect::ScheduleItemRetry` schedules them.
+        (ItemRetryDecision::Retry { next_attempt }, _) => Ok(FailActivityOutcome::RetryScheduled {
+            next_attempt,
+            ready_at: if kind == ItemAttemptFailureKind::TimedOut {
+                now
+            } else {
+                retry_visible_at_ms(&task.retry_policy, task.attempt, now)
+                    .map(TimestampMs)
+                    .unwrap_or(now)
+            },
+        }),
         (ItemRetryDecision::Exhausted, Some(event_id)) => {
             Ok(FailActivityOutcome::Failed { event_id })
         }
@@ -8845,9 +8790,10 @@ async fn timeout_activity_tx(
     }
 
     if let ActivityFailureDecision::Retry { next_attempt } = decision {
-        // Timeout retries carry no backoff: the expired deadline already
-        // paced this attempt, and delaying crash recovery further would only
-        // add latency.
+        // The stored policy paces a timed-out attempt's retry the way it paces
+        // a failed one, and the start-to-close clock restarts when the retry
+        // becomes visible.
+        let visible_at_ms = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
         let mut retry_task = task.clone();
         retry_task.attempt = next_attempt;
         let retry_blob = rmp_serde::to_vec_named(&retry_task)
@@ -8857,17 +8803,13 @@ async fn timeout_activity_tx(
                 "update {schema}.activity_tasks
                  set task = $1,
                      claim_token = null,
-                     timeout_at_ms = $2,
+                     timeout_at_ms = null,
                      heartbeat_deadline_at_ms = null,
                      implicit_heartbeat_ms = null,
-                     visible_at_ms = null
+                     visible_at_ms = $2
                  where activity_id = $3"
             ),
-            &[
-                &retry_blob,
-                &activity_timeout_at_ms_from(now, retry_task.start_to_close_timeout),
-                &activity_id.0,
-            ],
+            &[&retry_blob, &visible_at_ms, &activity_id.0],
         )
         .await
         .map_err(postgres_error)?;
@@ -9068,12 +9010,7 @@ fn is_external_payload_ref(payload: &PayloadRef) -> bool {
     matches!(payload, PayloadRef::Blob { uri, .. } if !is_postgres_payload_uri(uri))
 }
 
-fn collect_failure_payload_roots(failure: &DurableFailure, roots: &mut Vec<PayloadRootRef>) {
-    if let Some(details) = &failure.details {
-        roots.push(PayloadRootRef::Payload(details.clone()));
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn decode_payload_blob_row(
     _payload: &PayloadRef,
     row_codec: String,
@@ -9190,21 +9127,6 @@ impl crate::payload::PayloadRewrite for PostgresHydrateRewriter<'_> {
 
 fn map_command_key(command_id: &CommandId) -> String {
     format!("{}:{}", command_id.run_id, command_id.seq.0)
-}
-
-fn collect_child_workflow_map_outcome_payload_roots(
-    outcome: &ChildWorkflowMapItemOutcome,
-    roots: &mut Vec<PayloadRootRef>,
-) {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
-        }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_roots(failure, roots);
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-    }
 }
 
 #[cfg(test)]

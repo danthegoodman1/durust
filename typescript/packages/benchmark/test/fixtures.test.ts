@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   compareBenchmarkToBaseline,
+  parseBenchmarkOptions,
+  runBenchmark,
   type BenchmarkBaseline,
   type BenchmarkResult,
   type BenchmarkThresholdComparison
@@ -211,3 +213,47 @@ function loadFixture(): BenchmarkContractFixture {
   const fixtureUrl = new URL("../../../fixtures/contract/benchmark-output.json", import.meta.url);
   return JSON.parse(readFileSync(fixtureUrl, "utf8")) as BenchmarkContractFixture;
 }
+
+/**
+ * Every key a runner emits, at every object level, must be in the fixture's
+ * result for its runtime, so a field added on one runtime is added to the
+ * vocabulary both runtimes read. The Rust twin is
+ * `benchtools`' `memory_mixed_workload_completes`.
+ */
+function keysMissingFrom(emitted: unknown, fixture: unknown, path: string, missing: string[]): void {
+  if (emitted === null || typeof emitted !== "object" || Array.isArray(emitted)) {
+    return;
+  }
+  if (fixture === null || typeof fixture !== "object" || Array.isArray(fixture)) {
+    return;
+  }
+  for (const [key, value] of Object.entries(emitted)) {
+    if (!(key in fixture)) {
+      missing.push(`${path}.${key}`);
+      continue;
+    }
+    const expected = (fixture as Record<string, unknown>)[key];
+    // `operations` is keyed by operation name; every entry shares one shape,
+    // which any fixture entry pins.
+    if (key === "operations" && expected !== null && typeof expected === "object") {
+      const sample = Object.values(expected as Record<string, unknown>)[0];
+      for (const [name, entry] of Object.entries((value ?? {}) as Record<string, unknown>)) {
+        keysMissingFrom(entry, sample, `${path}.${key}.${name}`, missing);
+      }
+      continue;
+    }
+    keysMissingFrom(value, expected, `${path}.${key}`, missing);
+  }
+}
+
+describe("benchmark output vocabulary", () => {
+  it("emits no key the shared fixture lacks", async () => {
+    const fixture = loadFixture();
+    const result = await runBenchmark({
+      ...parseBenchmarkOptions(["--backend", "memory", "--mode", "mixed", "--workflows", "2", "--workers", "1"])
+    });
+    const missing: string[] = [];
+    keysMissingFrom(result, fixture.typescriptResult, "typescriptResult", missing);
+    expect(missing, "keys absent from typescript/fixtures/contract/benchmark-output.json").toEqual([]);
+  });
+});

@@ -178,10 +178,10 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
 
     /// Blocks until work may be claimable for the given queues or `max_wait`
     /// elapses. The default is a plain bounded sleep, so polling drivers work
-    /// against every provider; providers with a push channel (in-memory
-    /// notify, Postgres LISTEN/NOTIFY) override this to wake waiters as soon
-    /// as work is created. Spurious wakeups are allowed; callers must
-    /// re-check for work after every return.
+    /// against every provider; the memory provider overrides it with its
+    /// in-process notify, and the SQL providers keep the sleep. Spurious
+    /// wakeups are allowed; callers must re-check for work after every
+    /// return.
     fn wait_for_ready(&self, req: WaitForReadyRequest) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
             tokio::time::sleep(req.max_wait).await;
@@ -332,7 +332,7 @@ pub struct ClaimWorkflowTasksOptions {
     pub shard_filter: Option<Vec<ShardId>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorkflowTaskReason {
     WorkflowStarted,
     ActivityCompleted,
@@ -351,22 +351,56 @@ pub enum WorkflowTaskReason {
     CacheEvicted,
 }
 
+/// Hands a claimed workflow task back without committing. The run keeps
+/// the wake reason it was claimed with, so the next claim reports what a
+/// fresh claim would have; `delay` hides the run for that long.
 #[derive(Clone, Debug)]
 pub struct WorkflowTaskRelease {
-    pub reason: WorkflowTaskReason,
     pub delay: Duration,
 }
 
 impl WorkflowTaskRelease {
-    pub fn immediate(reason: WorkflowTaskReason) -> Self {
+    pub fn immediate() -> Self {
         Self {
-            reason,
             delay: Duration::ZERO,
         }
     }
 
-    pub fn delayed(reason: WorkflowTaskReason, delay: Duration) -> Self {
-        Self { reason, delay }
+    pub fn delayed(delay: Duration) -> Self {
+        Self { delay }
+    }
+}
+
+/// The clock a provider reads for leases, deadlines, and `current_time`.
+/// `System` is the wall clock; `Manual` is driven by the caller and only
+/// moves forward, which lets a test or an embedding host set the time every
+/// provider decision is made against.
+#[derive(Clone, Debug)]
+pub enum ProviderClock {
+    System,
+    Manual(std::sync::Arc<std::sync::atomic::AtomicI64>),
+}
+
+impl ProviderClock {
+    pub fn manual(start: TimestampMs) -> Self {
+        Self::Manual(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(
+            start.0,
+        )))
+    }
+
+    pub fn now(&self) -> TimestampMs {
+        match self {
+            Self::System => TimestampMs(crate::provider_util::unix_epoch_millis()),
+            Self::Manual(clock) => TimestampMs(clock.load(std::sync::atomic::Ordering::Relaxed)),
+        }
+    }
+
+    /// Moves a manual clock forward to `now`; an earlier reading leaves it
+    /// where it is, and the system clock ignores the call.
+    pub fn advance_to(&self, now: TimestampMs) {
+        if let Self::Manual(clock) = self {
+            clock.fetch_max(now.0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -480,7 +514,7 @@ pub enum ActivityHeartbeatOutcome {
     AlreadyCompleted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WaitKind {
     Timer,
     Signal,
@@ -598,8 +632,14 @@ pub struct FailActivityRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FailActivityOutcome {
-    RetryScheduled { next_attempt: u32 },
-    Failed { event_id: EventId },
+    /// The attempt the retry will carry and when it becomes claimable.
+    RetryScheduled {
+        next_attempt: u32,
+        ready_at: TimestampMs,
+    },
+    Failed {
+        event_id: EventId,
+    },
     AlreadyCompleted,
 }
 
@@ -627,7 +667,10 @@ pub enum QueryProjectionOutcome {
         event_id: EventId,
         payload: PayloadRef,
     },
+    /// No workflow with that id exists in the namespace.
     NotFound,
+    /// The workflow exists and has published no projection.
+    NoProjection,
 }
 
 #[derive(Clone, Debug, Default)]

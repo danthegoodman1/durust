@@ -1270,7 +1270,7 @@
       "input": {
         "value": 7
       },
-      "name": "a child workflow start is committed to the outbox and its completion closes the parent",
+      "name": "a child workflow start is committed with the parent's task and its completion closes the parent",
       "program": "corpus.child-await",
       "steps": [
         {
@@ -1338,10 +1338,6 @@
           "historyBefore": [
             "WorkflowStarted"
           ]
-        },
-        {
-          "action": "dispatchChildStarts",
-          "count": 1
         },
         {
           "action": "workflowTask",
@@ -1834,6 +1830,509 @@
         }
       ],
       "workflowId": "wf/corpus/sleep-after-signal"
+    },
+    {
+      "input": {
+        "value": 21
+      },
+      "name": "one change id consulted on both sides of a task boundary records two markers",
+      "program": "corpus.repeated-change-id",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "changeId": "corpus.repeat",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "VersionMarker",
+                "version": 1
+              },
+              {
+                "activityName": "corpus.double",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": "sha256:a9bbb89229e9eb8d11457eed9e2312eb5595c96744c25c530c863e881523ec7a",
+                  "kind": "Activity",
+                  "name": "corpus.double",
+                  "optionsDigest": "<activity-options-digest>"
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities",
+                "type": "ActivityScheduled"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [
+              {
+                "activityId": "run-1:2",
+                "activityName": "corpus.double",
+                "attempt": 1,
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "heartbeatTimeoutMs": null,
+                "input": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 21
+                  }
+                },
+                "mapItem": null,
+                "retryPolicy": {
+                  "maxAttempts": 1
+                },
+                "runId": "run-1",
+                "startToCloseTimeoutMs": null,
+                "taskQueue": "corpus-activities"
+              }
+            ],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "runActivity"
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "changeId": "corpus.repeat",
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "type": "VersionMarker",
+                "version": 1
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 44
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "VersionMarker",
+            "ActivityScheduled",
+            "ActivityCompleted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/repeated-change-id"
+    },
+    {
+      "input": {
+        "value": 60000
+      },
+      "name": "a signal that won a select whose timer registered later replays cold by command id",
+      "program": "corpus.signal-first-select-then-timer",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:60000"
+                },
+                "fireAtMs": 60000,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "corpus.approve",
+                "kind": "Signal",
+                "readyAtMs": null
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 60000
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "signal",
+          "name": "corpus.approve",
+          "signalId": "corpus-signal-first-1",
+          "who": "ada"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Signal",
+                  "name": "corpus.approve",
+                  "optionsDigest": "sha256:default"
+                },
+                "payload": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "who": "ada"
+                  }
+                },
+                "signalId": "corpus-signal-first-1",
+                "signalName": "corpus.approve",
+                "type": "SignalConsumed"
+              },
+              {
+                "branchOrdinal": 0,
+                "branchesDigest": "<select-branches-digest>",
+                "selectCommandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "type": "SelectWinner",
+                "winningEventId": 3
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 4
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:10"
+                },
+                "fireAtMs": 10,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [
+              "corpus-signal-first-1"
+            ],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "kind": "Signal"
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 2,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 4
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 10
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 10
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "text": "signal:ada"
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "kind": "Timer"
+              }
+            ],
+            "expectedTailEventId": 6,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "TimerStarted",
+            "SignalConsumed",
+            "SelectWinner",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/signal-first-select"
+    },
+    {
+      "input": {
+        "value": 1
+      },
+      "name": "a workflow that fails on purpose commits WorkflowFailed with its own failure",
+      "program": "corpus.fails",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "failure": {
+                  "details": null,
+                  "errorType": "corpus.rejected",
+                  "message": "rejected on purpose",
+                  "nonRetryable": true
+                },
+                "type": "WorkflowFailed"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/fails"
+    },
+    {
+      "input": {
+        "value": 10
+      },
+      "name": "now() records the provider clock once per call and replays it as recorded",
+      "program": "corpus.now-twice",
+      "steps": [
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 1
+                },
+                "key": "durust.now",
+                "type": "SideEffectMarker",
+                "value": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": 0
+                }
+              },
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "fingerprint": {
+                  "inputDigest": null,
+                  "kind": "Timer",
+                  "name": "sleep",
+                  "optionsDigest": "timestamp-ms:10"
+                },
+                "fireAtMs": 10,
+                "type": "TimerStarted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 1,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 2
+                },
+                "key": "timer",
+                "kind": "Timer",
+                "readyAtMs": 10
+              }
+            ]
+          },
+          "historyBefore": [
+            "WorkflowStarted"
+          ]
+        },
+        {
+          "action": "advanceTime",
+          "ms": 10
+        },
+        {
+          "action": "fireTimers",
+          "count": 1
+        },
+        {
+          "action": "restartWorker"
+        },
+        {
+          "action": "workflowTask",
+          "expect": {
+            "appendEvents": [
+              {
+                "commandId": {
+                  "runId": "run-1",
+                  "seq": 3
+                },
+                "key": "durust.now",
+                "type": "SideEffectMarker",
+                "value": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": 10
+                }
+              },
+              {
+                "result": {
+                  "codec": "MessagePack",
+                  "schemaFingerprint": "<schema-fingerprint>",
+                  "value": {
+                    "value": 10
+                  }
+                },
+                "type": "WorkflowCompleted"
+              }
+            ],
+            "consumeSignals": [],
+            "deleteWaits": [],
+            "expectedTailEventId": 4,
+            "queryProjection": null,
+            "scheduleActivities": [],
+            "scheduleActivityMaps": [],
+            "startChildWorkflows": [],
+            "upsertWaits": []
+          },
+          "historyBefore": [
+            "WorkflowStarted",
+            "SideEffectMarker",
+            "TimerStarted",
+            "TimerFired"
+          ]
+        }
+      ],
+      "workflowId": "wf/corpus/now-twice"
     }
   ],
   "declaredDivergences": {
@@ -1854,8 +2353,8 @@
       "why": "No case schedules one. commit_json and commitJson both refuse a commit whose scheduleChildWorkflowMaps is non-empty, so this cannot be reached accidentally, but the ChildWorkflowMapScheduled event, the ChildWorkflowMapTask, and the child-map result manifest have no behavioural coverage here. The Phase 6 map transition table covers the engine; this covers neither the scheduling commit nor the completion commit."
     },
     {
-      "what": "Workflow failure and cancellation events",
-      "why": "Every case completes successfully or continues as new. WorkflowFailed, WorkflowCancelled and the failure payloads they carry have neutral encoders in both runners but no case that produces them, so the encoders themselves are untested. The coverage test's exact-union assertion over event kinds is what will force this list to be updated the day a case does produce one."
+      "what": "Workflow cancellation events",
+      "why": "No case cancels a run. `corpus.fails` covers the failure event: a workflow that fails on purpose commits `WorkflowFailed` with the failure it named in both runtimes, and a plain throw (TypeScript) or panic (Rust) commits nothing, which the runners cannot record because a released task produces no commit. Cancellation is still unreached."
     },
     {
       "what": "Activity retries",

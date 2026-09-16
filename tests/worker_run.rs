@@ -372,6 +372,7 @@ where
 struct ObservingBackend {
     inner: MemoryBackend,
     maintenance_calls: Arc<AtomicUsize>,
+    child_dispatch_calls: Arc<AtomicUsize>,
     fail_workflow_claims: Arc<AtomicBool>,
 }
 
@@ -380,12 +381,20 @@ impl ObservingBackend {
         Self {
             inner,
             maintenance_calls: Arc::new(AtomicUsize::new(0)),
+            child_dispatch_calls: Arc::new(AtomicUsize::new(0)),
             fail_workflow_claims: Arc::new(AtomicBool::new(false)),
         }
     }
 
     fn maintenance_calls(&self) -> usize {
         self.maintenance_calls.load(Ordering::SeqCst)
+    }
+
+    /// How often the worker asked the provider to drain its child-start
+    /// outbox. The memory provider starts children inside the commit, so the
+    /// drain finds nothing; the count proves the worker still runs it.
+    fn child_dispatch_calls(&self) -> usize {
+        self.child_dispatch_calls.load(Ordering::SeqCst)
     }
 
     fn fail_workflow_claims(&self, failing: bool) {
@@ -451,6 +460,14 @@ impl DurableBackend for ObservingBackend {
         self.inner.run_due_maintenance(req)
     }
 
+    fn dispatch_child_workflow_starts(
+        &self,
+        req: durust::DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
+        self.child_dispatch_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.dispatch_child_workflow_starts(req)
+    }
+
     forward_to_inner! {
         fn start_workflow(req: durust::StartWorkflowRequest) -> durust::StartWorkflowOutcome;
         fn cancel_workflow(req: durust::CancelWorkflowRequest) -> durust::CancelWorkflowOutcome;
@@ -504,9 +521,6 @@ impl DurableBackend for ObservingBackend {
             req: durust::CompleteActivityTasksRequest
         ) -> Vec<durust::CompleteActivityTaskBatchResult>;
         fn fail_activity(req: durust::FailActivityRequest) -> durust::FailActivityOutcome;
-        fn dispatch_child_workflow_starts(
-            req: durust::DispatchChildWorkflowStartsRequest
-        ) -> durust::DispatchChildWorkflowStartsOutcome;
         fn query_projection(req: durust::QueryProjectionRequest) -> durust::QueryProjectionOutcome;
         fn workflow_change_versions(
             req: durust::WorkflowChangeVersionsRequest
@@ -946,26 +960,20 @@ fn panicking_workflow_task_does_not_suppress_the_rest_of_its_pass() {
             .build();
 
         // Park each healthy run on the stage that owns its pending work: a
-        // timer for maintenance, an undispatched child start for child
-        // dispatch, and a scheduled activity for activity execution.
+        // timer for maintenance and a scheduled activity for activity
+        // execution. The parent's child starts inside the parent's own
+        // commit, so its run only adds a claimable child task to the pass.
         for _ in 0..3 {
             assert!(worker.run_workflow_once().await.unwrap());
         }
         backend.advance_time(Duration::from_millis(50));
 
-        // None of the three stages has run yet, so each assertion below is a
-        // strict before/after over one pass.
+        // Neither stage has run yet, so each assertion below is a strict
+        // before/after over one pass.
         assert!(
             !has_event(&backend, &sleeper_run, |data| matches!(
                 data,
                 HistoryEventData::TimerFired(_)
-            ))
-            .await
-        );
-        assert!(
-            !has_event(&backend, &parent_run, |data| matches!(
-                data,
-                HistoryEventData::ChildWorkflowStarted(_)
             ))
             .await
         );
@@ -977,8 +985,8 @@ fn panicking_workflow_task_does_not_suppress_the_rest_of_its_pass() {
             .await
         );
 
-        // The only claimable workflow task for the next pass: every healthy run
-        // is blocked on work a later stage of that same pass performs.
+        // Every healthy run except the started child is blocked on work a
+        // later stage of that same pass performs.
         let panicking_run = client
             .start_workflow::<wr_panicking_batched>(
                 "wf/pass-panicking",
@@ -1005,15 +1013,6 @@ fn panicking_workflow_task_does_not_suppress_the_rest_of_its_pass() {
             ))
             .await,
             "a failed workflow task suppressed the pass's maintenance stage"
-        );
-        // ...child dispatch...
-        assert!(
-            has_event(&backend, &parent_run, |data| matches!(
-                data,
-                HistoryEventData::ChildWorkflowStarted(_)
-            ))
-            .await,
-            "a failed workflow task suppressed the pass's child dispatch stage"
         );
         // ...or activity execution.
         assert!(
@@ -1890,7 +1889,8 @@ fn disabled_timer_maintenance_still_dispatches_child_workflow_starts() {
             .await
             .unwrap();
 
-        let mut disabled = Worker::builder(backend.clone())
+        let observing = ObservingBackend::new(backend.clone());
+        let mut disabled = Worker::builder(observing.clone())
             .worker_id("maintenance-disabled-worker")
             .workflow_task_queue("workflows")
             .register_workflow(wr_sleeper)
@@ -1903,18 +1903,18 @@ fn disabled_timer_maintenance_still_dispatches_child_workflow_starts() {
             .build();
 
         // The child workflow starts, runs, and reports back to its parent on
-        // this worker alone — the outbox dispatch the knob must not touch.
+        // this worker alone, and the child-start drain, which the knob must
+        // not gate, still runs: the provider starts children inside the
+        // commit, so the drain's call count is what shows it ran.
         disabled.run_until_idle().await.unwrap();
         assert_eq!(
             completed_result(&backend, &parent_run).await,
             Some(102),
-            "a worker with timer maintenance disabled must still dispatch child starts, \
-             or child workflows never run anywhere"
+            "a worker with timer maintenance disabled must still run child workflows"
         );
         assert!(
-            disabled.metrics().child_workflow_starts_dispatched >= 1,
-            "{:?}",
-            disabled.metrics()
+            observing.child_dispatch_calls() >= 1,
+            "a worker with timer maintenance disabled must still drain child starts"
         );
 
         // The timer, meanwhile, is still pending: one pass started it, and
@@ -1997,7 +1997,8 @@ fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
         let backend = MemoryBackend::new();
         let client = durust::Client::new(backend.clone());
 
-        let mut disabled = Worker::builder(backend.clone())
+        let observing = ObservingBackend::new(backend.clone());
+        let mut disabled = Worker::builder(observing.clone())
             .worker_id("maintenance-disabled-loop-worker")
             .workflow_task_queue("workflows")
             .register_workflow(wr_optout_loop_parent)
@@ -2009,9 +2010,10 @@ fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
             .build();
 
         // Drains to idle against an empty queue. Everything this test asserts
-        // happens after this line, so no outbox row it measures can have been
-        // dispatched by the pass driver's maintenance stage.
+        // happens after this line, so no drain call it counts can have come
+        // from the pass driver's maintenance stage.
         disabled.run_until_idle().await.unwrap();
+        let drains_before = observing.child_dispatch_calls();
 
         let parent_run = client
             .start_workflow::<wr_optout_loop_parent>(
@@ -2025,11 +2027,17 @@ fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
         let shutdown = disabled.shutdown_handle();
         let (run_result, completed) = futures::future::join(disabled.run(), async {
             // Bounded well inside the harness timeout, so a worker that stops
-            // draining the outbox fails on the assertion naming the property
-            // rather than by hanging.
+            // running child workflows fails on the assertion naming the
+            // property rather than by hanging.
+            // Waits for both the parent's completion and a drain call from
+            // the interval loop: the provider starts the child inside the
+            // commit, so completion alone no longer proves the loop drained.
             let completed = tokio::time::timeout(
                 PROGRESS_TIMEOUT,
-                wait_until(|| async { completed_result(&backend, &parent_run).await.is_some() }),
+                wait_until(|| async {
+                    completed_result(&backend, &parent_run).await.is_some()
+                        && observing.child_dispatch_calls() > drains_before
+                }),
             )
             .await;
             shutdown.shutdown();
@@ -2040,9 +2048,9 @@ fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
 
         assert!(
             completed.is_ok(),
-            "the parent never completed under `run` alone: with timer maintenance disabled the \
-             interval loop stopped dispatching child workflow starts, so every child workflow in \
-             a deployment would be stranded forever"
+            "under `run` alone with timer maintenance disabled, the parent never completed or \
+             the interval loop never drained child starts: {:?}",
+            disabled.metrics()
         );
         assert_eq!(
             completed_result(&backend, &parent_run).await,
@@ -2050,8 +2058,8 @@ fn disabled_timer_maintenance_dispatches_child_starts_from_the_interval_loop() {
             "the child ran but reported the wrong result to its parent"
         );
         assert!(
-            disabled.metrics().child_workflow_starts_dispatched >= 1,
-            "no child start was dispatched from the interval loop: {:?}",
+            observing.child_dispatch_calls() > drains_before,
+            "the interval loop never drained child starts: {:?}",
             disabled.metrics()
         );
         assert_eq!(

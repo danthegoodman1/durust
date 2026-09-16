@@ -57,7 +57,7 @@ use std::time::Duration;
 /// rejects a terminal-parent notification with [`MapReject::TerminalParent`]
 /// where a child map drops the notification silently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MapKind {
+pub enum MapKind {
     Activity,
     ChildWorkflow,
 }
@@ -80,7 +80,7 @@ impl MapKind {
 /// their in-memory record) into this before every transition; nothing else
 /// about the descriptor is engine-visible.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MapState {
+pub struct MapState {
     pub map_command_id: CommandId,
     pub kind: MapKind,
     /// Meaningful for [`MapKind::ChildWorkflow`]. An activity map is always
@@ -180,7 +180,7 @@ impl MapState {
 /// Explicit failures are paced by the retry backoff; timeouts are already
 /// paced by the deadline that fired, so their retry is immediately claimable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ItemAttemptFailureKind {
+pub enum ItemAttemptFailureKind {
     Failed,
     TimedOut,
 }
@@ -190,7 +190,7 @@ pub(crate) enum ItemAttemptFailureKind {
 /// [`From`] impl is the only conversion, so the map machine cannot drift from
 /// the shared activity retry policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ItemRetryDecision {
+pub enum ItemRetryDecision {
     Retry { next_attempt: u32 },
     Exhausted,
 }
@@ -208,7 +208,7 @@ impl From<ActivityFailureDecision> for ItemRetryDecision {
 /// read inside its transaction, so the transition itself needs no further
 /// reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MapEvent {
+pub enum MapEvent {
     /// The scheduling commit inserted the descriptor.
     DescriptorCreated { parent_terminal: bool },
     /// An item reached a terminal outcome: an activity item's result, or a
@@ -253,7 +253,7 @@ pub(crate) enum MapEvent {
 /// A storage operation for the provider to execute. The list is ordered and
 /// total: applying it is the whole of the provider's map work for that event.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MapEffect {
+pub enum MapEffect {
     /// Insert the item's terminal outcome row, keyed by
     /// `(map_command_id, ordinal)`. Emitted only for [`MapKind::ChildWorkflow`].
     RecordItemOutcome {
@@ -303,7 +303,7 @@ pub(crate) enum MapEffect {
 /// mapped error and rolls its transaction back; no effect from the same event
 /// is applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum MapReject {
+pub enum MapReject {
     /// The item ordinal is outside the input manifest. Maps to
     /// `Error::Backend`.
     OutOfBounds { ordinal: u64 },
@@ -391,7 +391,7 @@ pub(crate) fn map_command_cancelled_reason(map_command_id: &CommandId) -> String
 }
 
 /// The whole machine: descriptor state plus one event in, ordered effects out.
-pub(crate) fn step(state: &MapState, event: MapEvent) -> Result<Vec<MapEffect>, MapReject> {
+pub fn step(state: &MapState, event: MapEvent) -> Result<Vec<MapEffect>, MapReject> {
     // Terminal is absorbing. Every later event — a duplicate completion, a
     // late failure, a cancellation, a completion racing the terminal commit —
     // is a no-op, so no interleaving can move a map between terminal states.
@@ -624,8 +624,8 @@ fn terminal_parent(state: &MapState, effects: Vec<MapEffect>) -> Result<Vec<MapE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider_util::{RETRY_BACKOFF_BASE_MS, activity_failure_decision};
-    use crate::{CommandSeq, RetryBackoff, RunId};
+    use crate::provider_util::activity_failure_decision;
+    use crate::{CommandSeq, RunId};
 
     fn map_command_id() -> CommandId {
         CommandId {
@@ -1139,7 +1139,7 @@ mod tests {
             Ok(vec![MapEffect::ScheduleItemRetry {
                 ordinal: 0,
                 next_attempt: 2,
-                visible_at_ms: Some(10_000 + RETRY_BACKOFF_BASE_MS),
+                visible_at_ms: Some(10_000 + 1_000),
                 timeout_at_ms: None,
             }]),
         );
@@ -1208,16 +1208,13 @@ mod tests {
             Ok(vec![MapEffect::ScheduleItemRetry {
                 ordinal: 0,
                 next_attempt: 4,
-                visible_at_ms: Some(10_000 + 4 * RETRY_BACKOFF_BASE_MS),
+                visible_at_ms: Some(10_000 + 4 * 1_000),
                 timeout_at_ms: None,
             }]),
         );
         // A policy without backoff stays immediately claimable.
         let unpaced = AttemptFailure {
-            retry_policy: RetryPolicy {
-                backoff: RetryBackoff::None,
-                ..RetryPolicy::exponential()
-            },
+            retry_policy: RetryPolicy::exponential().initial_interval(std::time::Duration::ZERO),
             ..AttemptFailure::new(0, ItemRetryDecision::Retry { next_attempt: 2 })
         };
         assert_eq!(
@@ -1253,8 +1250,8 @@ mod tests {
             Ok(vec![MapEffect::ScheduleItemRetry {
                 ordinal: 0,
                 next_attempt: 2,
-                visible_at_ms: Some(10_000 + RETRY_BACKOFF_BASE_MS),
-                timeout_at_ms: Some(10_000 + RETRY_BACKOFF_BASE_MS + 30_000),
+                visible_at_ms: Some(10_000 + 1_000),
+                timeout_at_ms: Some(10_000 + 1_000 + 30_000),
             }]),
         );
         // Timeout retry: immediately claimable, so the deadline is measured
@@ -1314,16 +1311,25 @@ mod tests {
         task.retry_policy.max_attempts = 3;
         task.attempt = 1;
         assert_eq!(
-            ItemRetryDecision::from(activity_failure_decision(&task, false)),
+            ItemRetryDecision::from(activity_failure_decision(
+                &task,
+                &DurableFailure::new("kind", "boom")
+            )),
             ItemRetryDecision::Retry { next_attempt: 2 }
         );
         assert_eq!(
-            ItemRetryDecision::from(activity_failure_decision(&task, true)),
+            ItemRetryDecision::from(activity_failure_decision(
+                &task,
+                &DurableFailure::non_retryable("kind", "boom")
+            )),
             ItemRetryDecision::Exhausted
         );
         task.attempt = 3;
         assert_eq!(
-            ItemRetryDecision::from(activity_failure_decision(&task, false)),
+            ItemRetryDecision::from(activity_failure_decision(
+                &task,
+                &DurableFailure::new("kind", "boom")
+            )),
             ItemRetryDecision::Exhausted
         );
     }

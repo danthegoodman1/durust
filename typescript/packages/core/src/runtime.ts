@@ -33,7 +33,8 @@ import {
   childWorkflowFingerprint,
   childWorkflowMapFingerprint,
   signalFingerprint,
-  timerFingerprint
+  timerFingerprint,
+  type CommandFingerprint
 } from "./fingerprint.js";
 import {
   activityTaskFromScheduled,
@@ -242,6 +243,7 @@ export function isReplayCommandEvent(event: HistoryEvent): boolean {
     case "ChildWorkflowFailed":
     case "ChildWorkflowCancelled":
     case "TimerFired":
+    case "SignalConsumed":
       return false;
     default:
       return true;
@@ -345,6 +347,50 @@ export class ActivityFailureError extends Error {
   }
 }
 
+/**
+ * The failure a workflow raises to close its run as failed, the TypeScript
+ * spelling of a Rust workflow returning `Err(...)`. Any other value thrown out
+ * of a handler is a workflow-code fault: the task is released and replayed
+ * later instead of committing `WorkflowFailed`, so a redeploy recovers the run.
+ */
+export class WorkflowFailure extends Error implements DurableFailure {
+  readonly errorType: string;
+  readonly nonRetryable: boolean;
+  readonly details?: PayloadRef<unknown>;
+
+  constructor(
+    message: string,
+    options: {
+      readonly errorType?: string;
+      readonly nonRetryable?: boolean;
+      readonly details?: PayloadRef<unknown>;
+    } = {}
+  ) {
+    super(message);
+    this.name = "WorkflowFailure";
+    this.errorType = options.errorType ?? "WorkflowFailure";
+    this.nonRetryable = options.nonRetryable ?? true;
+    if (options.details !== undefined) {
+      this.details = options.details;
+    }
+  }
+}
+
+/**
+ * A workflow handler threw something that is not a durable failure. Routed
+ * like nondeterminism: nothing is committed, the claim is released with the
+ * nondeterminism backoff, and the next claim replays the run, so a fixed
+ * redeploy recovers it. Mirrors Rust's `Error::TaskPanic`.
+ */
+export class WorkflowCodeError extends Error {
+  constructor(cause: unknown) {
+    super(`workflow task threw: ${cause instanceof Error ? cause.message : String(cause)}`, {
+      cause
+    });
+    this.name = "WorkflowCodeError";
+  }
+}
+
 export class WorkflowFailureError extends Error {
   readonly failure: DurableFailure;
 
@@ -420,6 +466,17 @@ export function deprecatePatch(patchId: string): void {
 
 export function sideEffect<T>(key: string, effect: () => T): PromiseLike<T> {
   return new SideEffectDurablePromise(key, effect);
+}
+
+/**
+ * Deterministic workflow time: the provider clock as observed by the task
+ * that first evaluates this call, recorded as a side-effect marker so every
+ * replay returns the same value. Each call records its own marker. The
+ * TypeScript twin of `durust::now()`.
+ */
+export function now(): PromiseLike<number> {
+  const observed = currentWorkflowRuntimeContext().nowMs();
+  return new SideEffectDurablePromise("durust.now", () => observed);
 }
 
 export function publish<QueryState extends object>(view: DurableInput<QueryState>): void {
@@ -508,12 +565,20 @@ export class HotWorkflowExecution {
           this.#context.notifyHotProgress();
           return;
         }
+        // A rejection that is not a durable failure is a workflow-code fault,
+        // and the run keeps its progress: the task fails without committing.
+        const failure = workflowRejectionFailure(error);
+        if (failure === null) {
+          this.#fatalError = new WorkflowCodeError(error);
+          this.#context.notifyHotProgress();
+          return;
+        }
         // failWorkflow can itself raise fatal nondeterminism (terminal reached
         // with unconsumed recorded commands). Nothing catches a throw from this
         // .catch handler, so route it to #fatalError like other fatal errors
         // instead of leaving nextCommit() waiting forever.
         try {
-          this.#context.failWorkflow(durableFailureFromUnknown(error));
+          this.#context.failWorkflow(failure);
         } catch (failError: unknown) {
           this.#fatalError = failError;
           this.#context.notifyHotProgress();
@@ -1223,6 +1288,11 @@ class WorkflowRuntimeContext {
   readonly #childMapCompletions = new Map<string, HistoryEvent>();
   readonly #childMapFailures = new Map<string, HistoryEvent>();
   readonly #timerFires = new Map<string, HistoryEvent>();
+  // A signal's consumption is recorded under the wait's command id, which may
+  // be far behind the commands recorded since the wait registered, so it is a
+  // ready event keyed by command like a timer fire rather than a positional
+  // command event. Mirrors Rust's `ReadyEventIndexes::consumed_signals`.
+  readonly #signalConsumptions = new Map<string, HistoryEvent>();
   #replayCursor = 0;
   #nextCommandSeq = 1;
   readonly #appendEvents: NewHistoryEvent[] = [];
@@ -1333,6 +1403,11 @@ class WorkflowRuntimeContext {
     if (Number(lastEventId) > Number(this.#lastLoadedEventId)) {
       this.#lastLoadedEventId = lastEventId;
     }
+  }
+
+  /** The provider clock this task observed, in milliseconds. */
+  nowMs(): number {
+    return this.#nowMs;
   }
 
   /** True once every recorded event through the replay target is loaded. */
@@ -1449,6 +1524,9 @@ class WorkflowRuntimeContext {
       }
       if (event.data.kind === "TimerFired") {
         this.#timerFires.set(commandKey(event.data.fired.commandId), event);
+      }
+      if (event.data.kind === "SignalConsumed") {
+        this.#signalConsumptions.set(commandKey(event.data.consumed.commandId), event);
       }
       if (event.data.kind === "ChildWorkflowStarted") {
         this.#childStarts.set(commandKey(event.data.started.commandId), event);
@@ -1818,22 +1896,12 @@ class WorkflowRuntimeContext {
     this.#assertDurableApiAllowed("signal", name);
     const id = this.#nextCommandId();
     const fingerprint = signalFingerprint(name);
-    const replayEvent = this.#peekReplayEvent();
-    if (replayEvent?.data.kind === "SignalConsumed") {
-      const consumed = replayEvent.data.consumed;
-      if (!sameCommandId(consumed.commandId, id)) {
-        throw new Error(
-          `nondeterminism: expected command seq ${id.seq}, found ${consumed.commandId.seq}`
-        );
-      }
-      if (!sameFingerprint(consumed.fingerprint, fingerprint)) {
-        throw new Error("nondeterminism: signal command fingerprint changed");
-      }
-      this.#advanceReplay();
+    const recorded = this.#takeRecordedSignalConsumption(id, fingerprint);
+    if (recorded !== undefined) {
       return {
         kind: "Consumed",
-        value: decodePayload<Payload>(consumed.payload as PayloadRef<Payload>, payloadSchema),
-        eventId: replayEvent.eventId
+        value: decodePayload<Payload>(recorded.payload as PayloadRef<Payload>, payloadSchema),
+        eventId: recorded.eventId
       };
     }
 
@@ -2087,6 +2155,17 @@ class WorkflowRuntimeContext {
     id: CommandId,
     payloadSchema?: SchemaAdapter<Payload>
   ): HotSuspendResolution<ReadyJoinBranch<Payload>> {
+    const recorded = this.#takeRecordedSignalConsumption(id, signalFingerprint(name));
+    if (recorded !== undefined) {
+      return {
+        kind: "Resolved",
+        value: {
+          kind: "Ready",
+          value: decodePayload<Payload>(recorded.payload as PayloadRef<Payload>, payloadSchema),
+          eventId: recorded.eventId
+        }
+      };
+    }
     const live = this.#takeLiveSignal(name);
     if (live === undefined) {
       return { kind: "Pending" };
@@ -3099,6 +3178,29 @@ class WorkflowRuntimeContext {
 
   #advanceReplay(): void {
     this.#replayCursor += 1;
+  }
+
+  /**
+   * Consumes the recorded `SignalConsumed` for a signal command, if history
+   * carries one. Indexed by command id rather than matched at the replay
+   * cursor: the consumption is appended when the signal arrives, which may be
+   * many commands after the wait registered, so a `select` or `join` whose
+   * signal branch registered before its timer would otherwise never find it
+   * on a cold replay.
+   */
+  #takeRecordedSignalConsumption(
+    id: CommandId,
+    fingerprint: CommandFingerprint
+  ): { readonly payload: PayloadRef; readonly eventId: EventId } | undefined {
+    const event = this.#takeReadyEvent(this.#signalConsumptions, commandKey(id));
+    if (event?.data.kind !== "SignalConsumed") {
+      return undefined;
+    }
+    const consumed = event.data.consumed;
+    if (!sameFingerprint(consumed.fingerprint, fingerprint)) {
+      throw new Error("nondeterminism: signal command fingerprint changed");
+    }
+    return { payload: consumed.payload, eventId: event.eventId };
   }
 
   #takeLiveSignal(name: string): SignalInboxRecord | undefined {
@@ -4406,8 +4508,37 @@ function isThenable(value: unknown): boolean {
   );
 }
 
+/**
+ * The durable failure a workflow's rejection carries, or `null` when the
+ * rejection is a plain throw. Propagated activity, child, and child-map
+ * failures, a `WorkflowFailure`, and any `DurableFailure`-shaped value close
+ * the run as failed; everything else is a workflow-code fault.
+ */
+export function workflowRejectionFailure(error: unknown): DurableFailure | null {
+  if (
+    error instanceof WorkflowFailure ||
+    error instanceof ActivityFailureError ||
+    error instanceof ChildWorkflowFailureError ||
+    error instanceof ChildWorkflowMapFailureError ||
+    error instanceof ChildWorkflowCancelledError
+  ) {
+    return durableFailureFromUnknown(error);
+  }
+  if (
+    error &&
+    typeof error === "object" &&
+    "errorType" in error &&
+    "message" in error &&
+    typeof (error as { readonly errorType?: unknown }).errorType === "string" &&
+    typeof (error as { readonly message?: unknown }).message === "string"
+  ) {
+    return durableFailureFromUnknown(error);
+  }
+  return null;
+}
+
 function isWorkflowTaskFatalError(error: unknown): boolean {
-  if (error instanceof UnsupportedWorkflowVersionError) {
+  if (error instanceof UnsupportedWorkflowVersionError || error instanceof WorkflowCodeError) {
     return true;
   }
   // A task-level fault, never a workflow failure: the run is fine, this

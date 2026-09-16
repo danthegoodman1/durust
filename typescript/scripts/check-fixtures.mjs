@@ -1,26 +1,29 @@
 #!/usr/bin/env node
 /**
- * Runs every shared-fixture runner, in both languages, from one place.
+ * Runs the TypeScript half of every shared-fixture runner from one place.
  *
  * The files under `typescript/fixtures/contract/` are the cross-language
  * contract: each one is read by a Rust runner and a TypeScript runner, and a
- * fixture only means anything if BOTH runners actually execute. This script is
- * that guarantee, and it is wired into `npm run check` — and so into CI's
- * "Run TypeScript checks" step — rather than being an opt-in command nobody
- * calls. CI runs the Rust halves a second time through
- * `cargo test --workspace --all-features`; the duplication is deliberate, so
- * neither job can be the only thing standing between a fixture and a
- * regression.
+ * fixture only means anything if BOTH runners execute. Every TypeScript
+ * runner drives the Rust providers through `@durust/native`, so the addon
+ * has to be built first (`npm run build:native --workspace @durust/native`).
+ * The `transitions` half of `map-transitions.json` has a Rust runner only,
+ * because the map engine lives in Rust. The Rust halves are
+ * ordinary Rust tests (`tests/contract_fixtures.rs`, `tests/map_transitions.rs`,
+ * `tests/behavioral_corpus.rs`, and the worker's start-jitter unit test), so
+ * `cargo test --locked --workspace --all-features` runs them; this script is
+ * wired into `npm run check` so the TypeScript halves are gated the same way.
+ * CI runs both commands.
  *
- * Adding a fixture means adding its two runners here. A runner that exists but
- * is not listed is a fixture nobody gates on — which is exactly how
- * `map-transitions.json`'s two runners went ungated after Phase 6.
+ * Adding a fixture means adding its TypeScript runner here and its Rust
+ * runner under `tests/`. A runner that exists but is not listed is a fixture
+ * nobody gates on, which is exactly how `map-transitions.json`'s two runners
+ * went ungated after Phase 6.
  */
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const workspaceRoot = fileURLToPath(new URL("..", import.meta.url));
-const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 /**
  * `fixtures` names the checked-in artefact each runner reads, so the mapping
@@ -41,50 +44,18 @@ const steps = [
     cwd: workspaceRoot
   },
   {
-    name: "Rust neutral contract fixture tests",
-    fixtures: ["core-events.json", "provider-io.json", "benchmark-output.json"],
-    command: "cargo",
-    args: ["test", "--test", "contract_fixtures"],
-    cwd: repoRoot
-  },
-  {
-    name: "TypeScript shared map transition table",
+    name: "TypeScript shared map transition table fanouts",
     fixtures: ["map-transitions.json"],
     command: "npm",
-    args: ["run", "test", "--", "packages/core/test/map-engine.test.ts"],
+    args: ["run", "test", "--", "packages/core/test/map-fanouts.test.ts"],
     cwd: workspaceRoot
   },
   {
-    name: "Rust shared map transition table",
-    fixtures: ["map-transitions.json"],
-    command: "cargo",
-    args: ["test", "--test", "map_transitions"],
-    cwd: repoRoot
-  },
-  {
-    name: "TypeScript behavioural corpus",
+    name: "TypeScript behavioural corpus, TypeScript worker over the Rust memory provider",
     fixtures: ["behavioral-corpus.json"],
     command: "npm",
     args: ["run", "test", "--", "packages/core/test/behavioral-corpus.test.ts"],
     cwd: workspaceRoot
-  },
-  {
-    name: "Rust behavioural corpus",
-    fixtures: ["behavioral-corpus.json"],
-    command: "cargo",
-    args: ["test", "--test", "behavioral_corpus"],
-    cwd: repoRoot
-  },
-  {
-    // The corpus's `workerStartJitter` table. `MaintenanceJitter` is private to
-    // `src/worker.rs`, so the Rust half of this one section lives in that
-    // module's unit tests rather than in `tests/`, and a `--test` filter would
-    // miss it.
-    name: "Rust worker start-jitter corpus table",
-    fixtures: ["behavioral-corpus.json"],
-    command: "cargo",
-    args: ["test", "--lib", "worker::tests::maintenance_jitter_matches_the_shared_corpus_table"],
-    cwd: repoRoot
   }
 ];
 
@@ -93,7 +64,7 @@ for (const step of steps) {
   const result = spawnSync(step.command, step.args, {
     cwd: step.cwd,
     stdio: "inherit",
-    env: process.env
+    env: { ...process.env, ...(step.env ?? {}) }
   });
   if (result.status !== 0) {
     process.exit(result.status ?? 1);

@@ -1,0 +1,72 @@
+{
+  "name": "@durust/native",
+  "version": "0.2.1",
+  "description": "The Rust durability providers (memory, SQLite, Postgres) for Durust TypeScript workflows, loaded through napi-rs.",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map",
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.json",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "prepack": "tsc -b",
+    "build:native": "node scripts/build-native.mjs",
+    "test": "vitest run --root ../.. --config vitest.config.ts packages/native/test"
+  },
+  "napi": {
+    "binaryName": "durust-node",
+    "packageName": "@durust/native",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-unknown-linux-gnu"
+    ]
+  },
+  "dependencies": {
+    "@durust/core": "^0.2.1",
+    "@msgpack/msgpack": "^3.1.3"
+  },
+  "optionalDependencies": {
+    "@durust/native-darwin-arm64": "0.2.1",
+    "@durust/native-darwin-x64": "0.2.1",
+    "@durust/native-linux-arm64-gnu": "0.2.1",
+    "@durust/native-linux-x64-gnu": "0.2.1"
+  },
+  "devDependencies": {
+    "@durust/testing": "^0.2.1",
+    "@napi-rs/cli": "^3.10.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "durust",
+    "durable-execution",
+    "durable-workflows",
+    "workflow",
+    "native",
+    "napi-rs"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danthegoodman1/durust",
+    "directory": "typescript/packages/native"
+  }
+}

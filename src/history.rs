@@ -77,6 +77,7 @@ pub struct SignalConsumed {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityMapInputManifest {
     pub item_count: usize,
     pub page_lengths: Vec<usize>,
@@ -89,6 +90,7 @@ pub struct ActivityMapInputPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityMapResultManifest {
     pub name: String,
     pub item_count: usize,
@@ -211,6 +213,7 @@ pub struct ChildWorkflowMapFailed {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ChildWorkflowMapResultManifest {
     pub name: String,
     pub item_count: usize,
@@ -224,6 +227,7 @@ pub struct ChildWorkflowMapResultPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
 pub enum ChildWorkflowMapItemOutcome {
     Succeeded { result: PayloadRef },
     Failed { failure: DurableFailure },
@@ -304,8 +308,14 @@ pub enum HistoryEventData {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEvent {
     pub event_id: EventId,
-    pub event_type: HistoryEventType,
     pub data: HistoryEventData,
+}
+
+impl HistoryEvent {
+    /// The event's type, read from its data; nothing stores it separately.
+    pub fn event_type(&self) -> HistoryEventType {
+        self.data.event_type()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +578,7 @@ pub fn child_workflow_fingerprint(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn child_workflow_map_fingerprint(
     workflow_type: WorkflowType,
     input_manifest_digest: String,

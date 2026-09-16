@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   publish,
@@ -9,6 +8,7 @@ import {
   sleep,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface ApprovalInput {
   readonly orderId: string;
@@ -80,7 +80,7 @@ const approvalWorkflow = workflow({
 });
 
 export async function runMemoryApprovalExample(): Promise<ApprovalExampleResult> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry().registerWorkflow(approvalWorkflow);
   const client = new Client(backend, { payloadCodec: "Json" });
   const worker = new Worker({
@@ -88,7 +88,6 @@ export async function runMemoryApprovalExample(): Promise<ApprovalExampleResult>
     registry,
     workerId: "examples-approval-worker",
     workflowTaskQueue: "workflows",
-    registeredSignalNames: ["approved"],
     payloadCodec: "Json"
   });
 

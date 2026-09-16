@@ -3,6 +3,7 @@ use crate::map_engine::{
     MapEffect, MapEvent, MapKind, MapReject, MapState, activity_outcome_counts,
     map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
+use crate::payload::ManifestKind;
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
     activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_attribution,
@@ -71,6 +72,48 @@ impl MemoryBackend {
     pub fn payload_blob_count(&self) -> usize {
         let state = self.state.lock().expect("memory backend mutex poisoned");
         state.payload_blobs.len()
+    }
+
+    /// Moves the virtual clock forward to `now`; an earlier instant is ignored,
+    /// since leases and timers were already judged against the current one.
+    pub fn advance_time_to(&self, now: TimestampMs) {
+        let moved = {
+            let mut state = self.state.lock().expect("memory backend mutex poisoned");
+            if now.0 > state.now.0 {
+                state.now = now;
+                true
+            } else {
+                false
+            }
+        };
+        if moved {
+            self.notify_work();
+        }
+    }
+
+    /// The first unconsumed inbox record of every signal name the run holds,
+    /// in received order: what a claim carries in the TypeScript contract.
+    pub fn live_signals(&self, run_id: &RunId) -> Result<Vec<SignalInboxRecord>> {
+        let state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut ordered = state
+            .signals
+            .iter()
+            .filter(|(_, signal)| signal.run_id == *run_id && !signal.consumed)
+            .collect::<Vec<_>>();
+        ordered.sort_by_key(|(_, signal)| signal.received_sequence);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut records = Vec::new();
+        for (signal_id, signal) in ordered {
+            if !seen.insert(signal.signal_name.clone()) {
+                continue;
+            }
+            records.push(SignalInboxRecord {
+                signal_id: signal_id.clone(),
+                signal_name: signal.signal_name.clone(),
+                payload: hydrate_payload_from_storage(&state, signal.payload.clone())?,
+            });
+        }
+        Ok(records)
     }
 
     pub fn advance_time(&self, duration: std::time::Duration) {
@@ -298,6 +341,18 @@ struct QueryProjectionRecord {
     payload: crate::PayloadRef,
 }
 
+/// A late call for an activity record that is gone: terminal cleanup deleted
+/// it, so the activity is over, unless the id names a run this provider
+/// never started.
+fn missing_activity_outcome(state: &MemoryState, activity_id: &ActivityId) -> Result<()> {
+    let run_id = crate::provider_util::activity_run_id(activity_id);
+    if state.runs.contains_key(&run_id) {
+        Ok(())
+    } else {
+        Err(Error::RunNotFound(run_id))
+    }
+}
+
 impl DurableBackend for MemoryBackend {
     fn payload_storage_config(&self) -> PayloadStorageConfig {
         self.payload_config.clone()
@@ -325,7 +380,6 @@ impl DurableBackend for MemoryBackend {
         let run_id = RunId::new(format!("run-{}", state.next_run_id));
         let start = HistoryEvent {
             event_id: EventId(1),
-            event_type: crate::HistoryEventType::WorkflowStarted,
             data: HistoryEventData::WorkflowStarted {
                 workflow_type: req.workflow_type.clone(),
                 input,
@@ -368,10 +422,7 @@ impl DurableBackend for MemoryBackend {
             .get(&(req.namespace.clone(), req.workflow_id.clone()))
             .cloned()
         else {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "workflow `{}` was not found",
-                req.workflow_id.0
-            )))));
+            return Box::pin(ready(Err(Error::WorkflowNotFound(req.workflow_id.clone()))));
         };
         let terminal_event = HistoryEventData::WorkflowCancelled { reason: req.reason };
         let event_id = {
@@ -391,7 +442,6 @@ impl DurableBackend for MemoryBackend {
                 .unwrap_or(EventId(1));
             run.push_history(HistoryEvent {
                 event_id,
-                event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: terminal_event.clone(),
             });
             run.terminal = true;
@@ -717,7 +767,6 @@ impl DurableBackend for MemoryBackend {
                 }
                 run.push_history(HistoryEvent {
                     event_id: next_event_id,
-                    event_type: data.event_type(),
                     data,
                 });
             }
@@ -755,14 +804,14 @@ impl DurableBackend for MemoryBackend {
         let mut map_ready_reason = None;
 
         for task in scheduled {
-            let timeout_at = activity_timeout_at(state.now, task.start_to_close_timeout);
             state.activities.insert(
                 task.activity_id.clone(),
                 ActivityRecord {
                     task,
                     claim: None,
                     completed: false,
-                    timeout_at,
+                    // The start-to-close clock starts at the claim.
+                    timeout_at: None,
                     heartbeat_deadline_at: None,
                     implicit_heartbeat_ms: None,
                     visible_at: None,
@@ -839,16 +888,30 @@ impl DurableBackend for MemoryBackend {
                 },
             );
         }
+        // Fenced to the claimed run: a wait naming another run is skipped, and
+        // a signal or wait belonging to another run is left untouched, so no
+        // commit can act on state it does not own.
         for wait in upsert_waits {
+            if wait.run_id != claim.run_id {
+                continue;
+            }
             state.waits.insert(wait.wait_id.clone(), wait);
         }
         for signal_id in consume_signals {
-            if let Some(signal) = state.signals.get_mut(&signal_id) {
+            if let Some(signal) = state.signals.get_mut(&signal_id)
+                && signal.run_id == claim.run_id
+            {
                 signal.consumed = true;
             }
         }
         for wait_id in delete_waits {
-            state.waits.remove(&wait_id);
+            if state
+                .waits
+                .get(&wait_id)
+                .is_some_and(|wait| wait.run_id == claim.run_id)
+            {
+                state.waits.remove(&wait_id);
+            }
         }
         for command_id in cancel_commands {
             if let Err(err) = cancel_command_operational_state(&mut state, &config, &command_id) {
@@ -881,17 +944,16 @@ impl DurableBackend for MemoryBackend {
                 })
         });
         let terminal_after_commit = state.runs.get(&claim.run_id).is_none_or(|run| run.terminal);
-        // Memory applies child starts through the outbox, so no same-commit
-        // child reason exists; an empty map completed at descriptor creation
-        // is the one same-commit reason this provider can produce, and only
-        // the signal recheck can otherwise re-mark the run.
+        // An empty map completed at descriptor creation is the one same-commit
+        // reason this bookkeeping can produce, and only the signal recheck can
+        // otherwise re-mark the run; the child starts dispatched below set
+        // their own reason afterwards.
         if let Some(reason) =
             post_commit_ready_reason(terminal_after_commit, map_ready_reason, signal_wait_ready)
+            && let Some(run) = state.runs.get_mut(&claim.run_id)
         {
-            if let Some(run) = state.runs.get_mut(&claim.run_id) {
-                run.ready = Some(reason);
-                run.ready_at = None;
-            }
+            run.ready = Some(reason);
+            run.ready_at = None;
         }
         if let Some((namespace, workflow_id, projection)) = projection_update {
             state
@@ -903,12 +965,32 @@ impl DurableBackend for MemoryBackend {
                 .workflow_change_versions
                 .insert((record.run_id.clone(), record.change_id.clone()), record);
         }
+        // The commit starts the children it requested and the map items it
+        // admitted before it returns, as the Postgres provider does. The
+        // returned tail predates their `ChildWorkflowStarted` events, which
+        // the worker ingests like any other provider append.
+        let namespace = state
+            .runs
+            .get(&claim.run_id)
+            .map(|run| run.namespace.clone());
+        if let Some(namespace) = namespace
+            && let Err(err) =
+                dispatch_pending_child_starts(&mut state, &config, &namespace, usize::MAX)
+        {
+            return Box::pin(ready(Err(err)));
+        }
+        // The tail the caller learns includes what the dispatch appended, as
+        // it does on Postgres.
+        let new_tail_event_id = state
+            .runs
+            .get(&claim.run_id)
+            .and_then(|run| run.history.last())
+            .map(|event| event.event_id)
+            .unwrap_or_else(|| map_tail_event_id.unwrap_or(next_event_id.0));
 
         drop(state);
         self.notify_work();
-        Box::pin(ready(Ok(CommitOutcome::Committed {
-            new_tail_event_id: map_tail_event_id.unwrap_or(next_event_id.0),
-        })))
+        Box::pin(ready(Ok(CommitOutcome::Committed { new_tail_event_id })))
     }
 
     fn release_workflow_task(
@@ -927,7 +1009,6 @@ impl DurableBackend for MemoryBackend {
         run.workflow_claim = None;
         let became_ready = !run.terminal;
         if became_ready {
-            run.ready = Some(release.reason);
             run.ready_at = ready_at_for_delay(now, release.delay);
         } else {
             run.ready_at = None;
@@ -952,10 +1033,7 @@ impl DurableBackend for MemoryBackend {
             .get(&(req.namespace.clone(), req.workflow_id.clone()))
             .cloned()
         else {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "workflow `{}` was not found",
-                req.workflow_id.0
-            )))));
+            return Box::pin(ready(Err(Error::WorkflowNotFound(req.workflow_id.clone()))));
         };
         if state.runs.get(&run_id).is_some_and(|run| run.terminal) {
             return Box::pin(ready(Err(Error::TerminalWorkflow)));
@@ -980,13 +1058,13 @@ impl DurableBackend for MemoryBackend {
         let has_wait = state.waits.values().any(|wait| {
             wait.run_id == run_id && wait.kind == WaitKind::Signal && wait.key == req.signal_name.0
         });
-        if has_wait {
-            if let Some(run) = state.runs.get_mut(&run_id) {
-                if !run.terminal && run.workflow_claim.is_none() {
-                    run.ready = Some(WorkflowTaskReason::SignalReceived);
-                    run.ready_at = None;
-                }
-            }
+        if has_wait
+            && let Some(run) = state.runs.get_mut(&run_id)
+            && !run.terminal
+            && run.workflow_claim.is_none()
+        {
+            run.ready = Some(WorkflowTaskReason::SignalReceived);
+            run.ready_at = None;
         }
         drop(state);
         self.notify_work();
@@ -1027,12 +1105,20 @@ impl DurableBackend for MemoryBackend {
         req: FireDueTimersRequest,
     ) -> BoxFuture<'static, Result<FireDueTimersOutcome>> {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        // Selected the way the SQL providers select: a due timer wait whose
+        // run is in another namespace is never a candidate, one whose run is
+        // gone is a candidate so the loop below deletes it, and the budget
+        // counts candidates only.
         let due = state
             .waits
             .iter()
             .filter(|(_, wait)| {
                 wait.kind == WaitKind::Timer
                     && wait.ready_at.is_some_and(|ready_at| ready_at <= req.now)
+                    && state
+                        .runs
+                        .get(&wait.run_id)
+                        .is_none_or(|run| run.namespace == req.namespace)
             })
             .take(req.limit.max(1))
             .map(|(wait_id, wait)| (wait_id.clone(), wait.clone()))
@@ -1043,7 +1129,8 @@ impl DurableBackend for MemoryBackend {
                 state.waits.remove(&wait_id);
                 continue;
             };
-            if run.namespace != req.namespace || run.terminal {
+            // Skipped, not deleted, for the reason the SQL providers give.
+            if run.terminal {
                 continue;
             }
             let event_id = run
@@ -1053,7 +1140,6 @@ impl DurableBackend for MemoryBackend {
                 .unwrap_or(EventId(1));
             run.push_history(HistoryEvent {
                 event_id,
-                event_type: crate::HistoryEventType::TimerFired,
                 data: HistoryEventData::TimerFired(crate::TimerFired {
                     command_id: wait.command_id,
                     fired_at: req.now,
@@ -1138,7 +1224,6 @@ impl DurableBackend for MemoryBackend {
                     .runs
                     .get(&record.task.run_id)
                     .is_none_or(|run| run.terminal || run.namespace != opts.namespace)
-                || activity_due_at(record).is_some_and(|due_at| due_at <= state.now)
                 || record
                     .visible_at
                     .is_some_and(|visible_at| visible_at > state.now)
@@ -1149,14 +1234,13 @@ impl DurableBackend for MemoryBackend {
             {
                 continue;
             }
-            if let Some(map_item) = &record.task.map_item {
-                if state
+            if let Some(map_item) = &record.task.map_item
+                && state
                     .activity_maps
                     .get(&map_item.map_command_id)
                     .is_some_and(|map| map.completed)
-                {
-                    continue;
-                }
+            {
+                continue;
             }
             selected = Some(activity_id.clone());
             break;
@@ -1174,6 +1258,10 @@ impl DurableBackend for MemoryBackend {
                 .get_mut(&activity_id)
                 .expect("activity id selected from activities map");
             record.claim = Some(token);
+            // Start-to-close is measured from the claim, as the TypeScript
+            // providers measure it: a task waiting in the queue has no
+            // deadline, and the scan only ever times out a claimed attempt.
+            record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
             record.implicit_heartbeat_ms = activity_claim_implicit_heartbeat_ms(
                 record.task.start_to_close_timeout,
                 record.task.heartbeat_timeout,
@@ -1208,9 +1296,10 @@ impl DurableBackend for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
         let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-            // Activity records exist until their run's terminal cleanup
-            // deletes them, so a missing record is a completed activity.
-            return Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted)));
+            return Box::pin(ready(
+                missing_activity_outcome(&state, &req.claim.activity_id)
+                    .map(|()| crate::ActivityHeartbeatOutcome::AlreadyCompleted),
+            ));
         };
         if record.completed {
             return Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::AlreadyCompleted)));
@@ -1235,8 +1324,10 @@ impl DurableBackend for MemoryBackend {
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-                // Missing record means the run's terminal cleanup deleted it.
-                return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
+                return Box::pin(ready(
+                    missing_activity_outcome(&state, &req.claim.activity_id)
+                        .map(|()| CompleteActivityOutcome::AlreadyCompleted),
+                ));
             };
             if record.completed {
                 return Box::pin(ready(Ok(CompleteActivityOutcome::AlreadyCompleted)));
@@ -1291,7 +1382,6 @@ impl DurableBackend for MemoryBackend {
             .unwrap_or(EventId(1));
         run.push_history(HistoryEvent {
             event_id,
-            event_type: crate::HistoryEventType::ActivityCompleted,
             data: HistoryEventData::ActivityCompleted(crate::ActivityCompleted {
                 command_id: task.command_id,
                 result,
@@ -1313,8 +1403,10 @@ impl DurableBackend for MemoryBackend {
         let now = state.now;
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
-                // Missing record means the run's terminal cleanup deleted it.
-                return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
+                return Box::pin(ready(
+                    missing_activity_outcome(&state, &req.claim.activity_id)
+                        .map(|()| FailActivityOutcome::AlreadyCompleted),
+                ));
             };
             if record.completed {
                 return Box::pin(ready(Ok(FailActivityOutcome::AlreadyCompleted)));
@@ -1324,7 +1416,7 @@ impl DurableBackend for MemoryBackend {
             }
             record.task.clone()
         };
-        let decision = activity_failure_decision(&task, req.failure.non_retryable);
+        let decision = activity_failure_decision(&task, &req.failure);
 
         // Map items take the engine route for *both* verdicts: a retry of an
         // item whose map already ended must not reschedule anything, and only
@@ -1379,15 +1471,14 @@ impl DurableBackend for MemoryBackend {
             // cannot fire on a task that was never claimable.
             let visible_at = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
             record.visible_at = visible_at.map(TimestampMs);
-            let visible_from = visible_at.map(TimestampMs).unwrap_or(now);
-            record.timeout_at =
-                activity_timeout_at(visible_from, record.task.start_to_close_timeout);
+            record.timeout_at = None;
             record.heartbeat_deadline_at = None;
             record.implicit_heartbeat_ms = None;
             drop(state);
             self.notify_work();
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
                 next_attempt,
+                ready_at: visible_at.map(TimestampMs).unwrap_or(now),
             })));
         }
 
@@ -1418,7 +1509,6 @@ impl DurableBackend for MemoryBackend {
             .unwrap_or(EventId(1));
         run.push_history(HistoryEvent {
             event_id,
-            event_type: crate::HistoryEventType::ActivityFailed,
             data: HistoryEventData::ActivityFailed(crate::ActivityFailed {
                 command_id: task.command_id,
                 failure,
@@ -1439,22 +1529,8 @@ impl DurableBackend for MemoryBackend {
         let result = (|| {
             let mut state = self.state.lock().expect("memory backend mutex poisoned");
             let config = self.payload_config.clone();
-            let mut dispatched = 0usize;
-            let limit = req.limit.max(1);
-            while dispatched < limit {
-                let Some(outbox_id) = state.child_outbox.iter().find_map(|(outbox_id, record)| {
-                    (!record.dispatched
-                        && state
-                            .runs
-                            .get(&record.message.command_id.run_id)
-                            .is_some_and(|run| run.namespace == req.namespace))
-                    .then(|| outbox_id.clone())
-                }) else {
-                    break;
-                };
-                dispatch_child_start(&mut state, &config, &outbox_id)?;
-                dispatched += 1;
-            }
+            let dispatched =
+                dispatch_pending_child_starts(&mut state, &config, &req.namespace, req.limit)?;
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
         })();
         if matches!(&result, Ok(outcome) if outcome.dispatched > 0) {
@@ -1468,10 +1544,8 @@ impl DurableBackend for MemoryBackend {
         req: crate::QueryProjectionRequest,
     ) -> BoxFuture<'static, Result<crate::QueryProjectionOutcome>> {
         let state = self.state.lock().expect("memory backend mutex poisoned");
-        let outcome = match state
-            .query_projections
-            .get(&(req.namespace, req.workflow_id))
-        {
+        let key = (req.namespace, req.workflow_id);
+        let outcome = match state.query_projections.get(&key) {
             Some(projection) => {
                 match hydrate_payload_from_storage(&state, projection.payload.clone()) {
                     Ok(payload) => crate::QueryProjectionOutcome::Found {
@@ -1481,6 +1555,9 @@ impl DurableBackend for MemoryBackend {
                     },
                     Err(err) => return Box::pin(ready(Err(err))),
                 }
+            }
+            None if state.workflow_ids.contains_key(&key) => {
+                crate::QueryProjectionOutcome::NoProjection
             }
             None => crate::QueryProjectionOutcome::NotFound,
         };
@@ -1598,7 +1675,6 @@ fn insert_activity_map_item_batch(
     first_ordinal: u64,
     count: u64,
 ) -> Result<()> {
-    let now = state.now;
     let mut tasks = Vec::new();
     {
         let Some(map) = state.activity_maps.get(map_command_id) else {
@@ -1607,10 +1683,9 @@ fn insert_activity_map_item_batch(
         for item_ordinal in first_ordinal..first_ordinal.saturating_add(count) {
             let input = activity_map_input_at(&map.input_manifest, item_ordinal)?;
             let activity_id = ActivityId::map_item(map_command_id, item_ordinal);
-            let timeout_at = activity_timeout_at(now, map.task.start_to_close_timeout);
             tasks.push((
                 activity_id.clone(),
-                timeout_at,
+                None,
                 ActivityTask {
                     activity_id,
                     run_id: map_command_id.run_id.clone(),
@@ -1785,14 +1860,16 @@ fn apply_map_effects(
                 ordinal,
                 next_attempt,
                 visible_at_ms,
-                timeout_at_ms,
+                timeout_at_ms: _,
             } => {
                 let activity_id = ActivityId::map_item(map_command_id, ordinal);
                 if let Some(record) = state.activities.get_mut(&activity_id) {
                     record.task.attempt = next_attempt;
                     record.claim = None;
                     record.visible_at = visible_at_ms.map(TimestampMs);
-                    record.timeout_at = timeout_at_ms.map(TimestampMs);
+                    // The engine's `timeout_at_ms` has no consumer here: the
+                    // start-to-close clock starts at the next claim.
+                    record.timeout_at = None;
                     record.heartbeat_deadline_at = None;
                     record.implicit_heartbeat_ms = None;
                 }
@@ -1948,6 +2025,42 @@ fn cleanup_run_operational_state(
     }
 }
 
+/// Starts every undispatched child of the namespace's runs, at most `limit`
+/// of them, and returns how many it started. A commit calls this before it
+/// returns, so the outbox only carries what a later drain may still need.
+fn dispatch_pending_child_starts(
+    state: &mut MemoryState,
+    config: &PayloadStorageConfig,
+    namespace: &Namespace,
+    limit: usize,
+) -> Result<usize> {
+    let limit = limit.max(1);
+    let mut dispatched = 0usize;
+    while dispatched < limit {
+        let pending = state
+            .child_outbox
+            .iter()
+            .filter(|(_, record)| {
+                !record.dispatched
+                    && state
+                        .runs
+                        .get(&record.message.command_id.run_id)
+                        .is_some_and(|run| run.namespace == *namespace)
+            })
+            .map(|(outbox_id, _)| outbox_id.clone())
+            .take(limit - dispatched)
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            break;
+        }
+        for outbox_id in pending {
+            dispatch_child_start(state, config, &outbox_id)?;
+            dispatched += 1;
+        }
+    }
+    Ok(dispatched)
+}
+
 fn dispatch_child_start(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
@@ -2000,7 +2113,7 @@ fn dispatch_child_start(
             if !same_child {
                 let failure = crate::DurableFailure::non_retryable(
                     "durust.child_workflow_id_conflict",
-                    format!("workflow id `{}` is already started", message.workflow_id),
+                    format!("child workflow id already exists: {}", message.workflow_id),
                 );
                 if let Some(map_item) = message.child_map_item.clone() {
                     complete_child_workflow_map_item(
@@ -2039,7 +2152,6 @@ fn start_child_run(state: &mut MemoryState, message: &ChildStartOutboxMessage) -
     let run_id = RunId::new(format!("run-{}", state.next_run_id));
     let start = HistoryEvent {
         event_id: EventId(1),
-        event_type: crate::HistoryEventType::WorkflowStarted,
         data: HistoryEventData::WorkflowStarted {
             workflow_type: message.workflow_type.clone(),
             input: message.input.clone(),
@@ -2098,7 +2210,6 @@ fn append_child_started(
         .unwrap_or(EventId(1));
     parent.push_history(HistoryEvent {
         event_id,
-        event_type: crate::HistoryEventType::ChildWorkflowStarted,
         data: HistoryEventData::ChildWorkflowStarted(crate::ChildWorkflowStarted {
             command_id: message.command_id.clone(),
             workflow_id: message.workflow_id.clone(),
@@ -2131,7 +2242,6 @@ fn append_child_start_failed(
         .unwrap_or(EventId(1));
     parent.push_history(HistoryEvent {
         event_id,
-        event_type: crate::HistoryEventType::ChildWorkflowFailed,
         data: HistoryEventData::ChildWorkflowFailed(crate::ChildWorkflowFailed {
             command_id: command_id.clone(),
             failure,
@@ -2190,7 +2300,6 @@ fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: Histo
     let new_run_id = RunId::new(format!("run-{}", state.next_run_id));
     let start = HistoryEvent {
         event_id: EventId(1),
-        event_type: crate::HistoryEventType::WorkflowStarted,
         data: HistoryEventData::WorkflowStarted {
             workflow_type: workflow_type.clone(),
             input,
@@ -2262,11 +2371,7 @@ fn notify_parent_of_child_terminal(
     else {
         return Ok(());
     };
-    parent_run.push_history(HistoryEvent {
-        event_id,
-        event_type: data.event_type(),
-        data,
-    });
+    parent_run.push_history(HistoryEvent { event_id, data });
     parent_run.ready = Some(reason);
     parent_run.ready_at = None;
     Ok(())
@@ -2292,16 +2397,14 @@ fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
     let children = state
         .runs
         .iter()
-        .filter_map(|(run_id, run)| {
-            run.parent
-                .as_ref()
-                .is_some_and(|parent| {
-                    parent.parent_run_id == *parent_run_id
-                        && parent.parent_close_policy == ParentClosePolicy::Cancel
-                        && !run.terminal
-                })
-                .then(|| run_id.clone())
+        .filter(|&(_run_id, run)| {
+            run.parent.as_ref().is_some_and(|parent| {
+                parent.parent_run_id == *parent_run_id
+                    && parent.parent_close_policy == ParentClosePolicy::Cancel
+                    && !run.terminal
+            })
         })
+        .map(|(run_id, _run)| run_id.clone())
         .collect::<Vec<_>>();
     for child_run_id in children {
         let terminal_event = HistoryEventData::WorkflowCancelled {
@@ -2315,7 +2418,6 @@ fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
                 .unwrap_or(EventId(1));
             child.push_history(HistoryEvent {
                 event_id,
-                event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: terminal_event.clone(),
             });
             child.terminal = true;
@@ -2557,9 +2659,8 @@ fn complete_map(
         }
     };
 
-    let (event_type, data, reason) = match kind {
+    let (data, reason) = match kind {
         MapKind::Activity => (
-            crate::HistoryEventType::ActivityMapCompleted,
             HistoryEventData::ActivityMapCompleted(crate::ActivityMapCompleted {
                 command_id: map_command_id.clone(),
                 result_manifest,
@@ -2570,7 +2671,6 @@ fn complete_map(
             WorkflowTaskReason::ActivityMapCompleted,
         ),
         MapKind::ChildWorkflow => (
-            crate::HistoryEventType::ChildWorkflowMapCompleted,
             HistoryEventData::ChildWorkflowMapCompleted(crate::ChildWorkflowMapCompleted {
                 command_id: map_command_id.clone(),
                 result_manifest,
@@ -2582,7 +2682,7 @@ fn complete_map(
             WorkflowTaskReason::ChildWorkflowMapCompleted,
         ),
     };
-    append_map_terminal_event(state, &map_command_id.run_id, event_type, data, reason)
+    append_map_terminal_event(state, &map_command_id.run_id, data, reason)
 }
 
 /// [`MapEffect::FailMap`]: append the terminal failure fact to the parent and
@@ -2595,9 +2695,8 @@ fn fail_map(
     failure: crate::DurableFailure,
 ) -> Result<EventId> {
     let failure = normalize_failure_for_storage(state, config, failure)?;
-    let (event_type, data, reason) = match kind {
+    let (data, reason) = match kind {
         MapKind::Activity => (
-            crate::HistoryEventType::ActivityMapFailed,
             HistoryEventData::ActivityMapFailed(crate::ActivityMapFailed {
                 command_id: map_command_id.clone(),
                 failure,
@@ -2605,7 +2704,6 @@ fn fail_map(
             WorkflowTaskReason::ActivityMapFailed,
         ),
         MapKind::ChildWorkflow => (
-            crate::HistoryEventType::ChildWorkflowMapFailed,
             HistoryEventData::ChildWorkflowMapFailed(crate::ChildWorkflowMapFailed {
                 command_id: map_command_id.clone(),
                 failure,
@@ -2613,7 +2711,7 @@ fn fail_map(
             WorkflowTaskReason::ChildWorkflowMapFailed,
         ),
     };
-    append_map_terminal_event(state, &map_command_id.run_id, event_type, data, reason)
+    append_map_terminal_event(state, &map_command_id.run_id, data, reason)
 }
 
 /// Append a terminal map fact to the parent and mark it ready. The engine has
@@ -2622,7 +2720,6 @@ fn fail_map(
 fn append_map_terminal_event(
     state: &mut MemoryState,
     run_id: &RunId,
-    event_type: crate::HistoryEventType,
     data: HistoryEventData,
     reason: WorkflowTaskReason,
 ) -> Result<EventId> {
@@ -2637,11 +2734,7 @@ fn append_map_terminal_event(
         .last()
         .map(|event| event.event_id.next())
         .unwrap_or(EventId(1));
-    parent.push_history(HistoryEvent {
-        event_id,
-        event_type,
-        data,
-    });
+    parent.push_history(HistoryEvent { event_id, data });
     parent.ready = Some(reason);
     parent.ready_at = None;
     Ok(event_id)
@@ -2677,7 +2770,6 @@ fn cancel_child_workflow_map_children(
                 .unwrap_or(EventId(1));
             child.push_history(HistoryEvent {
                 event_id,
-                event_type: crate::HistoryEventType::WorkflowCancelled,
                 data: HistoryEventData::WorkflowCancelled {
                     reason: reason.to_owned(),
                 },
@@ -2814,9 +2906,18 @@ fn fail_map_item(
         },
     )?;
     match (decision, appended) {
-        (ItemRetryDecision::Retry { next_attempt }, _) => {
-            Ok(FailActivityOutcome::RetryScheduled { next_attempt })
-        }
+        // A timed-out attempt retries at once; a failed one waits out the
+        // policy's backoff, as `MapEffect::ScheduleItemRetry` schedules them.
+        (ItemRetryDecision::Retry { next_attempt }, _) => Ok(FailActivityOutcome::RetryScheduled {
+            next_attempt,
+            ready_at: if kind == ItemAttemptFailureKind::TimedOut {
+                now
+            } else {
+                retry_visible_at_ms(&task.retry_policy, task.attempt, now)
+                    .map(TimestampMs)
+                    .unwrap_or(now)
+            },
+        }),
         (ItemRetryDecision::Exhausted, Some(event_id)) => {
             Ok(FailActivityOutcome::Failed { event_id })
         }
@@ -2856,13 +2957,14 @@ fn timeout_activity(
         // failure, and it is the only thing that knows whether the map is over.
         if task.map_item.is_none() {
             if let ActivityFailureDecision::Retry { next_attempt } = decision {
-                // Timeout retries carry no backoff: the expired deadline already
-                // paced this attempt, and delaying crash recovery further would
-                // only add latency.
+                // The stored policy paces a timed-out attempt's retry the way
+                // it paces a failed one, and the start-to-close clock restarts
+                // when the retry becomes visible.
+                let visible_at = retry_visible_at_ms(&task.retry_policy, task.attempt, now);
                 record.task.attempt = next_attempt;
                 record.claim = None;
-                record.visible_at = None;
-                record.timeout_at = activity_timeout_at(now, record.task.start_to_close_timeout);
+                record.visible_at = visible_at.map(TimestampMs);
+                record.timeout_at = None;
                 record.heartbeat_deadline_at = None;
                 record.implicit_heartbeat_ms = None;
                 return Ok(true);
@@ -2908,7 +3010,6 @@ fn timeout_activity(
         .unwrap_or(EventId(1));
     run.push_history(HistoryEvent {
         event_id,
-        event_type: crate::HistoryEventType::ActivityTimedOut,
         data: HistoryEventData::ActivityTimedOut(crate::ActivityTimedOut {
             command_id: timed_out_task.command_id,
             message: timeout_message(activity_id, timed_out_task.attempt, attribution),
@@ -2958,64 +3059,100 @@ fn collect_reachable_payload_blobs(
     state: &MemoryState,
     reachable: &mut BTreeSet<String>,
 ) -> Result<()> {
+    let mut load = |payload: &PayloadRef| -> Result<Option<PayloadRef>> {
+        if is_external_payload_ref(payload) {
+            Ok(None)
+        } else {
+            hydrate_payload_from_storage(state, payload.clone()).map(Some)
+        }
+    };
+    let mut mark = |payload: &PayloadRef| collect_payload_blob_ref(state, payload, reachable);
     for run in state.runs.values() {
         for event in &run.history {
-            collect_history_event_payload_blobs(state, &event.data, reachable)?;
+            crate::payload::history_event_payload_refs(&event.data, &mut load, &mut mark)?;
         }
     }
     for record in state.activities.values() {
-        collect_payload_blob_ref(state, &record.task.input, reachable)?;
+        mark(&record.task.input)?;
     }
     for map in state.activity_maps.values() {
-        collect_activity_map_input_manifest_ref(state, &map.task.input_manifest, reachable)?;
-        collect_activity_map_input_manifest(state, &map.input_manifest, reachable)?;
+        for payload in crate::payload::manifest_refs(
+            ManifestKind::ActivityMapInput,
+            &map.task.input_manifest,
+            &mut load,
+        )? {
+            mark(&payload)?;
+        }
+        for payload in crate::payload::input_manifest_page_refs(&map.input_manifest, &mut load)? {
+            mark(&payload)?;
+        }
         for result in map.results.values() {
-            collect_payload_blob_ref(state, result, reachable)?;
+            mark(result)?;
         }
     }
     for map in state.child_workflow_maps.values() {
-        collect_activity_map_input_manifest_ref(state, &map.task.input_manifest, reachable)?;
-        collect_activity_map_input_manifest(state, &map.input_manifest, reachable)?;
+        for payload in crate::payload::manifest_refs(
+            ManifestKind::ActivityMapInput,
+            &map.task.input_manifest,
+            &mut load,
+        )? {
+            mark(&payload)?;
+        }
+        for payload in crate::payload::input_manifest_page_refs(&map.input_manifest, &mut load)? {
+            mark(&payload)?;
+        }
         for outcome in map.outcomes.values() {
-            collect_child_workflow_map_outcome_payload_blobs(state, outcome, reachable)?;
+            if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(outcome) {
+                mark(payload)?;
+            }
         }
     }
     for record in state.child_outbox.values() {
-        collect_payload_blob_ref(state, &record.message.input, reachable)?;
+        mark(&record.message.input)?;
     }
     for signal in state.signals.values() {
-        collect_payload_blob_ref(state, &signal.payload, reachable)?;
+        mark(&signal.payload)?;
     }
     for projection in state.query_projections.values() {
-        collect_payload_blob_ref(state, &projection.payload, reachable)?;
+        mark(&projection.payload)?;
     }
     Ok(())
 }
 
 fn collect_payload_roots(state: &MemoryState) -> Result<Vec<PayloadRootRef>> {
     let mut roots = Vec::new();
+    let mut hydrate_manifest =
+        |kind: ManifestKind, payload: &PayloadRef| hydrate_manifest_root(state, kind, payload);
     for run in state.runs.values() {
         for event in &run.history {
-            collect_history_event_payload_roots(state, &event.data, &mut roots)?;
+            crate::payload::history_event_payload_roots(
+                &event.data,
+                &mut roots,
+                &mut hydrate_manifest,
+            )?;
         }
     }
     for record in state.activities.values() {
         roots.push(PayloadRootRef::Payload(record.task.input.clone()));
     }
     for map in state.activity_maps.values() {
-        roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(state, &map.task.input_manifest)?,
-        ));
+        roots.push(PayloadRootRef::ActivityMapInputManifest(hydrate_manifest(
+            ManifestKind::ActivityMapInput,
+            &map.task.input_manifest,
+        )?));
         for result in map.results.values() {
             roots.push(PayloadRootRef::Payload(result.clone()));
         }
     }
     for map in state.child_workflow_maps.values() {
-        roots.push(PayloadRootRef::ActivityMapInputManifest(
-            activity_map_input_root_for_roots(state, &map.task.input_manifest)?,
-        ));
+        roots.push(PayloadRootRef::ActivityMapInputManifest(hydrate_manifest(
+            ManifestKind::ActivityMapInput,
+            &map.task.input_manifest,
+        )?));
         for outcome in map.outcomes.values() {
-            collect_child_workflow_map_outcome_payload_roots(outcome, &mut roots);
+            if let Some(payload) = crate::payload::child_workflow_map_outcome_payload(outcome) {
+                roots.push(PayloadRootRef::Payload(payload.clone()));
+            }
         }
     }
     for record in state.child_outbox.values() {
@@ -3030,207 +3167,26 @@ fn collect_payload_roots(state: &MemoryState) -> Result<Vec<PayloadRootRef>> {
     Ok(roots)
 }
 
-fn collect_history_event_payload_roots(
+/// A manifest root with its bytes in place when this provider holds them.
+fn hydrate_manifest_root(
     state: &MemoryState,
-    data: &HistoryEventData,
-    roots: &mut Vec<PayloadRootRef>,
-) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            roots.push(PayloadRootRef::Payload(input.clone()));
-        }
-        HistoryEventData::WorkflowCompleted { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
-        }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_roots(failure, roots);
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            roots.push(PayloadRootRef::Payload(scheduled.input.clone()));
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(state, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ActivityMapResultManifest(
-                activity_map_result_root_for_roots(state, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            roots.push(PayloadRootRef::ActivityMapInputManifest(
-                activity_map_input_root_for_roots(state, &scheduled.input_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            roots.push(PayloadRootRef::ChildWorkflowMapResultManifest(
-                child_workflow_map_result_root_for_roots(state, &completed.result_manifest)?,
-            ));
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            roots.push(PayloadRootRef::Payload(requested.input.clone()));
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            roots.push(PayloadRootRef::Payload(completed.result.clone()));
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_roots(&failed.failure, roots);
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            roots.push(PayloadRootRef::Payload(signal.payload.clone()));
-        }
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)?;
-        }
-        HistoryEventData::WorkflowCancelled { .. }
-        | HistoryEventData::WorkflowTaskStarted
-        | HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => {}
-    }
-    Ok(())
-}
-
-fn collect_failure_payload_roots(failure: &crate::DurableFailure, roots: &mut Vec<PayloadRootRef>) {
-    if let Some(details) = &failure.details {
-        roots.push(PayloadRootRef::Payload(details.clone()));
-    }
-}
-
-fn activity_map_input_root_for_roots(
-    state: &MemoryState,
+    kind: ManifestKind,
     payload: &PayloadRef,
 ) -> Result<PayloadRef> {
     if is_external_payload_ref(payload) {
         return Ok(payload.clone());
     }
-    hydrate_activity_map_input_manifest_from_storage(state, payload.clone())
-}
-
-fn activity_map_result_root_for_roots(
-    state: &MemoryState,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_activity_map_result_manifest_from_storage(state, payload.clone())
-}
-
-fn child_workflow_map_result_root_for_roots(
-    state: &MemoryState,
-    payload: &PayloadRef,
-) -> Result<PayloadRef> {
-    if is_external_payload_ref(payload) {
-        return Ok(payload.clone());
-    }
-    hydrate_child_workflow_map_result_manifest_from_storage(state, payload.clone())
-}
-
-fn collect_history_event_payload_blobs(
-    state: &MemoryState,
-    data: &HistoryEventData,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    match data {
-        HistoryEventData::WorkflowStarted { input, .. }
-        | HistoryEventData::WorkflowContinuedAsNew { input } => {
-            collect_payload_blob_ref(state, input, reachable)
+    match kind {
+        ManifestKind::ActivityMapInput => {
+            hydrate_activity_map_input_manifest_from_storage(state, payload.clone())
         }
-        HistoryEventData::WorkflowCompleted { result } => {
-            collect_payload_blob_ref(state, result, reachable)
+        ManifestKind::ActivityMapResult => {
+            hydrate_activity_map_result_manifest_from_storage(state, payload.clone())
         }
-        HistoryEventData::WorkflowFailed { failure } => {
-            collect_failure_payload_blobs(state, failure, reachable)
-        }
-        HistoryEventData::WorkflowCancelled { .. } | HistoryEventData::WorkflowTaskStarted => {
-            Ok(())
-        }
-        HistoryEventData::ActivityScheduled(scheduled) => {
-            collect_payload_blob_ref(state, &scheduled.input, reachable)
-        }
-        HistoryEventData::ActivityMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(state, &scheduled.input_manifest, reachable)
-        }
-        HistoryEventData::ActivityMapCompleted(completed) => {
-            collect_activity_map_result_manifest_ref(state, &completed.result_manifest, reachable)
-        }
-        HistoryEventData::ActivityMapFailed(failed) => {
-            collect_failure_payload_blobs(state, &failed.failure, reachable)
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(scheduled) => {
-            collect_activity_map_input_manifest_ref(state, &scheduled.input_manifest, reachable)
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(completed) => {
-            collect_child_workflow_map_result_manifest_ref(
-                state,
-                &completed.result_manifest,
-                reachable,
-            )
-        }
-        HistoryEventData::ChildWorkflowMapFailed(failed) => {
-            collect_failure_payload_blobs(state, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityCompleted(completed) => {
-            collect_payload_blob_ref(state, &completed.result, reachable)
-        }
-        HistoryEventData::ActivityFailed(failed) => {
-            collect_failure_payload_blobs(state, &failed.failure, reachable)
-        }
-        HistoryEventData::ActivityTimedOut(_)
-        | HistoryEventData::ChildWorkflowStarted(_)
-        | HistoryEventData::ChildWorkflowCancelled(_)
-        | HistoryEventData::TimerStarted(_)
-        | HistoryEventData::TimerFired(_)
-        | HistoryEventData::SelectWinner(_)
-        | HistoryEventData::VersionMarker(_)
-        | HistoryEventData::DeprecatedPatchMarker(_) => Ok(()),
-        HistoryEventData::SideEffectMarker(marker) => {
-            crate::payload::validate_side_effect_marker(marker)
-        }
-        HistoryEventData::ChildWorkflowStartRequested(requested) => {
-            collect_payload_blob_ref(state, &requested.input, reachable)
-        }
-        HistoryEventData::ChildWorkflowCompleted(completed) => {
-            collect_payload_blob_ref(state, &completed.result, reachable)
-        }
-        HistoryEventData::ChildWorkflowFailed(failed) => {
-            collect_failure_payload_blobs(state, &failed.failure, reachable)
-        }
-        HistoryEventData::SignalConsumed(signal) => {
-            collect_payload_blob_ref(state, &signal.payload, reachable)
+        ManifestKind::ChildWorkflowMapResult => {
+            hydrate_child_workflow_map_result_manifest_from_storage(state, payload.clone())
         }
     }
-}
-
-fn collect_failure_payload_blobs(
-    state: &MemoryState,
-    failure: &crate::DurableFailure,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    if let Some(details) = &failure.details {
-        collect_payload_blob_ref(state, details, reachable)?;
-    }
-    Ok(())
 }
 
 fn collect_payload_blob_ref(
@@ -3245,120 +3201,6 @@ fn collect_payload_blob_ref(
         reachable.insert(digest.clone());
     }
     Ok(())
-}
-
-fn collect_activity_map_input_manifest_ref(
-    state: &MemoryState,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(state, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
-    let manifest: ActivityMapInputManifest = crate::decode_payload(&manifest_payload)?;
-    collect_activity_map_input_manifest(state, &manifest, reachable)
-}
-
-fn collect_activity_map_input_manifest(
-    state: &MemoryState,
-    manifest: &ActivityMapInputManifest,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    for page in &manifest.pages {
-        collect_payload_blob_ref(state, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
-        let page: ActivityMapInputPage = crate::decode_payload(&page_payload)?;
-        for item in &page.items {
-            collect_payload_blob_ref(state, item, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_activity_map_result_manifest_ref(
-    state: &MemoryState,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(state, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
-    let manifest: ActivityMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(state, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
-        let page: ActivityMapResultPage = crate::decode_payload(&page_payload)?;
-        for result in &page.results {
-            collect_payload_blob_ref(state, result, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_result_manifest_ref(
-    state: &MemoryState,
-    payload: &PayloadRef,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    collect_payload_blob_ref(state, payload, reachable)?;
-    if is_external_payload_ref(payload) {
-        return Ok(());
-    }
-    let manifest_payload = hydrate_payload_from_storage(state, payload.clone())?;
-    let manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&manifest_payload)?;
-    for page in &manifest.pages {
-        collect_payload_blob_ref(state, page, reachable)?;
-        if is_external_payload_ref(page) {
-            continue;
-        }
-        let page_payload = hydrate_payload_from_storage(state, page.clone())?;
-        let page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page_payload)?;
-        for outcome in &page.outcomes {
-            collect_child_workflow_map_outcome_payload_blobs(state, outcome, reachable)?;
-        }
-    }
-    Ok(())
-}
-
-fn collect_child_workflow_map_outcome_payload_roots(
-    outcome: &ChildWorkflowMapItemOutcome,
-    roots: &mut Vec<PayloadRootRef>,
-) {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            roots.push(PayloadRootRef::Payload(result.clone()));
-        }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_roots(failure, roots);
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => {}
-    }
-}
-
-fn collect_child_workflow_map_outcome_payload_blobs(
-    state: &MemoryState,
-    outcome: &ChildWorkflowMapItemOutcome,
-    reachable: &mut BTreeSet<String>,
-) -> Result<()> {
-    match outcome {
-        ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            collect_payload_blob_ref(state, result, reachable)
-        }
-        ChildWorkflowMapItemOutcome::Failed { failure } => {
-            collect_failure_payload_blobs(state, failure, reachable)
-        }
-        ChildWorkflowMapItemOutcome::Cancelled { .. } => Ok(()),
-    }
 }
 
 fn normalize_history_event_for_storage(
@@ -4098,7 +3940,7 @@ mod tests {
             let item0 = state.runs.get(&item0_run_id).expect("item 0 run");
             assert!(item0.terminal);
             assert!(matches!(
-                item0.history.last().map(|event| event.event_type),
+                item0.history.last().map(|event| event.event_type()),
                 Some(crate::HistoryEventType::WorkflowCancelled)
             ));
             // ...and so is the half that used to be skipped.
@@ -4108,7 +3950,7 @@ mod tests {
                 "a routing failure must not leave the closed run's own children running"
             );
             assert!(matches!(
-                grandchild.history.last().map(|event| event.event_type),
+                grandchild.history.last().map(|event| event.event_type()),
                 Some(crate::HistoryEventType::WorkflowCancelled)
             ));
         });

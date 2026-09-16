@@ -1,35 +1,29 @@
 {
   "note": [
-    "The shared map-fanout transition table. One artefact, two runners, so the",
-    "Rust and TypeScript map engines cannot drift apart silently.",
+    "The shared map-fanout transition table. One artefact, two runners for the",
+    "provider-level cases, so the Rust map engine and the TypeScript worker over",
+    "it cannot drift apart silently.",
     "",
     "`transitions` are single-step engine cases: descriptor state plus one",
-    "event in, an ordered effect list or a rejection out. The TypeScript runner",
-    "(packages/core/test/map-engine.test.ts) drives them straight through",
-    "map-engine.ts's `step`. The Rust engine is a private module (`mod",
-    "map_engine;` in src/lib.rs, `pub(crate)` items), so an integration test in",
-    "tests/ cannot call `step` at all; the Rust runner therefore asserts the",
-    "`fanouts` section instead. See `rustRunnerBlocker` below.",
+    "event in, an ordered effect list or a rejection out. The map engine lives",
+    "in Rust, so their runner is tests/map_transitions.rs, which drives them",
+    "through `durust::map_engine::step`, a `#[doc(hidden)]` module exposed for",
+    "that runner, and projects every effect onto the fields the table names.",
     "",
     "`fanouts` are scripted whole-fanout cases expressed only in terms of the",
-    "public provider API — claim an item, complete it, fail it, read the",
-    "parent's history. Both runtimes execute every one of them against their",
-    "own providers, so this section is the part that is genuinely asserted on",
-    "both sides today."
+    "public provider API \u2014 claim an item, complete it, fail it, read the",
+    "parent's history. Both runtimes execute every one of them: the Rust runner",
+    "over its providers, and packages/core/test/map-fanouts.test.ts over the Rust",
+    "memory provider through @durust/native under the TypeScript contract."
   ],
-  "rustRunnerBlocker": {
-    "what": "tests/map_transitions.rs cannot assert the `transitions` section.",
-    "why": "src/map_engine.rs is a private module with pub(crate) items, and a Cargo integration test only sees the crate's public API.",
-    "unblock": "Expose the engine to tests — `#[cfg(test)] pub use map_engine::...` or a `pub mod map_engine` behind a test-only feature in src/lib.rs — after which the Rust runner is the same table walk the TypeScript one already performs."
-  },
   "exclusions": [
     {
       "what": "ScheduleItemRetry.visibleAtMs and .timeoutAtMs values",
-      "why": "The two runtimes have different retry-policy models — RetryBackoff::{None,Exponential} over a fixed base in Rust, initialIntervalMs/maxIntervalMs/backoffCoefficient in TypeScript — that share no encoding, so numeric parity is impossible. Only the shape is normative and is asserted: `visibleAtMs === null` means immediately claimable, and a timed-out attempt always yields null. Cases carry `visibleAtMs` as \"Null\" or \"Deferred\" and `timeoutAtMs` as \"Null\" or \"Present\" rather than as numbers."
+      "why": "Both runtimes carry the same retry-policy fields (initialIntervalMs, maxIntervalMs, backoffCoefficient, maxAttempts) and Rust's `retry_delay_ms` computes the same delay, but the table asserts the shape only: `visibleAtMs === null` means immediately claimable, a timed-out attempt always yields null, and cases carry `visibleAtMs` as \"Null\" or \"Deferred\" and `timeoutAtMs` as \"Null\" or \"Present\" rather than as numbers. The delays themselves are pinned by the provider conformance scenarios (`memory_timeout_retry_becomes_visible_after_the_policy_backoff` and the map-item pacing scenarios) rather than by this table."
     },
     {
       "what": "The ParentCancelled event",
-      "why": "Both runtimes now drive it from WorkflowTaskCommit::cancel_commands / cancelCommands, and both emit the same two effects, so the exclusion is no longer about reachability. It stays because the transition is only half the behaviour: cancelling a child map must also cancel the children it already started, and that is deliberately not a step effect — the other producer, a run reaching a terminal event, must leave its children to the parentClosePolicy path, which is free to abandon them. Each provider therefore pairs ParentCancelled with its own child cancellation, and a table that asserted only the effect list would pin the half that agrees and say nothing about the half that matters. Each engine's own unit tests cover the transition."
+      "why": "Both runtimes now drive it from WorkflowTaskCommit::cancel_commands / cancelCommands, and both emit the same two effects, so the exclusion is no longer about reachability. It stays because the transition is only half the behaviour: cancelling a child map must also cancel the children it already started, and that is deliberately not a step effect \u2014 the other producer, a run reaching a terminal event, must leave its children to the parentClosePolicy path, which is free to abandon them. Each provider therefore pairs ParentCancelled with its own child cancellation, and a table that asserted only the effect list would pin the half that agrees and say nothing about the half that matters. Each engine's own unit tests cover the transition."
     }
   ],
   "transitions": [
@@ -45,12 +39,23 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 2 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 2, "inFlight": 2 }
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 0,
+            "count": 2
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 2,
+            "inFlight": 2
+          }
         ]
       }
     },
@@ -66,12 +71,23 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 2 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 2, "inFlight": 2 }
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 0,
+            "count": 2
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 2,
+            "inFlight": 2
+          }
         ]
       }
     },
@@ -87,12 +103,23 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MaterializeItems", "firstOrdinal": 0, "count": 1 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 1, "inFlight": 1 }
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 0,
+            "count": 1
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 1,
+            "inFlight": 1
+          }
         ]
       }
     },
@@ -108,8 +135,14 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
-      "expect": { "kind": "Effects", "effects": [] }
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
+      "expect": {
+        "kind": "Effects",
+        "effects": []
+      }
     },
     {
       "name": "an empty manifest is terminal at descriptor creation",
@@ -123,12 +156,20 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "CompleteMap", "itemCount": 0 },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "CompleteMap",
+            "itemCount": 0
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -144,12 +185,20 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": false },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": false
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "CompleteMap", "itemCount": 0 },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "CompleteMap",
+            "itemCount": 0
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -165,11 +214,16 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": true },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": true
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -185,11 +239,16 @@
         "recordedOutcomes": 0,
         "completed": false
       },
-      "event": { "kind": "DescriptorCreated", "parentTerminal": true },
+      "event": {
+        "kind": "DescriptorCreated",
+        "parentTerminal": true
+      },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -208,15 +267,25 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 0,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 2,
+            "count": 1
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 3,
+            "inFlight": 2
+          }
         ]
       }
     },
@@ -235,16 +304,32 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Succeeded" } },
-          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+          {
+            "kind": "RecordItemOutcome",
+            "ordinal": 1,
+            "outcome": {
+              "kind": "Succeeded"
+            }
+          },
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 2,
+            "count": 1
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 3,
+            "inFlight": 2
+          }
         ]
       }
     },
@@ -263,15 +348,22 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 2,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "CompleteMap", "itemCount": 3 },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "CompleteMap",
+            "itemCount": 3
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -290,11 +382,16 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
-      "expect": { "kind": "Effects", "effects": [] }
+      "expect": {
+        "kind": "Effects",
+        "effects": []
+      }
     },
     {
       "name": "a duplicate terminal outcome records nothing and releases no slot",
@@ -311,11 +408,16 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 0,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": true,
         "parentTerminal": false
       },
-      "expect": { "kind": "Effects", "effects": [] }
+      "expect": {
+        "kind": "Effects",
+        "effects": []
+      }
     },
     {
       "name": "a fail-fast child map stops on the first non-success, cancels its children, and abandons the rest",
@@ -332,18 +434,34 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 0,
-        "outcome": { "kind": "Failed" },
+        "outcome": {
+          "kind": "Failed"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "RecordItemOutcome", "ordinal": 0, "outcome": { "kind": "Failed" } },
-          { "kind": "FailMap" },
-          { "kind": "AbandonPendingItems" },
-          { "kind": "CancelChildren" },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "RecordItemOutcome",
+            "ordinal": 0,
+            "outcome": {
+              "kind": "Failed"
+            }
+          },
+          {
+            "kind": "FailMap"
+          },
+          {
+            "kind": "AbandonPendingItems"
+          },
+          {
+            "kind": "CancelChildren"
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -362,16 +480,32 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 0,
-        "outcome": { "kind": "Failed" },
+        "outcome": {
+          "kind": "Failed"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "RecordItemOutcome", "ordinal": 0, "outcome": { "kind": "Failed" } },
-          { "kind": "MaterializeItems", "firstOrdinal": 2, "count": 1 },
-          { "kind": "AdvanceDescriptor", "nextOrdinal": 3, "inFlight": 2 }
+          {
+            "kind": "RecordItemOutcome",
+            "ordinal": 0,
+            "outcome": {
+              "kind": "Failed"
+            }
+          },
+          {
+            "kind": "MaterializeItems",
+            "firstOrdinal": 2,
+            "count": 1
+          },
+          {
+            "kind": "AdvanceDescriptor",
+            "nextOrdinal": 3,
+            "inFlight": 2
+          }
         ]
       }
     },
@@ -390,16 +524,29 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Cancelled" },
+        "outcome": {
+          "kind": "Cancelled"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Cancelled" } },
-          { "kind": "CompleteMap", "itemCount": 2 },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "RecordItemOutcome",
+            "ordinal": 1,
+            "outcome": {
+              "kind": "Cancelled"
+            }
+          },
+          {
+            "kind": "CompleteMap",
+            "itemCount": 2
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -418,16 +565,24 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Failed" },
+        "outcome": {
+          "kind": "Failed"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "FailMap" },
-          { "kind": "AbandonPendingItems" },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "FailMap"
+          },
+          {
+            "kind": "AbandonPendingItems"
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -447,7 +602,10 @@
         "kind": "ItemAttemptFailed",
         "ordinal": 0,
         "attemptFailure": "Failed",
-        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "decision": {
+          "kind": "Retry",
+          "nextAttempt": 2
+        },
         "failedAttempt": 1,
         "retryBackoff": "Deferred",
         "startToCloseTimeout": "Present",
@@ -483,7 +641,10 @@
         "kind": "ItemAttemptFailed",
         "ordinal": 1,
         "attemptFailure": "TimedOut",
-        "decision": { "kind": "Retry", "nextAttempt": 3 },
+        "decision": {
+          "kind": "Retry",
+          "nextAttempt": 3
+        },
         "failedAttempt": 2,
         "retryBackoff": "Deferred",
         "startToCloseTimeout": "Null",
@@ -519,7 +680,10 @@
         "kind": "ItemAttemptFailed",
         "ordinal": 0,
         "attemptFailure": "Failed",
-        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "decision": {
+          "kind": "Retry",
+          "nextAttempt": 2
+        },
         "failedAttempt": 1,
         "retryBackoff": "Immediate",
         "startToCloseTimeout": "Null",
@@ -555,7 +719,9 @@
         "kind": "ItemAttemptFailed",
         "ordinal": 0,
         "attemptFailure": "Failed",
-        "decision": { "kind": "Exhausted" },
+        "decision": {
+          "kind": "Exhausted"
+        },
         "failedAttempt": 3,
         "retryBackoff": "Deferred",
         "startToCloseTimeout": "Present",
@@ -565,9 +731,15 @@
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "FailMap" },
-          { "kind": "AbandonPendingItems" },
-          { "kind": "MarkDescriptorTerminal" }
+          {
+            "kind": "FailMap"
+          },
+          {
+            "kind": "AbandonPendingItems"
+          },
+          {
+            "kind": "MarkDescriptorTerminal"
+          }
         ]
       }
     },
@@ -586,11 +758,16 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 2,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
-      "expect": { "kind": "Effects", "effects": [] }
+      "expect": {
+        "kind": "Effects",
+        "effects": []
+      }
     },
     {
       "name": "terminal is absorbing even for an out-of-bounds ordinal",
@@ -607,11 +784,16 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 7,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
-      "expect": { "kind": "Effects", "effects": [] }
+      "expect": {
+        "kind": "Effects",
+        "effects": []
+      }
     },
     {
       "name": "an ordinal outside the input manifest rejects the whole transition",
@@ -628,11 +810,19 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 2,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": false
       },
-      "expect": { "kind": "Reject", "reject": { "kind": "OutOfBounds", "ordinal": 2 } }
+      "expect": {
+        "kind": "Reject",
+        "reject": {
+          "kind": "OutOfBounds",
+          "ordinal": 2
+        }
+      }
     },
     {
       "name": "an out-of-bounds attempt failure rejects before the retry verdict is read",
@@ -650,14 +840,23 @@
         "kind": "ItemAttemptFailed",
         "ordinal": 5,
         "attemptFailure": "Failed",
-        "decision": { "kind": "Retry", "nextAttempt": 2 },
+        "decision": {
+          "kind": "Retry",
+          "nextAttempt": 2
+        },
         "failedAttempt": 1,
         "retryBackoff": "Deferred",
         "startToCloseTimeout": "Null",
         "alreadyRecorded": false,
         "parentTerminal": false
       },
-      "expect": { "kind": "Reject", "reject": { "kind": "OutOfBounds", "ordinal": 5 } }
+      "expect": {
+        "kind": "Reject",
+        "reject": {
+          "kind": "OutOfBounds",
+          "ordinal": 5
+        }
+      }
     },
     {
       "name": "an activity map rejects a completion whose parent run is already closed",
@@ -674,11 +873,18 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": true
       },
-      "expect": { "kind": "Reject", "reject": { "kind": "TerminalParent" } }
+      "expect": {
+        "kind": "Reject",
+        "reject": {
+          "kind": "TerminalParent"
+        }
+      }
     },
     {
       "name": "a child map keeps the outcome row and drops the notification when the parent is closed",
@@ -695,14 +901,22 @@
       "event": {
         "kind": "ItemCompleted",
         "ordinal": 1,
-        "outcome": { "kind": "Succeeded" },
+        "outcome": {
+          "kind": "Succeeded"
+        },
         "alreadyRecorded": false,
         "parentTerminal": true
       },
       "expect": {
         "kind": "Effects",
         "effects": [
-          { "kind": "RecordItemOutcome", "ordinal": 1, "outcome": { "kind": "Succeeded" } }
+          {
+            "kind": "RecordItemOutcome",
+            "ordinal": 1,
+            "outcome": {
+              "kind": "Succeeded"
+            }
+          }
         ]
       }
     }
@@ -713,62 +927,156 @@
       "itemCount": 3,
       "maxInFlight": 2,
       "steps": [
-        { "action": "claim", "ordinal": 0 },
-        { "action": "claim", "ordinal": 1 },
-        { "action": "claim", "ordinal": null },
-        { "action": "complete", "ordinal": 0 },
-        { "action": "claim", "ordinal": 2 },
-        { "action": "claim", "ordinal": null },
-        { "action": "complete", "ordinal": 1 },
-        { "action": "complete", "ordinal": 2 }
+        {
+          "action": "claim",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": 1
+        },
+        {
+          "action": "claim",
+          "ordinal": null
+        },
+        {
+          "action": "complete",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": 2
+        },
+        {
+          "action": "claim",
+          "ordinal": null
+        },
+        {
+          "action": "complete",
+          "ordinal": 1
+        },
+        {
+          "action": "complete",
+          "ordinal": 2
+        }
       ],
-      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+      "parentHistory": [
+        "WorkflowStarted",
+        "ActivityMapScheduled",
+        "ActivityMapCompleted"
+      ]
     },
     {
       "name": "a bound of one is strictly sequential",
       "itemCount": 2,
       "maxInFlight": 1,
       "steps": [
-        { "action": "claim", "ordinal": 0 },
-        { "action": "claim", "ordinal": null },
-        { "action": "complete", "ordinal": 0 },
-        { "action": "claim", "ordinal": 1 },
-        { "action": "complete", "ordinal": 1 }
+        {
+          "action": "claim",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": null
+        },
+        {
+          "action": "complete",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": 1
+        },
+        {
+          "action": "complete",
+          "ordinal": 1
+        }
       ],
-      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+      "parentHistory": [
+        "WorkflowStarted",
+        "ActivityMapScheduled",
+        "ActivityMapCompleted"
+      ]
     },
     {
       "name": "a bound larger than the manifest admits every item at once and no more",
       "itemCount": 2,
       "maxInFlight": 5,
       "steps": [
-        { "action": "claim", "ordinal": 0 },
-        { "action": "claim", "ordinal": 1 },
-        { "action": "claim", "ordinal": null },
-        { "action": "complete", "ordinal": 0 },
-        { "action": "complete", "ordinal": 1 }
+        {
+          "action": "claim",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": 1
+        },
+        {
+          "action": "claim",
+          "ordinal": null
+        },
+        {
+          "action": "complete",
+          "ordinal": 0
+        },
+        {
+          "action": "complete",
+          "ordinal": 1
+        }
       ],
-      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+      "parentHistory": [
+        "WorkflowStarted",
+        "ActivityMapScheduled",
+        "ActivityMapCompleted"
+      ]
     },
     {
       "name": "an exhausted item fails the map, abandons its siblings, and admits nothing further",
       "itemCount": 3,
       "maxInFlight": 2,
       "steps": [
-        { "action": "claim", "ordinal": 0 },
-        { "action": "claim", "ordinal": 1 },
-        { "action": "fail", "ordinal": 0 },
-        { "action": "completeAbandoned", "ordinal": 1 },
-        { "action": "claim", "ordinal": null }
+        {
+          "action": "claim",
+          "ordinal": 0
+        },
+        {
+          "action": "claim",
+          "ordinal": 1
+        },
+        {
+          "action": "fail",
+          "ordinal": 0
+        },
+        {
+          "action": "completeAbandoned",
+          "ordinal": 1
+        },
+        {
+          "action": "claim",
+          "ordinal": null
+        }
       ],
-      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapFailed"]
+      "parentHistory": [
+        "WorkflowStarted",
+        "ActivityMapScheduled",
+        "ActivityMapFailed"
+      ]
     },
     {
       "name": "an empty manifest completes at descriptor creation and admits nothing",
       "itemCount": 0,
       "maxInFlight": 2,
-      "steps": [{ "action": "claim", "ordinal": null }],
-      "parentHistory": ["WorkflowStarted", "ActivityMapScheduled", "ActivityMapCompleted"]
+      "steps": [
+        {
+          "action": "claim",
+          "ordinal": null
+        }
+      ],
+      "parentHistory": [
+        "WorkflowStarted",
+        "ActivityMapScheduled",
+        "ActivityMapCompleted"
+      ]
     }
   ]
 }

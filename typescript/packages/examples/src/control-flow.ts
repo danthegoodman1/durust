@@ -1,6 +1,5 @@
 import {
   Client,
-  MemoryBackend,
   Registry,
   Worker,
   activity,
@@ -14,6 +13,7 @@ import {
   sleep,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 
 interface ControlFlowInput {
   readonly requestId: string;
@@ -104,7 +104,7 @@ const controlFlowWorkflow = workflow({
 });
 
 export async function runMemoryControlFlowExample(): Promise<ControlFlowExampleResult> {
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   const registry = new Registry()
     .registerWorkflow(controlFlowWorkflow)
     .registerActivity(scoreOrder);
@@ -115,7 +115,6 @@ export async function runMemoryControlFlowExample(): Promise<ControlFlowExampleR
     workerId: "examples-control-flow-worker",
     workflowTaskQueue: "workflows",
     activityTaskQueue: "activities",
-    registeredSignalNames: [approvalSignal.name],
     activityCompletionBatchSize: 2,
     payloadCodec: "Json"
   });

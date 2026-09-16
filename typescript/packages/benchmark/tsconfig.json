@@ -7,9 +7,7 @@
   },
   "references": [
     { "path": "../core" },
-    { "path": "../payload" },
-    { "path": "../postgres" },
-    { "path": "../sqlite" }
+    { "path": "../native" }
   ],
   "include": [
     "src/**/*.ts"

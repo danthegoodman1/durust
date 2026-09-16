@@ -4,8 +4,8 @@ import v8 from "node:v8";
 import vm from "node:vm";
 import { describe, expect, it } from "vitest";
 import {
+  WorkflowFailure,
   Client,
-  MemoryBackend,
   ActivityFailureError,
   ChildWorkflowFailureError,
   DEFAULT_VERSION,
@@ -56,6 +56,7 @@ import {
   type WorkflowTaskCommit,
   type WorkflowTaskReason
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import { HotWorkflowExecution, HotWorkflowExecutionDisposedError } from "../src/runtime.js";
 import {
   claimActivity,
@@ -142,7 +143,8 @@ const fakeClaimed: ClaimedWorkflowTask = {
         input: encodePayload({}, { codec: "Json" })
       }
     }
-  ]
+  ],
+  liveSignals: []
 };
 
 function committedTail(outcome: { readonly kind: string; readonly newTailEventId?: unknown }) {
@@ -295,7 +297,7 @@ describe("minimal workflow runtime", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/unqueued-replay"),
       workflowType: checkout.workflowType,
@@ -343,7 +345,7 @@ describe("minimal workflow runtime", () => {
     ]);
   });
 
-  it("commits prepared activity schedules through MemoryBackend history", async () => {
+  it("commits prepared activity schedules through NativeBackend history", async () => {
     const checkout = workflow({
       name: "orders.checkout",
       version: 1,
@@ -352,7 +354,7 @@ describe("minimal workflow runtime", () => {
         return { unreachable: true };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/runtime"),
       workflowType: checkout.workflowType,
@@ -468,7 +470,7 @@ describe("minimal workflow runtime", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-complete"),
       workflowType: checkout.workflowType,
@@ -530,7 +532,7 @@ describe("minimal workflow runtime", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-activity"),
       workflowType: checkout.workflowType,
@@ -593,7 +595,7 @@ describe("minimal workflow runtime", () => {
         return { value: result.value };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-child-parent"),
       workflowType: parent.workflowType,
@@ -691,7 +693,7 @@ describe("minimal workflow runtime", () => {
         }
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("child/hot-conflict"),
       workflowType: childEchoWorkflow.workflowType,
@@ -755,7 +757,7 @@ describe("minimal workflow runtime", () => {
         return { totalCents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-activity-map"),
       workflowType: mappedWorkflow.workflowType,
@@ -828,7 +830,7 @@ describe("minimal workflow runtime", () => {
         return { values };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-child-workflow-map"),
       workflowType: mappedWorkflow.workflowType,
@@ -908,7 +910,7 @@ describe("minimal workflow runtime", () => {
         }
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-failure"),
       workflowType: failingWorkflow.workflowType,
@@ -1001,7 +1003,7 @@ describe("minimal workflow runtime", () => {
         return { count: input.count };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/continue-as-new"),
       workflowType: continuingWorkflow.workflowType,
@@ -1083,16 +1085,11 @@ describe("minimal workflow runtime", () => {
           continueAsNew(invalidInput as unknown as TestNoInput)
       });
 
-      const commit = await prepareWorkflowTaskCommit(invalid, {}, fakeClaimed, {
-        payloadCodec: "Json"
-      });
-
-      expect(commit.appendEvents?.map((event) => event.data.kind)).toEqual(["WorkflowFailed"]);
-      const failed = commit.appendEvents?.[0]?.data;
-      if (failed?.kind !== "WorkflowFailed") {
-        throw new Error("expected WorkflowFailed");
-      }
-      expect(failed.failure.message).toBe("continueAsNew input must be a durable input object");
+      // A caller error inside workflow code is a workflow-code fault: the
+      // task fails without committing, so a fixed redeploy recovers the run.
+      await expect(
+        prepareWorkflowTaskCommit(invalid, {}, fakeClaimed, { payloadCodec: "Json" })
+      ).rejects.toThrow("workflow task threw: continueAsNew input must be a durable input object");
     }
   });
 
@@ -1112,15 +1109,9 @@ describe("minimal workflow runtime", () => {
           publish(invalidProjection as unknown as Record<string, unknown>);
         }
       });
-      const commit = await prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, {
-        payloadCodec: "Json"
-      });
-      expect(commit.appendEvents?.map((event) => event.data.kind)).toEqual(["WorkflowFailed"]);
-      const failed = commit.appendEvents?.[0]?.data;
-      if (failed?.kind !== "WorkflowFailed") {
-        throw new Error("expected WorkflowFailed");
-      }
-      expect(failed.failure.message).toBe("query projection must be a durable input object");
+      await expect(
+        prepareWorkflowTaskCommit(invalidWorkflow, {}, fakeClaimed, { payloadCodec: "Json" })
+      ).rejects.toThrow("workflow task threw: query projection must be a durable input object");
     }
   });
 
@@ -1206,7 +1197,7 @@ describe("minimal workflow runtime", () => {
         return { done: true };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/timer"),
       workflowType: reminder.workflowType,
@@ -1260,7 +1251,7 @@ describe("minimal workflow runtime", () => {
   // replay claim plus the backend, so divergence tests can replay shortened
   // workflow versions against it.
   async function recordTwoTimerHistory(durableName: string): Promise<{
-    readonly backend: MemoryBackend;
+    readonly backend: NativeBackend;
     readonly replayClaim: ClaimedWorkflowTask;
   }> {
     const twoTimer = workflow({
@@ -1272,7 +1263,7 @@ describe("minimal workflow runtime", () => {
         return { done: true };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId(`wf/${durableName}`),
       workflowType: twoTimer.workflowType,
@@ -1297,7 +1288,7 @@ describe("minimal workflow runtime", () => {
   }
 
   async function assertHistoryHasNoTerminalEvent(
-    backend: MemoryBackend,
+    backend: NativeBackend,
     runId: RunId
   ): Promise<void> {
     const history = await backend.streamHistory({
@@ -1342,13 +1333,14 @@ describe("minimal workflow runtime", () => {
       version: 1,
       handler: async (_input: {}): Promise<{ readonly done: true }> => {
         await sleepUntil(1_000);
-        throw new Error("app failure after shortened replay");
+        throw new WorkflowFailure("app failure after shortened replay");
       }
     });
 
     // The divergence error is raised while recording WorkflowFailed inside the
     // handler's rejection path; it must surface as a fatal prepare error, not
-    // an unhandled rejection that leaves the task hanging.
+    // an unhandled rejection that leaves the task hanging. The handler throws
+    // a durable failure so the rejection reaches the terminal path at all.
     await expect(
       prepareWorkflowTaskCommit(oneTimerThenThrow, {}, replayClaim, { payloadCodec: "Json" })
     ).rejects.toThrow(
@@ -1388,7 +1380,7 @@ describe("minimal workflow runtime", () => {
         return { done: true };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-timer"),
       workflowType: reminder.workflowType,
@@ -1456,7 +1448,7 @@ describe("minimal workflow runtime", () => {
         return { approvalId: approval.approvalId };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/signal"),
       workflowType: approvalWorkflow.workflowType,
@@ -1547,7 +1539,7 @@ describe("minimal workflow runtime", () => {
         return await approved;
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, {
       payloadCodec: "Json",
       signalIdFactory: () => "schema-sig-1"
@@ -1620,7 +1612,7 @@ describe("minimal workflow runtime", () => {
         return { approvalId: approval.approvalId };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-signal"),
       workflowType: approvalWorkflow.workflowType,
@@ -1725,7 +1717,7 @@ describe("minimal workflow runtime", () => {
         return { cents: result.quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/join"),
       workflowType: joinedWorkflow.workflowType,
@@ -1794,7 +1786,7 @@ describe("minimal workflow runtime", () => {
         return { cents: result.quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-join"),
       workflowType: joinedWorkflow.workflowType,
@@ -1884,7 +1876,7 @@ describe("minimal workflow runtime", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-join-all"),
       workflowType: joinedWorkflow.workflowType,
@@ -1937,7 +1929,7 @@ describe("minimal workflow runtime", () => {
         return { index: winner.index };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-all"),
       workflowType: racingWorkflow.workflowType,
@@ -2010,7 +2002,7 @@ describe("minimal workflow runtime", () => {
         };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-select-all"),
       workflowType: racingWorkflow.workflowType,
@@ -2115,7 +2107,7 @@ describe("minimal workflow runtime", () => {
         return await callActivity(versionActivityA, {}, { taskQueue: "activities" });
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/version-old"),
       workflowType: originalWorkflow.workflowType,
@@ -2328,7 +2320,7 @@ describe("minimal workflow runtime", () => {
         return { id };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect"),
       workflowType: sideEffectWorkflow.workflowType,
@@ -2446,7 +2438,7 @@ describe("minimal workflow runtime", () => {
       handler: async (_input: TestNoInput): Promise<string> =>
         await sideEffect("make-id", () => `id-${getVersion("side-effect-reentrant", 1, 2)}`)
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect-reentrant"),
       workflowType: reentrantWorkflow.workflowType,
@@ -2973,7 +2965,7 @@ describe("minimal workflow runtime", () => {
           }
         }) as unknown as { readonly ok: boolean }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/encode-reentrant-output"),
       workflowType: reentrantOutputWorkflow.workflowType,
@@ -2997,14 +2989,15 @@ describe("minimal workflow runtime", () => {
     }
 
     const history = await readHistory(backend, claim.runId, 10);
-    // No VersionMarker, and nothing appended ahead of the terminal event.
-    expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted", "WorkflowFailed"]);
-    expect(taskError).toBeNull();
-    const failed = commit?.appendEvents?.[0]?.data;
-    if (failed?.kind !== "WorkflowFailed") {
-      throw new Error("expected WorkflowFailed");
-    }
-    expect(failed.failure.message).toBe("durust durable APIs must be awaited inside a workflow task");
+    // No VersionMarker, nothing appended, and the run stays open: the
+    // re-entrant conversion is a workflow-code fault, so the task fails
+    // without committing and a fixed redeploy recovers the run.
+    expect(history.events.map(commandTrace)).toEqual(["WorkflowStarted"]);
+    expect(commit).toBeNull();
+    expect(taskError).toBeInstanceOf(Error);
+    expect((taskError as Error).message).toBe(
+      "workflow task threw: durust durable APIs must be awaited inside a workflow task"
+    );
   });
 
   it("rejects parking on a hot waiter from inside a durable command's encoding", async () => {
@@ -3081,7 +3074,7 @@ describe("minimal workflow runtime", () => {
       }
     });
 
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/manifest-item-durable-call"),
       workflowType: manifestWorkflow.workflowType,
@@ -3273,7 +3266,7 @@ describe("minimal workflow runtime", () => {
           return getVersion("after-await", 1, 2);
         })
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/side-effect-async-reentrant"),
       workflowType: asyncWorkflow.workflowType,
@@ -3867,7 +3860,7 @@ describe("minimal workflow runtime", () => {
         return { cents: quote.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/activity-handle"),
       workflowType: handleWorkflow.workflowType,
@@ -3949,7 +3942,7 @@ describe("minimal workflow runtime", () => {
         return { branch: "delay" };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select"),
       workflowType: racingWorkflow.workflowType,
@@ -4041,7 +4034,7 @@ describe("minimal workflow runtime", () => {
         return { branch: "delay" };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-select"),
       workflowType: racingWorkflow.workflowType,
@@ -4111,7 +4104,7 @@ describe("minimal workflow runtime", () => {
         return { branch: "delay" };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-replay"),
       workflowType: racingWorkflow.workflowType,
@@ -4195,7 +4188,7 @@ describe("minimal workflow runtime", () => {
         return { branch: winner.branch };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-timer"),
       workflowType: racingWorkflow.workflowType,
@@ -4278,7 +4271,7 @@ describe("minimal workflow runtime", () => {
         return { branch: winner.branch };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-signal"),
       workflowType: racingWorkflow.workflowType,
@@ -4338,7 +4331,7 @@ describe("minimal workflow runtime", () => {
         return { branch: winner.branch };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-activity-same-task"),
       workflowType: racingWorkflow.workflowType,
@@ -4408,7 +4401,7 @@ describe("minimal workflow runtime", () => {
         return { branch: winner.branch };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/select-cancel-activity"),
       workflowType: racingWorkflow.workflowType,
@@ -4695,7 +4688,7 @@ describe("minimal workflow runtime", () => {
         return await firstAwait;
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-double-await"),
       workflowType: doubleAwait.workflowType,
@@ -4763,7 +4756,7 @@ describe("minimal workflow runtime", () => {
         return { cents: first.cents + second.cents };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-handle-reread"),
       workflowType: rereadHandle.workflowType,
@@ -4821,7 +4814,7 @@ describe("minimal workflow runtime", () => {
         };
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/hot-joinall-across-tasks"),
       workflowType: partialJoin.workflowType,
@@ -4996,7 +4989,7 @@ describe("map input manifest validation", () => {
     definition: Parameters<typeof prepareWorkflowTaskCommit>[0],
     label: string
   ): Promise<WorkflowTaskCommit> {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId(`wf/${label}`),
       workflowType: definition.workflowType,
@@ -5025,7 +5018,7 @@ describe("map input manifest validation", () => {
         return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
       }
     });
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     await startTestWorkflow(backend, {
       workflowId: workflowId("wf/empty-activity-map"),
       workflowType: emptyMapWorkflow.workflowType,
@@ -5195,17 +5188,12 @@ describe("map input manifest validation", () => {
         return decodeActivityMapResults<QuoteOutput>(await mapped.resultManifest()).length;
       }
     });
-    const commit = await firstCommit(brokenWorkflow, "broken-activity-map-manifest");
-    const failed = commit.appendEvents?.[0]?.data;
-    expect(failed?.kind).toBe("WorkflowFailed");
-    if (failed?.kind !== "WorkflowFailed") {
-      throw new Error("expected WorkflowFailed");
-    }
-    expect(failed.failure.message).toBe(
-      "activityMap inputManifest pages cover 1 items, expected 3"
+    // Rejected before the command id is allocated and before any commit: a
+    // malformed manifest is a workflow-code fault, so the task fails without
+    // committing rather than closing the run.
+    await expect(firstCommit(brokenWorkflow, "broken-activity-map-manifest")).rejects.toThrow(
+      "workflow task threw: activityMap inputManifest pages cover 1 items, expected 3"
     );
-    // Rejected before the command id is allocated, so nothing was scheduled.
-    expect(commit.scheduleActivityMaps ?? []).toHaveLength(0);
   });
 
   it("rejects a child workflow map manifest with a zero-length page", async () => {
@@ -5227,21 +5215,14 @@ describe("map input manifest validation", () => {
         return decodeChildWorkflowMapSuccesses(await mapped.resultManifest()).length;
       }
     });
-    const commit = await firstCommit(brokenWorkflow, "broken-child-map-manifest");
-    const failed = commit.appendEvents?.[0]?.data;
-    expect(failed?.kind).toBe("WorkflowFailed");
-    if (failed?.kind !== "WorkflowFailed") {
-      throw new Error("expected WorkflowFailed");
-    }
-    expect(failed.failure.message).toBe(
-      "childWorkflowMap inputManifest page 0 must hold at least one item, got 0"
+    await expect(firstCommit(brokenWorkflow, "broken-child-map-manifest")).rejects.toThrow(
+      "workflow task threw: childWorkflowMap inputManifest page 0 must hold at least one item, got 0"
     );
-    expect(commit.scheduleChildWorkflowMaps ?? []).toHaveLength(0);
   });
 });
 
 // Builds a claim without a provider so a memory test measures the runtime and
-// nothing else: a `MemoryBackend` accumulates the run's history by design, and
+// nothing else: a `NativeBackend` accumulates the run's history by design, and
 // that growth would swamp what is being asserted.
 //
 // `claim` and `reason` are built to the real provider shapes even though this
@@ -5267,12 +5248,13 @@ function syntheticWorkflowClaim(
     claim: {
       runId: runId("run/memory"),
       workerId: "worker-memory",
-      // What `MemoryBackend` hands out for a run's first claim.
+      // What `NativeBackend` hands out for a run's first claim.
       token: 1
     },
     replayTargetEventId,
     reason,
-    prefetchedHistory
+    prefetchedHistory,
+    liveSignals: []
   };
 }
 
@@ -5310,7 +5292,7 @@ async function startHotExecution(
   readonly claim: ClaimedWorkflowTask;
 }> {
   const definition = workflow({ name, version: 1, handler });
-  const backend = new MemoryBackend();
+  const backend = NativeBackend.memory();
   await startTestWorkflow(backend, {
     workflowId: workflowId(`wf/${name}`),
     workflowType: definition.workflowType,

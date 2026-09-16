@@ -17,9 +17,7 @@ const expectedRepository = {
 const expectedPublishablePackages = new Map([
   ["@durust/core", "typescript/packages/core"],
   ["@durust/eslint-plugin", "typescript/packages/eslint-plugin"],
-  ["@durust/payload", "typescript/packages/payload"],
-  ["@durust/postgres", "typescript/packages/postgres"],
-  ["@durust/sqlite", "typescript/packages/sqlite"],
+  ["@durust/native", "typescript/packages/native"],
   ["@durust/testing", "typescript/packages/testing"]
 ]);
 const expectedPrivatePackages = new Set(["@durust/benchmark", "@durust/examples"]);
@@ -30,6 +28,11 @@ const expectedFilesField = [
   "dist/**/*.js.map",
   "dist/**/*.json"
 ];
+// `@durust/native` also ships its README; the addon binaries come from the
+// platform packages.
+const expectedFilesFieldByPackage = new Map([
+  ["@durust/native", [...expectedFilesField, "README.md"]]
+]);
 const checkedPackages = [];
 const skippedPackages = [];
 const failures = [];
@@ -170,7 +173,12 @@ function validateManifest(packageJson) {
     failures.push(`${packageName} package.json keywords must be a non-empty string array`);
   }
 
-  if (!sameStringArray(packageJson.files, expectedFilesField)) {
+  if (
+    !sameStringArray(
+      packageJson.files,
+      expectedFilesFieldByPackage.get(packageName) ?? expectedFilesField
+    )
+  ) {
     failures.push(
       `${packageName} package.json files must list only built dist artifact globs`
     );

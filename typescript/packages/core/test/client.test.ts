@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
   Client,
-  MemoryBackend,
   decodePayload,
   namespace,
   publish,
@@ -9,6 +8,7 @@ import {
   workflow,
   workflowId
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import type { PayloadRef, SchemaAdapter } from "@durust/core";
 import { claimWorkflow, prepareWorkflowTaskCommit, readHistory } from "@durust/testing";
 
@@ -66,7 +66,7 @@ const schemaQueryWorkflow = workflow({
 
 describe("backend-backed Client", () => {
   it("starts workflows through the backend and preserves idempotent run identity", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
 
     const first = await client.startWorkflow(echoWorkflow, workflowId("wf/client"), "workflows", {
@@ -80,7 +80,7 @@ describe("backend-backed Client", () => {
   });
 
   it("decodes typed workflow results from committed history", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const handle = await client.startWorkflow(echoWorkflow, workflowId("wf/result"), "workflows", {
       value: "done"
@@ -98,7 +98,7 @@ describe("backend-backed Client", () => {
   });
 
   it("sends typed object signal payloads through the backend with idempotency", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const approved = signal<Approved>("approved");
     const handle = await client.startWorkflow(echoWorkflow, workflowId("wf/signal-client"), "workflows", {
@@ -133,7 +133,7 @@ describe("backend-backed Client", () => {
   });
 
   it("reports unavailable results without hidden polling", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const handle = await client.startWorkflow(echoWorkflow, workflowId("wf/pending"), "workflows", {
       value: "pending"
@@ -143,7 +143,7 @@ describe("backend-backed Client", () => {
   });
 
   it("reads typed query projections published by workflow commits", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       queryWorkflow,
@@ -171,7 +171,7 @@ describe("backend-backed Client", () => {
   });
 
   it("encodes query projections through workflow query-state schema", async () => {
-    const backend = new MemoryBackend();
+    const backend = NativeBackend.memory();
     const client = new Client(backend, { namespace: namespace(), payloadCodec: "Json" });
     const handle = await client.startWorkflow(
       schemaQueryWorkflow,

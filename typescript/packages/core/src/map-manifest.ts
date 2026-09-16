@@ -76,16 +76,14 @@ export function readMapManifestItems<Page, Item>(
  * **`itemCount === 0` is legal, and deliberately so.** Mapping over an empty
  * list is an ordinary degenerate case, not a caller error: the map has nothing
  * to admit and nothing outstanding, so it completes at descriptor creation with
- * an empty result manifest and the parent proceeds. Every TypeScript provider
- * does that, it is asserted by conformance on all three, and `map-engine.ts`'s
- * `DescriptorCreated` owns the rule. `src/map_engine.rs` now reaches the same
- * answer — it used to stall forever on this input — and the shared transition
- * table asserts the rule in both runners rather than excluding it.
+ * an empty result manifest and the parent proceeds. The `DescriptorCreated`
+ * arm of `src/map_engine.rs` owns the rule, every provider runs that engine,
+ * and the shared conformance cases and transition table assert it.
  *
  * The one exception is a commit that both schedules the empty map and closes
  * the run: there is no parent left to notify, so the descriptor is closed
  * without a terminal map fact rather than appending one behind the run's own
- * terminal event. Both runtimes do that too; see `map-engine.ts`'s `step`.
+ * terminal event; see `step` in `src/map_engine.rs`.
  *
  * What this rejects is a manifest that is *inconsistent*, which can only ever
  * fan out over the wrong number of items.

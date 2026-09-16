@@ -71,8 +71,7 @@ jobs:
     # a job-level variable would also switch on the env-gated Postgres cases in
     # `packages/benchmark/test/thresholds.test.ts` inside `npm run check` — and
     # those are throughput comparisons against baselines recorded on one
-    # developer machine, plus a hard `statementStats` assertion that needs
-    # `pg_stat_statements` preloaded. See the benchmark-threshold note below.
+    # developer machine. See the benchmark-threshold note below.
 
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +93,11 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+      - name: Clippy
+        # `result_large_err` is allowed on purpose: `durust::Error` carries a
+        # payload, and boxing it would change the public `Result` alias.
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings -A clippy::result_large_err
 
       # This step was named "Check feature matrix" and ran two lines, one of
       # which was redundant: `default = ["sqlite"]`, so `--features postgres,s3`
@@ -132,25 +136,26 @@ jobs:
           DURUST_REQUIRE_POSTGRES: "1"
         run: cargo test --locked --workspace --all-features
 
-      # The Rust half of every shared contract fixture, named so a failure
-      # points at the cross-language contract rather than at "some test".
-      # `cargo test --workspace` above already covers these; running them
-      # again here costs seconds and means the corpus is gated by a step whose
-      # name says what it gates.
-      - name: Run shared contract fixtures (Rust)
-        run: |
-          cargo test --locked --test contract_fixtures
-          cargo test --locked --test map_transitions
-          cargo test --locked --test behavioral_corpus
-          cargo test --locked --lib worker::tests::maintenance_jitter_matches_the_shared_corpus_table
+      # Every TypeScript provider is the Rust core behind `@durust/native`, so
+      # the workspace's tests need the `durust-node` addon built first; `npm
+      # run check` does not build it. Release builds come from the platform
+      # matrix in `release.yml`; this is the from-source path.
+      - name: Build the durust-node addon
+        run: npm --prefix typescript run build:native --workspace @durust/native
 
-      # `npm run check` includes `check:fixtures`, which runs both halves of
-      # every shared fixture: the TypeScript runners and, through `cargo`, the
-      # Rust ones. Before Phase 7 `check:fixtures` existed but was invoked by
-      # nothing — not by `npm run check`, not by this workflow — so the shared
-      # corpus was ungated in CI.
+      # The four platform packages under `packages/native/npm` must agree with
+      # the facade on name, version, and the addon file each ships.
+      - name: Check the native platform packages
+        run: node scripts/check-native-packages.mjs
+
+      # `npm run check` includes `check:fixtures`, the TypeScript half of every
+      # shared fixture; the Rust half ran in `cargo test --workspace` above.
       - name: Run TypeScript checks
         run: npm run check --prefix typescript
+
+      # Every test `PARITY.md` cites must still exist on both sides.
+      - name: Check PARITY.md test citations
+        run: node scripts/check-parity-names.mjs
 
       # `npm run check` runs `npm run test`, which *does* collect this file —
       # `vitest.config.ts` includes `packages/*/test/**/*.test.ts`. It reaches
@@ -165,9 +170,10 @@ jobs:
       # `test:benchmark-thresholds` — see the note below it.
       #
       # `DURUST_REQUIRE_POSTGRES` is the same flag the Rust suite uses, and the
-      # TypeScript side now honours it: both files below call
+      # TypeScript side honours it: both files below call
       # `assertPostgresAvailableWhenRequired` at module scope, which throws on
-      # a missing URL. Measured: require set with no URL exits 1.
+      # a missing URL. The conformance file runs the shared cases over the
+      # Rust Postgres provider through `@durust/native`.
       #
       # The `test -n` guard stays, and is not redundant, because it covers the
       # one case the assertion cannot. Delete this `env:` block and
@@ -193,7 +199,7 @@ jobs:
             exit 1
           }
           npm run test --prefix typescript -- \
-            packages/postgres/test/postgres-conformance.test.ts \
+            packages/native/test/native-conformance.test.ts \
             packages/benchmark/test/database-guard.test.ts
 
       # `DURUST_LONG_SOAK=1` adds exactly one case to the simulation suite
@@ -213,15 +219,13 @@ jobs:
       # Deliberately **not** run here, and this is the decision rather than an
       # omission: `npm run test:benchmark-thresholds` compares measured
       # throughput and latency against baselines recorded on one developer
-      # machine, and its accepted-baseline case additionally asserts
-      # `postgres_stats.statementStats` is non-null, which requires the server
-      # to have been started with `shared_preload_libraries=pg_stat_statements`
-      # — a setting a GitHub service container cannot supply, since `services:`
-      # cannot override the image's command. Run against a stock container it
-      # fails with `expected null not to be null`, which is a fact about the
-      # container rather than about the change under test. Performance
-      # baselines belong on a controlled machine; they stay in
-      # `npm run check:postgres` for that use.
+      # machine. Performance baselines belong on a controlled machine; they
+      # stay in `npm run check:postgres` for that use. Its accepted-baseline
+      # case asserts `postgres_stats.statementStats` only when
+      # `DURUST_REQUIRE_POSTGRES_STATEMENT_STATS=1`, because that needs a
+      # server started with `shared_preload_libraries=pg_stat_statements`,
+      # which a GitHub service container cannot supply (`services:` cannot
+      # override the image's command).
       #
       # The controlled machine is what `tests/fixtures/postgres.compose.yml` is
       # for, and it was the only file in the repository nothing referenced by
@@ -283,10 +287,12 @@ jobs:
         if: always()
         run: docker compose -f tests/fixtures/garage.compose.yml down -v
 
+      # Every example is a compiled, running document (`SPEC.md` §22.7).
       - name: Run examples
         run: |
-          cargo run --locked --example hello_activity
-          cargo run --locked --example worker_registration
+          for example in examples/*.rs; do
+            cargo run --locked --all-features --example "$(basename "${example%.rs}")"
+          done
 
       - name: Build benchmarks
         run: cargo bench --locked --no-run

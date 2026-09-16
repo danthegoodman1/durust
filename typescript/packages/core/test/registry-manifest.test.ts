@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   Client,
-  MemoryBackend,
   Registry,
   activity,
   activityMap,
@@ -19,6 +18,7 @@ import {
   signal,
   workflow
 } from "@durust/core";
+import { NativeBackend } from "@durust/native";
 import type { SchemaAdapter } from "@durust/core";
 import { runManifestCli } from "../src/manifest-cli.js";
 
@@ -292,7 +292,7 @@ describe("registry and manifest", () => {
         return { ok: true };
       }
     });
-    const client = new Client(new MemoryBackend());
+    const client = new Client(NativeBackend.memory());
     const approved = signal<Input>("runtime-approved");
 
     expect(() => callActivity(quote, "sku-1" as unknown as Input)).toThrow(
