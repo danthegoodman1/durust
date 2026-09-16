@@ -1916,6 +1916,13 @@ and publishes the new roots only on success. In-place mutations validate before
 their first write and perform no fallible operation afterward. Records and history share unchanged storage, so
 rollback does not require copying the database or replaying undo operations.
 
+The memory provider is a development, test, and deterministic simulation engine.
+It must preserve the same atomicity, fencing, ordering, and idempotency contract
+as persistent providers. Prefer a simple shared transaction boundary over
+specialized throughput optimizations. Its performance gates protect practical
+test execution and scaling with data size; production throughput goals are
+evaluated on persistent providers.
+
 The backend must atomically:
 
 ```text

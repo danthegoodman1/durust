@@ -125,6 +125,12 @@ heartbeat updates remain in place because no fallible work follows their first
 write. Map manifests and descriptors share immutable storage. Keep the shared
 map engine; a new generic SQL storage engine is not needed for this invariant.
 
+Performance policy: memory is a development, test, and simulation engine.
+Correctness, provider conformance, and one understandable rollback mechanism
+take priority over peak throughput. Retain the measured transaction cost and
+size-scaling benchmarks; optimize further when development or simulation cost
+justifies it. Persistent providers retain their production performance gates.
+
 Completion gate: invalid commits preserve history, projection, descriptor state,
 and the original lease; a corrected same-descriptor retry succeeds.
 
@@ -140,7 +146,7 @@ Status ledger:
 | Complete | Test | 3B: Late failures and valid retries | Shared `rejected_map_commit_is_atomic` on memory/SQLite/Postgres; `a_routing_failure_rolls_back_cancellation_and_child_cleanup`; existing provider and simulation suites |
 | Complete | Gate | 3C: Same-claim retry is safe | Regression checks unchanged history/no query projection, then retries the corrected manifest under the original claim and descriptor id |
 | Complete | Decision | 3D: Upstream handling before engine rewrite | One rollback mechanism replaces partial-mutation exceptions; existing SQL transactions and map engine remain authoritative |
-| Complete | Test | 3E: Cost slope and performance acceptance | `benches/durability_boundaries.rs`; 1/1k/10k/100k mutation measurements in validation evidence; staged-commit and publication overhead explicitly accepted for atomicity/durability |
+| Complete | Test | 3E: Cost slope and performance acceptance | `benches/durability_boundaries.rs`; 1/1k/10k/100k measurements in validation evidence; measured transaction overhead accepted for the memory engine's development/test role, retaining shared rollback and scaling checks |
 
 ## Phase 4: Turn Recovery Budgets Into Scheduling Quanta
 

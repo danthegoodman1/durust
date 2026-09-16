@@ -57,9 +57,14 @@ Existing small-memory benchmarks also expose the transaction cost:
 | `workflow_cached_wake_poll_memory` | 3.901 µs | 6.338 µs |
 | `activity_claim_complete_memory` | 1.111 µs | 3.522 µs |
 
-These increases are accepted as the cost of atomic late-failure rollback in the
-memory provider. The persistent tables avoid a linear database-size copy; a
-future optimization must retain the same conformance and fault guarantees.
+The memory provider serves development, testing, and deterministic simulation.
+These increases are accepted in that role to retain simple, shared atomic
+rollback and provider conformance. They do not require a further optimization
+pass before merging. The persistent tables avoid a linear database-size copy;
+the retained benchmarks guard practical test costs and scaling. Further
+optimization should respond to development or simulation needs and preserve
+the same conformance and fault guarantees. Persistent providers retain their
+production performance gates.
 
 ## Existing CI Counter Correction
 

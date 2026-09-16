@@ -902,11 +902,16 @@ provider conformance tests
 Durust includes:
 
 ```text
-memory provider for fast tests (always available)
+memory provider for development, tests, and deterministic simulation (always available)
 SQLite provider for local development and conformance (`sqlite` feature, default)
 Postgres provider (`postgres` feature)
 S3-compatible payload blob store (`s3` feature)
 ```
+
+The memory provider prioritizes correctness, provider conformance, and simple
+transaction boundaries. Its performance gates keep development and simulation
+practical as data grows; production throughput is measured on persistent
+providers. Memory state does not survive process exit.
 
 ### Cargo Features
 
