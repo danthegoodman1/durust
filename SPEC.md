@@ -1974,6 +1974,13 @@ The runtime contract is append journal only. Backends may keep caches, materiali
 
 A SQLite implementation is required for tests and local development. It should exercise the same backend trait and append-journal semantics as production providers, but its schema must not define the public provider abstraction.
 
+The TypeScript native binding loads provider-specific dependencies only when
+that provider is constructed. Memory and Postgres use an addon without SQLite;
+`NativeBackend.sqlite()` loads a companion addon linked to the system SQLite
+shared library. Both addons ship in the same platform package and share the
+binding implementation. SQLite is not bundled, and using another provider does
+not require installing it.
+
 ## 8.5 Scale-out, shards, and outbox handoff
 
 Mega-scale providers should partition runtime state by logical shards.

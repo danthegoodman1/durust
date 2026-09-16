@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-addon="${1:?usage: check-native-linkage.sh path/to/addon.node}"
-case "$(uname -s)" in
-  Linux) dependencies="$(readelf -d "$addon")" ;;
-  Darwin) dependencies="$(otool -L "$addon")" ;;
-  *) echo "unsupported native release platform" >&2; exit 1 ;;
-esac
+addon="${1:?usage: check-native-linkage.sh default.node sqlite.node}"
+sqlite_addon="${2:?usage: check-native-linkage.sh default.node sqlite.node}"
+dependencies() {
+  case "$(uname -s)" in
+    Linux) readelf -d "$1" ;;
+    Darwin) otool -L "$1" ;;
+    *) echo "unsupported native release platform" >&2; return 1 ;;
+  esac
+}
 
-# The npm addon must work without a system SQLite installation. Inspect the
-# artifact: a successful load on a development machine can mask this dependency.
-if [[ "$dependencies" == *libsqlite3* ]]; then
-  echo "$addon depends on system SQLite; build with bundled SQLite" >&2
+base_dependencies="$(dependencies "$addon")"
+sqlite_dependencies="$(dependencies "$sqlite_addon")"
+if [[ "$base_dependencies" == *libsqlite3* ]]; then
+  echo "$addon must load without SQLite installed" >&2
   exit 1
 fi
-echo "$addon has no system SQLite dependency"
+if [[ "$sqlite_dependencies" != *libsqlite3* ]]; then
+  echo "$sqlite_addon must link to system SQLite" >&2
+  exit 1
+fi
+echo "Only the SQLite companion depends on system SQLite"

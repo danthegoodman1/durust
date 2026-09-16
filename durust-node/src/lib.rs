@@ -5,15 +5,20 @@
 
 mod wire;
 
+#[cfg(feature = "sqlite")]
+use durust::SqliteBackend;
 use durust::provider::{
     DurableBackend, LocalDirectoryBlobStore, MemoryBlobStore, PayloadBackend, PayloadBlobStore,
     S3BlobStore, S3BlobStoreConfig, SignalInboxRecord,
 };
-use durust::{MemoryBackend, PostgresBackend, PostgresBackendConfig, RunId, SqliteBackend};
+use durust::{MemoryBackend, RunId};
+#[cfg(feature = "postgres")]
+use durust::{PostgresBackend, PostgresBackendConfig};
 use futures::future::{BoxFuture, ready};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "postgres")]
 use std::time::Duration;
 
 /// The provider behind a `NativeBackend`. `DurableBackend` is `Clone`, so it
@@ -151,6 +156,7 @@ impl ProviderExtras for MemoryBackend {
     }
 }
 
+#[cfg(feature = "sqlite")]
 impl ProviderExtras for SqliteBackend {
     fn live_signals(
         &self,
@@ -164,6 +170,7 @@ impl ProviderExtras for SqliteBackend {
     }
 }
 
+#[cfg(feature = "postgres")]
 impl ProviderExtras for PostgresBackend {
     fn live_signals(
         &self,
@@ -563,6 +570,7 @@ impl NativeBackend {
 
 /// The Rust Postgres provider. Connecting runs the schema migration, so the
 /// constructor is a free async function rather than a factory.
+#[cfg(feature = "postgres")]
 #[napi]
 pub async fn connect_postgres(url: String, options: Option<Buffer>) -> Result<NativeBackend> {
     let options: wire::PostgresOptions = decode_options(options)?;
@@ -595,19 +603,9 @@ pub async fn connect_postgres(url: String, options: Option<Buffer>) -> Result<Na
     ))
 }
 
+#[cfg(feature = "sqlite")]
 #[napi]
 impl NativeBackend {
-    /// The Rust in-memory provider, on its own virtual clock.
-    #[napi(factory)]
-    pub fn memory(options: Option<Buffer>) -> Result<Self> {
-        let options: wire::BackendOptions = decode_options(options)?;
-        let backend = MemoryBackend::new();
-        Ok(Self::new(
-            with_payload(backend.clone(), options.payload)?,
-            Clock::Memory(backend),
-        ))
-    }
-
     /// The Rust SQLite provider over the database file at `path`, on a
     /// caller-driven clock.
     #[napi(factory)]
@@ -623,6 +621,20 @@ impl NativeBackend {
         Ok(Self::new(
             with_payload(backend, options.payload)?,
             Clock::Manual(clock),
+        ))
+    }
+}
+
+#[napi]
+impl NativeBackend {
+    /// The Rust in-memory provider, on its own virtual clock.
+    #[napi(factory)]
+    pub fn memory(options: Option<Buffer>) -> Result<Self> {
+        let options: wire::BackendOptions = decode_options(options)?;
+        let backend = MemoryBackend::new();
+        Ok(Self::new(
+            with_payload(backend.clone(), options.payload)?,
+            Clock::Memory(backend),
         ))
     }
 

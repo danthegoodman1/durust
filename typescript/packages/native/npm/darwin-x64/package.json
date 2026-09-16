@@ -1,7 +1,7 @@
 {
   "name": "@durust/native-darwin-x64",
   "version": "0.2.1",
-  "description": "The durust-node addon for darwin-x64: a platform package of @durust/native.",
+  "description": "The Durust memory/Postgres and SQLite addons for darwin-x64: a platform package of @durust/native.",
   "os": [
     "darwin"
   ],
@@ -10,7 +10,8 @@
   ],
   "main": "durust-node.darwin-x64.node",
   "files": [
-    "durust-node.darwin-x64.node"
+    "durust-node.darwin-x64.node",
+    "durust-sqlite.darwin-x64.node"
   ],
   "license": "MIT",
   "engines": {

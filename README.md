@@ -1182,8 +1182,11 @@ commits the updated manifests and lockfiles back to `main` with
 built on four platform runners (Linux x64 and arm64 in manylinux 2.34
 containers, macOS x64 and arm64) and shipped as one `@durust/native-<target>`
 package each, published before the facade that depends on them.
-The addons bundle SQLite and are checked for a system SQLite dependency before
-packaging, so npm installations do not require SQLite to be installed separately.
+Each platform package contains a memory/Postgres addon and a separately loaded
+SQLite companion. Only SQLite users need the system SQLite shared library
+(`libsqlite3-0` on Debian/Ubuntu, `sqlite-libs` on Fedora/RHEL; included with
+macOS). Source builds of the SQLite companion also need the development
+package, which the Linux release jobs install before compilation.
 
 Manual dispatch can publish the `current` checked-in version without creating a
 new version commit. This is only for recovering a partially published release.

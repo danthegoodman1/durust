@@ -123,19 +123,24 @@ jobs:
       - name: Verify the build environment's glibc
         run: test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.34"
 
+      - name: Install SQLite development library
+        run: dnf install -y sqlite-devel
+
       - name: Build the addon
         run: npm --prefix typescript run build:native --workspace @durust/native
 
       - name: Load the addon
         run: |
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
-          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node"
-          node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
+          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node" "typescript/packages/native/durust-sqlite.${{ matrix.target }}.node"
+          node -e "const base = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); const sqlite = require('./typescript/packages/native/durust-sqlite.${{ matrix.target }}.node'); const memory = base.NativeBackend.memory(); const database = sqlite.NativeBackend.sqlite(process.env.RUNNER_TEMP + '/durust-smoke.sqlite3'); memory.close(); database.close()"
 
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.target }}
-          path: typescript/packages/native/durust-node.${{ matrix.target }}.node
+          path: |
+            typescript/packages/native/durust-node.${{ matrix.target }}.node
+            typescript/packages/native/durust-sqlite.${{ matrix.target }}.node
           if-no-files-found: error
 
   build-macos-native:
@@ -173,13 +178,15 @@ jobs:
       - name: Load the addon
         run: |
           test "$(uname -m)" = "${{ matrix.uname_arch }}"
-          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node"
-          node -e "const addon = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); if (typeof addon.NativeBackend !== 'function') throw new Error('NativeBackend export missing')"
+          bash scripts/check-native-linkage.sh "typescript/packages/native/durust-node.${{ matrix.target }}.node" "typescript/packages/native/durust-sqlite.${{ matrix.target }}.node"
+          node -e "const base = require('./typescript/packages/native/durust-node.${{ matrix.target }}.node'); const sqlite = require('./typescript/packages/native/durust-sqlite.${{ matrix.target }}.node'); const memory = base.NativeBackend.memory(); const database = sqlite.NativeBackend.sqlite(process.env.RUNNER_TEMP + '/durust-smoke.sqlite3'); memory.close(); database.close()"
 
       - uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.target }}
-          path: typescript/packages/native/durust-node.${{ matrix.target }}.node
+          path: |
+            typescript/packages/native/durust-node.${{ matrix.target }}.node
+            typescript/packages/native/durust-sqlite.${{ matrix.target }}.node
           if-no-files-found: error
 
   publish:
@@ -237,9 +244,11 @@ jobs:
         run: |
           set -euo pipefail
           for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu; do
-            binary="durust-node.${target}.node"
-            test -f "native-artifacts/${binary}" || { echo "missing ${binary}" >&2; exit 1; }
-            cp "native-artifacts/${binary}" "typescript/packages/native/npm/${target}/${binary}"
+            for addon in durust-node durust-sqlite; do
+              binary="${addon}.${target}.node"
+              test -f "native-artifacts/${binary}" || { echo "missing ${binary}" >&2; exit 1; }
+              cp "native-artifacts/${binary}" "typescript/packages/native/npm/${target}/${binary}"
+            done
           done
           node scripts/check-native-packages.mjs --require-binaries
           # With the addons in place the packed tarballs are the ones about to
