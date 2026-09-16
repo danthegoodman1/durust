@@ -81,9 +81,14 @@ interface NativeHandle {
 interface NativeModule {
   readonly NativeBackend: {
     memory(options?: Uint8Array): NativeHandle;
-    sqlite(path: string, options?: Uint8Array): NativeHandle;
   };
   connectPostgres(url: string, options?: Uint8Array): Promise<NativeHandle>;
+}
+
+interface SqliteModule {
+  readonly NativeBackend: {
+    sqlite(path: string, options?: Uint8Array): NativeHandle;
+  };
 }
 
 const require = createRequire(import.meta.url);
@@ -118,7 +123,11 @@ function isMusl(): boolean {
 
 /** Where a locally built addon lives: next to this package's `package.json`. */
 export function nativeModulePath(): string {
-  return fileURLToPath(new URL(`../durust-node.${nativeTarget()}.node`, import.meta.url));
+  return modulePath("durust-node");
+}
+
+function modulePath(binary: string): string {
+  return fileURLToPath(new URL(`../${binary}.${nativeTarget()}.node`, import.meta.url));
 }
 
 function platformPackage(): string {
@@ -145,32 +154,36 @@ export function nativeModuleAvailable(): boolean {
 }
 
 let loaded: NativeModule | null = null;
+let loadedSqlite: SqliteModule | null = null;
 
 function nativeModule(): NativeModule {
-  if (loaded !== null) {
-    return loaded;
-  }
-  const override = process.env.DURUST_NATIVE_LIBRARY_PATH;
-  if (override) {
-    loaded = require(override) as NativeModule;
-    return loaded;
-  }
-  const local = nativeModulePath();
-  if (existsSync(local)) {
-    loaded = require(local) as NativeModule;
-    return loaded;
+  return loaded ??= loadModule<NativeModule>("durust-node", process.env.DURUST_NATIVE_LIBRARY_PATH);
+}
+
+function sqliteModule(): SqliteModule {
+  return loadedSqlite ??= loadModule<SqliteModule>("durust-sqlite", process.env.DURUST_SQLITE_LIBRARY_PATH);
+}
+
+function loadModule<T>(binary: "durust-node" | "durust-sqlite", override: string | undefined): T {
+  let source = override;
+  if (!source) {
+    const local = modulePath(binary);
+    source = existsSync(local) ? local : `${platformPackage()}/${binary}.${nativeTarget()}.node`;
   }
   try {
-    loaded = require(platformPackage()) as NativeModule;
+    return require(source) as T;
   } catch (error) {
+    const prerequisite = binary === "durust-sqlite"
+      ? " SQLite requires the system shared library: libsqlite3-0 on Debian/Ubuntu, " +
+        "sqlite-libs on Fedora/RHEL (included with macOS)."
+      : "";
     throw new Error(
-      `@durust/native could not load its addon: no ${platformPackage()} is installed and no ` +
-        `local build exists at ${local}; run \`npm run build:native --workspace @durust/native\` ` +
-        "in the workspace, or reinstall with optional dependencies enabled",
+      `@durust/native could not load ${binary} from ${source}; ` +
+        "run `npm run build:native --workspace @durust/native` in the workspace, " +
+        "or reinstall with optional dependencies enabled." + prerequisite,
       { cause: error }
     );
   }
-  return loaded;
 }
 
 /**
@@ -291,7 +304,7 @@ export class NativeBackend implements DurableBackend {
   /** The Rust SQLite provider over the database file at `path`. */
   static sqlite(path: string, options: NativeBackendOptions = {}): NativeBackend {
     return new NativeBackend(
-      nativeModule().NativeBackend.sqlite(path, packOptions(options)),
+      sqliteModule().NativeBackend.sqlite(path, packOptions(options)),
       options.nowMs ?? (() => Date.now())
     );
   }

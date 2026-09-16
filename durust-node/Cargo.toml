@@ -9,8 +9,13 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["postgres"]
+postgres = ["durust/postgres"]
+sqlite = ["durust/sqlite"]
+
 [dependencies]
-durust = { path = "..", default-features = false, features = ["sqlite", "postgres", "s3"] }
+durust = { path = "..", default-features = false, features = ["s3"] }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
 napi-derive = "3"
 futures = "0.3"

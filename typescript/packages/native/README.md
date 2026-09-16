@@ -10,15 +10,26 @@ provider.
 
 ## The addon
 
-The package resolves its addon in this order:
+The package loads `durust-node` for memory/Postgres and loads `durust-sqlite`
+only when `NativeBackend.sqlite()` is called. Both are built from the same Rust
+binding and ship in the same platform package. Each is resolved in this order:
 
-1. `DURUST_NATIVE_LIBRARY_PATH`, when set, for a build placed anywhere.
-2. `durust-node.<target>.node` next to this package's `package.json`, which
+1. `DURUST_NATIVE_LIBRARY_PATH` for memory/Postgres or
+   `DURUST_SQLITE_LIBRARY_PATH` for SQLite, when set, for a build placed anywhere.
+2. `durust-node.<target>.node` or `durust-sqlite.<target>.node` next to this
+   package's `package.json`, which
    is where `npm run build:native --workspace @durust/native` puts a local
    build (`napi build --platform --release` over `../../../durust-node`).
 3. `@durust/native-<target>`, the platform package `optionalDependencies`
    installs for the running platform: `linux-x64-gnu`, `linux-arm64-gnu`,
    `darwin-x64`, or `darwin-arm64`. Linux builds link glibc 2.34 or newer.
+
+Only the SQLite provider requires the system SQLite shared library.
+On Debian/Ubuntu install `libsqlite3-0`;
+on Fedora/RHEL install `sqlite-libs`. macOS supplies the library. The `sqlite3`
+command-line program is not required. Prebuilt addons need no headers or
+compiler; Linux source builds also need `libsqlite3-dev` (Debian/Ubuntu) or
+`sqlite-devel` (Fedora/RHEL), alongside the Rust and C build tools.
 
 Inside this repository, build once before running any TypeScript test or
 example; `release.yml` builds the four platform packages on their own

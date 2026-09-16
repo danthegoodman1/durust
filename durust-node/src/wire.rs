@@ -1709,6 +1709,7 @@ pub enum BlobStore {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg(feature = "postgres")]
 pub struct PostgresOptions {
     #[serde(default)]
     pub schema: Option<String>,

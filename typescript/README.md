@@ -16,6 +16,9 @@ the open items are in
 ## Runtime Floor
 
 - Node.js: `>=24.0.0`
+- SQLite provider only: the system SQLite shared library (`libsqlite3-0` on
+  Debian/Ubuntu, `sqlite-libs` on Fedora/RHEL; included with macOS). Memory and
+  Postgres do not require SQLite. The SQLite command-line program is not needed.
 - Package manager: npm `>=11.0.0`
 - Test framework: Vitest
 - Platforms with a prebuilt addon: Linux x64 and arm64 (glibc 2.34 or newer),

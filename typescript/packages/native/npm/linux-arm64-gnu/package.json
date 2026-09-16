@@ -1,7 +1,7 @@
 {
   "name": "@durust/native-linux-arm64-gnu",
   "version": "0.2.1",
-  "description": "The durust-node addon for linux-arm64-gnu: a platform package of @durust/native.",
+  "description": "The Durust memory/Postgres and SQLite addons for linux-arm64-gnu: a platform package of @durust/native.",
   "os": [
     "linux"
   ],
@@ -13,7 +13,8 @@
   ],
   "main": "durust-node.linux-arm64-gnu.node",
   "files": [
-    "durust-node.linux-arm64-gnu.node"
+    "durust-node.linux-arm64-gnu.node",
+    "durust-sqlite.linux-arm64-gnu.node"
   ],
   "license": "MIT",
   "engines": {
