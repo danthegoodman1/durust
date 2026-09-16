@@ -4702,6 +4702,7 @@ impl PostgresBackend {
         &self,
         req: PayloadGarbageCollectionRequest,
     ) -> Result<PayloadGarbageCollectionOutcome> {
+        req.validate()?;
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();

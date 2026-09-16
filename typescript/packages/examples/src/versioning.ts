@@ -63,7 +63,7 @@ const rolloutWorkflow = workflow({
   name: "examples.versioning.rollout",
   version: 1,
   handler: async (input: RolloutInput): Promise<RolloutOutput> => {
-    const route = patched("route-v2") ? "v2" : "v1";
+    const route = (await patched("route-v2")) ? "v2" : "v1";
     if (input.generation < input.targetGeneration) {
       return continueAsNew({
         ...input,
@@ -82,7 +82,7 @@ const versionedScoreWorkflow = workflow({
   name: "examples.versioning.score",
   version: 1,
   handler: async (input: VersionedScoreInput): Promise<VersionedScoreOutput> => {
-    const algorithmVersion = getVersion("score-algorithm", 1, 2);
+    const algorithmVersion = (await getVersion("score-algorithm", 1, 2));
     return {
       orderId: input.orderId,
       algorithmVersion,
@@ -95,7 +95,7 @@ const deprecatedRouteWorkflow = workflow({
   name: "examples.versioning.deprecated-route",
   version: 1,
   handler: async (input: DeprecatedRouteInput): Promise<DeprecatedRouteOutput> => {
-    deprecatePatch("route-v2");
+    (await deprecatePatch("route-v2"));
     return {
       orderId: input.orderId,
       route: "v2"

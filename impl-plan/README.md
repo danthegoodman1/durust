@@ -27,6 +27,12 @@ affected plan file.
 15. [`0016-typescript-remediation.md`](0016-typescript-remediation.md)
 16. [`0017-architecture-hot-path-remediation.md`](0017-architecture-hot-path-remediation.md)
 17. [`0018-simplification-and-core-consolidation.md`](0018-simplification-and-core-consolidation.md)
+18. [`0019-durability-and-recovery-boundaries.md`](0019-durability-and-recovery-boundaries.md)
+
+Item 0019 records the 2026-09-16 review and its reproduced failure cases. Its
+blob-publication and commit-atomicity gates precede the remaining broad payload
+and provider migrations in 0018; its recovery phases revisit 0009's fixed-budget
+policy and the synchronous-marker full-history fallback.
 
 ## Shared Gate
 

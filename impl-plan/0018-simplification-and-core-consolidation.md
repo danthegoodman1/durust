@@ -1,5 +1,12 @@
 # 0018: Simplification and Core Consolidation (Rust and TypeScript)
 
+Follow-up: [0019](0019-durability-and-recovery-boundaries.md) records the
+2026-09-16 review. Its GC/publication proof gates Phase 3B, and its atomic
+memory-commit work is the next bounded step before Phase 4A–4D. It also revisits
+the full-history marker fallback accepted in 1A. The remaining consolidation
+work must preserve these guarantees rather than replacing transactional
+protection with a timestamp grace period.
+
 ## Overarching Goal
 
 Make Durust smaller without giving up a guarantee. A full review on
@@ -204,7 +211,7 @@ Status ledger:
 
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
-| Complete | Work | 1A: Rust double `patched` poisons the run | Landed 2026-09-15: the runtime marker index, `preconsume_marker`, and `skip_preconsumed_change_markers` are deleted from `src/runtime.rs`; markers match positionally and `peek_marker_or_overrun` latches a window overrun; the worker's `load_cold_history` replays with the whole history on an overrun and no longer calls `workflow_change_versions` per partial claim or evicts the cache after a marker append (`src/worker.rs`, net −373/+196 lines in `src/`). Tests: `tests/replay_core.rs::repeated_change_id_across_task_boundary_{cached,cold,cold_single_event_chunks}`, `::recorded_version_marker_beyond_loaded_window_replays_with_full_history`; revert-verified: with `src/runtime.rs` and `src/worker.rs` restored the three repeated cases fail at the history assertion. Review fix: the full-history reload takes a fresh recovery budget, since charging the discarded first attempt deferred a run whose history fits the budget on every claim (`::budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun`, revert-verified). Corpus case `one change id consulted on both sides of a task boundary records two markers`. `SPEC.md` §15.2 rewritten. |
+| Complete | Work | 1A: Rust repeated `patched` preserves positional markers | Superseded by 0019 Phase 5: awaited marker APIs use the ordinary replay gate in both runtimes. Unlimited reload/reserve paths are removed. Repeated-id replay and the shared behavioral corpus preserve recorded command semantics. |
 | Complete | Work | 1B: TypeScript signal branch cannot cold-replay | Landed: `SignalConsumed` leaves the replay window (`isReplayCommandEvent`) and is indexed by command key (`#signalConsumptions`, `#takeRecordedSignalConsumption`) in `runtime.ts`; `resolveSignal` and `resolveHotSignalBranch` consult the index before live signals, as Rust does. Tests: `worker.test.ts`, `signal branches replay by command id` (select signal-first, select timer-first, join signal-first × cache 1024 and 0); revert-verified: the two cold signal-first cases fail with the positional match restored. Corpus case `a signal that won a select whose timer registered later replays cold by command id`. |
 | Complete | Work | 1C: payload decorators forward batch methods | Landed: `src/payload_backend.rs` forwards `claim_workflow_tasks`, `commit_workflow_tasks` (offloading each item), `claim_activity_tasks` (hydrating each task), and `run_due_maintenance`; `@durust/payload`'s `PayloadBackend` exposes `claimWorkflowTasks`/`claimActivityTasks` exactly when the wrapped provider does, hydrating their results. Tests: `tests/provider_conformance.rs::payload_backend_forwards_batch_claims_commits_and_maintenance`, `::payload_backend_forwards_shard_filtered_batch_claims_to_postgres` (revert-verified: fails with `workflow task shard filters require a shard-aware backend`); `packages/payload/test/batch-forwarding.test.ts` (2 cases). |
 | Complete | Work | 1D: Postgres batch commit savepoints | Landed: `commit_workflow_tasks_once` wraps each scalar-path item in `savepoint durust_workflow_commit_item`, rolling back per-item errors and aborting the batch on `Error::Backend`. Test: `tests/provider_conformance.rs::postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor` (a map with `max_in_flight = 0` beside a valid timer commit); revert-verified: `left: [WorkflowStarted, ActivityMapScheduled]`. |
@@ -339,8 +346,9 @@ Scope:
   honored by SQLite only, and `PayloadBackend::with_payload_storage` clears it
   silently (`src/payload_backend.rs:96`). Providers store `PayloadRef`
   opaquely; the row-blob tables become `PayloadBlobStore` implementations. The
-  SQL providers' transactional timestamp refresh (`SPEC.md` §18) is replaced by
-  the GC grace period plus pre-delete re-probe the decorator already uses.
+  SQL providers' transactional timestamp refresh (`SPEC.md` §18) remains until
+  item 0019 Phase 1 proves equivalent publication/reclamation protection in the
+  shared mechanism. A grace period plus pre-delete probe is insufficient.
   Public surface change: `open_with_payload_storage` / `with_payload_storage`
   shapes and `PayloadStorageConfig::blob_store`.
 - 3C Cheaper refs. Reviewer-measured: `encode_payload` 193 ns against 45 ns for
@@ -361,8 +369,9 @@ Scope:
   it).
 
 Out of scope:
-- Any change to the `PayloadBlobStore` trait shape or the URI-ownership rule;
-  the GC design stays.
+- The publication/reclamation protocol belongs to item 0019 Phase 1, including
+  any required `PayloadBlobStore` changes. This phase consumes that proven
+  contract; URI ownership remains unchanged.
 
 Completion gate:
 One traversal in `src/payload.rs`; no provider contains a payload walker or a
@@ -381,7 +390,7 @@ Status ledger:
 | Status | Type | Item | Evidence / Gap |
 | --- | --- | --- | --- |
 | Complete | Work | 3A: single payload traversal | `src/payload.rs`: `history_event_payload_slots` is the one exhaustive match over an event's payload fields (a `PayloadSlot` is a plain ref or a `ManifestKind`-tagged manifest ref); `ManifestWalk` is the one manifest walk, pull-driven so a sync caller (`manifest_refs`, `input_manifest_page_refs`) and an async caller (Postgres transactions, the decorator's blob store) load containers their own way; `history_event_payload_roots` and `history_event_payload_refs` build the root and reachability collectors on them. Deleted: the event-walking matches and per-kind manifest collectors in `src/memory.rs`, `src/sqlite.rs`, `src/postgres.rs` (roots and blobs, failure and child-map-outcome helpers, three `*_root_for_roots` and three `collect_*_manifest_ref` per provider) and the decorator's three external manifest walks. 23,508 to 22,953 lines across the five files. Guard: `payload_offload_activity_map_round_trip` and `payload_offload_child_workflow_map_round_trip` now sweep with `gc_payload_blobs` and re-read the completed map's result manifest; dropping the `ActivityMapCompleted` slot from the traversal fails `memory_provider_offloads_large_payloads_and_hydrates_public_apis` and `sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen` (before those pins the whole workspace suite stayed green under that mutation). Still per provider: the normalize and hydrate manifest rewrites (`normalize_*_manifest_for_storage`, `hydrate_*_from_storage`, three each), which 3B removes with the row-blob tables. |
-| In Progress | Decision | 3B: decorator is the only offload mechanism | Decided: `PayloadBackend<B, S>` becomes the only offload path when the providers move onto the Phase 4 `Storage` trait. Providers store `PayloadRef` opaquely and lose their normalize and hydrate manifest rewrites; the row-blob tables become `PayloadBlobStore` implementations (`SqliteBlobStore` over the same file, `PostgresBlobStore` over `payload_blobs`, alongside the existing `MemoryBlobStore`); `PayloadStorageConfig::blob_store`, `open_with_payload_storage`, and `with_payload_storage` fold into the decorator's constructor; SPEC §18's transactional timestamp refresh gives way to the GC grace period plus the pre-delete re-probe the decorator already runs. Missing: the implementation, which lands with 4B to 4D because each provider's payload code (about 1,200 lines apiece) is what those rows rewrite. |
+| In Progress | Decision | 3B: decorator is the only offload mechanism | Centralized offload remains the proposed direction, with provider-owned row stores behind a shared contract. The prior safety premise is superseded by 0019/F1: the decorator's timestamp probe and delete can lose a concurrently committed blob. Missing: 0019 Phase 1's publication/reclamation proof before replacing SQL transactional protection, then the provider migrations and constructor/API migration. |
 | Complete | Work | 3C: fingerprint cached, default fields skipped | Landed: `type_fingerprint` memoizes per type (`cached_type_name_fingerprint`, keyed by the `type_name` address, value leaked once); Criterion `payload_encode_messagepack_small` 156.5 ns before, 31.2 ns after on the same machine. Decided against skipping default `schema_fingerprint`, `compression`, and `encryption` on a stored `PayloadRef`: the ref's stored shape is now the one both runtimes read (`kind`-tagged, camelCase, SPEC §14), and the TypeScript decoder expects every field present, so omitting defaults would buy a few bytes per ref at the price of a second shape. |
 | In Progress | Decision | 3D: `s3` dependency weight | Measured (`cargo tree -e normal --prefix none | sort -u`): no features 54 crates, `sqlite` 54, `postgres` 96, `s3` 151, all 184. The `s3` feature adds 81 crates over the `postgres` set, every one reached only through `rust-s3`: `reqwest`, `hyper`, `tower`, `rustls` (what any async HTTP client costs); `attohttpc`, `aws-creds`, `rust-ini` (a sync credential client that `tokio-rustls-tls` pulls through `aws-creds/rustls-tls`, which no feature choice removes); both `ring` and `aws-lc-rs` with `aws-lc-sys` (two TLS backends); `sysinfo`, `quick-xml`, `time`, `md5`. Decided: replace `rust-s3` with the five SigV4 requests (`PUT`, `GET`, `HEAD`, `DELETE`, `ListObjectsV2`) on `reqwest` with `rustls` and `hmac` over `sha2`, which drops the sync client, the second TLS backend, `sysinfo`, `quick-xml`, and the 130 lines of date parsing (`Last-Modified` alone remains). Missing: the client, landing with the 3B storage pass; Garage CI conformance is its acceptance test. |
 | Complete | Work | 3E: lazy hydration in TypeScript (no-go path only) | 2E decided go and 7C retired the TypeScript payload package; the binding hydrates a claim's prefetched history eagerly (`PayloadBackend::hydrate_history_events`, `durust-node/src/lib.rs` `hydrate_claim`) because the TypeScript worker reads payloads from the events it is handed, while the Rust worker keeps its lazy path (`tests/replay_core.rs::replay_hydrates_large_activity_result_only_when_workflow_observes_it`). |

@@ -256,12 +256,12 @@ async fn corpus_activity_map(input: Value1) -> durust::Result<Value1> {
 
 #[durust::workflow(name = "corpus.markers", version = 1)]
 async fn corpus_markers(input: Value1) -> durust::Result<Value1> {
-    let version = durust::get_version("corpus.change", 1, 1)?;
+    let version = durust::get_version("corpus.change", 1, 1).await?;
     let tagged = durust::side_effect("corpus.tag", move || Value1 {
         value: input.value + 100,
     })
     .await?;
-    durust::deprecate_patch("corpus.retired")?;
+    durust::deprecate_patch("corpus.retired").await?;
     Ok(Value1 {
         value: tagged.value + u64::try_from(version).unwrap_or(0),
     })
@@ -271,11 +271,11 @@ async fn corpus_markers(input: Value1) -> durust::Result<Value1> {
 /// its own marker, so the second task appends a second `VersionMarker`.
 #[durust::workflow(name = "corpus.repeated-change-id", version = 1)]
 async fn corpus_repeated_change_id(input: Value1) -> durust::Result<Value1> {
-    let first = durust::patched("corpus.repeat")?;
+    let first = durust::patched("corpus.repeat").await?;
     let doubled = durust::call_activity!(corpus_double(Value1 { value: input.value }))
         .task_queue(CORPUS_ACTIVITY_QUEUE)
         .await?;
-    let second = durust::patched("corpus.repeat")?;
+    let second = durust::patched("corpus.repeat").await?;
     Ok(Value1 {
         value: doubled.value + u64::from(first) + u64::from(second),
     })

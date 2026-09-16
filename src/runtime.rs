@@ -221,7 +221,6 @@ pub(crate) struct RuntimeContext {
     // makes one request; the request carries how many consumers wait on it.
     payload_hydration_requests: BTreeMap<String, PayloadHydrationRequest>,
     hydrated_payloads: BTreeMap<String, (usize, PayloadRef)>,
-    replay_window_overrun: bool,
     signal_requests: Vec<LiveSignalRequest>,
     append_events: Vec<NewHistoryEvent>,
     upsert_waits: Vec<WaitRecord>,
@@ -549,7 +548,6 @@ impl RuntimeContext {
             live_signals: BTreeMap::new(),
             payload_hydration_requests: BTreeMap::new(),
             hydrated_payloads: BTreeMap::new(),
-            replay_window_overrun: false,
             signal_requests: Vec::new(),
             append_events: Vec::new(),
             upsert_waits: Vec::new(),
@@ -1171,7 +1169,7 @@ impl RuntimeContext {
 
         // Borrowed, not cloned: matching a marker only needs its change id,
         // recorded seq, and version.
-        let recorded = match self.peek_marker_or_overrun("get_version", &change_id)? {
+        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
             Some(HistoryEventData::VersionMarker(marker)) => {
                 if marker.change_id != change_id {
                     return Err(Error::Nondeterminism(format!(
@@ -1226,7 +1224,7 @@ impl RuntimeContext {
         // Borrowed, not cloned, as in `get_version`. `Some(version)` carries a
         // recorded `VersionMarker` whose version still needs the bridge check;
         // `None` inside `Some(..)` carries a recorded `DeprecatedPatchMarker`.
-        let recorded = match self.peek_marker_or_overrun("deprecate_patch", &patch_id)? {
+        let recorded = match self.peek_replay_command_event().map(|event| &event.data) {
             Some(HistoryEventData::VersionMarker(marker)) => {
                 if marker.change_id != patch_id {
                     return Err(Error::Nondeterminism(format!(
@@ -1273,36 +1271,6 @@ impl RuntimeContext {
             }),
         ));
         Ok(())
-    }
-
-    /// The replay event a change-marker API matches against, or `None` at the
-    /// replay tail where the marker is appended instead.
-    ///
-    /// Markers are matched positionally like every other command, so the
-    /// answer needs the event at the cursor to be loaded. `get_version` and
-    /// `deprecate_patch` are synchronous and cannot park until the next chunk
-    /// arrives, so when the loaded window ends before the replay target the
-    /// call latches an overrun and fails: the worker discards this poll and
-    /// replays the run with its whole history loaded. Workflow code may catch
-    /// the error; the latch is what stops the task from committing.
-    fn peek_marker_or_overrun(
-        &mut self,
-        api: &str,
-        change_id: &str,
-    ) -> Result<Option<&HistoryEventData>> {
-        if self.peek_replay_command_event().is_none() && !self.at_replay_tail() {
-            self.replay_window_overrun = true;
-            return Err(Error::Nondeterminism(format!(
-                "{api}(`{change_id}`) reached the end of the loaded history window; the task replays with full history"
-            )));
-        }
-        Ok(self.peek_replay_command_event().map(|event| &event.data))
-    }
-
-    /// Whether a change-marker API hit the end of a partially loaded window
-    /// during this poll. The worker must not commit such a poll.
-    pub(crate) fn replay_window_overrun(&self) -> bool {
-        self.replay_window_overrun
     }
 }
 
@@ -1373,20 +1341,57 @@ pub fn set_default_activity_options(options: ActivityOptions) {
 
 pub const DEFAULT_VERSION: i32 = -1;
 
+/// Records or replays a positional version marker, awaiting bounded history reads.
 pub fn get_version(
     change_id: impl Into<String>,
     min_supported: i32,
     max_supported: i32,
-) -> Result<i32> {
-    with_context(|runtime| runtime.get_version(change_id.into(), min_supported, max_supported))
+) -> impl Future<Output = Result<i32>> + Send {
+    // Reject durable API re-entry even if a callback drops the returned future.
+    with_context(|_| ());
+    let mut change_id = Some(change_id.into());
+    futures::future::poll_fn(move |_| {
+        with_context(|runtime| {
+            if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
+                runtime.needs_more_history = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(
+                runtime.get_version(
+                    change_id
+                        .take()
+                        .expect("version future polled after completion"),
+                    min_supported,
+                    max_supported,
+                ),
+            )
+        })
+    })
 }
 
-pub fn patched(patch_id: impl Into<String>) -> Result<bool> {
-    Ok(get_version(patch_id, DEFAULT_VERSION, 1)? != DEFAULT_VERSION)
+pub fn patched(patch_id: impl Into<String>) -> impl Future<Output = Result<bool>> + Send {
+    let version = get_version(patch_id, DEFAULT_VERSION, 1);
+    async move { Ok(version.await? != DEFAULT_VERSION) }
 }
 
-pub fn deprecate_patch(patch_id: impl Into<String>) -> Result<()> {
-    with_context(|runtime| runtime.deprecate_patch(patch_id.into()))
+pub fn deprecate_patch(patch_id: impl Into<String>) -> impl Future<Output = Result<()>> + Send {
+    with_context(|_| ());
+    let mut patch_id = Some(patch_id.into());
+    futures::future::poll_fn(move |_| {
+        with_context(|runtime| {
+            if runtime.peek_replay_command_event().is_none() && !runtime.at_replay_tail() {
+                runtime.needs_more_history = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(
+                runtime.deprecate_patch(
+                    patch_id
+                        .take()
+                        .expect("patch future polled after completion"),
+                ),
+            )
+        })
+    })
 }
 
 pub fn continue_as_new<T, I>(input: I) -> Result<T>
@@ -3689,7 +3694,11 @@ mod tests {
         // property this row establishes while the test still passes.
         let mut context = workflow_context("run/side-effect-reentrancy");
         let outcome = poll_with_runtime_context::<_, ()>(&mut context, || {
-            let mut effect = side_effect("make-id", || patched("v2").unwrap_or(false));
+            let mut effect = side_effect("make-id", || {
+                futures::FutureExt::now_or_never(patched("v2"))
+                    .expect("tail marker is ready")
+                    .unwrap()
+            });
             let mut poll_context = Context::from_waker(std::task::Waker::noop());
             let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 Pin::new(&mut effect).poll(&mut poll_context)
@@ -3774,14 +3783,20 @@ mod tests {
             let manifest = activity_map_manifest((0..3_u64).map(|index| {
                 // The durable call is caller code running inside the adapter,
                 // which is exactly what the borrow hoist makes legal.
-                let legacy = index == 0 && patched("v2").expect("patched inside a map adapter");
+                let legacy = index == 0
+                    && futures::FutureExt::now_or_never(patched("v2"))
+                        .expect("tail marker is ready")
+                        .unwrap();
                 (index, legacy)
             }))
             .expect("manifest built from a lazy adapter calling a durable API");
             assert!(matches!(manifest, PayloadRef::Inline { .. }));
 
             let manifest = child_workflow_map_manifest((0..2_u64).map(|index| {
-                let legacy = index == 0 && patched("v3").expect("patched inside a map adapter");
+                let legacy = index == 0
+                    && futures::FutureExt::now_or_never(patched("v3"))
+                        .expect("tail marker is ready")
+                        .unwrap();
                 (index, legacy)
             }))
             .expect("child manifest built from a lazy adapter calling a durable API");

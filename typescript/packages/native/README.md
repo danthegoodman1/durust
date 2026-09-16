@@ -33,8 +33,11 @@ scans, and `currentTime()`.
 
 `payload` turns on offload through the Rust payload backend: payloads over
 `inlineThresholdBytes` go to `blobStore` (`LocalDirectory`, `S3`, or
-`Memory`) and come back inline on every read. `gcPayloadBlobs({ minAgeMs,
-dryRun })` sweeps blobs no root reaches.
+`Memory`) and come back inline on every read. Online collection is dry-run only:
+`gcPayloadBlobs({ dryRun: true })`. For deletion, stop and drain every writer
+sharing the store, keep them stopped throughout the sweep, and call
+`gcPayloadBlobs({ writersQuiescent: true, minAgeMs })`. Age is retention policy,
+not a concurrency guarantee.
 
 `postgres(url, options)` also takes `schema` (`durust` by default),
 `maxPoolSize`, `logicalShards`, `physicalPartitions`, `statementTimeoutMs`,

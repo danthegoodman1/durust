@@ -1885,6 +1885,7 @@ impl DurableBackend for SqliteBackend {
         req: crate::PayloadGarbageCollectionRequest,
     ) -> BoxFuture<'static, Result<crate::PayloadGarbageCollectionOutcome>> {
         let result = (|| {
+            req.validate()?;
             let mut conn = self.connection()?;
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)

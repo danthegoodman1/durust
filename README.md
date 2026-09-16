@@ -529,10 +529,12 @@ let status = status(&view);
 
 ### Version Branches
 
-Use version markers when changing command-producing workflow code.
+Use version markers when changing command-producing workflow code. Await
+`get_version`, `patched`, and `deprecate_patch`; a marker may need another bounded
+history chunk. Existing recorded marker histories remain compatible.
 
 ```rust
-if durust::patched("new-payment-flow")? {
+if durust::patched("new-payment-flow").await? {
     durust::call_activity!(charge_v2(input)).await?;
 } else {
     durust::call_activity!(charge_v1(input)).await?;
@@ -544,7 +546,7 @@ After no open workflow needs the old branch, keep a bridge while removing the
 branch body:
 
 ```rust
-durust::deprecate_patch("new-payment-flow")?;
+durust::deprecate_patch("new-payment-flow").await?;
 durust::call_activity!(charge_v2(input)).await?;
 ```
 
@@ -747,16 +749,19 @@ ownership is exclusive: each provider resolves only refs carrying its own
 scheme and persists every other scheme opaquely, so custom `PayloadBlobStore`
 implementations work over any inner provider.
 
-Providers also expose dry-run-capable payload GC that removes blobs no longer
-reachable from durable history or operational indexes; `PayloadBackend` applies
-the same contract to its external object store by asking the inner provider for
-generic payload roots and deleting only wrapper-owned unreachable objects.
-Because blobs upload before the commit that makes them reachable, GC never
-deletes a blob younger than `PayloadGarbageCollectionRequest::min_age` (default
-one hour); stores that can cheaply refresh a blob's timestamp on a
-content-addressed re-put do so, while S3 skips the refresh and relies on the
-grace period exceeding the worst upload-to-commit latency plus one GC scan.
-Delete failures are recorded in the outcome and the sweep continues.
+Payload GC supports online dry runs and offline deletion. Before deleting,
+stop and drain every writer using the provider or shared blob store, keep them
+stopped until the sweep finishes, and set
+`PayloadGarbageCollectionRequest::writers_quiescent = true`. Destructive requests
+without that assertion are rejected. The native TypeScript spelling is
+`writersQuiescent: true`. This includes clients, workers, maintenance services,
+and pending uploads across processes; a timestamp grace period cannot replace
+quiescence. `min_age` (default one hour) retains young orphan blobs. Delete
+failures are recorded in the outcome and the sweep continues.
+
+The local-directory store syncs blob contents and directory entries before a
+reference can commit. It requires a filesystem that honors file/directory sync
+and atomic rename.
 
 To run the local S3 conformance test, against the S3Proxy fixture:
 

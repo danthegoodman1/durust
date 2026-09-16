@@ -18,11 +18,9 @@ import { decodePayload, encodePayload, type CodecId, type PayloadRef } from "./p
 import type { Registry } from "./registry.js";
 import {
   HotWorkflowExecution,
-  REPLAY_WINDOW_LOOKAHEAD_EVENTS,
   UnsupportedWorkflowVersionError,
   WorkflowCodeError,
-  durableFailureFromUnknown,
-  isReplayCommandEvent
+  durableFailureFromUnknown
 } from "./runtime.js";
 import {
   eventId,
@@ -276,7 +274,7 @@ interface PreparedWorkflowExecution {
   readonly execution: HotWorkflowExecution;
   // Carried without `prefetchedHistory`. Only `runId` and `workflowType` are
   // read after the commit, and the array a cold replay starts from now holds
-  // the runtime's whole reserve — keeping a reference to it here would pin that
+  // the current replay chunk — keeping a reference to it here would pin that
   // for the length of the task, on top of the copy the runtime already owns.
   readonly claim: ClaimedWorkflowTask;
   readonly commit: WorkflowTaskCommit;
@@ -1021,54 +1019,20 @@ export class Worker {
       workflowStartedInput(replayClaim.prefetchedHistory) as PayloadRef<unknown>,
       definition.inputSchema
     );
-    let execution = this.#buildColdExecution(definition, input, replayClaim, liveSignals, nowMs);
+    const execution = this.#buildColdExecution(definition, input, replayClaim, liveSignals, nowMs);
     // Everything past this point needs the claim's identity, never its events.
     const preparedClaim = claimWithoutHistory(replayClaim);
     // Released as soon as the execution has ingested it. That array now carries
-    // the runtime's whole reserve, and the runtime keeps its own split of it —
+    // the current replay chunk, and the runtime keeps its own split of it —
     // window and indexes — so a second reference alive for the length of the
-    // task would double the replay's memory. A repair re-derives it instead of
-    // holding it against a case that almost never happens.
+    // task would keep consumed events alive unnecessarily.
     replayClaim = null;
     let commit: WorkflowTaskCommit;
     try {
       commit = await execution.nextCommit();
     } catch (error: unknown) {
-      // Asked of the execution rather than inferred from the error. A workflow
-      // that catches the refusal runs on with an unverified marker and usually
-      // fails later for some other reason — a nondeterminism mismatch against
-      // the recorded command it skipped — so the error that surfaces is not
-      // reliably the overrun. The latch is.
-      if (execution.replayWindowOverrun() === null) {
-        execution.dispose("task failed before commit");
-        throw error;
-      }
-      // A workflow whose synchronous markers outran the replay window's
-      // reserve. Repairable rather than fatal: nothing was committed, replay is
-      // deterministic, and the only thing wrong with the attempt is how much
-      // history it was willing to hold. Replay the run once more with no
-      // reserve limit — the window then carries the whole recorded history, the
-      // markers cannot outrun it, and this run alone gives up the chunk-sized
-      // memory bound. One wasted replay, no provider contract change, and no
-      // retry loop for an operator to interpret.
-      execution.dispose("replay window reserve exhausted");
-      // Primed to the whole history, not just to a bigger reserve. The reserve
-      // governs the runtime's own refills, but the first marker of a storm runs
-      // inside the execution's constructor, before any refill can happen — so
-      // the repair has to arrive with everything already loaded.
-      const repairClaim = await this.#claimWithInitialReplayChunk(
-        claimed,
-        Number.POSITIVE_INFINITY
-      );
-      execution = this.#buildColdExecution(
-        definition,
-        input,
-        repairClaim,
-        liveSignals,
-        nowMs,
-        Number.POSITIVE_INFINITY
-      );
-      commit = await execution.nextCommit();
+      execution.dispose("task failed before commit");
+      throw error;
     }
     return {
       cacheKey,
@@ -1124,8 +1088,7 @@ export class Worker {
     input: unknown,
     replayClaim: ClaimedWorkflowTask,
     liveSignals: readonly SignalInboxRecord[],
-    nowMs: number,
-    replayWindowLookaheadEvents?: number
+    nowMs: number
   ): HotWorkflowExecution {
     // The loader closes over ids, not over the claim: the claim holds the
     // provider's prefetched event array, and a loader that captured it would
@@ -1156,9 +1119,6 @@ export class Worker {
       // the claim above carries only the head.
       loadReplayHistory: (afterEventId) =>
         this.#loadReplayHistoryChunk(replayRunId, replayTargetEventId, afterEventId),
-      ...(replayWindowLookaheadEvents === undefined
-        ? {}
-        : { replayWindowLookaheadEvents }),
       // Spread rather than assigned to satisfy `exactOptionalPropertyTypes`,
       // which rejects an explicit `undefined` for an optional property. Both
       // forms behave identically at runtime — the runtime tests
@@ -1174,19 +1134,10 @@ export class Worker {
    * Builds the claim a cold replay starts from: the head of history, not all of
    * it.
    *
-   * The rest arrives through {@link #loadReplayHistoryChunk} as the runtime
-   * asks for it. Two things have to be in this first slice. `WorkflowStarted`,
-   * which carries the workflow input and is event 1; and enough recorded
-   * command events to fill the runtime's reserve, because a workflow whose
-   * *first* durable call is a synchronous marker — `getVersion` at the top of a
-   * handler is idiomatic — runs that call inside the execution's constructor,
-   * before any pump exists to fetch for it. Priming here is the only place that
-   * can serve it, and the size it primes to is the same reserve the window
-   * maintains from then on, so this costs nothing extra in steady state.
+   * The rest arrives through the ordinary replay gate, including for markers.
    */
   async #claimWithInitialReplayChunk(
-    claimed: ClaimedWorkflowTask,
-    minCommandEvents: number = REPLAY_WINDOW_LOOKAHEAD_EVENTS
+    claimed: ClaimedWorkflowTask
   ): Promise<ClaimedWorkflowTask> {
     const prefix = contiguousHistoryPrefix(claimed.prefetchedHistory, claimed.replayTargetEventId);
     this.#recordHistoryCacheOutcome(claimed.runId, claimed.replayTargetEventId, prefix.length);
@@ -1203,27 +1154,9 @@ export class Worker {
       prefix.length > this.#historyFetchMaxEvents
         ? prefix.slice(0, this.#historyFetchMaxEvents)
         : prefix;
-    let lastEventId = initial.at(-1)?.eventId ?? eventId(0);
-    let commandEvents = initial.reduce(
-      (count, event) => count + (isReplayCommandEvent(event) ? 1 : 0),
-      0
-    );
-    while (
-      commandEvents <= minCommandEvents &&
-      Number(lastEventId) < Number(claimed.replayTargetEventId)
-    ) {
-      const chunk = await this.#loadReplayHistoryChunk(
-        claimed.runId,
-        claimed.replayTargetEventId,
-        lastEventId
-      );
-      for (const event of chunk.events) {
-        initial.push(event);
-        if (isReplayCommandEvent(event)) {
-          commandEvents += 1;
-        }
-      }
-      lastEventId = chunk.lastEventId;
+    if (initial.length === 0 && Number(claimed.replayTargetEventId) > 0) {
+      const chunk = await this.#loadReplayHistoryChunk(claimed.runId, claimed.replayTargetEventId, eventId(0));
+      initial.push(...chunk.events);
     }
     return { ...claimed, prefetchedHistory: initial };
   }

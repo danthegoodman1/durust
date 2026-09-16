@@ -251,6 +251,8 @@ export interface NativePostgresOptions extends NativeBackendOptions {
 }
 
 export interface PayloadGcRequest {
+  /** Required for deletion: all writers sharing the store are stopped and drained until the sweep returns. */
+  readonly writersQuiescent?: boolean;
   /** Report what a sweep would delete without deleting it. */
   readonly dryRun?: boolean;
   /** Blobs modified more recently than this are kept; one hour by default. */

@@ -161,7 +161,8 @@ describe("NativeBackend payload offload", () => {
       payload: { inlineThresholdBytes: 8, blobStore: { kind: "LocalDirectory", root } }
     });
     await assertOffloadIsTransparent(backend, root);
-    const swept = await backend.gcPayloadBlobs({ minAgeMs: 0 });
+    await expect(backend.gcPayloadBlobs({ minAgeMs: 0 })).rejects.toThrow("quiescent");
+    const swept = await backend.gcPayloadBlobs({ minAgeMs: 0, writersQuiescent: true });
     expect(swept).toEqual({ scannedBlobs: 1, retainedBlobs: 1, deletedBlobs: 0, failedBlobs: 0 });
     expect(readdirSync(root)).toHaveLength(1);
   });
@@ -188,7 +189,8 @@ describe("NativeBackend payload offload", () => {
     expect(dryRun.scannedBlobs).toBe(2);
     expect(dryRun.retainedBlobs).toBe(1);
     expect(readdirSync(root)).toHaveLength(2);
-    const swept = await backend.gcPayloadBlobs({ minAgeMs: 0 });
+    await expect(backend.gcPayloadBlobs({ minAgeMs: 0 })).rejects.toThrow("quiescent");
+    const swept = await backend.gcPayloadBlobs({ minAgeMs: 0, writersQuiescent: true });
     expect(swept.deletedBlobs).toBe(1);
     expect(readdirSync(root)).toHaveLength(1);
   });

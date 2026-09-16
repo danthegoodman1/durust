@@ -21,6 +21,7 @@ import {
   decodeActivityMapResults,
   decodeChildWorkflowMapSuccesses,
   encodePayload,
+  decodePayload,
   eventId,
   getVersion,
   heartbeat,
@@ -40,8 +41,7 @@ import {
 } from "@durust/core";
 import { NativeBackend } from "@durust/native";
 import {
-  HotWorkflowExecutionDisposedError,
-  REPLAY_WINDOW_LOOKAHEAD_EVENTS
+  HotWorkflowExecutionDisposedError
 } from "../src/runtime.js";
 import { claimActivity, readHistory } from "@durust/testing";
 import { runWorkerUntilSettled, workerFixture } from "./support.js";
@@ -3733,23 +3733,13 @@ describe("Worker hot join settlement", () => {
   });
 });
 
-// The one absolute limit chunked replay introduces, and its repair.
-//
-// `getVersion` and friends return plain values rather than thenables, so they
-// cannot suspend to wait for the next chunk; they spend from the window's
-// reserve. A long enough unbroken run of them exhausts it. That is refused
-// rather than mis-replayed — appending a duplicate marker the rest of history
-// contradicts is the failure worth preventing — and then repaired by replaying
-// the run once with no reserve limit.
-describe("Worker replay window reserve", () => {
+// Markers suspend at ordinary replay boundaries, including before the first activity.
+describe("Worker streaming markers", () => {
   const markerActivity = activity({
     name: "worker.marker-quote",
     handler: async (input: { readonly step: number }): Promise<{ readonly step: number }> => input
   });
 
-  // Runs a long unbroken sequence of synchronous version markers *before* its
-  // first awaited durable call, which is the shape that has no chunk boundary
-  // to park at.
   function markerStormWorkflow(name: string, markers: number, swallow: boolean) {
     return workflow({
       name,
@@ -3758,15 +3748,14 @@ describe("Worker replay window reserve", () => {
         let total = input.seed;
         for (let index = 0; index < markers; index += 1) {
           if (swallow) {
-            // A workflow that hides the refusal must still not be able to
-            // commit a task built on a marker the runtime could not verify.
+            // A catch block must never observe history-loading as an error.
             try {
-              total += getVersion(`worker.change-${index}`, -1, 1);
+              total += (await getVersion(`worker.change-${index}`, -1, 1));
             } catch {
               total += 1000;
             }
           } else {
-            total += getVersion(`worker.change-${index}`, -1, 1);
+            total += (await getVersion(`worker.change-${index}`, -1, 1));
           }
         }
         const quote = await callActivity(markerActivity, { step: 1 }, { taskQueue: "activities" });
@@ -3796,16 +3785,14 @@ describe("Worker replay window reserve", () => {
       "workflows",
       { seed: 1 }
     );
-    // Records the markers and the scheduled activity, then completes it so a
-    // cold replay has to walk the whole marker run.
     await expect(recorder.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
     await expect(recorder.runActivityTaskOnce()).resolves.toMatchObject({ kind: "Completed" });
 
+    const reads = vi.spyOn(backend, "streamHistory");
     const replayer = workerFixture(backend, registry, {
       workerId: `marker-replayer-${label}`,
       activityTaskQueue: "activities",
       historyFetchMaxEvents,
-      // Cold, with nothing carried over from the recording worker.
       workflowExecutionCacheSize: 0,
       workflowHistoryCacheBytes: 0,
       payloadCodec: "Json"
@@ -3815,6 +3802,13 @@ describe("Worker replay window reserve", () => {
     if (outcome.kind !== "Committed") {
       throw new Error("expected a committed workflow task");
     }
+    const requests = reads.mock.calls.map(([request]) => request);
+    expect(requests.filter(request => Number(request.afterEventId) === 0)).toHaveLength(1);
+    expect(requests.every(request => request.maxEvents <= historyFetchMaxEvents)).toBe(true);
+    for (let index = 1; index < requests.length; index += 1) {
+      expect(Number(requests[index]!.afterEventId)).toBeGreaterThan(Number(requests[index - 1]!.afterEventId));
+    }
+    reads.mockRestore();
     const history = await backend.streamHistory({
       runId: outcome.runId,
       afterEventId: eventId(0),
@@ -3822,50 +3816,42 @@ describe("Worker replay window reserve", () => {
       maxEvents: 100_000,
       maxBytes: 100_000_000
     });
+    const terminal = history.events.at(-1)?.data;
+    expect(terminal?.kind).toBe("WorkflowCompleted");
+    if (terminal?.kind === "WorkflowCompleted") {
+      expect(decodePayload(terminal.result)).toEqual({ total: markers + 2 });
+    }
     return history.events.map((event) => `${Number(event.eventId)}:${event.eventType}`);
   }
 
-  it("repairs a marker run that outgrows the replay window reserve", async () => {
-    // Comfortably past the reserve, and past the chunk quantisation on top of
-    // it: the refusal point is "reserve, rounded up by however much the last
-    // chunk overshot", so the limit is a floor rather than an exact number.
-    const markers = REPLAY_WINDOW_LOOKAHEAD_EVENTS * 3;
-    const chunked = await recordThenColdReplay("repair", markers, false, 16);
+  it("streams thousands of markers without a replay restart", async () => {
+    const markers = 2048;
+    const chunked = await recordThenColdReplay("repair", markers, false, 1);
     const unchunked = await recordThenColdReplay("whole", markers, false, 100_000);
 
-    // The repaired replay commits, and commits exactly what an unchunked one
-    // does — no duplicate markers, no missing ones.
     expect(chunked).toEqual(unchunked);
     expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
     expect(chunked.at(-1)).toContain("WorkflowCompleted");
   }, 240_000);
 
-  it("repairs it even when the workflow swallows the refusal", async () => {
-    const markers = REPLAY_WINDOW_LOOKAHEAD_EVENTS * 3;
+  it("does not expose chunk boundaries as catchable errors", async () => {
+    const markers = 2048;
     const chunked = await recordThenColdReplay("swallowed", markers, true, 16);
     const unchunked = await recordThenColdReplay("swallowed-whole", markers, true, 100_000);
 
-    // The latch is what makes this true. Catching the refusal lets the handler
-    // run on with an unverified marker; without a refusal that survives the
-    // `catch`, the task would commit a history with duplicate markers in it.
     expect(chunked).toEqual(unchunked);
     expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
   }, 240_000);
 
-  it("replays a marker run that fits the reserve without repairing", async () => {
-    // Well inside the reserve: the priming load hands the window enough command
-    // events before the handler's first marker runs, so nothing is refused and
-    // the chunked replay streams normally.
+  it("streams a short marker history through tiny chunks", async () => {
     const markers = 32;
-    const chunked = await recordThenColdReplay("within", markers, false, 16);
+    const chunked = await recordThenColdReplay("within", markers, false, 1);
     const unchunked = await recordThenColdReplay("within-whole", markers, false, 100_000);
     expect(chunked).toEqual(unchunked);
     expect(chunked.filter((entry) => entry.endsWith(":VersionMarker"))).toHaveLength(markers);
   }, 240_000);
 });
 
-// Row 4A. Cold replay used to accumulate every event through the replay target
-// into one array and hand it to the execution, so replay memory scaled with
 // history length and the README's "No Event History Limit" held only for the
 // provider. These measure what the replay path actually retains.
 describe("Worker replay memory", () => {
@@ -3910,7 +3896,7 @@ describe("Worker replay memory", () => {
     readonly registry: Registry;
     readonly historyEvents: number;
   }> {
-    const backend = NativeBackend.memory();
+    const backend = NativeBackend.memory({ payload: { inlineThresholdBytes: memoryPayloadBytes * 4, blobStore: { kind: "Memory" } } });
     const registry = new Registry()
       .registerWorkflow(memoryWorkflow)
       .registerActivity(memoryActivity);
@@ -3996,12 +3982,9 @@ describe("Worker replay memory", () => {
     return Math.max(...samples) - baseline;
   }
 
-  // What the replay window should cost at a given chunk size: the runtime
-  // refills to `REPLAY_WINDOW_LOOKAHEAD_EVENTS` of reserve and pulls one chunk
-  // at a time, and this fixture splits its payload evenly between the command
-  // event that sits in the window and the ready event that sits in the index.
+  // One current chunk plus any ready facts belonging to it; no marker reserve.
   function predictedWindowBytes(historyFetchMaxEvents: number): number {
-    return 2 * (REPLAY_WINDOW_LOOKAHEAD_EVENTS + historyFetchMaxEvents) * memoryPayloadBytes;
+    return 2 * historyFetchMaxEvents * memoryPayloadBytes;
   }
 
   it("holds replay memory proportional to historyFetchMaxEvents, not to history length", async () => {
@@ -4022,23 +4005,16 @@ describe("Worker replay memory", () => {
     // The history is an order of magnitude past either window.
     expect(totalPayloadBytes).toBeGreaterThan(12 * 1024 * 1024);
 
-    // Ceiling, from the pull invariant: the window never holds more than the
-    // reserve plus one chunk. This is the edge that rejects a half-finished
+    // Ceiling, from the pull invariant: the window retains one chunk. This is the edge that rejects a half-finished
     // drain — keeping even a hundred extra matched events at the small chunk
     // size breaks it.
     expect(retainedSmall).toBeLessThan(predictedWindowBytes(smallChunk) * 1.25);
     expect(retainedLarge).toBeLessThan(predictedWindowBytes(largeChunk) * 1.25);
 
-    // Floor, from the refill invariant: every awaited durable call tops the
-    // window back up to the reserve, so a correct replay is always holding at
-    // least that much. Without this the assertions above would also pass on a
-    // measurement that had collapsed to nothing.
-    // Events reach the worker decoded from the addon's msgpack, which retains
-    // less per event than the old in-process provider's shared objects did, so
-    // the floor only proves the window holds a real share of its lookahead.
-    const reserveFloorBytes = 2 * REPLAY_WINDOW_LOOKAHEAD_EVENTS * memoryPayloadBytes * 0.2;
-    expect(retainedSmall).toBeGreaterThan(reserveFloorBytes);
-    expect(retainedLarge).toBeGreaterThan(reserveFloorBytes);
+    // A large window must retain a measurable share of real payloads. Small
+    // window deltas can include unrelated V8 reclamation from earlier tests;
+    // the upper bounds and cross-size slope still detect bulk retention.
+    expect(retainedLarge).toBeGreaterThan(largeChunk * memoryPayloadBytes * 0.2);
 
     // Proportionality itself, as a slope. Each extra event of chunk size buys
     // retained bytes; a replay bounded by the run rather than by the chunk
@@ -4191,8 +4167,9 @@ function materializeFreshHistoryChunks(
       if (property === "streamHistory") {
         return async (...args: Parameters<DurableBackend["streamHistory"]>) => {
           const chunk = await target.streamHistory(...args);
+          const fresh = { ...chunk, events: chunk.events.map(cloneHistoryEvent) };
           onChunk();
-          return { ...chunk, events: chunk.events.map(cloneHistoryEvent) };
+          return fresh;
         };
       }
       const value = Reflect.get(target, property, receiver);

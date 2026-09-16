@@ -238,7 +238,11 @@ interface ProviderIoFixture {
     readonly payload: PayloadRefJson;
   }[];
   readonly payloadGarbageCollection: {
-    readonly request: { readonly dryRun: boolean; readonly minAgeMs: number };
+    readonly request: {
+      readonly dryRun: boolean;
+      readonly minAgeMs: number;
+      readonly writersQuiescent: boolean;
+    };
     readonly rustProviderOutcome: {
       readonly scannedBlobs: number;
       readonly retainedBlobs: number;
@@ -526,7 +530,11 @@ describe("contract fixtures", () => {
       "Blob",
       "Blob"
     ]);
-    expect(fixture.payloadGarbageCollection.request).toEqual({ dryRun: true, minAgeMs: 3600000 });
+    expect(fixture.payloadGarbageCollection.request).toEqual({
+      dryRun: true,
+      minAgeMs: 3600000,
+      writersQuiescent: true
+    });
     expect(fixture.payloadGarbageCollection.rustProviderOutcome).toEqual({
       scannedBlobs: 3,
       retainedBlobs: 2,

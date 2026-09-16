@@ -260,7 +260,7 @@ access. Use Durust APIs instead:
 - `callActivity` for side effects and external I/O.
 - `childWorkflow` for durable child orchestration.
 - `activityMap` and `childWorkflowMap` for bounded manifest-backed fanout.
-- `getVersion`, `patched`, and `deprecatePatch` for deterministic rollout
+- Await `getVersion`, `patched`, and `deprecatePatch` for deterministic rollout
   branches.
 - `sideEffect` for recorded deterministic values.
 
@@ -394,9 +394,11 @@ const backend = NativeBackend.sqlite("durust.db", {
 
 `blobStore` is `{ kind: "LocalDirectory", root, prefix? }`, `{ kind: "S3",
 bucket, endpoint, region, prefix?, accessKeyId, secretAccessKey }`, or
-`{ kind: "Memory" }`. `backend.gcPayloadBlobs({ minAgeMs, dryRun })` sweeps
-blobs no root reaches, keeping any younger than the grace period (one hour by
-default) so an upload whose commit has not landed survives.
+`{ kind: "Memory" }`. `backend.gcPayloadBlobs({ dryRun: true })` reports unreachable
+blobs online. Destructive collection requires stopping and draining every writer
+sharing the provider and blob store, then passing `{ writersQuiescent: true }`.
+Keep writers stopped until collection finishes. `minAgeMs` is optional retention
+(one hour by default), not protection against concurrent publication.
 
 Large activity-map and child-workflow-map manifests are ordinary payloads: over
 the threshold they offload through the same store as workflow inputs, outputs,

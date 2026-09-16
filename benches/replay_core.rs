@@ -117,7 +117,7 @@ async fn join_all_activities(input: BenchInput) -> durust::Result<u64> {
 #[durust::workflow(name = "bench.version-branch", version = 1)]
 async fn version_branch(input: BenchInput) -> durust::Result<u64> {
     let input = input.value;
-    if durust::patched("bench-double-v2")? {
+    if durust::patched("bench-double-v2").await? {
         durust::call_activity!(double(BenchInput { value: input + 1 }))
             .task_queue("activities")
             .await

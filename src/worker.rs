@@ -8,7 +8,7 @@ use crate::{
     WorkflowTaskCommit, WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
-use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -661,9 +661,9 @@ struct RecoveryReplayBudget {
 impl RecoveryReplayBudget {
     fn new(flow_control: RecoveryFlowControl) -> Self {
         Self {
-            remaining_events: flow_control.replay_event_budget,
-            remaining_bytes: flow_control.replay_byte_budget,
-            remaining_chunks: flow_control.prefetch_chunks,
+            remaining_events: flow_control.replay_event_budget.max(1),
+            remaining_bytes: flow_control.replay_byte_budget.max(1),
+            remaining_chunks: flow_control.prefetch_chunks.max(1),
         }
     }
 
@@ -712,11 +712,6 @@ struct PreparedWorkflowTask {
     default_activity_options: crate::ActivityOptions,
     unconsumed_indexes: crate::runtime::ReadyEventIndexes,
     terminal: bool,
-}
-
-enum WorkflowPollOutcome {
-    Ready(Poll<Result<crate::PayloadRef>>),
-    Deferred,
 }
 
 // What one claimed workflow task settled as, for the single-task path.
@@ -1672,29 +1667,48 @@ where
         .await
     }
 
+    async fn recovery_request_limits(&self, budget: &mut RecoveryReplayBudget) -> (usize, usize) {
+        if budget
+            .next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
+            .is_none()
+        {
+            let mut yielded = false;
+            futures::future::poll_fn(|cx| {
+                if yielded {
+                    Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            *budget = RecoveryReplayBudget::new(self.recovery_flow_control);
+        }
+        budget
+            .next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
+            .expect("positive replay quantum")
+    }
+
     async fn claim_recovery_history_chunk(
         &self,
         claimed: &crate::ClaimedWorkflowTask,
         after_event_id: EventId,
         budget: &mut RecoveryReplayBudget,
-    ) -> Result<Option<crate::HistoryChunk>> {
+    ) -> Result<crate::HistoryChunk> {
         if after_event_id >= claimed.replay_target_event_id {
-            return Ok(Some(crate::HistoryChunk {
+            return Ok(crate::HistoryChunk {
                 events: Vec::new(),
                 last_event_id: after_event_id,
                 has_more: false,
-            }));
+            });
         }
-        let Some((max_events, max_bytes)) =
-            budget.next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
-        else {
-            return Ok(None);
-        };
+        let (max_events, max_bytes) = self.recovery_request_limits(budget).await;
         if let Some(chunk) =
             prefetched_claim_history_chunk_bounded(claimed, after_event_id, max_events, max_bytes)
         {
             budget.record_chunk(&chunk);
-            return Ok(Some(chunk));
+            return Ok(chunk);
         }
         self.stream_recovery_history_chunk(
             claimed.run_id.clone(),
@@ -1711,20 +1725,16 @@ where
         after_event_id: EventId,
         up_to_event_id: EventId,
         budget: &mut RecoveryReplayBudget,
-    ) -> Result<Option<crate::HistoryChunk>> {
+    ) -> Result<crate::HistoryChunk> {
         if after_event_id >= up_to_event_id {
-            return Ok(Some(crate::HistoryChunk {
+            return Ok(crate::HistoryChunk {
                 events: Vec::new(),
                 last_event_id: after_event_id,
                 has_more: false,
-            }));
+            });
         }
 
-        let Some((max_events, max_bytes)) =
-            budget.next_request_limits(self.history_chunk_events, self.history_chunk_bytes)
-        else {
-            return Ok(None);
-        };
+        let (max_events, max_bytes) = self.recovery_request_limits(budget).await;
 
         let chunk = self
             .backend
@@ -1737,7 +1747,7 @@ where
             })
             .await?;
         budget.record_chunk(&chunk);
-        Ok(Some(chunk))
+        Ok(chunk)
     }
 
     async fn poll_until_history_blocked_or_ready(
@@ -1748,7 +1758,7 @@ where
         context: &mut crate::runtime::RuntimeContext,
         replay_target_event_id: EventId,
         mut recovery_budget: Option<&mut RecoveryReplayBudget>,
-    ) -> Result<WorkflowPollOutcome> {
+    ) -> Result<Poll<Result<crate::PayloadRef>>> {
         loop {
             // `?` on a caught panic: returning here drops the in-progress
             // context untouched, so nothing this attempt accumulated is read
@@ -1835,17 +1845,12 @@ where
                 continue;
             }
             let Some(after_event_id) = context.needs_more_history_after() else {
-                return Ok(WorkflowPollOutcome::Ready(poll));
+                return Ok(poll);
             };
             let chunk = match recovery_budget.as_deref_mut() {
                 Some(budget) => {
-                    let Some(chunk) = self
-                        .claim_recovery_history_chunk(claimed, after_event_id, budget)
+                    self.claim_recovery_history_chunk(claimed, after_event_id, budget)
                         .await?
-                    else {
-                        return Ok(WorkflowPollOutcome::Deferred);
-                    };
-                    chunk
                 }
                 None => {
                     self.stream_history_chunk(
@@ -1960,7 +1965,6 @@ where
         cached: Option<CachedWorkflow>,
         now: crate::TimestampMs,
     ) -> Result<PreparedWorkflowTaskOutcome> {
-        let mut load_full_history = false;
         if let Some(mut cached) = cached {
             let chunk = self
                 .claim_history_chunk(&claimed, cached.last_event_id)
@@ -1988,32 +1992,10 @@ where
                     None,
                 )
                 .await?;
-            match poll {
-                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
-                    // A change-marker API ran past the loaded window, so the
-                    // cached future's state is unusable: the run cold-replays
-                    // below with its whole history loaded.
-                    load_full_history = true;
-                }
-                WorkflowPollOutcome::Ready(poll) => {
-                    return self
-                        .prepare_workflow_poll(claimed, cached.future, context, poll)
-                        .await
-                        .map(PreparedWorkflowTaskOutcome::Prepared);
-                }
-                WorkflowPollOutcome::Deferred => {
-                    // Deferred is only produced under a recovery budget and the
-                    // cached path polls without one; if a budget is ever added
-                    // here, this arm must release the claim the way the
-                    // cold-path defer does or the claim leaks until its lease
-                    // expires.
-                    debug_assert!(
-                        false,
-                        "cached-path workflow poll deferred without a recovery budget"
-                    );
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
-            }
+            return self
+                .prepare_workflow_poll(claimed, cached.future, context, poll)
+                .await
+                .map(PreparedWorkflowTaskOutcome::Prepared);
         }
 
         let is_recovery = claimed.replay_target_event_id > EventId(1);
@@ -2032,120 +2014,43 @@ where
         let Some(registration) = self.registry.workflow(&claimed.workflow_type) else {
             return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
         };
-        loop {
-            let mut first_chunk = match self
-                .load_cold_history(&claimed, load_full_history, recovery_budget.as_mut())
-                .await?
-            {
-                Some(chunk) => chunk,
-                None => {
-                    self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
-                        .await?;
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
-            };
-            let last_loaded_event_id = first_chunk.last_event_id;
-            let (input, replay_events) =
-                split_start_event(std::mem::take(&mut first_chunk.events))?;
-            let input = self.hydrate_payload_for_decode(input).await?;
-            let mut future = registration.run(input, self.payload_codec);
-            let mut context = crate::runtime::RuntimeContext::new(
-                claimed.run_id.clone(),
-                self.workflow_task_queue.clone(),
-                self.activity_task_queue.clone(),
-                self.payload_codec,
-                now,
-                replay_events,
-                crate::ActivityOptions::default(),
-                0,
-                last_loaded_event_id,
-                claimed.replay_target_event_id,
-                crate::runtime::ReadyEventIndexes::default(),
-            );
-            let poll = self
-                .poll_until_history_blocked_or_ready(
-                    &claimed.run_id,
-                    &claimed,
-                    &mut future,
-                    &mut context,
-                    claimed.replay_target_event_id,
-                    recovery_budget.as_mut(),
-                )
-                .await?;
-            match poll {
-                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
-                    if load_full_history {
-                        return Err(Error::Backend(format!(
-                            "replay of run {} overran a fully loaded history window",
-                            claimed.run_id
-                        )));
-                    }
-                    load_full_history = true;
-                    // The reload starts from event zero and the first attempt's
-                    // chunks are discarded, so it gets a fresh budget: charging
-                    // both would defer a run whose whole history fits the
-                    // budget on every claim.
-                    recovery_budget =
-                        is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
-                }
-                WorkflowPollOutcome::Ready(poll) => {
-                    return self
-                        .prepare_workflow_poll(claimed, future, context, poll)
-                        .await
-                        .map(PreparedWorkflowTaskOutcome::Prepared);
-                }
-                WorkflowPollOutcome::Deferred => {
-                    self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
-                        .await?;
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
+        let mut first_chunk = match recovery_budget.as_mut() {
+            Some(budget) => {
+                self.claim_recovery_history_chunk(&claimed, EventId::ZERO, budget)
+                    .await?
             }
-        }
-    }
-
-    // The history a cold replay starts from: the first chunk, or every chunk
-    // up to the replay target when a change-marker API overran a partial
-    // window. `None` means the recovery budget ran out and the task defers.
-    async fn load_cold_history(
-        &self,
-        claimed: &crate::ClaimedWorkflowTask,
-        load_full_history: bool,
-        mut recovery_budget: Option<&mut RecoveryReplayBudget>,
-    ) -> Result<Option<crate::HistoryChunk>> {
-        let mut loaded = crate::HistoryChunk {
-            events: Vec::new(),
-            last_event_id: EventId::ZERO,
-            has_more: true,
+            None => self.claim_history_chunk(&claimed, EventId::ZERO).await?,
         };
-        loop {
-            let chunk = match recovery_budget.as_deref_mut() {
-                Some(budget) => {
-                    let Some(chunk) = self
-                        .claim_recovery_history_chunk(claimed, loaded.last_event_id, budget)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    chunk
-                }
-                None => {
-                    self.claim_history_chunk(claimed, loaded.last_event_id)
-                        .await?
-                }
-            };
-            if chunk.events.is_empty() && loaded.last_event_id < claimed.replay_target_event_id {
-                return Err(Error::Backend(format!(
-                    "history stream ended at event {} before replay target {}",
-                    loaded.last_event_id, claimed.replay_target_event_id
-                )));
-            }
-            loaded.events.extend(chunk.events);
-            loaded.last_event_id = chunk.last_event_id;
-            loaded.has_more = chunk.has_more;
-            if !load_full_history || loaded.last_event_id >= claimed.replay_target_event_id {
-                return Ok(Some(loaded));
-            }
-        }
+        let last_loaded_event_id = first_chunk.last_event_id;
+        let (input, replay_events) = split_start_event(std::mem::take(&mut first_chunk.events))?;
+        let input = self.hydrate_payload_for_decode(input).await?;
+        let mut future = registration.run(input, self.payload_codec);
+        let mut context = crate::runtime::RuntimeContext::new(
+            claimed.run_id.clone(),
+            self.workflow_task_queue.clone(),
+            self.activity_task_queue.clone(),
+            self.payload_codec,
+            now,
+            replay_events,
+            crate::ActivityOptions::default(),
+            0,
+            last_loaded_event_id,
+            claimed.replay_target_event_id,
+            crate::runtime::ReadyEventIndexes::default(),
+        );
+        let poll = self
+            .poll_until_history_blocked_or_ready(
+                &claimed.run_id,
+                &claimed,
+                &mut future,
+                &mut context,
+                claimed.replay_target_event_id,
+                recovery_budget.as_mut(),
+            )
+            .await?;
+        self.prepare_workflow_poll(claimed, future, context, poll)
+            .await
+            .map(PreparedWorkflowTaskOutcome::Prepared)
     }
 
     async fn prepare_workflow_poll(
@@ -2369,7 +2274,6 @@ where
         let mut pass_error: Option<Error> = None;
         let mut failed = 0usize;
         let mut deferred = 0usize;
-        let mut prepared = Vec::with_capacity(claimed.len());
 
         // One clock reading for the whole batch. Every task in it was claimed
         // by one RPC at one instant, so reading the provider clock per task
@@ -2402,130 +2306,133 @@ where
         // The cache is the worker's only mutable state and the lookups need no
         // I/O, so they are drained here and the claims carry their entries into
         // the concurrent stage below.
-        let mut pending = claimed
+        let shared = self.shared;
+        let mut in_flight = claimed
             .into_iter()
             .map(|task| {
                 let cached = self.remove_cached_workflow(&task.run_id);
-                (task, cached)
+                let claim = task.claim.clone();
+                (
+                    claim,
+                    Box::pin(shared.prepare_claimed_workflow_task(task, cached, Some(now))),
+                )
             })
-            .collect::<Vec<_>>()
-            .into_iter();
-
-        // The tasks in a batch are distinct runs: their history reads, payload
-        // hydrations, and cold replays share nothing. Preparing them one at a
-        // time serialises every one of those round trips behind the batch,
-        // which is what made `max_concurrent_recoveries` unreachable — the
-        // counter could never exceed one.
-        let shared = self.shared;
-        // Ordered, not unordered: the batch's results drive the commit order
-        // and which error becomes the pass's, and both must not depend on
-        // which task's provider round trip happened to return first.
-        let mut in_flight = FuturesOrdered::new();
-        loop {
-            while in_flight.len() < limit {
-                let Some((task, cached)) = pending.next() else {
-                    break;
-                };
-                in_flight.push_back(shared.prepare_claimed_workflow_task(task, cached, Some(now)));
-            }
-            let Some(outcome) = in_flight.next().await else {
-                break;
-            };
-            match outcome {
-                Ok(PreparedWorkflowTaskOutcome::Prepared(task)) => prepared.push(task),
-                // Released unreplayed — recovery admission, a replay budget, or
-                // backpressure. Reported, not swallowed: a fully backpressured
-                // batch used to look exactly like an empty queue, so a drain
-                // could declare the worker idle with work still queued.
-                Ok(PreparedWorkflowTaskOutcome::Deferred) => deferred += 1,
-                // The prepare funnel already released this task's claim.
-                Err(err) => record_workflow_task_error(&mut pass_error, &mut failed, err),
-            }
-        }
-
+            .collect::<Vec<_>>();
         let mut committed = 0usize;
-        let chunk_size = self
-            .shared
-            .workflow_task_concurrency
-            .commit_batch_size
-            .max(1);
-        let mut start = 0usize;
-        while start < prepared.len() {
-            let end = (start + chunk_size).min(prepared.len());
-            // The commit moves into the batch instead of being deep-copied
-            // into it: every append event, activity input, and child start
-            // payload this task produced would otherwise be cloned and the
-            // original dropped unread. Nothing after the RPC reads
-            // `task.commit` — the wholesale-failure path and the per-task
-            // result loop below both only need `task.claim` — so the emptied
-            // slot is never observed. The claim is still cloned; it is a few
-            // ids and a lease token, and both release paths need it after the
-            // batch is built.
-            let commits = prepared[start..end]
-                .iter_mut()
-                .map(|task| crate::WorkflowTaskCommitInput {
-                    claim: task.claim.clone(),
-                    commit: std::mem::take(&mut task.commit),
-                })
-                .collect::<Vec<_>>();
-            let results = match self
-                .shared
-                .backend
-                .commit_workflow_tasks(crate::WorkflowTaskCommitBatch { commits })
-                .await
-            {
-                Ok(results) => results,
-                Err(err) => {
-                    // The commit RPC failed wholesale: nothing in this chunk or
-                    // any later chunk was committed, so release every remaining
-                    // claim (delayed for backpressure, immediate otherwise).
-                    for task in &prepared[start..] {
-                        if let Err(err) = self
-                            .shared
-                            .release_failed_workflow_task(task.claim.clone(), err.clone())
-                            .await
-                        {
-                            record_workflow_task_error(&mut pass_error, &mut failed, err);
-                        }
+        let chunk_size = shared.workflow_task_concurrency.commit_batch_size.max(1);
+        while !in_flight.is_empty() {
+            // Poll distinct runs once each in claim order. Ready work commits
+            // before another recovery quantum; waiting for the entire batch
+            // would hold cached wakes behind arbitrarily long cold histories.
+            let outcomes = futures::future::poll_fn(|cx| {
+                let mut ready = Vec::new();
+                in_flight.retain_mut(|(_, future)| match future.as_mut().poll(cx) {
+                    Poll::Ready(outcome) => {
+                        ready.push(outcome);
+                        false
                     }
-                    break;
+                    Poll::Pending => true,
+                });
+                if ready.is_empty() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(ready)
                 }
-            };
-            for (task, result) in prepared[start..end].iter_mut().zip(results) {
-                let last_event_id = match result.result {
-                    Ok(new_tail_event_id) => new_tail_event_id,
-                    Err(err) => {
-                        if let Err(err) = self
-                            .shared
-                            .release_failed_workflow_task(task.claim.clone(), err)
-                            .await
-                        {
-                            record_workflow_task_error(&mut pass_error, &mut failed, err);
-                        }
-                        continue;
-                    }
-                };
-                committed += 1;
-                self.shared.record_workflow_task_committed(&task.run_id);
-                let future = std::mem::replace(
-                    &mut task.future,
-                    Box::pin(std::future::ready(Err(Error::Backend(
-                        "committed workflow future was already moved".to_owned(),
-                    )))),
-                );
-                if let Some(entry) = cache_entry_after_commit(
-                    task.terminal,
-                    task.runtime_appended_tail,
-                    last_event_id,
-                    future,
-                    task.next_command_seq,
-                    std::mem::take(&mut task.default_activity_options),
-                    std::mem::take(&mut task.unconsumed_indexes),
-                ) {
-                    self.insert_cached_workflow(task.run_id.clone(), entry);
+            })
+            .await;
+            let mut prepared = Vec::with_capacity(outcomes.len());
+            for outcome in outcomes {
+                match outcome {
+                    Ok(PreparedWorkflowTaskOutcome::Prepared(task)) => prepared.push(task),
+                    Ok(PreparedWorkflowTaskOutcome::Deferred) => deferred += 1,
+                    // The prepare funnel already released this task's claim.
+                    Err(err) => record_workflow_task_error(&mut pass_error, &mut failed, err),
                 }
             }
-            start = end;
+            let mut start = 0usize;
+            while start < prepared.len() {
+                let end = (start + chunk_size).min(prepared.len());
+                // The commit moves into the batch instead of being deep-copied
+                // into it: every append event, activity input, and child start
+                // payload this task produced would otherwise be cloned and the
+                // original dropped unread. Nothing after the RPC reads
+                // `task.commit` — the wholesale-failure path and the per-task
+                // result loop below both only need `task.claim` — so the emptied
+                // slot is never observed. The claim is still cloned; it is a few
+                // ids and a lease token, and both release paths need it after the
+                // batch is built.
+                let commits = prepared[start..end]
+                    .iter_mut()
+                    .map(|task| crate::WorkflowTaskCommitInput {
+                        claim: task.claim.clone(),
+                        commit: std::mem::take(&mut task.commit),
+                    })
+                    .collect::<Vec<_>>();
+                let results = match self
+                    .shared
+                    .backend
+                    .commit_workflow_tasks(crate::WorkflowTaskCommitBatch { commits })
+                    .await
+                {
+                    Ok(results) => results,
+                    Err(err) => {
+                        // No remaining task in this pass may commit after a
+                        // wholesale RPC failure. Dropping a pending preparation
+                        // does not execute its async error funnel: release those
+                        // claims explicitly as well as all prepared neighbors.
+                        for claim in prepared[start..]
+                            .iter()
+                            .map(|task| &task.claim)
+                            .chain(in_flight.iter().map(|(claim, _)| claim))
+                        {
+                            if let Err(err) = self
+                                .shared
+                                .release_failed_workflow_task(claim.clone(), err.clone())
+                                .await
+                            {
+                                record_workflow_task_error(&mut pass_error, &mut failed, err);
+                            }
+                        }
+                        in_flight.clear();
+                        break;
+                    }
+                };
+                for (task, result) in prepared[start..end].iter_mut().zip(results) {
+                    let last_event_id = match result.result {
+                        Ok(new_tail_event_id) => new_tail_event_id,
+                        Err(err) => {
+                            if let Err(err) = self
+                                .shared
+                                .release_failed_workflow_task(task.claim.clone(), err)
+                                .await
+                            {
+                                record_workflow_task_error(&mut pass_error, &mut failed, err);
+                            }
+                            continue;
+                        }
+                    };
+                    committed += 1;
+                    self.shared.record_workflow_task_committed(&task.run_id);
+                    let future = std::mem::replace(
+                        &mut task.future,
+                        Box::pin(std::future::ready(Err(Error::Backend(
+                            "committed workflow future was already moved".to_owned(),
+                        )))),
+                    );
+                    if let Some(entry) = cache_entry_after_commit(
+                        task.terminal,
+                        task.runtime_appended_tail,
+                        last_event_id,
+                        future,
+                        task.next_command_seq,
+                        std::mem::take(&mut task.default_activity_options),
+                        std::mem::take(&mut task.unconsumed_indexes),
+                    ) {
+                        self.insert_cached_workflow(task.run_id.clone(), entry);
+                    }
+                }
+                start = end;
+            }
         }
         // Only a pass-level error short-circuits the rest of the stage: the
         // backend could not settle this batch, so draining local activities

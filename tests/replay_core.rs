@@ -242,7 +242,7 @@ async fn version_original(_: UnitInput) -> durust::Result<String> {
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
 async fn version_patched(_: UnitInput) -> durust::Result<String> {
-    if durust::patched("replace-a-with-b")? {
+    if durust::patched("replace-a-with-b").await? {
         durust::call_activity!(version_activity_b(UnitInput {}))
             .task_queue("activities")
             .await
@@ -255,7 +255,7 @@ async fn version_patched(_: UnitInput) -> durust::Result<String> {
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
 async fn version_min_two(_: UnitInput) -> durust::Result<String> {
-    let _ = durust::get_version("replace-a-with-b", 2, 2)?;
+    let _ = durust::get_version("replace-a-with-b", 2, 2).await?;
     durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
@@ -266,17 +266,17 @@ async fn version_min_two(_: UnitInput) -> durust::Result<String> {
 // `repeat`, which is what the TypeScript runtime commits for the same program.
 #[durust::workflow(name = "tests.version-repeated", version = 1)]
 async fn version_repeated(input: NumberInput) -> durust::Result<u64> {
-    let first = durust::patched("repeat")?;
+    let first = durust::patched("repeat").await?;
     let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
         .task_queue("activities")
         .await?;
-    let second = durust::patched("repeat")?;
+    let second = durust::patched("repeat").await?;
     Ok(doubled + u64::from(first) + u64::from(second))
 }
 
 #[durust::workflow(name = "tests.version-branch", version = 1)]
 async fn version_deprecated(_: UnitInput) -> durust::Result<String> {
-    durust::deprecate_patch("replace-a-with-b")?;
+    durust::deprecate_patch("replace-a-with-b").await?;
     durust::call_activity!(version_activity_b(UnitInput {}))
         .task_queue("activities")
         .await
@@ -484,7 +484,8 @@ async fn commands_then_panic_workflow(input: NumberInput) -> durust::Result<u64>
 #[durust::workflow(name = "tests.durable-api-inside-side-effect", version = 1)]
 async fn durable_api_inside_side_effect_workflow(_: UnitInput) -> durust::Result<bool> {
     let flag: bool = durust::side_effect("nested-durable-call", || {
-        durust::patched("nested-change").unwrap_or(false)
+        drop(durust::patched("nested-change"));
+        false
     })
     .await?;
     Ok(flag)
@@ -1393,7 +1394,7 @@ async fn spawn_sleep_then_version_workflow(input: NumberInput) -> durust::Result
         .spawn()
         .await?;
     durust::sleep(Duration::from_secs(1)).await?;
-    let version = durust::get_version("post-sleep-change", 1, 1)?;
+    let version = durust::get_version("post-sleep-change", 1, 1).await?;
     durust::sleep(Duration::from_secs(1)).await?;
     let first = handle.result().await?;
     Ok(first + version as u64)
@@ -3244,7 +3245,7 @@ fn out_of_order_completion_before_version_marker_cold_multi_chunk() {
 // at the cursor head: `get_version` overruns the window, the worker replays
 // with the full history, and the recorded version is matched positionally.
 #[test]
-fn recorded_version_marker_beyond_loaded_window_replays_with_full_history() {
+fn recorded_version_marker_beyond_loaded_window_streams_in_order() {
     block_on(async {
         let backend = MemoryBackend::new();
         let client = Client::new(backend.clone());
@@ -5136,24 +5137,22 @@ fn durable_api_refusing_a_value_fails_the_task_without_committing() {
     });
 }
 
-// A marker that sits just past the first chunk of a recovery replay overruns
-// the window and the worker reloads the whole history. The reload gets a
-// fresh recovery budget: with the first attempt's chunks still charged, a
-// history that fits the budget deferred on every claim.
+// A marker past the first loaded chunk suspends without restarting replay.
 #[durust::workflow(name = "tests.marker-after-activity-then-timer", version = 1)]
 async fn marker_after_activity_then_timer_workflow(input: NumberInput) -> durust::Result<u64> {
     let doubled = durust::call_activity!(double(NumberInput { value: input.value }))
         .task_queue("activities")
         .await?;
-    let bumped = durust::patched("after-activity")?;
+    let bumped = durust::patched("after-activity").await?;
     durust::sleep(Duration::from_secs(1)).await?;
     Ok(doubled + u64::from(bumped))
 }
 
 #[test]
-fn budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun() {
+fn budgeted_recovery_streams_markers_without_restarting() {
     block_on(async {
-        let backend = MemoryBackend::new();
+        let inner = MemoryBackend::new();
+        let backend = RecordingBackend::new(inner.clone()).without_claim_prefetch();
         let client = Client::new(backend.clone());
         let run_id = client
             .start_workflow::<marker_after_activity_then_timer_workflow>(
@@ -5163,25 +5162,27 @@ fn budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun() {
             )
             .await
             .unwrap();
-        let mut worker = out_of_order_worker(
-            backend.clone(),
-            marker_after_activity_then_timer_workflow,
-            None,
-        );
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(marker_after_activity_then_timer_workflow)
+            .register_activity(double)
+            .build();
         assert!(worker.run_workflow_once().await.unwrap());
         assert!(worker.run_activity_once().await.unwrap());
         assert!(worker.run_workflow_once().await.unwrap());
-        backend.advance_time(Duration::from_secs(1));
+        inner.advance_time(Duration::from_secs(1));
         assert_eq!(worker.run_timers_once().await.unwrap(), 1);
         drop(worker);
+        backend.clear_stream_requests();
 
-        // Six events of history, three-event chunks, a six-event budget: the
-        // marker is event four, first past the first chunk.
+        // Six events of history with one-event quanta: the marker is event
+        // four and must suspend across several loaded windows.
         let mut recovery_worker = Worker::builder(backend.clone())
             .workflow_task_queue("workflows")
             .activity_task_queue("activities")
             .history_chunk_events(3)
-            .recovery_replay_event_budget(6)
+            .recovery_replay_event_budget(1)
             .recovery_defer_delay(Duration::from_millis(1))
             .register_workflow(marker_after_activity_then_timer_workflow)
             .register_activity(double)
@@ -5190,6 +5191,17 @@ fn budgeted_recovery_reloads_the_whole_history_after_a_marker_overrun() {
             recovery_worker.run_workflow_once().await.unwrap(),
             "the recovery replay must commit, not defer"
         );
+        let requests = backend.stream_requests();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.after_event_id == EventId::ZERO)
+                .count(),
+            1,
+            "marker suspension must not restart at event zero: {requests:?}"
+        );
+        assert!(requests.iter().all(|r| r.max_events == 1));
+        assert_eq!(requests.len(), 6, "each recorded event is read once");
         let history = stream_all(&backend, &run_id).await;
         let HistoryEventData::WorkflowCompleted { result } = &history.last().unwrap().data else {
             panic!(
@@ -5215,11 +5227,8 @@ impl Serialize for ReentrantOutput {
     where
         S: serde::Serializer,
     {
-        let bumped = if durust::patched("output-reentrant").unwrap_or(false) {
-            self.value + 1
-        } else {
-            self.value
-        };
+        drop(durust::patched("output-reentrant"));
+        let bumped = self.value;
         serializer.serialize_u64(bumped)
     }
 }
@@ -6992,7 +7001,7 @@ fn cold_recovery_defers_before_streaming_when_admission_is_unavailable() {
 }
 
 #[test]
-fn cold_recovery_event_budget_defers_without_appending_failure() {
+fn cold_recovery_event_quantum_preserves_progress() {
     block_on(async {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
@@ -7025,7 +7034,11 @@ fn cold_recovery_event_budget_defers_without_appending_failure() {
         assert!(backend.stream_requests().is_empty());
 
         let history = stream_all(&backend, &run_id).await;
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
         assert!(
             !history
                 .iter()
@@ -7044,7 +7057,7 @@ fn cold_recovery_event_budget_defers_without_appending_failure() {
 }
 
 #[test]
-fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
+fn cold_recovery_byte_quantum_preserves_progress() {
     block_on(async {
         let backend = RecordingBackend::new(MemoryBackend::new());
         let client = Client::new(backend.clone());
@@ -7077,7 +7090,11 @@ fn cold_recovery_byte_budget_clamps_stream_request_and_defers() {
         assert!(backend.stream_requests().is_empty());
 
         let history = stream_all(&backend, &run_id).await;
-        assert_eq!(history.len(), 3);
+        assert_eq!(history.len(), 4);
+        assert!(matches!(
+            history.last().unwrap().data,
+            HistoryEventData::WorkflowCompleted { .. }
+        ));
         assert!(
             !history
                 .iter()
@@ -7356,6 +7373,71 @@ fn batch_commit_rpc_error_releases_every_claim_in_the_batch() {
             let history = stream_all(&backend, run_id).await;
             assert!(matches!(
                 history.last().unwrap().data,
+                HistoryEventData::WorkflowCompleted { .. }
+            ));
+        }
+    });
+}
+
+#[test]
+fn batch_commit_failure_releases_pending_recovery_claims_and_slots() {
+    block_on(async {
+        let backend = RecordingBackend::new(MemoryBackend::new()).without_claim_prefetch();
+        let client = Client::new(backend.clone());
+        let cold = client
+            .start_workflow::<double_plus_one>("wf/pending-cold", "workflows", number(1))
+            .await
+            .unwrap();
+        let mut recorder = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        assert!(recorder.run_workflow_once().await.unwrap());
+        assert!(recorder.run_activity_once().await.unwrap());
+        drop(recorder);
+        // A newly started neighbor prepares immediately, while the old run
+        // yields after reading its first history event.
+        let ready = client
+            .start_workflow::<double_plus_one>("wf/pending-ready", "workflows", number(2))
+            .await
+            .unwrap();
+        let mut worker = Worker::builder(backend.clone())
+            .workflow_task_queue("workflows")
+            .activity_task_queue("activities")
+            .history_chunk_events(1)
+            .recovery_replay_event_budget(1)
+            .max_concurrent_recoveries(1)
+            .max_concurrent_workflow_tasks(2)
+            .workflow_task_prefetch_limit(2)
+            .workflow_task_commit_batch_size(2)
+            .register_workflow(double_plus_one)
+            .register_activity(double)
+            .build();
+        backend.clear_stream_requests();
+        backend.fail_next_commit_batch();
+        assert!(matches!(
+            worker.run_workflow_batch_once().await,
+            Err(durust::Error::Backend(_))
+        ));
+        assert_eq!(
+            backend
+                .stream_requests()
+                .iter()
+                .filter(|r| r.run_id == cold)
+                .count(),
+            1,
+            "commit failure must occur while cold replay remains pending"
+        );
+        assert_eq!(stream_all(&backend, &cold).await.len(), 3);
+        assert_eq!(stream_all(&backend, &ready).await.len(), 1);
+        // No virtual-time advance: stranded claims or recovery admission
+        // would prevent these runs from completing under the same worker.
+        worker.run_until_idle().await.unwrap();
+        for run in [&cold, &ready] {
+            assert!(matches!(
+                stream_all(&backend, run).await.last().unwrap().data,
                 HistoryEventData::WorkflowCompleted { .. }
             ));
         }

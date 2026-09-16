@@ -712,24 +712,37 @@ pub struct WorkflowChangeVersionRecord {
 }
 
 /// Grace period protecting blobs uploaded by in-flight commits. Blob uploads
-/// happen before the durable commit that makes them reachable, so GC must
-/// never delete a blob younger than the longest plausible upload-to-commit
-/// window plus the GC scan itself. One hour dwarfs both.
+/// happen before the durable commit. Age is a retention policy; it cannot
+/// exclude racing writers. Destructive sweeps require quiescent writers.
 pub const DEFAULT_PAYLOAD_GC_MIN_AGE: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Clone, Debug)]
 pub struct PayloadGarbageCollectionRequest {
     pub dry_run: bool,
-    /// Blobs whose last-modified timestamp is younger than this are never
-    /// deleted, regardless of reachability. `Duration::ZERO` disables the
-    /// grace period (test-only; unsafe with concurrent writers).
+    /// The caller asserts that every writer sharing the provider/blob store
+    /// is stopped and drained, and remains so until this sweep returns.
+    /// Required for deletion; dry runs may run concurrently with writers.
+    pub writers_quiescent: bool,
+    /// Minimum age of an orphan eligible for offline collection.
     pub min_age: Duration,
+}
+
+impl PayloadGarbageCollectionRequest {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if !self.dry_run && !self.writers_quiescent {
+            return Err(crate::Error::Backend(
+                "destructive payload GC requires quiescent writers; stop and drain all writers sharing the store, then set writers_quiescent".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for PayloadGarbageCollectionRequest {
     fn default() -> Self {
         Self {
             dry_run: false,
+            writers_quiescent: false,
             min_age: DEFAULT_PAYLOAD_GC_MIN_AGE,
         }
     }

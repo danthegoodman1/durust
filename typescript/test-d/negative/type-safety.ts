@@ -1,5 +1,8 @@
 import {
   Client,
+  getVersion,
+  patched,
+  deprecatePatch,
   activity,
   activityMap,
   activityMapManifest,
@@ -380,3 +383,12 @@ void (() => {
   // @ts-expect-error continue-as-new input must not be functions
   return continueAsNew(() => ({ orderId: "o-2" }));
 });
+
+// Marker decisions require awaiting bounded replay, not synchronous values.
+// @ts-expect-error getVersion returns a durable awaitable
+const syncVersion: number = getVersion("migration", 1, 2);
+// @ts-expect-error patched returns a durable awaitable
+const syncPatch: boolean = patched("migration");
+// @ts-expect-error deprecatePatch must also be awaited
+const syncDeprecation: void = deprecatePatch("migration");
+void [syncVersion, syncPatch, syncDeprecation];

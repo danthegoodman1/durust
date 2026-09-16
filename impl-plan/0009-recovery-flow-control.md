@@ -8,6 +8,12 @@ labels: [runtime, recovery, provider-conformance, backpressure, benchmarks]
 
 # Recovery Flow Control
 
+[0019 Phase 4](0019-durability-and-recovery-boundaries.md#phase-4-turn-recovery-budgets-into-scheduling-quanta)
+replaces discarded per-quantum replay budgets with cooperative quanta. Exhaustion
+yields while preserving the fixed target, future, cursor, context, and claim.
+Zero event/byte/chunk values mean one; zero recovery admission still disables
+cold recovery. Provider backpressure and admission saturation retain delayed release.
+
 Add worker-level flow control and generic provider backpressure so crash
 recovery, cache eviction storms, and deployment churn cannot saturate the
 durability provider.
@@ -19,7 +25,7 @@ operational controls that keep aggregate recovery read pressure bounded.
 
 - Worker recovery admission control.
 - Worker-level recovery concurrency limit.
-- Worker-level replay byte/event budgets per cold recovery attempt.
+- Worker-level replay byte/event budgets per cold recovery quantum.
 - Separate cold replay throttling from cached workflow wakes.
 - Recovery prefetch limit.
 - Generic provider backpressure signal.
@@ -48,7 +54,7 @@ Providers own storage protection:
 
 ## Acceptance
 
-- Worker builder exposes recovery concurrency, per-attempt replay event/byte
+- Worker builder exposes recovery concurrency, per-quantum replay event/byte
   budgets, prefetch chunk limits, and defer-delay knobs.
 - Cold replay must acquire recovery admission before streaming history.
 - Cached workflow wake processing is not blocked behind cold replay saturation.
@@ -76,11 +82,11 @@ the recovery hot path:
 
 - `max_concurrent_recoveries` bounds in-worker cold replay work.
 - `recovery_replay_event_budget` bounds replay events loaded per cold recovery
-  attempt.
+  quantum.
 - `recovery_replay_byte_budget` bounds replay bytes requested per cold recovery
-  attempt.
+  quantum.
 - `recovery_prefetch_chunks` bounds replay stream calls per cold recovery
-  attempt.
+  quantum.
 - `recovery_defer_delay` converts unavailable capacity into generic delayed task
   visibility instead of a tight claim/release loop.
 - `history_chunk_bytes` exposes the existing stream byte bound alongside
@@ -130,8 +136,8 @@ optionally return retry-after backpressure.
   `recovery_prefetch_chunks`, `recovery_defer_delay`, and
   `history_chunk_bytes`.
 - Cold replay beyond the start event acquires worker admission before streaming
-  history. Budget exhaustion releases the workflow task with generic delayed
-  visibility instead of holding the lease.
+  history. Quantum exhaustion yields cooperatively without dropping progress;
+  admission saturation and provider backpressure release with delayed visibility.
 - Cached workflow wakes stream only events after the cached tail and bypass cold
   recovery admission.
 - Providers remain generic. `Error::Backpressure { retry_after, .. }` lets any
