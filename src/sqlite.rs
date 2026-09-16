@@ -970,7 +970,7 @@ impl DurableBackend for SqliteBackend {
             let ready_at_ms = if terminal {
                 0
             } else {
-                ready_at_ms_for_delay(release.delay)
+                ready_at_ms_for_delay(self.clock.now(), release.delay)
             };
             tx.execute(
                 "update workflow_instances

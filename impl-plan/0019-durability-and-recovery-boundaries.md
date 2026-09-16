@@ -23,6 +23,7 @@ new provider operation is required. Existing consolidation work remains in 0018.
 | F5 | Synchronous markers force whole-history replay | Main's Rust `load_cold_history` and TypeScript unlimited-reserve fallback | Markers return awaitables; both fallback mechanisms are removed |
 | F6 | Memory history streaming rescans the consumed prefix | Baseline `memory_history_tail_read` grows from ~1.2 µs at 1k events to ~423 µs at 100k | Index the persistent history vector by contiguous event id; a tail read is ~93 ns at 100k |
 | F7 | Postgres smoke baseline has stale exact cache counters | Main's unchanged TypeScript runtime reproduces misses=12/hits=20 against expected 8/24 | Correct three expected counters; preserve exact comparisons and speed thresholds |
+| F8 | Delayed-release conformance races a 25 ms wall-clock deadline; SQL release bypasses the configured clock | CI run `35158712212` failed `hidden.is_none`; controlled-clock tests then failed visibility on both SQL providers before the fix | Compute release visibility from `ProviderClock`; test t/24/25 ms boundaries and SQLite close/reopen without sleeps |
 
 The final reviewer also reproduced a mixed-workload stall introduced by keeping
 cold continuations alive: the old preparation barrier delayed ready cached
@@ -182,6 +183,7 @@ Status ledger:
 | Complete | Test | 4C: Failure and scheduling coverage | `tests/sim_worker.rs` runs real-worker crash, eviction, delayed/reordered facts, and lease theft with small event/byte/chunk quanta; existing backpressure and admission tests |
 | Complete | Test | 4E: Cached progress during long recovery | `cached_commits_do_not_wait_for_cold_recovery_or_a_full_commit_batch` failed before the pipeline fix and passes for both claim orders and batch sizes 1/2/128; `batch_commit_failure_releases_pending_recovery_claims_and_slots` proves cleanup without lease expiry |
 | Complete | Gate | 4D: Finite work progresses without raising limits | SPEC §4.6 and 0009 reconciled; old fixed-prefix repro now reaches `WorkflowCompleted` |
+| Complete | Test | 4F: Deterministic delayed release | Four provider/reopen regressions use controlled clocks; SQL regressions failed before `ready_at_ms_for_delay` accepted the provider timestamp and pass after; zero-delay/overflow unit table, required-Postgres conformance, and reviewer pass |
 
 ## Phase 5: Make Version Calls Compatible With Streaming Replay
 

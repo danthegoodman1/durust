@@ -496,9 +496,7 @@ fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
             backend,
             "wf/memory-delayed-release",
             "memory-delayed-release-workflows",
-            move || async move {
-                advance_backend.advance_time(Duration::from_millis(40));
-            },
+            move |duration| advance_backend.advance_time(duration),
         )
         .await;
     });
@@ -508,12 +506,22 @@ fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
 fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        let backend = SqliteBackend::open(dir.path().join("delayed-release.sqlite3")).unwrap();
+        let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+        let backend = SqliteBackend::open_with_clock(
+            dir.path().join("delayed-release.sqlite3"),
+            durust::PayloadStorageConfig::default(),
+            clock.clone(),
+        )
+        .unwrap();
         delayed_released_workflow_task_is_not_claimable_until_visible(
             backend,
             "wf/sqlite-delayed-release",
             "sqlite-delayed-release-workflows",
-            || async { std::thread::sleep(Duration::from_millis(40)) },
+            |duration| {
+                clock.advance_to(durust::TimestampMs(
+                    clock.now().0 + duration.as_millis() as i64,
+                ))
+            },
         )
         .await;
     });
@@ -522,15 +530,28 @@ fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
-    block_on_tokio(with_postgres(
+    block_on_tokio(with_postgres_schema(
         "Postgres delayed release conformance",
         "delayed_release",
-        |backend| async move {
+        |backend, url, schema| async move {
+            drop(backend);
+            let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+            let backend = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url)
+                    .schema(schema)
+                    .clock(clock.clone()),
+            )
+            .await
+            .unwrap();
             delayed_released_workflow_task_is_not_claimable_until_visible(
                 backend,
                 "wf/postgres-delayed-release",
                 "postgres-delayed-release-workflows",
-                || async { tokio::time::sleep(Duration::from_millis(40)).await },
+                |duration| {
+                    clock.advance_to(durust::TimestampMs(
+                        clock.now().0 + duration.as_millis() as i64,
+                    ))
+                },
             )
             .await;
         },
@@ -542,7 +563,16 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("delayed-visibility.sqlite3");
-        let backend = SqliteBackend::open(&path).unwrap();
+        let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+        let open = || {
+            SqliteBackend::open_with_clock(
+                &path,
+                durust::PayloadStorageConfig::default(),
+                clock.clone(),
+            )
+            .unwrap()
+        };
+        let backend = open();
         let client = Client::new(backend.clone());
         client
             .start_workflow::<workflow>(
@@ -565,16 +595,18 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             )
             .await
             .unwrap();
+        drop(client);
         drop(backend);
 
-        let reopened = SqliteBackend::open(&path).unwrap();
+        let reopened = open();
+        clock.advance_to(durust::TimestampMs(1_024));
         let hidden = reopened
             .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-b"), claim_opts.clone())
             .await
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        clock.advance_to(durust::TimestampMs(1_025));
         let visible = reopened
             .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-c"), claim_opts)
             .await
@@ -4250,18 +4282,16 @@ where
     assert!(reclaimed.is_some());
 }
 
-// Parametrized on how time passes because delayed visibility is a clock
-// comparison: memory follows the virtual clock (`advance_time`) while the SQL
-// providers compare against the wall clock and must really sleep.
-async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance, AdvanceFut>(
+// Every provider uses controlled time here: a wall-clock assertion that the
+// next database round trip finishes within 25 ms races a loaded CI runner.
+async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance>(
     backend: B,
     workflow_id: &str,
     workflow_queue: &str,
-    advance_past_delay: Advance,
+    mut advance_time: Advance,
 ) where
     B: DurableBackend,
-    Advance: FnOnce() -> AdvanceFut,
-    AdvanceFut: Future<Output = ()>,
+    Advance: FnMut(Duration),
 {
     let client = Client::new(backend.clone());
     client
@@ -4288,7 +4318,17 @@ async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advanc
         .unwrap();
     assert!(hidden.is_none());
 
-    advance_past_delay().await;
+    advance_time(Duration::from_millis(24));
+    let still_hidden = backend
+        .claim_workflow_task(WorkerId::new("worker-before-boundary"), claim_opts.clone())
+        .await
+        .unwrap();
+    assert!(
+        still_hidden.is_none(),
+        "release visible before its delay elapsed"
+    );
+
+    advance_time(Duration::from_millis(1));
     let visible = backend
         .claim_workflow_task(WorkerId::new("worker-c"), claim_opts)
         .await

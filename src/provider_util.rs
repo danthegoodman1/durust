@@ -332,11 +332,11 @@ pub(crate) fn unix_epoch_millis() -> i64 {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) fn ready_at_ms_for_delay(delay: Duration) -> i64 {
+pub(crate) fn ready_at_ms_for_delay(now: TimestampMs, delay: Duration) -> i64 {
     if delay.is_zero() {
         0
     } else {
-        unix_epoch_millis().saturating_add(duration_millis_i64(delay))
+        now.0.saturating_add(duration_millis_i64(delay))
     }
 }
 
@@ -703,6 +703,19 @@ pub(crate) mod commit_test_support {
 mod tests {
     use super::commit_test_support;
     use super::*;
+
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
+    #[test]
+    fn release_visibility_uses_supplied_time_and_saturates() {
+        for (now, delay, expected) in [
+            (1_000, Duration::ZERO, 0),
+            (1_000, Duration::from_millis(25), 1_025),
+            (i64::MAX - 1, Duration::from_millis(25), i64::MAX),
+            (1_000, Duration::MAX, i64::MAX),
+        ] {
+            assert_eq!(ready_at_ms_for_delay(TimestampMs(now), delay), expected);
+        }
+    }
 
     #[cfg(any(feature = "sqlite", feature = "postgres"))]
     #[test]

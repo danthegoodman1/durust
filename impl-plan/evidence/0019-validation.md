@@ -2,7 +2,7 @@
 
 Baseline: `46091e5`. Measurements and tests run locally on 2026-09-16.
 
-## Correctness
+## Initial Complete Validation (`d783aa5`)
 
 - Original F1/F3/F4 failures: `0019-review-probes.rs`, run only against baseline.
 - `cargo test --locked --workspace --all-features`, with
@@ -84,6 +84,28 @@ recovery claims and admission slots are released without advancing virtual time.
 Default-feature library tests are now an explicit CI gate. The reviewer then
 reran the independent mixed-workload probe successfully and reported no
 remaining actionable findings.
+
+## Delayed-Release CI Follow-up
+
+CI run `35158712212` failed the Postgres delayed-release test because it assumed
+its next claim RPC finished before a 25 ms wall-clock delay expired. Replacing
+wall-clock timing with the existing `ProviderClock` also exposed a shared SQL
+bug: delayed release ignored the configured clock and used wall time directly.
+
+Before the fix, controlled-clock tests passed on memory but failed on SQLite,
+Postgres, and SQLite reopen. After passing `self.clock.now()` into the shared
+release-deadline helper, all four pass: hidden at release and at 24 ms, visible
+at exactly 25 ms. SQLite drops the client and provider before reopening, proving
+the stored deadline survives a real close. A unit table covers immediate release
+and saturated deadlines. No new API or clock mechanism was added.
+
+Follow-up validation: 378 unit/provider/replay/simulation tests pass with required
+Postgres using `cargo test --locked --workspace --all-features --lib --test
+provider_conformance --test sim_worker --test replay_core`; S3 was not configured
+for this focused run. Default-feature library tests pass (94, one ignored), as
+do clippy, formatting, the four sqlite-free feature checks, and diff whitespace
+checks. The dedicated reviewer inspected the red/green evidence and final patch
+and found no actionable issues.
 
 ## Limits
 
