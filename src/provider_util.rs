@@ -1209,3 +1209,143 @@ mod tests {
         }
     }
 }
+
+/// Payload hydration that does not depend on where the bytes live.
+///
+/// A provider owns exactly one primitive — resolve this ref to inline bytes if
+/// I own its URI — and the walks over manifests, pages, and history events are
+/// the same whichever provider supplies it. They were written once per
+/// provider before this module existed.
+///
+/// Sync by construction, which is why the Postgres provider still carries its
+/// own copies: its resolver is `async` and these walks cannot await. Giving
+/// them async twins would retire that copy too, and is the remaining half of
+/// this de-duplication.
+pub(crate) mod hydrate {
+    use crate::{
+        ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest, ChildWorkflowMapResultPage,
+        HistoryEventData, PayloadRef, Result,
+    };
+
+    /// Resolves an offloaded ref to inline bytes, leaving refs the provider
+    /// does not own untouched.
+    pub(crate) trait Resolve: Fn(PayloadRef) -> Result<PayloadRef> {}
+    impl<F> Resolve for F where F: Fn(PayloadRef) -> Result<PayloadRef> {}
+
+    pub(crate) fn activity_map_input_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let mut load_container = |payload| resolve(payload);
+        let mut map_leaf = |payload| resolve(payload);
+        crate::payload::map_activity_map_input_manifest_ref(
+            payload,
+            &mut load_container,
+            &mut map_leaf,
+            &mut Ok,
+        )
+    }
+
+    pub(crate) fn activity_map_result_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let mut load_container = |payload| resolve(payload);
+        let mut map_leaf = |payload| resolve(payload);
+        crate::payload::map_activity_map_result_manifest_ref(
+            payload,
+            &mut load_container,
+            &mut map_leaf,
+            &mut Ok,
+        )
+    }
+
+    pub(crate) fn child_workflow_map_outcome(
+        resolve: &impl Resolve,
+        outcome: ChildWorkflowMapItemOutcome,
+    ) -> Result<ChildWorkflowMapItemOutcome> {
+        match outcome {
+            ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                    result: resolve(result)?,
+                })
+            }
+            ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+                if let Some(details) = failure.details.take() {
+                    failure.details = Some(resolve(details)?);
+                }
+                Ok(ChildWorkflowMapItemOutcome::Failed { failure })
+            }
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+            }
+        }
+    }
+
+    pub(crate) fn child_workflow_map_result_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let root = resolve(payload)?;
+        let mut manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+        manifest.pages = manifest
+            .pages
+            .into_iter()
+            .map(|page| {
+                let page = resolve(page)?;
+                let mut page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+                page.outcomes = page
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| child_workflow_map_outcome(resolve, outcome))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::encode_payload_with_codec(&page, root.codec())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::encode_payload_with_codec(&manifest, root.codec())
+    }
+
+    /// `is_external` reports a ref the provider does not own, which it leaves
+    /// for whichever layer does — a manifest root stored inline can still hold
+    /// pages in someone else's blob store.
+    pub(crate) fn history_event(
+        is_external: &impl Fn(&PayloadRef) -> bool,
+        resolve: &impl Resolve,
+        data: HistoryEventData,
+    ) -> Result<HistoryEventData> {
+        match data {
+            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
+                if !is_external(&scheduled.input_manifest) {
+                    scheduled.input_manifest =
+                        activity_map_input_manifest(resolve, scheduled.input_manifest)?;
+                }
+                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
+            }
+            HistoryEventData::ActivityMapCompleted(mut completed) => {
+                if !is_external(&completed.result_manifest) {
+                    completed.result_manifest =
+                        activity_map_result_manifest(resolve, completed.result_manifest)?;
+                }
+                Ok(HistoryEventData::ActivityMapCompleted(completed))
+            }
+            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+                if !is_external(&scheduled.input_manifest) {
+                    scheduled.input_manifest =
+                        activity_map_input_manifest(resolve, scheduled.input_manifest)?;
+                }
+                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+                if !is_external(&completed.result_manifest) {
+                    completed.result_manifest =
+                        child_workflow_map_result_manifest(resolve, completed.result_manifest)?;
+                }
+                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
+            }
+            data => {
+                let mut map_payload = |payload| resolve(payload);
+                crate::payload::map_history_event_payloads(data, &mut map_payload)
+            }
+        }
+    }
+}

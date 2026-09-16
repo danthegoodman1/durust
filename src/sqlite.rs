@@ -4,6 +4,7 @@ use crate::map_engine::{
     map_command_cancelled_reason, outcome_counts, validate_map_slot_bound,
 };
 use crate::payload::ManifestKind;
+use crate::provider_util::hydrate;
 use crate::provider_util::{
     ActivityFailureDecision, TerminalCleanup, activity_claim_implicit_heartbeat_ms,
     activity_failure_decision, activity_heartbeat_deadline_at_ms, activity_timeout_at_ms_from,
@@ -2517,52 +2518,11 @@ fn hydrate_history_event_from_storage(
     config: &PayloadStorageConfig,
     data: HistoryEventData,
 ) -> Result<HistoryEventData> {
-    match data {
-        HistoryEventData::ActivityMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(config, &scheduled.input_manifest) {
-                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
-                    conn,
-                    config,
-                    scheduled.input_manifest,
-                )?;
-            }
-            Ok(HistoryEventData::ActivityMapScheduled(scheduled))
-        }
-        HistoryEventData::ActivityMapCompleted(mut completed) => {
-            if !is_external_payload_ref(config, &completed.result_manifest) {
-                completed.result_manifest = hydrate_activity_map_result_manifest_from_storage(
-                    conn,
-                    config,
-                    completed.result_manifest,
-                )?;
-            }
-            Ok(HistoryEventData::ActivityMapCompleted(completed))
-        }
-        HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
-            if !is_external_payload_ref(config, &scheduled.input_manifest) {
-                scheduled.input_manifest = hydrate_activity_map_input_manifest_from_storage(
-                    conn,
-                    config,
-                    scheduled.input_manifest,
-                )?;
-            }
-            Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
-        }
-        HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
-            if !is_external_payload_ref(config, &completed.result_manifest) {
-                completed.result_manifest =
-                    hydrate_child_workflow_map_result_manifest_from_storage(
-                        conn,
-                        config,
-                        completed.result_manifest,
-                    )?;
-            }
-            Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
-        }
-        data => crate::payload::map_history_event_payloads(data, &mut |payload| {
-            hydrate_payload_from_storage(conn, config, payload)
-        }),
-    }
+    hydrate::history_event(
+        &|payload| is_external_payload_ref(config, payload),
+        &|payload| hydrate_payload_from_storage(conn, config, payload),
+        data,
+    )
 }
 
 fn normalize_activity_tasks_for_storage(
@@ -2768,14 +2728,9 @@ fn hydrate_activity_map_input_manifest_from_storage(
     config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let mut load_container = |payload| hydrate_payload_from_storage(conn, config, payload);
-    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, config, payload);
-    let mut finish_container = Ok;
-    crate::payload::map_activity_map_input_manifest_ref(
+    hydrate::activity_map_input_manifest(
+        &|payload| hydrate_payload_from_storage(conn, config, payload),
         payload,
-        &mut load_container,
-        &mut hydrate_leaf,
-        &mut finish_container,
     )
 }
 
@@ -2784,14 +2739,9 @@ fn hydrate_activity_map_result_manifest_from_storage(
     config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let mut load_container = |payload| hydrate_payload_from_storage(conn, config, payload);
-    let mut hydrate_leaf = |payload| hydrate_payload_from_storage(conn, config, payload);
-    let mut finish_container = Ok;
-    crate::payload::map_activity_map_result_manifest_ref(
+    hydrate::activity_map_result_manifest(
+        &|payload| hydrate_payload_from_storage(conn, config, payload),
         payload,
-        &mut load_container,
-        &mut hydrate_leaf,
-        &mut finish_container,
     )
 }
 
@@ -2800,50 +2750,10 @@ fn hydrate_child_workflow_map_result_manifest_from_storage(
     config: &PayloadStorageConfig,
     payload: PayloadRef,
 ) -> Result<PayloadRef> {
-    let root = hydrate_payload_from_storage(conn, config, payload)?;
-    let root_codec = root.codec();
-    let mut manifest: crate::ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
-    manifest.pages = manifest
-        .pages
-        .into_iter()
-        .map(|page| {
-            let page = hydrate_payload_from_storage(conn, config, page)?;
-            let page_codec = page.codec();
-            let mut page: crate::ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
-            page.outcomes = page
-                .outcomes
-                .into_iter()
-                .map(|outcome| {
-                    hydrate_child_workflow_map_outcome_from_storage(conn, config, outcome)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            crate::encode_payload_with_codec(&page, page_codec)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    crate::encode_payload_with_codec(&manifest, root_codec)
-}
-
-fn hydrate_child_workflow_map_outcome_from_storage(
-    conn: &Connection,
-    config: &PayloadStorageConfig,
-    outcome: crate::ChildWorkflowMapItemOutcome,
-) -> Result<crate::ChildWorkflowMapItemOutcome> {
-    match outcome {
-        crate::ChildWorkflowMapItemOutcome::Succeeded { result } => {
-            Ok(crate::ChildWorkflowMapItemOutcome::Succeeded {
-                result: hydrate_payload_from_storage(conn, config, result)?,
-            })
-        }
-        crate::ChildWorkflowMapItemOutcome::Failed { mut failure } => {
-            if let Some(details) = failure.details.take() {
-                failure.details = Some(hydrate_payload_from_storage(conn, config, details)?);
-            }
-            Ok(crate::ChildWorkflowMapItemOutcome::Failed { failure })
-        }
-        crate::ChildWorkflowMapItemOutcome::Cancelled { reason } => {
-            Ok(crate::ChildWorkflowMapItemOutcome::Cancelled { reason })
-        }
-    }
+    hydrate::child_workflow_map_result_manifest(
+        &|payload| hydrate_payload_from_storage(conn, config, payload),
+        payload,
+    )
 }
 
 fn normalize_payload_for_storage(
