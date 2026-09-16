@@ -44,7 +44,7 @@ import {
   REPLAY_WINDOW_LOOKAHEAD_EVENTS
 } from "../src/runtime.js";
 import { claimActivity, readHistory } from "@durust/testing";
-import { workerFixture } from "./support.js";
+import { runWorkerUntilSettled, workerFixture } from "./support.js";
 
 /**
  * The shape a `toMatchObject` argument actually has.
@@ -554,19 +554,36 @@ describe("Worker", () => {
       { sku: "sku-1" }
     );
 
-    const outcome = await worker.run({
-      maxIterations: 8,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0
-    });
+    const outcome = await runWorkerUntilSettled(worker, handle);
 
     expect(outcome).toMatchObject({
-      stopReason: "maxIterations",
+      stopReason: "abort",
       errors: 0,
       activityTasks: 1
     });
     expect(outcome.workflowTasks).toBeGreaterThanOrEqual(2);
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
+  });
+
+  // The `maxIterations` stop, on its own. A worker with nothing to claim idles
+  // every pass, so the budget is the only thing that can end the run and the
+  // count is exact — where a budget sized to cover real work is a guess about
+  // how many passes that work will take.
+  it("stops a loop that has used its iteration budget", async () => {
+    const worker = workerFixture(NativeBackend.memory(), new Registry(), {
+      workerId: "worker-a",
+      payloadCodec: "Json"
+    });
+
+    await expect(
+      worker.run({ maxIterations: 3, idleBackoffMs: 0, errorBackoffMs: 0 })
+    ).resolves.toMatchObject({
+      stopReason: "maxIterations",
+      iterations: 3,
+      workflowTasks: 0,
+      activityTasks: 0,
+      errors: 0
+    });
   });
 
   it("allows activity handlers to record heartbeats through worker context", async () => {
@@ -652,11 +669,7 @@ describe("Worker", () => {
       { sku: "sku-1" }
     );
 
-    await worker.run({
-      maxIterations: 8,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0
-    });
+    await runWorkerUntilSettled(worker, handle);
 
     await expect(handle.result()).resolves.toEqual({ cents: 5 });
     expect(events.map((event) => event.kind)).toEqual(
@@ -728,11 +741,7 @@ describe("Worker", () => {
     );
 
     await expect(worker.runWorkflowTaskOnce()).resolves.toMatchObject({ kind: "Committed" });
-    const outcome = await worker.run({
-      maxIterations: 4,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0
-    });
+    const outcome = await runWorkerUntilSettled(worker, handle);
 
     expect(batchSizes).toEqual([2]);
     expect(outcome.activityTasks).toBe(2);
@@ -795,11 +804,7 @@ describe("Worker", () => {
     expect(claimedActivityIds).toHaveLength(2);
     expect(batchSizes).toEqual([2]);
 
-    await expect(recoveryWorker.run({
-      maxIterations: 64,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0
-    })).resolves.toMatchObject({
+    await expect(runWorkerUntilSettled(recoveryWorker, handle)).resolves.toMatchObject({
       activityTasks: 0,
       workflowTasks: expect.any(Number)
     });
@@ -869,11 +874,7 @@ describe("Worker", () => {
     // own; every success reaches it through a flush, and the failure does not.
     expect(batchSizes.reduce((sum, size) => sum + size, 0)).toBe(2);
 
-    await expect(recoveryWorker.run({
-      maxIterations: 64,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0
-    })).resolves.toMatchObject({
+    await expect(runWorkerUntilSettled(recoveryWorker, handle)).resolves.toMatchObject({
       activityTasks: 0,
       workflowTasks: expect.any(Number)
     });
@@ -895,17 +896,12 @@ describe("Worker", () => {
       {}
     );
 
-    const outcome = await worker.run({
-      maxIterations: 6,
-      idleBackoffMs: 0,
-      // Maintenance is interval-paced, so a six-pass run would finish long
-      // before the first jittered scan. Zero opts out of pacing: the loop then
-      // scans once per macrotask turn, independently of the task loops.
-      //
-      // Ordering note: maintenance used to run inside the workflow pass,
-      // strictly after the workflow task, so this was ordered by construction.
-      // It is now concurrent, and the assertions below depend on the unpaced
-      // maintenance loop getting a turn within the workflow loop's six passes.
+    // Maintenance is interval-paced, and the run ends as soon as the workflow
+    // settles, which is long before the first jittered scan. Zero opts out of
+    // pacing: the loop then scans once per macrotask turn, independently of the
+    // task loops, and the timer it fires is what lets the workflow settle at
+    // all.
+    const outcome = await runWorkerUntilSettled(worker, handle, {
       maintenanceIntervalMs: 0,
       timerMaintenanceLimit: 8
     });
@@ -1337,10 +1333,7 @@ describe("Worker", () => {
     );
     const errors: unknown[] = [];
 
-    const outcome = await worker.run({
-      maxIterations: 4,
-      idleBackoffMs: 0,
-      errorBackoffMs: 0,
+    const outcome = await runWorkerUntilSettled(worker, handle, {
       onError: (error) => {
         errors.push(error);
       }
