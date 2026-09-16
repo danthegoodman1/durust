@@ -188,15 +188,22 @@ jobs:
       # unconditionally — so the filter can never match zero tests, and the
       # missing-feature case now fails here instead of passing.
       #
-      # `--all-features` rather than `--features s3`, purely for build cost:
-      # `--features s3` also enables the default `sqlite` but *not* `postgres`,
-      # so it is a different feature set from the "Run tests" step above and
-      # forced a full rebuild of the crate and the 9,600-line conformance test
-      # binary. Measured with `-- --list`, both feature sets select exactly the
-      # same three tests — `s3_feature_is_enabled_when_s3_is_required`,
+      # `--workspace --all-features` matches the "Run tests" step exactly, and
+      # both halves are needed to reuse its build. `--features s3` enables the
+      # default `sqlite` but not `postgres`, a different feature set; and
+      # dropping `--workspace` is the subtler one, because `--all-features`
+      # looks sufficient on its own. It is not: `durust-node` takes `napi` with
+      # `tokio_rt`, which enables `tokio/rt-multi-thread`, and that unifies into
+      # `durust`'s own tokio only when the addon is in the graph. Without
+      # `--workspace` this crate resolves to a different tokio, so it rebuilds
+      # `durust` and the 9,600-line conformance binary under a second hash.
+      # Measured: 3.79 s to rebuild versus 0.09 s to reuse.
+      #
+      # Measured with `-- --list`, `--features s3` and `--all-features` select
+      # exactly the same three tests — `s3_feature_is_enabled_when_s3_is_required`,
       # `payload_backend_over_sqlite_passes_s3_conformance_when_configured`,
       # and `payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref`
-      # — so this reuses the earlier build and runs identical coverage.
+      # — so the wider flag costs no coverage.
       - name: Run S3 conformance
         env:
           DURUST_S3_ENDPOINT: http://127.0.0.1:3900
@@ -206,7 +213,7 @@ jobs:
           DURUST_S3_ACCESS_KEY_ID: durust-access-key
           DURUST_S3_SECRET_ACCESS_KEY: durust-secret-key
           DURUST_REQUIRE_S3: "1"
-        run: cargo test --locked --all-features --test provider_conformance s3 -- --nocapture
+        run: cargo test --locked --workspace --all-features --test provider_conformance s3 -- --nocapture
 
       - name: Stop the S3 fixture
         if: always()
@@ -214,10 +221,17 @@ jobs:
 
 
       # Every example is a compiled, running document (`SPEC.md` §22.7).
+      #
+      # Built by the workspace and then executed, rather than through `cargo run
+      # --example`, which takes no `--workspace` and so resolves the features of
+      # this crate alone — the same split described above, rebuilding `durust`
+      # once more. `cargo build` here is a no-op after "Run tests" (measured at
+      # 0.09 s), and the binaries it names are the ones that step already built.
       - name: Run examples
         run: |
+          cargo build --locked --workspace --all-features --examples
           for example in examples/*.rs; do
-            cargo run --locked --all-features --example "$(basename "${example%.rs}")"
+            "target/debug/examples/$(basename "${example%.rs}")"
           done
 
 

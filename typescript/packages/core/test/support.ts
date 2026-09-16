@@ -1,10 +1,14 @@
 import {
   Worker,
+  WorkflowCancelledError,
+  WorkflowFailureError,
   namespace,
   type DurableBackend,
   type Registry,
   type TaskQueue,
-  type WorkerOptions
+  type WorkerOptions,
+  type WorkerRunOptions,
+  type WorkerRunOutcome
 } from "@durust/core";
 
 /**
@@ -67,4 +71,65 @@ export function workerFixture(
     backend,
     registry
   });
+}
+
+/** The subset of a workflow handle this file needs: a readable durable outcome. */
+interface SettleableHandle {
+  result(): PromiseLike<unknown>;
+}
+
+/**
+ * Run `worker` until `handle` has a durable outcome, then stop it and return
+ * the run's stats.
+ *
+ * `run({ maxIterations: n })` cannot express "until the work is done", and
+ * reading it that way is what made these tests flaky. The workflow and activity
+ * loops run concurrently, and `#runTaskLoop` counts *every* pass against the
+ * budget — an idle one that claimed nothing exactly like a productive one. So
+ * `n` is a wager that the workflow loop will not spend its budget idling while
+ * it waits for the activity loop, and `idleBackoffMs: 0` makes the idle passes
+ * as cheap as possible to burn. Under CI load that wager loses: `records
+ * structured events and cumulative worker metrics` failed on `main` with
+ * "workflow result is not available" at `maxIterations: 8`, while the same
+ * commit passed on a pull request and through 15 consecutive local runs.
+ *
+ * Waiting for the outcome removes the race rather than widening the window, so
+ * `maxIterations` survives here only as a stop for a workflow that never
+ * finishes at all.
+ *
+ * "Settled" is decided by type, not by message: a durable failure or
+ * cancellation throws `WorkflowFailureError` or `WorkflowCancelledError`, and
+ * every other rejection — `result()` throws a plain `Error` while no terminal
+ * event is in history — means the run is still going.
+ */
+export async function runWorkerUntilSettled(
+  worker: Worker,
+  handle: SettleableHandle,
+  options: Omit<WorkerRunOptions, "signal"> = {}
+): Promise<WorkerRunOutcome> {
+  const stop = new AbortController();
+  const run = worker.run({
+    maxIterations: 10_000,
+    idleBackoffMs: 0,
+    errorBackoffMs: 0,
+    ...options,
+    signal: stop.signal
+  });
+  try {
+    while (!(await hasDurableOutcome(handle))) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    stop.abort();
+  }
+  return await run;
+}
+
+async function hasDurableOutcome(handle: SettleableHandle): Promise<boolean> {
+  try {
+    await handle.result();
+    return true;
+  } catch (error) {
+    return error instanceof WorkflowFailureError || error instanceof WorkflowCancelledError;
+  }
 }
