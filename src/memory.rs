@@ -3773,6 +3773,7 @@ mod tests {
                     task_queue: crate::TaskQueue::new(queue),
                     registered_workflow_types: vec![workflow_type],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -3858,6 +3859,7 @@ mod tests {
                             1,
                         )],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await

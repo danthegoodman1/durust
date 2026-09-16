@@ -2285,6 +2285,7 @@ where
                     task_queue: self.shared.workflow_task_queue.clone(),
                     registered_workflow_types: self.shared.registered_workflow_types.clone(),
                     lease_duration: self.shared.workflow_task_lease_duration,
+                    shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                 },
             )
             .await?;
@@ -2351,9 +2352,9 @@ where
                         task_queue: self.shared.workflow_task_queue.clone(),
                         registered_workflow_types: self.shared.registered_workflow_types.clone(),
                         lease_duration: self.shared.workflow_task_lease_duration,
+                        shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                     },
                     limit,
-                    shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                 },
             )
             .await?;

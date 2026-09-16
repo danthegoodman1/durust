@@ -140,12 +140,14 @@ async fn start_inline_child_for_tests(
         task_queue: parent_queue,
         registered_workflow_types: vec![parent_workflow_type],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     };
     let child_claim_opts = crate::ClaimWorkflowTaskOptions {
         namespace: crate::Namespace::default(),
         task_queue: child_queue.clone(),
         registered_workflow_types: vec![child_workflow_type.clone()],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     };
     let parent = backend
         .claim_workflow_task(
@@ -245,6 +247,7 @@ async fn start_and_claim_for_terminal_guard(
                 task_queue: crate::TaskQueue::new(queue),
                 registered_workflow_types: vec![workflow_type],
                 lease_duration: Duration::from_secs(30),
+                shard_filter: None,
             },
         )
         .await
@@ -611,6 +614,7 @@ fn postgres_hot_path_ids_use_sequences_without_meta_counters() {
                     task_queue: queue,
                     registered_workflow_types: vec![workflow_type],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -719,9 +723,9 @@ fn postgres_batch_claim_honors_shard_filter_when_configured() {
                         task_queue: queue,
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                     limit: 8,
-                    shard_filter: Some(vec![target_shard]),
                 },
             )
             .await
@@ -757,9 +761,9 @@ fn postgres_empty_shard_filtered_claim_does_not_acquire_leases() {
                         task_queue: crate::TaskQueue::new("postgres-empty-shard-filter"),
                         registered_workflow_types: vec![WorkflowType::new("postgres.empty", 1)],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                     limit: 8,
-                    shard_filter: Some(shards.clone()),
                 },
             )
             .await
@@ -817,9 +821,9 @@ fn postgres_stale_shard_owner_cannot_commit_when_configured() {
                         task_queue: queue,
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                     limit: 1,
-                    shard_filter: Some(vec![target_shard]),
                 },
             )
             .await
@@ -904,6 +908,7 @@ fn postgres_claim_without_filter_acquires_shard_lease_when_configured() {
                     task_queue: queue,
                     registered_workflow_types: vec![workflow_type],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -989,9 +994,9 @@ fn postgres_batch_commit_on_one_shard_commits_all_items_when_configured() {
                         task_queue: queue,
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                     limit: 2,
-                    shard_filter: Some(vec![target_shard]),
                 },
             )
             .await
@@ -1174,6 +1179,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
                     task_queue: crate::TaskQueue::new("wrong"),
                     registered_workflow_types: vec![workflow_type.clone()],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -1185,6 +1191,7 @@ fn postgres_core_workflow_visibility_round_trip_when_configured() {
             task_queue: queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-core-worker-a"), claim_opts.clone())
@@ -1656,6 +1663,7 @@ fn postgres_child_start_is_inline_when_configured() {
             task_queue: parent_queue,
             registered_workflow_types: vec![parent_workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let parent = backend
             .claim_workflow_task(
@@ -1764,6 +1772,7 @@ fn postgres_child_start_is_inline_when_configured() {
                     task_queue: child_queue,
                     registered_workflow_types: vec![child_workflow_type],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -1836,6 +1845,7 @@ fn postgres_child_start_conflict_records_failure_when_configured() {
             task_queue: parent_queue,
             registered_workflow_types: vec![parent_workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let parent = backend
             .claim_workflow_task(
@@ -2153,6 +2163,7 @@ fn postgres_cancel_workflow_cleans_operational_state_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-cancel-worker"), claim_opts.clone())
@@ -2524,6 +2535,7 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
             task_queue: queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
 
         let reused_value = "postgres-dedup-refresh-projection".repeat(8);
@@ -2749,6 +2761,7 @@ fn postgres_cancel_commands_clean_activity_state_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let first_claim = backend
             .claim_workflow_task(
@@ -2930,6 +2943,7 @@ fn postgres_continue_as_new_starts_claimable_next_run_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-continue-first"), claim_opts.clone())
@@ -3036,6 +3050,7 @@ fn postgres_activity_map_completes_with_blob_backed_manifest_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-map-scheduler"), claim_opts.clone())
@@ -3257,6 +3272,7 @@ fn postgres_delayed_visibility_survives_reconnect_when_configured() {
             task_queue: queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-delayed-first"), claim_opts.clone())
@@ -3364,6 +3380,7 @@ fn postgres_reconnect_preserves_history_and_operational_indexes_when_configured(
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(
@@ -3552,6 +3569,7 @@ fn postgres_concurrent_claims_are_unique_and_stale_commits_are_rejected_when_con
             task_queue: queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let mut handles = Vec::new();
         for index in 0..16_u64 {
@@ -3668,6 +3686,7 @@ fn postgres_batch_activity_claims_are_bounded_and_unique_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(
@@ -3821,6 +3840,7 @@ fn postgres_batch_workflow_commit_fast_path_applies_simple_side_effects_when_con
             task_queue: workflow_queue.clone(),
             registered_workflow_types: vec![workflow_type.clone()],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
 
         let timer_run = backend
@@ -4130,12 +4150,14 @@ fn postgres_batch_workflow_commit_fast_path_starts_children_when_configured() {
             task_queue: parent_queue.clone(),
             registered_workflow_types: vec![parent_type.clone()],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let child_claim_opts = crate::ClaimWorkflowTaskOptions {
             namespace: crate::Namespace::default(),
             task_queue: child_queue.clone(),
             registered_workflow_types: vec![child_type.clone()],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let parent_a = backend
             .start_workflow(crate::StartWorkflowRequest {
@@ -4304,6 +4326,7 @@ fn postgres_batch_workflow_commit_fast_path_preserves_stale_item_results_when_co
             task_queue: workflow_queue.clone(),
             registered_workflow_types: vec![workflow_type.clone()],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let first = backend
             .start_workflow(crate::StartWorkflowRequest {
@@ -4439,6 +4462,7 @@ fn postgres_workflow_commit_bulk_history_preserves_order_and_markers_when_config
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(WorkerId::new("postgres-bulk-history-worker"), claim_opts)
@@ -4577,6 +4601,7 @@ fn postgres_batch_activity_completion_completes_multiple_claims_in_one_call() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(
@@ -4736,6 +4761,7 @@ fn postgres_batch_activity_completion_updates_multiple_runs_independently() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         for _ in 0..2 {
             let claimed = backend
@@ -4875,6 +4901,7 @@ fn postgres_batch_activity_completion_preserves_mixed_result_order() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(
@@ -5031,6 +5058,7 @@ fn postgres_activity_retry_failure_and_timeout_when_configured() {
             task_queue: workflow_queue,
             registered_workflow_types: vec![workflow_type],
             lease_duration: Duration::from_secs(30),
+            shard_filter: None,
         };
         let claimed = backend
             .claim_workflow_task(

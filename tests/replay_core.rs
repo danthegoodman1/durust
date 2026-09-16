@@ -1,8 +1,10 @@
+use durust::provider::{
+    ClaimActivityOptions, ClaimWorkflowTaskOptions, CompleteActivityRequest, DurableBackend,
+    HistoryEventData, HistoryEventType,
+};
 use durust::{
-    ActivityName, BoxSelectBranch, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
-    CompleteActivityRequest, DurableBackend, DurableBranchExt, EventId, HistoryEventData,
-    HistoryEventType, MemoryBackend, Namespace, PayloadRef, PayloadStorageConfig, SqliteBackend,
-    TaskQueue, Worker, WorkerId, WorkflowType,
+    ActivityName, BoxSelectBranch, Client, DurableBranchExt, EventId, MemoryBackend, Namespace,
+    PayloadRef, PayloadStorageConfig, SqliteBackend, TaskQueue, Worker, WorkerId, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -328,7 +330,7 @@ async fn child_spawn_abandon_workflow(input: NumberInput) -> durust::Result<Stri
     let input = input.value;
     let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/child-spawn-abandon/{input}"))
-        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Abandon)
         .spawn()
         .await?;
     Ok(child.run_id().0.clone())
@@ -339,7 +341,7 @@ async fn child_spawn_cancel_workflow(input: NumberInput) -> durust::Result<Strin
     let input = input.value;
     let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/child-spawn-cancel/{input}"))
-        .parent_close_policy(durust::ParentClosePolicy::Cancel)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Cancel)
         .spawn()
         .await?;
     Ok(child.run_id().0.clone())
@@ -369,7 +371,7 @@ async fn select_timer_before_child_result_workflow(input: NumberInput) -> durust
     let input = input.value;
     let child = durust::child!(child_double_workflow(number(input)))
         .workflow_id(format!("wf/select-timer-before-child-result/{input}"))
-        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Abandon)
         .spawn()
         .await?;
     let outcome = durust::select! {
@@ -522,7 +524,7 @@ async fn select_all_mixed_branches_workflow(input: NumberInput) -> durust::Resul
         .await?;
     let child = durust::child!(child_double_workflow(number(input + 10)))
         .workflow_id(format!("wf/select-all-mixed-child/{input}"))
-        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Abandon)
         .spawn()
         .await?;
 
@@ -1083,7 +1085,8 @@ async fn empty_map_manifests(_: UnitInput) -> durust::Result<u64> {
         .result_manifest("doubled")
         .spawn()
         .await?;
-    let result_refs = durust::decode_activity_map_result_refs(&mapped.result_manifest().await?)?;
+    let result_refs =
+        durust::provider::decode_activity_map_result_refs(&mapped.result_manifest().await?)?;
     let child_mapped = durust::child_workflow_map::<double_plus_one>()
         .task_queue("workflows")
         .workflow_id_prefix("wf/empty-map/item")
@@ -1094,8 +1097,9 @@ async fn empty_map_manifests(_: UnitInput) -> durust::Result<u64> {
         .result_manifest("child-doubled")
         .spawn()
         .await?;
-    let outcomes =
-        durust::decode_child_workflow_map_outcomes(&child_mapped.result_manifest().await?)?;
+    let outcomes = durust::provider::decode_child_workflow_map_outcomes(
+        &child_mapped.result_manifest().await?,
+    )?;
     Ok((result_refs.len() + outcomes.len()) as u64)
 }
 
@@ -1158,7 +1162,7 @@ async fn activity_map_sum(input: ValuesInput) -> durust::Result<u64> {
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&result_manifest)?;
     result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })
@@ -1176,7 +1180,7 @@ async fn activity_map_large_results(input: ValuesInput) -> durust::Result<u64> {
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&result_manifest)?;
     result_refs.iter().try_fold(0_u64, |total, payload| {
         Ok(total + durust::decode_payload::<String>(payload)?.len() as u64)
     })
@@ -1208,7 +1212,8 @@ macro_rules! child_workflow_map_sum_body {
             .spawn()
             .await?;
         let result_manifest = mapped.result_manifest().await?;
-        let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+        let result_refs =
+            durust::provider::decode_child_workflow_map_success_refs(&result_manifest)?;
         result_refs.iter().try_fold(0_u64, |sum, payload| {
             Ok(sum + durust::decode_payload::<u64>(payload)?)
         })
@@ -1224,8 +1229,8 @@ async fn child_workflow_map_sum(input: ValuesInput) -> durust::Result<u64> {
         "wf/child-workflow-map-sum/item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1239,8 +1244,8 @@ async fn child_workflow_map_sum_changed_child_type(input: ValuesInput) -> durust
         "wf/child-workflow-map-sum/item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1254,8 +1259,8 @@ async fn child_workflow_map_sum_changed_input_manifest(input: ValuesInput) -> du
         "wf/child-workflow-map-sum/item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         1,
     )
 }
@@ -1269,8 +1274,8 @@ async fn child_workflow_map_sum_changed_prefix(input: ValuesInput) -> durust::Re
         "wf/child-workflow-map-sum/changed-item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1284,8 +1289,8 @@ async fn child_workflow_map_sum_changed_task_queue(input: ValuesInput) -> durust
         "wf/child-workflow-map-sum/item",
         "other-workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1299,8 +1304,8 @@ async fn child_workflow_map_sum_changed_max_in_flight(input: ValuesInput) -> dur
         "wf/child-workflow-map-sum/item",
         "workflows",
         3,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1316,8 +1321,8 @@ async fn child_workflow_map_sum_changed_parent_close_policy(
         "wf/child-workflow-map-sum/item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Abandon,
-        durust::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Abandon,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
         0,
     )
 }
@@ -1331,8 +1336,8 @@ async fn child_workflow_map_sum_changed_failure_mode(input: ValuesInput) -> duru
         "wf/child-workflow-map-sum/item",
         "workflows",
         2,
-        durust::ParentClosePolicy::Cancel,
-        durust::ChildWorkflowMapFailureMode::CollectAll,
+        durust::provider::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::CollectAll,
         0,
     )
 }
@@ -1561,7 +1566,7 @@ fn replay_hydrates_large_activity_result_only_when_workflow_observes_it() {
     block_on(async {
         let inner = MemoryBackend::new();
         let blob_store = CountingBlobStore::default();
-        let backend = durust::PayloadBackend::with_payload_storage(
+        let backend = durust::provider::PayloadBackend::with_payload_storage(
             inner.clone(),
             blob_store.clone(),
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
@@ -1624,7 +1629,7 @@ fn inline_result_manifest_root_with_blob_item_results_hydrates_for_the_workflow(
         let blob_store = CountingBlobStore::default();
         // Item results (~4 KiB) offload; pages and root hold compact refs and
         // stay inline under the 2 KiB threshold.
-        let backend = durust::PayloadBackend::with_payload_storage(
+        let backend = durust::provider::PayloadBackend::with_payload_storage(
             inner.clone(),
             blob_store.clone(),
             durust::PayloadStorageConfig::new().inline_threshold_bytes(2048),
@@ -1652,7 +1657,7 @@ fn inline_result_manifest_root_with_blob_item_results_hydrates_for_the_workflow(
         // (inline root and pages, blob item results); otherwise this test
         // stops pinning the inline short-circuit.
         let raw_events = backend
-            .stream_history_for_replay(durust::StreamHistoryRequest {
+            .stream_history_for_replay(durust::provider::StreamHistoryRequest {
                 run_id: run_id.clone(),
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(1_000_000),
@@ -1674,14 +1679,15 @@ fn inline_result_manifest_root_with_blob_item_results_hydrates_for_the_workflow(
             "result manifest root should be inline, got {:?}",
             completed.result_manifest
         );
-        let manifest: durust::ActivityMapResultManifest =
+        let manifest: durust::provider::ActivityMapResultManifest =
             durust::decode_payload(&completed.result_manifest).unwrap();
         for page in &manifest.pages {
             assert!(
                 matches!(page, durust::PayloadRef::Inline { .. }),
                 "manifest page should be inline, got {page:?}"
             );
-            let page: durust::ActivityMapResultPage = durust::decode_payload(page).unwrap();
+            let page: durust::provider::ActivityMapResultPage =
+                durust::decode_payload(page).unwrap();
             for result in &page.results {
                 assert!(
                     matches!(result, durust::PayloadRef::Blob { uri, .. } if uri.starts_with("memory-blob://payload/")),
@@ -1708,13 +1714,13 @@ fn commit_validates_already_offloaded_refs_without_downloading() {
     block_on(async {
         let inner = MemoryBackend::new();
         let blob_store = CountingBlobStore::default();
-        let backend = durust::PayloadBackend::with_payload_storage(
+        let backend = durust::provider::PayloadBackend::with_payload_storage(
             inner,
             blob_store.clone(),
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
         );
         let run_id = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/offloaded-ref-commit"),
                 workflow_type: WorkflowType::new("tests.double-plus-one", 1),
@@ -1726,7 +1732,7 @@ fn commit_validates_already_offloaded_refs_without_downloading() {
             .run_id()
             .clone();
         let raw_events = backend
-            .stream_history_for_replay(durust::StreamHistoryRequest {
+            .stream_history_for_replay(durust::provider::StreamHistoryRequest {
                 run_id,
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(1),
@@ -1752,7 +1758,7 @@ fn commit_validates_already_offloaded_refs_without_downloading() {
         backend
             .commit_workflow_task(
                 claimed.claim,
-                durust::WorkflowTaskCommit {
+                durust::provider::WorkflowTaskCommit {
                     append_events: Vec::new(),
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
@@ -1787,7 +1793,7 @@ fn activity_map_schedule_commit_uploads_each_manifest_blob_once() {
     block_on(async {
         let inner = MemoryBackend::new();
         let blob_store = CountingBlobStore::default();
-        let backend = durust::PayloadBackend::with_payload_storage(
+        let backend = durust::provider::PayloadBackend::with_payload_storage(
             inner,
             blob_store.clone(),
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
@@ -2029,7 +2035,7 @@ fn durable_api_inside_side_effect_fails_the_task_without_recording_markers() {
         )));
         assert!(
             backend
-                .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+                .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
                     namespace: Namespace::default(),
                     workflow_id: None,
                     run_id: Some(run_id),
@@ -2339,6 +2345,7 @@ fn child_workflow_cancel_policy_cancels_child_on_parent_exit() {
                     task_queue: TaskQueue::new("workflows"),
                     registered_workflow_types: vec![WorkflowType::new("tests.child-double", 1)],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -2521,7 +2528,7 @@ fn activity_spawn_handle_launches_before_result_is_awaited() {
             .unwrap();
         assert_eq!(
             late_second,
-            durust::CompleteActivityOutcome::AlreadyCompleted
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted
         );
 
         let history = stream_all(&backend, &run_id).await;
@@ -2606,7 +2613,10 @@ fn select_all_races_spawned_activity_handles_and_cancels_pending_losers() {
                 })
                 .await
                 .unwrap();
-            assert_eq!(late, durust::CompleteActivityOutcome::AlreadyCompleted);
+            assert_eq!(
+                late,
+                durust::provider::CompleteActivityOutcome::AlreadyCompleted
+            );
         }
         assert!(
             backend
@@ -2915,7 +2925,7 @@ fn replay_skips_timer_fired_consumed_out_of_order_before_later_timer_command() {
 // matcher's replay branch uncovered for that kind — an always-append mutation
 // of the matcher survives it.
 fn assert_command_event_recorded_once(
-    history: &[durust::HistoryEvent],
+    history: &[durust::provider::HistoryEvent],
     label: &str,
     is_kind: impl Fn(&HistoryEventData) -> bool,
 ) {
@@ -3410,7 +3420,7 @@ fn cold_replay_of_two_signal_select_with_second_branch_winner_multi_chunk() {
     block_on(run_cold_replay_of_second_branch_signal_select_case(1));
 }
 
-fn consumed_signal_ids(history: &[durust::HistoryEvent]) -> Vec<durust::SignalId> {
+fn consumed_signal_ids(history: &[durust::provider::HistoryEvent]) -> Vec<durust::SignalId> {
     history
         .iter()
         .filter_map(|event| match &event.data {
@@ -3812,7 +3822,7 @@ fn cancelling_pending_workflow_cleans_activity_without_workflow_failure() {
             .unwrap();
         assert_eq!(
             cancelled,
-            durust::CancelWorkflowOutcome::Cancelled {
+            durust::provider::CancelWorkflowOutcome::Cancelled {
                 run_id: run_id.clone(),
                 event_id: EventId(3)
             }
@@ -3826,7 +3836,7 @@ fn cancelling_pending_workflow_cleans_activity_without_workflow_failure() {
             .unwrap();
         assert_eq!(
             late_completion,
-            durust::CompleteActivityOutcome::AlreadyCompleted
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted
         );
         assert!(!worker.run_workflow_once().await.unwrap());
 
@@ -4397,7 +4407,7 @@ fn select_timer_winner_cancels_in_flight_activity() {
             .unwrap();
         assert_eq!(
             late_completion,
-            durust::CompleteActivityOutcome::AlreadyCompleted
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted
         );
 
         let history = stream_all(&backend, &run_id).await;
@@ -4996,7 +5006,7 @@ fn patched_records_marker_and_takes_new_branch_for_new_history() {
         assert_eq!(scheduled.command_id.seq, durust::CommandSeq(2));
 
         let versions = backend
-            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+            .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
                 namespace: Namespace::default(),
                 workflow_id: None,
                 run_id: Some(run_id),
@@ -5007,7 +5017,7 @@ fn patched_records_marker_and_takes_new_branch_for_new_history() {
         assert_eq!(versions.records.len(), 1);
         assert_eq!(
             versions.records[0].marker_kind,
-            durust::WorkflowChangeMarkerKind::Version
+            durust::provider::WorkflowChangeMarkerKind::Version
         );
         assert!(!versions.safe_to_remove());
     });
@@ -5460,7 +5470,7 @@ fn deprecate_patch_records_bridge_marker_for_new_histories() {
         );
 
         let versions = backend
-            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+            .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
                 namespace: Namespace::default(),
                 workflow_id: None,
                 run_id: Some(run_id),
@@ -5470,7 +5480,7 @@ fn deprecate_patch_records_bridge_marker_for_new_histories() {
             .unwrap();
         assert_eq!(
             versions.records[0].marker_kind,
-            durust::WorkflowChangeMarkerKind::DeprecatedPatch
+            durust::provider::WorkflowChangeMarkerKind::DeprecatedPatch
         );
     });
 }
@@ -5712,6 +5722,7 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
                     task_queue: TaskQueue::new("workflows"),
                     registered_workflow_types: vec![WorkflowType::new("tests.query-projection", 1)],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -5724,7 +5735,10 @@ fn query_projection_reads_latest_committed_publish_without_replay() {
             .expect("committed projection");
         assert_eq!(still_committed.status, "started");
         backend
-            .release_workflow_task(claimed.claim, durust::WorkflowTaskRelease::immediate())
+            .release_workflow_task(
+                claimed.claim,
+                durust::provider::WorkflowTaskRelease::immediate(),
+            )
             .await
             .unwrap();
 
@@ -5784,13 +5798,13 @@ fn provider_configured_json_codec_round_trips_typed_runtime_apis() {
 
         assert!(worker.run_workflow_once().await.unwrap());
         let query = backend
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/provider-json-codec"),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = query else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = query else {
             panic!("expected started query projection");
         };
         assert_eq!(payload.codec(), durust::CodecId::Json);
@@ -5833,7 +5847,7 @@ fn provider_configured_json_codec_round_trips_typed_runtime_apis() {
             .await
             .unwrap();
         let signal = backend
-            .read_signal_inbox(durust::ReadSignalInboxRequest {
+            .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
                 run_id: run_id.clone(),
                 signal_name: durust::SignalName::new("advance"),
             })
@@ -6306,12 +6320,15 @@ fn signal_before_wait_buffers_and_completes_without_extra_task() {
             .signal_workflow("wf/signal-before", "ready", "signal-before-1", "buffered")
             .await
             .unwrap();
-        assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+        assert_eq!(outcome, durust::provider::SignalWorkflowOutcome::Accepted);
         let duplicate = client
             .signal_workflow("wf/signal-before", "ready", "signal-before-1", "ignored")
             .await
             .unwrap();
-        assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+        assert_eq!(
+            duplicate,
+            durust::provider::SignalWorkflowOutcome::Duplicate
+        );
 
         let mut worker = Worker::builder(backend.clone())
             .workflow_task_queue("workflows")
@@ -6357,7 +6374,7 @@ fn signal_after_wait_wakes_and_consumes_atomically() {
             .signal_workflow("wf/signal-after", "ready", "signal-after-1", "delivered")
             .await
             .unwrap();
-        assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+        assert_eq!(outcome, durust::provider::SignalWorkflowOutcome::Accepted);
         assert!(worker.run_workflow_once().await.unwrap());
         assert!(!worker.run_workflow_once().await.unwrap());
 
@@ -7173,7 +7190,10 @@ fn claim_is_released_when_current_time_fails_before_prepare() {
             .unwrap()
             .expect("claim released by failed prepare");
         backend
-            .release_workflow_task(reclaimed.claim, durust::WorkflowTaskRelease::immediate())
+            .release_workflow_task(
+                reclaimed.claim,
+                durust::provider::WorkflowTaskRelease::immediate(),
+            )
             .await
             .unwrap();
 
@@ -7573,6 +7593,7 @@ fn provider_claims_only_registered_workflow_and_activity_types() {
                     task_queue: TaskQueue::new("workflows"),
                     registered_workflow_types: Vec::new(),
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -8023,12 +8044,12 @@ fn an_empty_map_manifest_completes_instead_of_stalling_the_parent() {
                 .map(|event| event.event_type())
                 .collect::<Vec<_>>(),
             vec![
-                durust::HistoryEventType::WorkflowStarted,
-                durust::HistoryEventType::ActivityMapScheduled,
-                durust::HistoryEventType::ActivityMapCompleted,
-                durust::HistoryEventType::ChildWorkflowMapScheduled,
-                durust::HistoryEventType::ChildWorkflowMapCompleted,
-                durust::HistoryEventType::WorkflowCompleted,
+                durust::provider::HistoryEventType::WorkflowStarted,
+                durust::provider::HistoryEventType::ActivityMapScheduled,
+                durust::provider::HistoryEventType::ActivityMapCompleted,
+                durust::provider::HistoryEventType::ChildWorkflowMapScheduled,
+                durust::provider::HistoryEventType::ChildWorkflowMapCompleted,
+                durust::provider::HistoryEventType::WorkflowCompleted,
             ],
             "both empty maps must complete and the run must finish"
         );
@@ -8105,12 +8126,12 @@ fn a_zero_max_in_flight_map_bound_is_rejected_at_the_scheduling_boundary() {
     });
 }
 
-async fn stream_all<B>(backend: &B, run_id: &durust::RunId) -> Vec<durust::HistoryEvent>
+async fn stream_all<B>(backend: &B, run_id: &durust::RunId) -> Vec<durust::provider::HistoryEvent>
 where
     B: DurableBackend,
 {
     backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000_000),
@@ -8123,9 +8144,9 @@ where
 }
 
 fn lazy_payload_worker(
-    backend: durust::PayloadBackend<MemoryBackend, CountingBlobStore>,
+    backend: durust::provider::PayloadBackend<MemoryBackend, CountingBlobStore>,
     worker_id: &str,
-) -> Worker<durust::PayloadBackend<MemoryBackend, CountingBlobStore>> {
+) -> Worker<durust::provider::PayloadBackend<MemoryBackend, CountingBlobStore>> {
     Worker::builder(backend)
         .worker_id(worker_id)
         .workflow_task_queue("workflows")
@@ -8167,7 +8188,7 @@ impl CountingBlobStore {
     }
 }
 
-impl durust::PayloadBlobStore for CountingBlobStore {
+impl durust::provider::PayloadBlobStore for CountingBlobStore {
     fn put_payload_blob(
         &self,
         digest: String,
@@ -8251,9 +8272,9 @@ where
 }
 
 fn scheduled_activity(
-    history: &[durust::HistoryEvent],
+    history: &[durust::provider::HistoryEvent],
     index: usize,
-) -> &durust::ActivityScheduled {
+) -> &durust::provider::ActivityScheduled {
     let HistoryEventData::ActivityScheduled(scheduled) = &history[index].data else {
         panic!("expected ActivityScheduled at history index {index}");
     };
@@ -8266,14 +8287,15 @@ fn double_plus_one_claim_options() -> ClaimWorkflowTaskOptions {
         task_queue: TaskQueue::new("workflows"),
         registered_workflow_types: vec![WorkflowType::new("tests.double-plus-one", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     }
 }
 
 #[derive(Clone)]
 struct RecordingBackend {
     inner: MemoryBackend,
-    stream_requests: Arc<Mutex<Vec<durust::StreamHistoryRequest>>>,
-    signal_batch_requests: Arc<Mutex<Vec<durust::ReadSignalInboxesRequest>>>,
+    stream_requests: Arc<Mutex<Vec<durust::provider::StreamHistoryRequest>>>,
+    signal_batch_requests: Arc<Mutex<Vec<durust::provider::ReadSignalInboxesRequest>>>,
     backpressure_next_replay_stream: Arc<Mutex<Option<Duration>>>,
     fail_next_current_time: Arc<Mutex<bool>>,
     fail_next_replay_stream: Arc<Mutex<bool>>,
@@ -8310,11 +8332,11 @@ impl RecordingBackend {
         self.stream_requests.lock().unwrap().clear();
     }
 
-    fn stream_requests(&self) -> Vec<durust::StreamHistoryRequest> {
+    fn stream_requests(&self) -> Vec<durust::provider::StreamHistoryRequest> {
         self.stream_requests.lock().unwrap().clone()
     }
 
-    fn signal_batch_requests(&self) -> Vec<durust::ReadSignalInboxesRequest> {
+    fn signal_batch_requests(&self) -> Vec<durust::provider::ReadSignalInboxesRequest> {
         self.signal_batch_requests.lock().unwrap().clone()
     }
 
@@ -8356,17 +8378,21 @@ impl RecordingBackend {
 }
 
 impl DurableBackend for RecordingBackend {
+    fn payload_storage_config(&self) -> durust::PayloadStorageConfig {
+        self.inner.payload_storage_config()
+    }
+
     fn start_workflow(
         &self,
-        req: durust::StartWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::StartWorkflowOutcome>> {
+        req: durust::provider::StartWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::StartWorkflowOutcome>> {
         self.inner.start_workflow(req)
     }
 
     fn cancel_workflow(
         &self,
-        req: durust::CancelWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CancelWorkflowOutcome>> {
+        req: durust::provider::CancelWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CancelWorkflowOutcome>> {
         self.inner.cancel_workflow(req)
     }
 
@@ -8385,7 +8411,7 @@ impl DurableBackend for RecordingBackend {
         &self,
         worker_id: WorkerId,
         opts: ClaimWorkflowTaskOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedWorkflowTask>>> {
         let prefetch_enabled = self.claim_prefetch_enabled;
         let inner = self.inner.clone();
         Box::pin(async move {
@@ -8399,8 +8425,8 @@ impl DurableBackend for RecordingBackend {
 
     fn stream_history(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
         self.inner.stream_history(req)
     }
@@ -8425,8 +8451,8 @@ impl DurableBackend for RecordingBackend {
 
     fn stream_history_for_replay(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>> {
         self.stream_requests.lock().unwrap().push(req.clone());
         if Self::take_flag(&self.fail_next_replay_stream) {
             return Box::pin(async {
@@ -8449,8 +8475,8 @@ impl DurableBackend for RecordingBackend {
 
     fn commit_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        batch: durust::WorkflowTaskCommit,
+        claim: durust::provider::WorkflowTaskClaim,
+        batch: durust::provider::WorkflowTaskCommit,
     ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         self.inner.commit_workflow_task(claim, batch)
     }
@@ -8460,8 +8486,9 @@ impl DurableBackend for RecordingBackend {
     // for real.
     fn commit_workflow_tasks(
         &self,
-        batch: durust::WorkflowTaskCommitBatch,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
+        batch: durust::provider::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::WorkflowTaskCommitBatchResult>>>
+    {
         if Self::take_flag(&self.fail_next_commit_batch) {
             return Box::pin(async {
                 Err(durust::Error::Backend(
@@ -8476,7 +8503,7 @@ impl DurableBackend for RecordingBackend {
             for input in batch.commits {
                 let claim = input.claim;
                 if failed_run.as_ref() == Some(&claim.run_id) {
-                    results.push(durust::WorkflowTaskCommitBatchResult {
+                    results.push(durust::provider::WorkflowTaskCommitBatchResult {
                         claim,
                         result: Err(durust::Error::Backend(
                             "injected per-item commit failure".to_owned(),
@@ -8487,7 +8514,7 @@ impl DurableBackend for RecordingBackend {
                 let result = backend
                     .commit_workflow_task(claim.clone(), input.commit)
                     .await;
-                results.push(durust::WorkflowTaskCommitBatchResult { claim, result });
+                results.push(durust::provider::WorkflowTaskCommitBatchResult { claim, result });
             }
             Ok(results)
         })
@@ -8495,45 +8522,45 @@ impl DurableBackend for RecordingBackend {
 
     fn release_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        release: durust::WorkflowTaskRelease,
+        claim: durust::provider::WorkflowTaskClaim,
+        release: durust::provider::WorkflowTaskRelease,
     ) -> BoxFuture<'static, durust::Result<()>> {
         self.inner.release_workflow_task(claim, release)
     }
 
     fn signal_workflow(
         &self,
-        req: durust::SignalWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>> {
+        req: durust::provider::SignalWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::SignalWorkflowOutcome>> {
         self.inner.signal_workflow(req)
     }
 
     fn read_signal_inbox(
         &self,
-        req: durust::ReadSignalInboxRequest,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::SignalInboxRecord>>> {
+        req: durust::provider::ReadSignalInboxRequest,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::SignalInboxRecord>>> {
         self.inner.read_signal_inbox(req)
     }
 
     fn read_signal_inboxes(
         &self,
-        req: durust::ReadSignalInboxesRequest,
-    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::SignalInboxRecord>>>> {
+        req: durust::provider::ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::provider::SignalInboxRecord>>>> {
         self.signal_batch_requests.lock().unwrap().push(req.clone());
         self.inner.read_signal_inboxes(req)
     }
 
     fn fire_due_timers(
         &self,
-        req: durust::FireDueTimersRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>> {
+        req: durust::provider::FireDueTimersRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FireDueTimersOutcome>> {
         self.inner.fire_due_timers(req)
     }
 
     fn timeout_due_activities(
         &self,
-        req: durust::TimeoutDueActivitiesRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>> {
+        req: durust::provider::TimeoutDueActivitiesRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::TimeoutDueActivitiesOutcome>> {
         self.inner.timeout_due_activities(req)
     }
 
@@ -8541,21 +8568,21 @@ impl DurableBackend for RecordingBackend {
         &self,
         worker_id: WorkerId,
         opts: ClaimActivityOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>> {
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedActivityTask>>> {
         self.inner.claim_activity_task(worker_id, opts)
     }
 
     fn heartbeat_activity(
         &self,
-        req: durust::ActivityHeartbeatRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>> {
+        req: durust::provider::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ActivityHeartbeatOutcome>> {
         self.inner.heartbeat_activity(req)
     }
 
     fn complete_activity(
         &self,
         req: CompleteActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CompleteActivityOutcome>> {
         let advance = self
             .advance_before_activity_completion
             .lock()
@@ -8567,7 +8594,7 @@ impl DurableBackend for RecordingBackend {
                 inner.advance_time(advance);
                 let now = inner.current_time().await?;
                 inner
-                    .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+                    .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                         namespace: Namespace::default(),
                         now,
                         limit: 16,
@@ -8580,40 +8607,43 @@ impl DurableBackend for RecordingBackend {
 
     fn fail_activity(
         &self,
-        req: durust::FailActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
+        req: durust::provider::FailActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FailActivityOutcome>> {
         self.inner.fail_activity(req)
     }
 
     fn dispatch_child_workflow_starts(
         &self,
-        req: durust::DispatchChildWorkflowStartsRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
+        req: durust::provider::DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::DispatchChildWorkflowStartsOutcome>>
+    {
         self.inner.dispatch_child_workflow_starts(req)
     }
 
     fn query_projection(
         &self,
-        req: durust::QueryProjectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
+        req: durust::provider::QueryProjectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::QueryProjectionOutcome>> {
         self.inner.query_projection(req)
     }
 
     fn workflow_change_versions(
         &self,
-        req: durust::WorkflowChangeVersionsRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
+        req: durust::provider::WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::WorkflowChangeVersionsOutcome>> {
         self.inner.workflow_change_versions(req)
     }
 
-    fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>> {
+    fn payload_roots(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadRootsOutcome>> {
         self.inner.payload_roots()
     }
 
     fn gc_payload_blobs(
         &self,
-        req: durust::PayloadGarbageCollectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
+        req: durust::provider::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadGarbageCollectionOutcome>> {
         self.inner.gc_payload_blobs(req)
     }
 }
@@ -8650,7 +8680,7 @@ async fn spawn_sleep_then_activity_map_workflow(input: NumberInput) -> durust::R
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&result_manifest)?;
     let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
     })?;
@@ -8676,12 +8706,12 @@ async fn spawn_sleep_then_child_workflow_map_workflow(input: NumberInput) -> dur
         .input_manifest(input_manifest)
         .max_in_flight(2)
         .result_manifest("post-sleep-child-mapped")
-        .parent_close_policy(durust::ParentClosePolicy::Cancel)
-        .failure_mode(durust::ChildWorkflowMapFailureMode::FailFast)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Cancel)
+        .failure_mode(durust::provider::ChildWorkflowMapFailureMode::FailFast)
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_child_workflow_map_success_refs(&result_manifest)?;
     let mapped_sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok::<u64, durust::Error>(sum + durust::decode_payload::<u64>(payload)?)
     })?;
@@ -8931,7 +8961,7 @@ async fn large_inline_command_payloads_workflow(_: UnitInput) -> durust::Result<
 async fn drive_large_inline_command_payload_run(
     workflow_id: &str,
     cold_chunk_events: Option<usize>,
-) -> (u64, Vec<durust::HistoryEvent>) {
+) -> (u64, Vec<durust::provider::HistoryEvent>) {
     let backend = MemoryBackend::with_payload_storage(
         PayloadStorageConfig::new().inline_threshold_bytes(LARGE_INLINE_THRESHOLD_BYTES),
     );
@@ -8978,7 +9008,7 @@ async fn drive_large_inline_command_payload_run(
     (durust::decode_payload::<u64>(result).unwrap(), history)
 }
 
-fn assert_large_inline_command_payloads(history: &[durust::HistoryEvent]) {
+fn assert_large_inline_command_payloads(history: &[durust::provider::HistoryEvent]) {
     let scheduled: Vec<_> = history
         .iter()
         .filter_map(|event| match &event.data {
@@ -9039,7 +9069,7 @@ where
     B: DurableBackend,
 {
     let events = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000_000),

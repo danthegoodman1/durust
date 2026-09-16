@@ -1,4 +1,5 @@
-use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, EventId, MemoryBackend, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -109,9 +110,9 @@ async fn run_example() -> durust::Result<String> {
 async fn stream_history(
     backend: &MemoryBackend,
     run_id: &durust::RunId,
-) -> durust::Result<Vec<durust::HistoryEvent>> {
+) -> durust::Result<Vec<durust::provider::HistoryEvent>> {
     Ok(backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

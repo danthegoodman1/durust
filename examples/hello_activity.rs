@@ -1,4 +1,5 @@
-use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, EventId, MemoryBackend, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 
@@ -54,7 +55,7 @@ fn main() {
 
 async fn workflow_result(backend: &MemoryBackend, run_id: &durust::RunId) -> String {
     let history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

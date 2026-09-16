@@ -1,16 +1,25 @@
 use crate::{
     ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
-    ChildWorkflowMapTask, DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef,
+    ChildWorkflowMapTask, DurableFailure, EventId, Namespace, NewHistoryEvent, PayloadRef,
     PayloadStorageConfig, Result, RunId, ShardId, SignalId, SignalName, TaskQueue, TimestampMs,
     WaitId, WorkerId, WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
 
+/// Storage a workflow runtime commits against.
+///
+/// Every defaulted method here must stay correct when `self` is a **wrapper**
+/// around another backend, because that is the shape the compiler cannot
+/// check: a default that answers for itself rather than delegating to `self`
+/// turns a forgotten override into silent data loss instead of a build error.
+/// `payload_storage_config` and `hydrate_payload` have no default for exactly
+/// that reason — a wrapper that dropped them would report the wrong config and
+/// hand back unhydrated blobs. The batch and convenience methods default to
+/// driving `self`'s own single-item method, which stays correct through any
+/// number of wrappers and only costs a round trip per item.
 pub trait DurableBackend: Clone + Send + Sync + 'static {
-    fn payload_storage_config(&self) -> PayloadStorageConfig {
-        PayloadStorageConfig::default()
-    }
+    fn payload_storage_config(&self) -> PayloadStorageConfig;
 
     fn start_workflow(
         &self,
@@ -37,12 +46,6 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Vec<ClaimedWorkflowTask>>> {
         let backend = self.clone();
         Box::pin(async move {
-            if opts.shard_filter.is_some() {
-                return Err(Error::Backend(
-                    "workflow task shard filters require a shard-aware backend".to_owned(),
-                ));
-            }
-
             let mut claimed = Vec::new();
             for _ in 0..opts.limit {
                 let Some(task) = backend
@@ -67,9 +70,9 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         self.stream_history(req)
     }
 
-    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
-        Box::pin(async move { Ok(payload) })
-    }
+    /// Resolves an offloaded payload to inline bytes. A backend that never
+    /// offloads returns the payload unchanged.
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>>;
 
     fn hydrate_activity_map_result_manifest(
         &self,
@@ -333,13 +336,18 @@ pub struct ClaimWorkflowTaskOptions {
     pub task_queue: TaskQueue,
     pub registered_workflow_types: Vec<WorkflowType>,
     pub lease_duration: Duration,
+    /// Restricts the claim to these shards. It lives here rather than on the
+    /// batch options so the batched default — which drives
+    /// `claim_workflow_task` — honors it too; a filter only the batch path
+    /// could express would be silently dropped by any backend that does not
+    /// override the batch method.
+    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClaimWorkflowTasksOptions {
     pub claim: ClaimWorkflowTaskOptions,
     pub limit: usize,
-    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

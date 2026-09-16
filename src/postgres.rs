@@ -1536,7 +1536,7 @@ impl PostgresBackend {
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();
         let now_ms = self.clock.now().0;
-        let shard_ids = match opts.shard_filter {
+        let shard_ids = match opts.claim.shard_filter {
             Some(shards) => {
                 if shards.is_empty() {
                     tx.commit().await.map_err(postgres_error)?;

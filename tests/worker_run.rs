@@ -4,10 +4,8 @@
 // with the test logic, so no spawning or wall-clock coordination is needed,
 // and every test is bounded by a timeout so a hang fails fast.
 
-use durust::{
-    DurableBackend, EventId, HistoryEventData, MemoryBackend, RunId, SqliteBackend, Worker,
-    WorkerRunOptions,
-};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{EventId, MemoryBackend, RunId, SqliteBackend, Worker, WorkerRunOptions};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -308,12 +306,12 @@ async fn wr_reentrant_side_effect(_: UnitInput) -> durust::Result<bool> {
     Ok(flag)
 }
 
-async fn history<B>(backend: &B, run_id: &RunId) -> Vec<durust::HistoryEvent>
+async fn history<B>(backend: &B, run_id: &RunId) -> Vec<durust::provider::HistoryEvent>
 where
     B: DurableBackend,
 {
     backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000_000),
@@ -425,7 +423,7 @@ impl DurableBackend for ObservingBackend {
 
     fn wait_for_ready(
         &self,
-        req: durust::WaitForReadyRequest,
+        req: durust::provider::WaitForReadyRequest,
     ) -> BoxFuture<'static, durust::Result<()>> {
         self.inner.wait_for_ready(req)
     }
@@ -433,8 +431,8 @@ impl DurableBackend for ObservingBackend {
     fn claim_workflow_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTaskOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTaskOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedWorkflowTask>>> {
         if let Some(err) = self.workflow_claim_failure() {
             return Box::pin(async move { Err(err) });
         }
@@ -444,8 +442,8 @@ impl DurableBackend for ObservingBackend {
     fn claim_workflow_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedWorkflowTask>>> {
         if let Some(err) = self.workflow_claim_failure() {
             return Box::pin(async move { Err(err) });
         }
@@ -454,26 +452,27 @@ impl DurableBackend for ObservingBackend {
 
     fn run_due_maintenance(
         &self,
-        req: durust::RunDueMaintenanceRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::RunDueMaintenanceOutcome>> {
+        req: durust::provider::RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::RunDueMaintenanceOutcome>> {
         self.maintenance_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.run_due_maintenance(req)
     }
 
     fn dispatch_child_workflow_starts(
         &self,
-        req: durust::DispatchChildWorkflowStartsRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
+        req: durust::provider::DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::DispatchChildWorkflowStartsOutcome>>
+    {
         self.child_dispatch_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.dispatch_child_workflow_starts(req)
     }
 
     forward_to_inner! {
-        fn start_workflow(req: durust::StartWorkflowRequest) -> durust::StartWorkflowOutcome;
-        fn cancel_workflow(req: durust::CancelWorkflowRequest) -> durust::CancelWorkflowOutcome;
+        fn start_workflow(req: durust::provider::StartWorkflowRequest) -> durust::provider::StartWorkflowOutcome;
+        fn cancel_workflow(req: durust::provider::CancelWorkflowRequest) -> durust::provider::CancelWorkflowOutcome;
         fn current_time() -> durust::TimestampMs;
-        fn stream_history(req: durust::StreamHistoryRequest) -> durust::HistoryChunk;
-        fn stream_history_for_replay(req: durust::StreamHistoryRequest) -> durust::HistoryChunk;
+        fn stream_history(req: durust::provider::StreamHistoryRequest) -> durust::provider::HistoryChunk;
+        fn stream_history_for_replay(req: durust::provider::StreamHistoryRequest) -> durust::provider::HistoryChunk;
         fn hydrate_payload(payload: durust::PayloadRef) -> durust::PayloadRef;
         fn hydrate_activity_map_result_manifest(
             payload: durust::PayloadRef
@@ -482,53 +481,53 @@ impl DurableBackend for ObservingBackend {
             payload: durust::PayloadRef
         ) -> durust::PayloadRef;
         fn commit_workflow_task(
-            claim: durust::WorkflowTaskClaim,
-            commit: durust::WorkflowTaskCommit
+            claim: durust::provider::WorkflowTaskClaim,
+            commit: durust::provider::WorkflowTaskCommit
         ) -> durust::EventId;
         fn commit_workflow_tasks(
-            batch: durust::WorkflowTaskCommitBatch
-        ) -> Vec<durust::WorkflowTaskCommitBatchResult>;
+            batch: durust::provider::WorkflowTaskCommitBatch
+        ) -> Vec<durust::provider::WorkflowTaskCommitBatchResult>;
         fn release_workflow_task(
-            claim: durust::WorkflowTaskClaim,
-            release: durust::WorkflowTaskRelease
+            claim: durust::provider::WorkflowTaskClaim,
+            release: durust::provider::WorkflowTaskRelease
         ) -> ();
-        fn signal_workflow(req: durust::SignalWorkflowRequest) -> durust::SignalWorkflowOutcome;
+        fn signal_workflow(req: durust::provider::SignalWorkflowRequest) -> durust::provider::SignalWorkflowOutcome;
         fn read_signal_inbox(
-            req: durust::ReadSignalInboxRequest
-        ) -> Option<durust::SignalInboxRecord>;
+            req: durust::provider::ReadSignalInboxRequest
+        ) -> Option<durust::provider::SignalInboxRecord>;
         fn read_signal_inboxes(
-            req: durust::ReadSignalInboxesRequest
-        ) -> Vec<Option<durust::SignalInboxRecord>>;
-        fn fire_due_timers(req: durust::FireDueTimersRequest) -> durust::FireDueTimersOutcome;
+            req: durust::provider::ReadSignalInboxesRequest
+        ) -> Vec<Option<durust::provider::SignalInboxRecord>>;
+        fn fire_due_timers(req: durust::provider::FireDueTimersRequest) -> durust::provider::FireDueTimersOutcome;
         fn timeout_due_activities(
-            req: durust::TimeoutDueActivitiesRequest
-        ) -> durust::TimeoutDueActivitiesOutcome;
+            req: durust::provider::TimeoutDueActivitiesRequest
+        ) -> durust::provider::TimeoutDueActivitiesOutcome;
         fn claim_activity_task(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimActivityOptions
-        ) -> Option<durust::ClaimedActivityTask>;
+            opts: durust::provider::ClaimActivityOptions
+        ) -> Option<durust::provider::ClaimedActivityTask>;
         fn claim_activity_tasks(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimActivityTasksOptions
-        ) -> Vec<durust::ClaimedActivityTask>;
+            opts: durust::provider::ClaimActivityTasksOptions
+        ) -> Vec<durust::provider::ClaimedActivityTask>;
         fn heartbeat_activity(
-            req: durust::ActivityHeartbeatRequest
-        ) -> durust::ActivityHeartbeatOutcome;
+            req: durust::provider::ActivityHeartbeatRequest
+        ) -> durust::provider::ActivityHeartbeatOutcome;
         fn complete_activity(
-            req: durust::CompleteActivityRequest
-        ) -> durust::CompleteActivityOutcome;
+            req: durust::provider::CompleteActivityRequest
+        ) -> durust::provider::CompleteActivityOutcome;
         fn complete_activity_tasks(
-            req: durust::CompleteActivityTasksRequest
-        ) -> Vec<durust::CompleteActivityTaskBatchResult>;
-        fn fail_activity(req: durust::FailActivityRequest) -> durust::FailActivityOutcome;
-        fn query_projection(req: durust::QueryProjectionRequest) -> durust::QueryProjectionOutcome;
+            req: durust::provider::CompleteActivityTasksRequest
+        ) -> Vec<durust::provider::CompleteActivityTaskBatchResult>;
+        fn fail_activity(req: durust::provider::FailActivityRequest) -> durust::provider::FailActivityOutcome;
+        fn query_projection(req: durust::provider::QueryProjectionRequest) -> durust::provider::QueryProjectionOutcome;
         fn workflow_change_versions(
-            req: durust::WorkflowChangeVersionsRequest
-        ) -> durust::WorkflowChangeVersionsOutcome;
-        fn payload_roots() -> durust::PayloadRootsOutcome;
+            req: durust::provider::WorkflowChangeVersionsRequest
+        ) -> durust::provider::WorkflowChangeVersionsOutcome;
+        fn payload_roots() -> durust::provider::PayloadRootsOutcome;
         fn gc_payload_blobs(
-            req: durust::PayloadGarbageCollectionRequest
-        ) -> durust::PayloadGarbageCollectionOutcome;
+            req: durust::provider::PayloadGarbageCollectionRequest
+        ) -> durust::provider::PayloadGarbageCollectionOutcome;
     }
 }
 

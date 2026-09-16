@@ -1,8 +1,11 @@
+use durust::provider::{
+    ClaimWorkflowTaskOptions, DurableBackend, HistoryEventData, NewHistoryEvent,
+    StartWorkflowOutcome, StartWorkflowRequest, VersionMarker, WorkflowChangeMarkerKind,
+    WorkflowTaskCommit,
+};
 use durust::{
-    ClaimWorkflowTaskOptions, DurableBackend, DurableManifest, HistoryEventData, ManifestActivity,
-    ManifestWorkflow, Namespace, NewHistoryEvent, SqliteBackend, StartWorkflowOutcome,
-    StartWorkflowRequest, TaskQueue, VersionMarker, WorkerId, WorkflowChangeMarkerKind, WorkflowId,
-    WorkflowTaskCommit, WorkflowType, write_manifest,
+    DurableManifest, ManifestActivity, ManifestWorkflow, Namespace, SqliteBackend, TaskQueue,
+    WorkerId, WorkflowId, WorkflowType, write_manifest,
 };
 use futures::executor::block_on;
 use std::process::Command;
@@ -183,12 +186,13 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
                     task_queue: TaskQueue::new("workflows"),
                     registered_workflow_types: vec![WorkflowType::new("cli.versioned", 1)],
                     lease_duration: std::time::Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
             .unwrap()
             .expect("workflow task");
-        let command_id = durust::command_id(&run_id, 1);
+        let command_id = durust::provider::command_id(&run_id, 1);
         backend
             .commit_workflow_task(
                 claimed.claim,
@@ -214,7 +218,7 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
             .await
             .unwrap();
         let records = backend
-            .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+            .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
                 namespace: Namespace::default(),
                 workflow_id: None,
                 run_id: Some(run_id.clone()),
@@ -243,7 +247,7 @@ fn versions_safe_to_remove_queries_sqlite_marker_index() {
         assert!(String::from_utf8(open.stderr).unwrap().contains("not safe"));
 
         backend
-            .cancel_workflow(durust::CancelWorkflowRequest {
+            .cancel_workflow(durust::provider::CancelWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: WorkflowId::new("wf/version-cli"),
                 reason: "done".to_owned(),

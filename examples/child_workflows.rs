@@ -41,7 +41,7 @@ async fn checkout_abandon_child(input: CheckoutInput) -> durust::Result<String> 
         order_id: input.order_id.clone(),
     }))
     .workflow_id(format!("receipt/{}", input.order_id))
-    .parent_close_policy(durust::ParentClosePolicy::Abandon)
+    .parent_close_policy(durust::provider::ParentClosePolicy::Abandon)
     .spawn()
     .await?;
     Ok(child.run_id().0.clone())
@@ -74,7 +74,7 @@ fn main() -> durust::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use durust::DurableBackend;
+    use durust::provider::DurableBackend;
 
     #[test]
     fn runs_child_workflow_spawn_and_wait_example() {
@@ -99,7 +99,7 @@ mod tests {
             worker.run_until_idle().await.unwrap();
 
             let history = backend
-                .stream_history(durust::StreamHistoryRequest {
+                .stream_history(durust::provider::StreamHistoryRequest {
                     run_id,
                     after_event_id: durust::EventId::ZERO,
                     up_to_event_id: durust::EventId(100),
@@ -109,7 +109,7 @@ mod tests {
                 .await
                 .unwrap()
                 .events;
-            let durust::HistoryEventData::WorkflowCompleted { result } =
+            let durust::provider::HistoryEventData::WorkflowCompleted { result } =
                 &history.last().expect("parent terminal").data
             else {
                 panic!("checkout did not complete");
@@ -143,7 +143,7 @@ mod tests {
             parent_worker.run_until_idle().await.unwrap();
 
             let parent_history = backend
-                .stream_history(durust::StreamHistoryRequest {
+                .stream_history(durust::provider::StreamHistoryRequest {
                     run_id,
                     after_event_id: durust::EventId::ZERO,
                     up_to_event_id: durust::EventId(100),
@@ -156,7 +156,7 @@ mod tests {
             let child_run_id = parent_history
                 .iter()
                 .find_map(|event| match &event.data {
-                    durust::HistoryEventData::ChildWorkflowStarted(started) => {
+                    durust::provider::HistoryEventData::ChildWorkflowStarted(started) => {
                         Some(started.run_id.clone())
                     }
                     _ => None,
@@ -169,7 +169,7 @@ mod tests {
                 .build();
             assert!(child_worker.run_workflow_once().await.unwrap());
             let child_history = backend
-                .stream_history(durust::StreamHistoryRequest {
+                .stream_history(durust::provider::StreamHistoryRequest {
                     run_id: child_run_id,
                     after_event_id: durust::EventId::ZERO,
                     up_to_event_id: durust::EventId(100),
@@ -181,7 +181,7 @@ mod tests {
                 .events;
             assert!(matches!(
                 child_history.last().expect("child terminal").data,
-                durust::HistoryEventData::WorkflowCompleted { .. }
+                durust::provider::HistoryEventData::WorkflowCompleted { .. }
             ));
         });
     }

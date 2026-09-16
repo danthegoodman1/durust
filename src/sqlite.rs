@@ -5590,6 +5590,7 @@ mod tests {
                             1,
                         )],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -5636,6 +5637,7 @@ mod tests {
                     task_queue: crate::TaskQueue::new(queue),
                     registered_workflow_types: vec![workflow_type],
                     lease_duration: Duration::from_secs(30),
+                    shard_filter: None,
                 },
             )
             .await
@@ -5832,6 +5834,7 @@ mod tests {
                         task_queue: crate::TaskQueue::new("map-repair-orphan-q"),
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -6015,6 +6018,7 @@ mod tests {
                         task_queue: crate::TaskQueue::new("backfill-workflows"),
                         registered_workflow_types: vec![parent_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -6069,6 +6073,7 @@ mod tests {
                         task_queue: crate::TaskQueue::new("backfill-children"),
                         registered_workflow_types: vec![child_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -6238,6 +6243,7 @@ mod tests {
                         task_queue: crate::TaskQueue::new("sqlite-cleanup-workflows"),
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -6431,6 +6437,7 @@ mod tests {
                         task_queue: crate::TaskQueue::new("sqlite-terminal-guard"),
                         registered_workflow_types: vec![workflow_type],
                         lease_duration: Duration::from_secs(30),
+                        shard_filter: None,
                     },
                 )
                 .await
@@ -6524,6 +6531,7 @@ mod tests {
                 task_queue: crate::TaskQueue::new("legacy-index-workflows"),
                 registered_workflow_types: vec![WorkflowType::new("tests.legacy-index", 1)],
                 lease_duration: Duration::from_secs(30),
+                shard_filter: None,
             },
         ))
         .unwrap();

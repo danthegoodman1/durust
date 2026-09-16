@@ -11,6 +11,9 @@ repository = "https://github.com/danthegoodman1/durust"
 
 [features]
 default = ["sqlite"]
+# The deterministic simulation harness (`durust::testing`). Test scaffolding,
+# so it is opt-in rather than linked into every production binary.
+testing = []
 sqlite = ["dep:rusqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 s3 = ["dep:rust-s3"]

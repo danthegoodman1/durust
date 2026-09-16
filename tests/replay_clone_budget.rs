@@ -20,10 +20,8 @@
 //! affects no other suite, and it holds exactly one `#[test]` so the counters
 //! are never shared with a concurrently running test.
 
-use durust::{
-    Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, PayloadRef,
-    PayloadStorageConfig, Worker,
-};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, EventId, MemoryBackend, PayloadRef, PayloadStorageConfig, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -219,7 +217,7 @@ fn measure_cold_replay(payload_bytes: usize) -> ReplayCost {
         // stored and this check would pass while measuring nothing. That is the
         // exact trap this file exists to guard against.
         let recorded = backend
-            .stream_history_for_replay(durust::StreamHistoryRequest {
+            .stream_history_for_replay(durust::provider::StreamHistoryRequest {
                 run_id: run_id.clone(),
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(1_000_000),

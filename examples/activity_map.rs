@@ -1,4 +1,5 @@
-use durust::{Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, Worker};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, EventId, MemoryBackend, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +30,7 @@ async fn sum_squares(input: SumSquaresInput) -> durust::Result<u64> {
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&result_manifest)?;
     result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })
@@ -84,9 +85,9 @@ async fn run_example() -> durust::Result<u64> {
 async fn stream_history(
     backend: &MemoryBackend,
     run_id: &durust::RunId,
-) -> durust::Result<Vec<durust::HistoryEvent>> {
+) -> durust::Result<Vec<durust::provider::HistoryEvent>> {
     Ok(backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

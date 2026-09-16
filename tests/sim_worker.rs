@@ -1,3 +1,4 @@
+#![cfg(feature = "testing")]
 //! Deterministic simulations that drive the real `Worker` over the real
 //! `MemoryBackend` through the seeded `FaultInjectingBackend`.
 //!
@@ -8,12 +9,18 @@
 //! steps and the memory backend's clock is synced to it, so leases, timers,
 //! delayed releases, and backoffs are fully controlled per seed.
 
+use durust::provider::{
+    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions,
+    CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, HistoryEvent,
+    HistoryEventData, NewHistoryEvent, WorkflowTaskCommit,
+};
+use durust::testing::{
+    FaultInjectingBackend, FaultPoint, FaultProfile, SimFailure, SimRun, is_injected_fault,
+    run_many_seeds,
+};
 use durust::{
-    ClaimActivityOptions, ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client,
-    CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId,
-    FaultInjectingBackend, FaultPoint, FaultProfile, HistoryEvent, HistoryEventData, MemoryBackend,
-    Namespace, NewHistoryEvent, RunId, SimFailure, SimRun, TaskQueue, Worker, WorkerId,
-    WorkerRunStats, WorkflowTaskCommit, WorkflowType, is_injected_fault, run_many_seeds,
+    Client, EventId, MemoryBackend, Namespace, RunId, TaskQueue, Worker, WorkerId, WorkerRunStats,
+    WorkflowType,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -194,6 +201,7 @@ fn workflow_claim_options(queue: &str, workflow_type: &str) -> ClaimWorkflowTask
         task_queue: TaskQueue::new(queue),
         registered_workflow_types: vec![WorkflowType::new(workflow_type, 1)],
         lease_duration: Duration::from_secs(1),
+        shard_filter: None,
     }
 }
 
@@ -202,13 +210,15 @@ fn suffix(label: &str, prefix: &str) -> Option<u64> {
 }
 
 fn run_history(inner: &MemoryBackend, run_id: &RunId) -> Vec<HistoryEvent> {
-    block_on(inner.stream_history(durust::StreamHistoryRequest {
-        run_id: run_id.clone(),
-        after_event_id: EventId::ZERO,
-        up_to_event_id: EventId(u64::MAX),
-        max_events: 100_000,
-        max_bytes: usize::MAX,
-    }))
+    block_on(
+        inner.stream_history(durust::provider::StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(u64::MAX),
+            max_events: 100_000,
+            max_bytes: usize::MAX,
+        }),
+    )
     .expect("stream history from the inner backend")
     .events
 }
@@ -268,7 +278,7 @@ fn ensure_no_poisoned_workflow_tasks<B>(
     stats: &WorkerRunStats,
 ) -> Result<(), SimFailure>
 where
-    B: durust::DurableBackend,
+    B: durust::provider::DurableBackend,
 {
     // The worker's own metrics split the count by cause, so a failing seed
     // names the defect class instead of leaving the reader to guess which of
@@ -648,7 +658,6 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
         ClaimWorkflowTasksOptions {
             claim: workflow_claim_options("sim-workflows", "sim.pipeline"),
             limit: 3,
-            shard_filter: None,
         },
     ))
     .expect("batch claim");
@@ -720,7 +729,7 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
             )?;
             let late_release = block_on(env.backend.release_workflow_task(
                 stale.claim.clone(),
-                durust::WorkflowTaskRelease::immediate(),
+                durust::provider::WorkflowTaskRelease::immediate(),
             ));
             sim.ensure(
                 "late_release_fenced",
@@ -731,10 +740,10 @@ fn batch_prepare_exceeds_lease_scenario(sim: &mut SimRun) -> Result<ScenarioOutc
         // The batch commit RPC path is fenced identically.
         let batch_results = block_on(
             env.backend
-                .commit_workflow_tasks(durust::WorkflowTaskCommitBatch {
+                .commit_workflow_tasks(durust::provider::WorkflowTaskCommitBatch {
                     commits: claims[1..]
                         .iter()
-                        .map(|stale| durust::WorkflowTaskCommitInput {
+                        .map(|stale| durust::provider::WorkflowTaskCommitInput {
                             claim: stale.claim.clone(),
                             commit: WorkflowTaskCommit {
                                 ..WorkflowTaskCommit::default()
@@ -812,7 +821,7 @@ fn expired_lease_correct_tail_commit_is_fenced_scenario(
         )?;
         let late_release = block_on(env.backend.release_workflow_task(
             claim_a.claim.clone(),
-            durust::WorkflowTaskRelease::immediate(),
+            durust::provider::WorkflowTaskRelease::immediate(),
         ));
         sim.ensure(
             "late_release_fenced",

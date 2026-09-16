@@ -951,6 +951,7 @@ mod tests {
             task_queue: crate::TaskQueue::new("sim-crash-queue"),
             registered_workflow_types: vec![crate::WorkflowType::new("sim.crash", 1)],
             lease_duration: Duration::from_secs(1),
+            shard_filter: None,
         };
 
         backend.crash_after_next_workflow_claim();

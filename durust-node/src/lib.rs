@@ -5,11 +5,11 @@
 
 mod wire;
 
-use durust::{
-    DurableBackend, LocalDirectoryBlobStore, MemoryBackend, MemoryBlobStore, PayloadBackend,
-    PayloadBlobStore, PostgresBackend, PostgresBackendConfig, RunId, S3BlobStore,
-    S3BlobStoreConfig, SignalInboxRecord, SqliteBackend,
+use durust::provider::{
+    DurableBackend, LocalDirectoryBlobStore, MemoryBlobStore, PayloadBackend, PayloadBlobStore,
+    S3BlobStore, S3BlobStoreConfig, SignalInboxRecord,
 };
+use durust::{MemoryBackend, PostgresBackend, PostgresBackendConfig, RunId, SqliteBackend};
 use futures::future::{BoxFuture, ready};
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -23,83 +23,85 @@ trait Provider: Send + Sync {
     fn current_time(&self) -> BoxFuture<'static, durust::Result<durust::TimestampMs>>;
     fn start_workflow(
         &self,
-        req: durust::StartWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::StartWorkflowOutcome>>;
+        req: durust::provider::StartWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::StartWorkflowOutcome>>;
     fn claim_workflow_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTaskOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>>;
+        opts: durust::provider::ClaimWorkflowTaskOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedWorkflowTask>>>;
     fn claim_workflow_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedWorkflowTask>>>;
+        opts: durust::provider::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedWorkflowTask>>>;
     fn stream_history(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>>;
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>>;
     fn commit_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        commit: durust::WorkflowTaskCommit,
+        claim: durust::provider::WorkflowTaskClaim,
+        commit: durust::provider::WorkflowTaskCommit,
     ) -> BoxFuture<'static, durust::Result<durust::EventId>>;
     fn release_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        release: durust::WorkflowTaskRelease,
+        claim: durust::provider::WorkflowTaskClaim,
+        release: durust::provider::WorkflowTaskRelease,
     ) -> BoxFuture<'static, durust::Result<()>>;
     fn claim_activity_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>>;
+        opts: durust::provider::ClaimActivityOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedActivityTask>>>;
     fn claim_activity_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedActivityTask>>>;
+        opts: durust::provider::ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedActivityTask>>>;
     fn complete_activity(
         &self,
-        req: durust::CompleteActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>>;
+        req: durust::provider::CompleteActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CompleteActivityOutcome>>;
     fn complete_activity_tasks(
         &self,
-        req: durust::CompleteActivityTasksRequest,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::CompleteActivityTaskBatchResult>>>;
+        req: durust::provider::CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::CompleteActivityTaskBatchResult>>>;
     fn fail_activity(
         &self,
-        req: durust::FailActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>>;
+        req: durust::provider::FailActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FailActivityOutcome>>;
     fn heartbeat_activity(
         &self,
-        req: durust::ActivityHeartbeatRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>>;
+        req: durust::provider::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ActivityHeartbeatOutcome>>;
     fn fire_due_timers(
         &self,
-        req: durust::FireDueTimersRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>>;
+        req: durust::provider::FireDueTimersRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FireDueTimersOutcome>>;
     fn timeout_due_activities(
         &self,
-        req: durust::TimeoutDueActivitiesRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>>;
+        req: durust::provider::TimeoutDueActivitiesRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::TimeoutDueActivitiesOutcome>>;
     fn signal_workflow(
         &self,
-        req: durust::SignalWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>>;
+        req: durust::provider::SignalWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::SignalWorkflowOutcome>>;
     fn read_signal_inbox(
         &self,
-        req: durust::ReadSignalInboxRequest,
+        req: durust::provider::ReadSignalInboxRequest,
     ) -> BoxFuture<'static, durust::Result<Option<SignalInboxRecord>>>;
     fn query_projection(
         &self,
-        req: durust::QueryProjectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>>;
-    fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>>;
+        req: durust::provider::QueryProjectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::QueryProjectionOutcome>>;
+    fn payload_roots(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadRootsOutcome>>;
     fn gc_payload_blobs(
         &self,
-        req: durust::PayloadGarbageCollectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>>;
+        req: durust::provider::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadGarbageCollectionOutcome>>;
     /// Every undelivered signal of a run, one per signal name in arrival
     /// order: the snapshot a claimed workflow task carries in the TypeScript
     /// contract.
@@ -115,8 +117,8 @@ trait Provider: Send + Sync {
     /// every offloaded payload inline.
     fn hydrate_claim(
         &self,
-        task: durust::ClaimedWorkflowTask,
-    ) -> BoxFuture<'static, durust::Result<durust::ClaimedWorkflowTask>>;
+        task: durust::provider::ClaimedWorkflowTask,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ClaimedWorkflowTask>>;
 }
 
 /// The calls outside the `DurableBackend` trait that each concrete provider
@@ -130,8 +132,8 @@ trait ProviderExtras {
     fn destroy(&self) -> BoxFuture<'static, durust::Result<()>>;
     fn hydrate_claim(
         &self,
-        task: durust::ClaimedWorkflowTask,
-    ) -> BoxFuture<'static, durust::Result<durust::ClaimedWorkflowTask>> {
+        task: durust::provider::ClaimedWorkflowTask,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ClaimedWorkflowTask>> {
         Box::pin(ready(Ok(task)))
     }
 }
@@ -206,11 +208,11 @@ where
 
     fn hydrate_claim(
         &self,
-        task: durust::ClaimedWorkflowTask,
-    ) -> BoxFuture<'static, durust::Result<durust::ClaimedWorkflowTask>> {
+        task: durust::provider::ClaimedWorkflowTask,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ClaimedWorkflowTask>> {
         let hydrated = self.hydrate_history_events(task.prefetched_history);
         Box::pin(async move {
-            Ok(durust::ClaimedWorkflowTask {
+            Ok(durust::provider::ClaimedWorkflowTask {
                 prefetched_history: hydrated.await?,
                 ..task
             })
@@ -228,46 +230,46 @@ where
 
     fn start_workflow(
         &self,
-        req: durust::StartWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::StartWorkflowOutcome>> {
+        req: durust::provider::StartWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::StartWorkflowOutcome>> {
         DurableBackend::start_workflow(self, req)
     }
 
     fn claim_workflow_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTaskOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTaskOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedWorkflowTask>>> {
         DurableBackend::claim_workflow_task(self, worker_id, opts)
     }
 
     fn claim_workflow_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedWorkflowTask>>> {
         DurableBackend::claim_workflow_tasks(self, worker_id, opts)
     }
 
     fn stream_history(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>> {
         DurableBackend::stream_history(self, req)
     }
 
     fn commit_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        commit: durust::WorkflowTaskCommit,
+        claim: durust::provider::WorkflowTaskClaim,
+        commit: durust::provider::WorkflowTaskCommit,
     ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         DurableBackend::commit_workflow_task(self, claim, commit)
     }
 
     fn release_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        release: durust::WorkflowTaskRelease,
+        claim: durust::provider::WorkflowTaskClaim,
+        release: durust::provider::WorkflowTaskRelease,
     ) -> BoxFuture<'static, durust::Result<()>> {
         DurableBackend::release_workflow_task(self, claim, release)
     }
@@ -275,90 +277,93 @@ where
     fn claim_activity_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>> {
+        opts: durust::provider::ClaimActivityOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedActivityTask>>> {
         DurableBackend::claim_activity_task(self, worker_id, opts)
     }
 
     fn claim_activity_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedActivityTask>>> {
+        opts: durust::provider::ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedActivityTask>>> {
         DurableBackend::claim_activity_tasks(self, worker_id, opts)
     }
 
     fn complete_activity(
         &self,
-        req: durust::CompleteActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
+        req: durust::provider::CompleteActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CompleteActivityOutcome>> {
         DurableBackend::complete_activity(self, req)
     }
 
     fn complete_activity_tasks(
         &self,
-        req: durust::CompleteActivityTasksRequest,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::CompleteActivityTaskBatchResult>>> {
+        req: durust::provider::CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::CompleteActivityTaskBatchResult>>>
+    {
         DurableBackend::complete_activity_tasks(self, req)
     }
 
     fn fail_activity(
         &self,
-        req: durust::FailActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
+        req: durust::provider::FailActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FailActivityOutcome>> {
         DurableBackend::fail_activity(self, req)
     }
 
     fn heartbeat_activity(
         &self,
-        req: durust::ActivityHeartbeatRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>> {
+        req: durust::provider::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ActivityHeartbeatOutcome>> {
         DurableBackend::heartbeat_activity(self, req)
     }
 
     fn fire_due_timers(
         &self,
-        req: durust::FireDueTimersRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>> {
+        req: durust::provider::FireDueTimersRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FireDueTimersOutcome>> {
         DurableBackend::fire_due_timers(self, req)
     }
 
     fn timeout_due_activities(
         &self,
-        req: durust::TimeoutDueActivitiesRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>> {
+        req: durust::provider::TimeoutDueActivitiesRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::TimeoutDueActivitiesOutcome>> {
         DurableBackend::timeout_due_activities(self, req)
     }
 
     fn signal_workflow(
         &self,
-        req: durust::SignalWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>> {
+        req: durust::provider::SignalWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::SignalWorkflowOutcome>> {
         DurableBackend::signal_workflow(self, req)
     }
 
     fn read_signal_inbox(
         &self,
-        req: durust::ReadSignalInboxRequest,
+        req: durust::provider::ReadSignalInboxRequest,
     ) -> BoxFuture<'static, durust::Result<Option<SignalInboxRecord>>> {
         DurableBackend::read_signal_inbox(self, req)
     }
 
     fn query_projection(
         &self,
-        req: durust::QueryProjectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
+        req: durust::provider::QueryProjectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::QueryProjectionOutcome>> {
         DurableBackend::query_projection(self, req)
     }
 
-    fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>> {
+    fn payload_roots(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadRootsOutcome>> {
         DurableBackend::payload_roots(self)
     }
 
     fn gc_payload_blobs(
         &self,
-        req: durust::PayloadGarbageCollectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
+        req: durust::provider::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadGarbageCollectionOutcome>> {
         DurableBackend::gc_payload_blobs(self, req)
     }
 
@@ -375,8 +380,8 @@ where
 
     fn hydrate_claim(
         &self,
-        task: durust::ClaimedWorkflowTask,
-    ) -> BoxFuture<'static, durust::Result<durust::ClaimedWorkflowTask>> {
+        task: durust::provider::ClaimedWorkflowTask,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ClaimedWorkflowTask>> {
         ProviderExtras::hydrate_claim(self, task)
     }
 }
@@ -437,10 +442,10 @@ const PREFETCH_MAX_BYTES: usize = 1 << 20;
 
 async fn with_prefetched_history(
     backend: &dyn Provider,
-    mut task: durust::ClaimedWorkflowTask,
-) -> durust::Result<durust::ClaimedWorkflowTask> {
+    mut task: durust::provider::ClaimedWorkflowTask,
+) -> durust::Result<durust::provider::ClaimedWorkflowTask> {
     if task.prefetched_history.is_empty() && task.replay_target_event_id.0 > 0 {
-        let req = durust::StreamHistoryRequest {
+        let req = durust::provider::StreamHistoryRequest {
             run_id: task.run_id.clone(),
             after_event_id: durust::EventId::ZERO,
             up_to_event_id: task.replay_target_event_id,
@@ -530,7 +535,7 @@ fn activity_error(err: durust::Error, activity_id: &str) -> Error {
 /// owns a virtual clock, and SQLite and Postgres take a caller-driven one.
 enum Clock {
     Memory(MemoryBackend),
-    Manual(durust::ProviderClock),
+    Manual(durust::provider::ProviderClock),
 }
 
 #[napi]
@@ -580,7 +585,7 @@ pub async fn connect_postgres(url: String, options: Option<Buffer>) -> Result<Na
     if let Some(ms) = options.lock_timeout_ms {
         config = config.lock_timeout(Duration::from_millis(ms));
     }
-    let clock = durust::ProviderClock::manual(durust::TimestampMs(0));
+    let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(0));
     let backend = PostgresBackend::connect_with_config(config.clock(clock.clone()))
         .await
         .map_err(|err| provider_error(err, false))?;
@@ -608,7 +613,7 @@ impl NativeBackend {
     #[napi(factory)]
     pub fn sqlite(path: String, options: Option<Buffer>) -> Result<Self> {
         let options: wire::BackendOptions = decode_options(options)?;
-        let clock = durust::ProviderClock::manual(durust::TimestampMs(0));
+        let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(0));
         let backend = SqliteBackend::open_with_clock(
             path,
             durust::PayloadStorageConfig::default(),
@@ -941,23 +946,23 @@ impl NativeBackend {
         let mut roots = Vec::with_capacity(outcome.roots.len());
         for root in outcome.roots {
             match root {
-                durust::PayloadRootRef::Payload(payload) => roots.push(payload),
-                durust::PayloadRootRef::ActivityMapInputManifest(manifest) => {
+                durust::provider::PayloadRootRef::Payload(payload) => roots.push(payload),
+                durust::provider::PayloadRootRef::ActivityMapInputManifest(manifest) => {
                     push_manifest_roots::<
-                        durust::ActivityMapInputManifest,
-                        durust::ActivityMapInputPage,
+                        durust::provider::ActivityMapInputManifest,
+                        durust::provider::ActivityMapInputPage,
                     >(manifest, |m| &m.pages, |page| page.items, &mut roots)
                 }
-                durust::PayloadRootRef::ActivityMapResultManifest(manifest) => {
+                durust::provider::PayloadRootRef::ActivityMapResultManifest(manifest) => {
                     push_manifest_roots::<
-                        durust::ActivityMapResultManifest,
-                        durust::ActivityMapResultPage,
+                        durust::provider::ActivityMapResultManifest,
+                        durust::provider::ActivityMapResultPage,
                     >(manifest, |m| &m.pages, |page| page.results, &mut roots)
                 }
-                durust::PayloadRootRef::ChildWorkflowMapResultManifest(manifest) => {
+                durust::provider::PayloadRootRef::ChildWorkflowMapResultManifest(manifest) => {
                     push_manifest_roots::<
-                        durust::ChildWorkflowMapResultManifest,
-                        durust::ChildWorkflowMapResultPage,
+                        durust::provider::ChildWorkflowMapResultManifest,
+                        durust::provider::ChildWorkflowMapResultPage,
                     >(
                         manifest,
                         |m| &m.pages,
@@ -965,13 +970,15 @@ impl NativeBackend {
                             page.outcomes
                                 .into_iter()
                                 .filter_map(|outcome| match outcome {
-                                    durust::ChildWorkflowMapItemOutcome::Succeeded { result } => {
-                                        Some(result)
-                                    }
-                                    durust::ChildWorkflowMapItemOutcome::Failed { failure } => {
-                                        failure.details
-                                    }
-                                    durust::ChildWorkflowMapItemOutcome::Cancelled { .. } => None,
+                                    durust::provider::ChildWorkflowMapItemOutcome::Succeeded {
+                                        result,
+                                    } => Some(result),
+                                    durust::provider::ChildWorkflowMapItemOutcome::Failed {
+                                        failure,
+                                    } => failure.details,
+                                    durust::provider::ChildWorkflowMapItemOutcome::Cancelled {
+                                        ..
+                                    } => None,
                                 })
                                 .collect()
                         },
