@@ -244,15 +244,22 @@ pub(crate) fn commit_has_workflow_visible_mutations(commit: &WorkflowTaskCommit)
 /// ready. A child start/failure event appended by the same commit keeps its
 /// specific reason; otherwise a still-consumable signal matching a live signal
 /// wait re-marks the run so a delivery racing the claim window is not lost.
+/// `unobserved_fact_reason` is the run's standing wake reason when facts landed
+/// under this task's claim — the run's tail moved past the one the claim handed
+/// the worker as its replay target.
+/// Keeping it is what stops a commit from clearing the readiness an activity
+/// result, fired timer, or child terminal set while the task was held.
 pub(crate) fn post_commit_ready_reason(
     terminal_after_commit: bool,
     same_commit_child_reason: Option<WorkflowTaskReason>,
     signal_wait_ready: bool,
+    unobserved_fact_reason: Option<WorkflowTaskReason>,
 ) -> Option<WorkflowTaskReason> {
     if terminal_after_commit {
         return None;
     }
     same_commit_child_reason
+        .or(unobserved_fact_reason)
         .or_else(|| signal_wait_ready.then_some(WorkflowTaskReason::SignalReceived))
 }
 
@@ -551,20 +558,15 @@ pub(crate) fn parent_close_policy_to_str(policy: ParentClosePolicy) -> &'static 
 #[cfg(test)]
 pub(crate) mod commit_test_support {
     use crate::{
-        CommandId, EventId, HistoryEventData, ParentClosePolicy, RunId, WaitKind,
-        WorkflowTaskCommit,
+        CommandId, HistoryEventData, ParentClosePolicy, RunId, WaitKind, WorkflowTaskCommit,
     };
 
-    pub(crate) fn mutating_commits(
-        run_id: &RunId,
-        expected_tail_event_id: EventId,
-    ) -> Vec<(&'static str, WorkflowTaskCommit)> {
+    pub(crate) fn mutating_commits(run_id: &RunId) -> Vec<(&'static str, WorkflowTaskCommit)> {
         let command_id = CommandId {
             run_id: run_id.clone(),
             seq: crate::CommandSeq(900),
         };
         let base = WorkflowTaskCommit {
-            expected_tail_event_id,
             ..WorkflowTaskCommit::default()
         };
         vec![
@@ -1001,8 +1003,7 @@ mod tests {
         assert!(!commit_has_workflow_visible_mutations(
             &WorkflowTaskCommit::default()
         ));
-        let commits =
-            commit_test_support::mutating_commits(&crate::RunId::new("run"), crate::EventId::ZERO);
+        let commits = commit_test_support::mutating_commits(&crate::RunId::new("run"));
         assert_eq!(commits.len(), 10, "one catalog entry per mutation kind");
         for (kind, commit) in commits {
             assert!(
@@ -1018,18 +1019,47 @@ mod tests {
         // its specific reason, and a consumable signal fills the gap so a
         // delivery racing the claim window cannot be lost.
         assert_eq!(
-            post_commit_ready_reason(true, Some(WorkflowTaskReason::ChildWorkflowStarted), true),
+            post_commit_ready_reason(
+                true,
+                Some(WorkflowTaskReason::ChildWorkflowStarted),
+                true,
+                None
+            ),
             None
         );
         assert_eq!(
-            post_commit_ready_reason(false, Some(WorkflowTaskReason::ChildWorkflowStarted), true),
+            post_commit_ready_reason(
+                false,
+                Some(WorkflowTaskReason::ChildWorkflowStarted),
+                true,
+                None
+            ),
             Some(WorkflowTaskReason::ChildWorkflowStarted)
         );
         assert_eq!(
-            post_commit_ready_reason(false, None, true),
+            post_commit_ready_reason(false, None, true, None),
             Some(WorkflowTaskReason::SignalReceived)
         );
-        assert_eq!(post_commit_ready_reason(false, None, false), None);
+        assert_eq!(post_commit_ready_reason(false, None, false, None), None);
+        // A fact that landed under the claim keeps the run ready.
+        assert_eq!(
+            post_commit_ready_reason(
+                false,
+                None,
+                false,
+                Some(WorkflowTaskReason::ActivityCompleted)
+            ),
+            Some(WorkflowTaskReason::ActivityCompleted)
+        );
+        assert_eq!(
+            post_commit_ready_reason(
+                true,
+                None,
+                false,
+                Some(WorkflowTaskReason::ActivityCompleted)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -1176,6 +1206,146 @@ mod tests {
             start_to_close_timeout: None,
             heartbeat_timeout: None,
             map_item: None,
+        }
+    }
+}
+
+/// Payload hydration that does not depend on where the bytes live.
+///
+/// A provider owns exactly one primitive — resolve this ref to inline bytes if
+/// I own its URI — and the walks over manifests, pages, and history events are
+/// the same whichever provider supplies it. They were written once per
+/// provider before this module existed.
+///
+/// Sync by construction, which is why the Postgres provider still carries its
+/// own copies: its resolver is `async` and these walks cannot await. Giving
+/// them async twins would retire that copy too, and is the remaining half of
+/// this de-duplication.
+pub(crate) mod hydrate {
+    use crate::{
+        ChildWorkflowMapItemOutcome, ChildWorkflowMapResultManifest, ChildWorkflowMapResultPage,
+        HistoryEventData, PayloadRef, Result,
+    };
+
+    /// Resolves an offloaded ref to inline bytes, leaving refs the provider
+    /// does not own untouched.
+    pub(crate) trait Resolve: Fn(PayloadRef) -> Result<PayloadRef> {}
+    impl<F> Resolve for F where F: Fn(PayloadRef) -> Result<PayloadRef> {}
+
+    pub(crate) fn activity_map_input_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let mut load_container = |payload| resolve(payload);
+        let mut map_leaf = |payload| resolve(payload);
+        crate::payload::map_activity_map_input_manifest_ref(
+            payload,
+            &mut load_container,
+            &mut map_leaf,
+            &mut Ok,
+        )
+    }
+
+    pub(crate) fn activity_map_result_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let mut load_container = |payload| resolve(payload);
+        let mut map_leaf = |payload| resolve(payload);
+        crate::payload::map_activity_map_result_manifest_ref(
+            payload,
+            &mut load_container,
+            &mut map_leaf,
+            &mut Ok,
+        )
+    }
+
+    pub(crate) fn child_workflow_map_outcome(
+        resolve: &impl Resolve,
+        outcome: ChildWorkflowMapItemOutcome,
+    ) -> Result<ChildWorkflowMapItemOutcome> {
+        match outcome {
+            ChildWorkflowMapItemOutcome::Succeeded { result } => {
+                Ok(ChildWorkflowMapItemOutcome::Succeeded {
+                    result: resolve(result)?,
+                })
+            }
+            ChildWorkflowMapItemOutcome::Failed { mut failure } => {
+                if let Some(details) = failure.details.take() {
+                    failure.details = Some(resolve(details)?);
+                }
+                Ok(ChildWorkflowMapItemOutcome::Failed { failure })
+            }
+            ChildWorkflowMapItemOutcome::Cancelled { reason } => {
+                Ok(ChildWorkflowMapItemOutcome::Cancelled { reason })
+            }
+        }
+    }
+
+    pub(crate) fn child_workflow_map_result_manifest(
+        resolve: &impl Resolve,
+        payload: PayloadRef,
+    ) -> Result<PayloadRef> {
+        let root = resolve(payload)?;
+        let mut manifest: ChildWorkflowMapResultManifest = crate::decode_payload(&root)?;
+        manifest.pages = manifest
+            .pages
+            .into_iter()
+            .map(|page| {
+                let page = resolve(page)?;
+                let mut page: ChildWorkflowMapResultPage = crate::decode_payload(&page)?;
+                page.outcomes = page
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| child_workflow_map_outcome(resolve, outcome))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::encode_payload_with_codec(&page, root.codec())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        crate::encode_payload_with_codec(&manifest, root.codec())
+    }
+
+    /// `is_external` reports a ref the provider does not own, which it leaves
+    /// for whichever layer does — a manifest root stored inline can still hold
+    /// pages in someone else's blob store.
+    pub(crate) fn history_event(
+        is_external: &impl Fn(&PayloadRef) -> bool,
+        resolve: &impl Resolve,
+        data: HistoryEventData,
+    ) -> Result<HistoryEventData> {
+        match data {
+            HistoryEventData::ActivityMapScheduled(mut scheduled) => {
+                if !is_external(&scheduled.input_manifest) {
+                    scheduled.input_manifest =
+                        activity_map_input_manifest(resolve, scheduled.input_manifest)?;
+                }
+                Ok(HistoryEventData::ActivityMapScheduled(scheduled))
+            }
+            HistoryEventData::ActivityMapCompleted(mut completed) => {
+                if !is_external(&completed.result_manifest) {
+                    completed.result_manifest =
+                        activity_map_result_manifest(resolve, completed.result_manifest)?;
+                }
+                Ok(HistoryEventData::ActivityMapCompleted(completed))
+            }
+            HistoryEventData::ChildWorkflowMapScheduled(mut scheduled) => {
+                if !is_external(&scheduled.input_manifest) {
+                    scheduled.input_manifest =
+                        activity_map_input_manifest(resolve, scheduled.input_manifest)?;
+                }
+                Ok(HistoryEventData::ChildWorkflowMapScheduled(scheduled))
+            }
+            HistoryEventData::ChildWorkflowMapCompleted(mut completed) => {
+                if !is_external(&completed.result_manifest) {
+                    completed.result_manifest =
+                        child_workflow_map_result_manifest(resolve, completed.result_manifest)?;
+                }
+                Ok(HistoryEventData::ChildWorkflowMapCompleted(completed))
+            }
+            data => {
+                let mut map_payload = |payload| resolve(payload);
+                crate::payload::map_history_event_payloads(data, &mut map_payload)
+            }
         }
     }
 }

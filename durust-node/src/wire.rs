@@ -36,7 +36,7 @@ impl From<&durust::CommandId> for CommandId {
 
 impl From<CommandId> for durust::CommandId {
     fn from(id: CommandId) -> Self {
-        durust::command_id(&durust::RunId::new(id.run_id), id.seq)
+        durust::provider::command_id(&durust::RunId::new(id.run_id), id.seq)
     }
 }
 
@@ -73,14 +73,14 @@ pub type RetryPolicy = durust::RetryPolicy;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandFingerprint {
-    pub kind: durust::CommandKind,
+    pub kind: durust::provider::CommandKind,
     pub name: String,
     pub input_digest: Option<String>,
     pub options_digest: String,
 }
 
-impl From<&durust::CommandFingerprint> for CommandFingerprint {
-    fn from(value: &durust::CommandFingerprint) -> Self {
+impl From<&durust::provider::CommandFingerprint> for CommandFingerprint {
+    fn from(value: &durust::provider::CommandFingerprint) -> Self {
         Self {
             kind: value.kind,
             name: value.name.clone(),
@@ -90,9 +90,9 @@ impl From<&durust::CommandFingerprint> for CommandFingerprint {
     }
 }
 
-impl From<CommandFingerprint> for durust::CommandFingerprint {
+impl From<CommandFingerprint> for durust::provider::CommandFingerprint {
     fn from(value: CommandFingerprint) -> Self {
-        durust::CommandFingerprint {
+        durust::provider::CommandFingerprint {
             kind: value.kind,
             name: value.name,
             input_digest: value.input_digest,
@@ -170,7 +170,7 @@ pub struct ChildWorkflowStartRequested {
     pub workflow_id: String,
     pub task_queue: String,
     pub input: PayloadRef,
-    pub parent_close_policy: durust::ParentClosePolicy,
+    pub parent_close_policy: durust::provider::ParentClosePolicy,
     pub fingerprint: CommandFingerprint,
 }
 
@@ -199,8 +199,8 @@ pub struct ChildWorkflowMapScheduled {
     pub result_manifest_name: String,
     pub workflow_id_prefix: String,
     pub max_in_flight: u64,
-    pub parent_close_policy: durust::ParentClosePolicy,
-    pub failure_mode: durust::ChildWorkflowMapFailureMode,
+    pub parent_close_policy: durust::provider::ParentClosePolicy,
+    pub failure_mode: durust::provider::ChildWorkflowMapFailureMode,
     pub fingerprint: CommandFingerprint,
 }
 
@@ -245,7 +245,6 @@ pub struct SignalConsumed {
 pub struct SelectWinner {
     pub select_command_id: CommandId,
     pub branch_ordinal: u32,
-    pub winning_event_id: u64,
     pub branches_digest: String,
 }
 
@@ -409,9 +408,9 @@ fn result(command_id: &durust::CommandId, result: durust::PayloadRef) -> Command
     }
 }
 
-impl From<durust::HistoryEventData> for HistoryEventData {
-    fn from(data: durust::HistoryEventData) -> Self {
-        use durust::HistoryEventData as R;
+impl From<durust::provider::HistoryEventData> for HistoryEventData {
+    fn from(data: durust::provider::HistoryEventData) -> Self {
+        use durust::provider::HistoryEventData as R;
         match data {
             R::WorkflowStarted {
                 workflow_type,
@@ -558,7 +557,6 @@ impl From<durust::HistoryEventData> for HistoryEventData {
                 winner: SelectWinner {
                     select_command_id: (&w.select_command_id).into(),
                     branch_ordinal: w.branch_ordinal,
-                    winning_event_id: w.winning_event_id.0,
                     branches_digest: w.branches_digest,
                 },
             },
@@ -586,9 +584,9 @@ impl From<durust::HistoryEventData> for HistoryEventData {
     }
 }
 
-impl From<HistoryEventData> for durust::HistoryEventData {
+impl From<HistoryEventData> for durust::provider::HistoryEventData {
     fn from(data: HistoryEventData) -> Self {
-        use durust::HistoryEventData as R;
+        use durust::provider::HistoryEventData as R;
         match data {
             HistoryEventData::WorkflowStarted {
                 workflow_type,
@@ -605,7 +603,7 @@ impl From<HistoryEventData> for durust::HistoryEventData {
             }
             HistoryEventData::WorkflowTaskStarted => R::WorkflowTaskStarted,
             HistoryEventData::ActivityScheduled { scheduled: s } => {
-                R::ActivityScheduled(durust::ActivityScheduled {
+                R::ActivityScheduled(durust::provider::ActivityScheduled {
                     command_id: s.command_id.into(),
                     activity_name: durust::ActivityName::new(s.activity_name),
                     task_queue: durust::TaskQueue::new(s.task_queue),
@@ -617,7 +615,7 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 })
             }
             HistoryEventData::ActivityMapScheduled { scheduled: s } => {
-                R::ActivityMapScheduled(durust::ActivityMapScheduled {
+                R::ActivityMapScheduled(durust::provider::ActivityMapScheduled {
                     command_id: s.command_id.into(),
                     activity_name: durust::ActivityName::new(s.activity_name),
                     task_queue: durust::TaskQueue::new(s.task_queue),
@@ -631,7 +629,7 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 })
             }
             HistoryEventData::ActivityMapCompleted { completed: c } => {
-                R::ActivityMapCompleted(durust::ActivityMapCompleted {
+                R::ActivityMapCompleted(durust::provider::ActivityMapCompleted {
                     command_id: c.command_id.into(),
                     result_manifest: c.result_manifest,
                     item_count: c.item_count as usize,
@@ -640,25 +638,25 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 })
             }
             HistoryEventData::ActivityMapFailed { failed: f } => {
-                R::ActivityMapFailed(durust::ActivityMapFailed {
+                R::ActivityMapFailed(durust::provider::ActivityMapFailed {
                     command_id: f.command_id.into(),
                     failure: f.failure,
                 })
             }
             HistoryEventData::ActivityCompleted { completed: c } => {
-                R::ActivityCompleted(durust::ActivityCompleted {
+                R::ActivityCompleted(durust::provider::ActivityCompleted {
                     command_id: c.command_id.into(),
                     result: c.result,
                 })
             }
             HistoryEventData::ActivityFailed { failed: f } => {
-                R::ActivityFailed(durust::ActivityFailed {
+                R::ActivityFailed(durust::provider::ActivityFailed {
                     command_id: f.command_id.into(),
                     failure: f.failure,
                 })
             }
             HistoryEventData::ActivityTimedOut { timed_out: t } => {
-                R::ActivityTimedOut(durust::ActivityTimedOut {
+                R::ActivityTimedOut(durust::provider::ActivityTimedOut {
                     command_id: t.command_id.into(),
                     message: t.message,
                 })
@@ -667,32 +665,32 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 R::ChildWorkflowStartRequested(r.into())
             }
             HistoryEventData::ChildWorkflowStarted { started: s } => {
-                R::ChildWorkflowStarted(durust::ChildWorkflowStarted {
+                R::ChildWorkflowStarted(durust::provider::ChildWorkflowStarted {
                     command_id: s.command_id.into(),
                     workflow_id: durust::WorkflowId::new(s.workflow_id),
                     run_id: durust::RunId::new(s.run_id),
                 })
             }
             HistoryEventData::ChildWorkflowCompleted { completed: c } => {
-                R::ChildWorkflowCompleted(durust::ChildWorkflowCompleted {
+                R::ChildWorkflowCompleted(durust::provider::ChildWorkflowCompleted {
                     command_id: c.command_id.into(),
                     result: c.result,
                 })
             }
             HistoryEventData::ChildWorkflowFailed { failed: f } => {
-                R::ChildWorkflowFailed(durust::ChildWorkflowFailed {
+                R::ChildWorkflowFailed(durust::provider::ChildWorkflowFailed {
                     command_id: f.command_id.into(),
                     failure: f.failure,
                 })
             }
             HistoryEventData::ChildWorkflowCancelled { cancelled: c } => {
-                R::ChildWorkflowCancelled(durust::ChildWorkflowCancelled {
+                R::ChildWorkflowCancelled(durust::provider::ChildWorkflowCancelled {
                     command_id: c.command_id.into(),
                     reason: c.reason,
                 })
             }
             HistoryEventData::ChildWorkflowMapScheduled { scheduled: s } => {
-                R::ChildWorkflowMapScheduled(durust::ChildWorkflowMapScheduled {
+                R::ChildWorkflowMapScheduled(durust::provider::ChildWorkflowMapScheduled {
                     command_id: s.command_id.into(),
                     workflow_type: s.workflow_type.into(),
                     task_queue: durust::TaskQueue::new(s.task_queue),
@@ -706,7 +704,7 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 })
             }
             HistoryEventData::ChildWorkflowMapCompleted { completed: c } => {
-                R::ChildWorkflowMapCompleted(durust::ChildWorkflowMapCompleted {
+                R::ChildWorkflowMapCompleted(durust::provider::ChildWorkflowMapCompleted {
                     command_id: c.command_id.into(),
                     result_manifest: c.result_manifest,
                     item_count: c.item_count as usize,
@@ -716,24 +714,26 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                 })
             }
             HistoryEventData::ChildWorkflowMapFailed { failed: f } => {
-                R::ChildWorkflowMapFailed(durust::ChildWorkflowMapFailed {
+                R::ChildWorkflowMapFailed(durust::provider::ChildWorkflowMapFailed {
                     command_id: f.command_id.into(),
                     failure: f.failure,
                 })
             }
             HistoryEventData::TimerStarted { started: t } => {
-                R::TimerStarted(durust::TimerStarted {
+                R::TimerStarted(durust::provider::TimerStarted {
                     command_id: t.command_id.into(),
                     fire_at: durust::TimestampMs(t.fire_at),
                     fingerprint: t.fingerprint.into(),
                 })
             }
-            HistoryEventData::TimerFired { fired: t } => R::TimerFired(durust::TimerFired {
-                command_id: t.command_id.into(),
-                fired_at: durust::TimestampMs(t.fired_at),
-            }),
+            HistoryEventData::TimerFired { fired: t } => {
+                R::TimerFired(durust::provider::TimerFired {
+                    command_id: t.command_id.into(),
+                    fired_at: durust::TimestampMs(t.fired_at),
+                })
+            }
             HistoryEventData::SignalConsumed { consumed: s } => {
-                R::SignalConsumed(durust::SignalConsumed {
+                R::SignalConsumed(durust::provider::SignalConsumed {
                     command_id: s.command_id.into(),
                     signal_id: durust::SignalId::new(s.signal_id),
                     signal_name: durust::SignalName::new(s.signal_name),
@@ -741,27 +741,28 @@ impl From<HistoryEventData> for durust::HistoryEventData {
                     fingerprint: s.fingerprint.into(),
                 })
             }
-            HistoryEventData::SelectWinner { winner: w } => R::SelectWinner(durust::SelectWinner {
-                select_command_id: w.select_command_id.into(),
-                branch_ordinal: w.branch_ordinal,
-                winning_event_id: durust::EventId(w.winning_event_id),
-                branches_digest: w.branches_digest,
-            }),
+            HistoryEventData::SelectWinner { winner: w } => {
+                R::SelectWinner(durust::provider::SelectWinner {
+                    select_command_id: w.select_command_id.into(),
+                    branch_ordinal: w.branch_ordinal,
+                    branches_digest: w.branches_digest,
+                })
+            }
             HistoryEventData::VersionMarker { marker: m } => {
-                R::VersionMarker(durust::VersionMarker {
+                R::VersionMarker(durust::provider::VersionMarker {
                     command_id: m.command_id.into(),
                     change_id: m.change_id,
                     version: m.version,
                 })
             }
             HistoryEventData::DeprecatedPatchMarker { marker: m } => {
-                R::DeprecatedPatchMarker(durust::DeprecatedPatchMarker {
+                R::DeprecatedPatchMarker(durust::provider::DeprecatedPatchMarker {
                     command_id: m.command_id.into(),
                     patch_id: m.patch_id,
                 })
             }
             HistoryEventData::SideEffectMarker { marker: m } => {
-                R::SideEffectMarker(durust::SideEffectMarker {
+                R::SideEffectMarker(durust::provider::SideEffectMarker {
                     command_id: m.command_id.into(),
                     key: m.key,
                     value: m.value,
@@ -771,9 +772,9 @@ impl From<HistoryEventData> for durust::HistoryEventData {
     }
 }
 
-impl From<ChildWorkflowStartRequested> for durust::ChildWorkflowStartRequested {
+impl From<ChildWorkflowStartRequested> for durust::provider::ChildWorkflowStartRequested {
     fn from(r: ChildWorkflowStartRequested) -> Self {
-        durust::ChildWorkflowStartRequested {
+        durust::provider::ChildWorkflowStartRequested {
             command_id: r.command_id.into(),
             workflow_type: r.workflow_type.into(),
             workflow_id: durust::WorkflowId::new(r.workflow_id),
@@ -793,8 +794,8 @@ pub struct HistoryEvent {
     pub data: HistoryEventData,
 }
 
-impl From<durust::HistoryEvent> for HistoryEvent {
-    fn from(event: durust::HistoryEvent) -> Self {
+impl From<durust::provider::HistoryEvent> for HistoryEvent {
+    fn from(event: durust::provider::HistoryEvent) -> Self {
         let data = HistoryEventData::from(event.data);
         Self {
             event_id: event.event_id.0,
@@ -834,8 +835,8 @@ pub struct ActivityTask {
     pub map_item: Option<ActivityMapItem>,
 }
 
-impl From<durust::ActivityTask> for ActivityTask {
-    fn from(task: durust::ActivityTask) -> Self {
+impl From<durust::provider::ActivityTask> for ActivityTask {
+    fn from(task: durust::provider::ActivityTask) -> Self {
         Self {
             activity_id: task.activity_id.0,
             run_id: task.run_id.0,
@@ -855,9 +856,9 @@ impl From<durust::ActivityTask> for ActivityTask {
     }
 }
 
-impl From<ActivityTask> for durust::ActivityTask {
+impl From<ActivityTask> for durust::provider::ActivityTask {
     fn from(task: ActivityTask) -> Self {
-        durust::ActivityTask {
+        durust::provider::ActivityTask {
             activity_id: durust::ActivityId(task.activity_id),
             run_id: durust::RunId::new(task.run_id),
             command_id: task.command_id.into(),
@@ -868,7 +869,7 @@ impl From<ActivityTask> for durust::ActivityTask {
             heartbeat_timeout: ms_to_duration(task.heartbeat_timeout_ms),
             attempt: task.attempt,
             input: task.input,
-            map_item: task.map_item.map(|item| durust::ActivityMapItem {
+            map_item: task.map_item.map(|item| durust::provider::ActivityMapItem {
                 map_command_id: item.map_command_id.into(),
                 item_ordinal: item.item_ordinal,
             }),
@@ -890,9 +891,9 @@ pub struct ActivityMapTask {
     pub max_in_flight: u64,
 }
 
-impl From<ActivityMapTask> for durust::ActivityMapTask {
+impl From<ActivityMapTask> for durust::provider::ActivityMapTask {
     fn from(task: ActivityMapTask) -> Self {
-        durust::ActivityMapTask {
+        durust::provider::ActivityMapTask {
             map_command_id: task.map_command_id.into(),
             activity_name: durust::ActivityName::new(task.activity_name),
             task_queue: durust::TaskQueue::new(task.task_queue),
@@ -916,13 +917,13 @@ pub struct ChildWorkflowMapTask {
     pub result_manifest_name: String,
     pub workflow_id_prefix: String,
     pub max_in_flight: u64,
-    pub parent_close_policy: durust::ParentClosePolicy,
-    pub failure_mode: durust::ChildWorkflowMapFailureMode,
+    pub parent_close_policy: durust::provider::ParentClosePolicy,
+    pub failure_mode: durust::provider::ChildWorkflowMapFailureMode,
 }
 
-impl From<ChildWorkflowMapTask> for durust::ChildWorkflowMapTask {
+impl From<ChildWorkflowMapTask> for durust::provider::ChildWorkflowMapTask {
     fn from(task: ChildWorkflowMapTask) -> Self {
-        durust::ChildWorkflowMapTask {
+        durust::provider::ChildWorkflowMapTask {
             map_command_id: task.map_command_id.into(),
             workflow_type: task.workflow_type.into(),
             task_queue: durust::TaskQueue::new(task.task_queue),
@@ -942,14 +943,14 @@ pub struct WaitRecord {
     pub wait_id: String,
     pub run_id: String,
     pub command_id: CommandId,
-    pub kind: durust::WaitKind,
+    pub kind: durust::provider::WaitKind,
     pub key: String,
     pub ready_at: Option<i64>,
 }
 
-impl From<WaitRecord> for durust::WaitRecord {
+impl From<WaitRecord> for durust::provider::WaitRecord {
     fn from(wait: WaitRecord) -> Self {
-        durust::WaitRecord {
+        durust::provider::WaitRecord {
             wait_id: durust::WaitId::new(wait.wait_id),
             run_id: durust::RunId::new(wait.run_id),
             command_id: wait.command_id.into(),
@@ -972,9 +973,9 @@ pub struct StartWorkflowRequest {
     pub input: PayloadRef,
 }
 
-impl From<StartWorkflowRequest> for durust::StartWorkflowRequest {
+impl From<StartWorkflowRequest> for durust::provider::StartWorkflowRequest {
     fn from(req: StartWorkflowRequest) -> Self {
-        durust::StartWorkflowRequest {
+        durust::provider::StartWorkflowRequest {
             namespace: durust::Namespace::new(req.namespace),
             workflow_id: durust::WorkflowId::new(req.workflow_id),
             workflow_type: req.workflow_type.into(),
@@ -991,11 +992,13 @@ pub enum StartWorkflowOutcome {
     AlreadyStarted { run_id: String },
 }
 
-impl From<durust::StartWorkflowOutcome> for StartWorkflowOutcome {
-    fn from(outcome: durust::StartWorkflowOutcome) -> Self {
+impl From<durust::provider::StartWorkflowOutcome> for StartWorkflowOutcome {
+    fn from(outcome: durust::provider::StartWorkflowOutcome) -> Self {
         match outcome {
-            durust::StartWorkflowOutcome::Started { run_id } => Self::Started { run_id: run_id.0 },
-            durust::StartWorkflowOutcome::AlreadyStarted { run_id } => {
+            durust::provider::StartWorkflowOutcome::Started { run_id } => {
+                Self::Started { run_id: run_id.0 }
+            }
+            durust::provider::StartWorkflowOutcome::AlreadyStarted { run_id } => {
                 Self::AlreadyStarted { run_id: run_id.0 }
             }
         }
@@ -1011,9 +1014,9 @@ pub struct ClaimWorkflowTaskOptions {
     pub lease_duration_ms: u64,
 }
 
-impl From<ClaimWorkflowTaskOptions> for durust::ClaimWorkflowTaskOptions {
+impl From<ClaimWorkflowTaskOptions> for durust::provider::ClaimWorkflowTaskOptions {
     fn from(opts: ClaimWorkflowTaskOptions) -> Self {
-        durust::ClaimWorkflowTaskOptions {
+        durust::provider::ClaimWorkflowTaskOptions {
             namespace: durust::Namespace::new(opts.namespace),
             task_queue: durust::TaskQueue::new(opts.task_queue),
             registered_workflow_types: opts
@@ -1022,6 +1025,7 @@ impl From<ClaimWorkflowTaskOptions> for durust::ClaimWorkflowTaskOptions {
                 .map(Into::into)
                 .collect(),
             lease_duration: Duration::from_millis(opts.lease_duration_ms),
+            shard_filter: None,
         }
     }
 }
@@ -1036,9 +1040,9 @@ pub struct ClaimWorkflowBatchOptions {
     pub limit: u64,
 }
 
-impl From<ClaimWorkflowBatchOptions> for durust::ClaimWorkflowTasksOptions {
+impl From<ClaimWorkflowBatchOptions> for durust::provider::ClaimWorkflowTasksOptions {
     fn from(opts: ClaimWorkflowBatchOptions) -> Self {
-        durust::ClaimWorkflowTasksOptions {
+        durust::provider::ClaimWorkflowTasksOptions {
             claim: ClaimWorkflowTaskOptions {
                 namespace: opts.namespace,
                 task_queue: opts.task_queue,
@@ -1047,7 +1051,6 @@ impl From<ClaimWorkflowBatchOptions> for durust::ClaimWorkflowTasksOptions {
             }
             .into(),
             limit: opts.limit.max(1) as usize,
-            shard_filter: None,
         }
     }
 }
@@ -1060,8 +1063,8 @@ pub struct WorkflowTaskClaim {
     pub token: u64,
 }
 
-impl From<&durust::WorkflowTaskClaim> for WorkflowTaskClaim {
-    fn from(claim: &durust::WorkflowTaskClaim) -> Self {
+impl From<&durust::provider::WorkflowTaskClaim> for WorkflowTaskClaim {
+    fn from(claim: &durust::provider::WorkflowTaskClaim) -> Self {
         Self {
             run_id: claim.run_id.0.clone(),
             worker_id: claim.worker_id.0.clone(),
@@ -1070,9 +1073,9 @@ impl From<&durust::WorkflowTaskClaim> for WorkflowTaskClaim {
     }
 }
 
-impl From<WorkflowTaskClaim> for durust::WorkflowTaskClaim {
+impl From<WorkflowTaskClaim> for durust::provider::WorkflowTaskClaim {
     fn from(claim: WorkflowTaskClaim) -> Self {
-        durust::WorkflowTaskClaim {
+        durust::provider::WorkflowTaskClaim {
             run_id: durust::RunId::new(claim.run_id),
             worker_id: durust::WorkerId::new(claim.worker_id),
             token: claim.token,
@@ -1088,8 +1091,8 @@ pub struct SignalInboxRecord {
     pub payload: PayloadRef,
 }
 
-impl From<durust::SignalInboxRecord> for SignalInboxRecord {
-    fn from(record: durust::SignalInboxRecord) -> Self {
+impl From<durust::provider::SignalInboxRecord> for SignalInboxRecord {
+    fn from(record: durust::provider::SignalInboxRecord) -> Self {
         Self {
             signal_id: record.signal_id.0,
             signal_name: record.signal_name.0,
@@ -1106,15 +1109,15 @@ pub struct ClaimedWorkflowTask {
     pub workflow_type: WorkflowType,
     pub claim: WorkflowTaskClaim,
     pub replay_target_event_id: u64,
-    pub reason: durust::WorkflowTaskReason,
+    pub reason: durust::provider::WorkflowTaskReason,
     pub prefetched_history: Vec<HistoryEvent>,
     pub live_signals: Vec<SignalInboxRecord>,
 }
 
 impl ClaimedWorkflowTask {
     pub fn from_claimed(
-        task: durust::ClaimedWorkflowTask,
-        live_signals: Vec<durust::SignalInboxRecord>,
+        task: durust::provider::ClaimedWorkflowTask,
+        live_signals: Vec<durust::provider::SignalInboxRecord>,
     ) -> Self {
         Self {
             run_id: task.run_id.0,
@@ -1143,9 +1146,9 @@ pub struct StreamHistoryRequest {
     pub max_bytes: f64,
 }
 
-impl From<StreamHistoryRequest> for durust::StreamHistoryRequest {
+impl From<StreamHistoryRequest> for durust::provider::StreamHistoryRequest {
     fn from(req: StreamHistoryRequest) -> Self {
-        durust::StreamHistoryRequest {
+        durust::provider::StreamHistoryRequest {
             run_id: durust::RunId::new(req.run_id),
             after_event_id: durust::EventId(req.after_event_id),
             up_to_event_id: durust::EventId(req.up_to_event_id),
@@ -1163,8 +1166,8 @@ pub struct HistoryChunk {
     pub has_more: bool,
 }
 
-impl From<durust::HistoryChunk> for HistoryChunk {
-    fn from(chunk: durust::HistoryChunk) -> Self {
+impl From<durust::provider::HistoryChunk> for HistoryChunk {
+    fn from(chunk: durust::provider::HistoryChunk) -> Self {
         Self {
             events: chunk.events.into_iter().map(Into::into).collect(),
             last_event_id: chunk.last_event_id.0,
@@ -1176,7 +1179,6 @@ impl From<durust::HistoryChunk> for HistoryChunk {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowTaskCommit {
-    pub expected_tail_event_id: u64,
     #[serde(default)]
     pub append_events: Option<Vec<NewHistoryEvent>>,
     #[serde(default)]
@@ -1199,15 +1201,14 @@ pub struct WorkflowTaskCommit {
     pub query_projection: Option<PayloadRef>,
 }
 
-impl From<WorkflowTaskCommit> for durust::WorkflowTaskCommit {
+impl From<WorkflowTaskCommit> for durust::provider::WorkflowTaskCommit {
     fn from(commit: WorkflowTaskCommit) -> Self {
-        durust::WorkflowTaskCommit {
-            expected_tail_event_id: durust::EventId(commit.expected_tail_event_id),
+        durust::provider::WorkflowTaskCommit {
             append_events: commit
                 .append_events
                 .unwrap_or_default()
                 .into_iter()
-                .map(|event| durust::NewHistoryEvent::new(event.data.into()))
+                .map(|event| durust::provider::NewHistoryEvent::new(event.data.into()))
                 .collect(),
             upsert_waits: commit
                 .upsert_waits
@@ -1238,8 +1239,8 @@ impl From<WorkflowTaskCommit> for durust::WorkflowTaskCommit {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|requested| {
-                    durust::ChildStartOutboxMessage::from_requested(
-                        &durust::ChildWorkflowStartRequested::from(requested),
+                    durust::provider::ChildStartOutboxMessage::from_requested(
+                        &durust::provider::ChildWorkflowStartRequested::from(requested),
                     )
                 })
                 .collect(),
@@ -1266,24 +1267,6 @@ impl From<WorkflowTaskCommit> for durust::WorkflowTaskCommit {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all_fields = "camelCase")]
-pub enum CommitOutcome {
-    Committed { new_tail_event_id: u64 },
-    Conflict,
-}
-
-impl From<durust::CommitOutcome> for CommitOutcome {
-    fn from(outcome: durust::CommitOutcome) -> Self {
-        match outcome {
-            durust::CommitOutcome::Committed { new_tail_event_id } => Self::Committed {
-                new_tail_event_id: new_tail_event_id.0,
-            },
-            durust::CommitOutcome::Conflict => Self::Conflict,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseWorkflowTaskOptions {
@@ -1291,9 +1274,9 @@ pub struct ReleaseWorkflowTaskOptions {
     pub visibility_delay_ms: Option<u64>,
 }
 
-impl From<ReleaseWorkflowTaskOptions> for durust::WorkflowTaskRelease {
+impl From<ReleaseWorkflowTaskOptions> for durust::provider::WorkflowTaskRelease {
     fn from(options: ReleaseWorkflowTaskOptions) -> Self {
-        durust::WorkflowTaskRelease::delayed(Duration::from_millis(
+        durust::provider::WorkflowTaskRelease::delayed(Duration::from_millis(
             options.visibility_delay_ms.unwrap_or(0),
         ))
     }
@@ -1308,9 +1291,9 @@ pub struct ClaimActivityOptions {
     pub lease_duration_ms: u64,
 }
 
-impl From<ClaimActivityOptions> for durust::ClaimActivityOptions {
+impl From<ClaimActivityOptions> for durust::provider::ClaimActivityOptions {
     fn from(opts: ClaimActivityOptions) -> Self {
-        durust::ClaimActivityOptions {
+        durust::provider::ClaimActivityOptions {
             namespace: durust::Namespace::new(opts.namespace),
             task_queue: durust::TaskQueue::new(opts.task_queue),
             registered_activity_names: opts
@@ -1333,9 +1316,9 @@ pub struct ClaimActivityBatchOptions {
     pub limit: u64,
 }
 
-impl From<ClaimActivityBatchOptions> for durust::ClaimActivityTasksOptions {
+impl From<ClaimActivityBatchOptions> for durust::provider::ClaimActivityTasksOptions {
     fn from(opts: ClaimActivityBatchOptions) -> Self {
-        durust::ClaimActivityTasksOptions {
+        durust::provider::ClaimActivityTasksOptions {
             claim: ClaimActivityOptions {
                 namespace: opts.namespace,
                 task_queue: opts.task_queue,
@@ -1356,8 +1339,8 @@ pub struct ActivityTaskClaim {
     pub token: u64,
 }
 
-impl From<&durust::ActivityTaskClaim> for ActivityTaskClaim {
-    fn from(claim: &durust::ActivityTaskClaim) -> Self {
+impl From<&durust::provider::ActivityTaskClaim> for ActivityTaskClaim {
+    fn from(claim: &durust::provider::ActivityTaskClaim) -> Self {
         Self {
             activity_id: claim.activity_id.0.clone(),
             worker_id: claim.worker_id.0.clone(),
@@ -1366,9 +1349,9 @@ impl From<&durust::ActivityTaskClaim> for ActivityTaskClaim {
     }
 }
 
-impl From<ActivityTaskClaim> for durust::ActivityTaskClaim {
+impl From<ActivityTaskClaim> for durust::provider::ActivityTaskClaim {
     fn from(claim: ActivityTaskClaim) -> Self {
-        durust::ActivityTaskClaim {
+        durust::provider::ActivityTaskClaim {
             activity_id: durust::ActivityId(claim.activity_id),
             worker_id: durust::WorkerId::new(claim.worker_id),
             token: claim.token,
@@ -1382,8 +1365,8 @@ pub struct ClaimedActivityTask {
     pub claim: ActivityTaskClaim,
 }
 
-impl From<durust::ClaimedActivityTask> for ClaimedActivityTask {
-    fn from(claimed: durust::ClaimedActivityTask) -> Self {
+impl From<durust::provider::ClaimedActivityTask> for ClaimedActivityTask {
+    fn from(claimed: durust::provider::ClaimedActivityTask) -> Self {
         Self {
             claim: (&claimed.claim).into(),
             task: claimed.task.into(),
@@ -1397,9 +1380,9 @@ pub struct CompleteActivityRequest {
     pub result: PayloadRef,
 }
 
-impl From<CompleteActivityRequest> for durust::CompleteActivityRequest {
+impl From<CompleteActivityRequest> for durust::provider::CompleteActivityRequest {
     fn from(req: CompleteActivityRequest) -> Self {
-        durust::CompleteActivityRequest {
+        durust::provider::CompleteActivityRequest {
             claim: req.claim.into(),
             result: req.result,
         }
@@ -1413,13 +1396,13 @@ pub enum CompleteActivityOutcome {
     AlreadyCompleted,
 }
 
-impl From<durust::CompleteActivityOutcome> for CompleteActivityOutcome {
-    fn from(outcome: durust::CompleteActivityOutcome) -> Self {
+impl From<durust::provider::CompleteActivityOutcome> for CompleteActivityOutcome {
+    fn from(outcome: durust::provider::CompleteActivityOutcome) -> Self {
         match outcome {
-            durust::CompleteActivityOutcome::Completed { event_id } => Self::Completed {
+            durust::provider::CompleteActivityOutcome::Completed { event_id } => Self::Completed {
                 event_id: event_id.0,
             },
-            durust::CompleteActivityOutcome::AlreadyCompleted => Self::AlreadyCompleted,
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted => Self::AlreadyCompleted,
         }
     }
 }
@@ -1429,9 +1412,9 @@ pub struct CompleteActivitiesRequest {
     pub completions: Vec<CompleteActivityRequest>,
 }
 
-impl From<CompleteActivitiesRequest> for durust::CompleteActivityTasksRequest {
+impl From<CompleteActivitiesRequest> for durust::provider::CompleteActivityTasksRequest {
     fn from(req: CompleteActivitiesRequest) -> Self {
-        durust::CompleteActivityTasksRequest {
+        durust::provider::CompleteActivityTasksRequest {
             completions: req.completions.into_iter().map(Into::into).collect(),
         }
     }
@@ -1456,17 +1439,17 @@ impl CompleteActivitiesOutcome {
     /// are item outcomes, as in the TypeScript contract; any other error is
     /// the call's error.
     pub fn from_results(
-        results: Vec<durust::CompleteActivityTaskBatchResult>,
+        results: Vec<durust::provider::CompleteActivityTaskBatchResult>,
     ) -> durust::Result<Self> {
         let mut outcomes = Vec::with_capacity(results.len());
         for result in results {
             outcomes.push(match result.result {
-                Ok(durust::CompleteActivityOutcome::Completed { event_id }) => {
+                Ok(durust::provider::CompleteActivityOutcome::Completed { event_id }) => {
                     CompleteActivityItemOutcome::Completed {
                         event_id: event_id.0,
                     }
                 }
-                Ok(durust::CompleteActivityOutcome::AlreadyCompleted) => {
+                Ok(durust::provider::CompleteActivityOutcome::AlreadyCompleted) => {
                     CompleteActivityItemOutcome::AlreadyCompleted
                 }
                 Err(durust::Error::StaleLease) => CompleteActivityItemOutcome::StaleLease,
@@ -1484,9 +1467,9 @@ pub struct FailActivityRequest {
     pub failure: DurableFailure,
 }
 
-impl From<FailActivityRequest> for durust::FailActivityRequest {
+impl From<FailActivityRequest> for durust::provider::FailActivityRequest {
     fn from(req: FailActivityRequest) -> Self {
-        durust::FailActivityRequest {
+        durust::provider::FailActivityRequest {
             claim: req.claim.into(),
             failure: req.failure,
         }
@@ -1501,20 +1484,20 @@ pub enum FailActivityOutcome {
     AlreadyCompleted,
 }
 
-impl From<durust::FailActivityOutcome> for FailActivityOutcome {
-    fn from(outcome: durust::FailActivityOutcome) -> Self {
+impl From<durust::provider::FailActivityOutcome> for FailActivityOutcome {
+    fn from(outcome: durust::provider::FailActivityOutcome) -> Self {
         match outcome {
-            durust::FailActivityOutcome::Failed { event_id } => Self::Failed {
+            durust::provider::FailActivityOutcome::Failed { event_id } => Self::Failed {
                 event_id: event_id.0,
             },
-            durust::FailActivityOutcome::RetryScheduled {
+            durust::provider::FailActivityOutcome::RetryScheduled {
                 next_attempt,
                 ready_at,
             } => Self::RetryScheduled {
                 attempt: next_attempt,
                 ready_at_ms: ready_at.0,
             },
-            durust::FailActivityOutcome::AlreadyCompleted => Self::AlreadyCompleted,
+            durust::provider::FailActivityOutcome::AlreadyCompleted => Self::AlreadyCompleted,
         }
     }
 }
@@ -1524,9 +1507,9 @@ pub struct ActivityHeartbeatRequest {
     pub claim: ActivityTaskClaim,
 }
 
-impl From<ActivityHeartbeatRequest> for durust::ActivityHeartbeatRequest {
+impl From<ActivityHeartbeatRequest> for durust::provider::ActivityHeartbeatRequest {
     fn from(req: ActivityHeartbeatRequest) -> Self {
-        durust::ActivityHeartbeatRequest {
+        durust::provider::ActivityHeartbeatRequest {
             claim: req.claim.into(),
         }
     }
@@ -1539,11 +1522,11 @@ pub enum ActivityHeartbeatOutcome {
     AlreadyCompleted,
 }
 
-impl From<durust::ActivityHeartbeatOutcome> for ActivityHeartbeatOutcome {
-    fn from(outcome: durust::ActivityHeartbeatOutcome) -> Self {
+impl From<durust::provider::ActivityHeartbeatOutcome> for ActivityHeartbeatOutcome {
+    fn from(outcome: durust::provider::ActivityHeartbeatOutcome) -> Self {
         match outcome {
-            durust::ActivityHeartbeatOutcome::Recorded => Self::Recorded,
-            durust::ActivityHeartbeatOutcome::AlreadyCompleted => Self::AlreadyCompleted,
+            durust::provider::ActivityHeartbeatOutcome::Recorded => Self::Recorded,
+            durust::provider::ActivityHeartbeatOutcome::AlreadyCompleted => Self::AlreadyCompleted,
         }
     }
 }
@@ -1556,9 +1539,9 @@ pub struct FireDueTimersRequest {
     pub limit: u64,
 }
 
-impl From<FireDueTimersRequest> for durust::FireDueTimersRequest {
+impl From<FireDueTimersRequest> for durust::provider::FireDueTimersRequest {
     fn from(req: FireDueTimersRequest) -> Self {
-        durust::FireDueTimersRequest {
+        durust::provider::FireDueTimersRequest {
             namespace: durust::Namespace::new(req.namespace),
             now: durust::TimestampMs(req.now),
             limit: req.limit as usize,
@@ -1579,9 +1562,9 @@ pub struct TimeoutDueActivitiesRequest {
     pub limit: u64,
 }
 
-impl From<TimeoutDueActivitiesRequest> for durust::TimeoutDueActivitiesRequest {
+impl From<TimeoutDueActivitiesRequest> for durust::provider::TimeoutDueActivitiesRequest {
     fn from(req: TimeoutDueActivitiesRequest) -> Self {
-        durust::TimeoutDueActivitiesRequest {
+        durust::provider::TimeoutDueActivitiesRequest {
             namespace: durust::Namespace::new(req.namespace),
             now: durust::TimestampMs(req.now),
             limit: req.limit as usize,
@@ -1605,9 +1588,9 @@ pub struct SignalWorkflowRequest {
     pub payload: PayloadRef,
 }
 
-impl From<SignalWorkflowRequest> for durust::SignalWorkflowRequest {
+impl From<SignalWorkflowRequest> for durust::provider::SignalWorkflowRequest {
     fn from(req: SignalWorkflowRequest) -> Self {
-        durust::SignalWorkflowRequest {
+        durust::provider::SignalWorkflowRequest {
             namespace: durust::Namespace::new(req.namespace),
             workflow_id: durust::WorkflowId::new(req.workflow_id),
             signal_id: durust::SignalId::new(req.signal_id),
@@ -1624,11 +1607,11 @@ pub enum SignalWorkflowOutcome {
     Duplicate,
 }
 
-impl From<durust::SignalWorkflowOutcome> for SignalWorkflowOutcome {
-    fn from(outcome: durust::SignalWorkflowOutcome) -> Self {
+impl From<durust::provider::SignalWorkflowOutcome> for SignalWorkflowOutcome {
+    fn from(outcome: durust::provider::SignalWorkflowOutcome) -> Self {
         match outcome {
-            durust::SignalWorkflowOutcome::Accepted => Self::Accepted,
-            durust::SignalWorkflowOutcome::Duplicate => Self::Duplicate,
+            durust::provider::SignalWorkflowOutcome::Accepted => Self::Accepted,
+            durust::provider::SignalWorkflowOutcome::Duplicate => Self::Duplicate,
         }
     }
 }
@@ -1640,9 +1623,9 @@ pub struct ReadSignalInboxRequest {
     pub signal_name: String,
 }
 
-impl From<ReadSignalInboxRequest> for durust::ReadSignalInboxRequest {
+impl From<ReadSignalInboxRequest> for durust::provider::ReadSignalInboxRequest {
     fn from(req: ReadSignalInboxRequest) -> Self {
-        durust::ReadSignalInboxRequest {
+        durust::provider::ReadSignalInboxRequest {
             run_id: durust::RunId::new(req.run_id),
             signal_name: durust::SignalName::new(req.signal_name),
         }
@@ -1656,9 +1639,9 @@ pub struct QueryWorkflowRequest {
     pub workflow_id: String,
 }
 
-impl From<QueryWorkflowRequest> for durust::QueryProjectionRequest {
+impl From<QueryWorkflowRequest> for durust::provider::QueryProjectionRequest {
     fn from(req: QueryWorkflowRequest) -> Self {
-        durust::QueryProjectionRequest {
+        durust::provider::QueryProjectionRequest {
             namespace: durust::Namespace::new(req.namespace),
             workflow_id: durust::WorkflowId::new(req.workflow_id),
         }
@@ -1673,14 +1656,14 @@ pub enum QueryWorkflowOutcome {
     NoProjection,
 }
 
-impl From<durust::QueryProjectionOutcome> for QueryWorkflowOutcome {
-    fn from(outcome: durust::QueryProjectionOutcome) -> Self {
+impl From<durust::provider::QueryProjectionOutcome> for QueryWorkflowOutcome {
+    fn from(outcome: durust::provider::QueryProjectionOutcome) -> Self {
         match outcome {
-            durust::QueryProjectionOutcome::Found { payload, .. } => Self::Found {
+            durust::provider::QueryProjectionOutcome::Found { payload, .. } => Self::Found {
                 projection: payload,
             },
-            durust::QueryProjectionOutcome::NotFound => Self::NotFound,
-            durust::QueryProjectionOutcome::NoProjection => Self::NoProjection,
+            durust::provider::QueryProjectionOutcome::NotFound => Self::NotFound,
+            durust::provider::QueryProjectionOutcome::NoProjection => Self::NoProjection,
         }
     }
 }
@@ -1752,7 +1735,7 @@ pub struct PayloadGcRequest {
     pub min_age_ms: Option<u64>,
 }
 
-impl From<PayloadGcRequest> for durust::PayloadGarbageCollectionRequest {
+impl From<PayloadGcRequest> for durust::provider::PayloadGarbageCollectionRequest {
     fn from(req: PayloadGcRequest) -> Self {
         let mut request = Self {
             dry_run: req.dry_run,
@@ -1774,8 +1757,8 @@ pub struct PayloadGcOutcome {
     pub failed_blobs: usize,
 }
 
-impl From<durust::PayloadGarbageCollectionOutcome> for PayloadGcOutcome {
-    fn from(outcome: durust::PayloadGarbageCollectionOutcome) -> Self {
+impl From<durust::provider::PayloadGarbageCollectionOutcome> for PayloadGcOutcome {
+    fn from(outcome: durust::provider::PayloadGarbageCollectionOutcome) -> Self {
         Self {
             scanned_blobs: outcome.scanned_blobs,
             retained_blobs: outcome.retained_blobs,

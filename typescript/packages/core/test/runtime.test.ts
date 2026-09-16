@@ -147,11 +147,11 @@ const fakeClaimed: ClaimedWorkflowTask = {
   liveSignals: []
 };
 
-function committedTail(outcome: { readonly kind: string; readonly newTailEventId?: unknown }) {
-  if (outcome.kind !== "Committed" || typeof outcome.newTailEventId !== "number") {
-    throw new Error(`expected committed outcome, got ${outcome.kind}`);
+function committedTail(outcome: unknown) {
+  if (typeof outcome !== "number") {
+    throw new Error(`expected a committed tail event id, got ${String(outcome)}`);
   }
-  return eventId(outcome.newTailEventId);
+  return eventId(outcome);
 }
 
 // Renders an event as `Kind#seq` when it carries a marker command id, so an
@@ -199,7 +199,6 @@ describe("minimal workflow runtime", () => {
     });
 
     expect(first).toEqual(second);
-    expect(first.expectedTailEventId).toBe(eventId(1));
     expect(first.appendEvents).toHaveLength(1);
     expect(first.scheduleActivities).toHaveLength(1);
 
@@ -368,7 +367,7 @@ describe("minimal workflow runtime", () => {
       payloadCodec: "Json"
     });
     const outcome = await backend.commitWorkflowTask(claimed.claim, commit);
-    expect(outcome).toEqual({ kind: "Committed", newTailEventId: eventId(2) });
+    expect(outcome).toEqual(eventId(2));
 
     const history = await readHistory(backend, claimed.runId, 10);
     expect(history.events.map((event) => event.eventType)).toEqual([
@@ -1965,7 +1964,6 @@ describe("minimal workflow runtime", () => {
     }
     expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 1 });
     expect(winner.winner.branchOrdinal).toBe(0);
-    expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
     const history = await readHistory(backend, secondClaim.runId, 10);
@@ -3992,7 +3990,6 @@ describe("minimal workflow runtime", () => {
     }
     expect(winner.winner.selectCommandId).toEqual({ runId: secondClaim.runId, seq: 1 });
     expect(winner.winner.branchOrdinal).toBe(0);
-    expect(winner.winner.winningEventId).toBe(eventId(4));
     await backend.commitWorkflowTask(secondClaim.claim, completionCommit);
 
     const history = await readHistory(backend, secondClaim.runId, 10);
@@ -4168,7 +4165,7 @@ describe("minimal workflow runtime", () => {
       prepareWorkflowTaskCommit(racingWorkflow, { sku: "sku-1" }, badClaim, {
         payloadCodec: "Json"
       })
-    ).rejects.toThrow("nondeterminism: select winner branch changed");
+    ).rejects.toThrow("recorded branch 1 as the winner, but replay never produced that branch's result");
   });
 
   // The three tests below are one defect: TypeScript had no counterpart to

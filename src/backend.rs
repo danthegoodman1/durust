@@ -1,16 +1,25 @@
 use crate::{
     ActivityId, ActivityMapTask, ActivityName, ActivityTask, ChildStartOutboxMessage,
-    ChildWorkflowMapTask, DurableFailure, Error, EventId, Namespace, NewHistoryEvent, PayloadRef,
+    ChildWorkflowMapTask, DurableFailure, EventId, Namespace, NewHistoryEvent, PayloadRef,
     PayloadStorageConfig, Result, RunId, ShardId, SignalId, SignalName, TaskQueue, TimestampMs,
     WaitId, WorkerId, WorkflowId, WorkflowType,
 };
 use futures::future::BoxFuture;
 use std::time::Duration;
 
+/// Storage a workflow runtime commits against.
+///
+/// Every defaulted method here must stay correct when `self` is a **wrapper**
+/// around another backend, because that is the shape the compiler cannot
+/// check: a default that answers for itself rather than delegating to `self`
+/// turns a forgotten override into silent data loss instead of a build error.
+/// `payload_storage_config` and `hydrate_payload` have no default for exactly
+/// that reason — a wrapper that dropped them would report the wrong config and
+/// hand back unhydrated blobs. The batch and convenience methods default to
+/// driving `self`'s own single-item method, which stays correct through any
+/// number of wrappers and only costs a round trip per item.
 pub trait DurableBackend: Clone + Send + Sync + 'static {
-    fn payload_storage_config(&self) -> PayloadStorageConfig {
-        PayloadStorageConfig::default()
-    }
+    fn payload_storage_config(&self) -> PayloadStorageConfig;
 
     fn start_workflow(
         &self,
@@ -37,12 +46,6 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
     ) -> BoxFuture<'static, Result<Vec<ClaimedWorkflowTask>>> {
         let backend = self.clone();
         Box::pin(async move {
-            if opts.shard_filter.is_some() {
-                return Err(Error::Backend(
-                    "workflow task shard filters require a shard-aware backend".to_owned(),
-                ));
-            }
-
             let mut claimed = Vec::new();
             for _ in 0..opts.limit {
                 let Some(task) = backend
@@ -67,9 +70,9 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         self.stream_history(req)
     }
 
-    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>> {
-        Box::pin(async move { Ok(payload) })
-    }
+    /// Resolves an offloaded payload to inline bytes. A backend that never
+    /// offloads returns the payload unchanged.
+    fn hydrate_payload(&self, payload: PayloadRef) -> BoxFuture<'static, Result<PayloadRef>>;
 
     fn hydrate_activity_map_result_manifest(
         &self,
@@ -85,11 +88,21 @@ pub trait DurableBackend: Clone + Send + Sync + 'static {
         self.hydrate_payload(payload)
     }
 
+    /// Applies one workflow task's writes atomically and returns the run's new
+    /// history tail.
+    ///
+    /// The claim token is the whole fence. Only the claim holder appends
+    /// replay-window events, and the three paths that append one from outside
+    /// a claim — `cancel_workflow` and the two parent-close paths — revoke the
+    /// claim in the same transaction. So a provider rejects a commit whose
+    /// token no longer owns the run ([`Error::StaleLease`]) and needs no
+    /// further check: facts appended concurrently by activity workers, timer
+    /// sweeps, and child dispatch never invalidate a task.
     fn commit_workflow_task(
         &self,
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, Result<CommitOutcome>>;
+    ) -> BoxFuture<'static, Result<EventId>>;
 
     fn commit_workflow_tasks(
         &self,
@@ -323,13 +336,18 @@ pub struct ClaimWorkflowTaskOptions {
     pub task_queue: TaskQueue,
     pub registered_workflow_types: Vec<WorkflowType>,
     pub lease_duration: Duration,
+    /// Restricts the claim to these shards. It lives here rather than on the
+    /// batch options so the batched default — which drives
+    /// `claim_workflow_task` — honors it too; a filter only the batch path
+    /// could express would be silently dropped by any backend that does not
+    /// override the batch method.
+    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClaimWorkflowTasksOptions {
     pub claim: ClaimWorkflowTaskOptions,
     pub limit: usize,
-    pub shard_filter: Option<Vec<ShardId>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -438,9 +456,11 @@ pub struct HistoryChunk {
     pub has_more: bool,
 }
 
+/// Everything one workflow task writes, applied atomically (see the
+/// `commit_workflow_task` contract). The claim token is the fence: a provider
+/// applies this only while `claim` still owns the run.
 #[derive(Clone, Debug, Default)]
 pub struct WorkflowTaskCommit {
-    pub expected_tail_event_id: EventId,
     pub append_events: Vec<NewHistoryEvent>,
     pub upsert_waits: Vec<WaitRecord>,
     pub schedule_activities: Vec<ActivityTask>,
@@ -467,13 +487,8 @@ pub struct WorkflowTaskCommitInput {
 #[derive(Clone, Debug)]
 pub struct WorkflowTaskCommitBatchResult {
     pub claim: WorkflowTaskClaim,
-    pub result: Result<CommitOutcome>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommitOutcome {
-    Committed { new_tail_event_id: EventId },
-    Conflict,
+    /// The run's new history tail, or why this item could not be applied.
+    pub result: Result<EventId>,
 }
 
 #[derive(Clone, Debug)]
@@ -776,12 +791,5 @@ impl WorkflowChangeVersionsOutcome {
         self.records
             .iter()
             .all(|record| record.status == WorkflowChangeVersionStatus::Closed)
-    }
-}
-
-pub fn conflict_to_error(outcome: CommitOutcome) -> Result<EventId> {
-    match outcome {
-        CommitOutcome::Committed { new_tail_event_id } => Ok(new_tail_event_id),
-        CommitOutcome::Conflict => Err(Error::Conflict),
     }
 }

@@ -1,0 +1,40 @@
+# The S3-compatible object store the payload conformance test runs against.
+#
+# S3Proxy fronts a jclouds blob store with the S3 API, which is all the payload
+# path needs: it speaks S3 and knows nothing about the implementation behind it.
+# The fixture's only job is to be an S3 endpoint, and this one is serving about
+# a second after `up -d`.
+services:
+  # jclouds' filesystem provider treats every top-level directory under the
+  # base directory as a bucket, so creating the directory is how the fixture
+  # comes up with `durust-payloads` already there. S3Proxy creates no buckets
+  # of its own, and the conformance test does not create one either — a
+  # provider is handed a bucket, it does not provision storage.
+  s3proxy-init:
+    image: busybox:1.37
+    command: mkdir -p /data/durust-payloads
+    volumes:
+      - s3proxy-data:/data
+
+  s3proxy:
+    image: andrewgaul/s3proxy:2.6.0
+    depends_on:
+      s3proxy-init:
+        condition: service_completed_successfully
+    ports:
+      - "3900:3900"
+    environment:
+      S3PROXY_ENDPOINT: "http://0.0.0.0:3900"
+      # Signatures are verified rather than waved through: an unsigned fixture
+      # would pass a client that forgot to sign, and signing is the half of the
+      # S3 path most likely to break against a real store.
+      S3PROXY_AUTHORIZATION: "aws-v2-or-v4"
+      S3PROXY_IDENTITY: "durust-access-key"
+      S3PROXY_CREDENTIAL: "durust-secret-key"
+      JCLOUDS_PROVIDER: "filesystem"
+      JCLOUDS_FILESYSTEM_BASEDIR: "/data"
+    volumes:
+      - s3proxy-data:/data
+
+volumes:
+  s3proxy-data:

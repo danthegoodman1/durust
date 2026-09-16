@@ -27,7 +27,7 @@ import {
   type ActivityHeartbeatRequest,
   type ClaimedActivityTask,
   type ClaimedWorkflowTask,
-  type CommitOutcome,
+  type EventId,
   type CompleteActivitiesOutcome,
   type CompleteActivitiesRequest,
   type CompleteActivityOutcome,
@@ -610,7 +610,7 @@ class MeasuredBackend implements DurableBackend {
   async commitWorkflowTask(
     claim: WorkflowTaskClaim,
     commit: WorkflowTaskCommit
-  ): Promise<CommitOutcome> {
+  ): Promise<EventId> {
     return this.#measure("commitWorkflowTask", commit.appendEvents?.length ?? 0, () =>
       this.inner.commitWorkflowTask(claim, commit)
     );

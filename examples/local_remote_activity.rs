@@ -1,6 +1,6 @@
+use durust::provider::{ClaimActivityOptions, DurableBackend, HistoryEventData};
 use durust::{
-    ActivityName, ClaimActivityOptions, Client, DurableBackend, EventId, HistoryEventData,
-    MemoryBackend, Namespace, TaskQueue, Worker, WorkerId,
+    ActivityName, Client, EventId, MemoryBackend, Namespace, TaskQueue, Worker, WorkerId,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -132,9 +132,9 @@ async fn completed_result(backend: &MemoryBackend, run_id: &durust::RunId) -> du
 async fn stream_history(
     backend: &MemoryBackend,
     run_id: &durust::RunId,
-) -> durust::Result<Vec<durust::HistoryEvent>> {
+) -> durust::Result<Vec<durust::provider::HistoryEvent>> {
     Ok(backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

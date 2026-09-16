@@ -31,11 +31,14 @@
 //! silent slide back: deleting the cases fails here, and re-adding the
 //! exclusion fails the list above.
 
+use durust::provider::{
+    ActivityMapTask, ClaimActivityOptions, ClaimWorkflowTaskOptions, CompleteActivityOutcome,
+    CompleteActivityRequest, DurableBackend, FailActivityOutcome, FailActivityRequest,
+    HistoryEventData, WorkflowTaskCommit,
+};
 use durust::{
-    ActivityMapTask, ActivityName, ClaimActivityOptions, ClaimWorkflowTaskOptions, Client,
-    CompleteActivityOutcome, CompleteActivityRequest, DurableBackend, EventId, FailActivityOutcome,
-    FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, SqliteBackend, TaskQueue,
-    WorkerId, WorkflowTaskCommit, WorkflowType,
+    ActivityName, Client, EventId, MemoryBackend, Namespace, SqliteBackend, TaskQueue, WorkerId,
+    WorkflowType,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -236,18 +239,18 @@ fn shared_table_transitions_replay_through_the_engine() {
 
     let table = load_table();
     assert_eq!(table.transitions.len(), SHARED_TABLE_TRANSITIONS);
-    let map_command_id = durust::command_id(&durust::RunId::new("run-1"), 7);
+    let map_command_id = durust::provider::command_id(&durust::RunId::new("run-1"), 7);
     let failure = durust::DurableFailure::non_retryable("table.item", "item failed");
     let now = durust::TimestampMs(1_700_000_000_000);
 
     let outcome = |value: &Value| match value["kind"].as_str().expect("outcome kind") {
-        "Succeeded" => durust::ChildWorkflowMapItemOutcome::Succeeded {
+        "Succeeded" => durust::provider::ChildWorkflowMapItemOutcome::Succeeded {
             result: durust::encode_payload(&1_u64).unwrap(),
         },
-        "Failed" => durust::ChildWorkflowMapItemOutcome::Failed {
+        "Failed" => durust::provider::ChildWorkflowMapItemOutcome::Failed {
             failure: failure.clone(),
         },
-        "Cancelled" => durust::ChildWorkflowMapItemOutcome::Cancelled {
+        "Cancelled" => durust::provider::ChildWorkflowMapItemOutcome::Cancelled {
             reason: "cancelled".to_owned(),
         },
         other => panic!("unknown outcome kind `{other}`"),
@@ -258,9 +261,9 @@ fn shared_table_transitions_replay_through_the_engine() {
                 "kind": "RecordItemOutcome",
                 "ordinal": ordinal,
                 "outcome": { "kind": match outcome {
-                    durust::ChildWorkflowMapItemOutcome::Succeeded { .. } => "Succeeded",
-                    durust::ChildWorkflowMapItemOutcome::Failed { .. } => "Failed",
-                    durust::ChildWorkflowMapItemOutcome::Cancelled { .. } => "Cancelled",
+                    durust::provider::ChildWorkflowMapItemOutcome::Succeeded { .. } => "Succeeded",
+                    durust::provider::ChildWorkflowMapItemOutcome::Failed { .. } => "Failed",
+                    durust::provider::ChildWorkflowMapItemOutcome::Cancelled { .. } => "Cancelled",
                 } },
             }),
             MapEffect::MaterializeItems {
@@ -310,8 +313,8 @@ fn shared_table_transitions_replay_through_the_engine() {
                 other => panic!("{name}: unknown map kind `{other}`"),
             },
             failure_mode: match state_json["failureMode"].as_str().expect("failure mode") {
-                "FailFast" => durust::ChildWorkflowMapFailureMode::FailFast,
-                "CollectAll" => durust::ChildWorkflowMapFailureMode::CollectAll,
+                "FailFast" => durust::provider::ChildWorkflowMapFailureMode::FailFast,
+                "CollectAll" => durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                 other => panic!("{name}: unknown failure mode `{other}`"),
             },
             item_count: state_json["itemCount"].as_u64().expect("itemCount"),
@@ -538,7 +541,7 @@ where
     }
 
     let history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(50),
@@ -576,13 +579,14 @@ where
                 task_queue: TaskQueue::new("map-table-workflows"),
                 registered_workflow_types: vec![WorkflowType::new("map-table.workflow", 1)],
                 lease_duration: Duration::from_secs(30),
+                shard_filter: None,
             },
         )
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         (0..fanout.item_count)
             .map(|value| durust::encode_payload(&Item { value }).unwrap())
             .collect(),
@@ -592,7 +596,7 @@ where
     let activity_name = ActivityName::new("map-table.item");
     let task_queue = TaskQueue::new("map-table-activities");
     let retry_policy = durust::RetryPolicy::none();
-    let fingerprint = durust::activity_map_fingerprint(
+    let fingerprint = durust::provider::activity_map_fingerprint(
         activity_name.clone(),
         durust::payload_digest(&input_manifest),
         "mapped".to_owned(),
@@ -603,20 +607,21 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name: activity_name.clone(),
-                        task_queue: task_queue.clone(),
-                        retry_policy: retry_policy.clone(),
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: input_manifest.clone(),
-                        result_manifest_name: "mapped".to_owned(),
-                        max_in_flight: fanout.max_in_flight,
-                        fingerprint,
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name: activity_name.clone(),
+                            task_queue: task_queue.clone(),
+                            retry_policy: retry_policy.clone(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "mapped".to_owned(),
+                            max_in_flight: fanout.max_in_flight,
+                            fingerprint,
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![ActivityMapTask {
                     map_command_id: command_id,

@@ -589,14 +589,14 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
                     if let ::std::option::Option::Some((__durust_select_event_id, _)) =
                         #output_var.as_ref()
                     {
-                        match __durust_select_winner {
+                        match __durust_select_live_choice {
                             ::std::option::Option::Some((
-                                __durust_select_winner_ordinal,
-                                __durust_select_winner_event_id,
-                            )) if (__durust_select_winner_event_id, __durust_select_winner_ordinal)
+                                __durust_select_choice_ordinal,
+                                __durust_select_choice_event_id,
+                            )) if (__durust_select_choice_event_id, __durust_select_choice_ordinal)
                                 <= (*__durust_select_event_id, #branch_ordinal) => {}
                             _ => {
-                                __durust_select_winner =
+                                __durust_select_live_choice =
                                     ::std::option::Option::Some((#branch_ordinal, *__durust_select_event_id));
                             }
                         }
@@ -604,6 +604,13 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
                 }
             })
             .collect::<Vec<_>>();
+    let select_branch_ready = output_vars
+        .iter()
+        .zip(branch_ordinals.iter())
+        .map(|(output_var, branch_ordinal)| {
+            quote! { #branch_ordinal => #output_var.is_some(), }
+        })
+        .collect::<Vec<_>>();
     let cancel_losers = future_vars
         .iter()
         .zip(output_vars.iter())
@@ -642,25 +649,24 @@ fn expand_select(input: SelectInput) -> syn::Result<proc_macro2::TokenStream> {
             ::durust::__durust_select_ensure_command_id(&mut __durust_select_command_id);
             #(#poll_branches)*
 
-            let mut __durust_select_winner:
+            let mut __durust_select_live_choice:
                 ::std::option::Option<(u32, ::durust::EventId)> = ::std::option::Option::None;
             #(#select_ready)*
-            let ::std::option::Option::Some((
-                __durust_select_branch_ordinal,
-                __durust_select_winning_event_id,
-            )) = __durust_select_winner else {
-                return ::std::task::Poll::Pending;
-            };
             let __durust_select_command_id = __durust_select_command_id
                 .as_ref()
                 .expect("select command id initialized");
-            match ::durust::__durust_select_record_winner(
+            match ::durust::__durust_select_resolve(
                 __durust_select_command_id,
-                __durust_select_branch_ordinal,
-                __durust_select_winning_event_id,
                 #branch_digest,
+                |__durust_select_ordinal| match __durust_select_ordinal {
+                    #(#select_branch_ready)*
+                    _ => false,
+                },
+                __durust_select_live_choice.map(|(__durust_select_ordinal, _)| __durust_select_ordinal),
             ) {
-                ::std::task::Poll::Ready(::std::result::Result::Ok(())) => {
+                ::std::task::Poll::Ready(::std::result::Result::Ok(
+                    __durust_select_branch_ordinal,
+                )) => {
                     #(#cancel_losers)*
                     ::std::task::Poll::Ready(::std::result::Result::Ok(
                         __durust_select_branch_ordinal,

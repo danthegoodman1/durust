@@ -8,7 +8,7 @@ use crate::{
     WorkflowTaskCommit, WorkflowTaskRelease, poll_with_activity_context, poll_with_runtime_context,
 };
 use futures::Future;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -35,6 +35,12 @@ const MIN_IDLE_WAIT: Duration = Duration::from_millis(5);
 // worker already costs.
 const MIN_NONDETERMINISM_RETRY_BACKOFF: Duration = MIN_IDLE_WAIT;
 const DEFAULT_MAX_CACHED_WORKFLOWS: usize = 10_000;
+
+/// Blob reads one workflow task keeps in flight while hydrating offloaded
+/// payloads. A resumed fanout blocks on every item at once, so a serial drain
+/// costs one provider round trip per item; the bound keeps a wide map from
+/// opening one request per item instead.
+const DEFAULT_MAX_CONCURRENT_PAYLOAD_HYDRATIONS: usize = 16;
 // Ceiling for the doubling idle backoff. A worker that finds nothing for a
 // while re-polls at most this often, which is the provider load an idle fleet
 // costs.
@@ -160,8 +166,6 @@ pub struct WorkerRunStats {
 pub struct WorkerMetrics {
     /// Workflow tasks whose commit landed.
     pub workflow_tasks_committed: u64,
-    /// Workflow tasks abandoned because their commit lost to a concurrent one.
-    pub workflow_task_conflicts: u64,
     /// Workflow tasks that failed on a caught panic in workflow code
     /// ([`Error::TaskPanic`]).
     ///
@@ -208,7 +212,6 @@ pub struct WorkerMetrics {
 #[derive(Debug, Default)]
 struct WorkerMetricsState {
     workflow_tasks_committed: AtomicU64,
-    workflow_task_conflicts: AtomicU64,
     workflow_tasks_panicked: AtomicU64,
     workflow_tasks_nondeterministic: AtomicU64,
     workflow_tasks_unsupported_version: AtomicU64,
@@ -230,7 +233,6 @@ impl WorkerMetricsState {
     fn snapshot(&self) -> WorkerMetrics {
         WorkerMetrics {
             workflow_tasks_committed: self.workflow_tasks_committed.load(Ordering::Relaxed),
-            workflow_task_conflicts: self.workflow_task_conflicts.load(Ordering::Relaxed),
             workflow_tasks_panicked: self.workflow_tasks_panicked.load(Ordering::Relaxed),
             workflow_tasks_nondeterministic: self
                 .workflow_tasks_nondeterministic
@@ -282,11 +284,6 @@ pub enum WorkerEvent<'a> {
     WorkflowTaskFailed {
         run_id: &'a RunId,
         error: &'a Error,
-    },
-    /// A workflow task whose commit lost to a concurrent one; the provider
-    /// released the claim and the run replays from fresh history.
-    WorkflowTaskConflicted {
-        run_id: &'a RunId,
     },
     /// A workflow task released without being replayed: recovery admission, a
     /// replay budget, or provider backpressure.
@@ -531,6 +528,7 @@ where
     activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
     max_concurrent_activities: usize,
+    max_concurrent_payload_hydrations: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     max_cached_workflows: usize,
@@ -764,6 +762,7 @@ where
             activity_task_lease_duration: DEFAULT_TASK_LEASE_DURATION,
             activity_task_batch_size: 1,
             max_concurrent_activities: 1,
+            max_concurrent_payload_hydrations: DEFAULT_MAX_CONCURRENT_PAYLOAD_HYDRATIONS,
             activity_completion_batch_size: 1,
             max_local_activities_per_workflow_task: 0,
             max_cached_workflows: DEFAULT_MAX_CACHED_WORKFLOWS,
@@ -1269,13 +1268,6 @@ where
         self.emit(WorkerEvent::WorkflowTaskCommitted { run_id });
     }
 
-    fn record_workflow_task_conflict(&self, run_id: &RunId) {
-        self.metrics
-            .workflow_task_conflicts
-            .fetch_add(1, Ordering::Relaxed);
-        self.emit(WorkerEvent::WorkflowTaskConflicted { run_id });
-    }
-
     // Commits a single prepared task and decides whether its future stays cached,
     // factored out so the single-claim path reuses the same logic the batch loop
     // applies per committed task.
@@ -1293,17 +1285,10 @@ where
         // cloning one per committed task would put an allocation on the commit
         // hot path for the benefit of a sink that is usually absent.
         let run_id = prepared.run_id;
-        let commit = self
+        let last_event_id = self
             .backend
             .commit_workflow_task(prepared.claim, prepared.commit)
             .await?;
-        let crate::CommitOutcome::Committed {
-            new_tail_event_id: last_event_id,
-        } = commit
-        else {
-            self.record_workflow_task_conflict(&run_id);
-            return Ok(None);
-        };
         self.record_workflow_task_committed(&run_id);
         Ok(cache_entry_after_commit(
             terminal,
@@ -1816,25 +1801,36 @@ where
             }
             let payload_requests = context.take_payload_hydration_requests();
             if !payload_requests.is_empty() {
-                for request in payload_requests {
-                    let hydrated = match request.kind {
-                        crate::runtime::PayloadHydrationKind::Payload => {
-                            self.backend
-                                .hydrate_payload(request.payload.clone())
-                                .await?
-                        }
-                        crate::runtime::PayloadHydrationKind::ActivityMapResultManifest => {
-                            self.backend
-                                .hydrate_activity_map_result_manifest(request.payload.clone())
-                                .await?
-                        }
-                        crate::runtime::PayloadHydrationKind::ChildWorkflowMapResultManifest => {
-                            self.backend
-                                .hydrate_child_workflow_map_result_manifest(request.payload.clone())
-                                .await?
-                        }
+                // One poll can block on every item of a fanout at once, and
+                // those blob reads are independent. Draining them one at a
+                // time costs one provider round trip per item on the critical
+                // path of a single workflow task. Bounded so a wide map does
+                // not open an unbounded number of provider requests.
+                let limit = self.max_concurrent_payload_hydrations.max(1);
+                let mut queued = payload_requests.into_iter();
+                let mut in_flight = FuturesUnordered::new();
+                loop {
+                    while in_flight.len() < limit {
+                        let Some(request) = queued.next() else { break };
+                        let payload = request.payload.clone();
+                        let hydrate = match request.kind {
+                            crate::runtime::PayloadHydrationKind::Payload => {
+                                self.backend.hydrate_payload(payload)
+                            }
+                            crate::runtime::PayloadHydrationKind::ActivityMapResultManifest => {
+                                self.backend.hydrate_activity_map_result_manifest(payload)
+                            }
+                            crate::runtime::PayloadHydrationKind::ChildWorkflowMapResultManifest => {
+                                self.backend
+                                    .hydrate_child_workflow_map_result_manifest(payload)
+                            }
+                        };
+                        in_flight.push(async move { (request, hydrate.await) });
+                    }
+                    let Some((request, hydrated)) = in_flight.next().await else {
+                        break;
                     };
-                    context.fulfill_payload_hydration(request, hydrated)?;
+                    context.fulfill_payload_hydration(request, hydrated?)?;
                 }
                 continue;
             }
@@ -1880,18 +1876,17 @@ where
             .await
     }
 
-    // Only the workflow loop acquires recovery slots, and a worker's loops are
-    // branches of one joined future rather than separate tasks, so no two
-    // acquisitions can interleave and the load-then-add check is race-free. The
-    // atomic exists only so the drop guard can decrement without borrowing the
-    // worker.
+    // A batch prepares its tasks concurrently, so several cold recoveries can
+    // be admitted from one stage and this is what bounds them. Claimed with a
+    // compare-and-swap rather than load-then-add so the bound holds however
+    // the acquisitions interleave.
     fn try_acquire_recovery(&self) -> Option<RecoverySlotGuard> {
-        if self.active_recoveries.load(Ordering::Relaxed)
-            >= self.recovery_flow_control.max_concurrent_recoveries
-        {
-            return None;
-        }
-        self.active_recoveries.fetch_add(1, Ordering::Relaxed);
+        let limit = self.recovery_flow_control.max_concurrent_recoveries;
+        self.active_recoveries
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+                (active < limit).then_some(active + 1)
+            })
+            .ok()?;
         Some(RecoverySlotGuard {
             active_recoveries: Arc::clone(&self.active_recoveries),
         })
@@ -1916,6 +1911,241 @@ where
             ));
         }
         Ok(payload)
+    }
+
+    // Single reconciliation point for claim ownership: every error escaping
+    // the inner pipeline releases the claim here, so no fallible await between
+    // claim and commit can strand the run until its lease expires.
+    // `now` is `None` for a single claimed task, which reads the clock here:
+    // the read is a fallible await taken while the claim is held, so it belongs
+    // inside this funnel like every other step. A batch passes one reading in
+    // for all its tasks and releases the batch itself.
+    async fn prepare_claimed_workflow_task(
+        &self,
+        claimed: crate::ClaimedWorkflowTask,
+        cached: Option<CachedWorkflow>,
+        now: Option<crate::TimestampMs>,
+    ) -> Result<PreparedWorkflowTaskOutcome> {
+        let claim_for_release = claimed.claim.clone();
+        let now = match now {
+            Some(now) => Ok(now),
+            None => self.backend.current_time().await,
+        };
+        let now = match now {
+            Ok(now) => now,
+            Err(err) => {
+                self.release_failed_workflow_task(claim_for_release, err)
+                    .await?;
+                return Ok(PreparedWorkflowTaskOutcome::Deferred);
+            }
+        };
+        match self
+            .prepare_claimed_workflow_task_inner(claimed, cached, now)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => {
+                self.release_failed_workflow_task(claim_for_release, err)
+                    .await?;
+                Ok(PreparedWorkflowTaskOutcome::Deferred)
+            }
+        }
+    }
+
+    // Errors returned here leave the claim held; the caller releases it. The
+    // recovery slot is a drop guard, so `?` cannot leak it.
+    async fn prepare_claimed_workflow_task_inner(
+        &self,
+        claimed: crate::ClaimedWorkflowTask,
+        cached: Option<CachedWorkflow>,
+        now: crate::TimestampMs,
+    ) -> Result<PreparedWorkflowTaskOutcome> {
+        let mut load_full_history = false;
+        if let Some(mut cached) = cached {
+            let chunk = self
+                .claim_history_chunk(&claimed, cached.last_event_id)
+                .await?;
+            let mut context = crate::runtime::RuntimeContext::new(
+                claimed.run_id.clone(),
+                self.workflow_task_queue.clone(),
+                self.activity_task_queue.clone(),
+                self.payload_codec,
+                now,
+                chunk.events,
+                cached.default_activity_options,
+                cached.next_command_seq,
+                chunk.last_event_id,
+                claimed.replay_target_event_id,
+                cached.unconsumed_indexes,
+            );
+            let poll = self
+                .poll_until_history_blocked_or_ready(
+                    &claimed.run_id,
+                    &claimed,
+                    &mut cached.future,
+                    &mut context,
+                    claimed.replay_target_event_id,
+                    None,
+                )
+                .await?;
+            match poll {
+                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
+                    // A change-marker API ran past the loaded window, so the
+                    // cached future's state is unusable: the run cold-replays
+                    // below with its whole history loaded.
+                    load_full_history = true;
+                }
+                WorkflowPollOutcome::Ready(poll) => {
+                    return self
+                        .prepare_workflow_poll(claimed, cached.future, context, poll)
+                        .await
+                        .map(PreparedWorkflowTaskOutcome::Prepared);
+                }
+                WorkflowPollOutcome::Deferred => {
+                    // Deferred is only produced under a recovery budget and the
+                    // cached path polls without one; if a budget is ever added
+                    // here, this arm must release the claim the way the
+                    // cold-path defer does or the claim leaks until its lease
+                    // expires.
+                    debug_assert!(
+                        false,
+                        "cached-path workflow poll deferred without a recovery budget"
+                    );
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+            }
+        }
+
+        let is_recovery = claimed.replay_target_event_id > EventId(1);
+        let _recovery_slot = if is_recovery {
+            let Some(slot) = self.try_acquire_recovery() else {
+                self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                    .await?;
+                return Ok(PreparedWorkflowTaskOutcome::Deferred);
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        let mut recovery_budget =
+            is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
+        let Some(registration) = self.registry.workflow(&claimed.workflow_type) else {
+            return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
+        };
+        loop {
+            let mut first_chunk = match self
+                .load_cold_history(&claimed, load_full_history, recovery_budget.as_mut())
+                .await?
+            {
+                Some(chunk) => chunk,
+                None => {
+                    self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                        .await?;
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+            };
+            let last_loaded_event_id = first_chunk.last_event_id;
+            let (input, replay_events) =
+                split_start_event(std::mem::take(&mut first_chunk.events))?;
+            let input = self.hydrate_payload_for_decode(input).await?;
+            let mut future = registration.run(input, self.payload_codec);
+            let mut context = crate::runtime::RuntimeContext::new(
+                claimed.run_id.clone(),
+                self.workflow_task_queue.clone(),
+                self.activity_task_queue.clone(),
+                self.payload_codec,
+                now,
+                replay_events,
+                crate::ActivityOptions::default(),
+                0,
+                last_loaded_event_id,
+                claimed.replay_target_event_id,
+                crate::runtime::ReadyEventIndexes::default(),
+            );
+            let poll = self
+                .poll_until_history_blocked_or_ready(
+                    &claimed.run_id,
+                    &claimed,
+                    &mut future,
+                    &mut context,
+                    claimed.replay_target_event_id,
+                    recovery_budget.as_mut(),
+                )
+                .await?;
+            match poll {
+                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
+                    if load_full_history {
+                        return Err(Error::Backend(format!(
+                            "replay of run {} overran a fully loaded history window",
+                            claimed.run_id
+                        )));
+                    }
+                    load_full_history = true;
+                    // The reload starts from event zero and the first attempt's
+                    // chunks are discarded, so it gets a fresh budget: charging
+                    // both would defer a run whose whole history fits the
+                    // budget on every claim.
+                    recovery_budget =
+                        is_recovery.then(|| RecoveryReplayBudget::new(self.recovery_flow_control));
+                }
+                WorkflowPollOutcome::Ready(poll) => {
+                    return self
+                        .prepare_workflow_poll(claimed, future, context, poll)
+                        .await
+                        .map(PreparedWorkflowTaskOutcome::Prepared);
+                }
+                WorkflowPollOutcome::Deferred => {
+                    self.defer_workflow_task(claimed.claim, self.recovery_flow_control.defer_delay)
+                        .await?;
+                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
+                }
+            }
+        }
+    }
+
+    // The history a cold replay starts from: the first chunk, or every chunk
+    // up to the replay target when a change-marker API overran a partial
+    // window. `None` means the recovery budget ran out and the task defers.
+    async fn load_cold_history(
+        &self,
+        claimed: &crate::ClaimedWorkflowTask,
+        load_full_history: bool,
+        mut recovery_budget: Option<&mut RecoveryReplayBudget>,
+    ) -> Result<Option<crate::HistoryChunk>> {
+        let mut loaded = crate::HistoryChunk {
+            events: Vec::new(),
+            last_event_id: EventId::ZERO,
+            has_more: true,
+        };
+        loop {
+            let chunk = match recovery_budget.as_deref_mut() {
+                Some(budget) => {
+                    let Some(chunk) = self
+                        .claim_recovery_history_chunk(claimed, loaded.last_event_id, budget)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    chunk
+                }
+                None => {
+                    self.claim_history_chunk(claimed, loaded.last_event_id)
+                        .await?
+                }
+            };
+            if chunk.events.is_empty() && loaded.last_event_id < claimed.replay_target_event_id {
+                return Err(Error::Backend(format!(
+                    "history stream ended at event {} before replay target {}",
+                    loaded.last_event_id, claimed.replay_target_event_id
+                )));
+            }
+            loaded.events.extend(chunk.events);
+            loaded.last_event_id = chunk.last_event_id;
+            loaded.has_more = chunk.has_more;
+            if !load_full_history || loaded.last_event_id >= claimed.replay_target_event_id {
+                return Ok(Some(loaded));
+            }
+        }
     }
 
     async fn prepare_workflow_poll(
@@ -1975,7 +2205,6 @@ where
             run_id: claimed.run_id,
             claim: claimed.claim,
             commit: WorkflowTaskCommit {
-                expected_tail_event_id: claimed.replay_target_event_id,
                 append_events,
                 upsert_waits: parts.upsert_waits,
                 schedule_activities: parts.schedule_activities,
@@ -2056,6 +2285,7 @@ where
                     task_queue: self.shared.workflow_task_queue.clone(),
                     registered_workflow_types: self.shared.registered_workflow_types.clone(),
                     lease_duration: self.shared.workflow_task_lease_duration,
+                    shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                 },
             )
             .await?;
@@ -2122,9 +2352,9 @@ where
                         task_queue: self.shared.workflow_task_queue.clone(),
                         registered_workflow_types: self.shared.registered_workflow_types.clone(),
                         lease_duration: self.shared.workflow_task_lease_duration,
+                        shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                     },
                     limit,
-                    shard_filter: self.shared.workflow_task_concurrency.shard_filter.clone(),
                 },
             )
             .await?;
@@ -2140,8 +2370,68 @@ where
         let mut failed = 0usize;
         let mut deferred = 0usize;
         let mut prepared = Vec::with_capacity(claimed.len());
-        for task in claimed {
-            match self.prepare_claimed_workflow_task(task).await {
+
+        // One clock reading for the whole batch. Every task in it was claimed
+        // by one RPC at one instant, so reading the provider clock per task
+        // adds round trips to the critical path and lets tasks from the same
+        // claim disagree about `now`. It is still a fallible await taken with
+        // every claim held, so a failure releases the whole batch rather than
+        // leaving the runs to wait out their leases.
+        let now = match self.shared.backend.current_time().await {
+            Ok(now) => now,
+            Err(err) => {
+                for task in &claimed {
+                    if let Err(err) = self
+                        .shared
+                        .release_failed_workflow_task(task.claim.clone(), err.clone())
+                        .await
+                    {
+                        record_workflow_task_error(&mut pass_error, &mut failed, err);
+                    }
+                }
+                return match pass_error {
+                    Some(err) => Err(err),
+                    None => Ok(WorkflowStageOutcome {
+                        failed,
+                        deferred: claimed.len(),
+                        ..WorkflowStageOutcome::default()
+                    }),
+                };
+            }
+        };
+        // The cache is the worker's only mutable state and the lookups need no
+        // I/O, so they are drained here and the claims carry their entries into
+        // the concurrent stage below.
+        let mut pending = claimed
+            .into_iter()
+            .map(|task| {
+                let cached = self.remove_cached_workflow(&task.run_id);
+                (task, cached)
+            })
+            .collect::<Vec<_>>()
+            .into_iter();
+
+        // The tasks in a batch are distinct runs: their history reads, payload
+        // hydrations, and cold replays share nothing. Preparing them one at a
+        // time serialises every one of those round trips behind the batch,
+        // which is what made `max_concurrent_recoveries` unreachable — the
+        // counter could never exceed one.
+        let shared = self.shared;
+        // Ordered, not unordered: the batch's results drive the commit order
+        // and which error becomes the pass's, and both must not depend on
+        // which task's provider round trip happened to return first.
+        let mut in_flight = FuturesOrdered::new();
+        loop {
+            while in_flight.len() < limit {
+                let Some((task, cached)) = pending.next() else {
+                    break;
+                };
+                in_flight.push_back(shared.prepare_claimed_workflow_task(task, cached, Some(now)));
+            }
+            let Some(outcome) = in_flight.next().await else {
+                break;
+            };
+            match outcome {
                 Ok(PreparedWorkflowTaskOutcome::Prepared(task)) => prepared.push(task),
                 // Released unreplayed — recovery admission, a replay budget, or
                 // backpressure. Reported, not swallowed: a fully backpressured
@@ -2203,13 +2493,7 @@ where
             };
             for (task, result) in prepared[start..end].iter_mut().zip(results) {
                 let last_event_id = match result.result {
-                    Ok(crate::CommitOutcome::Committed { new_tail_event_id }) => new_tail_event_id,
-                    // The provider released the claim as part of reporting the
-                    // conflict; the task retries from fresh history.
-                    Ok(crate::CommitOutcome::Conflict) => {
-                        self.shared.record_workflow_task_conflict(&task.run_id);
-                        continue;
-                    }
+                    Ok(new_tail_event_id) => new_tail_event_id,
                     Err(err) => {
                         if let Err(err) = self
                             .shared
@@ -2268,7 +2552,12 @@ where
         claimed: crate::ClaimedWorkflowTask,
     ) -> Result<SingleWorkflowTaskOutcome> {
         let run_id = claimed.run_id.clone();
-        let prepared = match self.prepare_claimed_workflow_task(claimed).await? {
+        let cached = self.remove_cached_workflow(&claimed.run_id);
+        let prepared = match self
+            .shared
+            .prepare_claimed_workflow_task(claimed, cached, None)
+            .await?
+        {
             PreparedWorkflowTaskOutcome::Prepared(prepared) => prepared,
             PreparedWorkflowTaskOutcome::Deferred => {
                 return Ok(SingleWorkflowTaskOutcome::Deferred);
@@ -2293,241 +2582,6 @@ where
         }
         self.run_local_activities_after_workflow_tasks(1).await?;
         Ok(SingleWorkflowTaskOutcome::Settled)
-    }
-
-    // Single reconciliation point for claim ownership: every error escaping
-    // the inner pipeline releases the claim here, so no fallible await between
-    // claim and commit can strand the run until its lease expires.
-    async fn prepare_claimed_workflow_task(
-        &mut self,
-        claimed: crate::ClaimedWorkflowTask,
-    ) -> Result<PreparedWorkflowTaskOutcome> {
-        let claim_for_release = claimed.claim.clone();
-        match self.prepare_claimed_workflow_task_inner(claimed).await {
-            Ok(outcome) => Ok(outcome),
-            Err(err) => {
-                self.shared
-                    .release_failed_workflow_task(claim_for_release, err)
-                    .await?;
-                Ok(PreparedWorkflowTaskOutcome::Deferred)
-            }
-        }
-    }
-
-    // Errors returned here leave the claim held; the caller releases it. The
-    // recovery slot is a drop guard, so `?` cannot leak it.
-    async fn prepare_claimed_workflow_task_inner(
-        &mut self,
-        claimed: crate::ClaimedWorkflowTask,
-    ) -> Result<PreparedWorkflowTaskOutcome> {
-        let cached = self.remove_cached_workflow(&claimed.run_id);
-        let now = self.shared.backend.current_time().await?;
-
-        let mut load_full_history = false;
-        if let Some(mut cached) = cached {
-            let chunk = self
-                .shared
-                .claim_history_chunk(&claimed, cached.last_event_id)
-                .await?;
-            let mut context = crate::runtime::RuntimeContext::new(
-                claimed.run_id.clone(),
-                self.shared.workflow_task_queue.clone(),
-                self.shared.activity_task_queue.clone(),
-                self.shared.payload_codec,
-                now,
-                chunk.events,
-                cached.default_activity_options,
-                cached.next_command_seq,
-                chunk.last_event_id,
-                claimed.replay_target_event_id,
-                cached.unconsumed_indexes,
-            );
-            let poll = self
-                .shared
-                .poll_until_history_blocked_or_ready(
-                    &claimed.run_id,
-                    &claimed,
-                    &mut cached.future,
-                    &mut context,
-                    claimed.replay_target_event_id,
-                    None,
-                )
-                .await?;
-            match poll {
-                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
-                    // A change-marker API ran past the loaded window, so the
-                    // cached future's state is unusable: the run cold-replays
-                    // below with its whole history loaded.
-                    load_full_history = true;
-                }
-                WorkflowPollOutcome::Ready(poll) => {
-                    return self
-                        .shared
-                        .prepare_workflow_poll(claimed, cached.future, context, poll)
-                        .await
-                        .map(PreparedWorkflowTaskOutcome::Prepared);
-                }
-                WorkflowPollOutcome::Deferred => {
-                    // Deferred is only produced under a recovery budget and the
-                    // cached path polls without one; if a budget is ever added
-                    // here, this arm must release the claim the way the
-                    // cold-path defer does or the claim leaks until its lease
-                    // expires.
-                    debug_assert!(
-                        false,
-                        "cached-path workflow poll deferred without a recovery budget"
-                    );
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
-            }
-        }
-
-        let is_recovery = claimed.replay_target_event_id > EventId(1);
-        let _recovery_slot = if is_recovery {
-            let Some(slot) = self.shared.try_acquire_recovery() else {
-                self.shared
-                    .defer_workflow_task(
-                        claimed.claim,
-                        self.shared.recovery_flow_control.defer_delay,
-                    )
-                    .await?;
-                return Ok(PreparedWorkflowTaskOutcome::Deferred);
-            };
-            Some(slot)
-        } else {
-            None
-        };
-        let mut recovery_budget =
-            is_recovery.then(|| RecoveryReplayBudget::new(self.shared.recovery_flow_control));
-        let Some(registration) = self.shared.registry.workflow(&claimed.workflow_type) else {
-            return Err(Error::WorkflowNotRegistered(claimed.workflow_type.clone()));
-        };
-        loop {
-            let mut first_chunk = match self
-                .load_cold_history(&claimed, load_full_history, recovery_budget.as_mut())
-                .await?
-            {
-                Some(chunk) => chunk,
-                None => {
-                    self.shared
-                        .defer_workflow_task(
-                            claimed.claim,
-                            self.shared.recovery_flow_control.defer_delay,
-                        )
-                        .await?;
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
-            };
-            let last_loaded_event_id = first_chunk.last_event_id;
-            let (input, replay_events) =
-                split_start_event(std::mem::take(&mut first_chunk.events))?;
-            let input = self.shared.hydrate_payload_for_decode(input).await?;
-            let mut future = registration.run(input, self.shared.payload_codec);
-            let mut context = crate::runtime::RuntimeContext::new(
-                claimed.run_id.clone(),
-                self.shared.workflow_task_queue.clone(),
-                self.shared.activity_task_queue.clone(),
-                self.shared.payload_codec,
-                now,
-                replay_events,
-                crate::ActivityOptions::default(),
-                0,
-                last_loaded_event_id,
-                claimed.replay_target_event_id,
-                crate::runtime::ReadyEventIndexes::default(),
-            );
-            let poll = self
-                .shared
-                .poll_until_history_blocked_or_ready(
-                    &claimed.run_id,
-                    &claimed,
-                    &mut future,
-                    &mut context,
-                    claimed.replay_target_event_id,
-                    recovery_budget.as_mut(),
-                )
-                .await?;
-            match poll {
-                WorkflowPollOutcome::Ready(_) if context.replay_window_overrun() => {
-                    if load_full_history {
-                        return Err(Error::Backend(format!(
-                            "replay of run {} overran a fully loaded history window",
-                            claimed.run_id
-                        )));
-                    }
-                    load_full_history = true;
-                    // The reload starts from event zero and the first attempt's
-                    // chunks are discarded, so it gets a fresh budget: charging
-                    // both would defer a run whose whole history fits the
-                    // budget on every claim.
-                    recovery_budget = is_recovery
-                        .then(|| RecoveryReplayBudget::new(self.shared.recovery_flow_control));
-                }
-                WorkflowPollOutcome::Ready(poll) => {
-                    return self
-                        .shared
-                        .prepare_workflow_poll(claimed, future, context, poll)
-                        .await
-                        .map(PreparedWorkflowTaskOutcome::Prepared);
-                }
-                WorkflowPollOutcome::Deferred => {
-                    self.shared
-                        .defer_workflow_task(
-                            claimed.claim,
-                            self.shared.recovery_flow_control.defer_delay,
-                        )
-                        .await?;
-                    return Ok(PreparedWorkflowTaskOutcome::Deferred);
-                }
-            }
-        }
-    }
-
-    // The history a cold replay starts from: the first chunk, or every chunk
-    // up to the replay target when a change-marker API overran a partial
-    // window. `None` means the recovery budget ran out and the task defers.
-    async fn load_cold_history(
-        &self,
-        claimed: &crate::ClaimedWorkflowTask,
-        load_full_history: bool,
-        mut recovery_budget: Option<&mut RecoveryReplayBudget>,
-    ) -> Result<Option<crate::HistoryChunk>> {
-        let mut loaded = crate::HistoryChunk {
-            events: Vec::new(),
-            last_event_id: EventId::ZERO,
-            has_more: true,
-        };
-        loop {
-            let chunk = match recovery_budget.as_deref_mut() {
-                Some(budget) => {
-                    let Some(chunk) = self
-                        .shared
-                        .claim_recovery_history_chunk(claimed, loaded.last_event_id, budget)
-                        .await?
-                    else {
-                        return Ok(None);
-                    };
-                    chunk
-                }
-                None => {
-                    self.shared
-                        .claim_history_chunk(claimed, loaded.last_event_id)
-                        .await?
-                }
-            };
-            if chunk.events.is_empty() && loaded.last_event_id < claimed.replay_target_event_id {
-                return Err(Error::Backend(format!(
-                    "history stream ended at event {} before replay target {}",
-                    loaded.last_event_id, claimed.replay_target_event_id
-                )));
-            }
-            loaded.events.extend(chunk.events);
-            loaded.last_event_id = chunk.last_event_id;
-            loaded.has_more = chunk.has_more;
-            if !load_full_history || loaded.last_event_id >= claimed.replay_target_event_id {
-                return Ok(Some(loaded));
-            }
-        }
     }
 
     async fn run_local_activities_after_workflow_tasks(
@@ -3036,6 +3090,7 @@ where
     activity_task_lease_duration: Duration,
     activity_task_batch_size: usize,
     max_concurrent_activities: usize,
+    max_concurrent_payload_hydrations: usize,
     activity_completion_batch_size: usize,
     max_local_activities_per_workflow_task: usize,
     max_cached_workflows: usize,
@@ -3134,6 +3189,15 @@ where
     // this knob unset issues single-task claim RPCs.
     pub fn activity_task_batch_size(mut self, limit: usize) -> Self {
         self.activity_task_batch_size = limit.max(1);
+        self
+    }
+
+    /// Blob reads one workflow task may have in flight at once while
+    /// hydrating offloaded payloads a poll blocked on. One fanout item is one
+    /// read, and they are independent, so this is what keeps a resumed fanout
+    /// from costing one provider round trip per item.
+    pub fn max_concurrent_payload_hydrations(mut self, limit: usize) -> Self {
+        self.max_concurrent_payload_hydrations = limit.max(1);
         self
     }
 
@@ -3384,6 +3448,7 @@ where
                 activity_task_lease_duration: self.activity_task_lease_duration,
                 activity_task_batch_size: self.activity_task_batch_size,
                 max_concurrent_activities: self.max_concurrent_activities,
+                max_concurrent_payload_hydrations: self.max_concurrent_payload_hydrations,
                 activity_completion_batch_size: self.activity_completion_batch_size,
                 max_local_activities_per_workflow_task: self.max_local_activities_per_workflow_task,
                 max_cached_workflows: self.max_cached_workflows,

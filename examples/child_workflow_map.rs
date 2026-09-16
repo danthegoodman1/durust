@@ -1,4 +1,5 @@
-use durust::{Client, DurableBackend, HistoryEventData, MemoryBackend, Worker};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, MemoryBackend, Worker};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -30,7 +31,7 @@ async fn sum_child_workflow_map(input: SumChildWorkflowMapInput) -> durust::Resu
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_child_workflow_map_success_refs(&result_manifest)?;
     result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })
@@ -58,7 +59,7 @@ fn main() -> durust::Result<()> {
         worker.run_until_idle().await?;
 
         let history = backend
-            .stream_history(durust::StreamHistoryRequest {
+            .stream_history(durust::provider::StreamHistoryRequest {
                 run_id,
                 after_event_id: durust::EventId::ZERO,
                 up_to_event_id: durust::EventId(100),

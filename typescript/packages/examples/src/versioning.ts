@@ -210,7 +210,7 @@ async function expectCommitted(
   outcome: Promise<Awaited<ReturnType<Worker["runWorkflowTaskOnce"]>>>
 ): Promise<void> {
   const resolved = await outcome;
-  if (resolved.kind !== "Committed" || resolved.outcome.kind !== "Committed") {
+  if (resolved.kind !== "Committed") {
     throw new Error("expected versioning workflow task to commit");
   }
 }

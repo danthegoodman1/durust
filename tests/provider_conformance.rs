@@ -1,11 +1,13 @@
+use durust::provider::{
+    ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ChildWorkflowMapTask,
+    ClaimActivityOptions, ClaimActivityTasksOptions, ClaimWorkflowTaskOptions,
+    ClaimWorkflowTasksOptions, CompleteActivityRequest, CompleteActivityTasksRequest,
+    DurableBackend, FailActivityRequest, HistoryEventData, NewHistoryEvent, PayloadBackend,
+    PayloadBlobStore, WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput,
+};
 use durust::{
-    ActivityMapInputManifest, ActivityMapResultManifest, ActivityMapTask, ActivityName,
-    ChildWorkflowMapTask, ClaimActivityOptions, ClaimActivityTasksOptions,
-    ClaimWorkflowTaskOptions, ClaimWorkflowTasksOptions, Client, CommitOutcome,
-    CompleteActivityRequest, CompleteActivityTasksRequest, DurableBackend, Error, EventId,
-    FailActivityRequest, HistoryEventData, MemoryBackend, Namespace, NewHistoryEvent,
-    PayloadBackend, PayloadBlobStore, Registry, SqliteBackend, TaskQueue, Worker, WorkerId,
-    WorkflowTaskCommit, WorkflowTaskCommitBatch, WorkflowTaskCommitInput, WorkflowType,
+    ActivityName, Client, Error, EventId, MemoryBackend, Namespace, Registry, SqliteBackend,
+    TaskQueue, Worker, WorkerId, WorkflowType,
 };
 #[cfg(feature = "postgres")]
 use durust::{PostgresBackend, PostgresBackendConfig};
@@ -95,41 +97,41 @@ fn postgres_is_required() -> bool {
     env_flag_is_on("DURUST_REQUIRE_POSTGRES")
 }
 
-/// `DURUST_REQUIRE_GARAGE` can only fail a Garage test that was compiled, and
-/// the Garage test lives behind `#[cfg(feature = "s3")]` — so a build without
-/// that feature contains no Garage test and the flag has nothing to fire on.
+/// `DURUST_REQUIRE_S3` can only fail an S3 test that was compiled, and the S3
+/// conformance test lives behind `#[cfg(feature = "s3")]` — so a build without
+/// that feature contains no such test and the flag has nothing to fire on.
 ///
-/// That hole is wider here than it is for Postgres, because CI's Garage step
-/// selects a *single* test by name filter. `cargo test <filter>` that matches
-/// nothing prints `0 passed` and **exits 0** (measured, not assumed): drop the
+/// That hole is wider here than it is for Postgres, because CI's S3 step
+/// selects tests by name filter. `cargo test <filter>` that matches nothing
+/// prints `0 passed` and **exits 0** (measured, not assumed): drop the
 /// feature, or rename the conformance test, and the step stays green having
 /// run no S3 at all. Two independent ways to pass vacuously, and the container
 /// coming up healthy disguises both.
 ///
-/// So this test sits outside the `cfg`, and CI filters on the substring
-/// `garage` rather than the full test name. This test's own name contains it,
-/// so the filter always matches at least one test, that test always compiles,
-/// and it fails when the feature is gone. A filter that can never match zero
-/// tests is the part that makes the rest of the guard reachable.
+/// So this test sits outside the `cfg`, and CI filters on the substring `s3`
+/// rather than a full test name. This test's own name contains it, so the
+/// filter always matches at least one test, that test always compiles, and it
+/// fails when the feature is gone. A filter that can never match zero tests is
+/// the part that makes the rest of the guard reachable.
 // Deliberately constant: the assertion is a build-configuration check.
 #[allow(clippy::assertions_on_constants)]
 #[test]
-fn garage_s3_feature_is_enabled_when_garage_is_required() {
-    if !garage_is_required() {
+fn s3_feature_is_enabled_when_s3_is_required() {
+    if !s3_is_required() {
         return;
     }
     assert!(
         cfg!(feature = "s3"),
-        "DURUST_REQUIRE_GARAGE is set, but this binary was built without the `s3` feature, so \
-         the Garage conformance test was compiled out and the run proves nothing. Add \
+        "DURUST_REQUIRE_S3 is set, but this binary was built without the `s3` feature, so \
+         the S3 conformance test was compiled out and the run proves nothing. Add \
          `--features s3` or `--all-features`."
     );
 }
 
 /// Deliberately outside `#[cfg(feature = "s3")]`: the test above needs it in a
 /// build that has no S3 support at all.
-fn garage_is_required() -> bool {
-    env_flag_is_on("DURUST_REQUIRE_GARAGE")
+fn s3_is_required() -> bool {
+    env_flag_is_on("DURUST_REQUIRE_S3")
 }
 
 /// The on/off reading of a `DURUST_REQUIRE_*` switch, shared by every flag in
@@ -137,7 +139,7 @@ fn garage_is_required() -> bool {
 ///
 /// On for any value except unset, empty, `0`, and `false` (case-insensitive).
 /// That an unrecognized value reads as *on* is the deliberate part: a typo in
-/// `DURUST_REQUIRE_GARAGE=ture` runs the gated work rather than silently
+/// `DURUST_REQUIRE_S3=ture` runs the gated work rather than silently
 /// dropping it. For a switch whose only job is to stop a suite passing
 /// vacuously, failing toward more coverage is the sole safe direction.
 fn env_flag_is_on(name: &str) -> bool {
@@ -325,7 +327,7 @@ async fn foreign_page_map_workflow(input: Input) -> durust::Result<u64> {
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_activity_map_result_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&result_manifest)?;
     result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })
@@ -398,7 +400,7 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
 
         let reopened = SqliteBackend::open(&path).unwrap();
         let outcome = reopened
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: durust::TimestampMs(claimed_at.0.saturating_add(500)),
                 limit: 16,
@@ -412,7 +414,10 @@ fn sqlite_activity_heartbeat_deadline_persists_across_reopen() {
             .await
             .unwrap()
             .expect("workflow task after heartbeat timeout");
-        assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+        assert_eq!(
+            ready.reason,
+            durust::provider::WorkflowTaskReason::ActivityTimedOut
+        );
 
         let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
@@ -556,7 +561,7 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
         backend
             .release_workflow_task(
                 claimed.claim,
-                durust::WorkflowTaskRelease::delayed(Duration::from_millis(25)),
+                durust::provider::WorkflowTaskRelease::delayed(Duration::from_millis(25)),
             )
             .await
             .unwrap();
@@ -670,9 +675,9 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new(&activity_queue),
@@ -680,7 +685,7 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-options".to_owned(),
@@ -690,11 +695,12 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -721,7 +727,7 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
             })
             .await
             .unwrap(),
-        durust::FailActivityOutcome::RetryScheduled {
+        durust::provider::FailActivityOutcome::RetryScheduled {
             next_attempt: 2,
             ..
         }
@@ -767,13 +773,15 @@ async fn exponential_backoff_hides_retry_until_visible<B, R, F, Fut>(
         .await
         .unwrap()
         .expect("activity completion should wake workflow");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityCompleted
+    );
     retry_backend
         .commit_workflow_task(
             ready.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: ready.replay_target_event_id,
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&9_u64).unwrap(),
                     },
@@ -851,7 +859,7 @@ fn memory_provider_keeps_side_effect_marker_inline_when_threshold_would_offload(
 #[test]
 fn payload_backend_offloads_large_payloads_and_hydrates_memory_provider_apis() {
     block_on(async {
-        let blob_store = durust::MemoryBlobStore::new();
+        let blob_store = durust::provider::MemoryBlobStore::new();
         let backend = PayloadBackend::with_payload_storage(
             MemoryBackend::new(),
             blob_store.clone(),
@@ -900,13 +908,13 @@ fn sqlite_provider_offloads_large_payloads_and_hydrates_after_reopen() {
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         assert_eq!(reopened.payload_blob_count().unwrap(), blob_count);
         let projection = reopened
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(gc_workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
             panic!("expected retained projection after reopen");
         };
         assert_eq!(
@@ -1012,7 +1020,7 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("payload-wrapper.sqlite3");
-        let blob_store = durust::MemoryBlobStore::new();
+        let blob_store = durust::provider::MemoryBlobStore::new();
         let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
         let backend = PayloadBackend::with_payload_storage(
             SqliteBackend::open(&path).unwrap(),
@@ -1047,13 +1055,13 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
             large_payload("workflow-input")
         );
         let projection = reopened
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(gc_workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
             panic!("expected retained wrapper projection after reopen");
         };
         assert_eq!(
@@ -1065,14 +1073,14 @@ fn payload_backend_wraps_sqlite_and_hydrates_after_reopen() {
 
 #[cfg(feature = "s3")]
 #[test]
-fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
+fn payload_backend_over_sqlite_passes_s3_conformance_when_configured() {
     block_on_tokio(async {
-        let Some(garage) = garage_config_or_skip("Garage S3 conformance") else {
+        let Some(s3) = s3_config_or_skip("S3 conformance") else {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("payload-wrapper-garage.sqlite3");
-        let blob_store = durust::S3BlobStore::garage(garage).unwrap();
+        let path = dir.path().join("payload-wrapper-s3.sqlite3");
+        let blob_store = durust::provider::S3BlobStore::new(s3).unwrap();
         wait_for_blob_store(&blob_store).await;
         let config = durust::PayloadStorageConfig::new().inline_threshold_bytes(1);
         let backend = PayloadBackend::with_payload_storage(
@@ -1082,18 +1090,17 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         );
         let run_id = payload_offload_public_api_round_trip(
             backend.clone(),
-            "wf/payload-backend-garage-offload",
-            "payload-backend-garage-workflows",
-            "payload-backend-garage-activities",
+            "wf/payload-backend-s3-offload",
+            "payload-backend-s3-workflows",
+            "payload-backend-s3-activities",
         )
         .await;
-        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-garage").await;
-        payload_offload_child_workflow_map_round_trip(backend.clone(), "payload-backend-garage")
-            .await;
-        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-garage").await;
+        payload_offload_child_workflow_round_trip(backend.clone(), "payload-backend-s3").await;
+        payload_offload_child_workflow_map_round_trip(backend.clone(), "payload-backend-s3").await;
+        payload_offload_activity_map_round_trip(backend.clone(), "payload-backend-s3").await;
         let (gc_workflow_id, gc_projection) =
-            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-garage").await;
-        let external_blobs = durust::PayloadBlobStore::list_payload_blobs(&blob_store)
+            payload_gc_removes_unreachable_projection_blob(backend, "payload-backend-s3").await;
+        let external_blobs = durust::provider::PayloadBlobStore::list_payload_blobs(&blob_store)
             .await
             .unwrap();
         assert!(external_blobs.len() >= 8);
@@ -1105,21 +1112,21 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
         );
         let history = stream_history(&reopened, run_id).await;
         let HistoryEventData::WorkflowStarted { input, .. } = &history[0].data else {
-            panic!("expected hydrated workflow start after Garage wrapper reopen");
+            panic!("expected hydrated workflow start after S3 wrapper reopen");
         };
         assert_eq!(
             durust::decode_payload::<String>(input).unwrap(),
             large_payload("workflow-input")
         );
         let projection = reopened
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(gc_workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
-            panic!("expected retained Garage projection after reopen");
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
+            panic!("expected retained S3 projection after reopen");
         };
         assert_eq!(
             durust::decode_payload::<String>(&payload).unwrap(),
@@ -1133,10 +1140,10 @@ fn payload_backend_over_sqlite_passes_garage_s3_conformance_when_configured() {
 fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
     block_on_tokio(async {
         let inner = MemoryBackend::new();
-        let blob_store = durust::S3BlobStore::garage(durust::S3BlobStoreConfig {
+        let blob_store = durust::provider::S3BlobStore::new(durust::provider::S3BlobStoreConfig {
             bucket: "durust-payloads".to_owned(),
             endpoint: "http://127.0.0.1:9".to_owned(),
-            region: "garage".to_owned(),
+            region: "us-east-1".to_owned(),
             prefix: "payloads".to_owned(),
             access_key_id: "GK0123456789abcdef0123456789abcdef".to_owned(),
             secret_access_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -1149,7 +1156,7 @@ fn payload_backend_s3_upload_failure_does_not_commit_missing_payload_ref() {
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
         );
         let err = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/payload-backend-s3-upload-failure"),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -1183,30 +1190,30 @@ where
         .block_on(future)
 }
 
-/// The Garage connection settings, or `None` when this run is not expected to
-/// have a Garage.
+/// The S3 connection settings, or `None` when this run is not expected to have
+/// an object store.
 ///
 /// Same shape and same reason as `postgres_url_or_skip`: libtest captures
 /// `eprintln!` on a passing test, so with the variables unset this returns
 /// `None`, the caller returns early, and the run reports `ok. 1 passed` having
-/// touched no S3 at all. `DURUST_REQUIRE_GARAGE` turns that into a panic.
+/// touched no S3 at all. `DURUST_REQUIRE_S3` turns that into a panic.
 ///
 /// The panic names the variables that are actually missing rather than the
-/// `DURUST_GARAGE_*` family, because a dropped `DURUST_GARAGE_BUCKET` and a
-/// Garage container that never came up are different failures and should not
-/// print the same sentence.
+/// `DURUST_S3_*` family, because a dropped `DURUST_S3_BUCKET` and a container
+/// that never came up are different failures and should not print the same
+/// sentence.
 ///
 /// Blank is missing. The four required reads used `env::var(..).ok()?`, which
-/// accepts `DURUST_GARAGE_ENDPOINT=""` as a value and hands an empty endpoint
-/// to the client; the Postgres helper above has always rejected empty, and
-/// there is no reason for the two to disagree about what "set" means.
+/// accepts `DURUST_S3_ENDPOINT=""` as a value and hands an empty endpoint to
+/// the client; the Postgres helper above has always rejected empty, and there
+/// is no reason for the two to disagree about what "set" means.
 #[cfg(feature = "s3")]
-fn garage_config_or_skip(what: &str) -> Option<durust::S3BlobStoreConfig> {
+fn s3_config_or_skip(what: &str) -> Option<durust::provider::S3BlobStoreConfig> {
     const REQUIRED: [&str; 4] = [
-        "DURUST_GARAGE_ENDPOINT",
-        "DURUST_GARAGE_BUCKET",
-        "DURUST_GARAGE_ACCESS_KEY_ID",
-        "DURUST_GARAGE_SECRET_ACCESS_KEY",
+        "DURUST_S3_ENDPOINT",
+        "DURUST_S3_BUCKET",
+        "DURUST_S3_ACCESS_KEY_ID",
+        "DURUST_S3_SECRET_ACCESS_KEY",
     ];
     let missing: Vec<&str> = REQUIRED
         .into_iter()
@@ -1215,20 +1222,20 @@ fn garage_config_or_skip(what: &str) -> Option<durust::S3BlobStoreConfig> {
     if !missing.is_empty() {
         let missing = missing.join(", ");
         assert!(
-            !garage_is_required(),
-            "DURUST_REQUIRE_GARAGE is set, so `{what}` must run, \
+            !s3_is_required(),
+            "DURUST_REQUIRE_S3 is set, so `{what}` must run, \
              but these are unset or empty: {missing}"
         );
         eprintln!("skipping {what}; set {missing}");
         return None;
     }
-    Some(durust::S3BlobStoreConfig {
-        bucket: non_empty_env("DURUST_GARAGE_BUCKET").expect("checked above"),
-        endpoint: non_empty_env("DURUST_GARAGE_ENDPOINT").expect("checked above"),
-        region: env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned()),
-        prefix: env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "payloads".to_owned()),
-        access_key_id: non_empty_env("DURUST_GARAGE_ACCESS_KEY_ID").expect("checked above"),
-        secret_access_key: non_empty_env("DURUST_GARAGE_SECRET_ACCESS_KEY").expect("checked above"),
+    Some(durust::provider::S3BlobStoreConfig {
+        bucket: non_empty_env("DURUST_S3_BUCKET").expect("checked above"),
+        endpoint: non_empty_env("DURUST_S3_ENDPOINT").expect("checked above"),
+        region: env::var("DURUST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned()),
+        prefix: env::var("DURUST_S3_PREFIX").unwrap_or_else(|_| "payloads".to_owned()),
+        access_key_id: non_empty_env("DURUST_S3_ACCESS_KEY_ID").expect("checked above"),
+        secret_access_key: non_empty_env("DURUST_S3_SECRET_ACCESS_KEY").expect("checked above"),
     })
 }
 
@@ -1243,7 +1250,7 @@ fn non_empty_env(name: &str) -> Option<String> {
 #[cfg(feature = "s3")]
 async fn wait_for_blob_store<S>(blob_store: &S)
 where
-    S: durust::PayloadBlobStore,
+    S: durust::provider::PayloadBlobStore,
 {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut last_error = None;
@@ -1256,7 +1263,7 @@ where
             }
         }
     }
-    panic!("Garage S3 blob store did not become ready: {last_error:?}");
+    panic!("S3 blob store did not become ready: {last_error:?}");
 }
 
 #[test]
@@ -1269,7 +1276,7 @@ fn payload_backend_upload_failure_does_not_commit_missing_payload_ref() {
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
         );
         let err = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/payload-backend-upload-failure"),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -1295,7 +1302,7 @@ fn payload_backend_upload_failure_does_not_commit_missing_payload_ref() {
 #[derive(Clone, Debug)]
 struct FailingBlobStore;
 
-impl durust::PayloadBlobStore for FailingBlobStore {
+impl durust::provider::PayloadBlobStore for FailingBlobStore {
     fn put_payload_blob(
         &self,
         _digest: String,
@@ -1359,7 +1366,7 @@ fn wall_clock_ms() -> durust::TimestampMs {
     )
 }
 
-impl durust::PayloadBlobStore for TestCustomBlobStore {
+impl durust::provider::PayloadBlobStore for TestCustomBlobStore {
     fn put_payload_blob(
         &self,
         digest: String,
@@ -1449,7 +1456,7 @@ where
 
     // Raw replay refs carry the custom scheme end to end.
     let raw_events = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -1471,7 +1478,7 @@ where
     // custom-scheme blob alone.
     let before = blob_store.blob_count();
     let outcome = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -1482,7 +1489,7 @@ where
 
     // Hydration after GC proves reachable blobs survived.
     let history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -1538,7 +1545,7 @@ where
     // at least one foreign-scheme blob page, or this test stops exercising
     // the guarded path.
     let raw_events = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(100),
@@ -1645,7 +1652,7 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
             durust::PayloadStorageConfig::new().inline_threshold_bytes(1),
         );
         let outcome = reopened
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1653,7 +1660,7 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
             .unwrap();
         assert_eq!(outcome.failed_blobs, 0);
         let history = reopened
-            .stream_history(durust::StreamHistoryRequest {
+            .stream_history(durust::provider::StreamHistoryRequest {
                 run_id,
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(1),
@@ -1693,7 +1700,7 @@ fn custom_scheme_blob_store_works_over_postgres_provider_when_configured() {
 #[test]
 fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
     block_on(async {
-        let blob_store = durust::MemoryBlobStore::new();
+        let blob_store = durust::provider::MemoryBlobStore::new();
         let backend = PayloadBackend::with_payload_storage(
             MemoryBackend::new(),
             blob_store.clone(),
@@ -1712,7 +1719,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
             .await
             .unwrap();
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -1728,7 +1735,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
         // Zero grace period restores the pre-fix delete-anything-unreachable
         // behavior: the same window now loses the blob.
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1747,7 +1754,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
             .await
             .unwrap();
         backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/gc-race-committed"),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -1757,7 +1764,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
             .await
             .unwrap();
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1788,7 +1795,7 @@ async fn commit_projection_replacement<B>(
     // Idempotent re-start resolves the run id; the tiny input stays inline so
     // it cannot perturb blob-store contents.
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -1802,7 +1809,7 @@ async fn commit_projection_replacement<B>(
     let mut consume_signals = Vec::new();
     if signal_seq > 0 {
         backend
-            .signal_workflow(durust::SignalWorkflowRequest {
+            .signal_workflow(durust::provider::SignalWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(workflow_id),
                 signal_id: durust::SignalId::new(format!("{workflow_id}/replace/{signal_seq}")),
@@ -1812,7 +1819,7 @@ async fn commit_projection_replacement<B>(
             .await
             .unwrap();
         let inbox = backend
-            .read_signal_inbox(durust::ReadSignalInboxRequest {
+            .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
                 run_id: run_id.clone(),
                 signal_name: durust::SignalName::new("replace"),
             })
@@ -1827,18 +1834,18 @@ async fn commit_projection_replacement<B>(
         queue,
     )
     .await;
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let wait_id = durust::WaitId::new(format!("{}:{}:signal", command_id.run_id, command_id.seq.0));
     backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
                 consume_signals,
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id,
                     run_id,
                     command_id,
-                    kind: durust::WaitKind::Signal,
+                    kind: durust::provider::WaitKind::Signal,
                     key: "replace".to_owned(),
                     ready_at: None,
                 }],
@@ -1862,7 +1869,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         let workflow_id = "wf/memory-gc-grace";
         let queue = "memory-gc-grace-workflows";
         backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(workflow_id),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -1878,7 +1885,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         // grace period retains it because it could belong to an in-flight
         // commit.
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -1889,7 +1896,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         // Two virtual hours later the same blob is old garbage.
         backend.advance_time(Duration::from_secs(2 * 60 * 60));
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -1904,7 +1911,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         // default grace retains it, zero grace collects it.
         commit_projection_replacement(&backend, workflow_id, queue, 2, "projection-new").await;
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -1916,7 +1923,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         );
         commit_projection_replacement(&backend, workflow_id, queue, 3, "projection-final").await;
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -1927,7 +1934,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
             "projection-new blob is young garbage the grace period retains"
         );
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1940,13 +1947,13 @@ fn memory_gc_grace_period_follows_virtual_clock() {
 
         // The live projection and workflow input always survive.
         let projection = backend
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
             panic!("expected live projection");
         };
         assert_eq!(
@@ -1976,7 +1983,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         let workflow_id = "wf/sqlite-gc-grace";
         let queue = "sqlite-gc-grace-workflows";
         backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(workflow_id),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -2000,7 +2007,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
 
         // Young unreachable garbage survives the default grace period.
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -2018,7 +2025,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
             .set_modified(two_hours_ago)
             .unwrap();
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -2037,7 +2044,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         let in_flight_path = blob_dir.join(&in_flight_digest);
         fs::write(&in_flight_path, &in_flight_bytes).unwrap();
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 ..Default::default()
             })
@@ -2046,7 +2053,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         assert_eq!(outcome.deleted_blobs, 0);
         assert!(in_flight_path.exists());
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2092,7 +2099,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         // and hydrates from disk.
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         let outcome = reopened
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2101,13 +2108,13 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         assert_eq!(outcome.failed_blobs, 0);
         assert!(reused_path.exists());
         let projection = reopened
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
             panic!("expected reopened projection");
         };
         assert_eq!(
@@ -2121,11 +2128,11 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
 // is recorded in the outcome and the remaining garbage is still collected.
 #[derive(Clone, Debug)]
 struct PoisonedDeleteBlobStore {
-    inner: durust::MemoryBlobStore,
+    inner: durust::provider::MemoryBlobStore,
     poisoned_digest: String,
 }
 
-impl durust::PayloadBlobStore for PoisonedDeleteBlobStore {
+impl durust::provider::PayloadBlobStore for PoisonedDeleteBlobStore {
     fn put_payload_blob(
         &self,
         digest: String,
@@ -2174,7 +2181,7 @@ fn payload_backend_gc_records_delete_failures_and_continues() {
         let deletable_digest = durust::digest_bytes(&deletable_bytes);
 
         let blob_store = PoisonedDeleteBlobStore {
-            inner: durust::MemoryBlobStore::new(),
+            inner: durust::provider::MemoryBlobStore::new(),
             poisoned_digest: poisoned_digest.clone(),
         };
         let backend = PayloadBackend::with_payload_storage(
@@ -2193,7 +2200,7 @@ fn payload_backend_gc_records_delete_failures_and_continues() {
 
         // Dry run reports both as would-delete without attempting deletes.
         let dry_run = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: true,
                 min_age: Duration::ZERO,
             })
@@ -2203,7 +2210,7 @@ fn payload_backend_gc_records_delete_failures_and_continues() {
         assert_eq!(dry_run.failed_blobs, 0);
 
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2250,7 +2257,7 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
 
         fs::write(object_dir.path().join("payloads").join("orphan"), b"orphan").unwrap();
         let dry_run = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: true,
                 min_age: Duration::ZERO,
             })
@@ -2258,7 +2265,7 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
             .unwrap();
         assert!(dry_run.deleted_blobs >= 1);
         let collected = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2270,13 +2277,13 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
 
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         let projection = reopened
-            .query_projection(durust::QueryProjectionRequest {
+            .query_projection(durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(gc_workflow_id),
             })
             .await
             .unwrap();
-        let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+        let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
             panic!("expected retained projection after local object-store reopen");
         };
         assert_eq!(
@@ -2309,7 +2316,7 @@ fn sqlite_local_blob_store_upload_failure_does_not_commit_missing_payload_ref() 
             });
         let backend = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         let err = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("wf/sqlite-local-upload-failure"),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -2361,7 +2368,8 @@ fn sqlite_provider_json_codec_round_trips_nested_activity_map_payloads_after_reo
             panic!("expected persisted JSON activity map completion after reopen");
         };
         assert_eq!(completed.result_manifest.codec(), durust::CodecId::Json);
-        let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+        let results =
+            durust::provider::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
         assert_eq!(
             results
                 .iter()
@@ -2504,7 +2512,7 @@ fn default_durable_names_include_package_module_and_function() {
 ///
 /// [`run_conformance_scenarios`] counts what it expands and this number is the
 /// floor. Removing a scenario is meant to move it in the same commit.
-const CONFORMANCE_SCENARIOS: usize = 55;
+const CONFORMANCE_SCENARIOS: usize = 56;
 
 /// Runs each named scenario against a clone of `backend`, in order, and
 /// returns how many it ran.
@@ -2574,7 +2582,8 @@ where
         an_empty_map_scheduled_by_a_closing_commit_is_still_accepted,
         one_commit_completing_two_empty_maps_keeps_its_event_ids_contiguous,
         workflow_cancel_cleans_waits_activities_and_activity_maps,
-        stale_workflow_task_commit_conflicts,
+        concurrent_fact_does_not_void_a_workflow_task_commit,
+        committed_claim_cannot_commit_again,
         commit_side_signal_and_wait_mutations_are_fenced_to_the_claimed_run,
         batch_workflow_task_claim_and_commit_results_are_ordered,
         batch_activity_completion_reports_ordered_duplicate_and_stale_results,
@@ -2606,7 +2615,7 @@ where
     B: DurableBackend,
 {
     backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -2624,7 +2633,7 @@ where
     B: DurableBackend,
 {
     let public_history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -2644,7 +2653,7 @@ where
     );
 
     let replay_history = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -2674,7 +2683,7 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
     B: DurableBackend,
 {
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.side-effect-marker", 1),
@@ -2690,13 +2699,14 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
         task_queue: TaskQueue::new(workflow_queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.side-effect-marker", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     };
     let claimed = backend
         .claim_workflow_task(WorkerId::new("side-effect-marker-commit"), claim_opts)
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let value = durust::encode_payload(&"side-effect-value-that-exceeds-threshold").unwrap();
     assert!(value.encoded_len() > 1);
 
@@ -2704,9 +2714,8 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::SideEffectMarker(durust::SideEffectMarker {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::SideEffectMarker(durust::provider::SideEffectMarker {
                         command_id,
                         key: "make-id".to_owned(),
                         value,
@@ -2717,12 +2726,7 @@ async fn assert_side_effect_marker_stays_inline_for_replay_stream<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        durust::CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     assert_side_effect_marker_stays_inline_in_existing_history(backend, workflow_id).await;
 }
@@ -2734,7 +2738,7 @@ async fn assert_side_effect_marker_stays_inline_in_existing_history<B>(
     B: DurableBackend,
 {
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.side-effect-marker", 1),
@@ -2746,7 +2750,7 @@ async fn assert_side_effect_marker_stays_inline_in_existing_history<B>(
         .run_id()
         .clone();
     let replay_history = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(2),
@@ -2778,7 +2782,7 @@ where
 {
     let workflow_input = large_payload("workflow-input");
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -2791,7 +2795,7 @@ where
         .clone();
 
     let start_history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -2816,10 +2820,10 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let activity_input = large_payload("activity-input");
     let activity_payload = durust::encode_payload(&activity_input).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new(activity_queue),
@@ -2827,7 +2831,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: activity_payload.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&activity_payload),
             "sha256:payload-offload-options".to_owned(),
@@ -2838,32 +2842,28 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 query_projection: Some(durust::encode_payload(&projection).unwrap()),
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let query = backend
-        .query_projection(durust::QueryProjectionRequest {
+        .query_projection(durust::provider::QueryProjectionRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
         })
         .await
         .unwrap();
-    let durust::QueryProjectionOutcome::Found { payload, .. } = query else {
+    let durust::provider::QueryProjectionOutcome::Found { payload, .. } = query else {
         panic!("expected query projection");
     };
     assert_eq!(
@@ -2904,14 +2904,14 @@ where
         .unwrap();
     assert_eq!(
         completed,
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: EventId(3)
         }
     );
 
     let signal_payload = large_payload("signal");
     let accepted = backend
-        .signal_workflow(durust::SignalWorkflowRequest {
+        .signal_workflow(durust::provider::SignalWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             signal_id: durust::SignalId::new(format!("{workflow_id}/signal/1")),
@@ -2920,9 +2920,9 @@ where
         })
         .await
         .unwrap();
-    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(accepted, durust::provider::SignalWorkflowOutcome::Accepted);
     let signal = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_id.clone(),
             signal_name: durust::SignalName::new("payload"),
         })
@@ -2935,13 +2935,13 @@ where
     );
     assert!(matches!(signal.payload, durust::PayloadRef::Inline { .. }));
     let signal_batch = backend
-        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+        .read_signal_inboxes(durust::provider::ReadSignalInboxesRequest {
             requests: vec![
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("missing"),
                 },
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("payload"),
                 },
@@ -3006,7 +3006,7 @@ where
 {
     let workflow_id = format!("wf/{prefix}-payload-gc");
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -3026,19 +3026,18 @@ where
         .await
         .unwrap()
         .expect("first projection workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let wait_id = durust::WaitId::new(format!("{}:{}:signal", command_id.run_id, command_id.seq.0));
     let first_projection = large_payload(&format!("{prefix}-projection-old"));
     backend
         .commit_workflow_task(
             first_claim.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id,
                     run_id: run_id.clone(),
                     command_id,
-                    kind: durust::WaitKind::Signal,
+                    kind: durust::provider::WaitKind::Signal,
                     key: "replace".to_owned(),
                     ready_at: None,
                 }],
@@ -3050,7 +3049,7 @@ where
         .unwrap();
 
     backend
-        .signal_workflow(durust::SignalWorkflowRequest {
+        .signal_workflow(durust::provider::SignalWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
             signal_id: durust::SignalId::new(format!("{workflow_id}/replace")),
@@ -3060,7 +3059,7 @@ where
         .await
         .unwrap();
     let inbox = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_id.clone(),
             signal_name: durust::SignalName::new("replace"),
         })
@@ -3080,7 +3079,6 @@ where
         .commit_workflow_task(
             second_claim.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![inbox.signal_id],
                 query_projection: Some(durust::encode_payload(&second_projection).unwrap()),
                 ..WorkflowTaskCommit::default()
@@ -3090,7 +3088,7 @@ where
         .unwrap();
 
     let dry_run = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: true,
             min_age: Duration::ZERO,
         })
@@ -3112,7 +3110,7 @@ where
     );
 
     let collected = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -3121,7 +3119,7 @@ where
     assert_eq!(collected.deleted_blobs, dry_run.deleted_blobs);
 
     let after = backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: true,
             min_age: Duration::ZERO,
         })
@@ -3130,13 +3128,13 @@ where
     assert_eq!(after.deleted_blobs, 0);
 
     let projection = backend
-        .query_projection(durust::QueryProjectionRequest {
+        .query_projection(durust::provider::QueryProjectionRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
         })
         .await
         .unwrap();
-    let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+    let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
         panic!("expected retained projection");
     };
     assert_eq!(
@@ -3153,7 +3151,7 @@ where
     let parent_workflow_id = format!("wf/{prefix}-payload-child-parent");
     let child_workflow_id = format!("wf/{prefix}-payload-child-child");
     let parent_run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&parent_workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -3172,45 +3170,44 @@ where
         .await
         .unwrap()
         .expect("parent workflow task");
-    let command_id = durust::command_id(&parent_run_id, 1);
+    let command_id = durust::provider::command_id(&parent_run_id, 1);
     let child_input = large_payload("child-input");
     let input = durust::encode_payload(&child_input).unwrap();
     let workflow_type = WorkflowType::new("conformance.workflow", 1);
     let workflow_id = durust::WorkflowId::new(&child_workflow_id);
     let task_queue = TaskQueue::new("payload-child-workflows");
-    let requested = durust::ChildWorkflowStartRequested {
+    let requested = durust::provider::ChildWorkflowStartRequested {
         command_id: command_id.clone(),
         workflow_type: workflow_type.clone(),
         workflow_id: workflow_id.clone(),
         task_queue: task_queue.clone(),
         input: input.clone(),
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        fingerprint: durust::child_workflow_fingerprint(
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        fingerprint: durust::provider::child_workflow_fingerprint(
             workflow_type,
             workflow_id,
             durust::payload_digest(&input),
             task_queue,
-            durust::ParentClosePolicy::Cancel,
+            durust::provider::ParentClosePolicy::Cancel,
         ),
     };
     backend
         .commit_workflow_task(
             parent.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
-                start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
-                    &requested,
-                )],
+                start_child_workflows: vec![
+                    durust::provider::ChildStartOutboxMessage::from_requested(&requested),
+                ],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
     backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -3239,8 +3236,7 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&child_result).unwrap(),
                     },
@@ -3260,7 +3256,7 @@ where
         .expect("parent completion wake");
     assert_eq!(
         parent_ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowCompleted
+        durust::provider::WorkflowTaskReason::ChildWorkflowCompleted
     );
     let parent_history = stream_history(&backend, parent_run_id).await;
     let requested = parent_history
@@ -3293,7 +3289,7 @@ where
 {
     let workflow_id = format!("wf/{prefix}-payload-child-map");
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -3312,8 +3308,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [
             "child-map-input-0",
             "child-map-input-1",
@@ -3337,17 +3333,16 @@ where
         result_manifest_name: result_manifest_name.clone(),
         workflow_id_prefix: workflow_id_prefix.clone(),
         max_in_flight: 2,
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        failure_mode: durust::ChildWorkflowMapFailureMode::FailFast,
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        failure_mode: durust::provider::ChildWorkflowMapFailureMode::FailFast,
     };
     backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
+                        durust::provider::ChildWorkflowMapScheduled {
                             command_id: command_id.clone(),
                             workflow_type: workflow_type.clone(),
                             task_queue: task_queue.clone(),
@@ -3355,17 +3350,17 @@ where
                             result_manifest_name: result_manifest_name.clone(),
                             workflow_id_prefix: workflow_id_prefix.clone(),
                             max_in_flight: 2,
-                            parent_close_policy: durust::ParentClosePolicy::Cancel,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::FailFast,
-                            fingerprint: durust::child_workflow_map_fingerprint(
+                            parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                            failure_mode: durust::provider::ChildWorkflowMapFailureMode::FailFast,
+                            fingerprint: durust::provider::child_workflow_map_fingerprint(
                                 workflow_type,
                                 durust::payload_digest(&input_manifest),
                                 result_manifest_name,
                                 workflow_id_prefix,
                                 2,
                                 task_queue,
-                                durust::ParentClosePolicy::Cancel,
-                                durust::ChildWorkflowMapFailureMode::FailFast,
+                                durust::provider::ParentClosePolicy::Cancel,
+                                durust::provider::ChildWorkflowMapFailureMode::FailFast,
                             ),
                         },
                     ),
@@ -3420,7 +3415,7 @@ where
         durust::decode_payload(&scheduled.input_manifest).unwrap();
     assert_eq!(manifest.item_count, 3);
     for (ordinal, page) in manifest.pages.iter().enumerate() {
-        let page: durust::ActivityMapInputPage = durust::decode_payload(page).unwrap();
+        let page: durust::provider::ActivityMapInputPage = durust::decode_payload(page).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(
             durust::decode_payload::<String>(&page.items[0]).unwrap(),
@@ -3432,7 +3427,8 @@ where
         panic!("expected child workflow map completed event");
     };
     let results =
-        durust::decode_child_workflow_map_success_refs(&completed.result_manifest).unwrap();
+        durust::provider::decode_child_workflow_map_success_refs(&completed.result_manifest)
+            .unwrap();
     let values = results
         .iter()
         .map(|payload| durust::decode_payload::<String>(payload).unwrap())
@@ -3449,7 +3445,7 @@ where
     // The same sweep pin as the activity map: only the
     // `ChildWorkflowMapCompleted` event refers to the result manifest.
     backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -3459,7 +3455,9 @@ where
     let HistoryEventData::ChildWorkflowMapCompleted(completed) = &history[2].data else {
         panic!("expected child workflow map completed event after the sweep");
     };
-    let swept = durust::decode_child_workflow_map_success_refs(&completed.result_manifest).unwrap();
+    let swept =
+        durust::provider::decode_child_workflow_map_success_refs(&completed.result_manifest)
+            .unwrap();
     assert_eq!(
         swept.len(),
         results.len(),
@@ -3469,7 +3467,7 @@ where
 
 async fn assert_child_map_started_with_input<B>(
     backend: &B,
-    child: &durust::ClaimedWorkflowTask,
+    child: &durust::provider::ClaimedWorkflowTask,
     expected_label: &str,
 ) where
     B: DurableBackend,
@@ -3484,16 +3482,18 @@ async fn assert_child_map_started_with_input<B>(
     );
 }
 
-async fn complete_child_run_string<B>(backend: &B, child: durust::ClaimedWorkflowTask, value: &str)
-where
+async fn complete_child_run_string<B>(
+    backend: &B,
+    child: durust::provider::ClaimedWorkflowTask,
+    value: &str,
+) where
     B: DurableBackend,
 {
     backend
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&value.to_owned()).unwrap(),
                     },
@@ -3511,7 +3511,7 @@ where
 {
     let workflow_id = format!("wf/{prefix}-payload-map");
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -3530,8 +3530,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         ["map-input-0", "map-input-1", "map-input-2"]
             .into_iter()
             .map(|label| durust::encode_payload(&large_payload(label)).unwrap())
@@ -3557,26 +3557,27 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: input_manifest.clone(),
-                        result_manifest_name: "payload-results".to_owned(),
-                        max_in_flight: 2,
-                        fingerprint: durust::activity_map_fingerprint(
-                            ActivityName::new("conformance.echo"),
-                            durust::payload_digest(&input_manifest),
-                            "payload-results".to_owned(),
-                            2,
-                            "sha256:payload-map-options".to_owned(),
-                        ),
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
+                            retry_policy,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "payload-results".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint: durust::provider::activity_map_fingerprint(
+                                ActivityName::new("conformance.echo"),
+                                durust::payload_digest(&input_manifest),
+                                "payload-results".to_owned(),
+                                2,
+                                "sha256:payload-map-options".to_owned(),
+                            ),
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task],
                 ..WorkflowTaskCommit::default()
@@ -3649,7 +3650,7 @@ where
         durust::decode_payload(&scheduled.input_manifest).unwrap();
     assert_eq!(manifest.item_count, 3);
     for (ordinal, page) in manifest.pages.iter().enumerate() {
-        let page: durust::ActivityMapInputPage = durust::decode_payload(page).unwrap();
+        let page: durust::provider::ActivityMapInputPage = durust::decode_payload(page).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(
             durust::decode_payload::<String>(&page.items[0]).unwrap(),
@@ -3660,7 +3661,8 @@ where
     let HistoryEventData::ActivityMapCompleted(completed) = &history[2].data else {
         panic!("expected activity map completed event");
     };
-    let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+    let results =
+        durust::provider::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
     let values = results
         .iter()
         .map(|payload| durust::decode_payload::<String>(payload).unwrap())
@@ -3678,7 +3680,7 @@ where
     // a sweep keeps it and the results inside it only if the shared payload
     // traversal reports that slot.
     backend
-        .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -3688,7 +3690,7 @@ where
     let HistoryEventData::ActivityMapCompleted(completed) = &history[2].data else {
         panic!("expected activity map completed event after the sweep");
     };
-    let swept = durust::decode_activity_map_result_refs(&completed.result_manifest)
+    let swept = durust::provider::decode_activity_map_result_refs(&completed.result_manifest)
         .unwrap()
         .iter()
         .map(|payload| durust::decode_payload::<String>(payload).unwrap())
@@ -3709,7 +3711,7 @@ where
     );
     let workflow_id = format!("wf/{prefix}-payload-map");
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(&workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -3734,8 +3736,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest_with_codec(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest_with_codec(
         ["json-map-input-0", "json-map-input-1"]
             .into_iter()
             .map(|label| json_payload(&large_payload(label)))
@@ -3764,26 +3766,27 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: input_manifest.clone(),
-                        result_manifest_name: "payload-json-results".to_owned(),
-                        max_in_flight: 2,
-                        fingerprint: durust::activity_map_fingerprint(
-                            ActivityName::new("conformance.echo"),
-                            durust::payload_digest(&input_manifest),
-                            "payload-json-results".to_owned(),
-                            2,
-                            "sha256:payload-json-map-options".to_owned(),
-                        ),
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
+                            retry_policy,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "payload-json-results".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint: durust::provider::activity_map_fingerprint(
+                                ActivityName::new("conformance.echo"),
+                                durust::payload_digest(&input_manifest),
+                                "payload-json-results".to_owned(),
+                                2,
+                                "sha256:payload-json-map-options".to_owned(),
+                            ),
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task],
                 ..WorkflowTaskCommit::default()
@@ -3849,7 +3852,7 @@ where
         durust::decode_payload(&scheduled.input_manifest).unwrap();
     for page in &manifest.pages {
         assert_eq!(page.codec(), durust::CodecId::Json);
-        let page: durust::ActivityMapInputPage = durust::decode_payload(page).unwrap();
+        let page: durust::provider::ActivityMapInputPage = durust::decode_payload(page).unwrap();
         assert_eq!(page.items[0].codec(), durust::CodecId::Json);
     }
 
@@ -3861,10 +3864,11 @@ where
         durust::decode_payload(&completed.result_manifest).unwrap();
     for page in &result_manifest.pages {
         assert_eq!(page.codec(), durust::CodecId::Json);
-        let page: durust::ActivityMapResultPage = durust::decode_payload(page).unwrap();
+        let page: durust::provider::ActivityMapResultPage = durust::decode_payload(page).unwrap();
         assert_eq!(page.results[0].codec(), durust::CodecId::Json);
     }
-    let results = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+    let results =
+        durust::provider::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
     assert_eq!(
         results
             .iter()
@@ -3886,7 +3890,7 @@ where
     durust::encode_payload_with_codec(value, durust::CodecId::Json).unwrap()
 }
 
-fn assert_string_map_item(task: &durust::ActivityTask, ordinal: u64, label: &str) {
+fn assert_string_map_item(task: &durust::provider::ActivityTask, ordinal: u64, label: &str) {
     let map_item = task.map_item.as_ref().expect("map item metadata");
     assert_eq!(map_item.item_ordinal, ordinal);
     assert_eq!(
@@ -3923,6 +3927,7 @@ where
                 task_queue: TaskQueue::new("claim-filter-workflows"),
                 registered_workflow_types: vec![WorkflowType::new("other.workflow", 1)],
                 lease_duration: Duration::from_secs(30),
+                shard_filter: None,
             },
         )
         .await
@@ -3965,7 +3970,7 @@ where
         .await
         .unwrap();
     let start_only = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -3980,7 +3985,7 @@ where
     let mut worker = worker(backend.clone(), "stream-workflows", "stream-activities");
     worker.run_workflow_once().await.unwrap();
     let one_event = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(2),
@@ -3993,7 +3998,7 @@ where
     assert!(one_event.has_more);
 
     let one_event_by_byte_budget = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(2),
@@ -4006,7 +4011,99 @@ where
     assert!(one_event_by_byte_budget.has_more);
 }
 
-async fn stale_workflow_task_commit_conflicts<B>(backend: B)
+/// The claim token is the whole commit fence. A fact appended to the run while
+/// a workflow task is held — here an activity result for a command the task
+/// never observed — must not void that task: facts are looked up by command
+/// seq and never enter the replay window, so the task's decisions still stand.
+async fn concurrent_fact_does_not_void_a_workflow_task_commit<B>(backend: B)
+where
+    B: DurableBackend,
+{
+    let client = Client::new(backend.clone());
+    client
+        .start_workflow::<workflow>("wf/racing-fact", "racing-fact-workflows", input(3))
+        .await
+        .unwrap();
+
+    // Task one schedules two activities.
+    let first = backend
+        .claim_workflow_task(
+            WorkerId::new("racing-fact-worker"),
+            workflow_claim_opts("racing-fact-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("workflow task");
+    let commands: Vec<durust::CommandId> = (1..=2)
+        .map(|seq| durust::CommandId {
+            run_id: first.run_id.clone(),
+            seq: durust::CommandSeq(seq),
+        })
+        .collect();
+    backend
+        .commit_workflow_task(
+            first.claim,
+            WorkflowTaskCommit {
+                append_events: commands
+                    .iter()
+                    .map(|command_id| {
+                        NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                            racing_fact_activity(command_id),
+                        ))
+                    })
+                    .collect(),
+                schedule_activities: commands
+                    .iter()
+                    .map(|command_id| {
+                        durust::provider::ActivityTask::from_scheduled(&racing_fact_activity(
+                            command_id,
+                        ))
+                    })
+                    .collect(),
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The first activity completes, which makes the run claimable again.
+    let one = claim_racing_fact_activity(&backend).await;
+    let two = claim_racing_fact_activity(&backend).await;
+    complete_racing_fact_activity(&backend, one).await;
+
+    // Task two is claimed, and only then does the second activity complete:
+    // a fact for a command this task never observed, landing under its claim.
+    let held = backend
+        .claim_workflow_task(
+            WorkerId::new("racing-fact-worker"),
+            workflow_claim_opts("racing-fact-workflows"),
+        )
+        .await
+        .unwrap()
+        .expect("second workflow task");
+    let tail_at_claim = held.replay_target_event_id;
+    complete_racing_fact_activity(&backend, two).await;
+
+    // The run's tail moved under the held claim, and the commit still lands.
+    let new_tail = backend
+        .commit_workflow_task(
+            held.claim,
+            WorkflowTaskCommit {
+                append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowTaskStarted)],
+                ..WorkflowTaskCommit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        new_tail > tail_at_claim,
+        "commit landed after the racing fact, so the tail must have advanced past the claim's"
+    );
+}
+
+/// The fence that does exist: once a commit lands it clears the claim, so
+/// re-submitting the same claim is rejected rather than applied twice.
+async fn committed_claim_cannot_commit_again<B>(backend: B)
 where
     B: DurableBackend,
 {
@@ -4023,17 +4120,16 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let outcome = backend
-        .commit_workflow_task(
-            claimed.claim,
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId::ZERO,
-                ..WorkflowTaskCommit::default()
-            },
-        )
+    backend
+        .commit_workflow_task(claimed.claim.clone(), WorkflowTaskCommit::default())
         .await
         .unwrap();
-    assert_eq!(outcome, CommitOutcome::Conflict);
+    assert!(matches!(
+        backend
+            .commit_workflow_task(claimed.claim, WorkflowTaskCommit::default())
+            .await,
+        Err(durust::Error::StaleLease)
+    ));
 }
 
 async fn batch_workflow_task_claim_and_commit_results_are_ordered<B>(backend: B)
@@ -4056,7 +4152,6 @@ where
             ClaimWorkflowTasksOptions {
                 claim: claim_opts,
                 limit: 2,
-                shard_filter: None,
             },
         )
         .await
@@ -4065,14 +4160,15 @@ where
     let first = claimed.remove(0);
     let second = claimed.remove(0);
     let completion = WorkflowTaskCommit {
-        expected_tail_event_id: first.replay_target_event_id,
         append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
             result: durust::encode_payload(&first.run_id.0).unwrap(),
         })],
         ..WorkflowTaskCommit::default()
     };
-    let stale = WorkflowTaskCommit {
-        expected_tail_event_id: EventId::ZERO,
+    let second_completion = WorkflowTaskCommit {
+        append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+            result: durust::encode_payload(&second.run_id.0).unwrap(),
+        })],
         ..WorkflowTaskCommit::default()
     };
     let results = backend
@@ -4084,7 +4180,7 @@ where
                 },
                 WorkflowTaskCommitInput {
                     claim: second.claim.clone(),
-                    commit: stale,
+                    commit: second_completion,
                 },
             ],
         })
@@ -4093,14 +4189,9 @@ where
 
     assert_eq!(results.len(), 2);
     assert_eq!(results[0].claim.run_id, first.run_id);
-    assert_eq!(
-        results[0].result,
-        Ok(CommitOutcome::Committed {
-            new_tail_event_id: EventId(2),
-        })
-    );
+    assert_eq!(results[0].result, Ok(EventId(2)));
     assert_eq!(results[1].claim.run_id, second.run_id);
-    assert_eq!(results[1].result, Ok(CommitOutcome::Conflict));
+    assert_eq!(results[1].result, Ok(EventId(2)));
 }
 
 async fn released_workflow_task_is_claimable_again<B>(backend: B)
@@ -4119,7 +4210,10 @@ where
         .unwrap()
         .expect("workflow task");
     backend
-        .release_workflow_task(claimed.claim, durust::WorkflowTaskRelease::immediate())
+        .release_workflow_task(
+            claimed.claim,
+            durust::provider::WorkflowTaskRelease::immediate(),
+        )
         .await
         .unwrap();
 
@@ -4157,7 +4251,7 @@ async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advanc
     backend
         .release_workflow_task(
             claimed.claim,
-            durust::WorkflowTaskRelease::delayed(Duration::from_millis(25)),
+            durust::provider::WorkflowTaskRelease::delayed(Duration::from_millis(25)),
         )
         .await
         .unwrap();
@@ -4185,13 +4279,13 @@ where
         .start_workflow::<workflow>("wf/query-raw", "query-raw-workflows", input(5))
         .await
         .unwrap();
-    let req = durust::QueryProjectionRequest {
+    let req = durust::provider::QueryProjectionRequest {
         namespace: Namespace::default(),
         workflow_id: durust::WorkflowId::new("wf/query-raw"),
     };
     assert_eq!(
         backend.query_projection(req.clone()).await.unwrap(),
-        durust::QueryProjectionOutcome::NoProjection
+        durust::provider::QueryProjectionOutcome::NoProjection
     );
 
     let claim_opts = workflow_claim_opts("query-raw-workflows");
@@ -4202,55 +4296,24 @@ where
         .expect("workflow task");
     assert_eq!(
         backend.query_projection(req.clone()).await.unwrap(),
-        durust::QueryProjectionOutcome::NoProjection
+        durust::provider::QueryProjectionOutcome::NoProjection
     );
-    let stale_payload = durust::encode_payload(&"stale").unwrap();
-    let conflict = backend
-        .commit_workflow_task(
-            claimed.claim.clone(),
-            WorkflowTaskCommit {
-                expected_tail_event_id: EventId::ZERO,
-                query_projection: Some(stale_payload),
-                ..WorkflowTaskCommit::default()
-            },
-        )
-        .await
-        .unwrap();
-    assert_eq!(conflict, CommitOutcome::Conflict);
-    assert_eq!(
-        backend.query_projection(req.clone()).await.unwrap(),
-        durust::QueryProjectionOutcome::NoProjection
-    );
-
-    let reclaimed = backend
-        .claim_workflow_task(
-            WorkerId::new("query-raw-reclaimer"),
-            workflow_claim_opts("query-raw-workflows"),
-        )
-        .await
-        .unwrap()
-        .expect("workflow task after conflict");
+    let reclaimed = claimed.clone();
     let projection_payload = durust::encode_payload(&"visible").unwrap();
     let committed = backend
         .commit_workflow_task(
             reclaimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 query_projection: Some(projection_payload.clone()),
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        committed,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(committed, EventId(1));
     assert_eq!(
         backend.query_projection(req).await.unwrap(),
-        durust::QueryProjectionOutcome::Found {
+        durust::provider::QueryProjectionOutcome::Found {
             run_id: claimed.run_id,
             event_id: EventId(1),
             payload: projection_payload,
@@ -4271,7 +4334,7 @@ where
     B: DurableBackend,
 {
     let run_id = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new(workflow_id),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -4284,7 +4347,7 @@ where
         .run_id()
         .clone();
     let raw_events = backend
-        .stream_history_for_replay(durust::StreamHistoryRequest {
+        .stream_history_for_replay(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1),
@@ -4308,7 +4371,7 @@ async fn claim_conformance_workflow<B>(
     backend: &B,
     worker: &str,
     queue: &str,
-) -> durust::ClaimedWorkflowTask
+) -> durust::provider::ClaimedWorkflowTask
 where
     B: DurableBackend,
 {
@@ -4321,7 +4384,6 @@ where
 
 fn projection_only_commit(payload: durust::PayloadRef) -> WorkflowTaskCommit {
     WorkflowTaskCommit {
-        expected_tail_event_id: EventId(1),
         query_projection: Some(payload),
         ..WorkflowTaskCommit::default()
     }
@@ -4406,13 +4468,13 @@ where
         .await
         .unwrap();
     let projection = backend
-        .query_projection(durust::QueryProjectionRequest {
+        .query_projection(durust::provider::QueryProjectionRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/foreign-scheme-blob"),
         })
         .await
         .unwrap();
-    let durust::QueryProjectionOutcome::Found { payload, .. } = projection else {
+    let durust::provider::QueryProjectionOutcome::Found { payload, .. } = projection else {
         panic!("expected opaque foreign-scheme projection");
     };
     assert_eq!(payload, foreign);
@@ -4475,7 +4537,7 @@ where
     for (case, mismatched) in cases {
         let workflow_id = format!("wf/blob-metadata-mismatch/{case}");
         let run_id = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new(&workflow_id),
                 workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -4499,7 +4561,6 @@ where
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     query_projection: Some(mismatched),
                     ..WorkflowTaskCommit::default()
                 },
@@ -4530,14 +4591,13 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let outcome = backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::VersionMarker(durust::VersionMarker {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::VersionMarker(durust::provider::VersionMarker {
                         command_id: command_id.clone(),
                         change_id: "replace-a-with-b".to_owned(),
                         version: 1,
@@ -4548,15 +4608,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let open = backend
-        .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+        .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
             namespace: Namespace::default(),
             workflow_id: None,
             run_id: Some(run_id.clone()),
@@ -4580,9 +4635,12 @@ where
     assert_eq!(record.version, 1);
     assert_eq!(
         record.marker_kind,
-        durust::WorkflowChangeMarkerKind::Version
+        durust::provider::WorkflowChangeMarkerKind::Version
     );
-    assert_eq!(record.status, durust::WorkflowChangeVersionStatus::Open);
+    assert_eq!(
+        record.status,
+        durust::provider::WorkflowChangeVersionStatus::Open
+    );
     assert_eq!(record.command_seq, durust::CommandSeq(1));
     assert_eq!(record.first_event_id, EventId(2));
 
@@ -4591,7 +4649,7 @@ where
         .await
         .unwrap();
     let closed = backend
-        .workflow_change_versions(durust::WorkflowChangeVersionsRequest {
+        .workflow_change_versions(durust::provider::WorkflowChangeVersionsRequest {
             namespace: Namespace::default(),
             workflow_id: None,
             run_id: Some(run_id),
@@ -4603,7 +4661,7 @@ where
     assert_eq!(closed.records.len(), 1);
     assert_eq!(
         closed.records[0].status,
-        durust::WorkflowChangeVersionStatus::Closed
+        durust::provider::WorkflowChangeVersionStatus::Closed
     );
 }
 
@@ -4626,8 +4684,7 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowContinuedAsNew {
                         input: durust::encode_payload(&7_u64).unwrap(),
                     },
@@ -4637,12 +4694,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let old_history = stream_history(&backend, first_run_id.clone()).await;
     assert_eq!(old_history.len(), 2);
@@ -4661,7 +4713,10 @@ where
         next.workflow_id,
         durust::WorkflowId::new("wf/continue-conformance")
     );
-    assert_eq!(next.reason, durust::WorkflowTaskReason::WorkflowStarted);
+    assert_eq!(
+        next.reason,
+        durust::provider::WorkflowTaskReason::WorkflowStarted
+    );
     assert_eq!(next.replay_target_event_id, EventId(1));
     let new_history = stream_history(&backend, next.run_id).await;
     assert_eq!(new_history.len(), 1);
@@ -4684,39 +4739,42 @@ where
         .signal_workflow("wf/signal-inbox", "ready", "signal/inbox/1", "first")
         .await
         .unwrap();
-    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(accepted, durust::provider::SignalWorkflowOutcome::Accepted);
     let duplicate = client
         .signal_workflow("wf/signal-inbox", "ready", "signal/inbox/1", "duplicate")
         .await
         .unwrap();
-    assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+    assert_eq!(
+        duplicate,
+        durust::provider::SignalWorkflowOutcome::Duplicate
+    );
     let second = client
         .signal_workflow("wf/signal-inbox", "ready", "signal/inbox/2", "second")
         .await
         .unwrap();
-    assert_eq!(second, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(second, durust::provider::SignalWorkflowOutcome::Accepted);
     let other = client
         .signal_workflow("wf/signal-inbox", "other", "signal/inbox/other", "other")
         .await
         .unwrap();
-    assert_eq!(other, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(other, durust::provider::SignalWorkflowOutcome::Accepted);
 
     let batch = backend
-        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+        .read_signal_inboxes(durust::provider::ReadSignalInboxesRequest {
             requests: vec![
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("ready"),
                 },
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("missing"),
                 },
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("other"),
                 },
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("ready"),
                 },
@@ -4750,7 +4808,7 @@ where
     );
 
     let first_inbox = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_id.clone(),
             signal_name: durust::SignalName::new("ready"),
         })
@@ -4778,22 +4836,16 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![first_inbox.signal_id],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let second_inbox = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_id.clone(),
             signal_name: durust::SignalName::new("ready"),
         })
@@ -4806,13 +4858,13 @@ where
     );
 
     let post_consume_batch = backend
-        .read_signal_inboxes(durust::ReadSignalInboxesRequest {
+        .read_signal_inboxes(durust::provider::ReadSignalInboxesRequest {
             requests: vec![
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id: run_id.clone(),
                     signal_name: durust::SignalName::new("ready"),
                 },
-                durust::ReadSignalInboxRequest {
+                durust::provider::ReadSignalInboxRequest {
                     run_id,
                     signal_name: durust::SignalName::new("other"),
                 },
@@ -4842,23 +4894,23 @@ fn signal_race_claim_opts(queue: &str) -> ClaimWorkflowTaskOptions {
         task_queue: TaskQueue::new(queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.signal-race", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     }
 }
 
 /// The commit the signal-race workflow's first task produces: no appends, one
 /// signal wait registered for command seq 1 on signal name `go`.
-fn signal_wait_commit(run_id: &durust::RunId, expected_tail: EventId) -> WorkflowTaskCommit {
-    let command_id = durust::command_id(run_id, 1);
+fn signal_wait_commit(run_id: &durust::RunId) -> WorkflowTaskCommit {
+    let command_id = durust::provider::command_id(run_id, 1);
     WorkflowTaskCommit {
-        expected_tail_event_id: expected_tail,
-        upsert_waits: vec![durust::WaitRecord {
+        upsert_waits: vec![durust::provider::WaitRecord {
             wait_id: durust::WaitId::new(format!(
                 "{}:{}:signal",
                 command_id.run_id, command_id.seq.0
             )),
             run_id: run_id.clone(),
             command_id,
-            kind: durust::WaitKind::Signal,
+            kind: durust::provider::WaitKind::Signal,
             key: "go".to_owned(),
             ready_at: None,
         }],
@@ -4927,7 +4979,10 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    assert_eq!(claimed.reason, durust::WorkflowTaskReason::WorkflowStarted);
+    assert_eq!(
+        claimed.reason,
+        durust::provider::WorkflowTaskReason::WorkflowStarted
+    );
 
     // The race: the signal lands while the task is claimed and the wait it
     // matches is only created by the claimed task's commit below.
@@ -4940,18 +4995,13 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(accepted, durust::provider::SignalWorkflowOutcome::Accepted);
 
     let outcome = backend
-        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id))
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let woken = backend
         .claim_workflow_task(
@@ -4961,9 +5011,15 @@ where
         .await
         .unwrap()
         .expect("run should be immediately claimable after the racing signal");
-    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+    assert_eq!(
+        woken.reason,
+        durust::provider::WorkflowTaskReason::SignalReceived
+    );
     backend
-        .release_workflow_task(woken.claim, durust::WorkflowTaskRelease::immediate())
+        .release_workflow_task(
+            woken.claim,
+            durust::provider::WorkflowTaskRelease::immediate(),
+        )
         .await
         .unwrap();
 
@@ -4976,7 +5032,7 @@ where
     )
     .await;
     let inbox = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id,
             signal_name: durust::SignalName::new("go"),
         })
@@ -5011,7 +5067,7 @@ where
         .unwrap()
         .expect("workflow task");
     backend
-        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id, EventId(1)))
+        .commit_workflow_task(claimed.claim, signal_wait_commit(&run_id))
         .await
         .unwrap();
     // Blocked on the signal: not claimable until a delivery arrives.
@@ -5035,7 +5091,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(first, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(first, durust::provider::SignalWorkflowOutcome::Accepted);
     let woken = backend
         .claim_workflow_task(
             WorkerId::new("signal-existing-claimer"),
@@ -5044,7 +5100,10 @@ where
         .await
         .unwrap()
         .expect("signal delivery should wake the run");
-    assert_eq!(woken.reason, durust::WorkflowTaskReason::SignalReceived);
+    assert_eq!(
+        woken.reason,
+        durust::provider::WorkflowTaskReason::SignalReceived
+    );
 
     // Second delivery lands while the task is claimed, matching the
     // pre-existing wait; the claimed task then commits nothing (a spurious
@@ -5058,23 +5117,17 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(second, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(second, durust::provider::SignalWorkflowOutcome::Accepted);
     let outcome = backend
         .commit_workflow_task(
             woken.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let rewoken = backend
         .claim_workflow_task(
@@ -5084,9 +5137,15 @@ where
         .await
         .unwrap()
         .expect("pending signals must keep the run claimable after an empty commit");
-    assert_eq!(rewoken.reason, durust::WorkflowTaskReason::SignalReceived);
+    assert_eq!(
+        rewoken.reason,
+        durust::provider::WorkflowTaskReason::SignalReceived
+    );
     backend
-        .release_workflow_task(rewoken.claim, durust::WorkflowTaskRelease::immediate())
+        .release_workflow_task(
+            rewoken.claim,
+            durust::provider::WorkflowTaskRelease::immediate(),
+        )
         .await
         .unwrap();
 
@@ -5100,7 +5159,7 @@ where
     )
     .await;
     let remaining = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id,
             signal_name: durust::SignalName::new("go"),
         })
@@ -5148,7 +5207,7 @@ where
             )
             .await
             .unwrap();
-        assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+        assert_eq!(accepted, durust::provider::SignalWorkflowOutcome::Accepted);
         claims.push(claimed);
     }
 
@@ -5158,7 +5217,7 @@ where
                 .iter()
                 .map(|claimed| WorkflowTaskCommitInput {
                     claim: claimed.claim.clone(),
-                    commit: signal_wait_commit(&claimed.run_id, EventId(1)),
+                    commit: signal_wait_commit(&claimed.run_id),
                 })
                 .collect(),
         })
@@ -5166,12 +5225,7 @@ where
         .unwrap();
     assert_eq!(results.len(), 2);
     for result in &results {
-        assert_eq!(
-            *result.result.as_ref().unwrap(),
-            CommitOutcome::Committed {
-                new_tail_event_id: EventId(1)
-            }
-        );
+        assert_eq!(*result.result.as_ref().unwrap(), EventId(1));
     }
 
     let mut woken = Vec::new();
@@ -5184,7 +5238,10 @@ where
             .await
             .unwrap()
             .expect("both committed runs should be claimable after racing signals");
-        assert_eq!(task.reason, durust::WorkflowTaskReason::SignalReceived);
+        assert_eq!(
+            task.reason,
+            durust::provider::WorkflowTaskReason::SignalReceived
+        );
         woken.push(task);
     }
     let woken_run_ids = woken
@@ -5194,7 +5251,10 @@ where
     assert_eq!(woken_run_ids.len(), 2, "each run wakes exactly once");
     for task in woken {
         backend
-            .release_workflow_task(task.claim, durust::WorkflowTaskRelease::immediate())
+            .release_workflow_task(
+                task.claim,
+                durust::provider::WorkflowTaskRelease::immediate(),
+            )
             .await
             .unwrap();
     }
@@ -5240,11 +5300,11 @@ where
         .cancel_workflow("wf/terminal-fence", "fence test")
         .await
         .unwrap();
-    let durust::CancelWorkflowOutcome::Cancelled { event_id, .. } = cancelled else {
+    let durust::provider::CancelWorkflowOutcome::Cancelled { .. } = cancelled else {
         panic!("expected cancellation, got {cancelled:?}");
     };
 
-    for (kind, commit) in terminal_fence_commits(&run_id, event_id) {
+    for (kind, commit) in terminal_fence_commits(&run_id) {
         let err = backend
             .commit_workflow_task(claimed.claim.clone(), commit)
             .await
@@ -5256,19 +5316,15 @@ where
     }
 }
 
-/// One commit per workflow-visible mutation kind, aimed at the post-cancel
-/// tail so only claim fencing (not a tail conflict) decides the outcome.
-fn terminal_fence_commits(
-    run_id: &durust::RunId,
-    expected_tail: EventId,
-) -> Vec<(&'static str, WorkflowTaskCommit)> {
-    let command_id = durust::command_id(run_id, 900);
+/// One commit per workflow-visible mutation kind, so every kind is shown to be
+/// rejected against a run the claim no longer owns.
+fn terminal_fence_commits(run_id: &durust::RunId) -> Vec<(&'static str, WorkflowTaskCommit)> {
+    let command_id = durust::provider::command_id(run_id, 900);
     let base = WorkflowTaskCommit {
-        expected_tail_event_id: expected_tail,
         ..WorkflowTaskCommit::default()
     };
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("terminal-fence-activities"),
@@ -5276,7 +5332,7 @@ fn terminal_fence_commits(
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-options".to_owned(),
@@ -5295,18 +5351,20 @@ fn terminal_fence_commits(
         (
             "schedule_activities",
             WorkflowTaskCommit {
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..base.clone()
             },
         ),
         (
             "upsert_waits",
             WorkflowTaskCommit {
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!("{run_id}:900:signal")),
                     run_id: run_id.clone(),
                     command_id: command_id.clone(),
-                    kind: durust::WaitKind::Signal,
+                    kind: durust::provider::WaitKind::Signal,
                     key: "go".to_owned(),
                     ready_at: None,
                 }],
@@ -5330,13 +5388,13 @@ fn terminal_fence_commits(
         (
             "start_child_workflows",
             WorkflowTaskCommit {
-                start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                start_child_workflows: vec![durust::provider::ChildStartOutboxMessage {
                     command_id: command_id.clone(),
                     workflow_id: durust::WorkflowId::new(format!("{run_id}/fence-child")),
                     workflow_type: WorkflowType::new("conformance.signal-race", 1),
                     task_queue: TaskQueue::new("terminal-fence-workflows"),
                     input: durust::encode_payload(&Input { value: 0 }).unwrap(),
-                    parent_close_policy: durust::ParentClosePolicy::Cancel,
+                    parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
                     child_map_item: None,
                 }],
                 ..base.clone()
@@ -5345,7 +5403,7 @@ fn terminal_fence_commits(
         (
             "schedule_activity_maps",
             WorkflowTaskCommit {
-                schedule_activity_maps: vec![durust::ActivityMapTask {
+                schedule_activity_maps: vec![durust::provider::ActivityMapTask {
                     map_command_id: command_id.clone(),
                     activity_name: ActivityName::new("conformance.echo"),
                     task_queue: TaskQueue::new("terminal-fence-activities"),
@@ -5370,8 +5428,8 @@ fn terminal_fence_commits(
                     result_manifest_name: "results".to_owned(),
                     workflow_id_prefix: format!("{run_id}/fence-child-map"),
                     max_in_flight: 1,
-                    parent_close_policy: durust::ParentClosePolicy::Cancel,
-                    failure_mode: durust::ChildWorkflowMapFailureMode::FailFast,
+                    parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                    failure_mode: durust::provider::ChildWorkflowMapFailureMode::FailFast,
                 }],
                 ..base.clone()
             },
@@ -5401,7 +5459,7 @@ where
     B: DurableBackend,
 {
     let signalled = backend
-        .signal_workflow(durust::SignalWorkflowRequest {
+        .signal_workflow(durust::provider::SignalWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/never-started"),
             signal_id: durust::SignalId::new("sig/never-started"),
@@ -5414,7 +5472,7 @@ where
         "{signalled:?}"
     );
     let cancelled = backend
-        .cancel_workflow(durust::CancelWorkflowRequest {
+        .cancel_workflow(durust::provider::CancelWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/never-started"),
             reason: "operator".to_owned(),
@@ -5437,8 +5495,8 @@ where
         matches!(result, Err(Error::RunNotFound(run_id)) if run_id.0 == "run-never-started")
     }
 
-    let claim = durust::ActivityTaskClaim {
-        activity_id: durust::ActivityId::new(&durust::command_id(
+    let claim = durust::provider::ActivityTaskClaim {
+        activity_id: durust::ActivityId::new(&durust::provider::command_id(
             &durust::RunId::new("run-never-started"),
             1,
         )),
@@ -5460,13 +5518,13 @@ where
         .await;
     assert!(names_the_unknown_run(&failure), "{failure:?}");
     let heartbeat = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: claim.clone(),
         })
         .await;
     assert!(names_the_unknown_run(&heartbeat), "{heartbeat:?}");
     let batch = backend
-        .complete_activity_tasks(durust::CompleteActivityTasksRequest {
+        .complete_activity_tasks(durust::provider::CompleteActivityTasksRequest {
             completions: vec![CompleteActivityRequest {
                 claim,
                 result: durust::encode_payload(&1_u64).unwrap(),
@@ -5508,9 +5566,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input_payload = durust::encode_payload(&Input { value: 3 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("terminal-cleanup-activities"),
@@ -5518,7 +5576,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: Some(Duration::from_secs(30)),
         input: input_payload.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input_payload),
             "sha256:test-options".to_owned(),
@@ -5528,11 +5586,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -5562,7 +5621,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(undelivered, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(
+        undelivered,
+        durust::provider::SignalWorkflowOutcome::Accepted
+    );
 
     client
         .cancel_workflow("wf/terminal-cleanup", "terminal cleanup test")
@@ -5572,14 +5634,14 @@ where
     // Late calls answer idempotently from row absence, on every retry.
     for attempt in 0..2 {
         let heartbeat = backend
-            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
                 claim: activity.claim.clone(),
             })
             .await
             .unwrap();
         assert_eq!(
             heartbeat,
-            durust::ActivityHeartbeatOutcome::AlreadyCompleted,
+            durust::provider::ActivityHeartbeatOutcome::AlreadyCompleted,
             "heartbeat retry {attempt}"
         );
         let completed = backend
@@ -5591,7 +5653,7 @@ where
             .unwrap();
         assert_eq!(
             completed,
-            durust::CompleteActivityOutcome::AlreadyCompleted,
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted,
             "complete retry {attempt}"
         );
         let failed = backend
@@ -5603,7 +5665,7 @@ where
             .unwrap();
         assert_eq!(
             failed,
-            durust::FailActivityOutcome::AlreadyCompleted,
+            durust::provider::FailActivityOutcome::AlreadyCompleted,
             "fail retry {attempt}"
         );
     }
@@ -5620,7 +5682,7 @@ where
     // The undelivered signal stays readable and its dedup record survives;
     // a genuinely new send fails terminally.
     let inboxed = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_id.clone(),
             signal_name: durust::SignalName::new("go"),
         })
@@ -5640,7 +5702,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(duplicate, durust::SignalWorkflowOutcome::Duplicate);
+    assert_eq!(
+        duplicate,
+        durust::provider::SignalWorkflowOutcome::Duplicate
+    );
     let fresh = client
         .signal_workflow(
             "wf/terminal-cleanup",
@@ -5676,7 +5741,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(accepted, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(accepted, durust::provider::SignalWorkflowOutcome::Accepted);
 
     let claimed = backend
         .claim_workflow_task(
@@ -5686,22 +5751,23 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let signal_payload = durust::encode_payload(&"first").unwrap();
     // One commit consumes the delivery and continues the run as new.
     backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
                     NewHistoryEvent::new(HistoryEventData::SignalConsumed(
-                        durust::SignalConsumed {
+                        durust::provider::SignalConsumed {
                             command_id: command_id.clone(),
                             signal_id: consumed_signal_id.clone(),
                             signal_name: durust::SignalName::new("go"),
                             payload: signal_payload,
-                            fingerprint: durust::signal_fingerprint(durust::SignalName::new("go")),
+                            fingerprint: durust::provider::signal_fingerprint(
+                                durust::SignalName::new("go"),
+                            ),
                         },
                     )),
                     NewHistoryEvent::new(HistoryEventData::WorkflowContinuedAsNew {
@@ -5726,14 +5792,14 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(retried, durust::SignalWorkflowOutcome::Duplicate);
+    assert_eq!(retried, durust::provider::SignalWorkflowOutcome::Duplicate);
 
     // The continued run is live under the same workflow id: fresh sends land.
     let fresh = client
         .signal_workflow("wf/can-signal-dedup", "go", "signal/can-dedup/next", "next")
         .await
         .unwrap();
-    assert_eq!(fresh, durust::SignalWorkflowOutcome::Accepted);
+    assert_eq!(fresh, durust::provider::SignalWorkflowOutcome::Accepted);
 }
 
 /// Late completion and failure of an activity whose run was cancelled must be
@@ -5761,9 +5827,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input_payload = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("late-completion-activities"),
@@ -5771,7 +5837,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input_payload.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input_payload),
             "sha256:test-options".to_owned(),
@@ -5781,11 +5847,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -5823,7 +5890,7 @@ where
             .unwrap();
         assert_eq!(
             completed,
-            durust::CompleteActivityOutcome::AlreadyCompleted,
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted,
             "complete retry {attempt}"
         );
         let failed = backend
@@ -5835,7 +5902,7 @@ where
             .unwrap();
         assert_eq!(
             failed,
-            durust::FailActivityOutcome::AlreadyCompleted,
+            durust::provider::FailActivityOutcome::AlreadyCompleted,
             "fail retry {attempt}"
         );
     }
@@ -5865,25 +5932,27 @@ where
         .expect("workflow task");
     let now = backend.current_time().await.unwrap();
     let fire_at = durust::TimestampMs(now.0.saturating_add(50));
-    let command_id = durust::command_id(&claimed.run_id, 1);
+    let command_id = durust::provider::command_id(&claimed.run_id, 1);
     let wait_id = durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
     let outcome = backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::provider::TimerStarted {
                         command_id: command_id.clone(),
                         fire_at,
-                        fingerprint: durust::timer_fingerprint("sleep", durust::TimestampMs(50)),
+                        fingerprint: durust::provider::timer_fingerprint(
+                            "sleep",
+                            durust::TimestampMs(50),
+                        ),
                     }),
                 )],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id,
                     run_id: command_id.run_id.clone(),
                     command_id: command_id.clone(),
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
@@ -5892,15 +5961,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let early = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now,
             limit: 16,
@@ -5915,7 +5979,7 @@ where
     assert!(hidden.is_none());
 
     let due = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: fire_at,
             limit: 16,
@@ -5924,7 +5988,7 @@ where
         .unwrap();
     assert_eq!(due.fired, 1);
     let duplicate = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: fire_at,
             limit: 16,
@@ -5938,7 +6002,10 @@ where
         .await
         .unwrap()
         .expect("timer-fired workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::TimerFired);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::TimerFired
+    );
 }
 
 async fn activity_retry_reschedules_until_max_attempts<B>(backend: B)
@@ -5956,13 +6023,13 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
     // No backoff: this suite pins retry bookkeeping (attempt counts, history
     // silence, terminal failure), not retry pacing, and must stay immediate
     // for every provider clock. Backoff pacing has its own conformance tests.
     let retry_policy = durust::RetryPolicy::none().max_attempts(2);
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("retry-activities"),
@@ -5970,7 +6037,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-options".to_owned(),
@@ -5980,11 +6047,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6012,7 +6080,7 @@ where
         .unwrap();
     assert!(matches!(
         retried,
-        durust::FailActivityOutcome::RetryScheduled {
+        durust::provider::FailActivityOutcome::RetryScheduled {
             next_attempt: 2,
             ..
         }
@@ -6038,7 +6106,7 @@ where
         .unwrap();
     assert_eq!(
         failed,
-        durust::FailActivityOutcome::Failed {
+        durust::provider::FailActivityOutcome::Failed {
             event_id: EventId(3)
         }
     );
@@ -6047,7 +6115,10 @@ where
         .await
         .unwrap()
         .expect("activity failed workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityFailed);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityFailed
+    );
 
     let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
@@ -6081,10 +6152,10 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
     let retry_policy = durust::RetryPolicy::exponential().max_attempts(5);
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("non-retryable-activities"),
@@ -6092,7 +6163,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-options".to_owned(),
@@ -6102,11 +6173,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6138,7 +6210,7 @@ where
         .unwrap();
     assert_eq!(
         failed,
-        durust::FailActivityOutcome::Failed {
+        durust::provider::FailActivityOutcome::Failed {
             event_id: EventId(3)
         }
     );
@@ -6153,7 +6225,10 @@ where
         .await
         .unwrap()
         .expect("activity failed workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityFailed);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityFailed
+    );
 
     let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityFailed(failed) = &history[2].data else {
@@ -6177,7 +6252,7 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
     // A zero initial interval keeps the timed-out attempt's retry claimable
     // at once on the wall-clock providers; the memory-only test below covers
@@ -6185,7 +6260,7 @@ where
     let retry_policy = durust::RetryPolicy::exponential()
         .max_attempts(2)
         .initial_interval(Duration::ZERO);
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("timeout-activities"),
@@ -6193,7 +6268,7 @@ where
         start_to_close_timeout: Some(Duration::from_secs(1)),
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-options".to_owned(),
@@ -6203,11 +6278,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6222,7 +6298,7 @@ where
     };
     let after_schedule = backend.current_time().await.unwrap();
     let early = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_schedule.0.saturating_add(100)),
             limit: 16,
@@ -6238,7 +6314,7 @@ where
         .expect("first attempt");
     assert_eq!(first.task.attempt, 1);
     let retry = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_schedule.0.saturating_add(1_200)),
             limit: 16,
@@ -6267,7 +6343,7 @@ where
         .expect("second attempt");
     assert_eq!(second.task.attempt, 2);
     let final_timeout = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_schedule.0.saturating_add(2_400)),
             limit: 16,
@@ -6276,7 +6352,7 @@ where
         .unwrap();
     assert_eq!(final_timeout.timed_out, 1);
     let duplicate_timeout = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_schedule.0.saturating_add(2_500)),
             limit: 16,
@@ -6293,7 +6369,7 @@ where
         .unwrap();
     assert_eq!(
         late_completion,
-        durust::CompleteActivityOutcome::AlreadyCompleted
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
 
     let ready = backend
@@ -6301,7 +6377,10 @@ where
         .await
         .unwrap()
         .expect("activity timed-out workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
 
     let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
@@ -6337,7 +6416,7 @@ where
 
     let claimed_at = backend.current_time().await.unwrap();
     let early = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(claimed_at.0.saturating_add(100)),
             limit: 16,
@@ -6347,24 +6426,27 @@ where
     assert_eq!(early.timed_out, 0);
 
     let recorded = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: activity.claim.clone(),
         })
         .await
         .unwrap();
-    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    assert_eq!(
+        recorded,
+        durust::provider::ActivityHeartbeatOutcome::Recorded
+    );
 
     let mut stale_claim = activity.claim.clone();
     stale_claim.token = stale_claim.token.saturating_add(1);
     let stale = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest { claim: stale_claim })
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest { claim: stale_claim })
         .await
         .unwrap_err();
     assert!(matches!(stale, Error::StaleLease));
 
     let heartbeat_at = backend.current_time().await.unwrap();
     let still_early = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(heartbeat_at.0.saturating_add(100)),
             limit: 16,
@@ -6374,7 +6456,7 @@ where
     assert_eq!(still_early.timed_out, 0);
 
     let final_timeout = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(heartbeat_at.0.saturating_add(500)),
             limit: 16,
@@ -6388,7 +6470,10 @@ where
         .await
         .unwrap()
         .expect("heartbeat timeout workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
 
     let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
@@ -6425,7 +6510,7 @@ where
     assert_eq!(first.task.attempt, 1);
     let first_claimed_at = backend.current_time().await.unwrap();
     let retry = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(first_claimed_at.0.saturating_add(500)),
             limit: 16,
@@ -6458,7 +6543,7 @@ where
     assert_eq!(second.task.attempt, 2);
     let second_claimed_at = backend.current_time().await.unwrap();
     let final_timeout = backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(second_claimed_at.0.saturating_add(500)),
             limit: 16,
@@ -6472,7 +6557,10 @@ where
         .await
         .unwrap()
         .expect("heartbeat timeout workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
 
     let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
@@ -6507,9 +6595,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new(activity_queue),
@@ -6517,7 +6605,7 @@ where
         start_to_close_timeout: Some(Duration::from_secs(10)),
         heartbeat_timeout: Some(Duration::from_millis(200)),
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-heartbeat-options".to_owned(),
@@ -6527,11 +6615,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6572,7 +6661,10 @@ where
 
     // Releasing the claim restores normal claimability.
     backend
-        .release_workflow_task(claimed.claim, durust::WorkflowTaskRelease::immediate())
+        .release_workflow_task(
+            claimed.claim,
+            durust::provider::WorkflowTaskRelease::immediate(),
+        )
         .await
         .unwrap();
     let reclaimed = backend
@@ -6619,6 +6711,7 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         task_queue: TaskQueue::new(workflow_queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
         lease_duration,
+        shard_filter: None,
     };
     let original = backend
         .claim_workflow_task(WorkerId::new("lease-crash-holder"), claim_opts.clone())
@@ -6662,7 +6755,6 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         .commit_workflow_task(
             original.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: original.replay_target_event_id,
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6670,7 +6762,10 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         .unwrap_err();
     assert!(matches!(stale_commit, Error::StaleLease));
     let stale_release = backend
-        .release_workflow_task(original.claim, durust::WorkflowTaskRelease::immediate())
+        .release_workflow_task(
+            original.claim,
+            durust::provider::WorkflowTaskRelease::immediate(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(stale_release, Error::StaleLease));
@@ -6679,7 +6774,6 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         .commit_workflow_task(
             reclaimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: reclaimed.replay_target_event_id,
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                     result: durust::encode_payload(&5_u64).unwrap(),
                 })],
@@ -6688,7 +6782,7 @@ async fn workflow_lease_expiry_reclaims_and_fences_stale_holder<
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 }
 
 async fn schedule_timeoutless_activity<B>(
@@ -6715,9 +6809,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
+    let command_id = durust::provider::command_id(&run_id, 1);
     let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: command_id.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new(activity_queue),
@@ -6729,7 +6823,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&input),
             "sha256:test-timeoutless-options".to_owned(),
@@ -6739,11 +6833,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityScheduled(scheduled.clone()),
                 )],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -6784,7 +6879,7 @@ where
     // While the lease is unexpired the timeout scan leaves the claim alone and
     // the task is not claimable by anyone else.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(claimed_at.0.saturating_add(100)),
             limit: 16,
@@ -6803,7 +6898,7 @@ where
     // Past the 30s claim lease the timeout scan reclaims the task through the
     // existing retry machinery, making it claimable as attempt 2.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(claimed_at.0.saturating_add(31_000)),
             limit: 16,
@@ -6819,7 +6914,7 @@ where
 
     // Every operation from the crashed holder is fenced as stale.
     let stale_heartbeat = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: first.claim.clone(),
         })
         .await
@@ -6852,14 +6947,17 @@ where
         .unwrap();
     assert!(matches!(
         completed,
-        durust::CompleteActivityOutcome::Completed { .. }
+        durust::provider::CompleteActivityOutcome::Completed { .. }
     ));
     let ready = backend
         .claim_workflow_task(WorkerId::new("timeoutless-ready"), claim_opts)
         .await
         .unwrap()
         .expect("activity completion workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityCompleted
+    );
     assert_eq!(ready.run_id, run_id);
 }
 
@@ -6893,18 +6991,21 @@ where
 
     let before_heartbeat = backend.current_time().await.unwrap();
     let recorded = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: first.claim.clone(),
         })
         .await
         .unwrap();
-    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    assert_eq!(
+        recorded,
+        durust::provider::ActivityHeartbeatOutcome::Recorded
+    );
     let after_heartbeat = backend.current_time().await.unwrap();
 
     // The refreshed deadline sits at least one lease past the pre-heartbeat
     // instant, so a scan just short of that must leave the claim alone.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
             limit: 16,
@@ -6926,7 +7027,7 @@ where
     // One lease after the last heartbeat the holder counts as crashed and
     // the scan reclaims the task as attempt 2.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
             limit: 16,
@@ -6945,7 +7046,7 @@ where
 
     // Every operation from the stopped holder is fenced as stale.
     let stale_heartbeat = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: first.claim.clone(),
         })
         .await
@@ -6973,7 +7074,7 @@ where
     // missed-heartbeat or start-to-close message.
     let second_claimed_at = backend.current_time().await.unwrap();
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(second_claimed_at.0.saturating_add(lease_ms + 1)),
             limit: 16,
@@ -6985,7 +7086,10 @@ where
         .await
         .unwrap()
         .expect("terminal timeout workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
     assert_eq!(ready.run_id, run_id);
     let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
@@ -7036,18 +7140,21 @@ where
 
     let before_heartbeat = backend.current_time().await.unwrap();
     let recorded = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: first.claim.clone(),
         })
         .await
         .unwrap();
-    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    assert_eq!(
+        recorded,
+        durust::provider::ActivityHeartbeatOutcome::Recorded
+    );
     let after_heartbeat = backend.current_time().await.unwrap();
 
     // Just short of one lease past the last heartbeat the claim holds: the
     // heartbeat re-armed the batch-stamped implicit deadline.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(before_heartbeat.0.saturating_add(lease_ms - 1)),
             limit: 16,
@@ -7072,7 +7179,7 @@ where
     // One lease after the last heartbeat the task reclaims as attempt 2,
     // again through the batch claim RPC; the old holder is fenced.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_heartbeat.0.saturating_add(lease_ms + 1)),
             limit: 16,
@@ -7113,7 +7220,7 @@ where
     // one) fails one of these two boundaries. The lapse exhausts the retry
     // budget and records the lease attribution.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(before_second_claim.0.saturating_add(lease_ms - 1)),
             limit: 16,
@@ -7135,7 +7242,7 @@ where
         "batch claim must stamp the implicit deadline one full lease ahead"
     );
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_second_claim.0.saturating_add(lease_ms + 1)),
             limit: 16,
@@ -7147,7 +7254,10 @@ where
         .await
         .unwrap()
         .expect("terminal timeout workflow task (batch claim must stamp a deadline)");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
     assert_eq!(ready.run_id, run_id);
     let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
@@ -7192,17 +7302,20 @@ where
 
     let before_heartbeat = backend.current_time().await.unwrap();
     let recorded = backend
-        .heartbeat_activity(durust::ActivityHeartbeatRequest {
+        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
             claim: first.claim.clone(),
         })
         .await
         .unwrap();
-    assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+    assert_eq!(
+        recorded,
+        durust::provider::ActivityHeartbeatOutcome::Recorded
+    );
     let after_heartbeat = backend.current_time().await.unwrap();
 
     // Just short of the 200ms explicit cadence the claim holds.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(before_heartbeat.0.saturating_add(199)),
             limit: 16,
@@ -7222,7 +7335,7 @@ where
     // explicit cadence reclaims the task; the exhausted retry budget makes
     // the miss terminal with the missed-heartbeat attribution.
     backend
-        .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+        .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(after_heartbeat.0.saturating_add(201)),
             limit: 16,
@@ -7234,7 +7347,10 @@ where
         .await
         .unwrap()
         .expect("heartbeat timeout workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityTimedOut);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityTimedOut
+    );
     assert_eq!(ready.run_id, run_id);
     let history = stream_history(&backend, run_id).await;
     let HistoryEventData::ActivityTimedOut(timed_out) = &history[2].data else {
@@ -7285,7 +7401,7 @@ async fn heartbeating_timeoutless_activity_survives_lease_periods<B, F, Fut>(
         // deadline as re-armed by the previous heartbeat only.
         let now = backend.current_time().await.unwrap();
         backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now,
                 limit: 16,
@@ -7293,12 +7409,15 @@ async fn heartbeating_timeoutless_activity_survives_lease_periods<B, F, Fut>(
             .await
             .unwrap();
         let recorded = backend
-            .heartbeat_activity(durust::ActivityHeartbeatRequest {
+            .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
                 claim: claimed.claim.clone(),
             })
             .await
             .expect("heartbeating holder must never be reclaimed");
-        assert_eq!(recorded, durust::ActivityHeartbeatOutcome::Recorded);
+        assert_eq!(
+            recorded,
+            durust::provider::ActivityHeartbeatOutcome::Recorded
+        );
     }
     let now = backend.current_time().await.unwrap();
     assert!(
@@ -7317,14 +7436,17 @@ async fn heartbeating_timeoutless_activity_survives_lease_periods<B, F, Fut>(
         .unwrap();
     assert!(matches!(
         completed,
-        durust::CompleteActivityOutcome::Completed { .. }
+        durust::provider::CompleteActivityOutcome::Completed { .. }
     ));
     let ready = backend
         .claim_workflow_task(WorkerId::new("hb-timeoutless-ready"), claim_opts)
         .await
         .unwrap()
         .expect("activity completion workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityCompleted);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityCompleted
+    );
     assert_eq!(ready.run_id, run_id);
     let history = stream_history(&backend, run_id).await;
     assert!(
@@ -7412,10 +7534,10 @@ where
         .await
         .unwrap();
     let claim_opts = workflow_claim_opts("cancel-command-workflows");
-    let activity_command = durust::command_id(&run_id, 1);
-    let timer_command = durust::command_id(&run_id, 2);
+    let activity_command = durust::provider::command_id(&run_id, 1);
+    let timer_command = durust::provider::command_id(&run_id, 2);
     let activity_input = durust::encode_payload(&Input { value: 5 }).unwrap();
-    let scheduled = durust::ActivityScheduled {
+    let scheduled = durust::provider::ActivityScheduled {
         command_id: activity_command.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("activities"),
@@ -7423,7 +7545,7 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: activity_input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&activity_input),
             "sha256:cancel-command-options".to_owned(),
@@ -7441,40 +7563,41 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                         scheduled.clone(),
                     )),
-                    durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                        durust::TimerStarted {
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                        durust::provider::TimerStarted {
                             command_id: timer_command.clone(),
                             fire_at: durust::TimestampMs(10),
-                            fingerprint: durust::timer_fingerprint(
+                            fingerprint: durust::provider::timer_fingerprint(
                                 "sleep",
                                 durust::TimestampMs(10),
                             ),
                         },
                     )),
                 ],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
                         timer_command.run_id, timer_command.seq.0
                     )),
                     run_id: timer_command.run_id.clone(),
                     command_id: timer_command.clone(),
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(durust::TimestampMs(10)),
                 }],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                    &scheduled,
+                )],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 
     let claimed_activity = backend
         .claim_activity_task(
@@ -7490,7 +7613,7 @@ where
         .unwrap()
         .expect("activity task");
     let fired = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10),
             limit: 10,
@@ -7509,14 +7632,13 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(4),
                 cancel_commands: vec![activity_command],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .unwrap();
-    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+    assert!(outcome.0 > 0);
 
     let late_completion = backend
         .complete_activity(CompleteActivityRequest {
@@ -7527,7 +7649,7 @@ where
         .unwrap();
     assert_eq!(
         late_completion,
-        durust::CompleteActivityOutcome::AlreadyCompleted
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
 }
 
@@ -7539,12 +7661,12 @@ where
         backend.clone(),
         "wf/child-dispatch-parent",
         "wf/child-dispatch-child",
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ParentClosePolicy::Cancel,
     )
     .await;
 
     let dispatched = backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7555,7 +7677,7 @@ where
         "providers may dispatch one queued child start or inline it during commit"
     );
     let duplicate = backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7573,7 +7695,7 @@ where
         .expect("parent woken by child start");
     assert_eq!(
         parent_ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowStarted
+        durust::provider::WorkflowTaskReason::ChildWorkflowStarted
     );
 
     let child_ready = backend
@@ -7605,11 +7727,11 @@ where
         backend.clone(),
         "wf/child-completion-parent",
         "wf/child-completion-child",
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ParentClosePolicy::Cancel,
     )
     .await;
     backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7628,8 +7750,7 @@ where
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: result.clone(),
                     },
@@ -7650,7 +7771,7 @@ where
         .expect("parent woken by child completion");
     assert_eq!(
         parent_ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowCompleted
+        durust::provider::WorkflowTaskReason::ChildWorkflowCompleted
     );
     let history = stream_history(&backend, parent_run_id).await;
     let completed = history
@@ -7687,11 +7808,11 @@ where
         backend.clone(),
         "wf/child-conflict-parent",
         "wf/child-conflict-child",
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ParentClosePolicy::Cancel,
     )
     .await;
     backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7729,11 +7850,11 @@ where
         backend.clone(),
         "wf/child-cancel-parent",
         "wf/child-cancel-child",
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ParentClosePolicy::Cancel,
     )
     .await;
     backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7748,10 +7869,7 @@ where
         .unwrap()
         .expect("parent ready after child start");
     backend
-        .commit_workflow_task(
-            parent.claim,
-            terminal_parent_commit(parent.replay_target_event_id),
-        )
+        .commit_workflow_task(parent.claim, terminal_parent_commit())
         .await
         .unwrap();
 
@@ -7788,11 +7906,11 @@ where
         backend.clone(),
         "wf/child-abandon-parent",
         "wf/child-abandon-child",
-        durust::ParentClosePolicy::Abandon,
+        durust::provider::ParentClosePolicy::Abandon,
     )
     .await;
     backend
-        .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+        .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
             namespace: Namespace::default(),
             limit: 16,
         })
@@ -7807,10 +7925,7 @@ where
         .unwrap()
         .expect("parent ready after child start");
     backend
-        .commit_workflow_task(
-            parent.claim,
-            terminal_parent_commit(parent.replay_target_event_id),
-        )
+        .commit_workflow_task(parent.claim, terminal_parent_commit())
         .await
         .unwrap();
 
@@ -7828,7 +7943,7 @@ async fn schedule_child_start<B>(
     backend: B,
     parent_workflow_id: &str,
     child_workflow_id: &str,
-    parent_close_policy: durust::ParentClosePolicy,
+    parent_close_policy: durust::provider::ParentClosePolicy,
 ) -> (durust::RunId, durust::CommandId)
 where
     B: DurableBackend,
@@ -7846,19 +7961,19 @@ where
         .await
         .unwrap()
         .expect("parent workflow task");
-    let command_id = durust::command_id(&parent_run_id, 1);
+    let command_id = durust::provider::command_id(&parent_run_id, 1);
     let input = durust::encode_payload(&7_u64).unwrap();
     let workflow_type = durust::WorkflowType::new("conformance.workflow", 1);
     let workflow_id = durust::WorkflowId::new(child_workflow_id);
     let task_queue = TaskQueue::new("child-workflows");
-    let requested = durust::ChildWorkflowStartRequested {
+    let requested = durust::provider::ChildWorkflowStartRequested {
         command_id: command_id.clone(),
         workflow_type: workflow_type.clone(),
         workflow_id: workflow_id.clone(),
         task_queue: task_queue.clone(),
         input: input.clone(),
         parent_close_policy,
-        fingerprint: durust::child_workflow_fingerprint(
+        fingerprint: durust::provider::child_workflow_fingerprint(
             workflow_type,
             workflow_id,
             durust::payload_digest(&input),
@@ -7870,13 +7985,12 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
                 )],
-                start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
-                    &requested,
-                )],
+                start_child_workflows: vec![
+                    durust::provider::ChildStartOutboxMessage::from_requested(&requested),
+                ],
                 ..WorkflowTaskCommit::default()
             },
         )
@@ -7892,15 +8006,15 @@ async fn schedule_child_workflow_map<B>(
     parent_queue: &str,
     child_queue: &str,
     workflow_id_prefix: &str,
-    failure_mode: durust::ChildWorkflowMapFailureMode,
-    parent_close_policy: durust::ParentClosePolicy,
+    failure_mode: durust::provider::ChildWorkflowMapFailureMode,
+    parent_close_policy: durust::provider::ParentClosePolicy,
     max_in_flight: usize,
 ) -> (
     durust::RunId,
     durust::CommandId,
     ClaimWorkflowTaskOptions,
     ClaimWorkflowTaskOptions,
-    durust::Result<CommitOutcome>,
+    durust::Result<EventId>,
 )
 where
     B: DurableBackend,
@@ -7920,8 +8034,8 @@ where
         .await
         .unwrap()
         .expect("parent workflow task");
-    let command_id = durust::command_id(&parent_run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&parent_run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [1_u64, 2, 3]
             .into_iter()
             .map(|value| durust::encode_payload(&value).unwrap())
@@ -7943,7 +8057,7 @@ where
         parent_close_policy,
         failure_mode,
     };
-    let scheduled = durust::ChildWorkflowMapScheduled {
+    let scheduled = durust::provider::ChildWorkflowMapScheduled {
         command_id: command_id.clone(),
         workflow_type: workflow_type.clone(),
         task_queue: task_queue.clone(),
@@ -7953,7 +8067,7 @@ where
         max_in_flight,
         parent_close_policy,
         failure_mode,
-        fingerprint: durust::child_workflow_map_fingerprint(
+        fingerprint: durust::provider::child_workflow_map_fingerprint(
             workflow_type,
             durust::payload_digest(&input_manifest),
             result_manifest_name,
@@ -7968,8 +8082,7 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                 )],
                 schedule_child_workflow_maps: vec![map_task],
@@ -7986,7 +8099,7 @@ where
 {
     for _ in 0..4 {
         let dispatched = backend
-            .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
                 namespace: Namespace::default(),
                 limit: 16,
             })
@@ -7998,16 +8111,18 @@ where
     }
 }
 
-async fn complete_child_run<B>(backend: &B, child: durust::ClaimedWorkflowTask, value: u64)
-where
+async fn complete_child_run<B>(
+    backend: &B,
+    child: durust::provider::ClaimedWorkflowTask,
+    value: u64,
+) where
     B: DurableBackend,
 {
     backend
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&value).unwrap(),
                     },
@@ -8021,7 +8136,7 @@ where
 
 async fn fail_child_run<B>(
     backend: &B,
-    child: durust::ClaimedWorkflowTask,
+    child: durust::provider::ClaimedWorkflowTask,
     error_type: &str,
     message: &str,
 ) where
@@ -8031,8 +8146,7 @@ async fn fail_child_run<B>(
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowFailed {
                         failure: durust::DurableFailure::new(error_type, message),
                     },
@@ -8044,16 +8158,18 @@ async fn fail_child_run<B>(
         .unwrap();
 }
 
-async fn cancel_child_run<B>(backend: &B, child: durust::ClaimedWorkflowTask, reason: &str)
-where
+async fn cancel_child_run<B>(
+    backend: &B,
+    child: durust::provider::ClaimedWorkflowTask,
+    reason: &str,
+) where
     B: DurableBackend,
 {
     backend
         .commit_workflow_task(
             child.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: child.replay_target_event_id,
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCancelled {
                         reason: reason.to_owned(),
                     },
@@ -8119,8 +8235,8 @@ async fn child_workflow_map_fail_fast_history_strings<B>(
         "child-map-fail-fast-strings-parent",
         "child-map-fail-fast-strings-children",
         workflow_id_prefix,
-        durust::ChildWorkflowMapFailureMode::FailFast,
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
         2,
     )
     .await;
@@ -8163,7 +8279,7 @@ async fn child_workflow_map_fail_fast_history_strings<B>(
         .expect("parent ready after the map failed fast");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapFailed
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapFailed
     );
 
     let history = stream_history(&backend, run_id).await;
@@ -8224,7 +8340,7 @@ fn postgres_child_workflow_map_fail_fast_history_strings_are_pinned_when_configu
     ));
 }
 
-fn assert_compact_child_workflow_map_parent_history(history: &[durust::HistoryEvent]) {
+fn assert_compact_child_workflow_map_parent_history(history: &[durust::provider::HistoryEvent]) {
     assert!(
         history
             .iter()
@@ -8249,13 +8365,69 @@ fn workflow_claim_opts(task_queue: &str) -> ClaimWorkflowTaskOptions {
         task_queue: TaskQueue::new(task_queue),
         registered_workflow_types: vec![WorkflowType::new("conformance.workflow", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     }
 }
 
-fn terminal_parent_commit(expected_tail_event_id: EventId) -> WorkflowTaskCommit {
+fn racing_fact_activity(command_id: &durust::CommandId) -> durust::provider::ActivityScheduled {
+    let input = durust::encode_payload(&Input { value: 3 }).unwrap();
+    durust::provider::ActivityScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("conformance.echo"),
+        task_queue: TaskQueue::new("racing-fact-activities"),
+        retry_policy: durust::RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input: input.clone(),
+        fingerprint: durust::provider::activity_fingerprint(
+            ActivityName::new("conformance.echo"),
+            durust::payload_digest(&input),
+            "sha256:test-options".to_owned(),
+        ),
+    }
+}
+
+async fn claim_racing_fact_activity<B>(backend: &B) -> durust::provider::ClaimedActivityTask
+where
+    B: DurableBackend,
+{
+    backend
+        .claim_activity_task(
+            WorkerId::new("racing-fact-activity-worker"),
+            racing_fact_activity_claim_opts(),
+        )
+        .await
+        .unwrap()
+        .expect("activity task")
+}
+
+async fn complete_racing_fact_activity<B>(
+    backend: &B,
+    activity: durust::provider::ClaimedActivityTask,
+) where
+    B: DurableBackend,
+{
+    backend
+        .complete_activity(durust::provider::CompleteActivityRequest {
+            claim: activity.claim,
+            result: durust::encode_payload(&6u64).unwrap(),
+        })
+        .await
+        .unwrap();
+}
+
+fn racing_fact_activity_claim_opts() -> durust::provider::ClaimActivityOptions {
+    durust::provider::ClaimActivityOptions {
+        namespace: Namespace::default(),
+        task_queue: TaskQueue::new("racing-fact-activities"),
+        registered_activity_names: vec![ActivityName::new("conformance.echo")],
+        lease_duration: Duration::from_secs(30),
+    }
+}
+
+fn terminal_parent_commit() -> WorkflowTaskCommit {
     WorkflowTaskCommit {
-        expected_tail_event_id,
-        append_events: vec![durust::NewHistoryEvent::new(
+        append_events: vec![durust::provider::NewHistoryEvent::new(
             HistoryEventData::WorkflowCompleted {
                 result: durust::encode_payload(&()).unwrap(),
             },
@@ -8289,8 +8461,8 @@ where
             "child-map-collide-parent",
             "child-map-collide-children",
             "wf/child-map-collide/item",
-            durust::ChildWorkflowMapFailureMode::FailFast,
-            durust::ParentClosePolicy::Cancel,
+            durust::provider::ChildWorkflowMapFailureMode::FailFast,
+            durust::provider::ParentClosePolicy::Cancel,
             2,
         )
         .await;
@@ -8304,9 +8476,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::ChildWorkflowMapScheduled,
-            durust::HistoryEventType::ChildWorkflowMapFailed,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::ChildWorkflowMapScheduled,
+            durust::provider::HistoryEventType::ChildWorkflowMapFailed,
         ],
         "the collision must fail the map inside the scheduling commit"
     );
@@ -8327,7 +8499,7 @@ where
         .expect("the parent wakes for the failed map");
     assert_eq!(
         woken.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapFailed
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapFailed
     );
 
     let only_child = backend
@@ -8348,7 +8520,7 @@ where
         "the collision's batch-mate must never start, got {none:?}"
     );
     let probe = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/child-map-collide/item/1"),
             workflow_type: WorkflowType::new("conformance.workflow", 1),
@@ -8358,17 +8530,23 @@ where
         .await
         .unwrap();
     assert!(
-        matches!(probe, durust::StartWorkflowOutcome::Started { .. }),
+        matches!(
+            probe,
+            durust::provider::StartWorkflowOutcome::Started { .. }
+        ),
         "a fresh start under the batch-mate's id must be a new run, got {probe:?}"
     );
 }
 
-async fn stream_history<B>(backend: &B, run_id: durust::RunId) -> Vec<durust::HistoryEvent>
+async fn stream_history<B>(
+    backend: &B,
+    run_id: durust::RunId,
+) -> Vec<durust::provider::HistoryEvent>
 where
     B: DurableBackend,
 {
     backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id,
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(100),
@@ -8395,8 +8573,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [1_u64, 2, 3]
             .into_iter()
             .map(|value| durust::encode_payload(&Input { value }).unwrap())
@@ -8423,7 +8601,7 @@ where
         result_manifest_name: "mapped".to_owned(),
         max_in_flight: 2,
     };
-    let fingerprint = durust::activity_map_fingerprint(
+    let fingerprint = durust::provider::activity_map_fingerprint(
         activity_name.clone(),
         durust::payload_digest(&input_manifest),
         "mapped".to_owned(),
@@ -8434,20 +8612,21 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: input_manifest.clone(),
-                        result_manifest_name: "mapped".to_owned(),
-                        max_in_flight: 2,
-                        fingerprint,
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
+                            retry_policy,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "mapped".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint,
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task],
                 ..WorkflowTaskCommit::default()
@@ -8455,12 +8634,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -8495,7 +8669,7 @@ where
         .unwrap();
     assert_eq!(
         non_terminal,
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: EventId(2)
         }
     );
@@ -8523,7 +8697,7 @@ where
         .unwrap();
     assert_eq!(
         final_completion,
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: EventId(3)
         }
     );
@@ -8534,7 +8708,10 @@ where
         })
         .await
         .unwrap();
-    assert_eq!(duplicate, durust::CompleteActivityOutcome::AlreadyCompleted);
+    assert_eq!(
+        duplicate,
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
+    );
 
     let no_leftover_items = backend
         .claim_activity_task(WorkerId::new("mapper-leftover"), activity_opts)
@@ -8549,7 +8726,7 @@ where
         .expect("map-completed workflow task");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ActivityMapCompleted
+        durust::provider::WorkflowTaskReason::ActivityMapCompleted
     );
 
     let history = stream_history(&backend, run_id).await;
@@ -8570,7 +8747,8 @@ where
     assert_eq!(manifest.item_count, 3);
     assert_eq!(manifest.page_lengths, vec![2, 1]);
     assert_eq!(manifest.pages.len(), 2);
-    let result_refs = durust::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
+    let result_refs =
+        durust::provider::decode_activity_map_result_refs(&completed.result_manifest).unwrap();
     let values = result_refs
         .iter()
         .map(|payload| durust::decode_payload::<u64>(payload).unwrap())
@@ -8593,8 +8771,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [1_u64, 2, 3]
             .into_iter()
             .map(|value| durust::encode_payload(&Input { value }).unwrap())
@@ -8622,26 +8800,27 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy,
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: input_manifest.clone(),
-                        result_manifest_name: "mapped".to_owned(),
-                        max_in_flight: 2,
-                        fingerprint: durust::activity_map_fingerprint(
-                            ActivityName::new("conformance.echo"),
-                            durust::payload_digest(&input_manifest),
-                            "mapped".to_owned(),
-                            2,
-                            "sha256:test-options".to_owned(),
-                        ),
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
+                            retry_policy,
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: input_manifest.clone(),
+                            result_manifest_name: "mapped".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint: durust::provider::activity_map_fingerprint(
+                                ActivityName::new("conformance.echo"),
+                                durust::payload_digest(&input_manifest),
+                                "mapped".to_owned(),
+                                2,
+                                "sha256:test-options".to_owned(),
+                            ),
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task],
                 ..WorkflowTaskCommit::default()
@@ -8649,12 +8828,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -8685,7 +8859,7 @@ where
         .unwrap();
     assert!(matches!(
         retried,
-        durust::FailActivityOutcome::RetryScheduled {
+        durust::provider::FailActivityOutcome::RetryScheduled {
             next_attempt: 2,
             ..
         }
@@ -8712,7 +8886,7 @@ where
         .unwrap();
     assert_eq!(
         failed,
-        durust::FailActivityOutcome::Failed {
+        durust::provider::FailActivityOutcome::Failed {
             event_id: EventId(3)
         }
     );
@@ -8726,7 +8900,7 @@ where
         .unwrap();
     assert_eq!(
         stale_in_flight_completion,
-        durust::CompleteActivityOutcome::AlreadyCompleted
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
     let no_leftover_items = backend
         .claim_activity_task(WorkerId::new("failing-mapper-leftover"), activity_opts)
@@ -8739,7 +8913,10 @@ where
         .await
         .unwrap()
         .expect("map-failed workflow task");
-    assert_eq!(ready.reason, durust::WorkflowTaskReason::ActivityMapFailed);
+    assert_eq!(
+        ready.reason,
+        durust::provider::WorkflowTaskReason::ActivityMapFailed
+    );
 
     let history = stream_history(&backend, run_id).await;
     assert_eq!(history.len(), 3);
@@ -8759,8 +8936,8 @@ where
         "child-map-success-parent",
         "child-map-success-children",
         "wf/child-map-success/item",
-        durust::ChildWorkflowMapFailureMode::FailFast,
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
         2,
     )
     .await;
@@ -8824,7 +9001,7 @@ where
         .expect("parent ready after child map completion");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapCompleted
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapCompleted
     );
 
     let history = stream_history(&backend, run_id).await;
@@ -8840,7 +9017,8 @@ where
     assert_eq!(completed.success_count, 3);
     assert_eq!(completed.failure_count, 0);
     assert_eq!(completed.cancellation_count, 0);
-    let refs = durust::decode_child_workflow_map_success_refs(&completed.result_manifest).unwrap();
+    let refs = durust::provider::decode_child_workflow_map_success_refs(&completed.result_manifest)
+        .unwrap();
     let values = refs
         .iter()
         .map(|payload| durust::decode_payload::<u64>(payload).unwrap())
@@ -8858,8 +9036,8 @@ where
         "child-map-fail-fast-parent",
         "child-map-fail-fast-children",
         "wf/child-map-fail-fast/item",
-        durust::ChildWorkflowMapFailureMode::FailFast,
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::FailFast,
+        durust::provider::ParentClosePolicy::Cancel,
         2,
     )
     .await;
@@ -8888,7 +9066,7 @@ where
         .expect("parent ready after child map failure");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapFailed
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapFailed
     );
 
     let no_more_children = backend
@@ -8925,8 +9103,8 @@ where
         "child-map-collect-all-parent",
         "child-map-collect-all-children",
         "wf/child-map-collect-all/item",
-        durust::ChildWorkflowMapFailureMode::CollectAll,
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+        durust::provider::ParentClosePolicy::Cancel,
         2,
     )
     .await;
@@ -8963,7 +9141,7 @@ where
         .expect("parent ready after collect-all child map completion");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapCompleted
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapCompleted
     );
 
     let history = stream_history(&backend, run_id).await;
@@ -8979,22 +9157,23 @@ where
     assert_eq!(completed.success_count, 2);
     assert_eq!(completed.failure_count, 1);
     assert_eq!(completed.cancellation_count, 0);
-    let outcomes = durust::decode_child_workflow_map_outcomes(&completed.result_manifest).unwrap();
+    let outcomes =
+        durust::provider::decode_child_workflow_map_outcomes(&completed.result_manifest).unwrap();
     assert_eq!(outcomes.len(), 3);
     match &outcomes[0] {
-        durust::ChildWorkflowMapItemOutcome::Failed { failure } => {
+        durust::provider::ChildWorkflowMapItemOutcome::Failed { failure } => {
             assert_eq!(failure.error_type, "test.collect_failed");
         }
         other => panic!("expected failed first outcome, got {other:?}"),
     }
     match &outcomes[1] {
-        durust::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+        durust::provider::ChildWorkflowMapItemOutcome::Succeeded { result } => {
             assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 20);
         }
         other => panic!("expected successful second outcome, got {other:?}"),
     }
     match &outcomes[2] {
-        durust::ChildWorkflowMapItemOutcome::Succeeded { result } => {
+        durust::provider::ChildWorkflowMapItemOutcome::Succeeded { result } => {
             assert_eq!(durust::decode_payload::<u64>(result).unwrap(), 30);
         }
         other => panic!("expected successful third outcome, got {other:?}"),
@@ -9023,7 +9202,8 @@ where
     let client = Client::new(backend.clone());
     let activity_queue = TaskQueue::new("empty-map-activities");
     let activity_name = ActivityName::new("conformance.echo");
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
 
     let run_id = client
         .start_workflow::<workflow>("wf/empty-activity-map", "empty-map-workflows", input(1))
@@ -9038,8 +9218,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let scheduled = durust::ActivityMapScheduled {
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let scheduled = durust::provider::ActivityMapScheduled {
         command_id: command_id.clone(),
         activity_name: activity_name.clone(),
         task_queue: activity_queue.clone(),
@@ -9049,7 +9229,7 @@ where
         input_manifest: empty_manifest.clone(),
         result_manifest_name: "empty".to_owned(),
         max_in_flight: 2,
-        fingerprint: durust::activity_map_fingerprint(
+        fingerprint: durust::provider::activity_map_fingerprint(
             activity_name.clone(),
             durust::payload_digest(&empty_manifest),
             "empty".to_owned(),
@@ -9061,8 +9241,7 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ActivityMapScheduled(scheduled),
                 )],
                 schedule_activity_maps: vec![ActivityMapTask {
@@ -9084,9 +9263,7 @@ where
         .unwrap();
     assert_eq!(
         outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
+        EventId(3),
         "the empty map's terminal fact is appended by the scheduling commit, \
          so the returned tail must count it"
     );
@@ -9094,14 +9271,14 @@ where
     // observed, so it stays at the scheduling event on every provider even
     // though the map's terminal fact landed after it in the same commit.
     match backend
-        .query_projection(durust::QueryProjectionRequest {
+        .query_projection(durust::provider::QueryProjectionRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/empty-activity-map"),
         })
         .await
         .unwrap()
     {
-        durust::QueryProjectionOutcome::Found { event_id, .. } => {
+        durust::provider::QueryProjectionOutcome::Found { event_id, .. } => {
             assert_eq!(event_id, EventId(2))
         }
         other => panic!("expected a stored query projection, got {other:?}"),
@@ -9113,9 +9290,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::ActivityMapScheduled,
-            durust::HistoryEventType::ActivityMapCompleted,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::ActivityMapScheduled,
+            durust::provider::HistoryEventType::ActivityMapCompleted,
         ],
     );
     let completed = history
@@ -9129,7 +9306,7 @@ where
     assert_eq!(completed.success_count, 0);
     assert_eq!(completed.failure_count, 0);
     assert!(
-        durust::decode_activity_map_result_refs(&completed.result_manifest)
+        durust::provider::decode_activity_map_result_refs(&completed.result_manifest)
             .unwrap()
             .is_empty()
     );
@@ -9140,16 +9317,17 @@ where
         .expect("the parent of an empty map must be woken by the scheduling commit");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ActivityMapCompleted
+        durust::provider::WorkflowTaskReason::ActivityMapCompleted
     );
     assert_eq!(ready.replay_target_event_id, EventId(3));
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(3)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 
     // The child-workflow-map half. Same shape, different terminal applier.
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
     let child_queue = TaskQueue::new("empty-child-map-children");
     let workflow_type = WorkflowType::new("conformance.workflow", 1);
     let child_run_id = client
@@ -9165,7 +9343,7 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&child_run_id, 1);
+    let command_id = durust::provider::command_id(&child_run_id, 1);
     let map_task = ChildWorkflowMapTask {
         map_command_id: command_id.clone(),
         workflow_type: workflow_type.clone(),
@@ -9174,17 +9352,16 @@ where
         result_manifest_name: "empty".to_owned(),
         workflow_id_prefix: "wf/empty-child-map/item".to_owned(),
         max_in_flight: 2,
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
     };
     let outcome = backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
+                        durust::provider::ChildWorkflowMapScheduled {
                             command_id: command_id.clone(),
                             workflow_type: workflow_type.clone(),
                             task_queue: child_queue.clone(),
@@ -9192,17 +9369,17 @@ where
                             result_manifest_name: "empty".to_owned(),
                             workflow_id_prefix: "wf/empty-child-map/item".to_owned(),
                             max_in_flight: 2,
-                            parent_close_policy: durust::ParentClosePolicy::Cancel,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                            fingerprint: durust::child_workflow_map_fingerprint(
+                            parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                            failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                            fingerprint: durust::provider::child_workflow_map_fingerprint(
                                 workflow_type,
                                 durust::payload_digest(&empty_manifest),
                                 "empty".to_owned(),
                                 "wf/empty-child-map/item".to_owned(),
                                 2,
                                 child_queue,
-                                durust::ParentClosePolicy::Cancel,
-                                durust::ChildWorkflowMapFailureMode::CollectAll,
+                                durust::provider::ParentClosePolicy::Cancel,
+                                durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                             ),
                         },
                     ),
@@ -9213,12 +9390,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     let history = stream_history(&backend, child_run_id).await;
     assert_eq!(
         history
@@ -9226,9 +9398,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::ChildWorkflowMapScheduled,
-            durust::HistoryEventType::ChildWorkflowMapCompleted,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::ChildWorkflowMapScheduled,
+            durust::provider::HistoryEventType::ChildWorkflowMapCompleted,
         ],
     );
     let completed = history
@@ -9241,7 +9413,7 @@ where
     assert_eq!(completed.item_count, 0);
     assert_eq!(completed.cancellation_count, 0);
     assert!(
-        durust::decode_child_workflow_map_outcomes(&completed.result_manifest)
+        durust::provider::decode_child_workflow_map_outcomes(&completed.result_manifest)
             .unwrap()
             .is_empty()
     );
@@ -9252,10 +9424,10 @@ where
         .expect("the parent of an empty child map must be woken by the scheduling commit");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapCompleted
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapCompleted
     );
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(3)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 }
@@ -9295,11 +9467,12 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
     let activity_name = ActivityName::new("conformance.echo");
     let task_queue = TaskQueue::new("empty-map-closing-activities");
-    let scheduled = durust::ActivityMapScheduled {
+    let scheduled = durust::provider::ActivityMapScheduled {
         command_id: command_id.clone(),
         activity_name: activity_name.clone(),
         task_queue: task_queue.clone(),
@@ -9309,7 +9482,7 @@ where
         input_manifest: empty_manifest.clone(),
         result_manifest_name: "empty".to_owned(),
         max_in_flight: 2,
-        fingerprint: durust::activity_map_fingerprint(
+        fingerprint: durust::provider::activity_map_fingerprint(
             activity_name.clone(),
             durust::payload_digest(&empty_manifest),
             "empty".to_owned(),
@@ -9321,10 +9494,11 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(scheduled)),
-                    durust::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                        scheduled,
+                    )),
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&()).unwrap(),
                     }),
                 ],
@@ -9344,12 +9518,7 @@ where
         )
         .await
         .expect("a commit that schedules an empty map and closes its run must stay accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     assert_eq!(
         stream_history(&backend, run_id)
             .await
@@ -9357,9 +9526,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::ActivityMapScheduled,
-            durust::HistoryEventType::WorkflowCompleted,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::ActivityMapScheduled,
+            durust::provider::HistoryEventType::WorkflowCompleted,
         ],
         "no map fact may land behind the run's own terminal event",
     );
@@ -9384,8 +9553,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&child_run_id, 1);
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let command_id = durust::provider::command_id(&child_run_id, 1);
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
     let workflow_type = WorkflowType::new("conformance.workflow", 1);
     let task_queue = TaskQueue::new("empty-map-closing-children");
     let prefix = "wf/empty-map-closing/item".to_owned();
@@ -9393,32 +9563,34 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
-                            command_id: command_id.clone(),
-                            workflow_type: workflow_type.clone(),
-                            task_queue: task_queue.clone(),
-                            input_manifest: empty_manifest.clone(),
-                            result_manifest_name: "empty".to_owned(),
-                            workflow_id_prefix: prefix.clone(),
-                            max_in_flight: 2,
-                            parent_close_policy: durust::ParentClosePolicy::Cancel,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                            fingerprint: durust::child_workflow_map_fingerprint(
-                                workflow_type.clone(),
-                                durust::payload_digest(&empty_manifest),
-                                "empty".to_owned(),
-                                prefix.clone(),
-                                2,
-                                task_queue.clone(),
-                                durust::ParentClosePolicy::Cancel,
-                                durust::ChildWorkflowMapFailureMode::CollectAll,
-                            ),
-                        },
-                    )),
-                    durust::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+                    durust::provider::NewHistoryEvent::new(
+                        HistoryEventData::ChildWorkflowMapScheduled(
+                            durust::provider::ChildWorkflowMapScheduled {
+                                command_id: command_id.clone(),
+                                workflow_type: workflow_type.clone(),
+                                task_queue: task_queue.clone(),
+                                input_manifest: empty_manifest.clone(),
+                                result_manifest_name: "empty".to_owned(),
+                                workflow_id_prefix: prefix.clone(),
+                                max_in_flight: 2,
+                                parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                                failure_mode:
+                                    durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                                fingerprint: durust::provider::child_workflow_map_fingerprint(
+                                    workflow_type.clone(),
+                                    durust::payload_digest(&empty_manifest),
+                                    "empty".to_owned(),
+                                    prefix.clone(),
+                                    2,
+                                    task_queue.clone(),
+                                    durust::provider::ParentClosePolicy::Cancel,
+                                    durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                                ),
+                            },
+                        ),
+                    ),
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&()).unwrap(),
                     }),
                 ],
@@ -9430,20 +9602,15 @@ where
                     result_manifest_name: "empty".to_owned(),
                     workflow_id_prefix: prefix,
                     max_in_flight: 2,
-                    parent_close_policy: durust::ParentClosePolicy::Cancel,
-                    failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+                    parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                    failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                 }],
                 ..WorkflowTaskCommit::default()
             },
         )
         .await
         .expect("a commit that schedules an empty child map and closes its run stays accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     assert_eq!(
         stream_history(&backend, child_run_id)
             .await
@@ -9451,9 +9618,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::ChildWorkflowMapScheduled,
-            durust::HistoryEventType::WorkflowCompleted,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::ChildWorkflowMapScheduled,
+            durust::provider::HistoryEventType::WorkflowCompleted,
         ],
         "no map fact may land behind the run's own terminal event",
     );
@@ -9487,9 +9654,10 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let activity_command = durust::command_id(&run_id, 1);
-    let child_command = durust::command_id(&run_id, 2);
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let activity_command = durust::provider::command_id(&run_id, 1);
+    let child_command = durust::provider::command_id(&run_id, 2);
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
     let activity_name = ActivityName::new("conformance.echo");
     let activity_queue = TaskQueue::new("two-empty-map-activities");
     let workflow_type = WorkflowType::new("conformance.workflow", 1);
@@ -9500,10 +9668,9 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
-                        durust::ActivityMapScheduled {
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
                             command_id: activity_command.clone(),
                             activity_name: activity_name.clone(),
                             task_queue: activity_queue.clone(),
@@ -9513,7 +9680,7 @@ where
                             input_manifest: empty_manifest.clone(),
                             result_manifest_name: "empty".to_owned(),
                             max_in_flight: 2,
-                            fingerprint: durust::activity_map_fingerprint(
+                            fingerprint: durust::provider::activity_map_fingerprint(
                                 activity_name.clone(),
                                 durust::payload_digest(&empty_manifest),
                                 "empty".to_owned(),
@@ -9522,29 +9689,32 @@ where
                             ),
                         },
                     )),
-                    durust::NewHistoryEvent::new(HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
-                            command_id: child_command.clone(),
-                            workflow_type: workflow_type.clone(),
-                            task_queue: child_queue.clone(),
-                            input_manifest: empty_manifest.clone(),
-                            result_manifest_name: "empty".to_owned(),
-                            workflow_id_prefix: prefix.clone(),
-                            max_in_flight: 2,
-                            parent_close_policy: durust::ParentClosePolicy::Cancel,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                            fingerprint: durust::child_workflow_map_fingerprint(
-                                workflow_type.clone(),
-                                durust::payload_digest(&empty_manifest),
-                                "empty".to_owned(),
-                                prefix.clone(),
-                                2,
-                                child_queue.clone(),
-                                durust::ParentClosePolicy::Cancel,
-                                durust::ChildWorkflowMapFailureMode::CollectAll,
-                            ),
-                        },
-                    )),
+                    durust::provider::NewHistoryEvent::new(
+                        HistoryEventData::ChildWorkflowMapScheduled(
+                            durust::provider::ChildWorkflowMapScheduled {
+                                command_id: child_command.clone(),
+                                workflow_type: workflow_type.clone(),
+                                task_queue: child_queue.clone(),
+                                input_manifest: empty_manifest.clone(),
+                                result_manifest_name: "empty".to_owned(),
+                                workflow_id_prefix: prefix.clone(),
+                                max_in_flight: 2,
+                                parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                                failure_mode:
+                                    durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                                fingerprint: durust::provider::child_workflow_map_fingerprint(
+                                    workflow_type.clone(),
+                                    durust::payload_digest(&empty_manifest),
+                                    "empty".to_owned(),
+                                    prefix.clone(),
+                                    2,
+                                    child_queue.clone(),
+                                    durust::provider::ParentClosePolicy::Cancel,
+                                    durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                                ),
+                            },
+                        ),
+                    ),
                 ],
                 schedule_activity_maps: vec![ActivityMapTask {
                     map_command_id: activity_command,
@@ -9565,8 +9735,8 @@ where
                     result_manifest_name: "empty".to_owned(),
                     workflow_id_prefix: prefix,
                     max_in_flight: 2,
-                    parent_close_policy: durust::ParentClosePolicy::Cancel,
-                    failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+                    parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+                    failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                 }],
                 query_projection: Some(durust::encode_payload(&"two-empty-maps").unwrap()),
                 ..WorkflowTaskCommit::default()
@@ -9575,12 +9745,7 @@ where
         .await
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(5)
-        },
-    );
+    assert_eq!(outcome, EventId(5),);
     let history = stream_history(&backend, run_id).await;
     assert_eq!(
         history
@@ -9588,29 +9753,38 @@ where
             .map(|event| (event.event_id, event.event_type()))
             .collect::<Vec<_>>(),
         vec![
-            (EventId(1), durust::HistoryEventType::WorkflowStarted),
-            (EventId(2), durust::HistoryEventType::ActivityMapScheduled),
+            (
+                EventId(1),
+                durust::provider::HistoryEventType::WorkflowStarted
+            ),
+            (
+                EventId(2),
+                durust::provider::HistoryEventType::ActivityMapScheduled
+            ),
             (
                 EventId(3),
-                durust::HistoryEventType::ChildWorkflowMapScheduled
+                durust::provider::HistoryEventType::ChildWorkflowMapScheduled
             ),
-            (EventId(4), durust::HistoryEventType::ActivityMapCompleted),
+            (
+                EventId(4),
+                durust::provider::HistoryEventType::ActivityMapCompleted
+            ),
             (
                 EventId(5),
-                durust::HistoryEventType::ChildWorkflowMapCompleted
+                durust::provider::HistoryEventType::ChildWorkflowMapCompleted
             ),
         ],
         "two maps completing in one commit must take contiguous ids after the scheduling events",
     );
     match backend
-        .query_projection(durust::QueryProjectionRequest {
+        .query_projection(durust::provider::QueryProjectionRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/two-empty-maps"),
         })
         .await
         .unwrap()
     {
-        durust::QueryProjectionOutcome::Found { event_id, .. } => {
+        durust::provider::QueryProjectionOutcome::Found { event_id, .. } => {
             assert_eq!(
                 event_id,
                 EventId(3),
@@ -9626,12 +9800,12 @@ where
         .expect("the parent is woken by the maps its own commit completed");
     assert_eq!(
         ready.reason,
-        durust::WorkflowTaskReason::ChildWorkflowMapCompleted,
+        durust::provider::WorkflowTaskReason::ChildWorkflowMapCompleted,
         "the last map stepped names the wake reason",
     );
     assert_eq!(ready.replay_target_event_id, EventId(5));
     backend
-        .commit_workflow_task(ready.claim, terminal_parent_commit(EventId(5)))
+        .commit_workflow_task(ready.claim, terminal_parent_commit())
         .await
         .unwrap();
 }
@@ -9663,8 +9837,8 @@ where
             "child-map-abandon-parent",
             "child-map-abandon-children",
             "wf/child-map-abandon/item",
-            durust::ChildWorkflowMapFailureMode::CollectAll,
-            durust::ParentClosePolicy::Abandon,
+            durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+            durust::provider::ParentClosePolicy::Abandon,
             2,
         )
         .await;
@@ -9697,12 +9871,12 @@ where
         (
             "completed",
             first_run_id,
-            durust::HistoryEventType::WorkflowCompleted,
+            durust::provider::HistoryEventType::WorkflowCompleted,
         ),
         (
             "failed",
             second_run_id,
-            durust::HistoryEventType::WorkflowFailed,
+            durust::provider::HistoryEventType::WorkflowFailed,
         ),
     ] {
         let history = stream_history(&backend, run_id).await;
@@ -9742,8 +9916,8 @@ where
         .unwrap();
     let parent_opts = workflow_claim_opts("child-map-cancel-parent");
     let child_opts = workflow_claim_opts("child-map-cancel-children");
-    let map_command_id = durust::command_id(&parent_run_id, 1);
-    let timer_command_id = durust::command_id(&parent_run_id, 2);
+    let map_command_id = durust::provider::command_id(&parent_run_id, 1);
+    let timer_command_id = durust::provider::command_id(&parent_run_id, 2);
 
     let claimed = backend
         .claim_workflow_task(
@@ -9753,7 +9927,7 @@ where
         .await
         .unwrap()
         .expect("parent workflow task");
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [1_u64, 2, 3]
             .into_iter()
             .map(|value| durust::encode_payload(&value).unwrap())
@@ -9773,10 +9947,10 @@ where
         result_manifest_name: result_manifest_name.clone(),
         workflow_id_prefix: workflow_id_prefix.clone(),
         max_in_flight: 2,
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
     };
-    let scheduled = durust::ChildWorkflowMapScheduled {
+    let scheduled = durust::provider::ChildWorkflowMapScheduled {
         command_id: map_command_id.clone(),
         workflow_type: workflow_type.clone(),
         task_queue: task_queue.clone(),
@@ -9784,47 +9958,46 @@ where
         result_manifest_name: result_manifest_name.clone(),
         workflow_id_prefix: workflow_id_prefix.clone(),
         max_in_flight: 2,
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-        fingerprint: durust::child_workflow_map_fingerprint(
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+        fingerprint: durust::provider::child_workflow_map_fingerprint(
             workflow_type,
             durust::payload_digest(&input_manifest),
             result_manifest_name,
             workflow_id_prefix,
             2,
             task_queue,
-            durust::ParentClosePolicy::Cancel,
-            durust::ChildWorkflowMapFailureMode::CollectAll,
+            durust::provider::ParentClosePolicy::Cancel,
+            durust::provider::ChildWorkflowMapFailureMode::CollectAll,
         ),
     };
     backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::ChildWorkflowMapScheduled(
-                        scheduled,
-                    )),
-                    durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                        durust::TimerStarted {
+                    durust::provider::NewHistoryEvent::new(
+                        HistoryEventData::ChildWorkflowMapScheduled(scheduled),
+                    ),
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                        durust::provider::TimerStarted {
                             command_id: timer_command_id.clone(),
                             fire_at: durust::TimestampMs(10),
-                            fingerprint: durust::timer_fingerprint(
+                            fingerprint: durust::provider::timer_fingerprint(
                                 "sleep",
                                 durust::TimestampMs(10),
                             ),
                         },
                     )),
                 ],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
                         timer_command_id.run_id, timer_command_id.seq.0
                     )),
                     run_id: parent_run_id.clone(),
                     command_id: timer_command_id,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(durust::TimestampMs(10)),
                 }],
@@ -9849,7 +10022,7 @@ where
     let started = [first.run_id.clone(), second.run_id.clone()];
 
     let fired = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10),
             limit: 10,
@@ -9866,7 +10039,6 @@ where
         .commit_workflow_task(
             ready.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: ready.replay_target_event_id,
                 cancel_commands: vec![map_command_id.clone()],
                 ..WorkflowTaskCommit::default()
             },
@@ -9941,12 +10113,12 @@ where
 
     let now = backend.current_time().await.unwrap();
     let fire_at = durust::TimestampMs(now.0.saturating_add(50));
-    let timer_command = durust::command_id(&run_id, 1);
-    let activity_command = durust::command_id(&run_id, 2);
-    let map_command = durust::command_id(&run_id, 3);
+    let timer_command = durust::provider::command_id(&run_id, 1);
+    let activity_command = durust::provider::command_id(&run_id, 2);
+    let map_command = durust::provider::command_id(&run_id, 3);
     let activity_input = durust::encode_payload(&Input { value: 7 }).unwrap();
     let retry_policy = durust::RetryPolicy::none();
-    let scheduled_activity = durust::ActivityScheduled {
+    let scheduled_activity = durust::provider::ActivityScheduled {
         command_id: activity_command.clone(),
         activity_name: ActivityName::new("conformance.echo"),
         task_queue: TaskQueue::new("cancel-activities"),
@@ -9954,13 +10126,13 @@ where
         start_to_close_timeout: None,
         heartbeat_timeout: None,
         input: activity_input.clone(),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("conformance.echo"),
             durust::payload_digest(&activity_input),
             "sha256:test-options".to_owned(),
         ),
     };
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         [1_u64, 2]
             .into_iter()
             .map(|value| durust::encode_payload(&Input { value }).unwrap())
@@ -9987,23 +10159,22 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![
-                    durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                        durust::TimerStarted {
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                        durust::provider::TimerStarted {
                             command_id: timer_command.clone(),
                             fire_at,
-                            fingerprint: durust::timer_fingerprint(
+                            fingerprint: durust::provider::timer_fingerprint(
                                 "sleep",
                                 durust::TimestampMs(50),
                             ),
                         },
                     )),
-                    durust::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                         scheduled_activity.clone(),
                     )),
-                    durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
-                        durust::ActivityMapScheduled {
+                    durust::provider::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
                             command_id: map_command.clone(),
                             activity_name: ActivityName::new("conformance.echo"),
                             task_queue: TaskQueue::new("cancel-activities"),
@@ -10013,7 +10184,7 @@ where
                             input_manifest: input_manifest.clone(),
                             result_manifest_name: "cancelled".to_owned(),
                             max_in_flight: 2,
-                            fingerprint: durust::activity_map_fingerprint(
+                            fingerprint: durust::provider::activity_map_fingerprint(
                                 ActivityName::new("conformance.echo"),
                                 durust::payload_digest(&input_manifest),
                                 "cancelled".to_owned(),
@@ -10023,15 +10194,15 @@ where
                         },
                     )),
                 ],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id,
                     run_id: run_id.clone(),
                     command_id: timer_command,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
-                schedule_activities: vec![durust::ActivityTask::from_scheduled(
+                schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
                     &scheduled_activity,
                 )],
                 schedule_activity_maps: vec![map_task],
@@ -10040,12 +10211,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(4)
-        }
-    );
+    assert_eq!(outcome, EventId(4));
 
     let activity_opts = ClaimActivityOptions {
         namespace: Namespace::default(),
@@ -10075,7 +10241,7 @@ where
         .unwrap();
     assert_eq!(
         cancelled,
-        durust::CancelWorkflowOutcome::Cancelled {
+        durust::provider::CancelWorkflowOutcome::Cancelled {
             run_id: run_id.clone(),
             event_id: EventId(5)
         }
@@ -10086,7 +10252,7 @@ where
         .unwrap();
     assert_eq!(
         duplicate_cancel,
-        durust::CancelWorkflowOutcome::AlreadyTerminal {
+        durust::provider::CancelWorkflowOutcome::AlreadyTerminal {
             run_id: run_id.clone()
         }
     );
@@ -10097,7 +10263,7 @@ where
         .unwrap();
     assert!(workflow_after_cancel.is_none());
     let timer_after_cancel = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: fire_at,
             limit: 16,
@@ -10120,7 +10286,7 @@ where
         .unwrap();
     assert_eq!(
         late_ordinary_completion,
-        durust::CompleteActivityOutcome::AlreadyCompleted
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
     let late_map_completion = backend
         .complete_activity(CompleteActivityRequest {
@@ -10131,7 +10297,7 @@ where
         .unwrap();
     assert_eq!(
         late_map_completion,
-        durust::CompleteActivityOutcome::AlreadyCompleted
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
     let signal_after_cancel = client
         .signal_workflow("wf/cancel-cleanup", "ready", "signal/cancelled", "ignored")
@@ -10222,7 +10388,7 @@ where
         .unwrap();
     assert!(matches!(
         completed,
-        durust::CompleteActivityOutcome::Completed { .. }
+        durust::provider::CompleteActivityOutcome::Completed { .. }
     ));
     let duplicate = backend
         .complete_activity(CompleteActivityRequest {
@@ -10231,7 +10397,10 @@ where
         })
         .await
         .unwrap();
-    assert_eq!(duplicate, durust::CompleteActivityOutcome::AlreadyCompleted);
+    assert_eq!(
+        duplicate,
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted
+    );
 }
 
 async fn batch_activity_completion_reports_ordered_duplicate_and_stale_results<B>(backend: B)
@@ -10243,7 +10412,7 @@ where
     let activity_queue = TaskQueue::new("batch-activity-activities");
     let activity_name = ActivityName::new("conformance.echo");
     let started = backend
-        .start_workflow(durust::StartWorkflowRequest {
+        .start_workflow(durust::provider::StartWorkflowRequest {
             namespace: Namespace::default(),
             workflow_id: durust::WorkflowId::new("wf/batch-activity-completion"),
             workflow_type: workflow_type.clone(),
@@ -10258,6 +10427,7 @@ where
         task_queue: workflow_queue,
         registered_workflow_types: vec![workflow_type],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     };
     let claimed = backend
         .claim_workflow_task(WorkerId::new("batch-activity-scheduler"), claim_opts)
@@ -10267,7 +10437,7 @@ where
     let schedules = (0..2_u64)
         .map(|index| {
             let input = durust::encode_payload(&Input { value: index }).unwrap();
-            durust::ActivityScheduled {
+            durust::provider::ActivityScheduled {
                 command_id: durust::CommandId {
                     run_id: run_id.clone(),
                     seq: durust::CommandSeq(index + 1),
@@ -10277,7 +10447,7 @@ where
                 retry_policy: durust::RetryPolicy::none(),
                 start_to_close_timeout: Some(Duration::from_secs(30)),
                 heartbeat_timeout: None,
-                fingerprint: durust::activity_fingerprint(
+                fingerprint: durust::provider::activity_fingerprint(
                     activity_name.clone(),
                     durust::payload_digest(&input),
                     format!("batch-activity-{index}"),
@@ -10291,7 +10461,6 @@ where
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: claimed.replay_target_event_id,
                     append_events: schedules
                         .iter()
                         .cloned()
@@ -10303,16 +10472,14 @@ where
                         .collect(),
                     schedule_activities: schedules
                         .iter()
-                        .map(durust::ActivityTask::from_scheduled)
+                        .map(durust::provider::ActivityTask::from_scheduled)
                         .collect(),
                     ..WorkflowTaskCommit::default()
                 },
             )
             .await
             .unwrap(),
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        }
+        EventId(3)
     );
 
     let mut claimed_activities = backend
@@ -10342,7 +10509,7 @@ where
             })
             .await
             .unwrap(),
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: EventId(4)
         }
     );
@@ -10367,7 +10534,7 @@ where
     assert_eq!(results.len(), 2);
     assert_eq!(
         results[0].result.as_ref().unwrap(),
-        &durust::CompleteActivityOutcome::AlreadyCompleted
+        &durust::provider::CompleteActivityOutcome::AlreadyCompleted
     );
     assert!(matches!(results[1].result, Err(Error::StaleLease)));
 
@@ -10379,7 +10546,7 @@ where
             })
             .await
             .unwrap(),
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: EventId(5)
         }
     );
@@ -10397,7 +10564,7 @@ where
         .build()
 }
 
-fn assert_map_item(task: &durust::ActivityTask, item_ordinal: u64, expected_input: u64) {
+fn assert_map_item(task: &durust::provider::ActivityTask, item_ordinal: u64, expected_input: u64) {
     let map_item = task.map_item.as_ref().expect("map item metadata");
     assert_eq!(map_item.item_ordinal, item_ordinal);
     assert_eq!(
@@ -10431,7 +10598,7 @@ async fn schedule_activity_map<B>(
     durust::RunId,
     durust::CommandId,
     ClaimActivityOptions,
-    durust::Result<CommitOutcome>,
+    durust::Result<EventId>,
 )
 where
     B: DurableBackend,
@@ -10449,8 +10616,8 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         (0..item_count)
             .map(|value| durust::encode_payload(&Input { value }).unwrap())
             .collect(),
@@ -10470,7 +10637,7 @@ where
         result_manifest_name: "mapped".to_owned(),
         max_in_flight,
     };
-    let fingerprint = durust::activity_map_fingerprint(
+    let fingerprint = durust::provider::activity_map_fingerprint(
         activity_name.clone(),
         durust::payload_digest(&input_manifest),
         "mapped".to_owned(),
@@ -10481,20 +10648,21 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name: activity_name.clone(),
-                        task_queue: task_queue.clone(),
-                        retry_policy,
-                        start_to_close_timeout,
-                        heartbeat_timeout: None,
-                        input_manifest,
-                        result_manifest_name: "mapped".to_owned(),
-                        max_in_flight,
-                        fingerprint,
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name: activity_name.clone(),
+                            task_queue: task_queue.clone(),
+                            retry_policy,
+                            start_to_close_timeout,
+                            heartbeat_timeout: None,
+                            input_manifest,
+                            result_manifest_name: "mapped".to_owned(),
+                            max_in_flight,
+                            fingerprint,
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task],
                 ..WorkflowTaskCommit::default()
@@ -10572,7 +10740,7 @@ where
             .iter()
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
-        vec![durust::HistoryEventType::WorkflowStarted],
+        vec![durust::provider::HistoryEventType::WorkflowStarted],
     );
     assert!(
         backend
@@ -10600,8 +10768,8 @@ where
         "child-map-zero-bound-parent",
         "child-map-zero-bound-children",
         "wf/child-map-zero-bound/item",
-        durust::ChildWorkflowMapFailureMode::CollectAll,
-        durust::ParentClosePolicy::Cancel,
+        durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+        durust::provider::ParentClosePolicy::Cancel,
         0,
     )
     .await;
@@ -10623,7 +10791,7 @@ where
             .iter()
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
-        vec![durust::HistoryEventType::WorkflowStarted],
+        vec![durust::provider::HistoryEventType::WorkflowStarted],
     );
     dispatch_child_map_starts(&backend).await;
     assert!(
@@ -10663,8 +10831,9 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&run_id, 1);
-    let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+    let command_id = durust::provider::command_id(&run_id, 1);
+    let empty_manifest =
+        durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
     let activity_name = ActivityName::new("conformance.echo");
     let task_queue = TaskQueue::new("duplicate-map-activities");
     let map_task = ActivityMapTask {
@@ -10682,26 +10851,27 @@ where
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: command_id.clone(),
-                        activity_name,
-                        task_queue,
-                        retry_policy: durust::RetryPolicy::none(),
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: empty_manifest.clone(),
-                        result_manifest_name: "empty".to_owned(),
-                        max_in_flight: 2,
-                        fingerprint: durust::activity_map_fingerprint(
-                            ActivityName::new("conformance.echo"),
-                            durust::payload_digest(&empty_manifest),
-                            "empty".to_owned(),
-                            2,
-                            "sha256:test-options".to_owned(),
-                        ),
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: command_id.clone(),
+                            activity_name,
+                            task_queue,
+                            retry_policy: durust::RetryPolicy::none(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: empty_manifest.clone(),
+                            result_manifest_name: "empty".to_owned(),
+                            max_in_flight: 2,
+                            fingerprint: durust::provider::activity_map_fingerprint(
+                                ActivityName::new("conformance.echo"),
+                                durust::payload_digest(&empty_manifest),
+                                "empty".to_owned(),
+                                2,
+                                "sha256:test-options".to_owned(),
+                            ),
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![map_task.clone(), map_task],
                 ..WorkflowTaskCommit::default()
@@ -10721,7 +10891,7 @@ where
             .iter()
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
-        vec![durust::HistoryEventType::WorkflowStarted],
+        vec![durust::provider::HistoryEventType::WorkflowStarted],
     );
 }
 
@@ -10806,7 +10976,7 @@ where
         .unwrap();
     assert!(matches!(
         outcome,
-        durust::FailActivityOutcome::Failed { .. }
+        durust::provider::FailActivityOutcome::Failed { .. }
     ));
 
     // The sibling is tombstoned, so its own terminal call is a no-op rather
@@ -10819,7 +10989,7 @@ where
             })
             .await
             .unwrap(),
-        durust::FailActivityOutcome::AlreadyCompleted,
+        durust::provider::FailActivityOutcome::AlreadyCompleted,
         "a retryable failure on a map that is over must not reschedule the item",
     );
     assert_eq!(
@@ -10830,7 +11000,7 @@ where
             })
             .await
             .unwrap(),
-        durust::CompleteActivityOutcome::AlreadyCompleted,
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted,
     );
 
     // Nothing of this map is claimable any more, and the timeout scanner has
@@ -10844,7 +11014,7 @@ where
     );
     assert_eq!(
         backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: durust::TimestampMs(i64::MAX / 2),
                 limit: 32,
@@ -10955,8 +11125,8 @@ where
         .await
         .unwrap()
         .expect("parent workflow task");
-    let command_id = durust::command_id(&parent_run_id, 1);
-    let input_manifest = durust::encode_activity_map_input_manifest(
+    let command_id = durust::provider::command_id(&parent_run_id, 1);
+    let input_manifest = durust::provider::encode_activity_map_input_manifest(
         (0..4_u64)
             .map(|value| durust::encode_payload(&value).unwrap())
             .collect(),
@@ -10974,20 +11144,19 @@ where
         result_manifest_name: "collision-results".to_owned(),
         workflow_id_prefix: prefix.to_owned(),
         max_in_flight,
-        parent_close_policy: durust::ParentClosePolicy::Abandon,
+        parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
         // CollectAll, so the conflicting ordinal is recorded as a failed item
         // and the map keeps materializing instead of stopping at the first
         // non-success.
-        failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+        failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
     };
     backend
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
+                        durust::provider::ChildWorkflowMapScheduled {
                             command_id: command_id.clone(),
                             workflow_type: workflow_type.clone(),
                             task_queue: task_queue.clone(),
@@ -10995,17 +11164,17 @@ where
                             result_manifest_name: "collision-results".to_owned(),
                             workflow_id_prefix: prefix.to_owned(),
                             max_in_flight,
-                            parent_close_policy: durust::ParentClosePolicy::Abandon,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                            fingerprint: durust::child_workflow_map_fingerprint(
+                            parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
+                            failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                            fingerprint: durust::provider::child_workflow_map_fingerprint(
                                 workflow_type,
                                 durust::payload_digest(&input_manifest),
                                 "collision-results".to_owned(),
                                 prefix.to_owned(),
                                 max_in_flight,
                                 task_queue,
-                                durust::ParentClosePolicy::Abandon,
-                                durust::ChildWorkflowMapFailureMode::CollectAll,
+                                durust::provider::ParentClosePolicy::Abandon,
+                                durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                             ),
                         },
                     ),
@@ -11214,8 +11383,8 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
                 .await
                 .unwrap()
                 .expect("parent workflow task");
-            let command_id = durust::command_id(&parent_run_id, 1);
-            let input_manifest = durust::encode_activity_map_input_manifest(
+            let command_id = durust::provider::command_id(&parent_run_id, 1);
+            let input_manifest = durust::provider::encode_activity_map_input_manifest(
                 (0..2_u64)
                     .map(|value| durust::encode_payload(&value).unwrap())
                     .collect(),
@@ -11232,14 +11401,13 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
                 result_manifest_name: "vanish-results".to_owned(),
                 workflow_id_prefix: prefix.to_owned(),
                 max_in_flight: 2,
-                parent_close_policy: durust::ParentClosePolicy::Abandon,
-                failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
+                parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
+                failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
             };
             let commit = || WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowMapScheduled(
-                        durust::ChildWorkflowMapScheduled {
+                        durust::provider::ChildWorkflowMapScheduled {
                             command_id: command_id.clone(),
                             workflow_type: workflow_type.clone(),
                             task_queue: task_queue.clone(),
@@ -11247,17 +11415,17 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
                             result_manifest_name: "vanish-results".to_owned(),
                             workflow_id_prefix: prefix.to_owned(),
                             max_in_flight: 2,
-                            parent_close_policy: durust::ParentClosePolicy::Abandon,
-                            failure_mode: durust::ChildWorkflowMapFailureMode::CollectAll,
-                            fingerprint: durust::child_workflow_map_fingerprint(
+                            parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
+                            failure_mode: durust::provider::ChildWorkflowMapFailureMode::CollectAll,
+                            fingerprint: durust::provider::child_workflow_map_fingerprint(
                                 workflow_type.clone(),
                                 durust::payload_digest(&input_manifest),
                                 "vanish-results".to_owned(),
                                 prefix.to_owned(),
                                 2,
                                 task_queue.clone(),
-                                durust::ParentClosePolicy::Abandon,
-                                durust::ChildWorkflowMapFailureMode::CollectAll,
+                                durust::provider::ParentClosePolicy::Abandon,
+                                durust::provider::ChildWorkflowMapFailureMode::CollectAll,
                             ),
                         },
                     ),
@@ -11304,7 +11472,7 @@ fn postgres_child_map_item_vanishing_mid_transaction_fails_loudly_when_configure
                     .iter()
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
-                vec![durust::HistoryEventType::WorkflowStarted],
+                vec![durust::provider::HistoryEventType::WorkflowStarted],
             );
 
             run_postgres_sql(
@@ -11376,37 +11544,36 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
                 .await
                 .unwrap()
                 .expect("parent workflow task");
-            let command_id = durust::command_id(&parent_run_id, 1);
+            let command_id = durust::provider::command_id(&parent_run_id, 1);
             let commit = || WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::ChildWorkflowStartRequested(
-                        durust::ChildWorkflowStartRequested {
+                        durust::provider::ChildWorkflowStartRequested {
                             command_id: command_id.clone(),
                             workflow_type: WorkflowType::new("conformance.workflow", 1),
                             workflow_id: durust::WorkflowId::new(child_id),
                             task_queue: TaskQueue::new("child-vanish-children"),
                             input: durust::encode_payload(&Input { value: 1 }).unwrap(),
-                            parent_close_policy: durust::ParentClosePolicy::Abandon,
-                            fingerprint: durust::child_workflow_fingerprint(
+                            parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
+                            fingerprint: durust::provider::child_workflow_fingerprint(
                                 WorkflowType::new("conformance.workflow", 1),
                                 durust::WorkflowId::new(child_id),
                                 durust::payload_digest(
                                     &durust::encode_payload(&Input { value: 1 }).unwrap(),
                                 ),
                                 TaskQueue::new("child-vanish-children"),
-                                durust::ParentClosePolicy::Abandon,
+                                durust::provider::ParentClosePolicy::Abandon,
                             ),
                         },
                     ),
                 )],
-                start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                start_child_workflows: vec![durust::provider::ChildStartOutboxMessage {
                     command_id: command_id.clone(),
                     workflow_type: WorkflowType::new("conformance.workflow", 1),
                     workflow_id: durust::WorkflowId::new(child_id),
                     task_queue: TaskQueue::new("child-vanish-children"),
                     input: durust::encode_payload(&Input { value: 1 }).unwrap(),
-                    parent_close_policy: durust::ParentClosePolicy::Abandon,
+                    parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
                     child_map_item: None,
                 }],
                 ..WorkflowTaskCommit::default()
@@ -11448,7 +11615,7 @@ fn postgres_plain_child_start_vanishing_mid_transaction_fails_loudly_when_config
                     .iter()
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
-                vec![durust::HistoryEventType::WorkflowStarted],
+                vec![durust::provider::HistoryEventType::WorkflowStarted],
                 "the whole commit must roll back",
             );
 
@@ -11555,9 +11722,9 @@ fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
-                    durust::HistoryEventType::WorkflowStarted,
-                    durust::HistoryEventType::ActivityMapScheduled,
-                    durust::HistoryEventType::ActivityMapCompleted,
+                    durust::provider::HistoryEventType::WorkflowStarted,
+                    durust::provider::HistoryEventType::ActivityMapScheduled,
+                    durust::provider::HistoryEventType::ActivityMapCompleted,
                 ],
             );
             let woken = reopened
@@ -11570,7 +11737,7 @@ fn postgres_repairs_a_pre_upgrade_stalled_empty_map_at_open_when_configured() {
                 .expect("the repaired map wakes its parent");
             assert_eq!(
                 woken.reason,
-                durust::WorkflowTaskReason::ActivityMapCompleted
+                durust::provider::WorkflowTaskReason::ActivityMapCompleted
             );
             assert_eq!(woken.replay_target_event_id, EventId(3));
 
@@ -11662,9 +11829,9 @@ fn postgres_undecodable_stalled_map_is_skipped_not_fatal_when_configured() {
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
-                    durust::HistoryEventType::WorkflowStarted,
-                    durust::HistoryEventType::ActivityMapScheduled,
-                    durust::HistoryEventType::ActivityMapCompleted,
+                    durust::provider::HistoryEventType::WorkflowStarted,
+                    durust::provider::HistoryEventType::ActivityMapScheduled,
+                    durust::provider::HistoryEventType::ActivityMapCompleted,
                 ],
                 "the repairable descriptor beside the bad one is still repaired",
             );
@@ -11817,10 +11984,11 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
                 .await
                 .unwrap()
                 .expect("workflow task");
-            let child_command = durust::command_id(&run_id, 1);
-            let map_command = durust::command_id(&run_id, 2);
+            let child_command = durust::provider::command_id(&run_id, 1);
+            let map_command = durust::provider::command_id(&run_id, 2);
             let child_input = durust::encode_payload(&Input { value: 1 }).unwrap();
-            let empty_manifest = durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+            let empty_manifest =
+                durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
             let activity_name = ActivityName::new("conformance.echo");
             let activity_queue = TaskQueue::new("reason-activities");
 
@@ -11828,55 +11996,57 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
                 .commit_workflow_task(
                     claimed.claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
                         append_events: vec![
-                            durust::NewHistoryEvent::new(
+                            durust::provider::NewHistoryEvent::new(
                                 HistoryEventData::ChildWorkflowStartRequested(
-                                    durust::ChildWorkflowStartRequested {
+                                    durust::provider::ChildWorkflowStartRequested {
                                         command_id: child_command.clone(),
                                         workflow_type: WorkflowType::new("conformance.workflow", 1),
                                         workflow_id: durust::WorkflowId::new("wf/reason/child"),
                                         task_queue: TaskQueue::new("reason-children"),
                                         input: child_input.clone(),
-                                        parent_close_policy: durust::ParentClosePolicy::Abandon,
-                                        fingerprint: durust::child_workflow_fingerprint(
+                                        parent_close_policy:
+                                            durust::provider::ParentClosePolicy::Abandon,
+                                        fingerprint: durust::provider::child_workflow_fingerprint(
                                             WorkflowType::new("conformance.workflow", 1),
                                             durust::WorkflowId::new("wf/reason/child"),
                                             durust::payload_digest(&child_input),
                                             TaskQueue::new("reason-children"),
-                                            durust::ParentClosePolicy::Abandon,
+                                            durust::provider::ParentClosePolicy::Abandon,
                                         ),
                                     },
                                 ),
                             ),
-                            durust::NewHistoryEvent::new(HistoryEventData::ActivityMapScheduled(
-                                durust::ActivityMapScheduled {
-                                    command_id: map_command.clone(),
-                                    activity_name: activity_name.clone(),
-                                    task_queue: activity_queue.clone(),
-                                    retry_policy: durust::RetryPolicy::none(),
-                                    start_to_close_timeout: None,
-                                    heartbeat_timeout: None,
-                                    input_manifest: empty_manifest.clone(),
-                                    result_manifest_name: "empty".to_owned(),
-                                    max_in_flight: 2,
-                                    fingerprint: durust::activity_map_fingerprint(
-                                        activity_name.clone(),
-                                        durust::payload_digest(&empty_manifest),
-                                        "empty".to_owned(),
-                                        2,
-                                        "sha256:test-options".to_owned(),
-                                    ),
-                                },
-                            )),
+                            durust::provider::NewHistoryEvent::new(
+                                HistoryEventData::ActivityMapScheduled(
+                                    durust::provider::ActivityMapScheduled {
+                                        command_id: map_command.clone(),
+                                        activity_name: activity_name.clone(),
+                                        task_queue: activity_queue.clone(),
+                                        retry_policy: durust::RetryPolicy::none(),
+                                        start_to_close_timeout: None,
+                                        heartbeat_timeout: None,
+                                        input_manifest: empty_manifest.clone(),
+                                        result_manifest_name: "empty".to_owned(),
+                                        max_in_flight: 2,
+                                        fingerprint: durust::provider::activity_map_fingerprint(
+                                            activity_name.clone(),
+                                            durust::payload_digest(&empty_manifest),
+                                            "empty".to_owned(),
+                                            2,
+                                            "sha256:test-options".to_owned(),
+                                        ),
+                                    },
+                                ),
+                            ),
                         ],
-                        start_child_workflows: vec![durust::ChildStartOutboxMessage {
+                        start_child_workflows: vec![durust::provider::ChildStartOutboxMessage {
                             command_id: child_command,
                             workflow_type: WorkflowType::new("conformance.workflow", 1),
                             workflow_id: durust::WorkflowId::new("wf/reason/child"),
                             task_queue: TaskQueue::new("reason-children"),
                             input: child_input,
-                            parent_close_policy: durust::ParentClosePolicy::Abandon,
+                            parent_close_policy: durust::provider::ParentClosePolicy::Abandon,
                             child_map_item: None,
                         }],
                         schedule_activity_maps: vec![ActivityMapTask {
@@ -11903,11 +12073,11 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
-                    durust::HistoryEventType::WorkflowStarted,
-                    durust::HistoryEventType::ChildWorkflowStartRequested,
-                    durust::HistoryEventType::ActivityMapScheduled,
-                    durust::HistoryEventType::ChildWorkflowStarted,
-                    durust::HistoryEventType::ActivityMapCompleted,
+                    durust::provider::HistoryEventType::WorkflowStarted,
+                    durust::provider::HistoryEventType::ChildWorkflowStartRequested,
+                    durust::provider::HistoryEventType::ActivityMapScheduled,
+                    durust::provider::HistoryEventType::ChildWorkflowStarted,
+                    durust::provider::HistoryEventType::ActivityMapCompleted,
                 ],
             );
             let ready = backend
@@ -11917,7 +12087,7 @@ fn postgres_same_commit_map_completion_names_the_ready_reason_when_configured() 
                 .expect("the parent is woken by its own commit");
             assert_eq!(
                 ready.reason,
-                durust::WorkflowTaskReason::ActivityMapCompleted,
+                durust::provider::WorkflowTaskReason::ActivityMapCompleted,
                 "the last fact this commit appended names the reason, not the inline child start",
             );
         },
@@ -11983,32 +12153,33 @@ fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured
 
             let commit = |claim| {
                 let empty_manifest =
-                    durust::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
+                    durust::provider::encode_activity_map_input_manifest(Vec::new(), 2).unwrap();
                 let activity_name = ActivityName::new("conformance.echo");
                 let task_queue = TaskQueue::new("stale-desc-activities");
                 backend.commit_workflow_task(
                     claim,
                     WorkflowTaskCommit {
-                        expected_tail_event_id: EventId(1),
-                        append_events: vec![durust::NewHistoryEvent::new(
-                            HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                                command_id: command_id.clone(),
-                                activity_name: activity_name.clone(),
-                                task_queue: task_queue.clone(),
-                                retry_policy: durust::RetryPolicy::none(),
-                                start_to_close_timeout: None,
-                                heartbeat_timeout: None,
-                                input_manifest: empty_manifest.clone(),
-                                result_manifest_name: "mapped".to_owned(),
-                                max_in_flight: 2,
-                                fingerprint: durust::activity_map_fingerprint(
-                                    activity_name.clone(),
-                                    durust::payload_digest(&empty_manifest),
-                                    "mapped".to_owned(),
-                                    2,
-                                    "sha256:test-options".to_owned(),
-                                ),
-                            }),
+                        append_events: vec![durust::provider::NewHistoryEvent::new(
+                            HistoryEventData::ActivityMapScheduled(
+                                durust::provider::ActivityMapScheduled {
+                                    command_id: command_id.clone(),
+                                    activity_name: activity_name.clone(),
+                                    task_queue: task_queue.clone(),
+                                    retry_policy: durust::RetryPolicy::none(),
+                                    start_to_close_timeout: None,
+                                    heartbeat_timeout: None,
+                                    input_manifest: empty_manifest.clone(),
+                                    result_manifest_name: "mapped".to_owned(),
+                                    max_in_flight: 2,
+                                    fingerprint: durust::provider::activity_map_fingerprint(
+                                        activity_name.clone(),
+                                        durust::payload_digest(&empty_manifest),
+                                        "mapped".to_owned(),
+                                        2,
+                                        "sha256:test-options".to_owned(),
+                                    ),
+                                },
+                            ),
                         )],
                         schedule_activity_maps: vec![ActivityMapTask {
                             map_command_id: command_id.clone(),
@@ -12049,7 +12220,7 @@ fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured
                     .iter()
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
-                vec![durust::HistoryEventType::WorkflowStarted],
+                vec![durust::provider::HistoryEventType::WorkflowStarted],
                 "the whole commit must roll back, appending nothing",
             );
 
@@ -12073,9 +12244,9 @@ fn postgres_stale_map_descriptor_is_rejected_not_silently_reused_when_configured
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
-                    durust::HistoryEventType::WorkflowStarted,
-                    durust::HistoryEventType::ActivityMapScheduled,
-                    durust::HistoryEventType::ActivityMapCompleted,
+                    durust::provider::HistoryEventType::WorkflowStarted,
+                    durust::provider::HistoryEventType::ActivityMapScheduled,
+                    durust::provider::HistoryEventType::ActivityMapCompleted,
                 ],
             );
         },
@@ -12103,25 +12274,26 @@ fn timer_wait_closing_commit(
     run_id: &durust::RunId,
     fire_at: durust::TimestampMs,
 ) -> (durust::WaitId, WorkflowTaskCommit) {
-    let command_id = durust::command_id(run_id, 1);
+    let command_id = durust::provider::command_id(run_id, 1);
     let wait_id = durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
     let commit = WorkflowTaskCommit {
-        expected_tail_event_id: EventId(1),
         append_events: vec![
-            durust::NewHistoryEvent::new(HistoryEventData::TimerStarted(durust::TimerStarted {
-                command_id: command_id.clone(),
-                fire_at,
-                fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
-            })),
-            durust::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
+            durust::provider::NewHistoryEvent::new(HistoryEventData::TimerStarted(
+                durust::provider::TimerStarted {
+                    command_id: command_id.clone(),
+                    fire_at,
+                    fingerprint: durust::provider::timer_fingerprint("sleep_until", fire_at),
+                },
+            )),
+            durust::provider::NewHistoryEvent::new(HistoryEventData::WorkflowCompleted {
                 result: durust::encode_payload(&()).unwrap(),
             }),
         ],
-        upsert_waits: vec![durust::WaitRecord {
+        upsert_waits: vec![durust::provider::WaitRecord {
             wait_id: wait_id.clone(),
             run_id: run_id.clone(),
             command_id,
-            kind: durust::WaitKind::Timer,
+            kind: durust::provider::WaitKind::Timer,
             key: "timer".to_owned(),
             ready_at: Some(fire_at),
         }],
@@ -12183,12 +12355,7 @@ where
         .commit_workflow_task(claimed.claim, commit)
         .await
         .expect("a commit that starts a timer and closes its own run must be accepted");
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(3)
-        },
-    );
+    assert_eq!(outcome, EventId(3),);
     (run_id, wait_id)
 }
 
@@ -12212,7 +12379,7 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
         .await
         .unwrap()
         .expect("workflow task");
-    let command_id = durust::command_id(&live_run_id, 1);
+    let command_id = durust::provider::command_id(&live_run_id, 1);
     let live_wait_id =
         durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
     // The closed run's leftover has to be picked first under both selection
@@ -12233,19 +12400,18 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::provider::TimerStarted {
                         command_id: command_id.clone(),
                         fire_at,
-                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                        fingerprint: durust::provider::timer_fingerprint("sleep_until", fire_at),
                     }),
                 )],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: live_wait_id,
                     run_id: live_run_id.clone(),
                     command_id,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
@@ -12254,15 +12420,10 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     let fired = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10_000),
             limit: 1,
@@ -12281,9 +12442,9 @@ async fn only_the_live_runs_timer_spends_the_due_scan_budget<B>(
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::TimerStarted,
-            durust::HistoryEventType::TimerFired,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::TimerStarted,
+            durust::provider::HistoryEventType::TimerFired,
         ],
         "the live run's timer is the one that must have fired",
     );
@@ -12326,14 +12487,14 @@ fn sqlite_gc_measures_blob_age_on_the_wall_clock() {
                     prefix: String::new(),
                 },
             ),
-            durust::ProviderClock::manual(durust::TimestampMs(far_ahead)),
+            durust::provider::ProviderClock::manual(durust::TimestampMs(far_ahead)),
         )
         .unwrap();
         fs::create_dir_all(&blobs).unwrap();
         let orphan = blobs.join("sha256:orphan");
         fs::write(&orphan, b"orphan").unwrap();
         let outcome = backend
-            .gc_payload_blobs(durust::PayloadGarbageCollectionRequest {
+            .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
                 dry_run: false,
                 min_age: Duration::from_secs(60 * 60),
             })
@@ -12464,12 +12625,7 @@ fn postgres_closing_commits_delete_wait_rows_on_both_commit_paths_when_configure
                 .unwrap();
             assert_eq!(results.len(), 2);
             for result in &results {
-                assert_eq!(
-                    *result.result.as_ref().unwrap(),
-                    CommitOutcome::Committed {
-                        new_tail_event_id: EventId(3)
-                    },
-                );
+                assert_eq!(*result.result.as_ref().unwrap(), EventId(3),);
             }
             for claimed in &claims {
                 assert_eq!(
@@ -12562,8 +12718,7 @@ where
         .commit_workflow_task(
             closing.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
+                append_events: vec![durust::provider::NewHistoryEvent::new(
                     HistoryEventData::WorkflowCompleted {
                         result: durust::encode_payload(&()).unwrap(),
                     },
@@ -12573,12 +12728,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     client
         .start_workflow::<workflow>(
@@ -12596,20 +12746,19 @@ where
         .await
         .unwrap()
         .expect("workflow task");
-    let stray_command_id = durust::command_id(&closed_run_id, 1);
+    let stray_command_id = durust::provider::command_id(&closed_run_id, 1);
     let injected = backend
         .commit_workflow_task(
             injector.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
                         stray_command_id.run_id, stray_command_id.seq.0
                     )),
                     run_id: closed_run_id.clone(),
                     command_id: stray_command_id,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(durust::TimestampMs(1_000)),
                 }],
@@ -12618,12 +12767,7 @@ where
         )
         .await
         .expect("the forging commit is a live run's own commit and must be accepted");
-    assert_eq!(
-        injected,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        },
-    );
+    assert_eq!(injected, EventId(1),);
     closed_run_id
 }
 
@@ -12632,7 +12776,7 @@ where
     B: DurableBackend,
 {
     let fired = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10_000),
             limit: 16,
@@ -12651,8 +12795,8 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::WorkflowCompleted,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::WorkflowCompleted,
         ],
         "nothing may be appended past the run's own terminal event",
     );
@@ -12701,10 +12845,10 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
         "the live run must be the task claimed here, or the timer below is committed against \
          the wrong run and the final sweep proves nothing",
     );
-    let command_id = durust::command_id(&live_run_id, 1);
+    let command_id = durust::provider::command_id(&live_run_id, 1);
     let live_wait_id =
         durust::WaitId::new(format!("{}:{}:timer", command_id.run_id, command_id.seq.0));
-    let stray_command_id = durust::command_id(closed_run_id, 1);
+    let stray_command_id = durust::provider::command_id(closed_run_id, 1);
     let stray_wait_id = durust::WaitId::new(format!(
         "{}:{}:timer",
         stray_command_id.run_id, stray_command_id.seq.0
@@ -12728,19 +12872,18 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
         .commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::provider::TimerStarted {
                         command_id: command_id.clone(),
                         fire_at,
-                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                        fingerprint: durust::provider::timer_fingerprint("sleep_until", fire_at),
                     }),
                 )],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: live_wait_id,
                     run_id: live_run_id.clone(),
                     command_id,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
@@ -12749,15 +12892,10 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        },
-    );
+    assert_eq!(outcome, EventId(2),);
 
     let budgeted = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10_000),
             limit: 1,
@@ -12777,9 +12915,9 @@ async fn a_fenced_stray_wait_leaves_the_scan_budget_to_the_live_run<B>(
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::TimerStarted,
-            durust::HistoryEventType::TimerFired,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::TimerStarted,
+            durust::provider::HistoryEventType::TimerFired,
         ],
         "the live run's timer is the one that must have fired",
     );
@@ -12876,7 +13014,7 @@ where
             .signal_workflow("wf/fence-b", "ready", "signal/fence/b", "b")
             .await
             .unwrap(),
-        durust::SignalWorkflowOutcome::Accepted
+        durust::provider::SignalWorkflowOutcome::Accepted
     );
 
     // B registers its own timer wait.
@@ -12889,7 +13027,7 @@ where
         .unwrap()
         .expect("run b's task");
     assert_eq!(claimed_b.run_id, run_b);
-    let timer_command = durust::command_id(&run_b, 1);
+    let timer_command = durust::provider::command_id(&run_b, 1);
     let timer_wait_id = durust::WaitId::new(format!(
         "{}:{}:timer",
         timer_command.run_id, timer_command.seq.0
@@ -12899,19 +13037,18 @@ where
         .commit_workflow_task(
             claimed_b.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::provider::TimerStarted {
                         command_id: timer_command.clone(),
                         fire_at,
-                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                        fingerprint: durust::provider::timer_fingerprint("sleep_until", fire_at),
                     }),
                 )],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: timer_wait_id.clone(),
                     run_id: run_b.clone(),
                     command_id: timer_command,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
@@ -12920,12 +13057,7 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(2)
-        }
-    );
+    assert_eq!(outcome, EventId(2));
 
     // A's commit names B's signal, B's wait, and a new wait for B.
     let claimed_a = backend
@@ -12937,22 +13069,21 @@ where
         .unwrap()
         .expect("run a's task");
     assert_eq!(claimed_a.run_id, run_a);
-    let foreign_command = durust::command_id(&run_b, 2);
+    let foreign_command = durust::provider::command_id(&run_b, 2);
     let outcome = backend
         .commit_workflow_task(
             claimed_a.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 consume_signals: vec![durust::SignalId::new("signal/fence/b")],
                 delete_waits: vec![timer_wait_id],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
                         foreign_command.run_id, foreign_command.seq.0
                     )),
                     run_id: run_b.clone(),
                     command_id: foreign_command,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
@@ -12961,15 +13092,10 @@ where
         )
         .await
         .unwrap();
-    assert_eq!(
-        outcome,
-        CommitOutcome::Committed {
-            new_tail_event_id: EventId(1)
-        }
-    );
+    assert_eq!(outcome, EventId(1));
 
     let inbox = backend
-        .read_signal_inbox(durust::ReadSignalInboxRequest {
+        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
             run_id: run_b.clone(),
             signal_name: durust::SignalName::new("ready"),
         })
@@ -12979,7 +13105,7 @@ where
     assert_eq!(inbox.signal_id, durust::SignalId::new("signal/fence/b"));
 
     let fired = backend
-        .fire_due_timers(durust::FireDueTimersRequest {
+        .fire_due_timers(durust::provider::FireDueTimersRequest {
             namespace: Namespace::default(),
             now: durust::TimestampMs(10_000),
             limit: 16,
@@ -12997,9 +13123,9 @@ where
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
         vec![
-            durust::HistoryEventType::WorkflowStarted,
-            durust::HistoryEventType::TimerStarted,
-            durust::HistoryEventType::TimerFired,
+            durust::provider::HistoryEventType::WorkflowStarted,
+            durust::provider::HistoryEventType::TimerStarted,
+            durust::provider::HistoryEventType::TimerFired,
         ]
     );
     assert_eq!(
@@ -13008,7 +13134,7 @@ where
             .iter()
             .map(|event| event.event_type())
             .collect::<Vec<_>>(),
-        vec![durust::HistoryEventType::WorkflowStarted]
+        vec![durust::provider::HistoryEventType::WorkflowStarted]
     );
 }
 
@@ -13018,7 +13144,7 @@ where
 #[test]
 fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
     block_on(async {
-        let blob_store = durust::MemoryBlobStore::new();
+        let blob_store = durust::provider::MemoryBlobStore::new();
         let inner = MemoryBackend::new();
         let backend = PayloadBackend::with_payload_storage(
             inner.clone(),
@@ -13040,7 +13166,6 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
                 ClaimWorkflowTasksOptions {
                     claim: workflow_claim_opts("batch-forward-workflows"),
                     limit: 2,
-                    shard_filter: None,
                 },
             )
             .await
@@ -13050,8 +13175,8 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
         let first = claimed.remove(0);
 
         let activity_input = durust::encode_payload(&Input { value: 7 }).unwrap();
-        let command_id = durust::command_id(&first.run_id, 1);
-        let scheduled = durust::ActivityScheduled {
+        let command_id = durust::provider::command_id(&first.run_id, 1);
+        let scheduled = durust::provider::ActivityScheduled {
             command_id: command_id.clone(),
             activity_name: ActivityName::new("conformance.echo"),
             task_queue: TaskQueue::new("batch-forward-activities"),
@@ -13059,33 +13184,31 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
             start_to_close_timeout: None,
             heartbeat_timeout: None,
             input: activity_input.clone(),
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("conformance.echo"),
                 durust::payload_digest(&activity_input),
                 "sha256:test-options".to_owned(),
             ),
         };
         let results = backend
-            .commit_workflow_tasks(durust::WorkflowTaskCommitBatch {
+            .commit_workflow_tasks(durust::provider::WorkflowTaskCommitBatch {
                 commits: vec![
-                    durust::WorkflowTaskCommitInput {
+                    durust::provider::WorkflowTaskCommitInput {
                         claim: first.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: EventId(1),
-                            append_events: vec![durust::NewHistoryEvent::new(
+                            append_events: vec![durust::provider::NewHistoryEvent::new(
                                 HistoryEventData::ActivityScheduled(scheduled.clone()),
                             )],
-                            schedule_activities: vec![durust::ActivityTask::from_scheduled(
-                                &scheduled,
-                            )],
+                            schedule_activities: vec![
+                                durust::provider::ActivityTask::from_scheduled(&scheduled),
+                            ],
                             ..WorkflowTaskCommit::default()
                         },
                     },
-                    durust::WorkflowTaskCommitInput {
+                    durust::provider::WorkflowTaskCommitInput {
                         claim: second.claim,
                         commit: WorkflowTaskCommit {
-                            expected_tail_event_id: EventId(1),
-                            append_events: vec![durust::NewHistoryEvent::new(
+                            append_events: vec![durust::provider::NewHistoryEvent::new(
                                 HistoryEventData::WorkflowCompleted {
                                     result: durust::encode_payload(&"done").unwrap(),
                                 },
@@ -13102,7 +13225,7 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
 
         // The stored copies are blob refs, so the batch commit was offloaded.
         let stored = inner
-            .stream_history(durust::StreamHistoryRequest {
+            .stream_history(durust::provider::StreamHistoryRequest {
                 run_id: run_b.clone(),
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(2),
@@ -13118,7 +13241,7 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
             }
         ));
         let stored = inner
-            .stream_history(durust::StreamHistoryRequest {
+            .stream_history(durust::provider::StreamHistoryRequest {
                 run_id: run_a,
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(2),
@@ -13129,7 +13252,7 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
             .unwrap();
         assert!(matches!(
             &stored.events[1].data,
-            HistoryEventData::ActivityScheduled(durust::ActivityScheduled {
+            HistoryEventData::ActivityScheduled(durust::provider::ActivityScheduled {
                 input: durust::PayloadRef::Blob { .. },
                 ..
             })
@@ -13138,7 +13261,7 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
         let activities = backend
             .claim_activity_tasks(
                 WorkerId::new("batch-forward"),
-                durust::ClaimActivityTasksOptions {
+                durust::provider::ClaimActivityTasksOptions {
                     claim: ClaimActivityOptions {
                         namespace: Namespace::default(),
                         task_queue: TaskQueue::new("batch-forward-activities"),
@@ -13163,7 +13286,7 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
         );
 
         let maintenance = backend
-            .run_due_maintenance(durust::RunDueMaintenanceRequest {
+            .run_due_maintenance(durust::provider::RunDueMaintenanceRequest {
                 namespace: Namespace::default(),
                 now: durust::TimestampMs(0),
                 timer_limit: 16,
@@ -13175,8 +13298,10 @@ fn payload_backend_forwards_batch_claims_commits_and_maintenance() {
     });
 }
 
-// A shard filter is the one batch option the trait default rejects, so a
-// decorator that took the default failed every claim of a sharded deployment.
+// A shard filter used to live only on the batch options, where the trait
+// default rejected it, so a decorator that took the default failed every claim
+// of a sharded deployment. It now rides on the single-claim options, which the
+// default honors; this pins that a decorator forwards it either way.
 #[cfg(feature = "postgres")]
 #[test]
 fn payload_backend_forwards_shard_filtered_batch_claims_to_postgres() {
@@ -13189,7 +13314,7 @@ fn payload_backend_forwards_shard_filtered_batch_claims_to_postgres() {
                 .collect::<Vec<_>>();
             let backend = PayloadBackend::with_payload_storage(
                 inner,
-                durust::MemoryBlobStore::new(),
+                durust::provider::MemoryBlobStore::new(),
                 durust::PayloadStorageConfig::new(),
             );
             Client::new(backend.clone())
@@ -13200,9 +13325,11 @@ fn payload_backend_forwards_shard_filtered_batch_claims_to_postgres() {
                 .claim_workflow_tasks(
                     WorkerId::new("payload-shard"),
                     ClaimWorkflowTasksOptions {
-                        claim: workflow_claim_opts("payload-shard-workflows"),
+                        claim: ClaimWorkflowTaskOptions {
+                            shard_filter: Some(shards),
+                            ..workflow_claim_opts("payload-shard-workflows")
+                        },
                         limit: 4,
-                        shard_filter: Some(shards),
                     },
                 )
                 .await
@@ -13237,7 +13364,6 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
                     ClaimWorkflowTasksOptions {
                         claim: workflow_claim_opts("savepoint-workflows"),
                         limit: 2,
-                        shard_filter: None,
                     },
                 )
                 .await
@@ -13249,55 +13375,56 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
             assert_eq!(second.run_id, run_b);
 
             let fire_at = durust::TimestampMs(1_000);
-            let timer_command = durust::command_id(&run_a, 1);
+            let timer_command = durust::provider::command_id(&run_a, 1);
             let valid = WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::TimerStarted(durust::TimerStarted {
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::TimerStarted(durust::provider::TimerStarted {
                         command_id: timer_command.clone(),
                         fire_at,
-                        fingerprint: durust::timer_fingerprint("sleep_until", fire_at),
+                        fingerprint: durust::provider::timer_fingerprint("sleep_until", fire_at),
                     }),
                 )],
-                upsert_waits: vec![durust::WaitRecord {
+                upsert_waits: vec![durust::provider::WaitRecord {
                     wait_id: durust::WaitId::new(format!(
                         "{}:{}:timer",
                         timer_command.run_id, timer_command.seq.0
                     )),
                     run_id: run_a.clone(),
                     command_id: timer_command,
-                    kind: durust::WaitKind::Timer,
+                    kind: durust::provider::WaitKind::Timer,
                     key: "timer".to_owned(),
                     ready_at: Some(fire_at),
                 }],
                 ..WorkflowTaskCommit::default()
             };
 
-            let map_command = durust::command_id(&run_b, 1);
-            let manifest = durust::encode_activity_map_input_manifest(Vec::new(), 1).unwrap();
+            let map_command = durust::provider::command_id(&run_b, 1);
+            let manifest =
+                durust::provider::encode_activity_map_input_manifest(Vec::new(), 1).unwrap();
             let activity_name = ActivityName::new("conformance.echo");
             let task_queue = TaskQueue::new("savepoint-activities");
             let failing = WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
-                append_events: vec![durust::NewHistoryEvent::new(
-                    HistoryEventData::ActivityMapScheduled(durust::ActivityMapScheduled {
-                        command_id: map_command.clone(),
-                        activity_name: activity_name.clone(),
-                        task_queue: task_queue.clone(),
-                        retry_policy: durust::RetryPolicy::none(),
-                        start_to_close_timeout: None,
-                        heartbeat_timeout: None,
-                        input_manifest: manifest.clone(),
-                        result_manifest_name: "empty".to_owned(),
-                        max_in_flight: 0,
-                        fingerprint: durust::activity_map_fingerprint(
-                            activity_name.clone(),
-                            durust::payload_digest(&manifest),
-                            "empty".to_owned(),
-                            0,
-                            "sha256:test-options".to_owned(),
-                        ),
-                    }),
+                append_events: vec![durust::provider::NewHistoryEvent::new(
+                    HistoryEventData::ActivityMapScheduled(
+                        durust::provider::ActivityMapScheduled {
+                            command_id: map_command.clone(),
+                            activity_name: activity_name.clone(),
+                            task_queue: task_queue.clone(),
+                            retry_policy: durust::RetryPolicy::none(),
+                            start_to_close_timeout: None,
+                            heartbeat_timeout: None,
+                            input_manifest: manifest.clone(),
+                            result_manifest_name: "empty".to_owned(),
+                            max_in_flight: 0,
+                            fingerprint: durust::provider::activity_map_fingerprint(
+                                activity_name.clone(),
+                                durust::payload_digest(&manifest),
+                                "empty".to_owned(),
+                                0,
+                                "sha256:test-options".to_owned(),
+                            ),
+                        },
+                    ),
                 )],
                 schedule_activity_maps: vec![ActivityMapTask {
                     map_command_id: map_command,
@@ -13314,13 +13441,13 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
             };
 
             let results = backend
-                .commit_workflow_tasks(durust::WorkflowTaskCommitBatch {
+                .commit_workflow_tasks(durust::provider::WorkflowTaskCommitBatch {
                     commits: vec![
-                        durust::WorkflowTaskCommitInput {
+                        durust::provider::WorkflowTaskCommitInput {
                             claim: first.claim,
                             commit: valid,
                         },
-                        durust::WorkflowTaskCommitInput {
+                        durust::provider::WorkflowTaskCommitInput {
                             claim: second.claim,
                             commit: failing,
                         },
@@ -13329,12 +13456,7 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
                 .await
                 .unwrap();
             assert_eq!(results.len(), 2);
-            assert_eq!(
-                results[0].result.as_ref().unwrap(),
-                &CommitOutcome::Committed {
-                    new_tail_event_id: EventId(2)
-                }
-            );
+            assert_eq!(results[0].result.as_ref().unwrap(), &EventId(2));
             let err = results[1].result.as_ref().unwrap_err();
             assert!(
                 !matches!(err, durust::Error::Backend(_)),
@@ -13348,8 +13470,8 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
                 vec![
-                    durust::HistoryEventType::WorkflowStarted,
-                    durust::HistoryEventType::TimerStarted,
+                    durust::provider::HistoryEventType::WorkflowStarted,
+                    durust::provider::HistoryEventType::TimerStarted,
                 ]
             );
             assert_eq!(
@@ -13358,7 +13480,7 @@ fn postgres_batch_commit_rolls_back_a_failed_item_and_keeps_its_neighbor() {
                     .iter()
                     .map(|event| event.event_type())
                     .collect::<Vec<_>>(),
-                vec![durust::HistoryEventType::WorkflowStarted],
+                vec![durust::provider::HistoryEventType::WorkflowStarted],
                 "the failed item's history row must roll back with the item"
             );
         },
@@ -13402,13 +13524,13 @@ fn postgres_concurrent_duplicate_starts_and_signals_resolve_without_error() {
                 );
                 let mut outcomes = vec![first.unwrap(), second.unwrap()];
                 outcomes.sort_by_key(|outcome| {
-                    matches!(outcome, durust::SignalWorkflowOutcome::Duplicate)
+                    matches!(outcome, durust::provider::SignalWorkflowOutcome::Duplicate)
                 });
                 assert_eq!(
                     outcomes,
                     vec![
-                        durust::SignalWorkflowOutcome::Accepted,
-                        durust::SignalWorkflowOutcome::Duplicate
+                        durust::provider::SignalWorkflowOutcome::Accepted,
+                        durust::provider::SignalWorkflowOutcome::Duplicate
                     ]
                 );
             }
@@ -13437,15 +13559,15 @@ fn memory_timeout_retry_becomes_visible_after_the_policy_backoff() {
             .unwrap()
             .expect("workflow task");
         let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-        let scheduled = durust::ActivityScheduled {
-            command_id: durust::command_id(&run_id, 1),
+        let scheduled = durust::provider::ActivityScheduled {
+            command_id: durust::provider::command_id(&run_id, 1),
             activity_name: ActivityName::new("conformance.echo"),
             task_queue: TaskQueue::new("timeout-backoff-activities"),
             retry_policy: durust::RetryPolicy::exponential().max_attempts(2),
             start_to_close_timeout: Some(Duration::from_secs(1)),
             heartbeat_timeout: None,
             input: input.clone(),
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("conformance.echo"),
                 durust::payload_digest(&input),
                 "sha256:test-options".to_owned(),
@@ -13455,11 +13577,12 @@ fn memory_timeout_retry_becomes_visible_after_the_policy_backoff() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
-                    append_events: vec![durust::NewHistoryEvent::new(
+                    append_events: vec![durust::provider::NewHistoryEvent::new(
                         HistoryEventData::ActivityScheduled(scheduled.clone()),
                     )],
-                    schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                    schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                        &scheduled,
+                    )],
                     ..WorkflowTaskCommit::default()
                 },
             )
@@ -13483,7 +13606,7 @@ fn memory_timeout_retry_becomes_visible_after_the_policy_backoff() {
         backend.advance_time(Duration::from_millis(1_200));
         let scan_now = backend.current_time().await.unwrap();
         let timed_out = backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: scan_now,
                 limit: 16,
@@ -13514,7 +13637,7 @@ fn memory_timeout_retry_becomes_visible_after_the_policy_backoff() {
         // The restarted start-to-close clock runs from visibility, so a scan just
         // under one second after it leaves the retry alone.
         let early = backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: durust::TimestampMs(scan_now.0 + 1_000 + 999),
                 limit: 16,
@@ -13546,15 +13669,15 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
             .unwrap()
             .expect("workflow task");
         let input = durust::encode_payload(&Input { value: 9 }).unwrap();
-        let scheduled = durust::ActivityScheduled {
-            command_id: durust::command_id(&run_id, 1),
+        let scheduled = durust::provider::ActivityScheduled {
+            command_id: durust::provider::command_id(&run_id, 1),
             activity_name: ActivityName::new("conformance.echo"),
             task_queue: TaskQueue::new("claim-origin-activities"),
             retry_policy: durust::RetryPolicy::none(),
             start_to_close_timeout: Some(Duration::from_millis(100)),
             heartbeat_timeout: None,
             input: input.clone(),
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("conformance.echo"),
                 durust::payload_digest(&input),
                 "sha256:test-options".to_owned(),
@@ -13564,11 +13687,12 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
-                    append_events: vec![durust::NewHistoryEvent::new(
+                    append_events: vec![durust::provider::NewHistoryEvent::new(
                         HistoryEventData::ActivityScheduled(scheduled.clone()),
                     )],
-                    schedule_activities: vec![durust::ActivityTask::from_scheduled(&scheduled)],
+                    schedule_activities: vec![durust::provider::ActivityTask::from_scheduled(
+                        &scheduled,
+                    )],
                     ..WorkflowTaskCommit::default()
                 },
             )
@@ -13585,7 +13709,7 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
         // still claimable.
         backend.advance_time(Duration::from_millis(500));
         let scan = backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: backend.current_time().await.unwrap(),
                 limit: 16,
@@ -13606,7 +13730,7 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
         // 100 ms it has lapsed.
         backend.advance_time(Duration::from_millis(99));
         let early = backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: backend.current_time().await.unwrap(),
                 limit: 16,
@@ -13616,7 +13740,7 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
         assert_eq!(early.timed_out, 0);
         backend.advance_time(Duration::from_millis(1));
         let due = backend
-            .timeout_due_activities(durust::TimeoutDueActivitiesRequest {
+            .timeout_due_activities(durust::provider::TimeoutDueActivitiesRequest {
                 namespace: Namespace::default(),
                 now: backend.current_time().await.unwrap(),
                 limit: 16,
@@ -13634,7 +13758,7 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
                     result: durust::encode_payload(&1_u64).unwrap(),
                 })
                 .await,
-            Ok(durust::CompleteActivityOutcome::AlreadyCompleted)
+            Ok(durust::provider::CompleteActivityOutcome::AlreadyCompleted)
         ));
     });
 }

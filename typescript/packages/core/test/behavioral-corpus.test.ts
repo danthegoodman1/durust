@@ -80,9 +80,9 @@ import {
   type RunId,
   type WaitRecord,
   type WorkflowDefinition,
+  type EventId,
   type WorkflowTaskClaim,
-  type WorkflowTaskCommit,
-  type CommitOutcome
+  type WorkflowTaskCommit
 } from "@durust/core";
 import { NativeBackend } from "@durust/native";
 import { fnv1a32, maintenanceJitterSource } from "../src/worker.js";
@@ -505,7 +505,6 @@ function eventJson(data: HistoryEventData): Json {
         type: "SelectWinner",
         selectCommandId: commandIdJson(data.winner.selectCommandId),
         branchOrdinal: data.winner.branchOrdinal,
-        winningEventId: Number(data.winner.winningEventId),
         branchesDigest: SELECT_BRANCHES_PLACEHOLDER
       };
     case "VersionMarker":
@@ -625,7 +624,6 @@ function commitJson(commit: WorkflowTaskCommit): Json {
     throw new Error("no corpus case cancels a command yet");
   }
   return {
-    expectedTailEventId: Number(commit.expectedTailEventId),
     appendEvents: (commit.appendEvents ?? []).map((event: NewHistoryEvent) => eventJson(event.data)),
     upsertWaits: (commit.upsertWaits ?? []).map(waitJson),
     deleteWaits: (commit.deleteWaits ?? []).map((waitId) => waitIdJson(String(waitId))),
@@ -665,7 +663,7 @@ function recordingBackend(inner: DurableBackend): RecordingBackend {
         return () => commits.splice(0, commits.length);
       }
       if (property === "commitWorkflowTask") {
-        return async (claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<CommitOutcome> => {
+        return async (claim: WorkflowTaskClaim, commit: WorkflowTaskCommit): Promise<EventId> => {
           commits.push(commit);
           return target.commitWorkflowTask(claim, commit);
         };

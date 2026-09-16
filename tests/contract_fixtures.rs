@@ -38,13 +38,13 @@ fn rust_event_type_names_match_neutral_history_fixture() {
     }
 
     let started_input = payload_ref_from_fixture_json(&events[0]["data"]["input"]);
-    let started = durust::HistoryEventData::WorkflowStarted {
+    let started = durust::provider::HistoryEventData::WorkflowStarted {
         workflow_type: durust::WorkflowType::new("orders.checkout", 1),
         input: started_input,
     };
     assert_eq!(
         started.event_type(),
-        durust::HistoryEventType::WorkflowStarted,
+        durust::provider::HistoryEventType::WorkflowStarted,
     );
 }
 
@@ -54,7 +54,7 @@ fn rust_fingerprint_helpers_match_neutral_fixture() {
     let fingerprints = &fixture["fingerprints"];
 
     assert_eq!(
-        fingerprint_fixture_json(durust::activity_fingerprint(
+        fingerprint_fixture_json(durust::provider::activity_fingerprint(
             durust::ActivityName::new("payments.price-quote"),
             "sha256:quote-input-digest".to_owned(),
             "sha256:activity-options".to_owned(),
@@ -63,7 +63,7 @@ fn rust_fingerprint_helpers_match_neutral_fixture() {
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::activity_map_fingerprint(
+        fingerprint_fixture_json(durust::provider::activity_map_fingerprint(
             durust::ActivityName::new("payments.price-quote"),
             "sha256:manifest".to_owned(),
             "partials".to_owned(),
@@ -74,32 +74,32 @@ fn rust_fingerprint_helpers_match_neutral_fixture() {
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::child_workflow_fingerprint(
+        fingerprint_fixture_json(durust::provider::child_workflow_fingerprint(
             durust::WorkflowType::new("orders.ship", 1),
             durust::WorkflowId::new("ship/o-1"),
             "sha256:ship-input".to_owned(),
             durust::TaskQueue::new("workflows"),
-            durust::ParentClosePolicy::Cancel,
+            durust::provider::ParentClosePolicy::Cancel,
         )),
         fingerprints["childWorkflow"]
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::child_workflow_map_fingerprint(
+        fingerprint_fixture_json(durust::provider::child_workflow_map_fingerprint(
             durust::WorkflowType::new("orders.ship", 1),
             "sha256:ship-manifest".to_owned(),
             "ship-results".to_owned(),
             "ship-map".to_owned(),
             4,
             durust::TaskQueue::new("workflows"),
-            durust::ParentClosePolicy::Abandon,
-            durust::ChildWorkflowMapFailureMode::CollectAll,
+            durust::provider::ParentClosePolicy::Abandon,
+            durust::provider::ChildWorkflowMapFailureMode::CollectAll,
         )),
         fingerprints["childWorkflowMap"]
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::timer_fingerprint(
+        fingerprint_fixture_json(durust::provider::timer_fingerprint(
             "sleep_until",
             durust::TimestampMs(1_781_821_484_000),
         )),
@@ -107,14 +107,17 @@ fn rust_fingerprint_helpers_match_neutral_fixture() {
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::signal_fingerprint(durust::SignalName::new(
-            "approved"
-        ))),
+        fingerprint_fixture_json(durust::provider::signal_fingerprint(
+            durust::SignalName::new("approved")
+        )),
         fingerprints["signal"]
     );
 
     assert_eq!(
-        fingerprint_fixture_json(durust::version_marker_fingerprint("checkout-v2", 2)),
+        fingerprint_fixture_json(durust::provider::version_marker_fingerprint(
+            "checkout-v2",
+            2
+        )),
         fingerprints["versionMarker"]
     );
 }
@@ -278,13 +281,13 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     );
     assert_start_workflow_outcome(
         &fixture["startWorkflow"]["started"],
-        durust::StartWorkflowOutcome::Started {
+        durust::provider::StartWorkflowOutcome::Started {
             run_id: durust::RunId::new("run-1"),
         },
     );
     assert_start_workflow_outcome(
         &fixture["startWorkflow"]["alreadyStarted"],
-        durust::StartWorkflowOutcome::AlreadyStarted {
+        durust::provider::StartWorkflowOutcome::AlreadyStarted {
             run_id: durust::RunId::new("run-1"),
         },
     );
@@ -305,7 +308,10 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     assert_eq!(claimed.run_id, durust::RunId::new("run-1"));
     assert_eq!(claimed.claim.token, 7);
     assert_eq!(claimed.replay_target_event_id, durust::EventId(1));
-    assert_eq!(claimed.reason, durust::WorkflowTaskReason::WorkflowStarted);
+    assert_eq!(
+        claimed.reason,
+        durust::provider::WorkflowTaskReason::WorkflowStarted
+    );
     assert_eq!(claimed.prefetched_history.len(), 1);
 
     let stream_request = stream_history_request_from_fixture(&fixture["streamHistory"]["request"]);
@@ -320,12 +326,14 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     let workflow_claim = workflow_task_claim_from_fixture(&fixture["commitWorkflowTask"]["claim"]);
     assert_eq!(workflow_claim.worker_id, durust::WorkerId::new("worker-a"));
     let commit = workflow_task_commit_from_fixture(&fixture["commitWorkflowTask"]["commit"]);
-    assert_eq!(commit.expected_tail_event_id, durust::EventId(1));
     assert!(matches!(
         commit.append_events.first().map(|event| &event.data),
-        Some(durust::HistoryEventData::WorkflowTaskStarted)
+        Some(durust::provider::HistoryEventData::WorkflowTaskStarted)
     ));
-    assert_eq!(commit.upsert_waits[0].kind, durust::WaitKind::Timer);
+    assert_eq!(
+        commit.upsert_waits[0].kind,
+        durust::provider::WaitKind::Timer
+    );
     assert_eq!(
         commit.upsert_waits[0].ready_at,
         Some(durust::TimestampMs(1_781_821_484_000))
@@ -350,15 +358,9 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
             order_id: "o-1".to_owned()
         }
     );
-    assert_commit_outcome(
-        &fixture["commitWorkflowTask"]["committed"],
-        durust::CommitOutcome::Committed {
-            new_tail_event_id: durust::EventId(2),
-        },
-    );
-    assert_commit_outcome(
-        &fixture["commitWorkflowTask"]["conflict"],
-        durust::CommitOutcome::Conflict,
+    assert_eq!(
+        durust::EventId(u64_field(&fixture["commitWorkflowTask"], "newTailEventId")),
+        durust::EventId(2)
     );
 
     let signal_request =
@@ -370,11 +372,11 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     );
     assert_signal_workflow_outcome(
         &fixture["signalWorkflow"]["accepted"],
-        durust::SignalWorkflowOutcome::Accepted,
+        durust::provider::SignalWorkflowOutcome::Accepted,
     );
     assert_signal_workflow_outcome(
         &fixture["signalWorkflow"]["duplicate"],
-        durust::SignalWorkflowOutcome::Duplicate,
+        durust::provider::SignalWorkflowOutcome::Duplicate,
     );
     let inbox = signal_inbox_record_from_fixture(&fixture["signalWorkflow"]["inboxRecord"]);
     assert_eq!(inbox.signal_name, durust::SignalName::new("approved"));
@@ -387,26 +389,26 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     );
     assert_complete_activity_outcome(
         &fixture["activityCompletion"]["completed"],
-        durust::CompleteActivityOutcome::Completed {
+        durust::provider::CompleteActivityOutcome::Completed {
             event_id: durust::EventId(11),
         },
     );
     assert_complete_activity_outcome(
         &fixture["activityCompletion"]["alreadyCompleted"],
-        durust::CompleteActivityOutcome::AlreadyCompleted,
+        durust::provider::CompleteActivityOutcome::AlreadyCompleted,
     );
     let fail_request =
         fail_activity_request_from_fixture(&fixture["activityCompletion"]["failRequest"]);
     assert_eq!(fail_request.failure.error_type, "ActivityError");
     assert_fail_activity_outcome(
         &fixture["activityCompletion"]["failed"],
-        durust::FailActivityOutcome::Failed {
+        durust::provider::FailActivityOutcome::Failed {
             event_id: durust::EventId(12),
         },
     );
     assert_fail_activity_outcome(
         &fixture["activityCompletion"]["retryScheduled"],
-        durust::FailActivityOutcome::RetryScheduled {
+        durust::provider::FailActivityOutcome::RetryScheduled {
             next_attempt: 2,
             ready_at: durust::TimestampMs(0),
         },
@@ -416,8 +418,8 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     assert_eq!(timer_request.now, durust::TimestampMs(1_781_821_484_000));
     assert_eq!(timer_request.limit, 64);
     assert_eq!(
-        durust::FireDueTimersOutcome { fired: 1 },
-        durust::FireDueTimersOutcome {
+        durust::provider::FireDueTimersOutcome { fired: 1 },
+        durust::provider::FireDueTimersOutcome {
             fired: fixture["timers"]["outcome"]["fired"].as_u64().unwrap() as usize
         }
     );
@@ -430,7 +432,7 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     let query_found = query_projection_outcome_from_fixture(&fixture["queryWorkflow"]["found"]);
     assert!(matches!(
         query_found,
-        durust::QueryProjectionOutcome::Found {
+        durust::provider::QueryProjectionOutcome::Found {
             run_id: durust::RunId(ref run),
             event_id: durust::EventId(2),
             ..
@@ -438,15 +440,15 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     ));
     assert_eq!(
         query_projection_outcome_from_fixture(&fixture["queryWorkflow"]["notFound"]),
-        durust::QueryProjectionOutcome::NotFound
+        durust::provider::QueryProjectionOutcome::NotFound
     );
 
     let dispatch_request =
         dispatch_child_workflow_starts_request_from_fixture(&fixture["childDispatch"]["request"]);
     assert_eq!(dispatch_request.limit, 32);
     assert_eq!(
-        durust::DispatchChildWorkflowStartsOutcome { dispatched: 1 },
-        durust::DispatchChildWorkflowStartsOutcome {
+        durust::provider::DispatchChildWorkflowStartsOutcome { dispatched: 1 },
+        durust::provider::DispatchChildWorkflowStartsOutcome {
             dispatched: fixture["childDispatch"]["outcome"]["dispatched"]
                 .as_u64()
                 .unwrap() as usize
@@ -457,21 +459,24 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     assert_eq!(payload_roots.roots.len(), 2);
     assert!(matches!(
         payload_roots.roots[0],
-        durust::PayloadRootRef::Payload(_)
+        durust::provider::PayloadRootRef::Payload(_)
     ));
     assert!(matches!(
         payload_roots.roots[1],
-        durust::PayloadRootRef::ActivityMapInputManifest(_)
+        durust::provider::PayloadRootRef::ActivityMapInputManifest(_)
     ));
     let gc_request =
         payload_gc_request_from_fixture(&fixture["payloadGarbageCollection"]["request"]);
     assert!(gc_request.dry_run);
-    assert_eq!(gc_request.min_age, durust::DEFAULT_PAYLOAD_GC_MIN_AGE);
+    assert_eq!(
+        gc_request.min_age,
+        durust::provider::DEFAULT_PAYLOAD_GC_MIN_AGE
+    );
     assert_eq!(
         payload_gc_outcome_from_fixture(
             &fixture["payloadGarbageCollection"]["rustProviderOutcome"]
         ),
-        durust::PayloadGarbageCollectionOutcome {
+        durust::provider::PayloadGarbageCollectionOutcome {
             scanned_blobs: 3,
             retained_blobs: 2,
             deleted_blobs: 0,
@@ -660,41 +665,41 @@ fn load_benchmark_fixture() -> Value {
     .expect("benchmark contract fixture should be valid JSON")
 }
 
-fn all_history_event_types() -> [durust::HistoryEventType; 28] {
+fn all_history_event_types() -> [durust::provider::HistoryEventType; 28] {
     [
-        durust::HistoryEventType::WorkflowStarted,
-        durust::HistoryEventType::WorkflowCompleted,
-        durust::HistoryEventType::WorkflowFailed,
-        durust::HistoryEventType::WorkflowCancelled,
-        durust::HistoryEventType::WorkflowContinuedAsNew,
-        durust::HistoryEventType::WorkflowTaskStarted,
-        durust::HistoryEventType::ActivityScheduled,
-        durust::HistoryEventType::ActivityMapScheduled,
-        durust::HistoryEventType::ActivityMapCompleted,
-        durust::HistoryEventType::ActivityMapFailed,
-        durust::HistoryEventType::ActivityCompleted,
-        durust::HistoryEventType::ActivityFailed,
-        durust::HistoryEventType::ActivityTimedOut,
-        durust::HistoryEventType::ChildWorkflowStartRequested,
-        durust::HistoryEventType::ChildWorkflowStarted,
-        durust::HistoryEventType::ChildWorkflowCompleted,
-        durust::HistoryEventType::ChildWorkflowFailed,
-        durust::HistoryEventType::ChildWorkflowCancelled,
-        durust::HistoryEventType::ChildWorkflowMapScheduled,
-        durust::HistoryEventType::ChildWorkflowMapCompleted,
-        durust::HistoryEventType::ChildWorkflowMapFailed,
-        durust::HistoryEventType::TimerStarted,
-        durust::HistoryEventType::TimerFired,
-        durust::HistoryEventType::SignalConsumed,
-        durust::HistoryEventType::SelectWinner,
-        durust::HistoryEventType::VersionMarker,
-        durust::HistoryEventType::DeprecatedPatchMarker,
-        durust::HistoryEventType::SideEffectMarker,
+        durust::provider::HistoryEventType::WorkflowStarted,
+        durust::provider::HistoryEventType::WorkflowCompleted,
+        durust::provider::HistoryEventType::WorkflowFailed,
+        durust::provider::HistoryEventType::WorkflowCancelled,
+        durust::provider::HistoryEventType::WorkflowContinuedAsNew,
+        durust::provider::HistoryEventType::WorkflowTaskStarted,
+        durust::provider::HistoryEventType::ActivityScheduled,
+        durust::provider::HistoryEventType::ActivityMapScheduled,
+        durust::provider::HistoryEventType::ActivityMapCompleted,
+        durust::provider::HistoryEventType::ActivityMapFailed,
+        durust::provider::HistoryEventType::ActivityCompleted,
+        durust::provider::HistoryEventType::ActivityFailed,
+        durust::provider::HistoryEventType::ActivityTimedOut,
+        durust::provider::HistoryEventType::ChildWorkflowStartRequested,
+        durust::provider::HistoryEventType::ChildWorkflowStarted,
+        durust::provider::HistoryEventType::ChildWorkflowCompleted,
+        durust::provider::HistoryEventType::ChildWorkflowFailed,
+        durust::provider::HistoryEventType::ChildWorkflowCancelled,
+        durust::provider::HistoryEventType::ChildWorkflowMapScheduled,
+        durust::provider::HistoryEventType::ChildWorkflowMapCompleted,
+        durust::provider::HistoryEventType::ChildWorkflowMapFailed,
+        durust::provider::HistoryEventType::TimerStarted,
+        durust::provider::HistoryEventType::TimerFired,
+        durust::provider::HistoryEventType::SignalConsumed,
+        durust::provider::HistoryEventType::SelectWinner,
+        durust::provider::HistoryEventType::VersionMarker,
+        durust::provider::HistoryEventType::DeprecatedPatchMarker,
+        durust::provider::HistoryEventType::SideEffectMarker,
     ]
 }
 
-fn start_workflow_request_from_fixture(value: &Value) -> durust::StartWorkflowRequest {
-    durust::StartWorkflowRequest {
+fn start_workflow_request_from_fixture(value: &Value) -> durust::provider::StartWorkflowRequest {
+    durust::provider::StartWorkflowRequest {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         workflow_id: durust::WorkflowId::new(string_field(value, "workflowId")),
         workflow_type: workflow_type_from_fixture(&value["workflowType"]),
@@ -703,39 +708,42 @@ fn start_workflow_request_from_fixture(value: &Value) -> durust::StartWorkflowRe
     }
 }
 
-fn assert_start_workflow_outcome(value: &Value, expected: durust::StartWorkflowOutcome) {
+fn assert_start_workflow_outcome(value: &Value, expected: durust::provider::StartWorkflowOutcome) {
     match (string_field(value, "kind").as_str(), expected) {
-        ("Started", durust::StartWorkflowOutcome::Started { run_id })
-        | ("AlreadyStarted", durust::StartWorkflowOutcome::AlreadyStarted { run_id }) => {
+        ("Started", durust::provider::StartWorkflowOutcome::Started { run_id })
+        | ("AlreadyStarted", durust::provider::StartWorkflowOutcome::AlreadyStarted { run_id }) => {
             assert_eq!(durust::RunId::new(string_field(value, "runId")), run_id);
         }
         (actual, expected) => panic!("unexpected start outcome {actual} for {expected:?}"),
     }
 }
 
-fn claim_workflow_task_options_from_fixture(value: &Value) -> durust::ClaimWorkflowTaskOptions {
+fn claim_workflow_task_options_from_fixture(
+    value: &Value,
+) -> durust::provider::ClaimWorkflowTaskOptions {
     let registered_workflow_types = value["registeredWorkflowTypes"]
         .as_array()
         .expect("registeredWorkflowTypes should be an array")
         .iter()
         .map(workflow_type_from_fixture)
         .collect();
-    durust::ClaimWorkflowTaskOptions {
+    durust::provider::ClaimWorkflowTaskOptions {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         task_queue: durust::TaskQueue::new(string_field(value, "taskQueue")),
         registered_workflow_types,
         lease_duration: Duration::from_millis(u64_field(value, "leaseDurationMs")),
+        shard_filter: None,
     }
 }
 
-fn claimed_workflow_task_from_fixture(value: &Value) -> durust::ClaimedWorkflowTask {
+fn claimed_workflow_task_from_fixture(value: &Value) -> durust::provider::ClaimedWorkflowTask {
     let prefetched_history = value["prefetchedHistory"]
         .as_array()
         .expect("prefetchedHistory should be an array")
         .iter()
         .map(history_event_from_fixture)
         .collect();
-    durust::ClaimedWorkflowTask {
+    durust::provider::ClaimedWorkflowTask {
         run_id: durust::RunId::new(string_field(value, "runId")),
         workflow_id: durust::WorkflowId::new(string_field(value, "workflowId")),
         workflow_type: workflow_type_from_fixture(&value["workflowType"]),
@@ -746,8 +754,8 @@ fn claimed_workflow_task_from_fixture(value: &Value) -> durust::ClaimedWorkflowT
     }
 }
 
-fn stream_history_request_from_fixture(value: &Value) -> durust::StreamHistoryRequest {
-    durust::StreamHistoryRequest {
+fn stream_history_request_from_fixture(value: &Value) -> durust::provider::StreamHistoryRequest {
+    durust::provider::StreamHistoryRequest {
         run_id: durust::RunId::new(string_field(value, "runId")),
         after_event_id: durust::EventId(u64_field(value, "afterEventId")),
         up_to_event_id: durust::EventId(u64_field(value, "upToEventId")),
@@ -756,15 +764,15 @@ fn stream_history_request_from_fixture(value: &Value) -> durust::StreamHistoryRe
     }
 }
 
-fn workflow_task_claim_from_fixture(value: &Value) -> durust::WorkflowTaskClaim {
-    durust::WorkflowTaskClaim {
+fn workflow_task_claim_from_fixture(value: &Value) -> durust::provider::WorkflowTaskClaim {
+    durust::provider::WorkflowTaskClaim {
         run_id: durust::RunId::new(string_field(value, "runId")),
         worker_id: durust::WorkerId::new(string_field(value, "workerId")),
         token: u64_field(value, "token"),
     }
 }
 
-fn workflow_task_commit_from_fixture(value: &Value) -> durust::WorkflowTaskCommit {
+fn workflow_task_commit_from_fixture(value: &Value) -> durust::provider::WorkflowTaskCommit {
     let append_events = value["appendEvents"]
         .as_array()
         .unwrap_or(&Vec::new())
@@ -790,8 +798,7 @@ fn workflow_task_commit_from_fixture(value: &Value) -> durust::WorkflowTaskCommi
         .map(|signal| durust::SignalId::new(signal.as_str().expect("consumeSignals entry")))
         .collect();
 
-    durust::WorkflowTaskCommit {
-        expected_tail_event_id: durust::EventId(u64_field(value, "expectedTailEventId")),
+    durust::provider::WorkflowTaskCommit {
         append_events,
         upsert_waits,
         delete_waits,
@@ -803,21 +810,8 @@ fn workflow_task_commit_from_fixture(value: &Value) -> durust::WorkflowTaskCommi
     }
 }
 
-fn assert_commit_outcome(value: &Value, expected: durust::CommitOutcome) {
-    match (string_field(value, "kind").as_str(), expected) {
-        ("Committed", durust::CommitOutcome::Committed { new_tail_event_id }) => {
-            assert_eq!(
-                durust::EventId(u64_field(value, "newTailEventId")),
-                new_tail_event_id
-            );
-        }
-        ("Conflict", durust::CommitOutcome::Conflict) => {}
-        (actual, expected) => panic!("unexpected commit outcome {actual} for {expected:?}"),
-    }
-}
-
-fn signal_workflow_request_from_fixture(value: &Value) -> durust::SignalWorkflowRequest {
-    durust::SignalWorkflowRequest {
+fn signal_workflow_request_from_fixture(value: &Value) -> durust::provider::SignalWorkflowRequest {
+    durust::provider::SignalWorkflowRequest {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         workflow_id: durust::WorkflowId::new(string_field(value, "workflowId")),
         signal_id: durust::SignalId::new(string_field(value, "signalId")),
@@ -826,98 +820,113 @@ fn signal_workflow_request_from_fixture(value: &Value) -> durust::SignalWorkflow
     }
 }
 
-fn assert_signal_workflow_outcome(value: &Value, expected: durust::SignalWorkflowOutcome) {
+fn assert_signal_workflow_outcome(
+    value: &Value,
+    expected: durust::provider::SignalWorkflowOutcome,
+) {
     match (string_field(value, "kind").as_str(), expected) {
-        ("Accepted", durust::SignalWorkflowOutcome::Accepted)
-        | ("Duplicate", durust::SignalWorkflowOutcome::Duplicate) => {}
+        ("Accepted", durust::provider::SignalWorkflowOutcome::Accepted)
+        | ("Duplicate", durust::provider::SignalWorkflowOutcome::Duplicate) => {}
         (actual, expected) => panic!("unexpected signal outcome {actual} for {expected:?}"),
     }
 }
 
-fn signal_inbox_record_from_fixture(value: &Value) -> durust::SignalInboxRecord {
-    durust::SignalInboxRecord {
+fn signal_inbox_record_from_fixture(value: &Value) -> durust::provider::SignalInboxRecord {
+    durust::provider::SignalInboxRecord {
         signal_id: durust::SignalId::new(string_field(value, "signalId")),
         signal_name: durust::SignalName::new(string_field(value, "signalName")),
         payload: payload_ref_from_fixture_json(&value["payload"]),
     }
 }
 
-fn complete_activity_request_from_fixture(value: &Value) -> durust::CompleteActivityRequest {
-    durust::CompleteActivityRequest {
+fn complete_activity_request_from_fixture(
+    value: &Value,
+) -> durust::provider::CompleteActivityRequest {
+    durust::provider::CompleteActivityRequest {
         claim: activity_task_claim_from_fixture(&value["claim"]),
         result: payload_ref_from_fixture_json(&value["result"]),
     }
 }
 
-fn assert_complete_activity_outcome(value: &Value, expected: durust::CompleteActivityOutcome) {
+fn assert_complete_activity_outcome(
+    value: &Value,
+    expected: durust::provider::CompleteActivityOutcome,
+) {
     match (string_field(value, "kind").as_str(), expected) {
-        ("Completed", durust::CompleteActivityOutcome::Completed { event_id }) => {
+        ("Completed", durust::provider::CompleteActivityOutcome::Completed { event_id }) => {
             assert_eq!(durust::EventId(u64_field(value, "eventId")), event_id);
         }
-        ("AlreadyCompleted", durust::CompleteActivityOutcome::AlreadyCompleted) => {}
+        ("AlreadyCompleted", durust::provider::CompleteActivityOutcome::AlreadyCompleted) => {}
         (actual, expected) => {
             panic!("unexpected complete activity outcome {actual} for {expected:?}");
         }
     }
 }
 
-fn fail_activity_request_from_fixture(value: &Value) -> durust::FailActivityRequest {
-    durust::FailActivityRequest {
+fn fail_activity_request_from_fixture(value: &Value) -> durust::provider::FailActivityRequest {
+    durust::provider::FailActivityRequest {
         claim: activity_task_claim_from_fixture(&value["claim"]),
         failure: durable_failure_from_fixture_json(&value["failure"]),
     }
 }
 
-fn assert_fail_activity_outcome(value: &Value, expected: durust::FailActivityOutcome) {
+fn assert_fail_activity_outcome(value: &Value, expected: durust::provider::FailActivityOutcome) {
     match (string_field(value, "kind").as_str(), expected) {
-        ("Failed", durust::FailActivityOutcome::Failed { event_id }) => {
+        ("Failed", durust::provider::FailActivityOutcome::Failed { event_id }) => {
             assert_eq!(durust::EventId(u64_field(value, "eventId")), event_id);
         }
-        ("RetryScheduled", durust::FailActivityOutcome::RetryScheduled { next_attempt, .. }) => {
+        (
+            "RetryScheduled",
+            durust::provider::FailActivityOutcome::RetryScheduled { next_attempt, .. },
+        ) => {
             assert_eq!(u32_field(value, "attempt"), next_attempt);
         }
-        ("AlreadyCompleted", durust::FailActivityOutcome::AlreadyCompleted) => {}
+        ("AlreadyCompleted", durust::provider::FailActivityOutcome::AlreadyCompleted) => {}
         (actual, expected) => panic!("unexpected fail activity outcome {actual} for {expected:?}"),
     }
 }
 
-fn fire_due_timers_request_from_fixture(value: &Value) -> durust::FireDueTimersRequest {
-    durust::FireDueTimersRequest {
+fn fire_due_timers_request_from_fixture(value: &Value) -> durust::provider::FireDueTimersRequest {
+    durust::provider::FireDueTimersRequest {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         now: durust::TimestampMs(i64_field(value, "now")),
         limit: usize_field(value, "limit"),
     }
 }
 
-fn query_projection_request_from_fixture(value: &Value) -> durust::QueryProjectionRequest {
-    durust::QueryProjectionRequest {
+fn query_projection_request_from_fixture(
+    value: &Value,
+) -> durust::provider::QueryProjectionRequest {
+    durust::provider::QueryProjectionRequest {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         workflow_id: durust::WorkflowId::new(string_field(value, "workflowId")),
     }
 }
 
-fn query_projection_outcome_from_fixture(value: &Value) -> durust::QueryProjectionOutcome {
+fn query_projection_outcome_from_fixture(
+    value: &Value,
+) -> durust::provider::QueryProjectionOutcome {
     match string_field(value, "kind").as_str() {
-        "Found" => durust::QueryProjectionOutcome::Found {
+        "Found" => durust::provider::QueryProjectionOutcome::Found {
             run_id: durust::RunId::new(string_field(value, "runId")),
             event_id: durust::EventId(u64_field(value, "eventId")),
             payload: payload_ref_from_fixture_json(&value["projection"]),
         },
-        "NotFound" => durust::QueryProjectionOutcome::NotFound,
+        "NotFound" => durust::provider::QueryProjectionOutcome::NotFound,
         other => panic!("unsupported Rust query projection fixture outcome {other}"),
     }
 }
 
 fn dispatch_child_workflow_starts_request_from_fixture(
     value: &Value,
-) -> durust::DispatchChildWorkflowStartsRequest {
-    durust::DispatchChildWorkflowStartsRequest {
+) -> durust::provider::DispatchChildWorkflowStartsRequest {
+    durust::provider::DispatchChildWorkflowStartsRequest {
         namespace: durust::Namespace::new(string_field(value, "namespace")),
         limit: usize_field(value, "limit"),
     }
 }
 
-fn payload_roots_from_fixture(value: &Value) -> durust::PayloadRootsOutcome {
+fn payload_roots_from_fixture(value: &Value) -> durust::provider::PayloadRootsOutcome {
     let roots = value
         .as_array()
         .expect("payloadRoots should be an array")
@@ -925,32 +934,36 @@ fn payload_roots_from_fixture(value: &Value) -> durust::PayloadRootsOutcome {
         .map(|root| {
             let payload = payload_ref_from_fixture_json(&root["payload"]);
             match string_field(root, "kind").as_str() {
-                "Payload" => durust::PayloadRootRef::Payload(payload),
+                "Payload" => durust::provider::PayloadRootRef::Payload(payload),
                 "ActivityMapInputManifest" => {
-                    durust::PayloadRootRef::ActivityMapInputManifest(payload)
+                    durust::provider::PayloadRootRef::ActivityMapInputManifest(payload)
                 }
                 "ActivityMapResultManifest" => {
-                    durust::PayloadRootRef::ActivityMapResultManifest(payload)
+                    durust::provider::PayloadRootRef::ActivityMapResultManifest(payload)
                 }
                 "ChildWorkflowMapResultManifest" => {
-                    durust::PayloadRootRef::ChildWorkflowMapResultManifest(payload)
+                    durust::provider::PayloadRootRef::ChildWorkflowMapResultManifest(payload)
                 }
                 other => panic!("unsupported payload root kind {other}"),
             }
         })
         .collect();
-    durust::PayloadRootsOutcome { roots }
+    durust::provider::PayloadRootsOutcome { roots }
 }
 
-fn payload_gc_request_from_fixture(value: &Value) -> durust::PayloadGarbageCollectionRequest {
-    durust::PayloadGarbageCollectionRequest {
+fn payload_gc_request_from_fixture(
+    value: &Value,
+) -> durust::provider::PayloadGarbageCollectionRequest {
+    durust::provider::PayloadGarbageCollectionRequest {
         dry_run: value["dryRun"].as_bool().expect("GC dryRun"),
         min_age: Duration::from_millis(value["minAgeMs"].as_u64().expect("GC minAgeMs")),
     }
 }
 
-fn payload_gc_outcome_from_fixture(value: &Value) -> durust::PayloadGarbageCollectionOutcome {
-    durust::PayloadGarbageCollectionOutcome {
+fn payload_gc_outcome_from_fixture(
+    value: &Value,
+) -> durust::provider::PayloadGarbageCollectionOutcome {
+    durust::provider::PayloadGarbageCollectionOutcome {
         scanned_blobs: usize_field(value, "scannedBlobs"),
         retained_blobs: usize_field(value, "retainedBlobs"),
         deleted_blobs: usize_field(value, "deletedBlobs"),
@@ -958,16 +971,16 @@ fn payload_gc_outcome_from_fixture(value: &Value) -> durust::PayloadGarbageColle
     }
 }
 
-fn activity_task_claim_from_fixture(value: &Value) -> durust::ActivityTaskClaim {
-    durust::ActivityTaskClaim {
+fn activity_task_claim_from_fixture(value: &Value) -> durust::provider::ActivityTaskClaim {
+    durust::provider::ActivityTaskClaim {
         activity_id: durust::ActivityId(string_field(value, "activityId")),
         worker_id: durust::WorkerId::new(string_field(value, "workerId")),
         token: u64_field(value, "token"),
     }
 }
 
-fn wait_record_from_fixture(value: &Value) -> durust::WaitRecord {
-    durust::WaitRecord {
+fn wait_record_from_fixture(value: &Value) -> durust::provider::WaitRecord {
+    durust::provider::WaitRecord {
         wait_id: durust::WaitId::new(string_field(value, "waitId")),
         run_id: durust::RunId::new(string_field(value, "runId")),
         command_id: command_id_from_fixture(&value["commandId"]),
@@ -985,25 +998,25 @@ fn wait_record_from_fixture(value: &Value) -> durust::WaitRecord {
     }
 }
 
-fn new_history_event_from_fixture(value: &Value) -> durust::NewHistoryEvent {
-    durust::NewHistoryEvent::new(history_event_data_from_fixture(&value["data"]))
+fn new_history_event_from_fixture(value: &Value) -> durust::provider::NewHistoryEvent {
+    durust::provider::NewHistoryEvent::new(history_event_data_from_fixture(&value["data"]))
 }
 
-fn history_event_from_fixture(value: &Value) -> durust::HistoryEvent {
+fn history_event_from_fixture(value: &Value) -> durust::provider::HistoryEvent {
     let data = history_event_data_from_fixture(&value["data"]);
-    durust::HistoryEvent {
+    durust::provider::HistoryEvent {
         event_id: durust::EventId(u64_field(value, "eventId")),
         data,
     }
 }
 
-fn history_event_data_from_fixture(value: &Value) -> durust::HistoryEventData {
+fn history_event_data_from_fixture(value: &Value) -> durust::provider::HistoryEventData {
     match string_field(value, "kind").as_str() {
-        "WorkflowStarted" => durust::HistoryEventData::WorkflowStarted {
+        "WorkflowStarted" => durust::provider::HistoryEventData::WorkflowStarted {
             workflow_type: workflow_type_from_fixture(&value["workflowType"]),
             input: payload_ref_from_fixture_json(&value["input"]),
         },
-        "WorkflowTaskStarted" => durust::HistoryEventData::WorkflowTaskStarted,
+        "WorkflowTaskStarted" => durust::provider::HistoryEventData::WorkflowTaskStarted,
         other => panic!("fixture adapter does not construct history event data kind {other}"),
     }
 }
@@ -1013,45 +1026,47 @@ fn workflow_type_from_fixture(value: &Value) -> durust::WorkflowType {
 }
 
 fn command_id_from_fixture(value: &Value) -> durust::CommandId {
-    durust::command_id(
+    durust::provider::command_id(
         &durust::RunId::new(string_field(value, "runId")),
         u64_field(value, "seq"),
     )
 }
 
-fn workflow_task_reason_from_fixture(value: &Value) -> durust::WorkflowTaskReason {
+fn workflow_task_reason_from_fixture(value: &Value) -> durust::provider::WorkflowTaskReason {
     match value
         .as_str()
         .expect("workflow task reason should be string")
     {
-        "WorkflowStarted" => durust::WorkflowTaskReason::WorkflowStarted,
-        "ActivityCompleted" => durust::WorkflowTaskReason::ActivityCompleted,
-        "ActivityFailed" => durust::WorkflowTaskReason::ActivityFailed,
-        "ActivityTimedOut" => durust::WorkflowTaskReason::ActivityTimedOut,
-        "ActivityMapCompleted" => durust::WorkflowTaskReason::ActivityMapCompleted,
-        "ActivityMapFailed" => durust::WorkflowTaskReason::ActivityMapFailed,
-        "ChildWorkflowStarted" => durust::WorkflowTaskReason::ChildWorkflowStarted,
-        "ChildWorkflowCompleted" => durust::WorkflowTaskReason::ChildWorkflowCompleted,
-        "ChildWorkflowFailed" => durust::WorkflowTaskReason::ChildWorkflowFailed,
-        "ChildWorkflowCancelled" => durust::WorkflowTaskReason::ChildWorkflowCancelled,
-        "ChildWorkflowMapCompleted" => durust::WorkflowTaskReason::ChildWorkflowMapCompleted,
-        "ChildWorkflowMapFailed" => durust::WorkflowTaskReason::ChildWorkflowMapFailed,
-        "TimerFired" => durust::WorkflowTaskReason::TimerFired,
-        "SignalReceived" => durust::WorkflowTaskReason::SignalReceived,
-        "CacheEvicted" => durust::WorkflowTaskReason::CacheEvicted,
+        "WorkflowStarted" => durust::provider::WorkflowTaskReason::WorkflowStarted,
+        "ActivityCompleted" => durust::provider::WorkflowTaskReason::ActivityCompleted,
+        "ActivityFailed" => durust::provider::WorkflowTaskReason::ActivityFailed,
+        "ActivityTimedOut" => durust::provider::WorkflowTaskReason::ActivityTimedOut,
+        "ActivityMapCompleted" => durust::provider::WorkflowTaskReason::ActivityMapCompleted,
+        "ActivityMapFailed" => durust::provider::WorkflowTaskReason::ActivityMapFailed,
+        "ChildWorkflowStarted" => durust::provider::WorkflowTaskReason::ChildWorkflowStarted,
+        "ChildWorkflowCompleted" => durust::provider::WorkflowTaskReason::ChildWorkflowCompleted,
+        "ChildWorkflowFailed" => durust::provider::WorkflowTaskReason::ChildWorkflowFailed,
+        "ChildWorkflowCancelled" => durust::provider::WorkflowTaskReason::ChildWorkflowCancelled,
+        "ChildWorkflowMapCompleted" => {
+            durust::provider::WorkflowTaskReason::ChildWorkflowMapCompleted
+        }
+        "ChildWorkflowMapFailed" => durust::provider::WorkflowTaskReason::ChildWorkflowMapFailed,
+        "TimerFired" => durust::provider::WorkflowTaskReason::TimerFired,
+        "SignalReceived" => durust::provider::WorkflowTaskReason::SignalReceived,
+        "CacheEvicted" => durust::provider::WorkflowTaskReason::CacheEvicted,
         other => panic!("unsupported workflow task reason {other}"),
     }
 }
 
-fn wait_kind_from_fixture(value: &Value) -> durust::WaitKind {
+fn wait_kind_from_fixture(value: &Value) -> durust::provider::WaitKind {
     match value.as_str().expect("wait kind should be string") {
-        "Timer" => durust::WaitKind::Timer,
-        "Signal" => durust::WaitKind::Signal,
+        "Timer" => durust::provider::WaitKind::Timer,
+        "Signal" => durust::provider::WaitKind::Signal,
         other => panic!("unsupported wait kind {other}"),
     }
 }
 
-fn fingerprint_fixture_json(fingerprint: durust::CommandFingerprint) -> Value {
+fn fingerprint_fixture_json(fingerprint: durust::provider::CommandFingerprint) -> Value {
     json!({
         "kind": fingerprint.kind,
         "name": fingerprint.name,

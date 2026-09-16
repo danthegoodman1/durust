@@ -84,8 +84,10 @@ pub async fn checkout(input: CheckoutInput) -> durust::Result<CheckoutOutput> {
   - [Continue As New](#continue-as-new)
 - [Payloads](#payloads)
 - [Recovery Model](#recovery-model)
+  - [The Commit Fence](#the-commit-fence)
 - [Determinism](#determinism)
 - [Durability Providers](#durability-providers)
+  - [Cargo Features](#cargo-features)
 - [Benchmarks](#benchmarks)
 - [Upgrading](#upgrading)
 - [Release Automation](#release-automation)
@@ -709,13 +711,13 @@ let backend = durust::SqliteBackend::open_with_payload_storage(
 
 let backend = durust::PayloadBackend::with_payload_storage(
     durust::SqliteBackend::open("durust.sqlite3")?,
-    durust::S3BlobStore::garage(durust::S3BlobStoreConfig {
+    durust::S3BlobStore::new(durust::S3BlobStoreConfig {
         bucket: "durust-payloads".to_owned(),
         endpoint: "http://127.0.0.1:3900".to_owned(),
-        region: "garage".to_owned(),
+        region: "us-east-1".to_owned(),
         prefix: "payloads".to_owned(),
-        access_key_id: "garage-access-key".to_owned(),
-        secret_access_key: "garage-secret-key".to_owned(),
+        access_key_id: "durust-access-key".to_owned(),
+        secret_access_key: "durust-secret-key".to_owned(),
     })?,
     durust::PayloadStorageConfig::new().inline_threshold_bytes(1024),
 );
@@ -737,8 +739,8 @@ records a small inline value, capped at 8 KiB, and is never offloaded. Use
 activities or ordinary payload refs for larger values.
 
 The SQLite local-directory store is content-addressed and keeps large encoded
-bytes outside hot SQLite rows. For S3-compatible object stores such as Garage,
-use `PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
+bytes outside hot SQLite rows. For S3-compatible object stores, use
+`PayloadBackend` with `S3BlobStore` (behind the `s3` cargo feature) so the
 async object-store implementation works across durability providers instead of
 being duplicated inside each provider. Blob URI
 ownership is exclusive: each provider resolves only refs carrying its own
@@ -756,34 +758,38 @@ content-addressed re-put do so, while S3 skips the refresh and relies on the
 grace period exceeding the worst upload-to-commit latency plus one GC scan.
 Delete failures are recorded in the outcome and the sweep continues.
 
-To run the local Garage-backed S3 conformance test:
+To run the local S3 conformance test, against the S3Proxy fixture:
 
 ```bash
-docker compose -f tests/fixtures/garage.compose.yml up -d
-DURUST_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
-DURUST_GARAGE_BUCKET=durust-payloads \
-DURUST_GARAGE_REGION=garage \
-DURUST_GARAGE_PREFIX=local/payloads \
-DURUST_GARAGE_ACCESS_KEY_ID=GK0123456789abcdef0123456789abcdef \
-DURUST_GARAGE_SECRET_ACCESS_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-DURUST_REQUIRE_GARAGE=1 \
-cargo test --features s3 --test provider_conformance garage -- --nocapture
-docker compose -f tests/fixtures/garage.compose.yml down -v
+docker compose -f tests/fixtures/s3proxy.compose.yml up -d
+DURUST_S3_ENDPOINT=http://127.0.0.1:3900 \
+DURUST_S3_BUCKET=durust-payloads \
+DURUST_S3_REGION=us-east-1 \
+DURUST_S3_PREFIX=local/payloads \
+DURUST_S3_ACCESS_KEY_ID=durust-access-key \
+DURUST_S3_SECRET_ACCESS_KEY=durust-secret-key \
+DURUST_REQUIRE_S3=1 \
+cargo test --features s3 --test provider_conformance s3 -- --nocapture
+docker compose -f tests/fixtures/s3proxy.compose.yml down -v
 ```
 
-`DURUST_REQUIRE_GARAGE` makes a missing or blank `DURUST_GARAGE_*` variable a
-failure instead of a skip, and it names the variables that are actually
-missing. Leave it unset if you have no Garage: the test then skips and the run
-still passes. It is on for any value except empty, `0`, and `false`, so a typo
-runs the test rather than quietly dropping it.
+The fixture arrives with `durust-payloads` already created, because its init
+service makes the directory that jclouds' filesystem provider exposes as a
+bucket. A provider is handed a bucket; neither S3Proxy nor the test provisions
+one.
 
-The filter is the substring `garage` rather than the full test name, and that
-matters more than it looks. `cargo test` with a filter matching nothing prints
+`DURUST_REQUIRE_S3` makes a missing or blank `DURUST_S3_*` variable a failure
+instead of a skip, and it names the variables that are actually missing. Leave
+it unset if you have no object store: the test then skips and the run still
+passes. It is on for any value except empty, `0`, and `false`, so a typo runs
+the test rather than quietly dropping it.
+
+The filter is the substring `s3` rather than a full test name, and that matters
+more than it looks. `cargo test` with a filter matching nothing prints
 `0 passed` and exits 0, so naming the single conformance test meant a run
-without `--features s3` was green having executed nothing. `garage` also
-matches `garage_s3_feature_is_enabled_when_garage_is_required`, which compiles
-unconditionally and fails when the feature is absent — so the filter can never
-select zero tests.
+without `--features s3` was green having executed nothing. `s3` also matches
+`s3_feature_is_enabled_when_s3_is_required`, which compiles unconditionally and
+fails when the feature is absent — so the filter can never select zero tests.
 
 ## Recovery Model
 
@@ -797,7 +803,13 @@ durable APIs consume recorded facts
 switch to live mode at the tail
 ```
 
-Cold recovery is also flow-controlled by the worker. A worker can cap concurrent
+A claimed batch prepares its runs concurrently: each run's history read,
+payload hydration, and cold replay are independent, so they overlap instead of
+queueing behind one another. `max_concurrent_workflow_tasks` bounds that
+overlap, and `max_concurrent_payload_hydrations` bounds the blob reads one task
+issues while resuming a fanout.
+
+Cold recovery is flow-controlled by the worker. A worker can cap concurrent
 cold recoveries, clamp each recovery attempt by replay events, replay bytes, and
 history chunks, then defer the workflow task through generic delayed visibility
 when capacity is unavailable. Cached workflow wakes stay on the fast path and do
@@ -808,6 +820,23 @@ why the workflow is replaying.
 Unconsumed signals, pending timers, activity leases, and ready rows are live
 operational indexes. They are not streamed as replay history until workflow code
 observes a committed fact.
+
+### The Commit Fence
+
+A workflow task's claim token is its whole fence. A provider applies the commit
+while that token still owns the run and rejects it otherwise; there is no
+separate check on the run's history tail.
+
+That works because every event replay matches positionally is written by the
+claim holder. The exceptions — `cancel_workflow` and the two parent-close paths
+— revoke the claim in the same transaction, so the token catches them. Facts
+appended concurrently by activity workers, timer sweeps, and child dispatch are
+looked up by command sequence and never enter the replay window, so they cannot
+invalidate a task that never saw them.
+
+A fact that lands under a claim keeps the run ready, so the next task picks it
+up. Providers record the tail they handed out with each claim and compare it at
+commit to decide that, rather than taking the worker's word for it.
 
 ## Determinism
 
@@ -825,10 +854,10 @@ network/db calls        -> durust::call_activity!
 
 Replay and command fingerprints remain the correctness backstop.
 
-Runtime and provider fault tests use the deterministic simulator primitives
-(`SimRun`, `FaultProfile`, and `run_many_seeds`) so failures report a seed and
-trace that can be replayed locally. `FaultInjectingBackend` wraps any
-`DurableBackend` with seeded per-call fault decisions (transient errors,
+Runtime and provider fault tests use the deterministic simulator primitives in
+`durust::testing` (`SimRun`, `FaultProfile`, and `run_many_seeds`) so failures
+report a seed and trace that can be replayed locally. `FaultInjectingBackend`
+wraps any `DurableBackend` with seeded per-call fault decisions (transient errors,
 duplicated activity completions, scripted worker crashes) so simulations drive
 the real `Worker` over the real in-memory provider under fault injection; the
 memory provider's clock is fully virtual (`advance_time`), so leases, timers,
@@ -836,7 +865,17 @@ delayed visibility, and retry backoffs are simulation-controlled.
 
 ## Durability Providers
 
-Durability is a provider trait, not a database mandate.
+Durability is a provider trait, not a database mandate. The trait and every
+request and outcome type it exchanges with the runtime live in
+`durust::provider`; workflow code needs none of them.
+
+A defaulted method on `DurableBackend` must stay correct when `self` is a
+wrapper around another backend, since that is the case the compiler cannot
+check. The batch and convenience methods default to driving `self`'s own
+single-item method, which stays correct through any number of wrappers.
+`payload_storage_config` and `hydrate_payload` have no default, so a wrapper
+that forgets them fails to build rather than silently reporting the wrong
+config or handing back unresolved blob refs.
 
 Providers must support:
 
@@ -871,6 +910,7 @@ S3-compatible payload blob store (`s3` feature)
 durust = "0.1"                                            # memory + SQLite
 durust = { version = "0.1", features = ["postgres"] }     # + Postgres
 durust = { version = "0.1", features = ["s3"] }           # + S3BlobStore
+durust = { version = "0.1", features = ["testing"] }      # + durust::testing
 durust = { version = "0.1", default-features = false }    # memory only
 ```
 
@@ -879,6 +919,9 @@ durust = { version = "0.1", default-features = false }    # memory only
   dependencies.
 - `s3` gates `S3BlobStore`; the `PayloadBackend` decorator and the SQLite
   local-directory blob store are always available.
+- `testing` gates `durust::testing`, the deterministic simulation harness
+  (`SimRun`, `FaultProfile`, `FaultInjectingBackend`). Test scaffolding, so it
+  is opt-in rather than linked into every production binary.
 
 The benchmark workload, comparison, and reporting binaries live in the
 unpublished `durust-benchtools` workspace crate
@@ -896,16 +939,15 @@ own benchmark section in [`typescript/README.md`](typescript/README.md).
 
 Mixed workload medians:
 
-| Backend | Config | Processing workflows/s before -> current | Processing actions/s before -> current | Variance | Commit p95 |
+| Backend | Config | Processing workflows/s | Processing actions/s | Variance | Commit p95 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| SQLite | 1000 workflows, 4 workers, batch 32 | 206.10 -> 226.82 (+10.0%) | 1648.83 -> 1814.52 (+10.0%) | 9.6% | 3.769 ms |
-| SQLite | 1000 workflows, 1 worker, batch 32 | 215.63 -> 224.78 (+4.2%) | 1725.01 -> 1798.21 (+4.2%) | 4.2% | 0.402 ms |
-| Postgres | 1000 workflows, 4 workers, pool 8 | 38.46 -> 47.94 (+24.7%) | 307.68 -> 383.52 (+24.7%) | 9.9% | 7.912 ms |
-| Postgres | 1000 workflows, 100 shard leases, 10 workers, pool 24 | 141.72 -> 320.50 (+126.1%) | 1133.77 -> 2563.98 (+126.1%) | 7.3% | 15.838 ms |
+| SQLite | 1000 workflows, 4 workers, batch 32 | 226.82 | 1814.52 | 9.6% | 3.769 ms |
+| SQLite | 1000 workflows, 1 worker, batch 32 | 224.78 | 1798.21 | 4.2% | 0.402 ms |
+| Postgres | 1000 workflows, 4 workers, pool 8 | 47.94 | 383.52 | 9.9% | 7.912 ms |
+| Postgres | 1000 workflows, 100 shard leases, 10 workers, pool 24 | 320.50 | 2563.98 | 7.3% | 15.838 ms |
 
-The 100-shard Postgres profile still runs, but it now means batched normalized
-Postgres operation under 100 shard leases. The write-only shard journal and
-snapshot tables were removed, so this is not a shard-journal recovery profile.
+The 100-shard Postgres profile measures batched normalized Postgres operation
+under 100 shard leases, not shard-journal recovery.
 
 Criterion headline medians, current versus the saved `phase6-before` baseline:
 
@@ -984,6 +1026,40 @@ working today — either its code will not compile, or its in-flight runs stop
 replaying. `typescript/README.md` keeps the same ledger for the TypeScript
 packages; a change that breaks both is written in both, because the affected
 reader only reads one.
+
+### The commit fence is the claim token, and `SelectWinner` drops its event id
+
+**Who is affected.** Every deployment. In-flight runs whose history contains a
+`SelectWinner` event cannot be replayed by this version, and every third-party
+`DurableBackend` implementation must be updated to compile.
+
+**What changes.** Three things move together, because the first is what made
+the second necessary and the third is what made it possible.
+
+`WorkflowTaskCommit` loses `expected_tail_event_id`, and a provider fences a
+commit on the claim token alone. A fact appended to the run while a workflow
+task was claimed — an activity result, a fired timer, a child terminal — no
+longer voids that task. `commit_workflow_task` returns the run's new
+`EventId` directly, and `CommitOutcome`, `Error::Conflict`, `conflict_to_error`,
+`WorkerEvent::WorkflowTaskConflicted` and `WorkerMetrics::workflow_task_conflicts`
+are gone: a commit either lands or reports why it could not.
+
+`SelectWinner` loses `winning_event_id`. Replay follows the recorded
+`branch_ordinal` instead of recomputing which branch won, so it no longer
+depends on the absolute event id of the winning fact. This is the history-format
+break: a history recorded by 0.2.1 that contains a `SelectWinner` will fail to
+decode.
+
+Providers gain a `claim_tail_event_id` column on `workflow_instances`, recorded
+when a claim is handed out and compared at commit so a fact that arrived under
+the claim keeps the run ready. The SQLite and Postgres providers migrate it
+automatically on open.
+
+**What to do.** Drain in-flight runs before upgrading, or accept that runs with
+a recorded `SelectWinner` will not replay. Third-party providers: delete the
+tail comparison, return the new tail from `commit_workflow_task`, record the
+claim tail, and implement `payload_storage_config` and `hydrate_payload`, which
+no longer have defaults.
 
 ### An unqueued activity no longer fingerprints the worker's activity queue
 

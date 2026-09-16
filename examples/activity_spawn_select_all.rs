@@ -1,7 +1,9 @@
+use durust::provider::{
+    ClaimActivityOptions, CompleteActivityRequest, DurableBackend, HistoryEventData,
+};
 use durust::{
-    ActivityName, BoxSelectBranch, ClaimActivityOptions, Client, CompleteActivityRequest,
-    DurableBackend, DurableBranchExt, EventId, HistoryEventData, MemoryBackend, TaskQueue, Worker,
-    WorkerId,
+    ActivityName, BoxSelectBranch, Client, DurableBranchExt, EventId, MemoryBackend, TaskQueue,
+    Worker, WorkerId,
 };
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
@@ -127,7 +129,10 @@ async fn run_example() -> durust::Result<String> {
                 result: durust::encode_payload(&0_u64)?,
             })
             .await?;
-        assert_eq!(late, durust::CompleteActivityOutcome::AlreadyCompleted);
+        assert_eq!(
+            late,
+            durust::provider::CompleteActivityOutcome::AlreadyCompleted
+        );
     }
 
     let history = stream_history(&backend, &run_id).await?;
@@ -155,9 +160,9 @@ async fn run_example() -> durust::Result<String> {
 async fn stream_history(
     backend: &MemoryBackend,
     run_id: &durust::RunId,
-) -> durust::Result<Vec<durust::HistoryEvent>> {
+) -> durust::Result<Vec<durust::provider::HistoryEvent>> {
     Ok(backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

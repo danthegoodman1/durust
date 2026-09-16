@@ -2674,7 +2674,6 @@ class WorkflowRuntimeContext {
     if (readyBranches.length === 0) {
       throw new Error("durust.select requires at least one ready branch");
     }
-    const winner = [...readyBranches].sort(compareSelectReadyBranches)[0] as SelectReadyBranch;
     const replayEvent = this.#peekReplayEventForUnparkableApi("select");
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind !== "SelectWinner") {
@@ -2691,23 +2690,28 @@ class WorkflowRuntimeContext {
       if (replayed.branchesDigest !== branchesDigest) {
         throw new Error("nondeterminism: select branches changed");
       }
-      if (replayed.branchOrdinal !== winner.ordinal) {
-        throw new Error("nondeterminism: select winner branch changed");
-      }
-      if (!sameEventId(replayed.winningEventId, winner.eventId)) {
-        throw new Error("nondeterminism: select winning event changed");
+      // Replay follows the recorded decision rather than recomputing it: the
+      // live comparison ordered the winning fact against every other branch's
+      // by arrival, which only held while no unrelated fact could be appended
+      // to the run between a task's claim and its commit.
+      const recorded = readyBranches.find((branch) => branch.ordinal === replayed.branchOrdinal);
+      if (recorded === undefined) {
+        throw new Error(
+          `nondeterminism: select command ${selectCommandId.seq} recorded branch ` +
+            `${replayed.branchOrdinal} as the winner, but replay never produced that branch's result`
+        );
       }
       this.#advanceReplay();
-      return winner;
+      return recorded;
     }
 
+    const winner = [...readyBranches].sort(compareSelectReadyBranches)[0] as SelectReadyBranch;
     this.#appendEvents.push({
       data: {
         kind: "SelectWinner",
         winner: {
           selectCommandId,
           branchOrdinal: winner.ordinal,
-          winningEventId: winner.eventId,
           branchesDigest
         }
       }
@@ -2895,7 +2899,6 @@ class WorkflowRuntimeContext {
       }
     }
     return {
-      expectedTailEventId: this.#claimed.replayTargetEventId,
       appendEvents: [...this.#appendEvents],
       upsertWaits: [...this.#upsertWaits],
       deleteWaits: [...this.#deleteWaits],
@@ -4434,10 +4437,6 @@ function createDeferred<T>(): Deferred<T> {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
-}
-
-function sameEventId(left: EventId, right: EventId): boolean {
-  return Number(left) === Number(right);
 }
 
 function compareSelectReadyBranches(left: SelectReadyBranch, right: SelectReadyBranch): number {

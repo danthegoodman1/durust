@@ -1,6 +1,5 @@
-use durust::{
-    Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, PayloadRef, Worker,
-};
+use durust::provider::{DurableBackend, HistoryEventData};
+use durust::{Client, EventId, MemoryBackend, PayloadRef, Worker};
 use futures::executor::block_on;
 use serde::{Deserialize, Serialize};
 
@@ -36,7 +35,7 @@ async fn partition_input(input: WordCountInput) -> durust::Result<PartitionOutpu
         .into_iter()
         .map(|chunk| durust::encode_payload(&WorkInput { chunk }))
         .collect::<durust::Result<Vec<_>>>()?;
-    let manifest_ref = durust::encode_activity_map_input_manifest(items, 128)?;
+    let manifest_ref = durust::provider::encode_activity_map_input_manifest(items, 128)?;
     Ok(PartitionOutput { manifest_ref })
 }
 
@@ -47,7 +46,7 @@ async fn count_words(input: WorkInput) -> durust::Result<u64> {
 
 #[durust::activity(name = "examples.reduce-word-count")]
 async fn reduce_word_count(input: ReduceInput) -> durust::Result<WordCountOutput> {
-    let result_refs = durust::decode_activity_map_result_refs(&input.manifest_ref)?;
+    let result_refs = durust::provider::decode_activity_map_result_refs(&input.manifest_ref)?;
     let words = result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum + durust::decode_payload::<u64>(payload)?)
     })?;
@@ -189,9 +188,9 @@ async fn drive_until_idle(
 async fn stream_history(
     backend: &MemoryBackend,
     run_id: &durust::RunId,
-) -> durust::Result<Vec<durust::HistoryEvent>> {
+) -> durust::Result<Vec<durust::provider::HistoryEvent>> {
     Ok(backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),

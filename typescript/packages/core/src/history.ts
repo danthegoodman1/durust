@@ -261,7 +261,6 @@ export interface SignalConsumed {
 export interface SelectWinner {
   readonly selectCommandId: CommandId;
   readonly branchOrdinal: number;
-  readonly winningEventId: EventId;
   readonly branchesDigest: string;
 }
 

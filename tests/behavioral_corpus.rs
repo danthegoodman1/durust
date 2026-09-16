@@ -68,10 +68,8 @@
 //! writer that always passes. The TypeScript runner's `is not a print run` is
 //! the same guard for its own escape hatch.
 
-use durust::{
-    ActivityMapInputManifest, Client, CodecId, DurableBackend, EventId, MemoryBackend, PayloadRef,
-    TimestampMs, Worker, WorkflowTaskCommit,
-};
+use durust::provider::{ActivityMapInputManifest, DurableBackend, WorkflowTaskCommit};
+use durust::{Client, CodecId, EventId, MemoryBackend, PayloadRef, TimestampMs, Worker};
 use futures::executor::block_on;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -248,7 +246,7 @@ async fn corpus_activity_map(input: Value1) -> durust::Result<Value1> {
         .spawn()
         .await?;
     let manifest = mapped.result_manifest().await?;
-    let refs = durust::decode_activity_map_result_refs(&manifest)?;
+    let refs = durust::provider::decode_activity_map_result_refs(&manifest)?;
     let mut total = 0;
     for payload in &refs {
         total += durust::decode_payload::<Value1>(payload)?.value;
@@ -394,7 +392,7 @@ fn activity_map_manifest_json(payload: &PayloadRef) -> Value {
     let items: Vec<Value> = (0..manifest.item_count)
         .map(|ordinal| {
             payload_json(
-                &durust::activity_map_input_at(&manifest, ordinal as u64)
+                &durust::provider::activity_map_input_at(&manifest, ordinal as u64)
                     .expect("activity map manifest covers every ordinal"),
             )
         })
@@ -423,9 +421,9 @@ fn duration_ms_json(duration: Option<Duration>) -> Value {
     })
 }
 
-fn fingerprint_json(fingerprint: &durust::CommandFingerprint) -> Value {
+fn fingerprint_json(fingerprint: &durust::provider::CommandFingerprint) -> Value {
     let options_digest = match fingerprint.kind {
-        durust::CommandKind::Activity | durust::CommandKind::ActivityMap => {
+        durust::provider::CommandKind::Activity | durust::provider::CommandKind::ActivityMap => {
             ACTIVITY_OPTIONS_PLACEHOLDER.to_owned()
         }
         _ => fingerprint.options_digest.clone(),
@@ -434,7 +432,8 @@ fn fingerprint_json(fingerprint: &durust::CommandFingerprint) -> Value {
     // manifest wire encoding is itself excluded; the manifest's content is
     // asserted separately by `activity_map_manifest_json`.
     let input_digest = match fingerprint.kind {
-        durust::CommandKind::ActivityMap | durust::CommandKind::ChildWorkflowMap => {
+        durust::provider::CommandKind::ActivityMap
+        | durust::provider::CommandKind::ChildWorkflowMap => {
             Some(MANIFEST_DIGEST_PLACEHOLDER.to_owned())
         }
         _ => fingerprint.input_digest.clone(),
@@ -447,8 +446,8 @@ fn fingerprint_json(fingerprint: &durust::CommandFingerprint) -> Value {
     })
 }
 
-fn event_json(data: &durust::HistoryEventData) -> Value {
-    use durust::HistoryEventData as E;
+fn event_json(data: &durust::provider::HistoryEventData) -> Value {
+    use durust::provider::HistoryEventData as E;
     match data {
         E::WorkflowCompleted { result } => json!({
             "type": "WorkflowCompleted",
@@ -521,7 +520,6 @@ fn event_json(data: &durust::HistoryEventData) -> Value {
             "type": "SelectWinner",
             "selectCommandId": command_id_json(&winner.select_command_id),
             "branchOrdinal": winner.branch_ordinal,
-            "winningEventId": winner.winning_event_id.0,
             "branchesDigest": SELECT_BRANCHES_PLACEHOLDER,
         }),
         E::VersionMarker(marker) => json!({
@@ -562,7 +560,7 @@ fn failure_json(failure: &durust::DurableFailure) -> Value {
 /// two runtimes format the key differently (`{run}:{seq}:timer` in Rust,
 /// `{run}:timer:{seq}` in TypeScript), which is opaque within a store but not
 /// comparable across one.
-fn wait_json(wait: &durust::WaitRecord) -> Value {
+fn wait_json(wait: &durust::provider::WaitRecord) -> Value {
     json!({
         "kind": format!("{:?}", wait.kind),
         "commandId": command_id_json(&wait.command_id),
@@ -591,7 +589,7 @@ fn wait_id_json(wait_id: &durust::WaitId) -> Value {
     })
 }
 
-fn activity_task_json(task: &durust::ActivityTask) -> Value {
+fn activity_task_json(task: &durust::provider::ActivityTask) -> Value {
     json!({
         "activityId": task.activity_id.0,
         "runId": task.run_id.0,
@@ -612,7 +610,7 @@ fn activity_task_json(task: &durust::ActivityTask) -> Value {
     })
 }
 
-fn activity_map_task_json(task: &durust::ActivityMapTask) -> Value {
+fn activity_map_task_json(task: &durust::provider::ActivityMapTask) -> Value {
     json!({
         "mapCommandId": command_id_json(&task.map_command_id),
         "activityName": task.activity_name.0,
@@ -626,7 +624,7 @@ fn activity_map_task_json(task: &durust::ActivityMapTask) -> Value {
     })
 }
 
-fn child_start_json(message: &durust::ChildStartOutboxMessage) -> Value {
+fn child_start_json(message: &durust::provider::ChildStartOutboxMessage) -> Value {
     json!({
         "commandId": command_id_json(&message.command_id),
         "workflowType": {
@@ -653,7 +651,6 @@ fn commit_json(commit: &WorkflowTaskCommit) -> Value {
         "no corpus case schedules a child workflow map yet; add a neutral encoding first"
     );
     json!({
-        "expectedTailEventId": commit.expected_tail_event_id.0,
         "appendEvents": commit
             .append_events
             .iter()
@@ -736,17 +733,18 @@ impl DurableBackend for RecordingBackend {
 
     fn commit_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
+        claim: durust::provider::WorkflowTaskClaim,
         commit: WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         self.record(&commit);
         self.inner.commit_workflow_task(claim, commit)
     }
 
     fn commit_workflow_tasks(
         &self,
-        batch: durust::WorkflowTaskCommitBatch,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
+        batch: durust::provider::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::WorkflowTaskCommitBatchResult>>>
+    {
         for input in &batch.commits {
             self.record(&input.commit);
         }
@@ -754,19 +752,19 @@ impl DurableBackend for RecordingBackend {
     }
 
     forward_to_inner! {
-        fn start_workflow(req: durust::StartWorkflowRequest) -> durust::StartWorkflowOutcome;
-        fn cancel_workflow(req: durust::CancelWorkflowRequest) -> durust::CancelWorkflowOutcome;
+        fn start_workflow(req: durust::provider::StartWorkflowRequest) -> durust::provider::StartWorkflowOutcome;
+        fn cancel_workflow(req: durust::provider::CancelWorkflowRequest) -> durust::provider::CancelWorkflowOutcome;
         fn current_time() -> durust::TimestampMs;
         fn claim_workflow_task(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimWorkflowTaskOptions
-        ) -> Option<durust::ClaimedWorkflowTask>;
+            opts: durust::provider::ClaimWorkflowTaskOptions
+        ) -> Option<durust::provider::ClaimedWorkflowTask>;
         fn claim_workflow_tasks(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimWorkflowTasksOptions
-        ) -> Vec<durust::ClaimedWorkflowTask>;
-        fn stream_history(req: durust::StreamHistoryRequest) -> durust::HistoryChunk;
-        fn stream_history_for_replay(req: durust::StreamHistoryRequest) -> durust::HistoryChunk;
+            opts: durust::provider::ClaimWorkflowTasksOptions
+        ) -> Vec<durust::provider::ClaimedWorkflowTask>;
+        fn stream_history(req: durust::provider::StreamHistoryRequest) -> durust::provider::HistoryChunk;
+        fn stream_history_for_replay(req: durust::provider::StreamHistoryRequest) -> durust::provider::HistoryChunk;
         fn hydrate_payload(payload: durust::PayloadRef) -> durust::PayloadRef;
         fn hydrate_activity_map_result_manifest(
             payload: durust::PayloadRef
@@ -775,53 +773,53 @@ impl DurableBackend for RecordingBackend {
             payload: durust::PayloadRef
         ) -> durust::PayloadRef;
         fn release_workflow_task(
-            claim: durust::WorkflowTaskClaim,
-            release: durust::WorkflowTaskRelease
+            claim: durust::provider::WorkflowTaskClaim,
+            release: durust::provider::WorkflowTaskRelease
         ) -> ();
-        fn signal_workflow(req: durust::SignalWorkflowRequest) -> durust::SignalWorkflowOutcome;
+        fn signal_workflow(req: durust::provider::SignalWorkflowRequest) -> durust::provider::SignalWorkflowOutcome;
         fn read_signal_inbox(
-            req: durust::ReadSignalInboxRequest
-        ) -> Option<durust::SignalInboxRecord>;
+            req: durust::provider::ReadSignalInboxRequest
+        ) -> Option<durust::provider::SignalInboxRecord>;
         fn read_signal_inboxes(
-            req: durust::ReadSignalInboxesRequest
-        ) -> Vec<Option<durust::SignalInboxRecord>>;
-        fn fire_due_timers(req: durust::FireDueTimersRequest) -> durust::FireDueTimersOutcome;
+            req: durust::provider::ReadSignalInboxesRequest
+        ) -> Vec<Option<durust::provider::SignalInboxRecord>>;
+        fn fire_due_timers(req: durust::provider::FireDueTimersRequest) -> durust::provider::FireDueTimersOutcome;
         fn timeout_due_activities(
-            req: durust::TimeoutDueActivitiesRequest
-        ) -> durust::TimeoutDueActivitiesOutcome;
+            req: durust::provider::TimeoutDueActivitiesRequest
+        ) -> durust::provider::TimeoutDueActivitiesOutcome;
         fn run_due_maintenance(
-            req: durust::RunDueMaintenanceRequest
-        ) -> durust::RunDueMaintenanceOutcome;
-        fn wait_for_ready(req: durust::WaitForReadyRequest) -> ();
+            req: durust::provider::RunDueMaintenanceRequest
+        ) -> durust::provider::RunDueMaintenanceOutcome;
+        fn wait_for_ready(req: durust::provider::WaitForReadyRequest) -> ();
         fn claim_activity_task(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimActivityOptions
-        ) -> Option<durust::ClaimedActivityTask>;
+            opts: durust::provider::ClaimActivityOptions
+        ) -> Option<durust::provider::ClaimedActivityTask>;
         fn claim_activity_tasks(
             worker_id: durust::WorkerId,
-            opts: durust::ClaimActivityTasksOptions
-        ) -> Vec<durust::ClaimedActivityTask>;
+            opts: durust::provider::ClaimActivityTasksOptions
+        ) -> Vec<durust::provider::ClaimedActivityTask>;
         fn heartbeat_activity(
-            req: durust::ActivityHeartbeatRequest
-        ) -> durust::ActivityHeartbeatOutcome;
+            req: durust::provider::ActivityHeartbeatRequest
+        ) -> durust::provider::ActivityHeartbeatOutcome;
         fn complete_activity(
-            req: durust::CompleteActivityRequest
-        ) -> durust::CompleteActivityOutcome;
+            req: durust::provider::CompleteActivityRequest
+        ) -> durust::provider::CompleteActivityOutcome;
         fn complete_activity_tasks(
-            req: durust::CompleteActivityTasksRequest
-        ) -> Vec<durust::CompleteActivityTaskBatchResult>;
-        fn fail_activity(req: durust::FailActivityRequest) -> durust::FailActivityOutcome;
+            req: durust::provider::CompleteActivityTasksRequest
+        ) -> Vec<durust::provider::CompleteActivityTaskBatchResult>;
+        fn fail_activity(req: durust::provider::FailActivityRequest) -> durust::provider::FailActivityOutcome;
         fn dispatch_child_workflow_starts(
-            req: durust::DispatchChildWorkflowStartsRequest
-        ) -> durust::DispatchChildWorkflowStartsOutcome;
-        fn query_projection(req: durust::QueryProjectionRequest) -> durust::QueryProjectionOutcome;
+            req: durust::provider::DispatchChildWorkflowStartsRequest
+        ) -> durust::provider::DispatchChildWorkflowStartsOutcome;
+        fn query_projection(req: durust::provider::QueryProjectionRequest) -> durust::provider::QueryProjectionOutcome;
         fn workflow_change_versions(
-            req: durust::WorkflowChangeVersionsRequest
-        ) -> durust::WorkflowChangeVersionsOutcome;
-        fn payload_roots() -> durust::PayloadRootsOutcome;
+            req: durust::provider::WorkflowChangeVersionsRequest
+        ) -> durust::provider::WorkflowChangeVersionsOutcome;
+        fn payload_roots() -> durust::provider::PayloadRootsOutcome;
         fn gc_payload_blobs(
-            req: durust::PayloadGarbageCollectionRequest
-        ) -> durust::PayloadGarbageCollectionOutcome;
+            req: durust::provider::PayloadGarbageCollectionRequest
+        ) -> durust::provider::PayloadGarbageCollectionOutcome;
     }
 }
 
@@ -1363,7 +1361,7 @@ async fn start_case(backend: &RecordingBackend, case: &Value) -> durust::RunId {
 
 async fn history_types(backend: &RecordingBackend, run_id: &durust::RunId) -> Vec<String> {
     let chunk = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(u64::MAX),
@@ -1457,7 +1455,7 @@ async fn run_case(case: &Value, observed: &mut Vec<ObservedTask>, regenerate: bo
             }
             "fireTimers" => {
                 let outcome = backend
-                    .fire_due_timers(durust::FireDueTimersRequest {
+                    .fire_due_timers(durust::provider::FireDueTimersRequest {
                         namespace: durust::Namespace::default(),
                         now: current_time(&backend).await,
                         limit: 16,
@@ -1483,7 +1481,11 @@ async fn run_case(case: &Value, observed: &mut Vec<ObservedTask>, regenerate: bo
                     )
                     .await
                     .expect("signal");
-                assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted, "{where_}");
+                assert_eq!(
+                    outcome,
+                    durust::provider::SignalWorkflowOutcome::Accepted,
+                    "{where_}"
+                );
             }
             "restartWorker" => {
                 // Drops the cached execution so the next task cold-replays.

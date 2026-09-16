@@ -16,7 +16,6 @@ import {
   type ActivityTaskClaim,
   type ClaimWorkflowTaskOptions,
   type ClaimedWorkflowTask,
-  type CommitOutcome,
   type CompleteActivitiesOutcome,
   type CompleteActivityOutcome,
   type CompleteActivityRequest,
@@ -197,8 +196,7 @@ interface ProviderIoFixture {
   readonly commitWorkflowTask: {
     readonly claim: WorkflowTaskClaim;
     readonly commit: JsonWorkflowTaskCommit;
-    readonly committed: CommitOutcome;
-    readonly conflict: CommitOutcome;
+    readonly newTailEventId: number;
   };
   readonly signalWorkflow: {
     readonly request: JsonSignalWorkflowRequest;
@@ -483,11 +481,7 @@ describe("contract fixtures", () => {
       kind: "Timer",
       readyAt: 1_781_821_484_000
     });
-    expect(fixture.commitWorkflowTask.committed).toEqual({
-      kind: "Committed",
-      newTailEventId: 2
-    });
-    expect(fixture.commitWorkflowTask.conflict).toEqual({ kind: "Conflict" });
+    expect(fixture.commitWorkflowTask.newTailEventId).toBe(2);
 
     expect(fixture.signalWorkflow.accepted).toEqual({ kind: "Accepted" });
     expect(fixture.signalWorkflow.duplicate).toEqual({ kind: "Duplicate" });

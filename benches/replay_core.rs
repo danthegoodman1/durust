@@ -1,13 +1,15 @@
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 #[cfg(feature = "s3")]
-use durust::PayloadBlobStore;
+use durust::provider::PayloadBlobStore;
+use durust::provider::{
+    ActivityMapTask, ActivityScheduled, ActivityTask, ClaimActivityOptions,
+    ClaimWorkflowTaskOptions, ClaimedWorkflowTask, CompleteActivityRequest, DurableBackend,
+    FireDueTimersRequest, HistoryEventData, NewHistoryEvent, SignalWorkflowRequest, WaitKind,
+    WaitRecord, WorkflowTaskCommit,
+};
 use durust::{
-    ActivityMapTask, ActivityName, ActivityScheduled, ActivityTask, ClaimActivityOptions,
-    ClaimWorkflowTaskOptions, ClaimedWorkflowTask, Client, CommitOutcome, CompleteActivityRequest,
-    DurableBackend, DurableBranchExt, EventId, FireDueTimersRequest, HistoryEventData,
-    MemoryBackend, Namespace, NewHistoryEvent, PayloadStorageConfig, SignalWorkflowRequest,
-    TaskQueue, TimestampMs, WaitKind, WaitRecord, Worker, WorkerId, WorkflowTaskCommit,
-    WorkflowType,
+    ActivityName, Client, DurableBranchExt, EventId, MemoryBackend, Namespace,
+    PayloadStorageConfig, TaskQueue, TimestampMs, Worker, WorkerId, WorkflowType,
 };
 use durust::{BoxSelectBranch, SqliteBackend, WorkerRunOptions, WorkerRunStats};
 #[cfg(feature = "postgres")]
@@ -166,7 +168,7 @@ async fn select_all_mixed(input: BenchInput) -> durust::Result<String> {
         .await?;
     let child = durust::child!(child_double(bench_input(input + 10_000)))
         .workflow_id(format!("bench/mixed-child/{input}"))
-        .parent_close_policy(durust::ParentClosePolicy::Abandon)
+        .parent_close_policy(durust::provider::ParentClosePolicy::Abandon)
         .spawn()
         .await?;
 
@@ -353,7 +355,7 @@ fn workflow_task_append_commit(c: &mut Criterion) {
                         .commit_workflow_task(state.claimed.claim, state.batch)
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -370,7 +372,7 @@ fn workflow_task_append_commit(c: &mut Criterion) {
                         .commit_workflow_task(state.claimed.claim, state.batch)
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -620,7 +622,7 @@ fn child_start_dispatch(c: &mut Criterion) {
                 block_on(async {
                     let outcome = backend
                         .dispatch_child_workflow_starts(
-                            durust::DispatchChildWorkflowStartsRequest {
+                            durust::provider::DispatchChildWorkflowStartsRequest {
                                 namespace: Namespace::default(),
                                 limit: 16,
                             },
@@ -645,7 +647,6 @@ fn projection_update(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: Vec::new(),
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
@@ -660,7 +661,7 @@ fn projection_update(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -677,7 +678,7 @@ fn projection_read(c: &mut Criterion) {
                     let outcome = backend.query_projection(req).await.unwrap();
                     assert!(matches!(
                         outcome,
-                        durust::QueryProjectionOutcome::Found { .. }
+                        durust::provider::QueryProjectionOutcome::Found { .. }
                     ));
                 });
             },
@@ -721,7 +722,7 @@ fn activity_claim_complete(c: &mut Criterion) {
                         .unwrap();
                     assert!(matches!(
                         completed,
-                        durust::CompleteActivityOutcome::Completed { .. }
+                        durust::provider::CompleteActivityOutcome::Completed { .. }
                     ));
                 });
             },
@@ -748,7 +749,7 @@ fn activity_claim_complete(c: &mut Criterion) {
                         .unwrap();
                     assert!(matches!(
                         completed,
-                        durust::CompleteActivityOutcome::Completed { .. }
+                        durust::provider::CompleteActivityOutcome::Completed { .. }
                     ));
                 });
             },
@@ -842,7 +843,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(claimed.claim, batch)
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                         }
                     });
                 },
@@ -863,7 +864,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                         for run_id in run_ids {
                             let chunk = fixture
                                 .backend
-                                .stream_history_for_replay(durust::StreamHistoryRequest {
+                                .stream_history_for_replay(durust::provider::StreamHistoryRequest {
                                     run_id,
                                     after_event_id: EventId::ZERO,
                                     up_to_event_id: EventId(129),
@@ -897,15 +898,17 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                             loop {
                                 let chunk = fixture
                                     .backend
-                                    .stream_history_for_replay(durust::StreamHistoryRequest {
-                                        run_id: run_id.clone(),
-                                        after_event_id: after,
-                                        up_to_event_id: EventId(
-                                            POSTGRES_CHUNKED_HISTORY_EVENTS + 1,
-                                        ),
-                                        max_events: 128,
-                                        max_bytes: usize::MAX,
-                                    })
+                                    .stream_history_for_replay(
+                                        durust::provider::StreamHistoryRequest {
+                                            run_id: run_id.clone(),
+                                            after_event_id: after,
+                                            up_to_event_id: EventId(
+                                                POSTGRES_CHUNKED_HISTORY_EVENTS + 1,
+                                            ),
+                                            max_events: 128,
+                                            max_bytes: usize::MAX,
+                                        },
+                                    )
                                     .await
                                     .unwrap();
                                 total += chunk.events.len();
@@ -955,7 +958,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .unwrap();
                             assert!(matches!(
                                 completed,
-                                durust::CompleteActivityOutcome::Completed { .. }
+                                durust::provider::CompleteActivityOutcome::Completed { .. }
                             ));
                         }
                     });
@@ -977,10 +980,15 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                         for claim in claims {
                             let outcome = fixture
                                 .backend
-                                .heartbeat_activity(durust::ActivityHeartbeatRequest { claim })
+                                .heartbeat_activity(durust::provider::ActivityHeartbeatRequest {
+                                    claim,
+                                })
                                 .await
                                 .unwrap();
-                            assert_eq!(outcome, durust::ActivityHeartbeatOutcome::Recorded);
+                            assert_eq!(
+                                outcome,
+                                durust::provider::ActivityHeartbeatOutcome::Recorded
+                            );
                         }
                     });
                 },
@@ -1038,10 +1046,10 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 })
                                 .await
                                 .unwrap();
-                            assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+                            assert_eq!(outcome, durust::provider::SignalWorkflowOutcome::Accepted);
                             let inbox = fixture
                                 .backend
-                                .read_signal_inbox(durust::ReadSignalInboxRequest {
+                                .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
                                     run_id,
                                     signal_name: durust::SignalName::new("ready"),
                                 })
@@ -1072,7 +1080,6 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(
                                     claimed.claim,
                                     WorkflowTaskCommit {
-                                        expected_tail_event_id: EventId(1),
                                         append_events: Vec::new(),
                                         upsert_waits: Vec::new(),
                                         schedule_activities: Vec::new(),
@@ -1087,7 +1094,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 )
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                         }
                     });
                 },
@@ -1109,7 +1116,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                             let outcome = fixture.backend.query_projection(req).await.unwrap();
                             assert!(matches!(
                                 outcome,
-                                durust::QueryProjectionOutcome::Found { .. }
+                                durust::provider::QueryProjectionOutcome::Found { .. }
                             ));
                         }
                     });
@@ -1134,12 +1141,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(claimed.claim, batch)
                                 .await
                                 .unwrap();
-                            assert_eq!(
-                                outcome,
-                                CommitOutcome::Committed {
-                                    new_tail_event_id: EventId(3)
-                                }
-                            );
+                            assert_eq!(outcome, EventId(3));
                         }
                     });
                 },
@@ -1165,7 +1167,6 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 .commit_workflow_task(
                                     claimed.claim,
                                     WorkflowTaskCommit {
-                                        expected_tail_event_id: EventId(1),
                                         append_events: vec![NewHistoryEvent::new(
                                             HistoryEventData::ActivityMapScheduled(scheduled),
                                         )],
@@ -1182,7 +1183,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                 )
                                 .await
                                 .unwrap();
-                            assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                            assert!(outcome.0 > 0);
                             for value in 0..8_u64 {
                                 let claimed = fixture
                                     .backend
@@ -1205,7 +1206,7 @@ fn postgres_provider_hot_paths(c: &mut Criterion) {
                                     .unwrap();
                                 assert!(matches!(
                                     completed,
-                                    durust::CompleteActivityOutcome::Completed { .. }
+                                    durust::provider::CompleteActivityOutcome::Completed { .. }
                                 ));
                             }
                         }
@@ -1225,10 +1226,13 @@ fn activity_heartbeat(c: &mut Criterion) {
             |(backend, claim)| {
                 block_on(async {
                     let outcome = backend
-                        .heartbeat_activity(durust::ActivityHeartbeatRequest { claim })
+                        .heartbeat_activity(durust::provider::ActivityHeartbeatRequest { claim })
                         .await
                         .unwrap();
-                    assert_eq!(outcome, durust::ActivityHeartbeatOutcome::Recorded);
+                    assert_eq!(
+                        outcome,
+                        durust::provider::ActivityHeartbeatOutcome::Recorded
+                    );
                 });
             },
             BatchSize::SmallInput,
@@ -1275,7 +1279,7 @@ fn signal_send_consume(c: &mut Criterion) {
                         })
                         .await
                         .unwrap();
-                    assert_eq!(outcome, durust::SignalWorkflowOutcome::Accepted);
+                    assert_eq!(outcome, durust::provider::SignalWorkflowOutcome::Accepted);
                     let claimed = backend
                         .claim_workflow_task(
                             WorkerId::new("bench-signal-consumer"),
@@ -1285,7 +1289,7 @@ fn signal_send_consume(c: &mut Criterion) {
                         .unwrap()
                         .expect("signal-ready workflow task");
                     let inbox = backend
-                        .read_signal_inbox(durust::ReadSignalInboxRequest {
+                        .read_signal_inbox(durust::provider::ReadSignalInboxRequest {
                             run_id,
                             signal_name: durust::SignalName::new("ready"),
                         })
@@ -1296,7 +1300,6 @@ fn signal_send_consume(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: Vec::new(),
                                 upsert_waits: Vec::new(),
                                 schedule_activities: Vec::new(),
@@ -1311,7 +1314,7 @@ fn signal_send_consume(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(commit, CommitOutcome::Committed { .. }));
+                    assert!(commit.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1329,7 +1332,6 @@ fn activity_map_materialize(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::ActivityMapScheduled(scheduled),
                                 )],
@@ -1346,7 +1348,7 @@ fn activity_map_materialize(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1374,7 +1376,7 @@ fn activity_map_item_complete(c: &mut Criterion) {
                         .unwrap();
                     assert!(matches!(
                         completed,
-                        durust::CompleteActivityOutcome::Completed { .. }
+                        durust::provider::CompleteActivityOutcome::Completed { .. }
                     ));
                 });
             },
@@ -1393,7 +1395,6 @@ fn child_workflow_map_materialize(c: &mut Criterion) {
                         .commit_workflow_task(
                             claimed.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                                 )],
@@ -1410,7 +1411,7 @@ fn child_workflow_map_materialize(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1428,7 +1429,6 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
                         .commit_workflow_task(
                             child_claim.claim,
                             WorkflowTaskCommit {
-                                expected_tail_event_id: EventId(1),
                                 append_events: vec![NewHistoryEvent::new(
                                     HistoryEventData::WorkflowCompleted {
                                         result: durust::encode_payload(&20_u64).unwrap(),
@@ -1447,7 +1447,7 @@ fn child_workflow_map_item_complete(c: &mut Criterion) {
                         )
                         .await
                         .unwrap();
-                    assert!(matches!(outcome, CommitOutcome::Committed { .. }));
+                    assert!(outcome.0 > 0);
                 });
             },
             BatchSize::SmallInput,
@@ -1483,18 +1483,18 @@ fn payload_codec(c: &mut Criterion) {
 }
 
 #[cfg(feature = "s3")]
-fn payload_garage_object_store(c: &mut Criterion) {
-    let Some(config) = garage_config_from_env() else {
+fn payload_s3_object_store(c: &mut Criterion) {
+    let Some(config) = s3_config_from_env() else {
         return;
     };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-    let store = durust::S3BlobStore::garage(config).unwrap();
+    let store = durust::provider::S3BlobStore::new(config).unwrap();
     runtime
         .block_on(store.list_payload_blobs())
-        .expect("Garage S3 benchmark store must be reachable");
+        .expect("S3 benchmark store must be reachable");
 
     let bytes = encoded_payload_bytes(&large_payload());
     let digest = durust::digest_bytes(&bytes);
@@ -1502,7 +1502,7 @@ fn payload_garage_object_store(c: &mut Criterion) {
         .block_on(store.put_payload_blob(digest.clone(), bytes.clone()))
         .unwrap();
 
-    let mut group = c.benchmark_group("payload_garage_object_store_64kb");
+    let mut group = c.benchmark_group("payload_s3_object_store_64kb");
     group.throughput(Throughput::Bytes(bytes.len() as u64));
     group.bench_function("get_existing_blob", |b| {
         b.iter(|| {
@@ -1542,7 +1542,7 @@ fn payload_provider_refs(c: &mut Criterion) {
             |(backend, run_id)| {
                 block_on(async {
                     let chunk = backend
-                        .stream_history(durust::StreamHistoryRequest {
+                        .stream_history(durust::provider::StreamHistoryRequest {
                             run_id,
                             after_event_id: EventId::ZERO,
                             up_to_event_id: EventId(1),
@@ -1563,7 +1563,7 @@ fn payload_provider_refs(c: &mut Criterion) {
             |(backend, run_id)| {
                 block_on(async {
                     let chunk = backend
-                        .stream_history(durust::StreamHistoryRequest {
+                        .stream_history(durust::provider::StreamHistoryRequest {
                             run_id,
                             after_event_id: EventId::ZERO,
                             up_to_event_id: EventId(1),
@@ -1786,7 +1786,7 @@ fn setup_large_inline_command_replay() -> MemoryBackend {
         // "inline" whatever the backend stored. The replay path takes this
         // variant, so this is the surface the matcher sees.
         let scheduled = backend
-            .stream_history_for_replay(durust::StreamHistoryRequest {
+            .stream_history_for_replay(durust::provider::StreamHistoryRequest {
                 run_id: run_id.clone(),
                 after_event_id: EventId::ZERO,
                 up_to_event_id: EventId(1_000_000),
@@ -2000,14 +2000,13 @@ fn setup_claimed_projection_update() -> (MemoryBackend, ClaimedWorkflowTask, dur
     })
 }
 
-fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
+fn setup_projection_read() -> (MemoryBackend, durust::provider::QueryProjectionRequest) {
     let (backend, claimed, payload) = setup_claimed_projection_update();
     block_on(async {
         backend
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: Vec::new(),
                     upsert_waits: Vec::new(),
                     schedule_activities: Vec::new(),
@@ -2024,7 +2023,7 @@ fn setup_projection_read() -> (MemoryBackend, durust::QueryProjectionRequest) {
             .unwrap();
         (
             backend,
-            durust::QueryProjectionRequest {
+            durust::provider::QueryProjectionRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("bench/claim"),
             },
@@ -2102,13 +2101,13 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
             .expect("claimable workflow task");
         let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
         let scheduled = ActivityScheduled {
-            command_id: durust::command_id(&claimed.run_id, 0),
+            command_id: durust::provider::command_id(&claimed.run_id, 0),
             activity_name: ActivityName::new("bench.double"),
             task_queue: TaskQueue::new("activities"),
             retry_policy: durust::RetryPolicy::none(),
             start_to_close_timeout: None,
             heartbeat_timeout: None,
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("bench.double"),
                 durust::payload_digest(&input),
                 "sha256:bench-options".to_owned(),
@@ -2120,7 +2119,6 @@ fn setup_claimed_workflow_for_commit() -> AppendCommitBenchState {
             backend,
             claimed,
             batch: WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled,
                 ))],
@@ -2148,13 +2146,13 @@ fn setup_claimed_workflow_for_commit_sqlite() -> SqliteAppendCommitBenchState {
             .expect("claimable workflow task");
         let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
         let scheduled = ActivityScheduled {
-            command_id: durust::command_id(&claimed.run_id, 0),
+            command_id: durust::provider::command_id(&claimed.run_id, 0),
             activity_name: ActivityName::new("bench.double"),
             task_queue: TaskQueue::new("activities"),
             retry_policy: durust::RetryPolicy::none(),
             start_to_close_timeout: None,
             heartbeat_timeout: None,
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("bench.double"),
                 durust::payload_digest(&input),
                 "sha256:bench-options".to_owned(),
@@ -2167,7 +2165,6 @@ fn setup_claimed_workflow_for_commit_sqlite() -> SqliteAppendCommitBenchState {
             backend,
             claimed,
             batch: WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled,
                 ))],
@@ -2223,7 +2220,7 @@ fn setup_scheduled_activity_sqlite() -> (
     })
 }
 
-fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskClaim) {
+fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::provider::ActivityTaskClaim) {
     block_on(async {
         let (backend, worker_id, opts) = create_claimable_workflow().await;
         let claimed = backend
@@ -2233,13 +2230,13 @@ fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskCla
             .expect("workflow task");
         let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
         let scheduled = ActivityScheduled {
-            command_id: durust::command_id(&claimed.run_id, 1),
+            command_id: durust::provider::command_id(&claimed.run_id, 1),
             activity_name: ActivityName::new("bench.double"),
             task_queue: TaskQueue::new("activities"),
             retry_policy: durust::RetryPolicy::none(),
             start_to_close_timeout: None,
             heartbeat_timeout: Some(Duration::from_secs(30)),
-            fingerprint: durust::activity_fingerprint(
+            fingerprint: durust::provider::activity_fingerprint(
                 ActivityName::new("bench.double"),
                 durust::payload_digest(&input),
                 "sha256:bench-heartbeat-options".to_owned(),
@@ -2250,7 +2247,6 @@ fn setup_claimed_heartbeat_activity() -> (MemoryBackend, durust::ActivityTaskCla
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                         scheduled.clone(),
                     ))],
@@ -2287,17 +2283,19 @@ fn setup_due_timer() -> MemoryBackend {
             .await
             .unwrap()
             .expect("workflow task");
-        let command_id = durust::command_id(&claimed.run_id, 1);
+        let command_id = durust::provider::command_id(&claimed.run_id, 1);
         backend
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                        durust::TimerStarted {
+                        durust::provider::TimerStarted {
                             command_id: command_id.clone(),
                             fire_at: TimestampMs(10),
-                            fingerprint: durust::timer_fingerprint("sleep", TimestampMs(10)),
+                            fingerprint: durust::provider::timer_fingerprint(
+                                "sleep",
+                                TimestampMs(10),
+                            ),
                         },
                     ))],
                     upsert_waits: vec![WaitRecord {
@@ -2343,12 +2341,11 @@ fn setup_signal_wait() -> (MemoryBackend, durust::RunId) {
             .await
             .unwrap()
             .expect("workflow task");
-        let command_id = durust::command_id(&claimed.run_id, 1);
+        let command_id = durust::provider::command_id(&claimed.run_id, 1);
         backend
             .commit_workflow_task(
                 claimed.claim.clone(),
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: Vec::new(),
                     upsert_waits: vec![WaitRecord {
                         wait_id: durust::WaitId::new(format!(
@@ -2381,7 +2378,7 @@ fn setup_claimed_activity_map_workflow() -> (
     MemoryBackend,
     ClaimedWorkflowTask,
     ActivityMapTask,
-    durust::ActivityMapScheduled,
+    durust::provider::ActivityMapScheduled,
 ) {
     block_on(async {
         let (backend, worker_id, opts) = create_claimable_workflow().await;
@@ -2390,12 +2387,12 @@ fn setup_claimed_activity_map_workflow() -> (
             .await
             .unwrap()
             .expect("workflow task");
-        let command_id = durust::command_id(&claimed.run_id, 1);
+        let command_id = durust::provider::command_id(&claimed.run_id, 1);
         let input_manifest = activity_map_input_manifest(128);
         let activity_name = ActivityName::new("bench.double");
         let task_queue = TaskQueue::new("activities");
         let retry_policy = durust::RetryPolicy::none();
-        let scheduled = durust::ActivityMapScheduled {
+        let scheduled = durust::provider::ActivityMapScheduled {
             command_id: command_id.clone(),
             activity_name: activity_name.clone(),
             task_queue: task_queue.clone(),
@@ -2405,7 +2402,7 @@ fn setup_claimed_activity_map_workflow() -> (
             input_manifest: input_manifest.clone(),
             result_manifest_name: "bench-results".to_owned(),
             max_in_flight: 64,
-            fingerprint: durust::activity_map_fingerprint(
+            fingerprint: durust::provider::activity_map_fingerprint(
                 activity_name.clone(),
                 durust::payload_digest(&input_manifest),
                 "bench-results".to_owned(),
@@ -2435,7 +2432,6 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(
                         HistoryEventData::ActivityMapScheduled(scheduled),
                     )],
@@ -2463,8 +2459,8 @@ fn setup_materialized_activity_map() -> (MemoryBackend, WorkerId, ClaimActivityO
 fn setup_claimed_child_workflow_map_workflow() -> (
     MemoryBackend,
     ClaimedWorkflowTask,
-    durust::ChildWorkflowMapTask,
-    durust::ChildWorkflowMapScheduled,
+    durust::provider::ChildWorkflowMapTask,
+    durust::provider::ChildWorkflowMapScheduled,
 ) {
     block_on(async {
         let (backend, worker_id, opts) = create_claimable_workflow().await;
@@ -2473,14 +2469,14 @@ fn setup_claimed_child_workflow_map_workflow() -> (
             .await
             .unwrap()
             .expect("workflow task");
-        let command_id = durust::command_id(&claimed.run_id, 1);
+        let command_id = durust::provider::command_id(&claimed.run_id, 1);
         let input_manifest = child_workflow_map_input_manifest(128);
         let workflow_type = WorkflowType::new("bench.child-double", 1);
         let task_queue = TaskQueue::new("workflows");
         let workflow_id_prefix = format!("bench/child-map/{}", claimed.run_id.0);
-        let parent_close_policy = durust::ParentClosePolicy::Cancel;
-        let failure_mode = durust::ChildWorkflowMapFailureMode::FailFast;
-        let scheduled = durust::ChildWorkflowMapScheduled {
+        let parent_close_policy = durust::provider::ParentClosePolicy::Cancel;
+        let failure_mode = durust::provider::ChildWorkflowMapFailureMode::FailFast;
+        let scheduled = durust::provider::ChildWorkflowMapScheduled {
             command_id: command_id.clone(),
             workflow_type: workflow_type.clone(),
             task_queue: task_queue.clone(),
@@ -2490,7 +2486,7 @@ fn setup_claimed_child_workflow_map_workflow() -> (
             max_in_flight: 64,
             parent_close_policy,
             failure_mode,
-            fingerprint: durust::child_workflow_map_fingerprint(
+            fingerprint: durust::provider::child_workflow_map_fingerprint(
                 workflow_type.clone(),
                 durust::payload_digest(&input_manifest),
                 "bench-results".to_owned(),
@@ -2501,7 +2497,7 @@ fn setup_claimed_child_workflow_map_workflow() -> (
                 failure_mode,
             ),
         };
-        let map_task = durust::ChildWorkflowMapTask {
+        let map_task = durust::provider::ChildWorkflowMapTask {
             map_command_id: command_id,
             workflow_type,
             task_queue,
@@ -2523,7 +2519,6 @@ fn setup_materialized_child_workflow_map() -> (MemoryBackend, ClaimedWorkflowTas
             .commit_workflow_task(
                 claimed.claim,
                 WorkflowTaskCommit {
-                    expected_tail_event_id: EventId(1),
                     append_events: vec![NewHistoryEvent::new(
                         HistoryEventData::ChildWorkflowMapScheduled(scheduled),
                     )],
@@ -2541,7 +2536,7 @@ fn setup_materialized_child_workflow_map() -> (MemoryBackend, ClaimedWorkflowTas
             .await
             .unwrap();
         let dispatched = backend
-            .dispatch_child_workflow_starts(durust::DispatchChildWorkflowStartsRequest {
+            .dispatch_child_workflow_starts(durust::provider::DispatchChildWorkflowStartsRequest {
                 namespace: Namespace::default(),
                 limit: 64,
             })
@@ -2564,14 +2559,14 @@ fn activity_map_input_manifest(items: u64) -> durust::PayloadRef {
     let inputs = (0..items)
         .map(|value| durust::encode_payload(&BenchInput { value }).unwrap())
         .collect::<Vec<_>>();
-    durust::encode_activity_map_input_manifest(inputs, 32).unwrap()
+    durust::provider::encode_activity_map_input_manifest(inputs, 32).unwrap()
 }
 
 fn child_workflow_map_input_manifest(items: u64) -> durust::PayloadRef {
     let inputs = (0..items)
         .map(|value| durust::encode_payload(&BenchInput { value }).unwrap())
         .collect::<Vec<_>>();
-    durust::encode_activity_map_input_manifest(inputs, 32).unwrap()
+    durust::provider::encode_activity_map_input_manifest(inputs, 32).unwrap()
 }
 
 fn large_payload() -> LargePayload {
@@ -2589,14 +2584,14 @@ fn encoded_payload_bytes(payload: &LargePayload) -> Vec<u8> {
 }
 
 #[cfg(feature = "s3")]
-fn garage_config_from_env() -> Option<durust::S3BlobStoreConfig> {
-    let endpoint = env::var("DURUST_GARAGE_ENDPOINT").ok()?;
-    let bucket = env::var("DURUST_GARAGE_BUCKET").ok()?;
-    let access_key_id = env::var("DURUST_GARAGE_ACCESS_KEY_ID").ok()?;
-    let secret_access_key = env::var("DURUST_GARAGE_SECRET_ACCESS_KEY").ok()?;
-    let region = env::var("DURUST_GARAGE_REGION").unwrap_or_else(|_| "garage".to_owned());
-    let prefix = env::var("DURUST_GARAGE_PREFIX").unwrap_or_else(|_| "bench/payloads".to_owned());
-    Some(durust::S3BlobStoreConfig {
+fn s3_config_from_env() -> Option<durust::provider::S3BlobStoreConfig> {
+    let endpoint = env::var("DURUST_S3_ENDPOINT").ok()?;
+    let bucket = env::var("DURUST_S3_BUCKET").ok()?;
+    let access_key_id = env::var("DURUST_S3_ACCESS_KEY_ID").ok()?;
+    let secret_access_key = env::var("DURUST_S3_SECRET_ACCESS_KEY").ok()?;
+    let region = env::var("DURUST_S3_REGION").unwrap_or_else(|_| "us-east-1".to_owned());
+    let prefix = env::var("DURUST_S3_PREFIX").unwrap_or_else(|_| "bench/payloads".to_owned());
+    Some(durust::provider::S3BlobStoreConfig {
         bucket,
         endpoint,
         region,
@@ -2612,7 +2607,7 @@ fn setup_payload_history(inline_threshold_bytes: usize) -> (MemoryBackend, durus
             PayloadStorageConfig::new().inline_threshold_bytes(inline_threshold_bytes),
         );
         let outcome = backend
-            .start_workflow(durust::StartWorkflowRequest {
+            .start_workflow(durust::provider::StartWorkflowRequest {
                 namespace: Namespace::default(),
                 workflow_id: durust::WorkflowId::new("bench/payload-history"),
                 workflow_type: WorkflowType::new("bench.double-plus-one", 1),
@@ -2651,7 +2646,7 @@ fn setup_large_payload_timer_replay(
 
 async fn assert_large_payload_workflow_completed(backend: &MemoryBackend, run_id: &durust::RunId) {
     let history = backend
-        .stream_history(durust::StreamHistoryRequest {
+        .stream_history(durust::provider::StreamHistoryRequest {
             run_id: run_id.clone(),
             after_event_id: EventId::ZERO,
             up_to_event_id: EventId(1_000),
@@ -2675,6 +2670,7 @@ fn claim_workflow_options() -> ClaimWorkflowTaskOptions {
         task_queue: TaskQueue::new("workflows"),
         registered_workflow_types: vec![WorkflowType::new("bench.double-plus-one", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     }
 }
 
@@ -2684,6 +2680,7 @@ fn child_workflow_claim_options() -> ClaimWorkflowTaskOptions {
         task_queue: TaskQueue::new("workflows"),
         registered_workflow_types: vec![WorkflowType::new("bench.child-double", 1)],
         lease_duration: Duration::from_secs(30),
+        shard_filter: None,
     }
 }
 
@@ -2991,7 +2988,7 @@ fn start_postgres_workflow(
         .block_on(
             fixture
                 .backend
-                .start_workflow(durust::StartWorkflowRequest {
+                .start_workflow(durust::provider::StartWorkflowRequest {
                     namespace: Namespace::default(),
                     workflow_id: workflow_id.clone(),
                     workflow_type: WorkflowType::new("bench.double-plus-one", 1),
@@ -3028,13 +3025,13 @@ fn setup_postgres_claimed_workflow_for_commit(
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-commit-worker");
     let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
     let scheduled = ActivityScheduled {
-        command_id: durust::command_id(&claimed.run_id, 1),
+        command_id: durust::provider::command_id(&claimed.run_id, 1),
         activity_name: ActivityName::new("bench.double"),
         task_queue: TaskQueue::new("activities"),
         retry_policy: durust::RetryPolicy::none(),
         start_to_close_timeout: None,
         heartbeat_timeout: None,
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("bench.double"),
             durust::payload_digest(&input),
             "sha256:bench-options".to_owned(),
@@ -3045,7 +3042,6 @@ fn setup_postgres_claimed_workflow_for_commit(
     (
         claimed,
         WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
             append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                 scheduled,
             ))],
@@ -3075,18 +3071,18 @@ fn setup_postgres_scheduled_activity(fixture: &PostgresBenchFixture, iteration: 
 fn setup_postgres_claimed_heartbeat_activity(
     fixture: &PostgresBenchFixture,
     iteration: u64,
-) -> durust::ActivityTaskClaim {
+) -> durust::provider::ActivityTaskClaim {
     start_postgres_workflow(fixture, "heartbeat", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-heartbeat-workflow-worker");
     let input = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
     let scheduled = ActivityScheduled {
-        command_id: durust::command_id(&claimed.run_id, 1),
+        command_id: durust::provider::command_id(&claimed.run_id, 1),
         activity_name: ActivityName::new("bench.double"),
         task_queue: TaskQueue::new("activities"),
         retry_policy: durust::RetryPolicy::none(),
         start_to_close_timeout: None,
         heartbeat_timeout: Some(Duration::from_secs(30)),
-        fingerprint: durust::activity_fingerprint(
+        fingerprint: durust::provider::activity_fingerprint(
             ActivityName::new("bench.double"),
             durust::payload_digest(&input),
             "sha256:bench-heartbeat-options".to_owned(),
@@ -3098,7 +3094,6 @@ fn setup_postgres_claimed_heartbeat_activity(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::ActivityScheduled(
                     scheduled.clone(),
                 ))],
@@ -3129,18 +3124,17 @@ fn setup_postgres_claimed_heartbeat_activity(
 fn setup_postgres_due_timer(fixture: &PostgresBenchFixture, iteration: u64) {
     start_postgres_workflow(fixture, "timer", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-timer-worker");
-    let command_id = durust::command_id(&claimed.run_id, 1);
+    let command_id = durust::provider::command_id(&claimed.run_id, 1);
     fixture
         .runtime
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: vec![NewHistoryEvent::new(HistoryEventData::TimerStarted(
-                    durust::TimerStarted {
+                    durust::provider::TimerStarted {
                         command_id: command_id.clone(),
                         fire_at: TimestampMs(10),
-                        fingerprint: durust::timer_fingerprint("sleep", TimestampMs(10)),
+                        fingerprint: durust::provider::timer_fingerprint("sleep", TimestampMs(10)),
                     },
                 ))],
                 upsert_waits: vec![WaitRecord {
@@ -3174,13 +3168,12 @@ fn setup_postgres_signal_wait(
 ) -> (durust::RunId, durust::WorkflowId, durust::SignalId) {
     let (workflow_id, _) = start_postgres_workflow(fixture, "signal", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-signal-worker");
-    let command_id = durust::command_id(&claimed.run_id, 1);
+    let command_id = durust::provider::command_id(&claimed.run_id, 1);
     fixture
         .runtime
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim.clone(),
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: Vec::new(),
                 upsert_waits: vec![WaitRecord {
                     wait_id: durust::WaitId::new(format!(
@@ -3228,7 +3221,7 @@ fn setup_postgres_claimed_projection_update(
 fn setup_postgres_projection_read(
     fixture: &PostgresBenchFixture,
     iteration: u64,
-) -> durust::QueryProjectionRequest {
+) -> durust::provider::QueryProjectionRequest {
     let (workflow_id, _) = start_postgres_workflow(fixture, "projection_read", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-projection-read-worker");
     let payload = durust::encode_payload(&BenchInput { value: 10 }).unwrap();
@@ -3237,7 +3230,6 @@ fn setup_postgres_projection_read(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: Vec::new(),
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3251,7 +3243,7 @@ fn setup_postgres_projection_read(
             },
         ))
         .unwrap();
-    durust::QueryProjectionRequest {
+    durust::provider::QueryProjectionRequest {
         namespace: Namespace::default(),
         workflow_id,
     }
@@ -3269,7 +3261,6 @@ fn setup_postgres_history_stream(fixture: &PostgresBenchFixture, iteration: u64)
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: events,
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3304,7 +3295,6 @@ fn setup_postgres_large_history_stream(
         .block_on(fixture.backend.commit_workflow_task(
             claimed.claim,
             WorkflowTaskCommit {
-                expected_tail_event_id: EventId(1),
                 append_events: events,
                 upsert_waits: Vec::new(),
                 schedule_activities: Vec::new(),
@@ -3328,30 +3318,29 @@ fn setup_postgres_child_start(
 ) -> (ClaimedWorkflowTask, WorkflowTaskCommit) {
     start_postgres_workflow(fixture, "child_parent", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-child-worker");
-    let command_id = durust::command_id(&claimed.run_id, 1);
+    let command_id = durust::provider::command_id(&claimed.run_id, 1);
     let input = durust::encode_payload(&10_u64).unwrap();
     let workflow_type = WorkflowType::new("bench.child-double", 1);
     let workflow_id = postgres_workflow_id("child_target", &fixture.schema, iteration);
     let task_queue = TaskQueue::new("workflows");
-    let requested = durust::ChildWorkflowStartRequested {
+    let requested = durust::provider::ChildWorkflowStartRequested {
         command_id: command_id.clone(),
         workflow_type: workflow_type.clone(),
         workflow_id: workflow_id.clone(),
         task_queue: task_queue.clone(),
         input: input.clone(),
-        parent_close_policy: durust::ParentClosePolicy::Cancel,
-        fingerprint: durust::child_workflow_fingerprint(
+        parent_close_policy: durust::provider::ParentClosePolicy::Cancel,
+        fingerprint: durust::provider::child_workflow_fingerprint(
             workflow_type,
             workflow_id,
             durust::payload_digest(&input),
             task_queue,
-            durust::ParentClosePolicy::Cancel,
+            durust::provider::ParentClosePolicy::Cancel,
         ),
     };
     (
         claimed,
         WorkflowTaskCommit {
-            expected_tail_event_id: EventId(1),
             append_events: vec![NewHistoryEvent::new(
                 HistoryEventData::ChildWorkflowStartRequested(requested.clone()),
             )],
@@ -3359,7 +3348,7 @@ fn setup_postgres_child_start(
             schedule_activities: Vec::new(),
             schedule_activity_maps: Vec::new(),
             schedule_child_workflow_maps: Vec::new(),
-            start_child_workflows: vec![durust::ChildStartOutboxMessage::from_requested(
+            start_child_workflows: vec![durust::provider::ChildStartOutboxMessage::from_requested(
                 &requested,
             )],
             consume_signals: Vec::new(),
@@ -3377,16 +3366,16 @@ fn setup_postgres_claimed_activity_map_workflow(
 ) -> (
     ClaimedWorkflowTask,
     ActivityMapTask,
-    durust::ActivityMapScheduled,
+    durust::provider::ActivityMapScheduled,
 ) {
     start_postgres_workflow(fixture, "activity_map", iteration);
     let claimed = claim_postgres_workflow_task(fixture, "bench-postgres-map-workflow-worker");
-    let command_id = durust::command_id(&claimed.run_id, 1);
+    let command_id = durust::provider::command_id(&claimed.run_id, 1);
     let input_manifest = activity_map_input_manifest(8);
     let activity_name = ActivityName::new("bench.double");
     let task_queue = TaskQueue::new("activities");
     let retry_policy = durust::RetryPolicy::none();
-    let scheduled = durust::ActivityMapScheduled {
+    let scheduled = durust::provider::ActivityMapScheduled {
         command_id: command_id.clone(),
         activity_name: activity_name.clone(),
         task_queue: task_queue.clone(),
@@ -3396,7 +3385,7 @@ fn setup_postgres_claimed_activity_map_workflow(
         input_manifest: input_manifest.clone(),
         result_manifest_name: "bench-results".to_owned(),
         max_in_flight: 8,
-        fingerprint: durust::activity_map_fingerprint(
+        fingerprint: durust::provider::activity_map_fingerprint(
             activity_name.clone(),
             durust::payload_digest(&input_manifest),
             "bench-results".to_owned(),
@@ -3500,7 +3489,7 @@ fn version_replay_worker(backend: MemoryBackend) -> Worker<MemoryBackend> {
 fn postgres_provider_hot_paths(_: &mut Criterion) {}
 
 #[cfg(not(feature = "s3"))]
-fn payload_garage_object_store(_: &mut Criterion) {}
+fn payload_s3_object_store(_: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -3526,7 +3515,7 @@ criterion_group!(
     postgres_provider_hot_paths,
     activity_heartbeat,
     payload_codec,
-    payload_garage_object_store,
+    payload_s3_object_store,
     payload_provider_refs,
     payload_replay,
     timer_due_scan_wakeup,

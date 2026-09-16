@@ -41,7 +41,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -97,7 +96,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 3,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -168,7 +166,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -259,7 +256,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 5,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -319,7 +315,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 7,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -394,7 +389,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -489,7 +483,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 5,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -553,7 +546,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 7,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -601,7 +593,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -670,8 +661,7 @@
                   "runId": "run-1",
                   "seq": 1
                 },
-                "type": "SelectWinner",
-                "winningEventId": 3
+                "type": "SelectWinner"
               },
               {
                 "result": {
@@ -703,7 +693,6 @@
                 "kind": "Timer"
               }
             ],
-            "expectedTailEventId": 2,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -746,7 +735,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -795,8 +783,7 @@
                   "runId": "run-1",
                   "seq": 1
                 },
-                "type": "SelectWinner",
-                "winningEventId": 3
+                "type": "SelectWinner"
               },
               {
                 "result": {
@@ -819,7 +806,6 @@
                 "kind": "Signal"
               }
             ],
-            "expectedTailEventId": 3,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -890,7 +876,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -958,8 +943,7 @@
                   "runId": "run-1",
                   "seq": 1
                 },
-                "type": "SelectWinner",
-                "winningEventId": 4
+                "type": "SelectWinner"
               },
               {
                 "result": {
@@ -974,7 +958,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 5,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1047,7 +1030,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -1115,8 +1097,7 @@
                   "runId": "run-1",
                   "seq": 1
                 },
-                "type": "SelectWinner",
-                "winningEventId": 4
+                "type": "SelectWinner"
               },
               {
                 "result": {
@@ -1131,7 +1112,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 5,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1162,7 +1142,6 @@
             "appendEvents": [],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": {
               "codec": "MessagePack",
               "schemaFingerprint": "<schema-fingerprint>",
@@ -1245,7 +1224,6 @@
                 "kind": "Signal"
               }
             ],
-            "expectedTailEventId": 1,
             "queryProjection": {
               "codec": "MessagePack",
               "schemaFingerprint": "<schema-fingerprint>",
@@ -1307,7 +1285,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1345,7 +1322,6 @@
             "appendEvents": [],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 3,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1378,7 +1354,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 4,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1460,7 +1435,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [
@@ -1542,7 +1516,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 3,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1614,7 +1587,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1654,7 +1626,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1684,7 +1655,6 @@
             "appendEvents": [],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1768,7 +1738,6 @@
                 "kind": "Signal"
               }
             ],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1814,7 +1783,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 4,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1881,7 +1849,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [
               {
@@ -1949,7 +1916,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 4,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -1994,7 +1960,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2063,8 +2028,7 @@
                   "runId": "run-1",
                   "seq": 1
                 },
-                "type": "SelectWinner",
-                "winningEventId": 3
+                "type": "SelectWinner"
               },
               {
                 "commandId": {
@@ -2100,7 +2064,6 @@
                 "kind": "Timer"
               }
             ],
-            "expectedTailEventId": 2,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2158,7 +2121,6 @@
                 "kind": "Timer"
               }
             ],
-            "expectedTailEventId": 6,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2200,7 +2162,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2255,7 +2216,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 1,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2317,7 +2277,6 @@
             ],
             "consumeSignals": [],
             "deleteWaits": [],
-            "expectedTailEventId": 4,
             "queryProjection": null,
             "scheduleActivities": [],
             "scheduleActivityMaps": [],
@@ -2337,16 +2296,16 @@
   ],
   "declaredDivergences": {
     "count": 0,
-    "why": "How many `divergence` blocks this corpus holds, asserted for EQUALITY by both runners — a count, not a floor. It replaced a `count > 0` tripwire, which encoded the assumption that the corpus would always record at least one divergence; that assumption became wrong the moment the last one was converged away, and it would have had to be edited under exactly the pressure that makes a careless edit likely. It is 0 today: every divergence this corpus ever found has been closed by moving TypeScript onto Rust's answer, and the eight blocks that held the select command-seq numbering are now shared `expect`s. Zero is a real state, not a disabled check — the next genuine divergence must raise this number in the same change that records it, or both runners fail, and a block deleted rather than converged fails them too."
+    "why": "How many `divergence` blocks this corpus holds, asserted for EQUALITY by both runners \u2014 a count, not a floor. It replaced a `count > 0` tripwire, which encoded the assumption that the corpus would always record at least one divergence; that assumption became wrong the moment the last one was converged away, and it would have had to be edited under exactly the pressure that makes a careless edit likely. It is 0 today: every divergence this corpus ever found has been closed by moving TypeScript onto Rust's answer, and the eight blocks that held the select command-seq numbering are now shared `expect`s. Zero is a real state, not a disabled check \u2014 the next genuine divergence must raise this number in the same change that records it, or both runners fail, and a block deleted rather than converged fails them too."
   },
   "declaredGaps": [
     {
       "what": "Double-await of a handle",
-      "why": "A three-way split, not a two-way one. Rust's ActivityHandle::result(self) takes self by value, so a second await does not compile at all. Rust's ChildWorkflowHandle::result(&self) borrows, so both a second concurrent await and a second sequential read compile — and take_child_completion removes the entry from the index, so the second await returns Poll::Pending forever and the workflow silently stalls. TypeScript allows a sequential re-read and rejects a concurrent one. Three behaviours across two runtimes and two handle kinds; no corpus case awaits a handle twice. No corpus case awaits a handle twice, so this is a gap rather than a projection: there is nothing here for the runners to normalise, only behaviour nobody looked at."
+      "why": "A three-way split, not a two-way one. Rust's ActivityHandle::result(self) takes self by value, so a second await does not compile at all. Rust's ChildWorkflowHandle::result(&self) borrows, so both a second concurrent await and a second sequential read compile \u2014 and take_child_completion removes the entry from the index, so the second await returns Poll::Pending forever and the workflow silently stalls. TypeScript allows a sequential re-read and rejects a concurrent one. Three behaviours across two runtimes and two handle kinds; no corpus case awaits a handle twice. No corpus case awaits a handle twice, so this is a gap rather than a projection: there is nothing here for the runners to normalise, only behaviour nobody looked at."
     },
     {
       "what": "Offloaded (blob) payload refs",
-      "why": "Every payload in every case is inline. payload_json/payloadJson call decode_payload/decodePayload, which refuse a Blob ref, so a case that started offloading would fail loudly rather than under-assert — but nothing exercises the payload-offload layer, its digest/size/uri fields, or the hydration a provider must perform before replay. The corpus says nothing about offloaded payload parity in either direction."
+      "why": "Every payload in every case is inline. payload_json/payloadJson call decode_payload/decodePayload, which refuse a Blob ref, so a case that started offloading would fail loudly rather than under-assert \u2014 but nothing exercises the payload-offload layer, its digest/size/uri fields, or the hydration a provider must perform before replay. The corpus says nothing about offloaded payload parity in either direction."
     },
     {
       "what": "Child workflow maps",
@@ -2358,7 +2317,7 @@
     },
     {
       "what": "Activity retries",
-      "why": "Every activity in the catalogue succeeds on its first attempt, so the corpus never observes a second attempt, a retry delay, or an ActivityTimedOut. That is partly deliberate — retry delay VALUES are a forced divergence and are excluded above — but the shape of a retry (attempt number, whether a new task is scheduled at all) is comparable and is not compared."
+      "why": "Every activity in the catalogue succeeds on its first attempt, so the corpus never observes a second attempt, a retry delay, or an ActivityTimedOut. That is partly deliberate \u2014 retry delay VALUES are a forced divergence and are excluded above \u2014 but the shape of a retry (attempt number, whether a new task is scheduled at all) is comparable and is not compared."
     },
     {
       "what": "Terminal-with-leftover-command divergence detection",
@@ -2366,11 +2325,11 @@
     },
     {
       "what": "The select tie-break between two branches ready at the same event id",
-      "why": "There are TWO implementations of the rule in Rust, not one: the select! macro expands its own comparison (durust-macros/src/lib.rs) and select_all carries a separate copy (src/runtime.rs). TypeScript has compareSelectReadyBranches. All three order ready branches by ready event id and then by branch ordinal. The event-id half is pinned for the macro path and for TypeScript by the two-ready-branch cases, in both orders, and reversing either implementation fails them. What this corpus does NOT pin: the select_all copy, which no case reaches — pre-existing replay_core tests do cover it, so it is untested by the corpus rather than untested outright — and the ordinal half of the rule, for any implementation. The ordinal half appears unreachable through the public API: every ready branch resolves from a distinct history event — a TimerFired, an activity completion, or the SignalConsumed the task is about to append — so two ready branches cannot share a ready event id, and a comparator reading 'lowest event id, then HIGHEST ordinal' passes both cases here. It is recorded as a gap rather than claimed as an assertion, because a future change that let two branches share an event id would land on untested code."
+      "why": "There are TWO implementations of the rule in Rust, not one: the select! macro expands its own comparison (durust-macros/src/lib.rs) and select_all carries a separate copy (src/runtime.rs). TypeScript has compareSelectReadyBranches. All three order ready branches by ready event id and then by branch ordinal. The event-id half is pinned for the macro path and for TypeScript by the two-ready-branch cases, in both orders, and reversing either implementation fails them. What this corpus does NOT pin: the select_all copy, which no case reaches \u2014 pre-existing replay_core tests do cover it, so it is untested by the corpus rather than untested outright \u2014 and the ordinal half of the rule, for any implementation. The ordinal half appears unreachable through the public API: every ready branch resolves from a distinct history event \u2014 a TimerFired, an activity completion, or the SignalConsumed the task is about to append \u2014 so two ready branches cannot share a ready event id, and a comparator reading 'lowest event id, then HIGHEST ordinal' passes both cases here. It is recorded as a gap rather than claimed as an assertion, because a future change that let two branches share an event id would land on untested code."
     },
     {
       "what": "Providers other than the two in-memory ones",
-      "why": "Every case runs against MemoryBackend. That is less single-provider than it sounds — Rust and TypeScript have entirely independent MemoryBackend implementations, so the corpus is implicitly cross-checking two providers as well as two runtimes — but neither SQLite nor Postgres executes a single corpus case in either language, and provider-specific commit handling is covered only by the separate conformance suites."
+      "why": "Every case runs against MemoryBackend. That is less single-provider than it sounds \u2014 Rust and TypeScript have entirely independent MemoryBackend implementations, so the corpus is implicitly cross-checking two providers as well as two runtimes \u2014 but neither SQLite nor Postgres executes a single corpus case in either language, and provider-specific commit handling is covered only by the separate conformance suites."
     }
   ],
   "exclusions": [
@@ -2392,12 +2351,12 @@
     {
       "kind": "Projection",
       "what": "SelectWinner.branchesDigest",
-      "why": "Rust's select! is positional and records the literal string \"select:{n}\" (\"select_all:{n}\" for select_all); TypeScript's select takes a named record and records sha256(JSON.stringify({kind: \"select\", branches: [...keys]})), over key names Rust's positional macro does not have. What the corpus asserts instead is the winner itself: branchOrdinal and winningEventId are compared exactly. That claim is only worth anything if some case resolves a select with MORE THAN ONE ready branch — with a single ready branch every comparator returns the same winner and the assertion cannot fail — so the corpus carries `a select resolved with two ready branches takes the lower ready event id`, in which the signal and the timer are both ready in the same task and the recorded winner is the one with the lower ready event id. Reversing either half of compareSelectReadyBranches fails that case. The ordinal half of the rule is a declared gap, not an assertion: see declaredGaps."
+      "why": "Rust's select! is positional and records the literal string \"select:{n}\" (\"select_all:{n}\" for select_all); TypeScript's select takes a named record and records sha256(JSON.stringify({kind: \"select\", branches: [...keys]})), over key names Rust's positional macro does not have. What the corpus asserts instead is the winner itself: branchOrdinal is compared exactly, and it is the outcome of the tie-break, so reversing the comparator changes it. That claim is only worth anything if some case resolves a select with MORE THAN ONE ready branch \u2014 with a single ready branch every comparator returns the same winner and the assertion cannot fail \u2014 so the corpus carries `a select resolved with two ready branches takes the lower ready event id`, in which the signal and the timer are both ready in the same task and the recorded winner is the one with the lower ready event id. Reversing either half of compareSelectReadyBranches fails that case. The ordinal half of the rule is a declared gap, not an assertion: see declaredGaps."
     },
     {
       "kind": "Projection",
       "what": "WaitId string format",
-      "why": "Rust formats a wait id as \"{runId}:{seq}:timer\" / \"{runId}:{seq}:signal\"; TypeScript formats the same wait as \"{runId}:timer:{seq}\" / \"{runId}:signal:{seq}\". The id is an opaque provider key within one store, so neither format is wrong, but they are not interchangeable and a store written by one runtime could not have its waits deleted by the other. The corpus asserts what the id stands for — kind plus command id — for both upserted and deleted waits, each runner parsing its own format back into that neutral triple. This is a real divergence discovered while building the corpus, not a language-forced one."
+      "why": "Rust formats a wait id as \"{runId}:{seq}:timer\" / \"{runId}:{seq}:signal\"; TypeScript formats the same wait as \"{runId}:timer:{seq}\" / \"{runId}:signal:{seq}\". The id is an opaque provider key within one store, so neither format is wrong, but they are not interchangeable and a store written by one runtime could not have its waits deleted by the other. The corpus asserts what the id stands for \u2014 kind plus command id \u2014 for both upserted and deleted waits, each runner parsing its own format back into that neutral triple. This is a real divergence discovered while building the corpus, not a language-forced one."
     },
     {
       "kind": "Projection",
@@ -2407,12 +2366,12 @@
     {
       "kind": "Assertion",
       "what": "WorkflowTaskCommit.cancelCommands and the ParentCancelled event",
-      "why": "Both runtimes carry the field — cancel_commands in Rust, cancelCommands in TypeScript — both raise ParentCancelled from it, and both now write it from the same producer: a select branch that loses while still holding a scheduled activity, which Rust withdraws in ActivityFuture::__durust_cancel_branch and TypeScript in cancelActivityBranch. It stays excluded because no corpus case reaches that state — every select here races a timer against a signal, or races branches that have both already produced a value — and not because either runtime is unable to produce it. Both runners assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
+      "why": "Both runtimes carry the field \u2014 cancel_commands in Rust, cancelCommands in TypeScript \u2014 both raise ParentCancelled from it, and both now write it from the same producer: a select branch that loses while still holding a scheduled activity, which Rust withdraws in ActivityFuture::__durust_cancel_branch and TypeScript in cancelActivityBranch. It stays excluded because no corpus case reaches that state \u2014 every select here races a timer against a signal, or races branches that have both already produced a value \u2014 and not because either runtime is unable to produce it. Both runners assert the field is empty on every recorded commit, so the first case that starts cancelling a command fails loudly in both languages instead of quietly asserting half a commit."
     },
     {
       "kind": "Scope",
       "what": "The execution mechanism",
-      "why": "Rust polls futures and rebuilds a RuntimeContext per task; TypeScript keeps a long-lived hot promise chain (HotWorkflowExecution) and mutates its context in place through AsyncLocalStorage. Neither can adopt the other and the corpus does not try: it names no execution-internal state and asserts only the committed history and the provider contract. What it does assert is that the choice is unobservable through that contract — the hot/cold case pairs below run the same script with and without a cached execution and require byte-identical commits."
+      "why": "Rust polls futures and rebuilds a RuntimeContext per task; TypeScript keeps a long-lived hot promise chain (HotWorkflowExecution) and mutates its context in place through AsyncLocalStorage. Neither can adopt the other and the corpus does not try: it names no execution-internal state and asserts only the committed history and the provider contract. What it does assert is that the choice is unobservable through that contract \u2014 the hot/cold case pairs below run the same script with and without a cached execution and require byte-identical commits."
     }
   ],
   "note": [
@@ -2434,9 +2393,9 @@
     "  `program`   names an entry in a catalogue that exists once per language",
     "              with the same observable behaviour. The corpus never carries",
     "              code.",
-    "  `steps`     are provider-level actions — run a workflow task, run an",
+    "  `steps`     are provider-level actions \u2014 run a workflow task, run an",
     "              activity, advance the virtual clock, fire due timers, send a",
-    "              signal, restart the worker with a given replay chunk size — so",
+    "              signal, restart the worker with a given replay chunk size \u2014 so",
     "              the input history is produced the same way on both sides.",
     "  `historyBefore` pins that input history as literal data, read from the",
     "              provider immediately before the task is claimed.",
@@ -2449,15 +2408,15 @@
     "              is the point: a divergence that is normalised away stops being",
     "              visible, and one that is merely omitted stops being tracked.",
     "              Both runners refuse a divergence whose two sides are equal.",
-    "              There are none today — see `declaredDivergences` — but the",
+    "              There are none today \u2014 see `declaredDivergences` \u2014 but the",
     "              mechanism stays, because the next one has to be recordable in",
     "              the change that finds it rather than in the change that fixes",
     "              it.",
     "",
-    "              The two diff implementations agree on every structural shape —",
+    "              The two diff implementations agree on every structural shape \u2014",
     "              nested objects, arrays of differing length, null against an",
     "              absent key, object against scalar, key ordering, deep key-set",
-    "              mismatch — and disagree on exactly one class: numeric",
+    "              mismatch \u2014 and disagree on exactly one class: numeric",
     "              REPRESENTATION. Rust compares serde_json::Number, which",
     "              distinguishes 1.0 from 1, -0.0 from 0, and 9007199254740993",
     "              from 9007199254740992; TypeScript compares JSON.stringify after",
@@ -2467,17 +2426,17 @@
     "              declare the extra path and TypeScript rejects it as spurious,",
     "              omit it and Rust rejects the omission. One runner always goes",
     "              red, and check:fixtures and CI both run both. Unreachable",
-    "              today — every number in every commit is an integer inside the",
-    "              double-safe range — so it is recorded rather than fixed.",
+    "              today \u2014 every number in every commit is an integer inside the",
+    "              double-safe range \u2014 so it is recorded rather than fixed.",
     "",
     "  `declaredDivergences.count` is how many `divergence` blocks the corpus",
     "              claims to hold, asserted for EQUALITY by both runners. It",
     "              replaced a `count > 0` tripwire, which asserted that the",
-    "              corpus would always record at least one divergence — an",
+    "              corpus would always record at least one divergence \u2014 an",
     "              assumption that becomes wrong the moment the last one is",
     "              converged away. Equality is loud in both directions: delete a",
     "              block and both runners fail, find a new divergence and forget",
-    "              to declare it and both runners fail, and 0 — the value today —",
+    "              to declare it and both runners fail, and 0 \u2014 the value today \u2014",
     "              is a real state rather than a disabled check. Zero is reachable",
     "              only by editing this number on purpose.",
     "",
@@ -2494,7 +2453,7 @@
     "  DURUST_CORPUS_REGENERATE=1 and are checked in. The TypeScript runner has no",
     "  regeneration path at all: it can satisfy the file or fail. That asymmetry",
     "  is what makes the corpus a cross-implementation assertion rather than a",
-    "  snapshot of one implementation — every shared `expect` here is a value one",
+    "  snapshot of one implementation \u2014 every shared `expect` here is a value one",
     "  runtime produced and the other had to match without having seen it.",
     "  DURUST_CORPUS_PRINT=1 makes the TypeScript runner report what it observed,",
     "  for filling in a `divergence.typescript` block; it never writes this file.",
@@ -2513,8 +2472,8 @@
     "     TypeScript now cancels every branch that loses without producing a",
     "     value, so both runtimes delete the same waits, and those two steps",
     "     differ only by (2) below. The corpus reaches the timer and signal branch",
-    "     kinds; the activity branch — which Rust withdraws through",
-    "     `cancel_commands` rather than a wait — is not reached by any case here",
+    "     kinds; the activity branch \u2014 which Rust withdraws through",
+    "     `cancel_commands` rather than a wait \u2014 is not reached by any case here",
     "     and is covered by the `WorkflowTaskCommit.cancelCommands` exclusion.",
     "  2. A `select` allocated its own command sequence number before polling its",
     "     branches in Rust and after resolving a winner in TypeScript, which",
@@ -2528,7 +2487,7 @@
     "     initiation; the exception was an artefact of `then()` inheriting the",
     "     readiness condition, not a decision. It was recorded as a `divergence`",
     "     on all eight steps of the four select cases, and those eight blocks are",
-    "     now shared `expect`s that both runners satisfy — which is the proof the",
+    "     now shared `expect`s that both runners satisfy \u2014 which is the proof the",
     "     convergence landed, since the recorded commits are Rust's and",
     "     TypeScript had to reproduce them without having produced them.",
     "  3. The TypeScript worker never supplied PrepareWorkflowTaskOptions.nowMs,",
@@ -2541,8 +2500,8 @@
     "     perfectly comparable, the runtimes simply differed, and an exclusion",
     "     would have hidden that behind a projection the runners do not perform.",
     "  4. WorkerOptions.activityTaskQueue in TypeScript was used only for CLAIMING",
-    "     activity tasks — the worker never passed defaultActivityTaskQueue into",
-    "     HotWorkflowExecution — so a callActivity() with no explicit taskQueue",
+    "     activity tasks \u2014 the worker never passed defaultActivityTaskQueue into",
+    "     HotWorkflowExecution \u2014 so a callActivity() with no explicit taskQueue",
     "     scheduled onto the literal queue \"default\" and the worker that scheduled",
     "     it would never claim it. CLOSED, by giving the runtime the worker's",
     "     configured queue as its fallback exactly as Rust does. It could not be",
@@ -2623,7 +2582,7 @@
           550319038,
           2319465759
         ],
-        "workerId": "wörker"
+        "workerId": "w\u00f6rker"
       },
       {
         "seed": 1131670609,
@@ -2635,7 +2594,7 @@
           2059652591,
           1622848149
         ],
-        "workerId": "worker-🙂"
+        "workerId": "worker-\ud83d\ude42"
       }
     ],
     "note": [
@@ -2645,7 +2604,7 @@
       "pinned here so nothing can drift.",
       "",
       "`seed` is the FNV-1a-32 state before the first draw. `unitsScaled` are the",
-      "first six draws multiplied by 2^32 — that is, the raw 32-bit mulberry32",
+      "first six draws multiplied by 2^32 \u2014 that is, the raw 32-bit mulberry32",
       "outputs, before the single exact division each runtime performs. Integers,",
       "not decimals, deliberately: the division by 2^32 is exact in both runtimes,",
       "so the integer form loses nothing, while decimal text does not survive the",
@@ -2657,7 +2616,7 @@
       "sub-millisecond precision in a Duration, TypeScript rounds to whole",
       "milliseconds. The stream is the shared part.",
       "",
-      "worker-🙂 is in the table on purpose: an astral character is two",
+      "worker-\ud83d\ude42 is in the table on purpose: an astral character is two",
       "UTF-16 code units and one four-byte UTF-8 sequence, so a runtime that",
       "hashed bytes instead of code units would agree on every ASCII id here and",
       "fail only on this one.",

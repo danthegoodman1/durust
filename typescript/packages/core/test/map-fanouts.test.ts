@@ -7,7 +7,6 @@ import {
   activityMapManifest,
   commandId,
   encodePayload,
-  eventId,
   namespace,
   payloadDigest,
   taskQueue,
@@ -91,7 +90,6 @@ describe("shared map transition table fanouts", () => {
         )
       };
       await backend.commitWorkflowTask(claimed.claim, {
-        expectedTailEventId: eventId(1),
         appendEvents: [{ data: { kind: "ActivityMapScheduled", scheduled } }],
         scheduleActivityMaps: [
           {

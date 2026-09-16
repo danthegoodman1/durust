@@ -1,7 +1,7 @@
+use durust::provider::{DurableBackend, HistoryEventData, StreamHistoryRequest};
 use durust::{
-    Client, DurableBackend, EventId, HistoryEventData, MemoryBackend, PostgresBackend,
-    PostgresBackendConfig, RunId, ShardId, SqliteBackend, StreamHistoryRequest, Worker,
-    WorkerRunStats,
+    Client, EventId, MemoryBackend, PostgresBackend, PostgresBackendConfig, RunId, ShardId,
+    SqliteBackend, Worker, WorkerRunStats,
 };
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -390,7 +390,7 @@ impl BackendMetrics {
         }
     }
 
-    fn record_workflow_task_commit_shape(&self, commit: &durust::WorkflowTaskCommit) {
+    fn record_workflow_task_commit_shape(&self, commit: &durust::provider::WorkflowTaskCommit) {
         let mut shapes = self
             .workflow_task_commit_shapes
             .lock()
@@ -617,8 +617,8 @@ where
 
     fn start_workflow(
         &self,
-        req: durust::StartWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::StartWorkflowOutcome>> {
+        req: durust::provider::StartWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::StartWorkflowOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -636,8 +636,8 @@ where
 
     fn cancel_workflow(
         &self,
-        req: durust::CancelWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CancelWorkflowOutcome>> {
+        req: durust::provider::CancelWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CancelWorkflowOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -672,8 +672,8 @@ where
     fn claim_workflow_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTaskOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTaskOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedWorkflowTask>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -697,8 +697,8 @@ where
     fn claim_workflow_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimWorkflowTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedWorkflowTask>>> {
+        opts: durust::provider::ClaimWorkflowTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedWorkflowTask>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -717,8 +717,8 @@ where
 
     fn stream_history(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -732,8 +732,8 @@ where
 
     fn stream_history_for_replay(
         &self,
-        req: durust::StreamHistoryRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::HistoryChunk>> {
+        req: durust::provider::StreamHistoryRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::HistoryChunk>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -790,9 +790,9 @@ where
 
     fn commit_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        batch: durust::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, durust::Result<durust::CommitOutcome>> {
+        claim: durust::provider::WorkflowTaskClaim,
+        batch: durust::provider::WorkflowTaskCommit,
+    ) -> BoxFuture<'static, durust::Result<durust::EventId>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -813,8 +813,9 @@ where
 
     fn commit_workflow_tasks(
         &self,
-        batch: durust::WorkflowTaskCommitBatch,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::WorkflowTaskCommitBatchResult>>> {
+        batch: durust::provider::WorkflowTaskCommitBatch,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::WorkflowTaskCommitBatchResult>>>
+    {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         let input_items = batch.commits.len() as u64;
@@ -836,8 +837,8 @@ where
 
     fn release_workflow_task(
         &self,
-        claim: durust::WorkflowTaskClaim,
-        release: durust::WorkflowTaskRelease,
+        claim: durust::provider::WorkflowTaskClaim,
+        release: durust::provider::WorkflowTaskRelease,
     ) -> BoxFuture<'static, durust::Result<()>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
@@ -856,8 +857,8 @@ where
 
     fn signal_workflow(
         &self,
-        req: durust::SignalWorkflowRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::SignalWorkflowOutcome>> {
+        req: durust::provider::SignalWorkflowRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::SignalWorkflowOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -875,8 +876,8 @@ where
 
     fn read_signal_inbox(
         &self,
-        req: durust::ReadSignalInboxRequest,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::SignalInboxRecord>>> {
+        req: durust::provider::ReadSignalInboxRequest,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::SignalInboxRecord>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -899,8 +900,8 @@ where
 
     fn read_signal_inboxes(
         &self,
-        req: durust::ReadSignalInboxesRequest,
-    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::SignalInboxRecord>>>> {
+        req: durust::provider::ReadSignalInboxesRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<Option<durust::provider::SignalInboxRecord>>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         let force_scalar_signal_reads = self.force_scalar_signal_reads;
@@ -937,8 +938,8 @@ where
 
     fn fire_due_timers(
         &self,
-        req: durust::FireDueTimersRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FireDueTimersOutcome>> {
+        req: durust::provider::FireDueTimersRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FireDueTimersOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -952,8 +953,8 @@ where
 
     fn timeout_due_activities(
         &self,
-        req: durust::TimeoutDueActivitiesRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::TimeoutDueActivitiesOutcome>> {
+        req: durust::provider::TimeoutDueActivitiesRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::TimeoutDueActivitiesOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -974,8 +975,8 @@ where
 
     fn run_due_maintenance(
         &self,
-        req: durust::RunDueMaintenanceRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::RunDueMaintenanceOutcome>> {
+        req: durust::provider::RunDueMaintenanceRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::RunDueMaintenanceOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -997,8 +998,8 @@ where
     fn claim_activity_task(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityOptions,
-    ) -> BoxFuture<'static, durust::Result<Option<durust::ClaimedActivityTask>>> {
+        opts: durust::provider::ClaimActivityOptions,
+    ) -> BoxFuture<'static, durust::Result<Option<durust::provider::ClaimedActivityTask>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1022,8 +1023,8 @@ where
     fn claim_activity_tasks(
         &self,
         worker_id: durust::WorkerId,
-        opts: durust::ClaimActivityTasksOptions,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::ClaimedActivityTask>>> {
+        opts: durust::provider::ClaimActivityTasksOptions,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::ClaimedActivityTask>>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1042,8 +1043,8 @@ where
 
     fn heartbeat_activity(
         &self,
-        req: durust::ActivityHeartbeatRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::ActivityHeartbeatOutcome>> {
+        req: durust::provider::ActivityHeartbeatRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::ActivityHeartbeatOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1061,8 +1062,8 @@ where
 
     fn complete_activity(
         &self,
-        req: durust::CompleteActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::CompleteActivityOutcome>> {
+        req: durust::provider::CompleteActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::CompleteActivityOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1080,8 +1081,9 @@ where
 
     fn complete_activity_tasks(
         &self,
-        req: durust::CompleteActivityTasksRequest,
-    ) -> BoxFuture<'static, durust::Result<Vec<durust::CompleteActivityTaskBatchResult>>> {
+        req: durust::provider::CompleteActivityTasksRequest,
+    ) -> BoxFuture<'static, durust::Result<Vec<durust::provider::CompleteActivityTaskBatchResult>>>
+    {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         let input_items = req.completions.len() as u64;
@@ -1103,8 +1105,8 @@ where
 
     fn fail_activity(
         &self,
-        req: durust::FailActivityRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::FailActivityOutcome>> {
+        req: durust::provider::FailActivityRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::FailActivityOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1122,8 +1124,9 @@ where
 
     fn dispatch_child_workflow_starts(
         &self,
-        req: durust::DispatchChildWorkflowStartsRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::DispatchChildWorkflowStartsOutcome>> {
+        req: durust::provider::DispatchChildWorkflowStartsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::DispatchChildWorkflowStartsOutcome>>
+    {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1144,8 +1147,8 @@ where
 
     fn query_projection(
         &self,
-        req: durust::QueryProjectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::QueryProjectionOutcome>> {
+        req: durust::provider::QueryProjectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::QueryProjectionOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1163,8 +1166,8 @@ where
 
     fn workflow_change_versions(
         &self,
-        req: durust::WorkflowChangeVersionsRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::WorkflowChangeVersionsOutcome>> {
+        req: durust::provider::WorkflowChangeVersionsRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::WorkflowChangeVersionsOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1180,7 +1183,9 @@ where
         })
     }
 
-    fn payload_roots(&self) -> BoxFuture<'static, durust::Result<durust::PayloadRootsOutcome>> {
+    fn payload_roots(
+        &self,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadRootsOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1198,8 +1203,8 @@ where
 
     fn gc_payload_blobs(
         &self,
-        req: durust::PayloadGarbageCollectionRequest,
-    ) -> BoxFuture<'static, durust::Result<durust::PayloadGarbageCollectionOutcome>> {
+        req: durust::provider::PayloadGarbageCollectionRequest,
+    ) -> BoxFuture<'static, durust::Result<durust::provider::PayloadGarbageCollectionOutcome>> {
         let inner = self.inner.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -1332,7 +1337,7 @@ async fn benchmark_child_map_parent(input: ChildMapInput) -> durust::Result<Chil
         .spawn()
         .await?;
     let result_manifest = mapped.result_manifest().await?;
-    let result_refs = durust::decode_child_workflow_map_success_refs(&result_manifest)?;
+    let result_refs = durust::provider::decode_child_workflow_map_success_refs(&result_manifest)?;
     let sum = result_refs.iter().try_fold(0_u64, |sum, payload| {
         Ok(sum.saturating_add(durust::decode_payload::<u64>(payload)?))
     })?;

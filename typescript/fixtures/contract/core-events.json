@@ -505,7 +505,6 @@
             "seq": 7
           },
           "branchOrdinal": 1,
-          "winningEventId": 24,
           "branchesDigest": "sha256:select-branches"
         }
       }

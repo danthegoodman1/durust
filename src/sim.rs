@@ -1,4 +1,4 @@
-use crate::{CommitOutcome, CompleteActivityOutcome, DurableBackend, Error, PayloadStorageConfig};
+use crate::{CompleteActivityOutcome, DurableBackend, Error, EventId, PayloadStorageConfig};
 use futures::future::BoxFuture;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -457,7 +457,6 @@ struct FaultInjectorState {
     injected_faults: u64,
     duplicated_completions: u64,
     duplicate_completion_outcomes: Vec<CompleteActivityOutcome>,
-    observed_commit_conflicts: u64,
 }
 
 impl<B> FaultInjectingBackend<B>
@@ -484,7 +483,6 @@ where
                 injected_faults: 0,
                 duplicated_completions: 0,
                 duplicate_completion_outcomes: Vec::new(),
-                observed_commit_conflicts: 0,
             })),
         }
     }
@@ -537,10 +535,6 @@ where
 
     pub fn duplicate_completion_outcomes(&self) -> Vec<CompleteActivityOutcome> {
         self.lock().duplicate_completion_outcomes.clone()
-    }
-
-    pub fn observed_commit_conflicts(&self) -> u64 {
-        self.lock().observed_commit_conflicts
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, FaultInjectorState> {
@@ -725,22 +719,12 @@ where
         &self,
         claim: crate::WorkflowTaskClaim,
         batch: crate::WorkflowTaskCommit,
-    ) -> BoxFuture<'static, crate::Result<CommitOutcome>> {
+    ) -> BoxFuture<'static, crate::Result<EventId>> {
         if let Some(err) = self.fault("commit_workflow_task") {
             return Box::pin(futures::future::ready(Err(err)));
         }
         let inner = self.inner.clone();
-        let state = Arc::clone(&self.state);
-        Box::pin(async move {
-            let outcome = inner.commit_workflow_task(claim, batch).await?;
-            if outcome == CommitOutcome::Conflict {
-                state
-                    .lock()
-                    .expect("fault injector mutex poisoned")
-                    .observed_commit_conflicts += 1;
-            }
-            Ok(outcome)
-        })
+        Box::pin(async move { inner.commit_workflow_task(claim, batch).await })
     }
 
     fn commit_workflow_tasks(
@@ -751,21 +735,7 @@ where
             return Box::pin(futures::future::ready(Err(err)));
         }
         let inner = self.inner.clone();
-        let state = Arc::clone(&self.state);
-        Box::pin(async move {
-            let results = inner.commit_workflow_tasks(batch).await?;
-            let conflicts = results
-                .iter()
-                .filter(|result| result.result == Ok(CommitOutcome::Conflict))
-                .count() as u64;
-            if conflicts > 0 {
-                state
-                    .lock()
-                    .expect("fault injector mutex poisoned")
-                    .observed_commit_conflicts += conflicts;
-            }
-            Ok(results)
-        })
+        Box::pin(async move { inner.commit_workflow_tasks(batch).await })
     }
 
     fn complete_activity(
@@ -981,6 +951,7 @@ mod tests {
             task_queue: crate::TaskQueue::new("sim-crash-queue"),
             registered_workflow_types: vec![crate::WorkflowType::new("sim.crash", 1)],
             lease_duration: Duration::from_secs(1),
+            shard_filter: None,
         };
 
         backend.crash_after_next_workflow_claim();
