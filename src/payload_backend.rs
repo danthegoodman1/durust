@@ -23,14 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
-    /// Stores a content-addressed blob and returns its URI. A put for a digest
-    /// that already exists may skip the upload; stores that can cheaply refresh
-    /// the blob's last-modified timestamp on such a skip should do so, because
-    /// the GC grace period (`PayloadGarbageCollectionRequest::min_age`) is the
-    /// only thing protecting a deduplicated blob whose commit has not landed
-    /// yet. S3 skips the refresh: the grace period must exceed the maximum
-    /// upload-to-commit latency plus one GC scan, which the one-hour default
-    /// dwarfs.
+    /// Durably stores content-addressed bytes before returning their URI.
+    /// Deduplication may retain the existing timestamp. Destructive GC requires
+    /// quiescent writers; timestamps alone cannot protect in-flight publication.
     fn put_payload_blob(
         &self,
         digest: String,
@@ -48,13 +43,8 @@ pub trait PayloadBlobStore: Clone + Send + Sync + 'static {
     /// the minimum-age grace period.
     fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>>;
 
-    /// Fresh last-modified probe for one blob, consulted by the GC sweep
-    /// immediately before each delete so a content-addressed re-put landing
-    /// after the sweep's listing is not deleted out from under its racing
-    /// commit. `Ok(None)` means the store has no fresh information (missing
-    /// blob or no timestamp support); the sweep then trusts its listing
-    /// snapshot. Defaulted so existing third-party stores keep compiling with
-    /// their current behavior.
+    /// Optional timestamp inspection. This is not an atomic deletion fence;
+    /// collectors must obey the quiescent-writer contract regardless of age.
     fn payload_blob_last_modified(
         &self,
         digest: String,
@@ -512,13 +502,13 @@ where
         let inner = self.inner.clone();
         let blob_store = self.blob_store.clone();
         Box::pin(async move {
+            req.validate()?;
             let roots = inner.payload_roots().await?;
             let external_blobs = blob_store.list_payload_blobs().await?;
             let mut reachable = BTreeSet::new();
             collect_reachable_external_blobs(&blob_store, roots.roots, &mut reachable).await?;
-            // Blob uploads precede the commit that makes them reachable, so an
-            // unreachable-but-young blob may belong to an in-flight commit.
-            // Only blobs older than the grace period are garbage.
+            // Writers are quiescent for destructive sweeps. Age is an optional
+            // retention policy, not a concurrency guarantee.
             let cutoff = payload_gc_cutoff_ms(unix_epoch_millis(), req.min_age);
             let garbage = external_blobs
                 .iter()
@@ -533,20 +523,6 @@ where
             if !req.dry_run {
                 deleted_blobs = 0;
                 for digest in &garbage {
-                    // Re-probe the timestamp right before the delete: a
-                    // content-addressed re-put racing the sweep refreshes it,
-                    // and deleting anyway would dangle the racing commit's
-                    // ref. A blob skipped here counts as retained; a failed
-                    // probe leaves the blob alone and reports it so the next
-                    // sweep reconsiders it.
-                    match blob_store.payload_blob_last_modified(digest.clone()).await {
-                        Ok(Some(last_modified)) if last_modified.0 > cutoff => continue,
-                        Ok(_) => {}
-                        Err(_) => {
-                            failed_blobs += 1;
-                            continue;
-                        }
-                    }
                     match blob_store.delete_payload_blob(digest.clone()).await {
                         Ok(()) => deleted_blobs += 1,
                         Err(_) => failed_blobs += 1,
@@ -1301,6 +1277,15 @@ pub(crate) fn local_blob_uri(digest: &str) -> String {
     format!("local://payload/{digest}")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalPublicationStep {
+    Written,
+    FileSynced,
+    Renamed,
+    DirectorySynced,
+    Published,
+}
+
 impl LocalDirectoryBlobStore {
     pub fn new(root: impl Into<std::path::PathBuf>, prefix: &str) -> Self {
         let root: std::path::PathBuf = root.into();
@@ -1321,63 +1306,75 @@ impl LocalDirectoryBlobStore {
     }
 
     pub fn put_sync(&self, digest: &str, bytes: &[u8]) -> Result<String> {
-        let expected_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        validate_payload_blob_bytes(digest, expected_size, bytes)?;
-        std::fs::create_dir_all(&self.dir).map_err(|err| {
+        self.publish(digest, bytes, |_| Ok(()))
+    }
+
+    // The observer is also the fault-injection boundary for the durability
+    // model. It never substitutes for the real filesystem barriers.
+    fn publish(
+        &self,
+        digest: &str,
+        bytes: &[u8],
+        mut checkpoint: impl FnMut(LocalPublicationStep) -> std::io::Result<()>,
+    ) -> Result<String> {
+        use std::io::Write;
+        validate_payload_blob_bytes(digest, bytes.len() as u64, bytes)?;
+        let publish = || -> std::io::Result<()> {
+            std::fs::create_dir_all(&self.dir)?;
+            let path = self.blob_path(digest);
+            if path.exists() {
+                // A concurrent publisher may have renamed but not yet synced
+                // the directory. Deduplication must perform the same barriers.
+                let existing = std::fs::read(&path)?;
+                if existing != bytes {
+                    return Err(std::io::Error::other(
+                        "existing payload blob content mismatch",
+                    ));
+                }
+                let file = std::fs::File::options().write(true).open(&path)?;
+                file.set_modified(std::time::SystemTime::now())?;
+                file.sync_all()?;
+                checkpoint(LocalPublicationStep::FileSynced)?;
+            } else {
+                let sequence =
+                    LOCAL_BLOB_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp_path = self
+                    .dir
+                    .join(format!("{digest}.tmp-{}-{sequence}", std::process::id()));
+                let result = (|| {
+                    let mut file = std::fs::File::options()
+                        .write(true)
+                        .create_new(true)
+                        .open(&tmp_path)?;
+                    file.write_all(bytes)?;
+                    checkpoint(LocalPublicationStep::Written)?;
+                    file.sync_all()?;
+                    checkpoint(LocalPublicationStep::FileSynced)?;
+                    std::fs::rename(&tmp_path, &path)?;
+                    checkpoint(LocalPublicationStep::Renamed)
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
+                result?;
+            }
+            // Sync each parent too: create_dir_all may have created a nested
+            // prefix, or another publisher may have just created it. Syncing
+            // only the leaf directory does not persist its own parent entry.
+            let absolute = std::path::absolute(&self.dir)?;
+            for directory in absolute.ancestors() {
+                std::fs::File::open(directory)?.sync_all()?;
+                checkpoint(LocalPublicationStep::DirectorySynced)?;
+            }
+            checkpoint(LocalPublicationStep::Published)?;
+            Ok(())
+        };
+        let mut publish = publish;
+        publish().map_err(|err| {
             Error::Backend(format!(
-                "failed to create local payload blob directory `{}`: {err}",
-                self.dir.display()
+                "failed to durably publish local payload blob `{digest}`: {err}"
             ))
         })?;
-        let path = self.blob_path(digest);
-        if path.exists() {
-            let metadata = std::fs::metadata(&path).map_err(|err| {
-                Error::Backend(format!(
-                    "failed to inspect local payload blob `{}`: {err}",
-                    path.display()
-                ))
-            })?;
-            if metadata.len() != expected_size {
-                return Err(Error::PayloadDecode(format!(
-                    "payload blob size mismatch: expected {expected_size}, got {}",
-                    metadata.len()
-                )));
-            }
-            std::fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|file| file.set_modified(std::time::SystemTime::now()))
-                .map_err(|err| {
-                    Error::Backend(format!(
-                        "failed to refresh local payload blob `{}`: {err}",
-                        path.display()
-                    ))
-                })?;
-            return Ok(local_blob_uri(digest));
-        }
-        let sequence = LOCAL_BLOB_TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_path = self
-            .dir
-            .join(format!("{digest}.tmp-{}-{sequence}", std::process::id()));
-        std::fs::write(&tmp_path, bytes).map_err(|err| {
-            Error::Backend(format!(
-                "failed to write local payload blob `{}`: {err}",
-                tmp_path.display()
-            ))
-        })?;
-        match std::fs::rename(&tmp_path, &path) {
-            Ok(()) => {}
-            Err(_) if path.exists() => {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
-            Err(err) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(Error::Backend(format!(
-                    "failed to commit local payload blob `{}`: {err}",
-                    path.display()
-                )));
-            }
-        }
         Ok(local_blob_uri(digest))
     }
 
@@ -1701,8 +1698,7 @@ impl PayloadBlobStore for S3BlobStore {
             )?;
             // Content-addressed keys make re-puts byte-identical, so one HEAD
             // replaces the upload. The skip does not refresh LastModified
-            // (copy-object-to-itself per put is not worth the round trip); the
-            // GC grace period covers the unrefreshed dedup window instead.
+            // because destructive collection already requires quiescent writers.
             if s3_object_exists(&bucket, &key).await? {
                 return Ok(s3_blob_uri(&bucket_name, &key));
             }
@@ -1977,11 +1973,84 @@ mod tests {
     use futures::executor::block_on;
     use std::time::Duration;
 
-    // Dedup-reuse window pin (Bug A second flavor): content-addressed dedup
-    // makes a put on an existing digest a data no-op, so a concurrent writer
-    // can reuse a blob GC has already sentenced. The put must restart the GC
-    // grace period; without the timestamp refresh the second sweep here
-    // deletes the blob the in-flight commit is about to reference.
+    #[test]
+    fn local_publication_crash_boundaries_never_acknowledge_unflushed_data() {
+        // Explore a crash after every production publication operation, both
+        // for a new nested path and for a deduplicated existing name.
+        for existing in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalDirectoryBlobStore::new(dir.path(), "nested/payloads");
+            let bytes = vec![3_u8; 1024];
+            let digest = digest_bytes(&bytes);
+            if existing {
+                store.put_sync(&digest, &bytes).unwrap();
+            }
+            let mut trace = Vec::new();
+            store
+                .publish(&digest, &bytes, |step| {
+                    trace.push(step);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(trace.contains(&LocalPublicationStep::FileSynced));
+            assert_eq!(trace.last(), Some(&LocalPublicationStep::Published));
+            for crash_at in 0..trace.len() {
+                let attempt = tempfile::tempdir().unwrap();
+                let store = LocalDirectoryBlobStore::new(attempt.path(), "nested/payloads");
+                if existing {
+                    store.put_sync(&digest, &bytes).unwrap();
+                }
+                let mut operations = 0;
+                let mut stable_file = existing;
+                let mut visible_name = existing;
+                let mut stable_directories = 0;
+                let required_directories = std::path::absolute(store.directory())
+                    .unwrap()
+                    .ancestors()
+                    .count();
+                let result = store.publish(&digest, &bytes, |step| {
+                    match step {
+                        LocalPublicationStep::FileSynced => stable_file = true,
+                        LocalPublicationStep::Renamed => visible_name = true,
+                        LocalPublicationStep::DirectorySynced => {
+                            assert!(stable_file && visible_name);
+                            stable_directories += 1;
+                        }
+                        LocalPublicationStep::Published => {
+                            assert!(stable_file && visible_name);
+                            assert_eq!(stable_directories, required_directories);
+                        }
+                        _ => {}
+                    }
+                    let cut = operations == crash_at;
+                    operations += 1;
+                    if cut {
+                        Err(std::io::Error::other("simulated crash"))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert!(result.is_err(), "existing={existing}, crash_at={crash_at}");
+                // A retry must safely complete an orphaned rename or fresh write.
+                store.put_sync(&digest, &bytes).unwrap();
+                let reopened = LocalDirectoryBlobStore::new(attempt.path(), "nested/payloads");
+                assert_eq!(reopened.get_sync(&digest).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn local_dedup_rejects_corrupt_existing_bytes_even_with_matching_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalDirectoryBlobStore::new(dir.path(), "");
+        let bytes = vec![1_u8; 16];
+        let digest = digest_bytes(&bytes);
+        std::fs::write(store.blob_path(&digest), vec![2_u8; 16]).unwrap();
+        assert!(store.put_sync(&digest, &bytes).is_err());
+    }
+
+    // Memory storage refreshes optional age retention on reuse. All writes
+    // finish before these offline sweeps begin.
     #[test]
     fn memory_blob_store_put_restarts_gc_grace_period_for_reused_digest() {
         let store = MemoryBlobStore::new();
@@ -2004,6 +2073,7 @@ mod tests {
         // Control: backdated past the grace period, the unreachable blob is
         // collectable garbage.
         let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: true,
             ..Default::default()
         }))
@@ -2014,6 +2084,7 @@ mod tests {
         // restarts the grace period, so the sweep retains the blob.
         block_on(store.put_payload_blob(digest.clone(), bytes)).unwrap();
         let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             ..Default::default()
         }))
@@ -2038,6 +2109,7 @@ mod tests {
             PayloadStorageConfig::default(),
         );
         let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             min_age: Duration::ZERO,
         }))
@@ -2047,137 +2119,6 @@ mod tests {
             .expect_err("zero grace period deletes the uncommitted reused blob");
     }
 
-    // Blob store wrapper that performs a content-addressed re-put of another
-    // sentenced digest inside the first delete call, deterministically
-    // landing the reuse in the window between the sweep's listing and its
-    // remaining deletes.
-    type PendingReput = Arc<Mutex<Option<(String, Vec<u8>)>>>;
-
-    #[derive(Clone)]
-    struct ReputOnFirstDeleteStore {
-        inner: MemoryBlobStore,
-        reput: PendingReput,
-    }
-
-    impl PayloadBlobStore for ReputOnFirstDeleteStore {
-        fn put_payload_blob(
-            &self,
-            digest: String,
-            bytes: Vec<u8>,
-        ) -> BoxFuture<'static, Result<String>> {
-            self.inner.put_payload_blob(digest, bytes)
-        }
-
-        fn get_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<Vec<u8>>> {
-            self.inner.get_payload_blob(digest)
-        }
-
-        fn payload_blob_exists(&self, digest: String) -> BoxFuture<'static, Result<bool>> {
-            self.inner.payload_blob_exists(digest)
-        }
-
-        fn list_payload_blobs(&self) -> BoxFuture<'static, Result<BTreeMap<String, TimestampMs>>> {
-            self.inner.list_payload_blobs()
-        }
-
-        fn payload_blob_last_modified(
-            &self,
-            digest: String,
-        ) -> BoxFuture<'static, Result<Option<TimestampMs>>> {
-            self.inner.payload_blob_last_modified(digest)
-        }
-
-        fn delete_payload_blob(&self, digest: String) -> BoxFuture<'static, Result<()>> {
-            let inner = self.inner.clone();
-            let reput = self.reput.clone();
-            Box::pin(async move {
-                let racing_put = reput.lock().unwrap().take();
-                if let Some((reput_digest, bytes)) = racing_put {
-                    inner.put_payload_blob(reput_digest, bytes).await?;
-                }
-                inner.delete_payload_blob(digest).await
-            })
-        }
-
-        fn owns_payload_blob_uri(&self, uri: &str) -> bool {
-            self.inner.owns_payload_blob_uri(uri)
-        }
-    }
-
-    fn backdate_blob(store: &MemoryBlobStore, digest: &str) {
-        store
-            .blobs
-            .lock()
-            .unwrap()
-            .get_mut(digest)
-            .unwrap()
-            .last_modified = TimestampMs(0);
-    }
-
-    // Reuse-window pin for the decorator sweep: a content-addressed re-put of
-    // an already-past-min_age orphan landing between the sweep's listing and
-    // its delete must not be deleted (the racing commit is about to reference
-    // it). The per-delete timestamp re-probe catches the refresh; without it
-    // the just-re-put blob is lost.
-    #[test]
-    fn gc_sweep_reprobe_skips_orphan_reput_between_listing_and_delete() {
-        let inner = MemoryBlobStore::new();
-        let bytes_x = vec![1_u8; 64];
-        let bytes_y = vec![2_u8; 64];
-        let digest_x = digest_bytes(&bytes_x);
-        let digest_y = digest_bytes(&bytes_y);
-        block_on(inner.put_payload_blob(digest_x.clone(), bytes_x.clone())).unwrap();
-        block_on(inner.put_payload_blob(digest_y.clone(), bytes_y.clone())).unwrap();
-        backdate_blob(&inner, &digest_x);
-        backdate_blob(&inner, &digest_y);
-
-        // The sweep deletes garbage in listing (digest-sorted) order, so the
-        // wrapper's first-delete hook fires for the smaller digest and
-        // re-puts the other one — a reuse landing after the listing but
-        // before that blob's delete.
-        let (first_deleted, reused) = if digest_x < digest_y {
-            (digest_x.clone(), digest_y.clone())
-        } else {
-            (digest_y.clone(), digest_x.clone())
-        };
-        let reused_bytes = if reused == digest_x { bytes_x } else { bytes_y };
-        let store = ReputOnFirstDeleteStore {
-            inner: inner.clone(),
-            reput: Arc::new(Mutex::new(Some((reused.clone(), reused_bytes)))),
-        };
-        let backend = PayloadBackend::with_payload_storage(
-            MemoryBackend::new(),
-            store,
-            PayloadStorageConfig::default(),
-        );
-
-        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
-            dry_run: false,
-            ..Default::default()
-        }))
-        .unwrap();
-        assert_eq!(outcome.deleted_blobs, 1, "only the un-reused orphan goes");
-        assert_eq!(outcome.retained_blobs, 1, "the re-put blob counts retained");
-        assert_eq!(outcome.failed_blobs, 0);
-        block_on(inner.get_payload_blob(first_deleted))
-            .expect_err("the un-reused orphan is collected");
-        block_on(inner.get_payload_blob(reused.clone()))
-            .expect("the re-put blob must survive the sweep that sentenced it");
-
-        // Once the reuse ages past min_age again (and no commit landed), a
-        // later sweep collects it normally.
-        backdate_blob(&inner, &reused);
-        let outcome = block_on(backend.gc_payload_blobs(PayloadGarbageCollectionRequest {
-            dry_run: false,
-            ..Default::default()
-        }))
-        .unwrap();
-        assert_eq!(outcome.deleted_blobs, 1);
-        block_on(inner.get_payload_blob(reused)).expect_err("aged orphan collected on resweep");
-    }
-
-    // Pins the hand-rolled S3 ListObjectsV2 timestamp parser against known
-    // epoch values, including a leap-day and fractional seconds.
     #[cfg(feature = "s3")]
     #[test]
     fn iso8601_utc_timestamps_parse_to_epoch_milliseconds() {

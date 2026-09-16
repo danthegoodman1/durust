@@ -300,7 +300,8 @@ async fn wr_optout_loop_parent(input: NumberInput) -> durust::Result<u64> {
 #[durust::workflow(name = "worker-run.reentrant-side-effect", version = 1)]
 async fn wr_reentrant_side_effect(_: UnitInput) -> durust::Result<bool> {
     let flag: bool = durust::side_effect("worker-run-nested-call", || {
-        durust::patched("worker-run-nested-change").unwrap_or(false)
+        drop(durust::patched("worker-run-nested-change"));
+        false
     })
     .await?;
     Ok(flag)

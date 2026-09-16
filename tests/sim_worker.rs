@@ -180,6 +180,9 @@ fn build_worker(backend: &SimBackend, worker_id: &str) -> Worker<SimBackend> {
         .activity_task_queue("sim-activities")
         // Tiny chunks force cold replays to span multiple history chunks.
         .history_chunk_events(3)
+        .recovery_replay_event_budget(2)
+        .recovery_replay_byte_budget(128)
+        .recovery_prefetch_chunks(1)
         .workflow_task_lease_duration(Duration::from_secs(1))
         .activity_task_lease_duration(Duration::from_secs(1))
         // Short enough that a poisoned task is claimable again inside the
@@ -928,6 +931,9 @@ fn racing_fact_storm_scenario(sim: &mut SimRun) -> Result<ScenarioOutcome, SimFa
                 .workflow_task_queue(format!("sim-conflict-workflows-{index}"))
                 .activity_task_queue(format!("sim-conflict-activities-{value}"))
                 .history_chunk_events(3)
+                .recovery_replay_event_budget(2)
+                .recovery_replay_byte_budget(128)
+                .recovery_prefetch_chunks(1)
                 .workflow_task_lease_duration(Duration::from_secs(1))
                 .activity_task_lease_duration(Duration::from_secs(1))
                 .register_workflow(sim_conflict)

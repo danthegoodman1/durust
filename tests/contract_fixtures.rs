@@ -468,6 +468,7 @@ fn rust_provider_io_fixture_matches_backend_contract_vocabulary() {
     let gc_request =
         payload_gc_request_from_fixture(&fixture["payloadGarbageCollection"]["request"]);
     assert!(gc_request.dry_run);
+    assert!(gc_request.writers_quiescent);
     assert_eq!(
         gc_request.min_age,
         durust::provider::DEFAULT_PAYLOAD_GC_MIN_AGE
@@ -955,6 +956,9 @@ fn payload_gc_request_from_fixture(
     value: &Value,
 ) -> durust::provider::PayloadGarbageCollectionRequest {
     durust::provider::PayloadGarbageCollectionRequest {
+        writers_quiescent: value["writersQuiescent"]
+            .as_bool()
+            .expect("GC writersQuiescent"),
         dry_run: value["dryRun"].as_bool().expect("GC dryRun"),
         min_age: Duration::from_millis(value["minAgeMs"].as_u64().expect("GC minAgeMs")),
     }

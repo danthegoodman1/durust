@@ -150,49 +150,6 @@ export interface PrepareWorkflowTaskOptions {
    * loaded" nondeterminism error as before.
    */
   readonly loadReplayHistory?: ReplayHistoryLoader;
-  /**
-   * How many recorded command events the replay window keeps in reserve beyond
-   * whatever the current durable call needs. Defaults to
-   * {@link REPLAY_WINDOW_LOOKAHEAD_EVENTS}.
-   *
-   * `Number.POSITIVE_INFINITY` asks for the whole recorded history, which is
-   * how the worker repairs a {@link ReplayWindowOverrunError}: it re-replays
-   * the run once with no reserve limit, trading this run's memory bound for
-   * completing the task.
-   */
-  readonly replayWindowLookaheadEvents?: number;
-}
-
-/**
- * Raised when a synchronous durable marker needed a recorded event the replay
- * window had not loaded.
- *
- * `getVersion`, `patched`, and `deprecatePatch` return plain values rather than
- * thenables, so they cannot suspend to wait for the next chunk. They spend from
- * the window's reserve instead, and a long enough run of consecutive marker
- * calls with no awaited durable call between them exhausts it.
- *
- * Recoverable, not fatal, and repaired rather than reported: nothing has been
- * committed at the point this is raised and replay is deterministic, so the
- * owner can drop the execution and replay the run again with no reserve limit.
- * {@link Worker} does exactly that, once, which is why an operator does not see
- * a retry loop. The latch behind it (`toCommit()` refuses while it is set) is
- * what keeps a workflow's own `try`/`catch` from hiding the condition and
- * committing a task built on a marker the runtime could not verify.
- */
-export class ReplayWindowOverrunError extends Error {
-  readonly api: string;
-
-  constructor(api: string, reserve: number) {
-    super(
-      `durust: ${api} needed recorded history that is not loaded yet; more than ` +
-        `${reserve} consecutive synchronous durable markers ran without an awaited ` +
-        `durable call between them. Raise the worker's historyFetchMaxEvents so the ` +
-        `replay window carries a larger reserve.`
-    );
-    this.name = "ReplayWindowOverrunError";
-    this.api = api;
-  }
 }
 
 /**
@@ -203,23 +160,6 @@ export class ReplayWindowOverrunError extends Error {
 export type ReplayHistoryLoader = (
   afterEventId: EventId
 ) => Promise<{ readonly events: readonly HistoryEvent[]; readonly lastEventId: EventId }>;
-
-/**
- * How many recorded command events the replay window keeps in reserve past
- * whatever the current durable call needs.
- *
- * It exists for the durable APIs that cannot park. `getVersion`, `patched`,
- * and `deprecatePatch` return plain values rather than thenables, so they
- * cannot suspend to wait for a chunk; every awaited durable call refills the
- * window to at least this many events, and those markers spend from that
- * reserve. A run of more than this many consecutive marker calls with no
- * awaited durable call between them exhausts it and is refused rather than
- * mis-replayed — see `#peekReplayEventForUnparkableApi`.
- *
- * Matched to the worker's default `historyFetchMaxEvents` so the steady-state
- * window is about two chunks.
- */
-export const REPLAY_WINDOW_LOOKAHEAD_EVENTS = 128;
 
 /**
  * True for the recorded events the replay cursor matches positionally.
@@ -452,16 +392,22 @@ export function getVersion(
   changeId: string,
   minSupported: number,
   maxSupported: number
-): number {
-  return currentWorkflowRuntimeContext().getVersion(changeId, minSupported, maxSupported);
+): PromiseLike<number> {
+  const context = currentWorkflowRuntimeContext();
+  context.assertMarkerAllowed("getVersion", changeId);
+  return new MarkerDurablePromise(() => context.getVersion(changeId, minSupported, maxSupported));
 }
 
-export function patched(patchId: string): boolean {
-  return getVersion(patchId, DEFAULT_VERSION, 1) !== DEFAULT_VERSION;
+export function patched(patchId: string): PromiseLike<boolean> {
+  const context = currentWorkflowRuntimeContext();
+  context.assertMarkerAllowed("getVersion", patchId);
+  return new MarkerDurablePromise(() => context.getVersion(patchId, DEFAULT_VERSION, 1) !== DEFAULT_VERSION);
 }
 
-export function deprecatePatch(patchId: string): void {
-  currentWorkflowRuntimeContext().deprecatePatch(patchId);
+export function deprecatePatch(patchId: string): PromiseLike<void> {
+  const context = currentWorkflowRuntimeContext();
+  context.assertMarkerAllowed("deprecatePatch", patchId);
+  return new MarkerDurablePromise(() => context.deprecatePatch(patchId));
 }
 
 export function sideEffect<T>(key: string, effect: () => T): PromiseLike<T> {
@@ -661,18 +607,6 @@ export class HotWorkflowExecution {
     this.#assertLive();
     this.#context.advanceHotClaim(claimed, options);
     return this.nextCommit();
-  }
-
-  /**
-   * The replay-window refusal this execution hit, if any.
-   *
-   * Read by the owner after a failed `nextCommit()`. The refusal is thrown into
-   * workflow code, which may catch it and carry on to diverge in some other
-   * way, so the error that actually surfaces is not always the overrun itself;
-   * this reports the condition regardless of which error came out.
-   */
-  replayWindowOverrun(): ReplayWindowOverrunError | null {
-    return this.#context.replayWindowOverrun();
   }
 
   markCommitted(newTailEventId: EventId): void {
@@ -1247,15 +1181,6 @@ class WorkflowRuntimeContext {
   // was loaded, so "did the workflow leave a recorded command unconsumed?"
   // could not be answered yet. `toCommit()` answers it once loading finishes.
   #pendingTerminalReplayCheck: string | null = null;
-  // How many recorded command events the window keeps in reserve for the
-  // durable markers that cannot park. `Infinity` means "load everything", which
-  // is what a replay repaired after {@link ReplayWindowOverrunError} runs with.
-  readonly #replayWindowLookahead: number;
-  // Latched when a synchronous marker was refused. Separate from throwing:
-  // the throw lands in workflow code, which may catch it, and a task whose
-  // marker could not be verified must not commit whether or not the workflow
-  // noticed.
-  #replayWindowOverrun: ReplayWindowOverrunError | null = null;
   // Per-command indexes over the ready events (completions, failures, timer
   // fires, child lifecycle) loaded so far. They are the single consumption path
   // for ready events: the replay cursor skips over ready events and never hands
@@ -1364,8 +1289,6 @@ class WorkflowRuntimeContext {
     this.#nowMs = options.nowMs ?? 0;
     this.#liveSignals = [...(options.liveSignals ?? [])];
     this.#loadReplayHistory = options.loadReplayHistory ?? null;
-    this.#replayWindowLookahead =
-      options.replayWindowLookaheadEvents ?? REPLAY_WINDOW_LOOKAHEAD_EVENTS;
     this.#lastLoadedEventId = eventId(0);
     this.#ingestReplayChunk(
       claimed.prefetchedHistory,
@@ -1433,11 +1356,7 @@ class WorkflowRuntimeContext {
    * for a single durable call, one per branch plus the winner marker for a
    * `select`.
    *
-   * The gate reserves {@link REPLAY_WINDOW_LOOKAHEAD_EVENTS} beyond that.
-   * `getVersion`, `patched`, and `deprecatePatch` are synchronous and return
-   * plain values, so they cannot park; the reserve is what they consume from,
-   * and it is why a run of consecutive marker calls between two awaits has a
-   * documented ceiling instead of a corrupting failure mode.
+   * Marker calls use this same gate before allocating their command id.
    */
   replayHistoryGate(required: number): Promise<void> | null {
     if (!this.#replayWindowShort(required)) {
@@ -1458,7 +1377,7 @@ class WorkflowRuntimeContext {
       return false;
     }
     return this.#replayEvents.length - this.#replayCursor <
-      required + this.#replayWindowLookahead;
+      required;
   }
 
   /**
@@ -2462,10 +2381,14 @@ class WorkflowRuntimeContext {
     return { kind: "Pending" };
   }
 
+  assertMarkerAllowed(api: string, id: string): void {
+    this.#assertDurableApiAllowed(api, id);
+  }
+
   getVersion(changeId: string, minSupported: number, maxSupported: number): number {
     this.#assertDurableApiAllowed("getVersion", changeId);
     validateVersionRange(changeId, minSupported, maxSupported);
-    const replayEvent = this.#peekReplayEventForUnparkableApi("getVersion");
+    const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind === "VersionMarker") {
         const marker = replayEvent.data.marker;
@@ -2513,7 +2436,7 @@ class WorkflowRuntimeContext {
 
   deprecatePatch(patchId: string): void {
     this.#assertDurableApiAllowed("deprecatePatch", patchId);
-    const replayEvent = this.#peekReplayEventForUnparkableApi("deprecatePatch");
+    const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind === "VersionMarker") {
         const marker = replayEvent.data.marker;
@@ -2674,7 +2597,7 @@ class WorkflowRuntimeContext {
     if (readyBranches.length === 0) {
       throw new Error("durust.select requires at least one ready branch");
     }
-    const replayEvent = this.#peekReplayEventForUnparkableApi("select");
+    const replayEvent = this.#peekReplayEvent();
     if (replayEvent !== undefined) {
       if (replayEvent.data.kind !== "SelectWinner") {
         throw new Error(
@@ -2864,19 +2787,6 @@ class WorkflowRuntimeContext {
     // at all, so the invariant is enforced where it is defined.
     if (this.#disposalError !== null) {
       throw this.#disposalError;
-    }
-    // Refused even if the workflow caught the throw. A backstop, and an honest
-    // label: no test kills this line, because every reachable path that reaches
-    // here with the latch set is already caught earlier — the marker the
-    // workflow skipped stays at the replay cursor, so either the next command
-    // event mismatches it positionally, or the workflow reaches a terminal
-    // state and the deferred `#assertTerminalReplayConsumed` finds it
-    // unconsumed. It is kept because this is the only function that can produce
-    // a commit, and "a task built on a marker the runtime could not verify"
-    // must be refused where commits are made rather than relying on two other
-    // checks to have covered every future shape of workflow code.
-    if (this.#replayWindowOverrun !== null) {
-      throw this.#replayWindowOverrun;
     }
     // The divergence check a terminal event could not perform when it was
     // appended, because history was still loading. The pump only calls this
@@ -3110,37 +3020,6 @@ class WorkflowRuntimeContext {
 
   #peekReplayEvent(): HistoryEvent | undefined {
     return this.#replayEvents[this.#replayCursor];
-  }
-
-  /**
-   * The peek for the durable APIs that cannot park.
-   *
-   * `getVersion`, `patched`, and `deprecatePatch` return plain values, so a
-   * short window cannot suspend them the way a thenable API suspends. Reading
-   * "no recorded event" as "this is a new command" would append a duplicate
-   * marker that the rest of history contradicts, so an exhausted window is
-   * refused here instead. `replayHistoryGate` reserves
-   * {@link REPLAY_WINDOW_LOOKAHEAD_EVENTS} events at every awaited durable call
-   * precisely so this cannot fire below that many consecutive marker calls.
-   */
-  #peekReplayEventForUnparkableApi(api: string): HistoryEvent | undefined {
-    const event = this.#peekReplayEvent();
-    if (event === undefined && !this.replayHistoryComplete()) {
-      // Latched as well as thrown. The throw lands in workflow code, which is
-      // free to catch it; the latch is what stops this task from committing on
-      // a marker the runtime never verified, and what the worker reads to
-      // decide to replay the run again with no reserve limit.
-      const overrun = new ReplayWindowOverrunError(api, this.#replayWindowLookahead);
-      this.#replayWindowOverrun ??= overrun;
-      throw overrun;
-    }
-    return event;
-  }
-
-  /** The overrun this replay hit, if any. Read by the owner to decide whether
-   * re-replaying with an unlimited reserve is worth it. */
-  replayWindowOverrun(): ReplayWindowOverrunError | null {
-    return this.#replayWindowOverrun;
   }
 
   #assertTerminalReplayConsumed(terminalKind: string): void {
@@ -4204,6 +4083,27 @@ class SelectAllDurablePromise implements PromiseLike<SelectAllRuntimeResult> {
   }
 }
 
+/** A positional marker uses the ordinary replay gate; it never performs I/O. */
+class MarkerDurablePromise<T> implements PromiseLike<T> {
+  #resolve: (() => T) | null;
+  constructor(resolve: () => T) { this.#resolve = resolve; }
+
+  then<TResult1 = T, TResult2 = never>(
+    onfulfilled?: ((value: T) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null
+  ): PromiseLike<TResult1 | TResult2> {
+    const resolve = this.#resolve;
+    if (resolve === null) { throw new Error("marker future polled after completion"); }
+    const gate = currentWorkflowRuntimeContext().replayHistoryGate(1);
+    if (gate !== null) {
+      return retryAfterReplayHistory(gate, () => this.then(onfulfilled, onrejected), onrejected);
+    }
+    this.#resolve = null;
+    const value = resolve();
+    return Promise.resolve(onfulfilled ? onfulfilled(value) : (value as unknown as TResult1));
+  }
+}
+
 class SideEffectDurablePromise<T> implements PromiseLike<T> {
   readonly #key: string;
   #effect: (() => T) | null;
@@ -4538,12 +4438,6 @@ export function workflowRejectionFailure(error: unknown): DurableFailure | null 
 
 function isWorkflowTaskFatalError(error: unknown): boolean {
   if (error instanceof UnsupportedWorkflowVersionError || error instanceof WorkflowCodeError) {
-    return true;
-  }
-  // A task-level fault, never a workflow failure: the run is fine, this
-  // execution's replay window was not big enough. Routing it here keeps a
-  // workflow that swallows the throw from recording `WorkflowFailed`.
-  if (error instanceof ReplayWindowOverrunError) {
     return true;
   }
   return (

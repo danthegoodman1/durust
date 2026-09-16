@@ -33,8 +33,10 @@ use crate::{
     encode_child_workflow_map_result_manifest_with_codec, event_payload_len, is_terminal,
 };
 use futures::future::{BoxFuture, ready};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::borrow::Borrow;
+use std::collections::BTreeSet;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -64,6 +66,12 @@ impl MemoryBackend {
             payload_config,
             work_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    fn transaction(&self) -> MemoryTransaction<'_> {
+        let committed = self.state.lock().expect("memory backend mutex poisoned");
+        let staged = committed.clone();
+        MemoryTransaction { committed, staged }
     }
 
     fn notify_work(&self) {
@@ -153,16 +161,23 @@ impl MemoryBackend {
         let max_bytes = req.max_bytes.max(1);
         let mut bytes = 0usize;
         let mut events = Vec::new();
-        for event in run.history.iter().filter(|event| {
-            event.event_id > req.after_event_id && event.event_id <= req.up_to_event_id
-        }) {
+        // Event ids are contiguous and one-based. Index directly into the
+        // persistent vector rather than rescanning the prefix on every chunk.
+        let start = usize::try_from(req.after_event_id.0)
+            .unwrap_or(usize::MAX)
+            .min(run.history.len());
+        let end = usize::try_from(req.up_to_event_id.0)
+            .unwrap_or(usize::MAX)
+            .min(run.history.len());
+        for index in start..end {
+            let event = &run.history[index];
             let event_bytes = event_payload_len(&event.data).max(1);
             if !events.is_empty() && (events.len() >= max_events || bytes + event_bytes > max_bytes)
             {
                 break;
             }
             bytes += event_bytes;
-            let mut event = event.clone();
+            let mut event = (**event).clone();
             if hydrate {
                 event.data = hydrate_history_event_from_storage(&state, event.data)?;
             }
@@ -176,10 +191,11 @@ impl MemoryBackend {
             .last()
             .map(|event| event.event_id)
             .unwrap_or(req.after_event_id);
-        let has_more = run
-            .history
-            .iter()
-            .any(|event| event.event_id > last_event_id && event.event_id <= req.up_to_event_id);
+        let has_more = last_event_id < req.up_to_event_id
+            && run
+                .history
+                .last()
+                .is_some_and(|event| event.event_id > last_event_id);
 
         Ok(HistoryChunk {
             events,
@@ -189,46 +205,147 @@ impl MemoryBackend {
     }
 }
 
-#[derive(Default)]
+// Persistent ordered indexes share records until a transaction actually writes
+// one. This is a storage primitive, not a second provider state machine.
+#[derive(Clone)]
+struct Table<K: Ord + Clone, V: Clone>(im::OrdMap<K, Arc<V>>);
+impl<K: Ord + Clone, V: Clone> Default for Table<K, V> {
+    fn default() -> Self {
+        Self(im::OrdMap::new())
+    }
+}
+impl<K: Ord + Clone, V: Clone> Table<K, V> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&K, &V)> {
+        self.0.iter().map(|(k, v)| (k, v.as_ref()))
+    }
+    fn values(&self) -> impl DoubleEndedIterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+    fn get<Q: Ord + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
+        self.0.get(key).map(Arc::as_ref)
+    }
+    fn get_mut<Q: Ord + ?Sized>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        K: Borrow<Q>,
+    {
+        self.0.get_mut(key).map(Arc::make_mut)
+    }
+    fn contains_key<Q: Ord + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
+        self.get(key).is_some()
+    }
+    fn insert(&mut self, key: K, value: V) {
+        self.0.insert(key, Arc::new(value));
+    }
+    fn remove<Q: Ord + ?Sized>(&mut self, key: &Q)
+    where
+        K: Borrow<Q>,
+    {
+        self.0.remove(key);
+    }
+    fn retain(&mut self, mut predicate: impl FnMut(&K, &V) -> bool) {
+        for (key, value) in self.clone().iter() {
+            if !predicate(key, value) {
+                self.0.remove(key);
+            }
+        }
+    }
+    fn entry(&mut self, key: K) -> TableEntry<'_, K, V> {
+        TableEntry { table: self, key }
+    }
+}
+struct TableEntry<'a, K: Ord + Clone, V: Clone> {
+    table: &'a mut Table<K, V>,
+    key: K,
+}
+impl<K: Ord + Clone, V: Clone> TableEntry<'_, K, V> {
+    fn and_modify(self, modify: impl FnOnce(&mut V)) -> Self {
+        if let Some(value) = self.table.get_mut(&self.key) {
+            modify(value);
+        }
+        self
+    }
+    fn or_insert(self, value: V) {
+        self.or_insert_with(|| value);
+    }
+    fn or_insert_with(self, value: impl FnOnce() -> V) {
+        if !self.table.contains_key(&self.key) {
+            self.table.insert(self.key, value());
+        }
+    }
+}
+
+struct MemoryTransaction<'a> {
+    committed: MutexGuard<'a, MemoryState>,
+    staged: MemoryState,
+}
+impl MemoryTransaction<'_> {
+    fn commit(mut self) {
+        std::mem::swap(&mut *self.committed, &mut self.staged);
+    }
+}
+impl Deref for MemoryTransaction<'_> {
+    type Target = MemoryState;
+    fn deref(&self) -> &MemoryState {
+        &self.staged
+    }
+}
+impl DerefMut for MemoryTransaction<'_> {
+    fn deref_mut(&mut self) -> &mut MemoryState {
+        &mut self.staged
+    }
+}
+
+#[derive(Clone, Default)]
 struct MemoryState {
     now: TimestampMs,
     next_run_id: u64,
     next_claim_token: u64,
     next_signal_sequence: u64,
-    workflow_ids: BTreeMap<(Namespace, WorkflowId), RunId>,
-    runs: BTreeMap<RunId, RunRecord>,
-    activities: BTreeMap<ActivityId, ActivityRecord>,
-    activity_maps: BTreeMap<crate::CommandId, ActivityMapRecord>,
-    child_workflow_maps: BTreeMap<crate::CommandId, ChildWorkflowMapRecord>,
-    child_outbox: BTreeMap<String, ChildOutboxRecord>,
-    waits: BTreeMap<WaitId, WaitRecord>,
-    signals: BTreeMap<SignalId, SignalRecord>,
-    query_projections: BTreeMap<(Namespace, WorkflowId), QueryProjectionRecord>,
-    workflow_change_versions: BTreeMap<(RunId, String), WorkflowChangeVersionRecord>,
-    payload_blobs: BTreeMap<String, StoredPayloadBlob>,
+    workflow_ids: Table<(Namespace, WorkflowId), RunId>,
+    runs: Table<RunId, RunRecord>,
+    activities: Table<ActivityId, ActivityRecord>,
+    activity_maps: Table<crate::CommandId, ActivityMapRecord>,
+    child_workflow_maps: Table<crate::CommandId, ChildWorkflowMapRecord>,
+    child_outbox: Table<String, ChildOutboxRecord>,
+    waits: Table<WaitId, WaitRecord>,
+    signals: Table<SignalId, SignalRecord>,
+    query_projections: Table<(Namespace, WorkflowId), QueryProjectionRecord>,
+    workflow_change_versions: Table<(RunId, String), WorkflowChangeVersionRecord>,
+    payload_blobs: Table<String, StoredPayloadBlob>,
 }
 
 // `stored_at` follows the virtual clock and is refreshed whenever a
 // content-addressed store call reuses the blob, so the GC grace period
-// (`PayloadGarbageCollectionRequest::min_age`) protects blobs that an
-// in-flight commit is about to reference.
+// (`PayloadGarbageCollectionRequest::min_age`) retains recently stored orphans.
+// Destructive collection separately requires quiescent writers.
+#[derive(Clone)]
 struct StoredPayloadBlob {
     blob: PayloadBlob,
     stored_at: TimestampMs,
 }
 
+#[derive(Clone)]
 struct RunRecord {
     namespace: Namespace,
     workflow_id: WorkflowId,
     workflow_type: crate::WorkflowType,
     task_queue: crate::TaskQueue,
-    history: Vec<HistoryEvent>,
+    history: im::Vector<Arc<HistoryEvent>>,
     // Command seqs with a child lifecycle event (started/terminal) in this
     // run's history, and the terminal-only subset. Kept so child start and
     // terminal notification dedup are lookups instead of history scans;
     // rebuildable from history.
-    child_event_seqs: BTreeSet<u64>,
-    child_terminal_seqs: BTreeSet<u64>,
+    child_event_seqs: im::OrdSet<u64>,
+    child_terminal_seqs: im::OrdSet<u64>,
     ready: Option<WorkflowTaskReason>,
     // Virtual-clock visibility deadline for delayed releases; `advance_time`
     // controls when a deferred task becomes claimable again.
@@ -260,12 +377,13 @@ impl RunRecord {
             }
             _ => {}
         }
-        self.history.push(event);
+        self.history.push_back(Arc::new(event));
     }
 }
 
 // Lease expiry is compared against the virtual clock (`state.now`) so
 // deterministic simulations can expire claims with `advance_time`.
+#[derive(Clone)]
 struct WorkflowClaim {
     token: u64,
     lease_until: TimestampMs,
@@ -294,12 +412,14 @@ struct ChildParentLink {
     child_map_item: Option<ChildWorkflowMapItem>,
 }
 
+#[derive(Clone)]
 struct ChildOutboxRecord {
     message: ChildStartOutboxMessage,
     dispatched: bool,
     child_run_id: Option<RunId>,
 }
 
+#[derive(Clone)]
 struct ActivityRecord {
     task: ActivityTask,
     claim: Option<u64>,
@@ -315,24 +435,27 @@ struct ActivityRecord {
     visible_at: Option<TimestampMs>,
 }
 
+#[derive(Clone)]
 struct ActivityMapRecord {
-    task: ActivityMapTask,
-    input_manifest: ActivityMapInputManifest,
-    results: BTreeMap<u64, crate::PayloadRef>,
+    task: Arc<ActivityMapTask>,
+    input_manifest: Arc<ActivityMapInputManifest>,
+    results: Table<u64, crate::PayloadRef>,
     next_ordinal: u64,
     in_flight: usize,
     completed: bool,
 }
 
+#[derive(Clone)]
 struct ChildWorkflowMapRecord {
-    task: ChildWorkflowMapTask,
-    input_manifest: ActivityMapInputManifest,
-    outcomes: BTreeMap<u64, ChildWorkflowMapItemOutcome>,
+    task: Arc<ChildWorkflowMapTask>,
+    input_manifest: Arc<ActivityMapInputManifest>,
+    outcomes: Table<u64, ChildWorkflowMapItemOutcome>,
     next_ordinal: u64,
     in_flight: usize,
     completed: bool,
 }
 
+#[derive(Clone)]
 struct SignalRecord {
     run_id: RunId,
     signal_name: crate::SignalName,
@@ -341,6 +464,7 @@ struct SignalRecord {
     consumed: bool,
 }
 
+#[derive(Clone)]
 struct QueryProjectionRecord {
     run_id: RunId,
     event_id: EventId,
@@ -368,7 +492,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: StartWorkflowRequest,
     ) -> BoxFuture<'static, Result<StartWorkflowOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         if let Some(run_id) = state
             .workflow_ids
             .get(&(req.namespace.clone(), req.workflow_id.clone()))
@@ -402,9 +526,9 @@ impl DurableBackend for MemoryBackend {
                 workflow_id: req.workflow_id,
                 workflow_type: req.workflow_type,
                 task_queue: req.task_queue,
-                history: vec![start],
-                child_event_seqs: BTreeSet::new(),
-                child_terminal_seqs: BTreeSet::new(),
+                history: im::vector![Arc::new(start)],
+                child_event_seqs: im::OrdSet::new(),
+                child_terminal_seqs: im::OrdSet::new(),
                 ready: Some(WorkflowTaskReason::WorkflowStarted),
                 ready_at: None,
                 workflow_claim: None,
@@ -413,7 +537,7 @@ impl DurableBackend for MemoryBackend {
             },
         );
 
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(StartWorkflowOutcome::Started { run_id })))
     }
@@ -422,7 +546,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: CancelWorkflowRequest,
     ) -> BoxFuture<'static, Result<CancelWorkflowOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         let Some(run_id) = state
             .workflow_ids
             .get(&(req.namespace.clone(), req.workflow_id.clone()))
@@ -458,21 +582,11 @@ impl DurableBackend for MemoryBackend {
         };
         cleanup_run_operational_state(&mut state, &run_id, TerminalCleanup::Closed);
         let config = self.payload_config.clone();
-        // The cancellation itself is already durable and this provider has no
-        // transaction to undo it, so a routing failure must not be reported as
-        // if nothing happened: the SQL providers roll back, where an error
-        // truthfully means the run was *not* cancelled, and a bare error here
-        // would mean the opposite on the same API. The message says which,
-        // because the outcome type cannot. A retry answers `AlreadyTerminal`,
-        // which is then consistent with it rather than contradicting it.
         if let Err(err) = handle_terminal_run(&mut state, &config, &run_id, &terminal_event) {
-            return Box::pin(ready(Err(Error::Backend(format!(
-                "workflow run `{run_id}` was cancelled, but routing its terminal \
-                 outcome to its parent failed: {err}"
-            )))));
+            return Box::pin(ready(Err(err)));
         }
 
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(CancelWorkflowOutcome::Cancelled {
             run_id,
@@ -490,6 +604,7 @@ impl DurableBackend for MemoryBackend {
         worker_id: crate::WorkerId,
         opts: ClaimWorkflowTaskOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedWorkflowTask>>> {
+        // Validation precedes the first write; no fallible operation follows it.
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
         let Some(run_id) = state.runs.iter().find_map(|(run_id, run)| {
@@ -536,13 +651,13 @@ impl DurableBackend for MemoryBackend {
             .iter()
             .rev()
             .take(16)
-            .cloned()
+            .map(|event| (**event).clone())
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect();
 
-        Box::pin(ready(Ok(Some(ClaimedWorkflowTask {
+        let task = ClaimedWorkflowTask {
             run_id: run_id.clone(),
             workflow_id: run.workflow_id.clone(),
             workflow_type: run.workflow_type.clone(),
@@ -554,7 +669,9 @@ impl DurableBackend for MemoryBackend {
             replay_target_event_id,
             reason,
             prefetched_history,
-        }))))
+        };
+        drop(state);
+        Box::pin(ready(Ok(Some(task))))
     }
 
     fn stream_history(
@@ -591,7 +708,7 @@ impl DurableBackend for MemoryBackend {
         claim: WorkflowTaskClaim,
         batch: WorkflowTaskCommit,
     ) -> BoxFuture<'static, Result<EventId>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         {
             let Some(run) = state.runs.get_mut(&claim.run_id) else {
                 return Box::pin(ready(Err(Error::RunNotFound(claim.run_id))));
@@ -607,18 +724,15 @@ impl DurableBackend for MemoryBackend {
             }
         }
 
-        // Validated before this commit touches anything. The SQL providers reject
-        // the same commits inside their descriptor-insert primitive and roll
-        // back, but this provider has no transaction, so a rejection raised any
-        // later than here would leave `ActivityMapScheduled` already appended to
-        // a run whose map was never created.
+        // Reject invalid descriptor creation before doing fallible preparation.
+        // The transaction also rolls back failures in subsequent map effects.
         //
         // Two checks, both of which the SQL providers make at the same point. A
         // zero `max_in_flight` is a caller typo the boundary rejects rather than
         // clamps. A descriptor that already exists is an invariant violation:
         // SQLite raises on its unique index and Postgres on its
         // `on conflict do nothing` row count, while this provider's
-        // `BTreeMap::insert` would *replace* it and re-step
+        // `Table::insert` would *replace* it and re-step
         // `DescriptorCreated` — appending a second terminal fact for the same
         // command id when the map is empty. The insert must stay a replace, not
         // an upsert, because `MapState::next_ordinal`'s contract depends on the
@@ -830,9 +944,9 @@ impl DurableBackend for MemoryBackend {
             state.activity_maps.insert(
                 map_task.map_command_id.clone(),
                 ActivityMapRecord {
-                    task: map_task.clone(),
-                    input_manifest: manifest,
-                    results: BTreeMap::new(),
+                    task: Arc::new(map_task.clone()),
+                    input_manifest: Arc::new(manifest),
+                    results: Table::default(),
                     next_ordinal: 0,
                     in_flight: 0,
                     completed: false,
@@ -860,9 +974,9 @@ impl DurableBackend for MemoryBackend {
             state.child_workflow_maps.insert(
                 map_task.map_command_id.clone(),
                 ChildWorkflowMapRecord {
-                    task: map_task.clone(),
-                    input_manifest: manifest,
-                    outcomes: BTreeMap::new(),
+                    task: Arc::new(map_task.clone()),
+                    input_manifest: Arc::new(manifest),
+                    outcomes: Table::default(),
                     next_ordinal: 0,
                     in_flight: 0,
                     completed: false,
@@ -999,7 +1113,7 @@ impl DurableBackend for MemoryBackend {
             .map(|event| event.event_id)
             .unwrap_or_else(|| map_tail_event_id.unwrap_or(next_event_id.0));
 
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(new_tail_event_id)))
     }
@@ -1009,6 +1123,7 @@ impl DurableBackend for MemoryBackend {
         claim: WorkflowTaskClaim,
         release: crate::WorkflowTaskRelease,
     ) -> BoxFuture<'static, Result<()>> {
+        // Validation precedes the first write; no fallible operation follows it.
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
         let Some(run) = state.runs.get_mut(&claim.run_id) else {
@@ -1035,7 +1150,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: SignalWorkflowRequest,
     ) -> BoxFuture<'static, Result<SignalWorkflowOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         if state.signals.contains_key(&req.signal_id) {
             return Box::pin(ready(Ok(SignalWorkflowOutcome::Duplicate)));
         }
@@ -1077,7 +1192,7 @@ impl DurableBackend for MemoryBackend {
             run.ready = Some(WorkflowTaskReason::SignalReceived);
             run.ready_at = None;
         }
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(SignalWorkflowOutcome::Accepted)))
     }
@@ -1115,7 +1230,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: FireDueTimersRequest,
     ) -> BoxFuture<'static, Result<FireDueTimersOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         // Selected the way the SQL providers select: a due timer wait whose
         // run is in another namespace is never a candidate, one whose run is
         // gone is a candidate so the loop below deletes it, and the budget
@@ -1161,7 +1276,7 @@ impl DurableBackend for MemoryBackend {
             state.waits.remove(&wait_id);
             fired += 1;
         }
-        drop(state);
+        state.commit();
         // Guarded so idle maintenance passes do not wake other waiters and
         // spin them against each other.
         if fired > 0 {
@@ -1174,7 +1289,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: TimeoutDueActivitiesRequest,
     ) -> BoxFuture<'static, Result<TimeoutDueActivitiesOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         let due = state
             .activities
             .iter()
@@ -1200,7 +1315,7 @@ impl DurableBackend for MemoryBackend {
             }
         }
 
-        drop(state);
+        state.commit();
         if timed_out > 0 {
             self.notify_work();
         }
@@ -1225,9 +1340,9 @@ impl DurableBackend for MemoryBackend {
         worker_id: crate::WorkerId,
         opts: ClaimActivityOptions,
     ) -> BoxFuture<'static, Result<Option<ClaimedActivityTask>>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         let mut selected = None;
-        for (activity_id, record) in &state.activities {
+        for (activity_id, record) in state.activities.iter() {
             if record.completed
                 || record.claim.is_some()
                 || record.task.task_queue != opts.task_queue
@@ -1290,6 +1405,7 @@ impl DurableBackend for MemoryBackend {
             Ok(task) => task,
             Err(err) => return Box::pin(ready(Err(err))),
         };
+        state.commit();
         Box::pin(ready(Ok(Some(ClaimedActivityTask {
             task,
             claim: ActivityTaskClaim {
@@ -1304,6 +1420,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: crate::ActivityHeartbeatRequest,
     ) -> BoxFuture<'static, Result<crate::ActivityHeartbeatOutcome>> {
+        // Validation precedes the first write; no fallible operation follows it.
         let mut state = self.state.lock().expect("memory backend mutex poisoned");
         let now = state.now;
         let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
@@ -1325,6 +1442,7 @@ impl DurableBackend for MemoryBackend {
             record.implicit_heartbeat_ms,
         )
         .map(TimestampMs);
+        drop(state);
         Box::pin(ready(Ok(crate::ActivityHeartbeatOutcome::Recorded)))
     }
 
@@ -1332,7 +1450,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: CompleteActivityRequest,
     ) -> BoxFuture<'static, Result<CompleteActivityOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
                 return Box::pin(ready(
@@ -1361,7 +1479,7 @@ impl DurableBackend for MemoryBackend {
             if let Some(record) = state.activities.get_mut(&req.claim.activity_id) {
                 record.completed = true;
             }
-            drop(state);
+            state.commit();
             self.notify_work();
             return Box::pin(ready(Ok(outcome)));
         }
@@ -1401,7 +1519,7 @@ impl DurableBackend for MemoryBackend {
         run.ready = Some(WorkflowTaskReason::ActivityCompleted);
         run.ready_at = None;
 
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(CompleteActivityOutcome::Completed { event_id })))
     }
@@ -1410,7 +1528,7 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: FailActivityRequest,
     ) -> BoxFuture<'static, Result<FailActivityOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        let mut state = self.transaction();
         let now = state.now;
         let task = {
             let Some(record) = state.activities.get_mut(&req.claim.activity_id) else {
@@ -1463,7 +1581,7 @@ impl DurableBackend for MemoryBackend {
             {
                 record.completed = true;
             }
-            drop(state);
+            state.commit();
             self.notify_work();
             return Box::pin(ready(Ok(outcome)));
         }
@@ -1485,7 +1603,7 @@ impl DurableBackend for MemoryBackend {
             record.timeout_at = None;
             record.heartbeat_deadline_at = None;
             record.implicit_heartbeat_ms = None;
-            drop(state);
+            state.commit();
             self.notify_work();
             return Box::pin(ready(Ok(FailActivityOutcome::RetryScheduled {
                 next_attempt,
@@ -1528,7 +1646,7 @@ impl DurableBackend for MemoryBackend {
         run.ready = Some(WorkflowTaskReason::ActivityFailed);
         run.ready_at = None;
 
-        drop(state);
+        state.commit();
         self.notify_work();
         Box::pin(ready(Ok(FailActivityOutcome::Failed { event_id })))
     }
@@ -1538,10 +1656,11 @@ impl DurableBackend for MemoryBackend {
         req: DispatchChildWorkflowStartsRequest,
     ) -> BoxFuture<'static, Result<DispatchChildWorkflowStartsOutcome>> {
         let result = (|| {
-            let mut state = self.state.lock().expect("memory backend mutex poisoned");
+            let mut state = self.transaction();
             let config = self.payload_config.clone();
             let dispatched =
                 dispatch_pending_child_starts(&mut state, &config, &req.namespace, req.limit)?;
+            state.commit();
             Ok(DispatchChildWorkflowStartsOutcome { dispatched })
         })();
         if matches!(&result, Ok(outcome) if outcome.dispatched > 0) {
@@ -1646,7 +1765,10 @@ impl DurableBackend for MemoryBackend {
         &self,
         req: crate::PayloadGarbageCollectionRequest,
     ) -> BoxFuture<'static, Result<crate::PayloadGarbageCollectionOutcome>> {
-        let mut state = self.state.lock().expect("memory backend mutex poisoned");
+        if let Err(err) = req.validate() {
+            return Box::pin(ready(Err(err)));
+        }
+        let mut state = self.transaction();
         let scanned_blobs = state.payload_blobs.len();
         let mut reachable = BTreeSet::new();
         if let Err(err) = collect_reachable_payload_blobs(&state, &mut reachable) {
@@ -1666,6 +1788,7 @@ impl DurableBackend for MemoryBackend {
                 .payload_blobs
                 .retain(|digest, record| reachable.contains(digest) || record.stored_at.0 > cutoff);
         }
+        state.commit();
         Box::pin(ready(Ok(crate::PayloadGarbageCollectionOutcome {
             scanned_blobs,
             retained_blobs,
@@ -1719,12 +1842,7 @@ fn insert_activity_map_item_batch(
 
     for (activity_id, timeout_at, task) in tasks {
         let task = normalize_activity_task_for_storage(state, config, task)?;
-        // `or_insert`, never `insert`. This provider has no transaction, so a
-        // materialization batch that fails part-way leaves its prefix applied
-        // and a later event re-drives the same range; overwriting would reset
-        // `completed` and the claim of an item that is already in flight. That
-        // is what makes the engine's "applying a prefix and crashing is safe"
-        // claim true here and not merely true of the SQL providers.
+        // Preserve idempotent materialization if an item already exists.
         state
             .activities
             .entry(activity_id)
@@ -1934,13 +2052,14 @@ fn abandon_pending_map_items(
 ) {
     match kind {
         MapKind::Activity => {
-            for record in state.activities.values_mut() {
+            for (key, record) in state.activities.clone().iter() {
                 let is_item = record
                     .task
                     .map_item
                     .as_ref()
                     .is_some_and(|item| item.map_command_id == *map_command_id);
                 if is_item && !record.completed {
+                    let record = state.activities.get_mut(key).expect("snapshot key");
                     record.completed = true;
                     record.claim = None;
                     record.heartbeat_deadline_at = None;
@@ -1949,13 +2068,14 @@ fn abandon_pending_map_items(
             }
         }
         MapKind::ChildWorkflow => {
-            for record in state.child_outbox.values_mut() {
+            for (key, record) in state.child_outbox.clone().iter() {
                 let is_item = record
                     .message
                     .child_map_item
                     .as_ref()
                     .is_some_and(|item| item.map_command_id == *map_command_id);
                 if is_item && record.child_run_id.is_none() {
+                    let record = state.child_outbox.get_mut(key).expect("snapshot key");
                     record.dispatched = true;
                 }
             }
@@ -2179,9 +2299,9 @@ fn start_child_run(state: &mut MemoryState, message: &ChildStartOutboxMessage) -
             workflow_id: message.workflow_id.clone(),
             workflow_type: message.workflow_type.clone(),
             task_queue: message.task_queue.clone(),
-            history: vec![start],
-            child_event_seqs: BTreeSet::new(),
-            child_terminal_seqs: BTreeSet::new(),
+            history: im::vector![Arc::new(start)],
+            child_event_seqs: im::OrdSet::new(),
+            child_terminal_seqs: im::OrdSet::new(),
             ready: Some(WorkflowTaskReason::WorkflowStarted),
             ready_at: None,
             workflow_claim: None,
@@ -2270,29 +2390,17 @@ fn child_event_exists(state: &MemoryState, command_id: &crate::CommandId) -> boo
         .is_some_and(|run| run.child_event_seqs.contains(&command_id.seq.0))
 }
 
-/// Both halves of closing a run: route its terminal outcome to its parent, and
-/// close out its own children.
-///
-/// The two are independent obligations and **both always run**. Short-circuiting
-/// on the routing error with `?` looked natural and was wrong: this provider has
-/// no transaction, so the run is already terminal by the time either half is
-/// reached, and abandoning the second half left the closed run's children still
-/// executing with nothing waiting for them — work that previously always
-/// happened, because the routing result used to be discarded entirely.
-///
-/// The routing error is reported after the cancellation, never instead of it.
-/// Every error still reachable here is an invariant violation rather than a
-/// race — a missing descriptor is answered as already-handled by
-/// [`complete_child_workflow_map_item`] — so it must stay loud.
+/// Route the terminal outcome and close children in the same transaction.
+/// A routing error rolls back both halves, preserving a retryable open run.
 fn handle_terminal_run(
     state: &mut MemoryState,
     config: &PayloadStorageConfig,
     run_id: &RunId,
     terminal_event: &HistoryEventData,
 ) -> Result<()> {
-    let routed = notify_parent_of_child_terminal(state, config, run_id, terminal_event);
+    notify_parent_of_child_terminal(state, config, run_id, terminal_event)?;
     cancel_children_for_parent(state, run_id);
-    routed
+    Ok(())
 }
 
 fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: HistoryEventData) {
@@ -2326,9 +2434,9 @@ fn continue_run_as_new(state: &mut MemoryState, old_run_id: &RunId, event: Histo
             workflow_id,
             workflow_type,
             task_queue,
-            history: vec![start],
-            child_event_seqs: BTreeSet::new(),
-            child_terminal_seqs: BTreeSet::new(),
+            history: im::vector![Arc::new(start)],
+            child_event_seqs: im::OrdSet::new(),
+            child_terminal_seqs: im::OrdSet::new(),
             ready: Some(WorkflowTaskReason::WorkflowStarted),
             ready_at: None,
             workflow_claim: None,
@@ -2396,11 +2504,12 @@ fn child_terminal_event_exists(state: &MemoryState, command_id: &crate::CommandI
 }
 
 fn cancel_children_for_parent(state: &mut MemoryState, parent_run_id: &RunId) {
-    for record in state.child_outbox.values_mut() {
+    for (key, record) in state.child_outbox.clone().iter() {
         if record.message.command_id.run_id == *parent_run_id
             && record.message.parent_close_policy == ParentClosePolicy::Cancel
             && record.child_run_id.is_none()
         {
+            let record = state.child_outbox.get_mut(key).expect("snapshot key");
             record.dispatched = true;
         }
     }
@@ -2445,8 +2554,9 @@ fn cancel_command_operational_state(
     config: &PayloadStorageConfig,
     command_id: &crate::CommandId,
 ) -> Result<()> {
-    for record in state.activities.values_mut() {
+    for (key, record) in state.activities.clone().iter() {
         if record.task.command_id == *command_id && record.task.map_item.is_none() {
+            let record = state.activities.get_mut(key).expect("snapshot key");
             record.completed = true;
             record.claim = None;
             record.heartbeat_deadline_at = None;
@@ -2480,8 +2590,9 @@ fn cancel_command_operational_state(
         }
         step_map(state, config, map_state, MapEvent::ParentCancelled)?;
     }
-    for record in state.child_outbox.values_mut() {
+    for (key, record) in state.child_outbox.clone().iter() {
         if record.message.command_id == *command_id && record.message.child_map_item.is_none() {
+            let record = state.child_outbox.get_mut(key).expect("snapshot key");
             record.dispatched = true;
         }
     }
@@ -2837,8 +2948,8 @@ fn complete_map_item(
 
     // Ask before writing. An activity map's result row is its own storage
     // primitive rather than an effect, so it must not be written for a
-    // transition the engine rejects — this provider has no transaction to roll
-    // the write back.
+    // transition the engine rejects. Subsequent fallible effects are protected
+    // by the enclosing provider transaction.
     let effects = crate::map_engine::step(
         &map_state,
         MapEvent::ItemCompleted {
@@ -3705,23 +3816,10 @@ mod tests {
         state.runs.get_mut(run_id).unwrap().terminal = true;
     }
 
-    /// A routing failure while closing a run must not abandon the rest of the
-    /// close, and must not read as "nothing happened".
-    ///
-    /// Removing `notify_parent_of_child_terminal`'s `let _ =` swallow was
-    /// right, but propagating it with `?` from `handle_terminal_run` made the
-    /// close *partial*: this provider has no transaction, so the run was
-    /// already terminal, and skipping `cancel_children_for_parent` left the
-    /// closed run's own children executing forever — work that always happened
-    /// while the error was being discarded.
-    ///
-    /// Driven by corrupting the parent map's outcome table, because every
-    /// routing error still reachable is an invariant violation rather than a
-    /// race: a bogus out-of-range outcome makes the descriptor's recorded count
-    /// reach `item_count` while ordinal 1 has no outcome, so assembling the
-    /// result manifest fails inside `CompleteMap`.
+    /// Corrupt an outcome table so routing fails after the child was staged
+    /// as cancelled. Neither the child nor its own children may partially close.
     #[test]
-    fn a_routing_failure_while_closing_a_run_still_closes_its_children() {
+    fn a_routing_failure_rolls_back_cancellation_and_child_cleanup() {
         block_on(async {
             let backend = MemoryBackend::new();
             let parent = start_and_claim(&backend, "wf/route-fail", "route-fail-q").await;
@@ -3857,31 +3955,21 @@ mod tests {
             let Error::Backend(message) = &err else {
                 panic!("expected a backend error, got {err:?}");
             };
-            assert!(
-                message.contains("was cancelled, but routing its terminal outcome")
-                    && message.contains("missing child workflow map outcome for item 1"),
-                "the error must say the cancellation happened and why routing failed, got \
-                 `{message}`"
-            );
+            assert!(message.contains("missing child workflow map outcome for item 1"));
 
             let state = backend.state.lock().unwrap();
-            // The cancellation itself is complete...
+            // Failure rolls back cancellation, parent routing, and child cleanup together.
             let item0 = state.runs.get(&item0_run_id).expect("item 0 run");
-            assert!(item0.terminal);
-            assert!(matches!(
-                item0.history.last().map(|event| event.event_type()),
+            assert!(!item0.terminal);
+            assert!(!matches!(
+                item0.history.last().map(|e| e.event_type()),
                 Some(crate::HistoryEventType::WorkflowCancelled)
             ));
-            // ...and so is the half that used to be skipped.
             let grandchild = state.runs.get(&grandchild_run_id).expect("grandchild run");
-            assert!(
-                grandchild.terminal,
-                "a routing failure must not leave the closed run's own children running"
-            );
-            assert!(matches!(
-                grandchild.history.last().map(|event| event.event_type()),
-                Some(crate::HistoryEventType::WorkflowCancelled)
-            ));
+            assert!(!grandchild.terminal);
+            let map = state.child_workflow_maps.get(&map_command_id).unwrap();
+            assert_eq!(map.outcomes.len(), 1);
+            assert!(map.outcomes.get(&0).is_none());
         });
     }
 

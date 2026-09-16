@@ -18,7 +18,7 @@ async fn charge_v2(_: ChargeInput) -> durust::Result<String> {
 
 #[durust::workflow(name = "examples.versioned-charge", version = 1)]
 async fn charge_workflow(_: ChargeInput) -> durust::Result<String> {
-    if durust::patched("charge-v2")? {
+    if durust::patched("charge-v2").await? {
         durust::call_activity!(charge_v2(ChargeInput {}))
             .task_queue("activities")
             .await

@@ -2073,7 +2073,7 @@ impl PostgresBackend {
         let ready_at_ms = if terminal {
             0
         } else {
-            ready_at_ms_for_delay(release.delay)
+            ready_at_ms_for_delay(self.clock.now(), release.delay)
         };
         tx.execute(
             &format!(
@@ -4702,6 +4702,7 @@ impl PostgresBackend {
         &self,
         req: PayloadGarbageCollectionRequest,
     ) -> Result<PayloadGarbageCollectionOutcome> {
+        req.validate()?;
         let mut client = self.client().await?;
         let tx = client.transaction().await.map_err(postgres_error)?;
         let schema = self.schema_sql();

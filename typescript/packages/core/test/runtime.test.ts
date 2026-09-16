@@ -2055,7 +2055,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-new",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        if (patched("replace-a-with-b")) {
+        if ((await patched("replace-a-with-b"))) {
           return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
         }
         return await callActivity(versionActivityA, {}, { taskQueue: "activities" });
@@ -2098,7 +2098,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-old-patched",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        const version = getVersion("replace-a-with-b", DEFAULT_VERSION, 1);
+        const version = (await getVersion("replace-a-with-b", DEFAULT_VERSION, 1));
         if (version !== DEFAULT_VERSION) {
           return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
         }
@@ -2138,7 +2138,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-bridge-patched",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        if (patched("replace-a-with-b")) {
+        if ((await patched("replace-a-with-b"))) {
           return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
         }
         return await callActivity(versionActivityA, {}, { taskQueue: "activities" });
@@ -2148,7 +2148,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-bridge-deprecated",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        deprecatePatch("replace-a-with-b");
+        (await deprecatePatch("replace-a-with-b"));
         return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
       }
     });
@@ -2199,7 +2199,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-deprecated-new",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        deprecatePatch("replace-a-with-b");
+        (await deprecatePatch("replace-a-with-b"));
         return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
       }
     });
@@ -2227,7 +2227,7 @@ describe("minimal workflow runtime", () => {
       name: "tests.version-min-two",
       version: 1,
       handler: async (_input: {}): Promise<string> => {
-        getVersion("replace-a-with-b", 2, 2);
+        (await getVersion("replace-a-with-b", 2, 2));
         return await callActivity(versionActivityB, {}, { taskQueue: "activities" });
       }
     });
@@ -2774,7 +2774,8 @@ describe("minimal workflow runtime", () => {
         sku: "sku-1",
         // JSON encoding of a durable payload calls this.
         toJSON(): { readonly sku: string; readonly version: number } {
-          return { sku: "sku-1", version: getVersion(changeId, 1, 2) };
+          getVersion(changeId, 1, 2);
+          return { sku: "sku-1", version: 0 };
         }
       }) as unknown as { readonly sku: string };
     // Types say these are a string and a number; at runtime a JS caller, an
@@ -2794,7 +2795,8 @@ describe("minimal workflow runtime", () => {
     const reentrantNumber = (changeId: string): number =>
       ({
         valueOf(): number {
-          return getVersion(changeId, 1, 2);
+          getVersion(changeId, 1, 2);
+          return 0;
         }
       }) as unknown as number;
 
@@ -2959,7 +2961,8 @@ describe("minimal workflow runtime", () => {
         ({
           ok: true,
           toJSON(): { readonly version: number } {
-            return { version: getVersion("encode-output", 1, 2) };
+            getVersion("encode-output", 1, 2);
+            return { version: 0 };
           }
         }) as unknown as { readonly ok: boolean }
     });
@@ -3039,8 +3042,8 @@ describe("minimal workflow runtime", () => {
     // SPEC.md §16 makes the map-manifest builders the documented exception to
     // the re-entrancy rule: `activityMapManifest` allocates no command and opens
     // no guarded window, so the item conversions the caller supplies run outside
-    // it and a durable API called from one is legal. Its command is allocated
-    // and appended before the map command that consumes the manifest exists.
+    // it and a synchronous durable API such as publish is legal. Version
+    // markers must be awaited outside synchronous schema adapters.
     //
     // The item schema's `encode` is the hook that matters here rather than
     // `toJSON`: the builder encodes items with MessagePack unless told
@@ -3055,7 +3058,8 @@ describe("minimal workflow runtime", () => {
           rootKind: "object",
           encode: (item: QuoteInput): unknown => {
             encoded += 1;
-            return { ...item, version: getVersion(`item-${item.sku}`, 1, 2) };
+            publish({ lastEncodedSku: item.sku });
+            return item;
           }
         };
         const mapped = activityMap(priceQuote, {
@@ -3082,26 +3086,14 @@ describe("minimal workflow runtime", () => {
       workflowTypes: [manifestWorkflow.workflowType]
     });
 
-    // The task does not fail, and both markers are allocated in call order
-    // ahead of the map command's own seq.
+    // Item conversions can publish a query projection without re-entry.
     const commit = await prepareWorkflowTaskCommit(manifestWorkflow, {}, claim, {
       payloadCodec: "Json"
     });
     expect(commit.appendEvents?.map(commandTrace)).toEqual([
-      "VersionMarker#1",
-      "VersionMarker#2",
-      "ActivityMapScheduled#3"
+      "ActivityMapScheduled#1"
     ]);
-    expect(
-      commit.appendEvents?.flatMap((event) =>
-        event.data.kind === "VersionMarker"
-          ? [[event.data.marker.changeId, Number(event.data.marker.commandId.seq)] as const]
-          : []
-      )
-    ).toEqual([
-      ["item-a", 1],
-      ["item-b", 2]
-    ]);
+    expect(decodePayload(commit.queryProjection!)).toEqual({ lastEncodedSku: "b" });
     expect(encoded).toBe(2);
     await backend.commitWorkflowTask(claim.claim, commit);
 
@@ -3112,9 +3104,7 @@ describe("minimal workflow runtime", () => {
     const history = await readHistory(backend, claim.runId, 10);
     expect(history.events.map(commandTrace)).toEqual([
       "WorkflowStarted",
-      "VersionMarker#1",
-      "VersionMarker#2",
-      "ActivityMapScheduled#3"
+      "ActivityMapScheduled#1"
     ]);
     encoded = 0;
     const replayCommit = await prepareWorkflowTaskCommit(
@@ -3122,7 +3112,7 @@ describe("minimal workflow runtime", () => {
       {},
       {
         ...claim,
-        replayTargetEventId: eventId(4),
+        replayTargetEventId: eventId(2),
         prefetchedHistory: history.events
       },
       { payloadCodec: "Json" }
@@ -3156,7 +3146,7 @@ describe("minimal workflow runtime", () => {
           caught.push((error as Error).name);
         }
         // Latched on either throw path, both of these would fail instead.
-        const version = getVersion("outer-change", 1, 2);
+        const version = (await getVersion("outer-change", 1, 2));
         const recorded = await sideEffect("after", () => "recorded");
         return { caught, version, recorded };
       }

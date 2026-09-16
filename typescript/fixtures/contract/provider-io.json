@@ -508,7 +508,8 @@
   "payloadGarbageCollection": {
     "request": {
       "dryRun": true,
-      "minAgeMs": 3600000
+      "minAgeMs": 3600000,
+      "writersQuiescent": true
     },
     "rustProviderOutcome": {
       "scannedBlobs": 3,

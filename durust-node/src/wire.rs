@@ -1730,6 +1730,8 @@ pub struct PostgresOptions {
 #[serde(rename_all = "camelCase")]
 pub struct PayloadGcRequest {
     #[serde(default)]
+    pub writers_quiescent: bool,
+    #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
     pub min_age_ms: Option<u64>,
@@ -1739,6 +1741,7 @@ impl From<PayloadGcRequest> for durust::provider::PayloadGarbageCollectionReques
     fn from(req: PayloadGcRequest) -> Self {
         let mut request = Self {
             dry_run: req.dry_run,
+            writers_quiescent: req.writers_quiescent,
             ..Self::default()
         };
         if let Some(ms) = req.min_age_ms {

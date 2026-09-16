@@ -425,7 +425,7 @@ continue-as-new
 The intended DX is ordinary Rust control flow around durable futures:
 
 ```rust
-if durust::patched("new-payment-flow")? {
+if durust::patched("new-payment-flow").await? {
     durust::call_activity!(charge_v2(input)).await?;
 } else {
     durust::call_activity!(charge_v1(input)).await?;
@@ -763,36 +763,15 @@ enum PollOutcome {
 
 If replay needs more history, the driver fetches the next segment and polls again.
 
-### Synchronous change markers and the replay window reserve
+### Suspendable change markers
 
 `NeedsMoreHistory` assumes the durable API that ran out of history can suspend.
-Most can. `get_version`, `patched`, and `deprecate_patch` cannot: they return
-plain values rather than futures, so a runtime whose durable APIs are promises
-— the TypeScript one — has no way to park them while a chunk is fetched.
-
-The replay window therefore keeps a **reserve** of recorded command events
-beyond whatever the current call needs, and every awaited durable call refills
-the window to at least that reserve. Synchronous markers spend from it. This
-gives one absolute limit, and it is the only limit chunked replay introduces:
-
-> A run of consecutive synchronous change-marker calls with no awaited durable
-> call between them may not exceed the replay window reserve.
-
-The reserve is `REPLAY_WINDOW_LOOKAHEAD_EVENTS` (128 by default, matched to the
-worker's default `historyFetchMaxEvents`). The effective limit is a floor rather
-than an exact number, because the last chunk loaded usually overshoots it.
-
-Exceeding it is refused, never mis-replayed: reading an unloaded window as "no
-recorded command" would append a duplicate marker that the rest of history
-contradicts. The refusal is recoverable rather than fatal — nothing has been
-committed when it is raised, and replay is deterministic — so the driver drops
-the execution and replays the run once more with no reserve limit, trading that
-one run's memory bound for completing the task. A worker does this
-automatically; the cost is one wasted replay and no provider contract change.
-
-Implementations that can suspend their marker APIs, or that carry a
-provider-maintained index of change markers, do not need the reserve and are not
-bound by this limit.
+All durable command APIs can suspend, including `get_version`, `patched`, and
+`deprecate_patch`. Marker calls await the next bounded replay chunk before
+matching or appending a marker. Their recorded event format, positional matching,
+and command sequence semantics do not change. Both Rust and TypeScript callers
+must await marker results. Recovery never reloads the whole history to resolve a
+marker at a chunk boundary.
 
 ## 4.4 Worker registration and task queues
 
@@ -983,7 +962,7 @@ Those live reads do not mutate correctness state by themselves. The signal remai
 
 Streaming replay bounds per-workflow memory, but it does not by itself protect
 the durability provider from a fleet-wide recovery storm. Recovery therefore has
-explicit admission control and per-attempt read budgets separate from normal
+explicit admission control and cooperative replay quanta separate from normal
 cached workflow progress.
 
 Worker/runtime policy owns semantic recovery throttling:
@@ -1001,10 +980,18 @@ separate cached-wake and cold-replay budgets
 The worker must acquire cold-recovery capacity before recreating a missing
 workflow future and streaming history beyond the start event. Each cold recovery
 attempt clamps replay stream requests by event count, byte count, and chunk
-count. If a replay attempt exhausts its budget before reaching the claimed
-`replay_target_event_id`, the worker releases the workflow task through generic
-delayed visibility and retries later. Cached workflow wakes use their existing
-tail and are not blocked behind cold replay saturation.
+count. These limits describe a scheduling quantum, not a ceiling on history
+length. When a quantum is exhausted, the worker yields to the executor and
+renews the quantum while retaining the replay cursor, future, context, and claim.
+A finite history therefore progresses with any positive quantum. Zero values
+are clamped to one; a single oversized event is allowed by the stream contract.
+No new provider API is required. Existing fencing rejects the task if ownership
+changes during replay. Admission saturation and provider backpressure still
+release the task with delayed visibility. Cached workflow wakes use their
+existing tail and are not blocked behind cold replay saturation. Within a claimed
+batch, the worker polls preparations in claim order and commits ready tasks in
+bounded batches before resuming pending recoveries; a partially filled commit
+batch does not wait for cold replay to finish.
 
 Provider implementations own physical protection for the storage system:
 
@@ -1923,6 +1910,19 @@ durable visibility.
 
 ## 8.3 Atomicity requirement
 
+Every rejected provider mutation preserves authoritative state and ownership.
+The memory provider stages fallible mutations against persistent ordered tables
+and publishes the new roots only on success. In-place mutations validate before
+their first write and perform no fallible operation afterward. Records and history share unchanged storage, so
+rollback does not require copying the database or replaying undo operations.
+
+The memory provider is a development, test, and deterministic simulation engine.
+It must preserve the same atomicity, fencing, ordering, and idempotency contract
+as persistent providers. Prefer a simple shared transaction boundary over
+specialized throughput optimizations. Its performance gates protect practical
+test execution and scaling with data size; production throughput goals are
+evaluated on persistent providers.
+
 The backend must atomically:
 
 ```text
@@ -2469,7 +2469,7 @@ Implement the same concept.
 ```rust
 pub const DEFAULT_VERSION: i32 = -1;
 
-let v = durust::get_version("charge-flow", DEFAULT_VERSION, 2)?;
+let v = durust::get_version("charge-flow", DEFAULT_VERSION, 2).await?;
 
 match v {
     DEFAULT_VERSION => {
@@ -2491,7 +2491,7 @@ match v {
 Boolean sugar:
 
 ```rust
-if durust::patched("new-charge-flow")? {
+if durust::patched("new-charge-flow").await? {
     // new path
 } else {
     // old path
@@ -2501,7 +2501,7 @@ if durust::patched("new-charge-flow")? {
 Deprecation bridge:
 
 ```rust
-durust::deprecate_patch("new-charge-flow")?;
+durust::deprecate_patch("new-charge-flow").await?;
 ```
 
 ## 15.2 `get_version` semantics
@@ -2531,15 +2531,12 @@ If replay cursor is at tail:
 The marker is part of command history and participates in deterministic replay.
 Markers are matched positionally like every other command, and one marker is
 recorded per call, so a change id consulted twice records two markers.
-`get_version` is a synchronous workflow API while recovery streams history in
-bounded chunks, so when the loaded window ends before the replay target at the
-point of a marker call, the call fails the poll and latches an overrun; the
-worker discards that poll and replays the run with its whole history loaded.
-Workflow code may catch the error, but the latch keeps the task from
-committing.
+`get_version` returns an awaitable result. At a loaded-window boundary, the
+runtime parks the call until the next bounded chunk arrives. It allocates no
+command id and records no marker until the positional replay decision is known.
 
 Unsupported workflow versions and marker-order mismatches abort the workflow
-task. They must not append `WorkflowFailed`; the worker releases the task with a
+task without appending `WorkflowFailed`; the worker releases the task with
 retry backoff just like nondeterminism.
 
 ## 15.3 `patched` semantics
@@ -2551,7 +2548,7 @@ durust::patched("id")
 Equivalent to:
 
 ```rust
-durust::get_version("id", DEFAULT_VERSION, 1)? != DEFAULT_VERSION
+durust::get_version("id", DEFAULT_VERSION, 1).await? != DEFAULT_VERSION
 ```
 
 ## 15.4 Deployment flow
@@ -2565,7 +2562,7 @@ let result = durust::call_activity!(activity_a(input)).await?;
 ### Stage 2: patch in new code
 
 ```rust
-if durust::patched("replace-a-with-b")? {
+if durust::patched("replace-a-with-b").await? {
     let result = durust::call_activity!(activity_b(input)).await?;
 } else {
     let result = durust::call_activity!(activity_a(input)).await?;
@@ -2579,7 +2576,7 @@ No old worker binary needs to stay online.
 ### Stage 3: after no open workflows need the old branch
 
 ```rust
-durust::deprecate_patch("replace-a-with-b")?;
+durust::deprecate_patch("replace-a-with-b").await?;
 
 let result = durust::call_activity!(activity_b(input)).await?;
 ```
@@ -2986,30 +2983,30 @@ retained and deleted blob counts without mutating storage. Counts are for blobs
 owned by the GC target: concrete providers count provider-owned blobs, while
 wrapper GC counts wrapper-owned object-store blobs.
 
-Blob uploads precede the durable commit that makes them reachable, so a
-reachability snapshot alone can sentence a blob an in-flight commit is about to
-reference — either a fresh upload or an existing blob a content-addressed put
-deduplicated against. GC therefore never deletes a blob whose last-modified
-timestamp is younger than `PayloadGarbageCollectionRequest::min_age` (default
-one hour). Blob listings return last-modified timestamps, and stores that can
-cheaply refresh the timestamp on a deduplicated put do so: local directories
-touch the file mtime, the in-memory stores refresh under their lock, and the
-SQL providers refresh through the row-conflict update whose lock the GC
-delete's timestamp predicate re-evaluates under, which closes the
-sentence-then-reuse race transactionally for provider-internal blobs. The
-decorator sweep re-probes each candidate's last-modified timestamp immediately
-before deleting it (`PayloadBlobStore::payload_blob_last_modified`; the
-in-tree memory and S3 stores implement it, S3 via HEAD Last-Modified), so a
-re-put that lands after the sweep's listing but before that blob's pre-delete
-probe is retained; only the sliver between the probe and the delete itself
-stays exposed. The
-residual window shrinks to stores that cannot report a fresh timestamp — the
-defaulted probe returns no information and the sweep trusts its listing
-snapshot — and to S3 deduplicated puts, which skip the timestamp refresh
-because a copy-object round trip per put is not worth it (fresh S3 uploads do
-get a new Last-Modified the re-probe observes). Operators size `min_age`
-accordingly: above the maximum upload-to-commit latency plus one full GC
-sweep, which the one-hour default dwarfs.
+Destructive payload GC is an offline operation. The caller must stop and drain
+all writers that can publish references into the target provider or shared blob
+store, keep them stopped through the sweep, and set
+`PayloadGarbageCollectionRequest::writers_quiescent = true`. This includes
+clients, workers, maintenance services, pending uploads, other processes, and
+other providers sharing the store. A provider rejects a destructive request
+without this explicit assertion before reading roots or deleting anything.
+Dry runs remain available online; their counts describe a snapshot and are not
+a promise about a later sweep. The native TypeScript option is
+`writersQuiescent: true`.
+
+A grace period is a retention policy, not a writer/collector exclusion protocol.
+`min_age` (default one hour) retains young orphans even during offline collection.
+Neither a timestamp refresh nor a pre-delete HEAD closes the gap between a root
+snapshot and a concurrent reference commit, especially when a writer reuses an
+old content-addressed object. Durust does not offer destructive online GC without
+a transactional publication/reclamation protocol.
+
+Local-directory blob publication syncs the file before publishing its name, and
+syncs the containing directory and its ancestor entries before returning success.
+A deduplicated put crosses the same file and directory durability barriers.
+Failures propagate before a provider commits the reference. These guarantees
+require a filesystem and storage stack that honor file and directory sync and
+atomic rename; clean process restart alone does not establish power-loss safety.
 
 Reachability marks leaf blobs from the ref's digest alone; only manifest
 containers load, because traversal needs their contents. If a committed

@@ -496,9 +496,7 @@ fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
             backend,
             "wf/memory-delayed-release",
             "memory-delayed-release-workflows",
-            move || async move {
-                advance_backend.advance_time(Duration::from_millis(40));
-            },
+            move |duration| advance_backend.advance_time(duration),
         )
         .await;
     });
@@ -508,12 +506,22 @@ fn memory_delayed_released_workflow_task_visibility_follows_virtual_clock() {
 fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
-        let backend = SqliteBackend::open(dir.path().join("delayed-release.sqlite3")).unwrap();
+        let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+        let backend = SqliteBackend::open_with_clock(
+            dir.path().join("delayed-release.sqlite3"),
+            durust::PayloadStorageConfig::default(),
+            clock.clone(),
+        )
+        .unwrap();
         delayed_released_workflow_task_is_not_claimable_until_visible(
             backend,
             "wf/sqlite-delayed-release",
             "sqlite-delayed-release-workflows",
-            || async { std::thread::sleep(Duration::from_millis(40)) },
+            |duration| {
+                clock.advance_to(durust::TimestampMs(
+                    clock.now().0 + duration.as_millis() as i64,
+                ))
+            },
         )
         .await;
     });
@@ -522,15 +530,28 @@ fn sqlite_delayed_released_workflow_task_is_not_claimable_until_visible() {
 #[cfg(feature = "postgres")]
 #[test]
 fn postgres_delayed_released_workflow_task_is_not_claimable_until_visible_when_configured() {
-    block_on_tokio(with_postgres(
+    block_on_tokio(with_postgres_schema(
         "Postgres delayed release conformance",
         "delayed_release",
-        |backend| async move {
+        |backend, url, schema| async move {
+            drop(backend);
+            let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+            let backend = PostgresBackend::connect_with_config(
+                PostgresBackendConfig::new(url)
+                    .schema(schema)
+                    .clock(clock.clone()),
+            )
+            .await
+            .unwrap();
             delayed_released_workflow_task_is_not_claimable_until_visible(
                 backend,
                 "wf/postgres-delayed-release",
                 "postgres-delayed-release-workflows",
-                || async { tokio::time::sleep(Duration::from_millis(40)).await },
+                |duration| {
+                    clock.advance_to(durust::TimestampMs(
+                        clock.now().0 + duration.as_millis() as i64,
+                    ))
+                },
             )
             .await;
         },
@@ -542,7 +563,16 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
     block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("delayed-visibility.sqlite3");
-        let backend = SqliteBackend::open(&path).unwrap();
+        let clock = durust::provider::ProviderClock::manual(durust::TimestampMs(1_000));
+        let open = || {
+            SqliteBackend::open_with_clock(
+                &path,
+                durust::PayloadStorageConfig::default(),
+                clock.clone(),
+            )
+            .unwrap()
+        };
+        let backend = open();
         let client = Client::new(backend.clone());
         client
             .start_workflow::<workflow>(
@@ -565,16 +595,18 @@ fn sqlite_delayed_workflow_task_visibility_persists_across_reopen() {
             )
             .await
             .unwrap();
+        drop(client);
         drop(backend);
 
-        let reopened = SqliteBackend::open(&path).unwrap();
+        let reopened = open();
+        clock.advance_to(durust::TimestampMs(1_024));
         let hidden = reopened
             .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-b"), claim_opts.clone())
             .await
             .unwrap();
         assert!(hidden.is_none());
 
-        std::thread::sleep(Duration::from_millis(40));
+        clock.advance_to(durust::TimestampMs(1_025));
         let visible = reopened
             .claim_workflow_task(WorkerId::new("sqlite-delayed-worker-c"), claim_opts)
             .await
@@ -1479,6 +1511,7 @@ where
     let before = blob_store.blob_count();
     let outcome = backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -1653,6 +1686,7 @@ fn custom_scheme_blob_store_works_over_sqlite_provider() {
         );
         let outcome = reopened
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1720,6 +1754,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
             .unwrap();
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -1736,6 +1771,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
         // behavior: the same window now loses the blob.
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1765,6 +1801,7 @@ fn payload_backend_gc_grace_period_protects_in_flight_uploads() {
             .unwrap();
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -1886,6 +1923,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         // commit.
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -1897,6 +1935,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         backend.advance_time(Duration::from_secs(2 * 60 * 60));
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -1912,6 +1951,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         commit_projection_replacement(&backend, workflow_id, queue, 2, "projection-new").await;
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -1924,6 +1964,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         commit_projection_replacement(&backend, workflow_id, queue, 3, "projection-final").await;
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -1935,6 +1976,7 @@ fn memory_gc_grace_period_follows_virtual_clock() {
         );
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2008,6 +2050,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         // Young unreachable garbage survives the default grace period.
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -2026,6 +2069,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
             .unwrap();
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -2045,6 +2089,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         fs::write(&in_flight_path, &in_flight_bytes).unwrap();
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -2054,6 +2099,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         assert!(in_flight_path.exists());
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2100,6 +2146,7 @@ fn sqlite_local_blob_gc_grace_period_and_dedup_mtime_refresh() {
         let reopened = SqliteBackend::open_with_payload_storage(&path, config).unwrap();
         let outcome = reopened
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2201,6 +2248,7 @@ fn payload_backend_gc_records_delete_failures_and_continues() {
         // Dry run reports both as would-delete without attempting deletes.
         let dry_run = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: true,
                 min_age: Duration::ZERO,
             })
@@ -2211,6 +2259,7 @@ fn payload_backend_gc_records_delete_failures_and_continues() {
 
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2258,6 +2307,7 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
         fs::write(object_dir.path().join("payloads").join("orphan"), b"orphan").unwrap();
         let dry_run = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: true,
                 min_age: Duration::ZERO,
             })
@@ -2266,6 +2316,7 @@ fn sqlite_provider_offloads_large_payloads_to_local_blob_store_and_gc_collects_o
         assert!(dry_run.deleted_blobs >= 1);
         let collected = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2326,7 +2377,7 @@ fn sqlite_local_blob_store_upload_failure_does_not_commit_missing_payload_ref() 
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::Backend(message) if message.contains("failed to create local payload blob directory"))
+            matches!(err, Error::Backend(message) if message.contains("failed to durably publish local payload blob"))
         );
         let claim = backend
             .claim_workflow_task(
@@ -2512,7 +2563,7 @@ fn default_durable_names_include_package_module_and_function() {
 ///
 /// [`run_conformance_scenarios`] counts what it expands and this number is the
 /// floor. Removing a scenario is meant to move it in the same commit.
-const CONFORMANCE_SCENARIOS: usize = 56;
+const CONFORMANCE_SCENARIOS: usize = 58;
 
 /// Runs each named scenario against a clone of `backend`, in order, and
 /// returns how many it ran.
@@ -2537,6 +2588,8 @@ where
 {
     let ran = run_conformance_scenarios!(
         backend,
+        rejected_map_commit_is_atomic,
+        destructive_gc_requires_quiescence,
         start_workflow_is_idempotent,
         workflow_claim_filters_by_queue_and_registered_type,
         stream_history_honors_bounds,
@@ -3089,6 +3142,7 @@ where
 
     let dry_run = backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: true,
             min_age: Duration::ZERO,
         })
@@ -3111,6 +3165,7 @@ where
 
     let collected = backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -3120,6 +3175,7 @@ where
 
     let after = backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: true,
             min_age: Duration::ZERO,
         })
@@ -3446,6 +3502,7 @@ where
     // `ChildWorkflowMapCompleted` event refers to the result manifest.
     backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -3681,6 +3738,7 @@ where
     // traversal reports that slot.
     backend
         .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            writers_quiescent: true,
             dry_run: false,
             min_age: Duration::ZERO,
         })
@@ -4224,18 +4282,16 @@ where
     assert!(reclaimed.is_some());
 }
 
-// Parametrized on how time passes because delayed visibility is a clock
-// comparison: memory follows the virtual clock (`advance_time`) while the SQL
-// providers compare against the wall clock and must really sleep.
-async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance, AdvanceFut>(
+// Every provider uses controlled time here: a wall-clock assertion that the
+// next database round trip finishes within 25 ms races a loaded CI runner.
+async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advance>(
     backend: B,
     workflow_id: &str,
     workflow_queue: &str,
-    advance_past_delay: Advance,
+    mut advance_time: Advance,
 ) where
     B: DurableBackend,
-    Advance: FnOnce() -> AdvanceFut,
-    AdvanceFut: Future<Output = ()>,
+    Advance: FnMut(Duration),
 {
     let client = Client::new(backend.clone());
     client
@@ -4262,7 +4318,17 @@ async fn delayed_released_workflow_task_is_not_claimable_until_visible<B, Advanc
         .unwrap();
     assert!(hidden.is_none());
 
-    advance_past_delay().await;
+    advance_time(Duration::from_millis(24));
+    let still_hidden = backend
+        .claim_workflow_task(WorkerId::new("worker-before-boundary"), claim_opts.clone())
+        .await
+        .unwrap();
+    assert!(
+        still_hidden.is_none(),
+        "release visible before its delay elapsed"
+    );
+
+    advance_time(Duration::from_millis(1));
     let visible = backend
         .claim_workflow_task(WorkerId::new("worker-c"), claim_opts)
         .await
@@ -12495,6 +12561,7 @@ fn sqlite_gc_measures_blob_age_on_the_wall_clock() {
         fs::write(&orphan, b"orphan").unwrap();
         let outcome = backend
             .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::from_secs(60 * 60),
             })
@@ -13761,4 +13828,145 @@ fn memory_start_to_close_deadline_starts_at_the_claim() {
             Ok(durust::provider::CompleteActivityOutcome::AlreadyCompleted)
         ));
     });
+}
+
+async fn rejected_map_commit_is_atomic<B: DurableBackend>(backend: B) {
+    use durust::provider::*;
+    use durust::*;
+    let run_id = backend
+        .start_workflow(StartWorkflowRequest {
+            namespace: Namespace::default(),
+            workflow_id: WorkflowId::new("wf/rejected-map"),
+            workflow_type: WorkflowType::new("review.probe", 1),
+            task_queue: TaskQueue::new("review-rejected-map"),
+            input: durust::encode_payload(&1_u64).unwrap(),
+        })
+        .await
+        .unwrap()
+        .run_id()
+        .clone();
+    let claim = backend
+        .claim_workflow_task(
+            WorkerId::new("probe"),
+            ClaimWorkflowTaskOptions {
+                namespace: Namespace::default(),
+                task_queue: TaskQueue::new("review-rejected-map"),
+                registered_workflow_types: vec![WorkflowType::new("review.probe", 1)],
+                lease_duration: Duration::from_secs(30),
+                shard_filter: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .claim;
+    let command_id = CommandId {
+        run_id: run_id.clone(),
+        seq: CommandSeq(1),
+    };
+    let manifest = encode_payload(&ActivityMapInputManifest {
+        item_count: 1,
+        page_lengths: vec![1],
+        pages: vec![],
+    })
+    .unwrap();
+    let scheduled = ActivityMapScheduled {
+        command_id: command_id.clone(),
+        activity_name: ActivityName::new("review.double"),
+        task_queue: TaskQueue::new("default"),
+        retry_policy: RetryPolicy::none(),
+        start_to_close_timeout: None,
+        heartbeat_timeout: None,
+        input_manifest: manifest.clone(),
+        result_manifest_name: "results".into(),
+        max_in_flight: 1,
+        fingerprint: CommandFingerprint {
+            kind: CommandKind::ActivityMap,
+            name: "review.double".into(),
+            input_digest: None,
+            options_digest: "probe".into(),
+        },
+    };
+    let mut commit = WorkflowTaskCommit {
+        append_events: vec![NewHistoryEvent {
+            data: HistoryEventData::ActivityMapScheduled(scheduled),
+        }],
+        schedule_activity_maps: vec![ActivityMapTask {
+            map_command_id: command_id,
+            activity_name: ActivityName::new("review.double"),
+            task_queue: TaskQueue::new("default"),
+            retry_policy: RetryPolicy::none(),
+            start_to_close_timeout: None,
+            heartbeat_timeout: None,
+            input_manifest: manifest,
+            result_manifest_name: "results".into(),
+            max_in_flight: 1,
+        }],
+        query_projection: Some(encode_payload(&41_u64).unwrap()),
+        ..Default::default()
+    };
+    let failure = backend
+        .commit_workflow_task(claim.clone(), commit.clone())
+        .await
+        .unwrap_err();
+    let history = backend
+        .stream_history(StreamHistoryRequest {
+            run_id: run_id.clone(),
+            after_event_id: EventId::ZERO,
+            up_to_event_id: EventId(100),
+            max_events: 100,
+            max_bytes: usize::MAX,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.events.len(), 1);
+    assert!(failure.to_string().contains("missing page"));
+    let projection = backend
+        .query_projection(QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: WorkflowId::new("wf/rejected-map"),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(projection, QueryProjectionOutcome::NoProjection));
+
+    // Correct the manifest and retry the same descriptor under the original
+    // claim. This detects leaked descriptor rows as well as lost ownership.
+    let valid = encode_payload(&ActivityMapInputManifest {
+        item_count: 0,
+        page_lengths: vec![],
+        pages: vec![],
+    })
+    .unwrap();
+    commit.schedule_activity_maps[0].input_manifest = valid.clone();
+    if let HistoryEventData::ActivityMapScheduled(scheduled) = &mut commit.append_events[0].data {
+        scheduled.input_manifest = valid;
+    }
+    backend.commit_workflow_task(claim, commit).await.unwrap();
+    let projection = backend
+        .query_projection(QueryProjectionRequest {
+            namespace: Namespace::default(),
+            workflow_id: WorkflowId::new("wf/rejected-map"),
+        })
+        .await
+        .unwrap();
+    let QueryProjectionOutcome::Found { payload, .. } = projection else {
+        panic!("retry must publish projection")
+    };
+    assert_eq!(decode_payload::<u64>(&payload).unwrap(), 41);
+}
+
+async fn destructive_gc_requires_quiescence<B: DurableBackend>(backend: B) {
+    let error = backend
+        .gc_payload_blobs(Default::default())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("quiescent"));
+    backend
+        .gc_payload_blobs(durust::provider::PayloadGarbageCollectionRequest {
+            dry_run: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 }

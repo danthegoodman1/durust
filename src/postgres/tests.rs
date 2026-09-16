@@ -2421,6 +2421,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         // could belong to an in-flight commit.
         let dry_run = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: true,
                 ..Default::default()
             })
@@ -2430,6 +2431,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         assert!(dry_run.retained_blobs >= 2);
         let collected = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -2460,6 +2462,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         // unreachable blobs, deleting the young orphan too.
         let collected = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })
@@ -2468,6 +2471,7 @@ fn postgres_payload_roots_and_gc_when_configured() {
         assert_eq!(collected.deleted_blobs, 1);
         let after = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: true,
                 min_age: Duration::ZERO,
             })
@@ -2684,6 +2688,7 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
 
         let collected = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 ..Default::default()
             })
@@ -2720,6 +2725,7 @@ fn postgres_dedup_reput_restarts_gc_grace_period_when_configured() {
         // only the refreshed timestamp retained it above.
         let collected = backend
             .gc_payload_blobs(PayloadGarbageCollectionRequest {
+                writers_quiescent: true,
                 dry_run: false,
                 min_age: Duration::ZERO,
             })

@@ -263,9 +263,9 @@ const corpusMarkers = workflow({
   name: "corpus.markers",
   version: 1,
   handler: async (input: Value1): Promise<Value1> => {
-    const version = getVersion("corpus.change", 1, 1);
+    const version = (await getVersion("corpus.change", 1, 1));
     const tagged = await sideEffect<Value1>("corpus.tag", () => ({ value: input.value + 100 }));
-    deprecatePatch("corpus.retired");
+    (await deprecatePatch("corpus.retired"));
     return { value: tagged.value + Math.max(version, 0) };
   }
 });
@@ -274,11 +274,11 @@ const corpusRepeatedChangeId = workflow({
   name: "corpus.repeated-change-id",
   version: 1,
   handler: async (input: Value1): Promise<Value1> => {
-    const first = patched("corpus.repeat");
+    const first = (await patched("corpus.repeat"));
     const doubled = await callActivity(corpusDouble, { value: input.value }, {
       taskQueue: CORPUS_ACTIVITY_QUEUE
     });
-    const second = patched("corpus.repeat");
+    const second = (await patched("corpus.repeat"));
     return { value: doubled.value + Number(first) + Number(second) };
   }
 });

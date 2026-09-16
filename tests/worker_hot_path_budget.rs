@@ -266,7 +266,7 @@ struct MarkerInput {
 #[durust::workflow(name = "hot-path-budget.markers", version = 1)]
 async fn marker_workflow(input: MarkerInput) -> durust::Result<u64> {
     for index in 0..input.markers {
-        let _ = durust::get_version(format!("change-{index}"), 1, 2)?;
+        let _ = durust::get_version(format!("change-{index}"), 1, 2).await?;
     }
     let mut total = 0;
     for _ in 0..input.rounds {

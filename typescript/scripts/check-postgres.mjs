@@ -9,6 +9,19 @@ if (typeof postgresUrl !== "string" || postgresUrl.trim().length === 0) {
   process.exit(1);
 }
 
+// This script is where the benchmark thresholds are the performance gate, so
+// the variable that lifts the speed comparisons for a shared runner would make
+// it pass while measuring nothing. It fails here rather than reporting a green
+// run over correctness gates alone.
+const skipSpeedEnv = "DURUST_BENCHMARK_SKIP_SPEED_THRESHOLDS";
+if (process.env[skipSpeedEnv] !== undefined) {
+  console.error(
+    `npm run check:postgres compares throughput and latency against the baselines, so ${skipSpeedEnv} ` +
+      "must be unset; run it on the controlled machine that recorded them"
+  );
+  process.exit(1);
+}
+
 const steps = [
   {
     name: "Postgres provider conformance",
