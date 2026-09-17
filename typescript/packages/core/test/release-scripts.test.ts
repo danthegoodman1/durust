@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { copyFile, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
@@ -14,6 +14,59 @@ const checkReleaseScript = fileURLToPath(new URL("scripts/check-release.mjs", wo
 const checkPostgresScript = fileURLToPath(new URL("scripts/check-postgres.mjs", workspaceRootUrl));
 
 describe("release gate scripts", () => {
+  it("keeps downloaded and assembled native artifacts out of the Rust package", async () => {
+    const repoRoot = fileURLToPath(new URL("..", workspaceRootUrl));
+    const workflow = readFileSync(join(repoRoot, ".github/workflows/release.yml"), "utf8");
+    const downloadPath = workflow.match(
+      /uses: actions\/download-artifact@[^\n]+\n\s+with:[\s\S]*?\n\s+path: ([^\n]+)/u
+    )?.[1];
+    expect(downloadPath).toBeDefined();
+    const root = await mkdtemp(join(tmpdir(), "durust-release-package-"));
+    const checkout = join(root, "checkout");
+    const runnerTemp = join(root, "runner-temp");
+    try {
+      await mkdir(join(checkout, "src"), { recursive: true });
+      await copyFile(join(repoRoot, ".gitignore"), join(checkout, ".gitignore"));
+      await writeFile(join(checkout, "Cargo.toml"),
+        '[package]\nname = "durust-release-fixture"\nversion = "0.0.0"\nedition = "2024"\n');
+      await writeFile(join(checkout, "src/lib.rs"), "pub fn fixture() {}\n");
+      const options = { cwd: checkout };
+      await execFileAsync("cargo", ["generate-lockfile", "--offline"], options);
+      await execFileAsync("git", ["init", "-q"], options);
+      await execFileAsync("git", ["add", "."], options);
+      await execFileAsync("git", [
+        "-c", "user.name=Release Test", "-c", "user.email=release-test@example.invalid",
+        "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"
+      ], options);
+
+      const download = resolve(checkout, downloadPath!.replace("${{ runner.temp }}", runnerTemp));
+      expect(download).not.toContain("${{");
+      await mkdir(download, { recursive: true });
+      const platforms = join(workspaceRoot, "packages/native/npm");
+      for (const target of await readdir(platforms)) {
+        const manifest = JSON.parse(readFileSync(join(platforms, target, "package.json"), "utf8")) as {
+          files: string[];
+        };
+        for (const binary of manifest.files) {
+          const artifact = join(download, binary);
+          await writeFile(artifact, "native release artifact fixture\n");
+          const assembled = join(checkout, "typescript/packages/native/npm", target, binary);
+          await mkdir(dirname(assembled), { recursive: true });
+          await copyFile(artifact, assembled);
+        }
+      }
+
+      // This is Cargo's publication cleanliness check, without credentials,
+      // uploads, dependencies, or a compiler run. The old staging path fails it.
+      await execFileAsync("cargo", ["package", "--locked", "--offline", "--no-verify"], options);
+      const files = await execFileAsync("cargo", ["package", "--locked", "--offline", "--list"], options);
+      expect(files.stdout).not.toContain(".node");
+      expect((await execFileAsync("git", ["status", "--porcelain"], options)).stdout).toBe("");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it("prints the aggregate release gate command list in dry-run mode without Postgres", async () => {
     const result = await execFileAsync(process.execPath, [checkReleaseScript, "--dry-run"], {
       cwd: workspaceRoot,

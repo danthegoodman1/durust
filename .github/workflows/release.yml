@@ -237,7 +237,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           pattern: native-*
-          path: native-artifacts
+          # Keep downloaded binaries outside Cargo's source package and git checkout.
+          path: ${{ runner.temp }}/durust-native-artifacts
           merge-multiple: true
 
       - name: Assemble the platform packages
@@ -246,8 +247,8 @@ jobs:
           for target in darwin-arm64 darwin-x64 linux-arm64-gnu linux-x64-gnu; do
             for addon in durust-node durust-sqlite; do
               binary="${addon}.${target}.node"
-              test -f "native-artifacts/${binary}" || { echo "missing ${binary}" >&2; exit 1; }
-              cp "native-artifacts/${binary}" "typescript/packages/native/npm/${target}/${binary}"
+              test -f "${RUNNER_TEMP}/durust-native-artifacts/${binary}" || { echo "missing ${binary}" >&2; exit 1; }
+              cp "${RUNNER_TEMP}/durust-native-artifacts/${binary}" "typescript/packages/native/npm/${target}/${binary}"
             done
           done
           node scripts/check-native-packages.mjs --require-binaries
