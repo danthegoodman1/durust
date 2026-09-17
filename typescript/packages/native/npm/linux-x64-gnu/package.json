@@ -1,6 +1,6 @@
 {
   "name": "@durust/native-linux-x64-gnu",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "The Durust memory/Postgres and SQLite addons for linux-x64-gnu: a platform package of @durust/native.",
   "os": [
     "linux"

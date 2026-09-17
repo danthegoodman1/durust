@@ -1,13 +1,13 @@
 {
   "name": "@durust/testing",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Shared provider conformance tests for Durust TypeScript backends.",
   "type": "module",
   "engines": {
     "node": ">=24.0.0"
   },
   "dependencies": {
-    "@durust/core": "^0.2.2"
+    "@durust/core": "^0.2.3"
   },
   "exports": {
     ".": {

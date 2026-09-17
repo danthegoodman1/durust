@@ -1,6 +1,6 @@
 {
   "name": "@durust/core",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Durable workflow runtime core for TypeScript and Node.js.",
   "type": "module",
   "engines": {
@@ -51,6 +51,6 @@
     "directory": "typescript/packages/core"
   },
   "devDependencies": {
-    "@durust/native": "^0.2.2"
+    "@durust/native": "^0.2.3"
   }
 }
