@@ -1,6 +1,6 @@
 [package]
 name = "durust-benchtools"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Benchmark workload, comparison, and reporting tools for durust development."
 license = "MIT"

@@ -1,6 +1,6 @@
 {
   "name": "@durust/eslint-plugin",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "ESLint rules for deterministic Durust workflow code.",
   "type": "module",
   "engines": {

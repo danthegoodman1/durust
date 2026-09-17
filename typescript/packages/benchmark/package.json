@@ -1,6 +1,6 @@
 {
   "name": "@durust/benchmark",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "private": true,
   "engines": {
@@ -29,12 +29,12 @@
     "test": "vitest run --root ../.. --config vitest.config.ts packages/benchmark/test"
   },
   "dependencies": {
-    "@durust/core": "^0.2.1",
-    "@durust/native": "^0.2.1",
+    "@durust/core": "^0.2.2",
+    "@durust/native": "^0.2.2",
     "pg": "^8.21.0"
   },
   "devDependencies": {
-    "@durust/testing": "^0.2.1",
+    "@durust/testing": "^0.2.2",
     "@types/pg": "^8.20.0"
   },
   "license": "MIT",

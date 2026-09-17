@@ -1,6 +1,6 @@
 {
   "name": "@durust/native-darwin-arm64",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "The Durust memory/Postgres and SQLite addons for darwin-arm64: a platform package of @durust/native.",
   "os": [
     "darwin"
